@@ -92,6 +92,7 @@
                   "type": "text"
                 }
               },
+              "tool_choice": "auto",
               "tools": [
                 {
                   "description": "Apply a unified diff to the workspace.",
@@ -105,6 +106,7 @@
               "usage": {
                 "input_tokens": 6,
                 "input_tokens_details": {
+                  "cache_write_tokens": 0,
                   "cached_tokens": 0
                 },
                 "output_tokens": 4,

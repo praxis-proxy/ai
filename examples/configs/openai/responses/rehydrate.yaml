@@ -8,10 +8,10 @@
 # the `openai_responses_proxy` filter.
 #
 # Pipeline ordering:
-#   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — parses JSON, enriches metadata, generates IDs
-#   3. openai_response_store — initializes store, registers in ctx
-#   4. openai_responses_rehydrate — validates previous response, sets metadata
+#   1. openai_responses_request — parses the create body once, promotes
+#      classification metadata, enriches it, and generates IDs
+#   2. openai_response_store — initializes store, registers in ctx
+#   3. openai_responses_rehydrate — validates previous response, sets metadata
 #
 # The response_store filter must appear before openai_responses_rehydrate so its
 # store backend is registered in `ctx.response_stores` during
@@ -40,9 +40,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
-
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
 
       - filter: state_owner
         mode: single_tenant

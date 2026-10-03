@@ -9,8 +9,9 @@
 //!
 //! A matched operation is published three ways: a typed
 //! [`OpenAiOperationMatch`] in request extensions for downstream filters,
-//! metadata and filter results for branching, and optional proxy-owned routing
-//! headers applied to the upstream request.
+//! including registry body metadata and allocation-free path-parameter
+//! locations; metadata and filter results for branching; and optional
+//! proxy-owned routing headers applied to the upstream request.
 //!
 //! The headers are pending mutations applied when the request is forwarded, so
 //! the `router` filter — which matches the downstream request headers — does not
@@ -28,16 +29,18 @@ mod config;
 mod tests;
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_filter::{
+    ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+};
 use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        responses::routes as responses_routes,
+        operation::OpenAiOperationSpec, responses::routes as responses_routes,
     },
-    operation::{ApplicationProtocol, OperationEntry as _, OperationSpec, Transport},
+    operation::{ApplicationProtocol, PathParameterOffsets, RequestBody, RouteParams, Transport},
 };
 
 /// Filter name as configured in a pipeline.
@@ -96,8 +99,8 @@ impl OpenaiOperationFilter {
 ///
 /// Stored in request extensions so downstream filters share one authoritative
 /// operation identity rather than re-deriving it from the same method and path.
-/// Every field is `'static`; borrowed path parameters remain available through
-/// each family's own matcher.
+/// Every field is `'static`; path parameters are stored as byte offsets into
+/// the immutable request path and can be borrowed again without cloning it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenAiOperationMatch {
     /// Application protocol that owns the operation, for example
@@ -109,6 +112,12 @@ pub struct OpenAiOperationMatch {
 
     /// Transport the operation was reached over.
     pub transport: Transport,
+
+    /// Registry-derived runtime request-body shape.
+    pub request_body: RequestBody,
+
+    /// Checked byte ranges for parameters captured from the request path.
+    pub path_parameters: PathParameterOffsets,
 }
 
 #[async_trait]
@@ -143,15 +152,38 @@ impl HttpFilter for OpenaiOperationFilter {
         );
 
         publish_match(ctx, matched)?;
+        install_error_formatter(ctx, matched.application_protocol);
         self.set_routing_headers(ctx, matched);
 
         Ok(FilterAction::Continue)
     }
 }
 
+/// Install the OpenAI error formatter for a matched OpenAI protocol.
+///
+/// Proxy-generated failures are returned in the shape the matched protocol's
+/// clients expect rather than as RFC 9457 problem details.
+///
+/// Keyed off the operation resolved from the request head, so it does not
+/// require a body, a successful parse, or any protocol-specific filter later
+/// in the chain. A Chat Completions request therefore keeps OpenAI-shaped
+/// errors without a Responses filter present, and a request whose body fails
+/// to parse still gets them.
+fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: ApplicationProtocol) {
+    // Every OpenAI protocol shares one error schema, so membership is derived
+    // from the protocol name rather than an enumerated list that has to be
+    // extended whenever a registry is added. Anthropic Messages and any vendor
+    // protocol keep their own error shape.
+    if protocol.as_str().starts_with("openai_") {
+        ctx.extensions.insert(ErrorResponseFormatterHandle::new(
+            crate::openai::error_response_formatter::OpenAiErrorFormatter,
+        ));
+    }
+}
+
 /// Publish a match as request extensions, metadata, and filter results.
 ///
-/// The extension carries the typed identity for downstream filters, the
+/// The extension carries the generic identity for downstream filters, the
 /// metadata is for logging and tracing, and the filter results are what
 /// `on_result` branch conditions evaluate.
 fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) -> Result<(), FilterError> {
@@ -178,28 +210,43 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 /// introduce Chat- or Conversations-specific branching here. Responses is
 /// matched separately because transport is part of its operation identity.
 /// Path spaces do not overlap, so at most one match can succeed.
-fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
-    let http_match = (transport == Transport::Http).then(|| {
-        [
-            conversations_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
-            chat_completions_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
-    });
+pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
+    let http_match = (transport == Transport::Http)
+        .then(|| classify_conversation(method, path).or_else(|| classify_chat_completions(method, path)));
     http_match
         .flatten()
-        .or_else(|| responses_routes::match_route(method, path, transport).map(|route| classified(route.spec.spec())))
+        .or_else(|| classify_responses(method, path, transport))
 }
 
-/// Build the published match from shared operation metadata.
-fn classified(spec: &OperationSpec) -> OpenAiOperationMatch {
-    OpenAiOperationMatch {
-        application_protocol: spec.application_protocol,
-        operation_id: spec.operation_id,
-        transport: spec.transport,
-    }
+/// Match one Conversations operation.
+fn classify_conversation(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
+    conversations_routes::match_route(method, path).and_then(|route| {
+        let matched = classified(&route.spec.definition, route.params, path)?;
+        Some(matched)
+    })
+}
+
+/// Match one Chat Completions operation.
+fn classify_chat_completions(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
+    chat_completions_routes::match_route(method, path)
+        .and_then(|route| classified(&route.spec.definition, route.params, path))
+}
+
+/// Match one Responses operation.
+fn classify_responses(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
+    responses_routes::match_route(method, path, transport)
+        .and_then(|route| classified(&route.spec.definition, route.params, path))
+}
+
+/// Build a published match from one typed registry entry and its parameters.
+fn classified(spec: &OpenAiOperationSpec, params: RouteParams<'_>, path: &str) -> Option<OpenAiOperationMatch> {
+    Some(OpenAiOperationMatch {
+        application_protocol: spec.application_protocol(),
+        operation_id: spec.operation_id(),
+        transport: spec.transport(),
+        request_body: spec.request_body(),
+        path_parameters: params.offsets_in(path)?,
+    })
 }
 
 /// Determine the transport a request arrived over.

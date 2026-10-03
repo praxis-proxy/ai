@@ -49,6 +49,7 @@ mod conversations_rehydrate;
 mod error_response_formatter;
 mod examples;
 mod failure_mode;
+mod fips;
 mod guardrails;
 mod harness;
 // Several replayed scenarios run examples backed by the SQLite response store.

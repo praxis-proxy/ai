@@ -11,6 +11,14 @@ use serde_json::{Map, Value};
 /// Fallback error body used only if Serde serialization fails.
 const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":"api_error","message":"failed to serialize error response"},"request_id":null}"#;
 
+/// Return whether an Anthropic tool-use identifier satisfies the wire schema.
+pub(crate) fn is_valid_tool_use_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// Complete Anthropic Messages response.
 #[derive(Serialize)]
 pub(crate) struct MessageResponse<'a> {
@@ -195,11 +203,16 @@ pub(crate) fn error_body(error_type: &str, message: &str, request_id: Option<&st
     .unwrap_or_else(|_| ERROR_SERIALIZATION_FALLBACK.to_vec())
 }
 
+/// Build a schema-complete Anthropic error rejection with an explicit status.
+pub(crate) fn error_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
+    Rejection::status(status)
+        .with_header("content-type", "application/json")
+        .with_body(Bytes::from(error_body(error_type, message, None)))
+}
+
 /// Build a schema-complete Anthropic invalid-request rejection.
 pub(crate) fn invalid_request_rejection(message: &str) -> Rejection {
-    Rejection::status(400)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(error_body("invalid_request_error", message, None)))
+    error_rejection(400, "invalid_request_error", message)
 }
 
 #[cfg(test)]

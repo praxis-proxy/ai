@@ -339,7 +339,7 @@ fn map_chat_usage_maps_all_fields() {
         "prompt_tokens": 50,
         "completion_tokens": 10,
         "total_tokens": 60,
-        "prompt_tokens_details": {"cached_tokens": 8},
+        "prompt_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 12},
         "completion_tokens_details": {"reasoning_tokens": 4}
     });
     let mapped = map_chat_usage(&usage);
@@ -347,7 +347,7 @@ fn map_chat_usage_maps_all_fields() {
     assert_eq!(mapped["output_tokens"], 10);
     assert_eq!(mapped["total_tokens"], 60);
     assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 8);
-    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 0);
+    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 12);
     assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 4);
 }
 
@@ -533,7 +533,7 @@ fn replace_messages_preserves_current_input() {
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
     let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
-    replace_messages(&mut state, compaction_item);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
     assert_eq!(state.messages[0]["type"], "compaction");
@@ -545,6 +545,10 @@ fn replace_messages_preserves_current_input() {
     );
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+    assert_eq!(
+        state.persisted_messages[0]["_praxis_local_compaction"], true,
+        "private persisted history must retain local compaction provenance"
+    );
     assert_eq!(
         state.persisted_messages[1]["content"], "What's next?",
         "current-turn tail from persisted_messages must be kept"
@@ -567,7 +571,8 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
         json!({"role": "user", "content": "from-persisted"}),
     ];
 
-    replace_messages(&mut state, build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX));
+    let compaction_item = build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[1]["content"], "from-messages");
@@ -612,10 +617,8 @@ fn compaction_preserves_resolved_file_data_instead_of_file_url() {
         "state.input stays the original client payload"
     );
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages[0]["type"], "compaction");
     let current = &state.messages[1];
@@ -664,10 +667,8 @@ fn compaction_preserves_extracted_input_text_instead_of_input_file() {
     state.messages[tail] = extracted_item.clone();
     state.persisted_messages[tail] = extracted_item;
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     let current = &state.messages[1];
     assert_eq!(
@@ -985,7 +986,7 @@ fn parse_compact_request_body_with_previous_response_id() {
 #[tokio::test]
 #[cfg(feature = "store-sqlite")]
 async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
-    let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
         crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
             .await
             .unwrap(),

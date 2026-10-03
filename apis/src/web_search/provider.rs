@@ -436,14 +436,6 @@ impl SearchClient {
         Some(extensions)
     }
 
-    /// The request header a header-authenticated provider carries its API key in,
-    /// or `None` for a body-authenticated provider (Tavily, whose key travels in
-    /// the request body and is protected instead by the executor re-pinning the
-    /// staged upstream against mid-chain retargeting).
-    fn auth_header(&self) -> Option<http::HeaderName> {
-        provider_auth_header(self.provider)
-    }
-
     /// Stage a header-authenticated provider's API key as an exact-authority-bound
     /// [`DeferredCredential`].
     ///
@@ -466,7 +458,7 @@ impl SearchClient {
         url: &str,
         identity: &CalloutIdentity,
     ) -> Result<Option<PendingCredentials>, FilterError> {
-        let Some(header) = self.auth_header() else {
+        let Some(header) = provider_auth_header(self.provider) else {
             return Ok(None);
         };
         // Bind to the exact `host:port` authority the executor resolves from this
@@ -914,7 +906,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
 
@@ -952,7 +943,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
     }
@@ -981,7 +971,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         }
     }
 
@@ -1056,7 +1045,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
         assert!(client.is_ok(), "a valid search configuration should build a client");
@@ -1072,7 +1060,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
 
         let error = SearchClient::from_config("anthropic_web_search", &config, test_subrequest_client()).unwrap_err();
@@ -1095,7 +1082,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_brave_request("test query", 5);
@@ -1115,7 +1101,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_tavily_request("test query", SearchContextSize::Medium);
@@ -1135,7 +1120,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_you_request("test query", 5);
@@ -1155,7 +1139,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
@@ -1175,7 +1158,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(br#"{"web":{"results":[]}}"#);
@@ -1194,7 +1176,6 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
-            terminal_streaming: false,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
     }

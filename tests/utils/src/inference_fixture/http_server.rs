@@ -1436,7 +1436,7 @@ mod tests {
         .expect("scripted server should start");
         assert!(server.addr().ip().is_loopback(), "server must bind only loopback");
 
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.append("content-type", HeaderValue::from_static("application/json"));
         headers.append("x-request-id", HeaderValue::from_static("trace-a"));
@@ -1677,7 +1677,7 @@ mod tests {
             body: RecordedBody::Empty,
         }])
         .expect("scripted server should start");
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
 
         let first = client
             .get(format!("http://{}/one", server.addr()))
@@ -1716,7 +1716,7 @@ mod tests {
         }])
         .expect("scripted server should start");
         let addr = server.addr();
-        let response = reqwest::Client::new()
+        let response = crate::inference_fixture::http_client()
             .post(format!("http://{addr}/malformed"))
             .header("content-type", "application/json")
             .body("{not-json")
@@ -1758,7 +1758,7 @@ mod tests {
         }])
         .expect("scripted server should start");
         let addr = server.addr();
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         assert_eq!(
             client
                 .get(format!("http://{addr}/expected"))
@@ -1796,7 +1796,9 @@ mod tests {
         .expect("scripted server should start");
         server.finish_proxy_readiness();
 
-        let response = reqwest::get(format!("http://{}/", server.addr()))
+        let response = crate::inference_fixture::http_client()
+            .get(format!("http://{}/", server.addr()))
+            .send()
             .await
             .expect("scenario root request should complete");
 
@@ -1817,7 +1819,7 @@ mod tests {
             body: RecordedBody::Empty,
         }])
         .expect("scripted server should start");
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let send = client.get(format!("http://{}/race", server.addr())).send();
         let wait = server.wait_for_exchanges(1, Duration::from_secs(1));
 

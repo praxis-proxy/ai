@@ -40,6 +40,9 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
+      # Required request-head classifier for openai_conversations.
+      - filter: openai_operation
+
       - filter: openai_conversations
         backend: postgres
         # No password: the client authenticates with a certificate.

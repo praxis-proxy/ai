@@ -122,6 +122,7 @@
               "usage": {
                 "input_tokens": 12,
                 "input_tokens_details": {
+                  "cache_write_tokens": 0,
                   "cached_tokens": 0
                 },
                 "output_tokens": 6,

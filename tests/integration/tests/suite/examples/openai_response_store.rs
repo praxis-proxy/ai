@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_status,
-    patch_yaml, start_proxy,
+    Backend, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_header,
+    parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -18,6 +18,11 @@ use sqlx::Row as _;
 /// Backend response matching a real Responses API shape with `input`
 /// and `output` fields the store extracts for persistence.
 const RESPONSE_JSON: &str = r#"{"id":"resp_abc","created_at":1000,"model":"gpt-4.1","object":"response","input":"Hello","output":[{"type":"message","content":[{"type":"output_text","text":"Hi there"}]}]}"#;
+
+/// Terminal Responses object carried by a streamed `response.completed` event.
+/// Distinct id/model from [`RESPONSE_JSON`] so the GET assertions prove the
+/// accumulated streaming state — not the finite path — produced the record.
+const STREAM_RESPONSE_JSON: &str = r#"{"id":"resp_stream_store","created_at":2000,"model":"gpt-4.1-mini","object":"response","status":"completed","input":"Stream hello","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Streamed reply"}]}]}"#;
 
 /// Table name from the example config.
 const RESPONSES_TABLE: &str = "openai_responses";
@@ -170,6 +175,109 @@ async fn response_store_persists_compressed_payload_to_sqlite() {
     drop(proxy);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_store_persists_streamed_post_then_get_returns_completed_json() {
+    // A `stream: true` POST is composed into one logical stream inside the IRR,
+    // accumulated by `openai_stream_events`, and persisted by the pre-IRR store.
+    // The backend delivers the SSE across multiple chunks so the accumulator
+    // must merge state across chunk boundaries before the terminal event.
+    let chunks = vec![
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_store\",\"status\":\"in_progress\"}}\n\n".to_owned(),
+        format!("event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{STREAM_RESPONSE_JSON}}}\n\n"),
+        "event: done\ndata: [DONE]\n\n".to_owned(),
+    ];
+    let backend_guard = Backend::chunked(chunks)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("stream_persist");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    // The client receives a valid terminal SSE stream.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1-mini","input":"Stream hello","stream":true}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "streaming POST should return 200");
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("text/event-stream"),
+        "streaming response should keep the text/event-stream content type"
+    );
+    let body = parse_body(&raw);
+    let completed = sse_completed_events(&body);
+    assert_eq!(
+        completed.len(),
+        1,
+        "client stream must dispatch exactly one blank-line-terminated response.completed event: {body}"
+    );
+    let completed_response = &completed[0]["response"];
+    assert_eq!(
+        completed_response["id"], "resp_stream_store",
+        "terminal event should carry the streamed response id"
+    );
+    assert_eq!(
+        completed_response["status"], "completed",
+        "terminal event should report the completed status"
+    );
+    assert_eq!(
+        completed_response["output"][0]["content"][0]["text"], "Streamed reply",
+        "terminal event should carry the accumulated output text"
+    );
+
+    // An immediate ordinary GET returns the completed JSON object built from the
+    // accumulated stream — not a stream — with the full output.
+    let (status, get_body) = http_get(proxy.addr(), "/v1/responses/resp_stream_store", None);
+    assert_eq!(status, 200, "GET of the streamed response should return 200");
+    let parsed: serde_json::Value = serde_json::from_str(&get_body).expect("GET body should be valid JSON");
+    assert_eq!(
+        parsed["id"], "resp_stream_store",
+        "GET id should match the streamed response"
+    );
+    assert_eq!(
+        parsed["model"], "gpt-4.1-mini",
+        "GET model should match the streamed response"
+    );
+    assert_eq!(parsed["status"], "completed", "GET should report the completed status");
+    assert_eq!(
+        parsed["output"][0]["content"][0]["text"], "Streamed reply",
+        "GET should return the accumulated output text"
+    );
+
+    // The persisted row carries the accumulated terminal object.
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let sql = format!("SELECT id, tenant_id, model FROM {RESPONSES_TABLE} WHERE id = ?");
+    let row: sqlx::sqlite::SqliteRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind("resp_stream_store")
+        .fetch_one(&pool)
+        .await
+        .expect("streamed response should be persisted in database");
+    pool.close().await;
+
+    let id: String = row.get("id");
+    let tenant_id: String = row.get("tenant_id");
+    let model: String = row.get("model");
+    assert_eq!(id, "resp_stream_store", "persisted id should match the stream");
+    assert_eq!(tenant_id, "default", "single_tenant owner should be persisted");
+    assert_eq!(model, "gpt-4.1-mini", "persisted model should match the stream");
+
+    drop(proxy);
+}
+
 #[test]
 fn response_store_passes_through_non_responses_traffic() {
     let backend_guard = Backend::fixed("fallback")
@@ -294,7 +402,7 @@ fn response_store_delete_has_json_content_type() {
         "DELETE /v1/responses/resp_any HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    let ct = praxis_test_utils::parse_header(&raw, "content-type");
+    let ct = parse_header(&raw, "content-type");
     assert_eq!(
         ct.as_deref(),
         Some("application/json"),
@@ -354,4 +462,37 @@ fn get_missing_input_items_returns_404() {
             .contains("resp_nonexistent"),
         "error message should include the missing ID"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Parse `response.completed` events from a fully accumulated SSE body.
+///
+/// Splits the body into `\n\n`-delimited frames and returns the parsed `data:`
+/// JSON of every frame whose `type` is `response.completed`. Only frames
+/// terminated by the required blank-line boundary are considered — SSE dispatches
+/// an event only at that boundary, so a truncated final frame is never counted —
+/// and malformed `data:` JSON is dropped rather than matched by a naive
+/// substring.
+fn sse_completed_events(body: &str) -> Vec<serde_json::Value> {
+    let mut frames: Vec<&str> = body.split("\n\n").collect();
+    // Drop the segment after the final boundary: it is either empty (the body
+    // ended with the blank line) or an unterminated, undispatched partial frame.
+    frames.pop();
+
+    frames
+        .iter()
+        .filter_map(|frame| {
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str::<serde_json::Value>(&data).ok()
+        })
+        .filter(|event| event["type"] == "response.completed")
+        .collect()
 }

@@ -127,7 +127,7 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
 
-    /// Maximum request body bytes to buffer.
+    /// Maximum request and response body bytes buffered per loop round.
     #[serde(default)]
     pub(crate) max_body_bytes: Option<usize>,
 
@@ -160,14 +160,6 @@ pub(crate) struct WebSearchFilterConfig {
     /// cross-cutting concerns.
     #[serde(default = "default_outbound_chain")]
     pub(crate) outbound_chain: ChainRef,
-
-    /// Select Praxis streaming transport for effective `stream: true`
-    /// Messages requests. When enabled, the terminal inference response is
-    /// streamed incrementally as one coherent client-visible SSE lifecycle
-    /// while intermediate tool/search transitions stay internal. This knob is
-    /// anthropic-only; `openai_web_search` does not accept it.
-    #[serde(default)]
-    pub(crate) terminal_streaming: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -262,10 +254,6 @@ impl OpenAiWebSearchConfig {
             max_body_bytes: None,
             base_url: self.base_url,
             outbound_chain: self.outbound_chain,
-            // `openai_web_search` has no terminal_streaming knob; its own
-            // deny_unknown_fields config never accepts the field, so the
-            // shared validated form is always off for it.
-            terminal_streaming: false,
         }
     }
 }
@@ -297,9 +285,6 @@ pub(crate) struct ValidatedConfig {
 
     /// Configured callout-credential slot id (non-secret), or `None` for the shared key.
     pub user_credential: Option<String>,
-
-    /// Whether to stream the terminal Messages response incrementally.
-    pub terminal_streaming: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -312,7 +297,6 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
             .field("user_credential", &self.user_credential)
-            .field("terminal_streaming", &self.terminal_streaming)
             .finish()
     }
 }
@@ -364,7 +348,6 @@ fn build_validated_config(
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
         user_credential: raw.user_credential.clone(),
-        terminal_streaming: raw.terminal_streaming,
     })
 }
 
@@ -432,28 +415,24 @@ mod tests {
             max_body_bytes: None,
             base_url: None,
             outbound_chain: ChainRef::Named("web_search_outbound".to_owned()),
-            terminal_streaming: false,
         }
     }
 
     #[test]
-    fn build_config_defaults_terminal_streaming_off() {
-        let validated = build_config("anthropic_web_search", &base_config()).unwrap();
-        assert!(
-            !validated.terminal_streaming,
-            "terminal_streaming must default to off so non-streaming behavior is unchanged"
-        );
-    }
-
-    #[test]
-    fn parse_config_reads_terminal_streaming() {
+    fn anthropic_web_search_rejects_terminal_streaming() {
+        // `terminal_streaming` was removed: `anthropic_web_search` now selects the
+        // streaming transport per request from the client's `stream` field. The
+        // shared config carries `deny_unknown_fields`, so a stale config that still
+        // sets the flag fails to build — the migration is explicit, never a silent
+        // no-op toggle.
         let yaml = serde_yaml::from_str(
             "provider: you\napi_key: k\noutbound_chain: web_search_outbound\nterminal_streaming: true",
         )
         .unwrap();
-        let raw = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).unwrap();
-        let validated = build_config("anthropic_web_search", &raw).unwrap();
-        assert!(validated.terminal_streaming);
+        assert!(
+            parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).is_err(),
+            "the removed terminal_streaming flag must be rejected so operators migrate their config"
+        );
     }
 
     #[test]
@@ -497,7 +476,7 @@ mod tests {
         let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
         assert!(
             parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).is_err(),
-            "terminal_streaming is anthropic-only; openai_web_search must reject the unknown field"
+            "terminal_streaming was removed; openai_web_search must reject the unknown field"
         );
     }
 
@@ -583,7 +562,7 @@ mod tests {
         for url in [
             "http://127.0.0.1:9999",
             "http://localhost:9999",
-            "http://169.254.169.254",
+            "http://169.254.1.1",
             "http://internal.search.example:8080",
         ] {
             let mut cfg = base_config();

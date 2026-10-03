@@ -10,7 +10,7 @@
 """
 OpenAI SDK compatibility tests for the openai_conversations filter.
 
-Starts a Praxis proxy with an in-memory SQLite conversations store,
+Starts a Praxis proxy with a file-backed SQLite conversations store,
 then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
@@ -21,13 +21,16 @@ Usage:
 """
 
 import base64
+import http.server
 import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import httpx
@@ -41,10 +44,11 @@ from openai import (
 )
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
-# conversations store runs against PostgreSQL instead of the default in-memory
-# SQLite, so this suite exercises the same store backend as the responses tests.
+# conversations store runs against PostgreSQL instead of the default file-backed
+# SQLite, so this suite exercises the backend compiled into that job.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OWNER_HEADER = "x-authenticated-state-owner"
+PROXY_STARTUP_TIMEOUT = 30.0
 
 
 def _owner_assertion(subject: str) -> str:
@@ -95,42 +99,55 @@ def _find_tenant_binary() -> str:
     )
 
 
-def _conversations_filter() -> dict:
-    """Build the openai_conversations filter config for the configured store.
-
-    Defaults to in-memory SQLite; switches to PostgreSQL when DATABASE_URL is a
-    postgres:// URL, matching the responses tests' backend selection so both
-    suites cover the same store backend in CI.
-    """
-    cfg = {
-        "filter": "openai_conversations",
-        "conversations_table": "conversations",
-        "items_table": "conversation_items",
+def _conversations_filter(table_prefix: str, db_path: str) -> dict:
+    """Build the conversations store for the backend configured by CI."""
+    tables = {
+        "conversations_table": f"{table_prefix}_conversations",
+        "items_table": f"{table_prefix}_conversation_items",
     }
     if DATABASE_URL.startswith("postgres"):
-        cfg.update(
-            {
-                "backend": "postgres",
-                "database_url": DATABASE_URL,
-                # Local CI postgres service is loopback + non-TLS.
-                "allow_private_database_url": True,
-                "ssl_mode": "disable",
-            }
-        )
+        store = {
+            "backend": "postgres",
+            "database_url": DATABASE_URL,
+            # Local CI postgres service is loopback + non-TLS.
+            "allow_private_database_url": True,
+            "ssl_mode": "disable",
+        }
     else:
-        cfg.update(
-            {
-                "backend": "sqlite",
-                "database_url": "sqlite::memory:",
-                # Every pooled SQLite in-memory connection is a distinct
-                # database, so keep this SDK suite on one connection.
-                "pool": {"max_connections": 1},
-            }
-        )
-    return cfg
+        store = {
+            "backend": "sqlite",
+            # File-backed, not `sqlite::memory:`. A private in-memory
+            # database lives only as long as the single pooled connection
+            # that created it: if that connection is ever replaced, or the
+            # store is rebuilt on a runtime pipeline swap, the data vanishes
+            # and a just-created conversation 404s on the very next request
+            # (an intermittent, PR-independent flake in this session-scoped
+            # suite). An on-disk file keeps state alive across connection and
+            # store recreation.
+            "database_url": f"sqlite://{db_path}?mode=rwc",
+            "pool": {"max_connections": 1},
+        }
+    return {
+        "filter": "openai_conversations",
+        **store,
+        **tables,
+    }
 
 
-def _write_config(port: int) -> str:
+def _write_config(
+    port: int, db_path: str, include_operation_classifier: bool = True
+) -> str:
+    filters = [
+        {
+            "filter": "state_owner",
+            "mode": "trusted_owner",
+            "header": OWNER_HEADER,
+        },
+    ]
+    if include_operation_classifier:
+        filters.append({"filter": "openai_operation"})
+    filters.append(_conversations_filter(f"sdk_{port}", db_path))
+
     config = {
         "listeners": [
             {
@@ -142,14 +159,7 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [
-                    {
-                        "filter": "state_owner",
-                        "mode": "trusted_owner",
-                        "header": OWNER_HEADER,
-                    },
-                    _conversations_filter(),
-                ],
+                "filters": filters,
             }
         ],
     }
@@ -159,14 +169,11 @@ def _write_config(port: int) -> str:
     return path
 
 
-def _write_tenant_config(port: int) -> str:
-    conversations_filter = _conversations_filter()
-    conversations_filter.update(
-        {
-            "conversations_table": "tenant_test_conversations",
-            "items_table": "tenant_test_conversation_items",
-        }
-    )
+def _write_tenant_config(port: int, db_path: str) -> str:
+    # Keep the generated `{conversations}_unused_responses` identifier below
+    # PostgreSQL's 45-byte validation limit while retaining per-process
+    # isolation from the main SDK fixture.
+    conversations_filter = _conversations_filter(f"t_{port}", db_path)
     config = {
         "listeners": [
             {
@@ -180,6 +187,7 @@ def _write_tenant_config(port: int) -> str:
                 "name": "tenant-conversations-pipeline",
                 "filters": [
                     {"filter": "test_tenant_identity"},
+                    {"filter": "openai_operation"},
                     conversations_filter,
                 ],
             }
@@ -191,40 +199,251 @@ def _write_tenant_config(port: int) -> str:
     return path
 
 
-def _wait_for_proxy(port: int, timeout: float = 10.0) -> None:
+class _ChunkedResponsesBackend(http.server.BaseHTTPRequestHandler):
+    """Return a successful Responses JSON object in two HTTP chunks."""
+
+    protocol_version = "HTTP/1.1"
+    response_body = json.dumps(
+        {
+            "id": "resp_sdk_chunked",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "chunked"},
+                    ],
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        content_length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(content_length)
+
+        split_at = len(self.response_body) // 2
+        chunks = (self.response_body[:split_at], self.response_body[split_at:])
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(f"{len(chunk):x}\r\n".encode())
+            self.wfile.write(chunk)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
+    """Build matching filters for the listener-level regression test."""
+    tables = {
+        "conversations_table": f"chunked_{port}_conversations",
+        "items_table": f"chunked_{port}_conversation_items",
+    }
+    if DATABASE_URL.startswith("postgres"):
+        store = {
+            "backend": "postgres",
+            "database_url": DATABASE_URL,
+            "allow_private_database_url": True,
+            "ssl_mode": "disable",
+        }
+    else:
+        store = {
+            "backend": "sqlite",
+            "database_url": f"sqlite://{db_path}?mode=rwc",
+            "pool": {"max_connections": 1},
+        }
+
+    conversations = {"filter": "openai_conversations", **store, **tables}
+    response_store = {
+        "filter": "openai_response_store",
+        **store,
+        "responses_table": f"chunked_{port}_responses",
+        "conversations_table": tables["conversations_table"],
+    }
+    return conversations, response_store
+
+
+def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -> str:
+    conversations_filter, response_store_filter = _chunked_response_store_filters(db_path, port)
+    config = {
+        "listeners": [
+            {
+                "name": "responses-test",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["responses-test-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "responses-test-pipeline",
+                "filters": [
+                    {
+                        "filter": "state_owner",
+                        "mode": "trusted_owner",
+                        "header": OWNER_HEADER,
+                    },
+                    conversations_filter,
+                    {"filter": "openai_responses_format"},
+                    response_store_filter,
+                    {
+                        "filter": "router",
+                        "routes": [
+                            {"path": "/v1/responses", "cluster": "responses-backend"}
+                        ],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "responses-backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
+def _wait_for_proxy(
+    port: int,
+    process: subprocess.Popen | None = None,
+    timeout: float = PROXY_STARTUP_TIMEOUT,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            raise RuntimeError(
+                f"proxy exited with status {process.returncode} before binding: {stderr}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.1)
-    raise TimeoutError(f"proxy did not start within {timeout}s")
+    raise TimeoutError(
+        f"proxy did not start within {timeout}s"
+        + (f" (process status: {process.poll()})" if process is not None else "")
+    )
+
+
+def _proxy_env(readiness_port: int) -> dict[str, str]:
+    """Enable the store-readiness listener on a fixture-private port."""
+    env = os.environ.copy()
+    env["PRAXIS_STORE_READINESS_ADDR"] = f"127.0.0.1:{readiness_port}"
+    return env
+
+
+def _wait_for_store_ready(
+    readiness_port: int,
+    process: subprocess.Popen,
+    timeout: float = PROXY_STARTUP_TIMEOUT,
+) -> None:
+    """Wait until asynchronous store provisioning has completed."""
+    deadline = time.monotonic() + timeout
+    url = f"http://127.0.0.1:{readiness_port}/ready"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            raise RuntimeError(
+                f"proxy exited with status {process.returncode} before becoming ready: {stderr}"
+            )
+        try:
+            response = httpx.get(url, timeout=0.5)
+        except httpx.HTTPError:
+            time.sleep(0.1)
+            continue
+        if response.status_code == 200:
+            return
+        if response.status_code != 503:
+            raise RuntimeError(
+                f"unexpected readiness response {response.status_code}: {response.text}"
+            )
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"store did not become ready within {timeout}s "
+        f"(process status: {process.poll()})"
+    )
 
 
 @pytest.fixture(scope="session")
 def praxis_proxy():
     """Start a Praxis proxy for the test session and tear it down after."""
-    port = _free_port()
-    config_path = _write_config(port)
-    binary = _find_binary()
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path)
+        binary = _find_binary()
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def classifier_missing_proxy():
+    """Start Praxis with the Conversations dependency deliberately omitted."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path, include_operation_classifier=False)
+        binary = _find_binary()
+
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_proxy_env(readiness_port),
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -237,6 +456,53 @@ def openai_client(praxis_proxy):
         max_retries=0,
         timeout=10.0,
     )
+
+
+@pytest.fixture
+def chunked_response_client():
+    """Start a composed response-store/Conversations proxy and chunked backend."""
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _ChunkedResponsesBackend
+    )
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+
+    with tempfile.TemporaryDirectory() as db_dir:
+        proxy_port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "responses.db")
+        config_path = _write_chunked_response_config(
+            proxy_port, backend.server_port, db_path
+        )
+        binary = _find_binary()
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield OpenAI(
+                api_key="not-needed",
+                base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                max_retries=0,
+                timeout=10.0,
+            )
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
+            backend.shutdown()
+            backend.server_close()
+            backend_thread.join(timeout=5)
 
 
 @pytest.fixture(scope="session")
@@ -255,25 +521,31 @@ def other_owner_client(praxis_proxy):
 def tenant_praxis_proxy():
     """Start Praxis with deterministic test credentials mapped to tenants."""
     binary = _find_tenant_binary()
-    port = _free_port()
-    config_path = _write_tenant_config(port)
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_tenant_config(port, db_path)
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -290,6 +562,68 @@ def tenant_clients(tenant_praxis_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    DATABASE_URL.startswith("postgres"),
+    reason="cold-start lock regression uses SQLite file locking",
+)
+def test_cold_start_returns_503_until_store_is_ready():
+    """The listener binds promptly but gates requests while SQLite is locked."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "cold-start.db")
+        lock = sqlite3.connect(db_path)
+        lock.execute("CREATE TABLE lock_holder (id INTEGER)")
+        lock.commit()
+        lock.execute("BEGIN EXCLUSIVE")
+        lock_released = False
+        config_path = _write_config(port, db_path)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            default_headers={OWNER_HEADER: _owner_assertion("cold-start")},
+            max_retries=0,
+            timeout=2.0,
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            with pytest.raises(InternalServerError) as pending:
+                client.conversations.retrieve("not-created")
+            assert pending.value.status_code == 503, "cold-start must surface a 503 while the store is locked"
+
+            lock.commit()
+            lock.close()
+            lock_released = True
+            deadline = time.monotonic() + PROXY_STARTUP_TIMEOUT
+            while True:
+                try:
+                    client.conversations.retrieve("not-created")
+                except NotFoundError:
+                    break
+                except InternalServerError as error:
+                    assert error.status_code == 503, "store warm-up must only surface 503 until ready"
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("store did not become ready after releasing SQLite lock")
+                    time.sleep(0.1)
+        finally:
+            if not lock_released:
+                if lock.in_transaction:
+                    lock.rollback()
+                lock.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 def _message_items(prefix: str, count: int) -> list[dict]:
@@ -318,6 +652,19 @@ class TestOpenAIConversations:
         assert isinstance(conversation.created_at, int)
         assert conversation.created_at > 0
 
+    def test_chunked_response_is_retrievable_with_composed_filters(
+        self, chunked_response_client
+    ):
+        response = chunked_response_client.responses.create(
+            model="gpt-4.1",
+            input="Hello",
+        )
+
+        assert response.id == "resp_sdk_chunked"
+        retrieved = chunked_response_client.responses.retrieve(response.id)
+        assert retrieved.id == response.id
+        assert retrieved.status == "completed"
+
     def test_conversation_create_no_metadata(self, openai_client):
         conversation = openai_client.conversations.create()
 
@@ -338,10 +685,56 @@ class TestOpenAIConversations:
         assert retrieved.metadata["topic"] == "demo"
         assert retrieved.created_at == conversation.created_at
 
+    def test_bodyless_retrieve_ignores_invalid_json_bytes(self, openai_client):
+        conversation = openai_client.conversations.create()
+        response = httpx.request(
+            "GET",
+            f"{str(openai_client.base_url).rstrip('/')}"
+            f"/conversations/{conversation.id}",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+                "Content-Type": "application/json",
+            },
+            content=b"not valid json",
+            timeout=10,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == conversation.id
+
+    def test_missing_operation_classifier_fails_closed(self, classifier_missing_proxy):
+        response = httpx.get(
+            f"http://127.0.0.1:{classifier_missing_proxy}/v1/conversations/conv_unclassified",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+            },
+            timeout=10,
+        )
+
+        assert response.status_code == 500, "missing operation classifier must fail closed with 500"
+        assert response.json()["error"]["type"] == "server_error", "fail-closed error envelope type must be server_error"
+
+    def test_upgrade_on_conversation_route_fails_closed(self, openai_client):
+        response = httpx.get(
+            f"{str(openai_client.base_url).rstrip('/')}/conversations/conv_upgrade",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+                "Connection": "Upgrade",
+                "Upgrade": "websocket",
+            },
+            timeout=10,
+        )
+
+        assert response.status_code == 500, "upgrade on conversation route must fail closed with 500"
+        assert response.json()["error"]["type"] == "server_error", "fail-closed error envelope type must be server_error"
+
     def test_conversation_retrieve_nonexistent(self, openai_client):
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.retrieve("conv_nonexistent")
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "missing conversation must return 404"
 
     def test_conversation_update(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -363,7 +756,7 @@ class TestOpenAIConversations:
                 "conv_nonexistent",
                 metadata={"topic": "nope"},
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "updating a missing conversation must return 404"
 
     def test_conversation_update_preserves_items(self, openai_client):
         # End-to-end smoke check that a metadata update coexists with existing
@@ -420,7 +813,7 @@ class TestOpenAIConversations:
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.retrieve(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "retrieving a deleted conversation must return 404"
 
     def test_deleted_conversation_hides_preserved_item_rows(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -440,7 +833,7 @@ class TestOpenAIConversations:
                 "item_keep",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleted conversation must hide preserved item rows with 404"
 
     def test_same_tenant_other_owner_cannot_access_state(
         self, openai_client, other_owner_client
@@ -473,7 +866,7 @@ class TestOpenAIConversations:
             other_owner_client.conversations.delete(conversation.id)
 
         retrieved = openai_client.conversations.retrieve(conversation.id)
-        assert retrieved.metadata["visibility"] == "private"
+        assert retrieved.metadata["visibility"] == "private", "owner must still see private state unchanged after denied cross-owner access"
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -489,7 +882,7 @@ class TestOpenAIConversations:
     def test_conversation_delete_nonexistent(self, openai_client):
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.delete("conv_nonexistent")
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting a missing conversation must return 404"
 
     def test_initial_items_are_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -679,7 +1072,7 @@ class TestOpenAIConversations:
         missing_conversation = "conv_missing_sdk_integration"
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.list(missing_conversation)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "listing items on a missing conversation must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.create(
@@ -692,7 +1085,7 @@ class TestOpenAIConversations:
                     }
                 ],
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "creating items on a missing conversation must return 404"
 
         conversation = openai_client.conversations.create()
         with pytest.raises(NotFoundError) as exc_info:
@@ -700,14 +1093,14 @@ class TestOpenAIConversations:
                 "item_missing_sdk_integration",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "retrieving a missing item must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.delete(
                 "item_missing_sdk_integration",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting a missing item must return 404"
 
     def test_duplicate_item_id_is_rejected(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -733,7 +1126,7 @@ class TestOpenAIConversations:
                     }
                 ],
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "duplicate item id must be rejected with 400"
 
     @pytest.mark.parametrize(
         "query",
@@ -754,21 +1147,21 @@ class TestOpenAIConversations:
             },
             timeout=10,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, "invalid item list query must return 400"
         error = response.json()["error"]
-        assert error["type"] == "invalid_request_error"
-        assert error["message"]
+        assert error["type"] == "invalid_request_error", "error envelope type must be invalid_request_error"
+        assert error["message"], "error envelope must include a message"
 
     def test_conversation_invalid_metadata_type(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata="not-an-object")
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "non-object metadata must be rejected with 400"
 
     def test_conversation_metadata_too_many_keys(self, openai_client):
         metadata = {f"key{i}": f"val{i}" for i in range(17)}
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata=metadata)
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "too many metadata keys must be rejected with 400"
 
     def test_conversation_accepts_twenty_initial_items(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -793,7 +1186,7 @@ class TestOpenAIConversations:
             openai_client.conversations.create(
                 items=_message_items("item_initial_over_limit", 21),
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "more than twenty initial items must be rejected with 400"
 
     def test_item_create_accepts_twenty_items(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -816,10 +1209,10 @@ class TestOpenAIConversations:
                 conversation.id,
                 items=_message_items("item_append_over_limit", 21),
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "oversized item batch must be rejected with 400"
 
         page = openai_client.conversations.items.list(conversation.id)
-        assert page.data == []
+        assert page.data == [], "rejected batch must not persist any items"
 
     def test_metadata_length_boundaries_are_accepted(self, openai_client):
         boundary_metadata = {"k" * 64: "v" * 512}
@@ -850,7 +1243,7 @@ class TestOpenAIConversations:
     ):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata=metadata)
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "invalid metadata must be rejected on create with 400"
 
     @pytest.mark.parametrize(
         "metadata",
@@ -872,7 +1265,7 @@ class TestOpenAIConversations:
                 conversation.id,
                 metadata=metadata,
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "invalid metadata must be rejected on update with 400"
 
     def test_conversation_update_replaces_and_clears_metadata(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -956,8 +1349,8 @@ class TestOpenAIConversations:
                 conversation.id,
                 items=[duplicate, duplicate],
             )
-        assert exc_info.value.status_code == 400
-        assert openai_client.conversations.items.list(conversation.id).data == []
+        assert exc_info.value.status_code == 400, "duplicate ids in one batch must be rejected with 400"
+        assert openai_client.conversations.items.list(conversation.id).data == [], "atomically rejected batch must not persist any items"
 
     def test_invalid_mixed_item_batch_is_rejected_atomically(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -978,8 +1371,8 @@ class TestOpenAIConversations:
                     },
                 ],
             )
-        assert exc_info.value.status_code == 400
-        assert openai_client.conversations.items.list(conversation.id).data == []
+        assert exc_info.value.status_code == 400, "invalid mixed batch must be rejected with 400"
+        assert openai_client.conversations.items.list(conversation.id).data == [], "atomically rejected batch must not persist any items"
 
     def test_item_cannot_be_accessed_through_another_conversation(
         self,
@@ -1002,20 +1395,20 @@ class TestOpenAIConversations:
                 "item_parent_isolation",
                 conversation_id=other.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "item must not be retrievable through another conversation"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.delete(
                 "item_parent_isolation",
                 conversation_id=other.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "item must not be deletable through another conversation"
 
         item = openai_client.conversations.items.retrieve(
             "item_parent_isolation",
             conversation_id=owner.id,
         )
-        assert item.content[0].text == "private to its parent"
+        assert item.content[0].text == "private to its parent", "item remains accessible through its real parent conversation"
 
     def test_descending_cursor_pagination_has_no_gaps_or_duplicates(
         self,
@@ -1048,7 +1441,7 @@ class TestOpenAIConversations:
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.delete(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting an already-deleted conversation must return 404"
 
     def test_item_delete_updates_list_and_is_not_repeatable(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -1088,7 +1481,7 @@ class TestOpenAIConversations:
                 "item_delete_once",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting an already-deleted item must return 404"
 
     def test_full_workflow(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -1121,21 +1514,21 @@ class TestConversationTenantIsolation:
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.retrieve(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant retrieve must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.update(
                 conversation.id,
                 metadata={"owner": "tenant-b"},
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant update must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.delete(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant delete must return 404"
 
         retrieved = tenant_a.conversations.retrieve(conversation.id)
-        assert retrieved.metadata == {"owner": "tenant-a"}
+        assert retrieved.metadata == {"owner": "tenant-a"}, "owner tenant must still read its own conversation after denied cross-tenant writes"
 
     def test_item_operations_are_tenant_scoped(self, tenant_clients):
         tenant_a, tenant_b = tenant_clients
@@ -1152,7 +1545,7 @@ class TestConversationTenantIsolation:
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.items.list(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant item list must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.items.create(
@@ -1165,26 +1558,26 @@ class TestConversationTenantIsolation:
                     }
                 ],
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant item write must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.items.retrieve(
                 "item_tenant_private",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant item retrieve must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.items.delete(
                 "item_tenant_private",
                 conversation_id=conversation.id,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant item delete must return 404"
 
         page = tenant_a.conversations.items.list(conversation.id)
-        assert [item.id for item in page.data] == ["item_tenant_private"]
+        assert [item.id for item in page.data] == ["item_tenant_private"], "owner tenant must still see only its own item after denied cross-tenant write"
 
-    def test_item_id_cannot_transfer_between_tenants(self, tenant_clients):
+    def test_same_item_id_is_isolated_between_tenants(self, tenant_clients):
         tenant_a, tenant_b = tenant_clients
         conversation_a = tenant_a.conversations.create(
             items=[
@@ -1196,24 +1589,27 @@ class TestConversationTenantIsolation:
                 }
             ],
         )
-        with pytest.raises(InternalServerError) as exc_info:
-            tenant_b.conversations.create(
-                items=[
-                    {
-                        "id": "item_shared_across_tenants",
-                        "type": "message",
-                        "role": "user",
-                        "content": "tenant-b value",
-                    }
-                ],
-            )
-        assert exc_info.value.status_code == 500
+        conversation_b = tenant_b.conversations.create(
+            items=[
+                {
+                    "id": "item_shared_across_tenants",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-b value",
+                }
+            ],
+        )
 
         item_a = tenant_a.conversations.items.retrieve(
             "item_shared_across_tenants",
             conversation_id=conversation_a.id,
         )
-        assert item_a.content[0].text == "tenant-a value"
+        item_b = tenant_b.conversations.items.retrieve(
+            "item_shared_across_tenants",
+            conversation_id=conversation_b.id,
+        )
+        assert item_a.content[0].text == "tenant-a value", "shared item id must resolve to tenant-a's value"
+        assert item_b.content[0].text == "tenant-b value", "shared item id must resolve to tenant-b's value"
 
     def test_denied_access_does_not_affect_callers_own_resources(
         self,
@@ -1227,10 +1623,10 @@ class TestConversationTenantIsolation:
 
         with pytest.raises(NotFoundError) as exc_info:
             tenant_b.conversations.retrieve(conversation_a.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "cross-tenant retrieve must return 404"
 
         retrieved = tenant_b.conversations.retrieve(conversation_b.id)
-        assert retrieved.metadata == {"owner": "tenant-b"}
+        assert retrieved.metadata == {"owner": "tenant-b"}, "denied cross-tenant access must not affect caller's own resource"
 
     def test_unknown_bearer_token_is_rejected(self, tenant_praxis_proxy):
         client = OpenAI(
@@ -1242,7 +1638,7 @@ class TestConversationTenantIsolation:
 
         with pytest.raises(AuthenticationError) as exc_info:
             client.conversations.create()
-        assert exc_info.value.status_code == 401
+        assert exc_info.value.status_code == 401, "unknown bearer token must return 401"
 
     def test_tenant_header_cannot_override_authenticated_tenant(
         self,
@@ -1261,7 +1657,7 @@ class TestConversationTenantIsolation:
 
         with pytest.raises(NotFoundError) as exc_info:
             spoofing_client.conversations.retrieve(conversation.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "spoofed tenant header must not grant access and must return 404"
 
 
 if __name__ == "__main__":

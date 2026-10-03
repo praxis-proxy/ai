@@ -1,0 +1,62 @@
+# Token Rate Limiting -- Per-Header Bucket Keys
+#
+# Extends token-rate-limit.yaml with M5 header dimensions (ai#123 /
+# ai#129): each distinct `x-tenant-id` value gets its own token budget
+# under the same catch-all rule. Missing `x-tenant-id` is rejected (400)
+# unless you set `missing: fallback`.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit-header-keys.yaml
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-tenant-id: alpha' \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# See token-rate-limit.yaml for reservation-based admission (M2),
+# reconciliation, M4 token-type weights, and the `rules:` schema.
+# CEL-expression matchers/keys remain deferred.
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        key:
+          - header: x-tenant-id
+        default_weights:
+          input: 1.0
+          output: 1.0
+          cached_input: 0.1
+          cache_write: 1.25
+          reasoning: 0.9
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+            reserved_tokens: 500
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true

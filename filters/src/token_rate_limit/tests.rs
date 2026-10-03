@@ -3,6 +3,8 @@
 
 //! Tests for the `token_rate_limit` filter.
 
+use std::future::Future;
+
 use praxis_filter::{FilterAction, HttpFilter};
 
 use super::TokenRateLimitFilter;
@@ -75,7 +77,7 @@ fn subject_bucket_keys_are_stable_distinct_and_opaque() {
     assert_eq!(first, repeated);
     assert_ne!(first, second);
     assert!(!first.contains("application-a"));
-    assert_eq!(first.len(), "subject:v1:".len() + 43);
+    assert_eq!(first, "subject:v1:0wfYjuGrt6TOMloboGk1H_QGJBDgt-0kQ-OyQ3qjy34");
 }
 
 #[tokio::test]
@@ -91,6 +93,400 @@ async fn authenticated_subject_keying_fails_closed_without_identity() {
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401));
+}
+
+#[test]
+fn from_config_accepts_header_ip_model_and_composite_keys() {
+    for top_level in [
+        "key: ip",
+        "key: model",
+        "key:\n  - header: x-tenant-id",
+        "key:\n  - authenticated_subject\n  - model",
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key",
+        "max_keys: 16\nkey:\n  - header: x-tenant-id",
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "key: global",
+    ] {
+        let yaml = single_rule_yaml_with(
+            top_level,
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100000\nreserved_tokens: 500",
+        );
+        assert!(
+            TokenRateLimitFilter::from_config(&yaml).is_ok(),
+            "config should parse:\n{top_level}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_empty_key_dimensions_and_zero_max_keys() {
+    let empty = single_rule_yaml_with(
+        "key:\n  dimensions: []",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty).err().expect("should error");
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+
+    let zero = single_rule_yaml_with(
+        "max_keys: 0",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&zero).err().expect("should error");
+    assert!(err.to_string().contains("max_keys"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_invalid_key_combinations() {
+    let mixed = single_rule_yaml_with(
+        "key:\n  - global\n  - ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&mixed).err().expect("should error");
+    assert!(err.to_string().contains("cannot be combined"), "got: {err}");
+
+    let dup = single_rule_yaml_with(
+        "key:\n  - model\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&dup).err().expect("should error");
+    assert!(err.to_string().contains("duplicate"), "got: {err}");
+
+    let empty_header = single_rule_yaml_with(
+        "key:\n  - header: \"\"",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty_header)
+        .err()
+        .expect("should error");
+    assert!(err.to_string().contains("header name"), "got: {err}");
+
+    let blank_ip = single_rule_yaml_with(
+        "key:\n  ip:\n    header: \"  \"",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&blank_ip)
+        .err()
+        .expect("should error");
+    assert!(err.to_string().contains("invalid ip header name"), "got: {err}");
+}
+
+#[tokio::test]
+async fn header_keys_give_each_value_its_own_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let alpha_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    assert!(matches!(
+        filter.on_request(&mut alpha_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let beta_req = make_request_with_header("x-tenant-id", "beta");
+    let mut beta_ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(
+        matches!(filter.on_request(&mut beta_ctx).await.unwrap(), FilterAction::Continue),
+        "a different header value must not share alpha's exhausted-looking 10-token bucket"
+    );
+
+    let alpha_again_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_again_ctx = crate::test_utils::make_filter_context(&alpha_again_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut alpha_again_ctx).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "the same tenant must hit its own exhausted bucket"
+    );
+}
+
+#[tokio::test]
+async fn missing_header_rejects_by_default_and_can_fall_back() {
+    let reject_yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&reject_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+
+    let fallback_yaml = single_rule_yaml_with(
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&fallback_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "header-absent fallback must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn ip_keys_partition_by_client_address() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut alice = crate::test_utils::make_filter_context(&req);
+    alice.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut bob = crate::test_utils::make_filter_context(&req);
+    bob.client_addr = Some("203.0.113.11".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut bob).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut alice_again = crate::test_utils::make_filter_context(&req);
+    alice_again.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice_again).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_ip_rejects_when_client_addr_is_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn model_keys_prefer_header_and_isolate_models() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let gpt_req = make_request_with_header("x-model", "gpt-4");
+    let mut gpt = crate::test_utils::make_filter_context(&gpt_req);
+    assert!(matches!(
+        filter.on_request(&mut gpt).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let llama_req = make_request_with_header("x-model", "llama-3");
+    let mut llama = crate::test_utils::make_filter_context(&llama_req);
+    assert!(matches!(
+        filter.on_request(&mut llama).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut gpt_again = crate::test_utils::make_filter_context(&gpt_req);
+    assert!(matches!(
+        filter.on_request(&mut gpt_again).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_model_rejects_when_body_and_header_are_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn header_mapping_with_missing_fallback_shares_the_global_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "{{ header, missing: fallback }} must not ignore missing and must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn composite_header_and_model_are_isolated_from_header_only() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "acme");
+
+    let mut gpt = crate::test_utils::make_filter_context(&req);
+    let mut gpt_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut gpt, &mut gpt_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut llama = crate::test_utils::make_filter_context(&req);
+    let mut llama_body = Some(bytes::Bytes::from(r#"{"model":"llama-3"}"#));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut llama, &mut llama_body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "same tenant on a different model must not share the gpt-4 bucket"
+    );
+}
+
+#[tokio::test]
+async fn whitespace_header_is_treated_as_missing() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "   ");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn max_keys_denies_a_new_distinct_key_once_the_cap_is_hit() {
+    assert_max_keys_cap("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1").await;
+}
+
+#[tokio::test]
+async fn max_keys_denies_a_new_distinct_key_once_the_cap_is_hit_token_bucket() {
+    assert_max_keys_cap("algorithm: token_bucket\ncapacity: 1000\nrefill_rate: 1\nreserved_tokens: 1").await;
+}
+
+async fn assert_max_keys_cap(algorithm_body: &str) {
+    let yaml = single_rule_yaml_with("max_keys: 1\nkey:\n  - header: x-tenant-id", algorithm_body);
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let first_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut first = crate::test_utils::make_filter_context(&first_req);
+    assert!(
+        matches!(filter.on_request(&mut first).await.unwrap(), FilterAction::Continue),
+        "first distinct key must be admitted"
+    );
+
+    let second_req = make_request_with_header("x-tenant-id", "beta");
+    let mut second = crate::test_utils::make_filter_context(&second_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "a second distinct header key must be denied once max_keys is exhausted"
+    );
+
+    let mut alpha_again = crate::test_utils::make_filter_context(&first_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut alpha_again).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "the original key must still be admitted after a different key is 429'd (cap on distinct keys, not requests)"
+    );
+}
+
+#[tokio::test]
+async fn max_keys_is_enforced_per_rule_not_across_rules() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "max_keys: 1\n\
+         key:\n\
+         \x20 - header: x-tenant-id\n\
+         rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   reserved_tokens: 1\n\
+         \x20 - name: team-beta\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: beta\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   reserved_tokens: 1\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let mut alpha_one = make_request_with_header("x-tenant-id", "one");
+    alpha_one.headers.insert("x-app-id", "alpha".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_one);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut alpha_two = make_request_with_header("x-tenant-id", "two");
+    alpha_two.headers.insert("x-app-id", "alpha".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_two);
+    assert!(
+        matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "alpha's own max_keys cap must deny a second tenant"
+    );
+
+    let mut beta_one = make_request_with_header("x-tenant-id", "one");
+    beta_one.headers.insert("x-app-id", "beta".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&beta_one);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "beta must have its own max_keys budget, independent of alpha"
+    );
 }
 
 #[test]
@@ -134,7 +530,7 @@ fn from_config_rejects_zero_capacity() {
 /// so this rejection has to come from the shared gate, not either
 /// algorithm's downstream validation, to protect both.
 #[test]
-fn from_config_rejects_capacity_above_the_lua_safe_integer_bound() {
+fn from_config_rejects_capacity_above_the_f64_safe_integer_bound() {
     let over_bound = super::token_bucket_ledger::MAX_F64_SAFE_INTEGER + 1;
 
     let sliding_window = single_rule_yaml(&format!(
@@ -182,7 +578,7 @@ fn from_config_rejects_unknown_field() {
     );
     assert!(
         TokenRateLimitFilter::from_config(&yaml).is_err(),
-        "composite/CEL bucket keys are still deliberately unsupported, config should reject the unknown field"
+        "unknown rule-level field 'bucket_key' must still be rejected; keys are configured at filter level"
     );
 }
 
@@ -599,35 +995,39 @@ async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     ));
 }
 
-/// Missing `META_ESTIMATE` must skip settlement rather than treat the
-/// estimate as 0 (which would debit `actual - 0` on top of the original
-/// reservation and over-charge the window).
+/// Missing `META_RESERVATION_ID` must skip settlement: without the id
+/// there is nothing to settle, so the reservation stands at its estimate.
 #[tokio::test]
-async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero() {
-    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 500");
+async fn missing_reservation_id_skips_reconciliation() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 400");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    ctx.filter_metadata.remove(super::META_ESTIMATE);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "the first 400-token request fits"
+    );
+    ctx.filter_metadata.remove(super::META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            FilterAction::Continue
+        ),
+        "a skipped settlement still lets the response through"
+    );
 
-    // Reservation of 500 still stands (no bogus +200 overage). A second
-    // 500-token admit fits remaining capacity; it would not if settlement
-    // had charged 700.
     let mut second = crate::test_utils::make_filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
-        "skipping reconcile must leave the original 500-token reservation, not 700"
+        "400 + 400 fits in 1000"
+    );
+    let mut third = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
+        "the unsettled 400 still counts; settling it at 200 would have let a third 400 in"
     );
 }
 
@@ -717,15 +1117,16 @@ fn debug_format_lists_configured_rule_names() {
     let rules = cfg
         .rules
         .into_iter()
-        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY))
+        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY, super::MAX_KEYS))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let needs_body = rules.iter().any(|r| r.estimation.needs_body());
     let filter = TokenRateLimitFilter {
         rules,
         needs_body,
-        key_source: cfg.key,
+        key_spec: super::compile_key_spec(cfg.key).unwrap(),
         epoch: std::time::Instant::now(),
+        valkey_clock: false,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -960,7 +1361,7 @@ fn from_config_rejects_non_finite_or_negative_default_weights_from_yaml() {
 }
 
 #[test]
-fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_reserve_scripts_pexpire_ttl() {
+fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_pexpire_ttl() {
     // capacity / refill_rate = 1e11 seconds -- a config typo away from
     // plausible (e.g. an extra zero on refill_rate against a large
     // capacity meant for a generous burst rule), not a contrived extreme.
@@ -1104,6 +1505,61 @@ async fn poll_until_admitted(filter: &dyn HttpFilter, req: &praxis_filter::Reque
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     false
+}
+
+fn valkey_header_key_yaml(algorithm_body: &str, url: &str, namespace: &str) -> serde_yaml::Value {
+    single_rule_yaml_with(
+        &format!(
+            "max_keys: 1\nkey:\n  - header: x-tenant-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: \
+             {namespace}"
+        ),
+        algorithm_body,
+    )
+}
+
+async fn assert_valkey_max_keys_cap(algorithm_body: &str) {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!(
+        "praxis-test-max-keys-{}-{}",
+        std::process::id(),
+        algorithm_body
+            .lines()
+            .next()
+            .unwrap_or("rule")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+    );
+    let yaml = valkey_header_key_yaml(algorithm_body, &url, &namespace);
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let alpha = make_request_with_header("x-tenant-id", "alpha");
+    let beta = make_request_with_header("x-tenant-id", "beta");
+    assert_admitted(&*filter, &alpha, "first distinct Valkey key must be admitted").await;
+    assert_denied(
+        &*filter,
+        &beta,
+        "a second distinct Valkey key must be denied once max_keys is exhausted",
+    )
+    .await;
+    assert_admitted(
+        &*filter,
+        &alpha,
+        "the original Valkey key must still be admitted after a different key is 429'd",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_max_keys_denies_a_new_distinct_key_sliding_window() {
+    assert_valkey_max_keys_cap("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1").await;
+}
+
+#[tokio::test]
+async fn valkey_max_keys_denies_a_new_distinct_key_token_bucket() {
+    assert_valkey_max_keys_cap("algorithm: token_bucket\ncapacity: 1000\nrefill_rate: 1\nreserved_tokens: 1").await;
 }
 
 #[tokio::test]
@@ -2312,5 +2768,1084 @@ async fn token_bucket_applies_the_same_weighted_cost() {
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
         "token_bucket must apply the same partitioned weighted cost as sliding_window"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// S1: Graduated soft-limit tiers (inject action)
+// -----------------------------------------------------------------------------
+
+/// Helper: build a config with tiers on a `sliding_window` rule.
+fn tiered_rule_yaml(capacity: u64, reserved_tokens: u64, tiers_yaml: &str) -> serde_yaml::Value {
+    let indented_tiers = tiers_yaml
+        .lines()
+        .map(|line| format!("      {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: {capacity}\n\
+         \x20   reserved_tokens: {reserved_tokens}\n\
+         \x20   tiers:\n\
+         {indented_tiers}\n"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+// -- Config validation --
+
+#[test]
+fn tier_config_parses_valid_inject_and_deny_tiers() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn tier_config_rejects_empty_tiers_list() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 100\n    \
+         reserved_tokens: 10\n    tiers: []\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_non_ascending_capacities() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 90\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: high\n\
+         - capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: low\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("strictly ascending"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_deny_tier_not_last() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 200\n\
+         \x20   reserved_tokens: 10\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: low\n\
+         \x20     - capacity: 200\n\
+         \x20       action:\n\
+         \x20         type: deny\n\
+         \x20     - capacity: 300\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: over\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("deny tier must be the last"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_deny_capacity_mismatch() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 90\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must equal the algorithm"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_inject_without_headers() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("at least one header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_zero_capacity_tier() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 0\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: bad\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("capacity > 0"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_invalid_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      \"invalid header!\": value\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("invalid inject header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_inject_tier_above_algorithm_capacity() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 120\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: over",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("above the algorithm"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_reserved_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      content-length: \"42\"",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("reserved/hop-by-hop"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_hop_by_hop_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      transfer-encoding: chunked",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("reserved/hop-by-hop"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_duplicate_header_after_normalization() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n      x-token-tier: degraded",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("duplicate header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_allows_inject_only_tiers_without_deny() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 95\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded",
+    );
+    assert!(
+        TokenRateLimitFilter::from_config(&yaml).is_ok(),
+        "inject-only tiers (no deny) are valid for soft enforcement"
+    );
+}
+
+#[test]
+fn no_tiers_preserves_backward_compatible_behavior() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
+    assert!(
+        TokenRateLimitFilter::from_config(&yaml).is_ok(),
+        "a rule with no tiers must still parse as before"
+    );
+}
+
+// -- Admission with tier header injection --
+
+#[tokio::test]
+async fn inject_tier_adds_headers_when_usage_exceeds_threshold() {
+    // capacity 100, reserve 60. After first request: usage_after=60, which
+    // exceeds the 50-token inject tier → header should be injected.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "should be admitted");
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(injected.is_some(), "inject tier header should be set");
+    assert_eq!(
+        injected.unwrap().1.to_str().unwrap(),
+        "warning",
+        "header value should match the tier config"
+    );
+}
+
+#[tokio::test]
+async fn no_headers_injected_when_usage_is_below_all_tiers() {
+    // capacity 100, reserve 10. After first request: usage_after=10,
+    // below the 50-token inject tier → no headers.
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "no tier headers should be injected when usage is below all thresholds"
+    );
+}
+
+#[tokio::test]
+async fn highest_breached_tier_header_wins_for_the_same_header_name() {
+    // capacity 100, reserve 80. usage_after=80 breaches both the 50 and
+    // 70 tiers. Both inject X-Token-Tier but with different values.
+    // The last pushed value (70-tier's "degraded") wins.
+    let yaml = tiered_rule_yaml(
+        100,
+        80,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 70\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let tier_headers: Vec<_> = ctx
+        .request_headers_to_set
+        .iter()
+        .filter(|(name, _)| name.as_str() == "x-token-tier")
+        .collect();
+    assert_eq!(tier_headers.len(), 2, "both breached tiers push their header");
+    assert_eq!(
+        tier_headers.last().unwrap().1.to_str().unwrap(),
+        "degraded",
+        "the highest breached tier's value should be last (wins for same-name headers)"
+    );
+}
+
+#[tokio::test]
+async fn multiple_distinct_headers_from_different_tiers_are_all_injected() {
+    // capacity 100, reserve 80. usage_after=80 breaches both tiers.
+    // Tier 1 injects X-Token-Hour-Tier; Tier 2 injects a different header.
+    let yaml = tiered_rule_yaml(
+        100,
+        80,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Hour-Tier: warning\n\
+         - capacity: 70\n  action:\n    type: inject\n    headers:\n      X-Fairness-Id: \"85\"\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let hour_tier = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-hour-tier");
+    let fairness = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-fairness-id");
+    assert_eq!(
+        hour_tier.unwrap().1.to_str().unwrap(),
+        "warning",
+        "first tier's header should be injected"
+    );
+    assert_eq!(
+        fairness.unwrap().1.to_str().unwrap(),
+        "85",
+        "second tier's header should also be injected"
+    );
+}
+
+#[tokio::test]
+async fn deny_tier_still_rejects_when_budget_exhausted() {
+    // capacity 100, reserve 60. First request: usage_after=60, admitted
+    // with warning header. Second request: needs 60 more, only 40 left → 429.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let first = filter.on_request(&mut first_ctx).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Continue),
+        "first request should be admitted"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Reject(_)),
+        "second request should be denied (429) when capacity is exhausted"
+    );
+}
+
+#[tokio::test]
+async fn inject_only_tiers_never_deny() {
+    // No deny tier. capacity 100, reserve 60. Two requests: 60+60=120 > 100.
+    // Without a deny tier in the tiers list, the backend's capacity (100)
+    // still governs the deny decision.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let first = filter.on_request(&mut first_ctx).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Continue),
+        "first request should be admitted with inject headers"
+    );
+    let tier_header = first_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert_eq!(
+        tier_header.unwrap().1.to_str().unwrap(),
+        "warning",
+        "usage_after 60 breaches the 50 tier but not the 80 tier"
+    );
+}
+
+#[tokio::test]
+async fn tier_evaluation_with_token_bucket_algorithm() {
+    // Same tier behavior should work with token_bucket.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: token_bucket\n\
+         \x20   capacity: 100\n\
+         \x20   refill_rate: 0.0001\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "should be admitted");
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(injected.is_some(), "token_bucket should also evaluate inject tiers");
+}
+
+#[tokio::test]
+async fn tier_headers_injected_from_on_request_body_path() {
+    // Body-dependent estimation with tiers.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 200\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 100\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 80\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 200\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(
+        injected.is_some(),
+        "inject tier should fire from the on_request_body path too (usage_after=100 > 80)"
+    );
+}
+
+#[tokio::test]
+async fn tiers_with_match_condition_only_apply_to_matching_requests() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // Request matching the rule: should get inject headers.
+    let alpha_req = make_request_with_header("x-app-id", "alpha");
+    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let action = filter.on_request(&mut alpha_ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        alpha_ctx
+            .request_headers_to_set
+            .iter()
+            .any(|(name, _)| name.as_str() == "x-token-tier"),
+        "matching request should get inject tier headers"
+    );
+
+    // Request not matching: should pass through without tiers or rate limiting.
+    let other_req = make_request_with_header("x-app-id", "beta");
+    let mut other_ctx = crate::test_utils::make_filter_context(&other_req);
+    let action = filter.on_request(&mut other_ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        other_ctx.request_headers_to_set.is_empty(),
+        "non-matching request should not get any injected headers"
+    );
+}
+
+/// Client-supplied tier header is stripped on admission, preventing
+/// a below-threshold client from spoofing the tier signal.
+#[tokio::test]
+async fn client_supplied_tier_header_is_stripped_on_admission() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 10\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // Client sends the inject header pre-emptively.
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert("x-token-tier", "spoofed".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    // The spoofed header should be in request_headers_to_remove.
+    assert!(
+        ctx.request_headers_to_remove
+            .iter()
+            .any(|n| n.as_str() == "x-token-tier"),
+        "client-supplied inject header name must be stripped"
+    );
+}
+
+/// When `pre_read_mutations` is already active (body phase with earlier
+/// ordered producers), `evaluate_tiers` pushes inject headers into
+/// the ordered log as well as `request_headers_to_set`.
+#[tokio::test]
+async fn tier_headers_join_pre_read_mutations_when_ordered_log_is_active() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    // Simulate an earlier filter having activated the ordered log.
+    ctx.pre_read_mutations.push(praxis_filter::TrustedHeaderMutation::Set(
+        http::HeaderName::from_static("x-tenant-id"),
+        http::HeaderValue::from_static("acme"),
+    ));
+
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":60}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    // The inject header should appear in both queues.
+    assert!(
+        ctx.request_headers_to_set
+            .iter()
+            .any(|(n, _)| n.as_str() == "x-token-tier"),
+        "inject header should be in request_headers_to_set"
+    );
+    assert!(
+        ctx.pre_read_mutations.iter().any(|m| matches!(
+            m,
+            praxis_filter::TrustedHeaderMutation::Set(name, _) if name.as_str() == "x-token-tier"
+        )),
+        "inject header should also be in pre_read_mutations when ordered log is active"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Metrics, Accounting Records, and Spans
+// -----------------------------------------------------------------------------
+
+/// One tracing span or event captured by [`TracingCapture`], with every
+/// recorded field rendered as text.
+#[derive(Debug, Clone)]
+struct CapturedRecord {
+    /// Span name, or `"event"` for events.
+    name: &'static str,
+    target: String,
+    level: tracing::Level,
+    fields: std::collections::BTreeMap<&'static str, String>,
+}
+
+/// A `tracing` layer that records spans and events for assertions.
+///
+/// Install it with [`TracingCapture::install`] and keep the returned
+/// guard alive for the duration of the scenario; it is a thread-local
+/// default, so drive the code under test on the current thread.
+#[derive(Debug, Clone, Default)]
+struct TracingCapture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
+    spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
+}
+
+impl TracingCapture {
+    /// Make this capture the default subscriber for the current thread.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+
+    /// Every event recorded so far, oldest first.
+    fn events(&self) -> Vec<CapturedRecord> {
+        self.events.lock().expect("capture lock").clone()
+    }
+
+    /// Every span created so far, oldest first, with later
+    /// `Span::record` calls merged in.
+    fn spans(&self) -> Vec<CapturedRecord> {
+        self.spans
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+}
+
+/// Renders every field value as text so tests compare strings only.
+#[derive(Default)]
+struct FieldText(std::collections::BTreeMap<&'static str, String>);
+
+impl tracing::field::Visit for FieldText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name(), value.to_owned());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name(), value.to_string());
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = FieldText::default();
+        attrs.record(&mut fields);
+        let metadata = attrs.metadata();
+        self.spans.lock().expect("capture lock").push((
+            id.into_u64(),
+            CapturedRecord {
+                name: metadata.name(),
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            },
+        ));
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = FieldText::default();
+        values.record(&mut fields);
+        let mut spans = self.spans.lock().expect("capture lock");
+        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+            record.fields.extend(fields.0);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut fields = FieldText::default();
+        event.record(&mut fields);
+        let metadata = event.metadata();
+        self.events.lock().expect("capture lock").push(CapturedRecord {
+            name: "event",
+            target: metadata.target().to_owned(),
+            level: *metadata.level(),
+            fields: fields.0,
+        });
+    }
+}
+
+/// Run `scenario` on the current thread with a local metrics recorder and
+/// return every metric it emitted.
+fn metrics_emitted_by<F>(scenario: F) -> Vec<(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)>
+where
+    F: Future<Output = ()>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || runtime.block_on(scenario));
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(key, _, _, value)| (key, value))
+        .collect()
+}
+
+/// The value of the metric `name` whose labels include every pair in
+/// `labels`, if it was emitted.
+fn metric_value<'a>(
+    snapshot: &'a [(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    snapshot
+        .iter()
+        .find(|(key, _)| {
+            key.key().name() == name
+                && labels.iter().all(|(label, expected)| {
+                    key.key()
+                        .labels()
+                        .any(|candidate| candidate.key() == *label && candidate.value() == *expected)
+                })
+        })
+        .map(|(_, value)| value)
+}
+
+fn counter_value(
+    snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<u64> {
+    match metric_value(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Counter(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn gauge_value(
+    snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    match metric_value(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Gauge(value)) => Some(value.into_inner()),
+        _ => None,
+    }
+}
+
+/// Admit one 60-token request against a 100-token sliding window, deny the
+/// next one, then settle the first at 40 actual tokens.
+async fn admit_deny_and_settle(filter: &dyn HttpFilter) {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut admitted = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut admitted).await.unwrap(), FilterAction::Continue),
+        "the first 60-token request fits a 100-token budget"
+    );
+    let mut denied = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut denied).await.unwrap(), FilterAction::Reject(_)),
+        "the second 60-token request exceeds the 40 tokens left"
+    );
+    admitted.set_metadata(META_TOKEN_TOTAL, "40");
+    let mut body = None;
+    drop(filter.on_response_body(&mut admitted, &mut body, true).unwrap());
+}
+
+#[test]
+fn metrics_carry_the_values_of_an_admission_a_denial_and_a_reconciliation() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        admit_deny_and_settle(filter.as_ref()).await;
+    });
+    let rule = ("rule", "default");
+
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_requests_total", &[rule, ("result", "admitted")]),
+        Some(1),
+        "one admission"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_requests_total", &[rule, ("result", "denied")]),
+        Some(1),
+        "one budget denial"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_reserved_total", &[rule]),
+        Some(60),
+        "the admitted estimate is the only reservation"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_reconciled_total", &[rule]),
+        Some(40),
+        "actual usage reported at end of stream"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_refunded_total", &[rule]),
+        Some(20),
+        "estimate 60 minus actual 40"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_overage_total", &[rule]),
+        Some(0),
+        "no usage above the estimate"
+    );
+    assert_eq!(
+        counter_value(
+            &snapshot,
+            "praxis_trl_reservations_total",
+            &[rule, ("result", "reconciled")]
+        ),
+        Some(1),
+        "the admitted reservation was settled once"
+    );
+    assert_eq!(
+        gauge_value(
+            &snapshot,
+            "praxis_trl_budget_remaining",
+            &[rule, ("algorithm", "sliding_window")]
+        ),
+        Some(40.0),
+        "the last decision (the denial) saw 40 of 100 left"
+    );
+    assert_eq!(
+        gauge_value(&snapshot, "praxis_trl_reservations_active", &[rule]),
+        Some(0.0),
+        "nothing is pending after settlement"
+    );
+    assert_eq!(
+        gauge_value(&snapshot, "praxis_trl_active_keys", &[rule]),
+        Some(1.0),
+        "the global key is the only retained key"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_unauthenticated_total", &[]).is_none(),
+        "global keying never rejects for a missing subject"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_backend_errors_total", &[]).is_none(),
+        "the memory backend cannot fail"
+    );
+}
+
+#[test]
+fn unauthenticated_rejections_are_counted_apart_from_budget_decisions() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = single_rule_yaml_with(
+            "key: authenticated_subject",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+        );
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        match filter.on_request(&mut ctx).await.unwrap() {
+            FilterAction::Reject(rejection) => assert_eq!(rejection.status, 401, "no subject fails closed"),
+            other => panic!("expected a 401 rejection, got {other:?}"),
+        }
+    });
+
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_unauthenticated_total", &[("rule", "default")]),
+        Some(1),
+        "the identity miss is counted on its own family"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_requests_total", &[]).is_none(),
+        "a 401 is not a budget decision"
+    );
+}
+
+/// Field names an accounting record may carry; anything else would risk
+/// leaking request identity into the audit stream.
+const ACCOUNTING_FIELDS: &[&str] = &[
+    "message",
+    "phase",
+    "rule",
+    "algorithm",
+    "backend",
+    "result",
+    "estimate",
+    "outcome",
+    "actual",
+    "refund",
+    "overage",
+    "error",
+];
+
+fn accounting_records(capture: &TracingCapture) -> Vec<CapturedRecord> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event.target == "praxis_ai::token_rate_limit::accounting")
+        .collect()
+}
+
+fn field<'a>(record: &'a CapturedRecord, name: &str) -> Option<&'a str> {
+    record.fields.get(name).map(String::as_str)
+}
+
+#[tokio::test]
+async fn accounting_records_describe_admissions_denials_and_settlements_with_bounded_fields() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    admit_deny_and_settle(filter.as_ref()).await;
+
+    let records = accounting_records(&capture);
+    let [admission, denial, settlement] = records.as_slice() else {
+        panic!("expected one admission, one denial, and one settlement record, got {records:?}");
+    };
+    for record in &records {
+        assert_eq!(record.name, "event", "accounting records are events, not spans");
+        assert_eq!(record.level, tracing::Level::INFO, "routine records are informational");
+        assert_eq!(field(record, "rule"), Some("default"), "every record names its rule");
+        assert_eq!(field(record, "algorithm"), Some("sliding_window"));
+        assert_eq!(field(record, "backend"), Some("memory"));
+        for name in record.fields.keys() {
+            assert!(ACCOUNTING_FIELDS.contains(name), "unexpected accounting field {name}");
+        }
+    }
+    assert_eq!(field(admission, "phase"), Some("admission"));
+    assert_eq!(field(admission, "result"), Some("admitted"));
+    assert_eq!(field(admission, "outcome"), Some("reserved"));
+    assert_eq!(field(admission, "estimate"), Some("60"));
+    assert_eq!(field(denial, "phase"), Some("admission"));
+    assert_eq!(field(denial, "result"), Some("denied"));
+    assert_eq!(field(denial, "outcome"), Some("budget_exhausted"));
+    assert_eq!(field(settlement, "phase"), Some("reconciliation"));
+    assert_eq!(field(settlement, "result"), Some("applied"));
+    assert_eq!(field(settlement, "actual"), Some("40"));
+    assert_eq!(field(settlement, "refund"), Some("20"));
+    assert_eq!(field(settlement, "overage"), Some("0"));
+}
+
+#[tokio::test]
+async fn an_identity_miss_leaves_a_denied_accounting_record_without_the_subject() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let records = accounting_records(&capture);
+    let [record] = records.as_slice() else {
+        panic!("expected exactly one rejection record, got {records:?}");
+    };
+    assert_eq!(field(record, "result"), Some("denied"));
+    assert_eq!(field(record, "outcome"), Some("missing_authenticated_subject"));
+    for name in record.fields.keys() {
+        assert!(ACCOUNTING_FIELDS.contains(name), "unexpected accounting field {name}");
+    }
+}
+
+#[cfg(not(feature = "opentelemetry"))]
+#[tokio::test]
+async fn no_decision_span_is_created_without_the_opentelemetry_feature() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    admit_deny_and_settle(filter.as_ref()).await;
+
+    assert!(
+        capture.spans().iter().all(|span| span.name != "token_rate_limit"),
+        "the span is compiled out with the feature"
+    );
+}
+
+#[cfg(feature = "opentelemetry")]
+fn token_rate_limit_span(capture: &TracingCapture) -> CapturedRecord {
+    let spans: Vec<_> = capture
+        .spans()
+        .into_iter()
+        .filter(|span| span.name == "token_rate_limit")
+        .collect();
+    assert_eq!(spans.len(), 1, "exactly one decision span per request");
+    spans.into_iter().next().unwrap()
+}
+
+#[cfg(feature = "opentelemetry")]
+#[tokio::test]
+async fn the_decision_span_records_the_admission_and_the_actual_cost() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    ctx.set_metadata(META_TOKEN_TOTAL, "40");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let span = token_rate_limit_span(&capture);
+    assert_eq!(field(&span, "token_rate_limit.rule"), Some("default"));
+    assert_eq!(field(&span, "token_rate_limit.algorithm"), Some("sliding_window"));
+    assert_eq!(field(&span, "token_rate_limit.estimated_cost"), Some("60"));
+    assert_eq!(field(&span, "token_rate_limit.decision"), Some("admitted"));
+    assert_eq!(
+        field(&span, "token_rate_limit.actual_cost"),
+        Some("40"),
+        "actual usage is recorded on the same span at end of stream"
+    );
+    assert_eq!(span.fields.len(), 5, "no other field may be attached to the span");
+}
+
+#[cfg(feature = "opentelemetry")]
+#[tokio::test]
+async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let span = token_rate_limit_span(&capture);
+    assert_eq!(field(&span, "token_rate_limit.decision"), Some("unauthenticated"));
+    assert_eq!(
+        field(&span, "token_rate_limit.actual_cost"),
+        None,
+        "a rejected request never reports usage"
     );
 }

@@ -5,7 +5,7 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
-use praxis_filter::{BodyAccess, BodyMode, Request};
+use praxis_filter::{BodyAccess, BodyMode, ErrorResponseFormatterHandle, Request};
 
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
@@ -58,6 +58,7 @@ async fn classifies_a_conversations_operation() {
     );
     assert_eq!(matched.operation_id, "getConversation");
     assert_eq!(matched.transport, Transport::Http);
+    assert_eq!(matched.request_body, RequestBody::None);
 
     assert_eq!(
         ctx.filter_metadata
@@ -71,6 +72,74 @@ async fn classifies_a_conversations_operation() {
             .map(String::as_str),
         Some("getConversation")
     );
+}
+
+#[test]
+fn classifies_open_ended_protocols_and_registry_body_metadata() {
+    for (method, path, application_protocol, request_body) in [
+        (
+            "POST",
+            "/v1/conversations",
+            ApplicationProtocol::new("openai_conversations"),
+            RequestBody::Json { required: false },
+        ),
+        (
+            "GET",
+            "/v1/conversations/conv_bodyless",
+            ApplicationProtocol::new("openai_conversations"),
+            RequestBody::None,
+        ),
+        (
+            "POST",
+            "/v1/chat/completions",
+            ApplicationProtocol::new("openai_chat_completions"),
+            RequestBody::Json { required: true },
+        ),
+        (
+            "POST",
+            "/v1/responses",
+            ApplicationProtocol::new("openai_responses"),
+            RequestBody::Json { required: true },
+        ),
+    ] {
+        let matched = classify(method, path, Transport::Http).unwrap();
+        assert_eq!(matched.application_protocol, application_protocol, "{method} {path}");
+        assert_eq!(matched.request_body, request_body, "{method} {path}");
+    }
+}
+
+#[test]
+fn offset_backed_parameters_survive_request_lifecycle_phases() {
+    let path = "/v1/conversations/conv_%E2%9C%93/items/item%2Fraw";
+    let matched = classify("GET", path, Transport::Http).unwrap();
+
+    // Copy the stored value as later request/body hooks do, then recover raw
+    // path segments from the still-immutable request URI without cloning it.
+    let phase_match = matched;
+    assert_eq!(
+        phase_match.path_parameters.get(path, "conversation_id"),
+        Some("conv_%E2%9C%93")
+    );
+    assert_eq!(phase_match.path_parameters.get(path, "item_id"), Some("item%2Fraw"));
+    assert_eq!(phase_match.path_parameters.len(), 2);
+}
+
+#[test]
+fn conversations_normalization_and_malformed_paths_follow_the_shared_matcher() {
+    for (method, path, expected) in [
+        ("GET", "/v1/conversations/conv_1/", true),
+        ("GET", "/v1/conversations/conv_1?include=x", true),
+        ("GET", "/v1/conversations//items", false),
+        ("GET", "/v1/conversations/conv_1/items/", true),
+        ("GET", "/v1/conversations/conv_1/items/item_1/extra", false),
+        ("PATCH", "/v1/conversations/conv_1", false),
+    ] {
+        assert_eq!(
+            classify(method, path, Transport::Http).is_some(),
+            expected,
+            "{method} {path}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -117,6 +186,64 @@ async fn websocket_handshake_on_chat_completions_does_not_match() {
     assert!(
         ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
         "Chat Completions is HTTP-only, so a websocket handshake must not classify"
+    );
+}
+
+#[tokio::test]
+async fn websocket_handshake_on_conversations_is_not_classified() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/conversations/conv_123");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
+    );
+}
+
+/// The error formatter is installed from the request head, so an OpenAI
+/// client keeps OpenAI-shaped errors on proxy failures without any
+/// protocol-specific filter later in the chain.
+///
+/// Membership is derived from the protocol name, so a registry added later —
+/// Files and Vector Stores, for instance — is covered without touching this
+/// filter.
+#[tokio::test]
+async fn an_openai_operation_installs_the_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/conversations/conv_123"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the OpenAI error formatter"
+        );
+    }
+}
+
+/// A request that matches no OpenAI operation is left alone, so non-OpenAI
+/// traffic on a shared listener keeps its default error shape.
+#[tokio::test]
+async fn an_unmatched_request_installs_no_error_formatter() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/unknown");
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "an unmatched request keeps the default error formatting"
     );
 }
 

@@ -65,13 +65,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, ChainBindingContext, FilterAction, FilterError, FilterPipeline,
+    HttpFilter, HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
+    bound_body_outcome,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
@@ -333,15 +334,18 @@ impl McpToolResolveFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        original_bytes: Bytes,
+        mut parsed: serde_json::Value,
     ) -> Result<FilterAction, ResolveError> {
-        let mut mcp_entries = extract_mcp_entries(&original_bytes);
+        let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
-        resolve_connector_ids(&self.connectors, &mut mcp_entries)?;
-        let has_configured_connector = mcp_entries.iter().any(|entry| entry.get("connector_id").is_some());
+        resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
+        let has_configured_connector = mcp_entries
+            .values
+            .iter()
+            .any(|entry| entry.get("connector_id").is_some());
         let connector_identity = if has_configured_connector {
             stage_mcp_callout_identity(
                 ctx,
@@ -352,21 +356,21 @@ impl McpToolResolveFilter {
         } else {
             None
         };
-        require_tool_search_for_deferred(ctx, &mcp_entries)?;
-        self.validate_entries(&mcp_entries)?;
+        require_tool_search_for_deferred(ctx, &mcp_entries.values)?;
+        self.validate_entries(&mcp_entries.values)?;
 
         // Capture the parent transport + downstream attributes for the outbound
         // callout before the resolution work borrows `ctx` mutably; fails closed
         // if no shared sub-request client is available.
         let callout = self.acquire_callout(ctx)?;
         let deferred_mcp = collect_deferred_connectors(
-            &mcp_entries,
+            &mcp_entries.values,
             self.timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
         );
         let resolution = self
-            .resolve_request_entries(ctx, &mcp_entries, &callout, connector_identity.as_ref())
+            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
@@ -383,7 +387,8 @@ impl McpToolResolveFilter {
         self.commit_resolved_tools(
             ctx,
             body,
-            &original_bytes,
+            parsed,
+            mcp_entries,
             resolution,
             deferred_mcp,
             connector_context_policy,
@@ -393,13 +398,14 @@ impl McpToolResolveFilter {
     /// Rewrite the request body and store resolved plus deferred MCP state.
     #[expect(
         clippy::too_many_arguments,
-        reason = "rewrite needs body, original bytes, and both resolved maps"
+        reason = "rewrite needs the parsed body and both resolved maps"
     )]
     fn commit_resolved_tools(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        original_bytes: &Bytes,
+        mut parsed: serde_json::Value,
+        mcp_entries: ExtractedMcpEntries,
         resolution: Resolution,
         deferred_mcp: Vec<DeferredMcpConnector>,
         connector_context_policy: McpConnectorContextPolicy,
@@ -411,13 +417,13 @@ impl McpToolResolveFilter {
             listings,
             ..
         } = resolution;
-        let Some(serialized) = rewrite_request_body(original_bytes, per_entry, &tool_map, &resolved_labels)? else {
+        let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
+        else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
-        let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
-        write_state(ctx, body_for_state, tool_map, deferred_mcp, connector_context_policy);
+        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
         commit_discovery_items(ctx, listings);
         Ok(FilterAction::Continue)
     }
@@ -503,7 +509,7 @@ impl McpToolResolveFilter {
             .collect();
         let task_results = futures::future::try_join_all(futures).await?;
 
-        collect_resolutions(entries, &entry_to_task, &task_results)
+        collect_resolutions(entries, &entry_to_task, task_results)
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -539,7 +545,6 @@ impl McpToolResolveFilter {
                 server_url,
                 owner_fingerprint,
                 cache_allowed_names,
-                is_connector,
             )
         {
             // Cache hit: no dial is made, so validate the target here to preserve
@@ -597,6 +602,10 @@ impl HttpFilter for McpToolResolveFilter {
         BodyAccess::ReadWrite
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         // Accept up to the absolute ceiling; the pipeline's body_limits
         // decides the real raw cap. max_rewritten_body_bytes bounds only
@@ -633,16 +642,28 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(FilterAction::Continue);
+        };
 
         let streaming = is_streaming(ctx);
 
         // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
         // copying the body, so keeping a handle for the failure path (which
         // captures the size-bounded request options from it) is cheap.
-        match Box::pin(self.resolve_mcp_tools(ctx, body, bytes.clone())).await {
+        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
             Ok(action) => Ok(action),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 
@@ -755,6 +776,22 @@ enum EntryResolution {
     Resolved(Vec<serde_json::Value>),
 }
 
+/// MCP request entries moved out of the parsed `tools` array while resolution
+/// is in progress, together with their original positions in that array.
+struct ExtractedMcpEntries {
+    /// Owned MCP request entries in request order.
+    values: Vec<serde_json::Value>,
+    /// Original index of each entry in the complete mixed `tools` array.
+    tool_indices: Vec<usize>,
+}
+
+impl ExtractedMcpEntries {
+    /// Return whether the request contained any MCP entries.
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
 /// Result of resolving all MCP entries.
 struct Resolution {
     /// Per-entry resolution outcomes parallel to the input MCP entries.
@@ -775,12 +812,16 @@ struct Resolution {
 /// A successful local MCP discovery listing awaiting commit as an
 /// `mcp_list_tools` output item.
 ///
-/// Carries only the fields the output item needs; the item `id` is assigned at
-/// commit time from the request's id generator so it matches the failure path's
-/// `mcpl_` convention.
+/// The item `id` is assigned at commit time from the request's id generator so
+/// it matches the failure path's `mcpl_` convention. Direct, uncredentialed
+/// listings also carry their exact URL in private persisted history so a
+/// continuation can reuse them without repeating `tools/list`. Connector and
+/// credentialed listings omit it and remain ineligible for cache reuse.
 struct McpListing {
     /// The MCP server's client-visible label.
     server_label: String,
+    /// Exact target identity for a cacheable direct listing.
+    server_url: Option<String>,
     /// The resolved tools normalized to the `MCPListToolsTool` shape
     /// (`name`, `input_schema`, optional `description`/`annotations`).
     tools: Vec<serde_json::Value>,
@@ -807,25 +848,32 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
 }
 
 /// Collect per-entry resolutions from task results.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-entry results and cache identity are collected at the same boundary"
+)]
 fn collect_resolutions(
     entries: &[serde_json::Value],
     entry_to_task: &[Option<usize>],
-    task_results: &[Option<Vec<serde_json::Value>>],
+    mut task_results: Vec<Option<Vec<serde_json::Value>>>,
 ) -> Result<Resolution, ResolveError> {
     let mut tool_map = HashMap::new();
     let mut per_entry = Vec::with_capacity(entries.len());
     let mut has_resolved = false;
     let mut resolved_labels = HashSet::new();
     let mut listings = Vec::new();
+    let mut remaining_consumers = task_consumer_counts(entry_to_task, task_results.len());
+
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
-        if let Some((resolution, listing_tools)) =
-            build_entry_resolution(entry, *task_idx, task_results, &mut tool_map)?
-        {
+        let tools =
+            (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
+        if let Some((resolution, listing_tools)) = build_entry_resolution(entry, tools, &mut tool_map)? {
             has_resolved = true;
             let label = server_label(entry).to_owned();
             resolved_labels.insert(label.clone());
             listings.push(McpListing {
                 server_label: label,
+                server_url: reusable_listing_server_url(entry).map(str::to_owned),
                 tools: listing_tools,
             });
             per_entry.push(resolution);
@@ -842,6 +890,37 @@ fn collect_resolutions(
         resolved_labels,
         listings,
     })
+}
+
+/// Count how many entries consume each deduplicated resolution task.
+fn task_consumer_counts(entry_to_task: &[Option<usize>], task_count: usize) -> Vec<usize> {
+    let mut counts = vec![0; task_count];
+    for task_idx in entry_to_task.iter().flatten() {
+        if let Some(count) = counts.get_mut(*task_idx) {
+            *count += 1;
+        }
+    }
+    counts
+}
+
+/// Return one entry's task result, moving it for the final consumer.
+///
+/// A deduplicated task may feed several request entries. Earlier consumers
+/// receive a clone while the final (or only) consumer takes the owned result.
+fn consume_task_result(
+    task_idx: usize,
+    task_results: &mut [Option<Vec<serde_json::Value>>],
+    remaining_consumers: &mut [usize],
+) -> Option<Vec<serde_json::Value>> {
+    let remaining = remaining_consumers.get_mut(task_idx)?;
+    let result = task_results.get_mut(task_idx)?;
+    if *remaining > 1 {
+        *remaining -= 1;
+        result.clone()
+    } else {
+        *remaining = 0;
+        result.take()
+    }
 }
 
 /// Resolve connector IDs to server URLs for MCP tool entries.
@@ -908,11 +987,10 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
 /// result before it is consumed into `tool_map`.
 fn build_entry_resolution(
     entry: &serde_json::Value,
-    task_idx: Option<usize>,
-    task_results: &[Option<Vec<serde_json::Value>>],
+    tools: Option<Vec<serde_json::Value>>,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
 ) -> Result<Option<(EntryResolution, Vec<serde_json::Value>)>, ResolveError> {
-    let Some(tools) = task_idx.and_then(|idx| task_results.get(idx)?.clone()) else {
+    let Some(tools) = tools else {
         return Ok(None);
     };
     let allowed = extract_allowed_tools(entry)?;
@@ -1149,23 +1227,23 @@ const MAX_ECHOED_OPTIONS_BYTES: usize = 256 * 1024;
 /// Extract the size-bounded, credential-free subset of request options echoed
 /// into a streaming discovery-failure snapshot.
 ///
-/// Only [`ECHOED_REQUEST_FIELDS`] are copied (never `input`/`tools`), and a field
+/// Only [`ECHOED_REQUEST_FIELDS`] are captured (never `input`/`tools`), and a field
 /// is skipped once including it would push the aggregate past
 /// [`MAX_ECHOED_OPTIONS_BYTES`], so a large `instructions`/`metadata` cannot be
 /// amplified across the synthesized snapshots. Returns `None` when the body is
 /// unparseable or no whitelisted field survives, in which case the snapshot falls
 /// back to API defaults for every echoed field.
 fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let obj = parsed.as_object()?;
+    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = parsed.as_object_mut()?;
     let mut total = 0_usize;
     let mut captured = serde_json::Map::new();
     for &field in ECHOED_REQUEST_FIELDS {
         let Some(value) = obj.get(field) else {
             continue;
         };
-        // Measure before cloning so an oversized field is never copied into the
-        // capture, and skip (rather than truncate) any field that would exceed
+        // Measure before moving so an oversized field is never removed from the
+        // parsed object, and skip (rather than truncate) any field that would exceed
         // the aggregate bound so the retained JSON stays well-formed.
         // Serializing an in-memory `Value` into the counting sink should not
         // fail. If it does, treat the field as maximally large so it is skipped
@@ -1174,8 +1252,11 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
         if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
             continue;
         }
+        let Some(value) = obj.remove(field) else {
+            continue;
+        };
         total += len;
-        captured.insert(field.to_owned(), value.clone());
+        captured.insert(field.to_owned(), value);
     }
     (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
 }
@@ -1790,14 +1871,12 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// pipeline-local `connector_id`, configured URL, and credentials
 /// never reach the inference backend.
 fn rewrite_request_body(
-    original_bytes: &[u8],
+    parsed: &mut serde_json::Value,
+    mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<Option<SerializedJson>, ResolveError> {
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
-        return Ok(None);
-    };
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
     };
@@ -1810,14 +1889,14 @@ fn rewrite_request_body(
     // Commit the emptied array anyway: returning `None` would make the
     // caller forward the *original* body, leaking those entries'
     // `authorization`/`headers` credentials to the inference backend.
-    let (rewritten, generated_names) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated_names) = rewrite_tools_array(tools, mcp_entries, per_entry);
     detect_name_collisions(&rewritten, &generated_names)?;
 
     let rewritten_count = rewritten.len();
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
 
-    let serialized = serialize_json_body(&parsed).map_err(|e| {
+    let serialized = serialize_json_body(parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
@@ -1829,45 +1908,47 @@ fn rewrite_request_body(
 /// pre-built function tools from `per_entry`.
 fn rewrite_tools_array(
     tools: Vec<serde_json::Value>,
+    mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
 ) -> (Vec<serde_json::Value>, HashSet<String>) {
     let mut result = Vec::with_capacity(tools.len());
     let mut generated_names = HashSet::new();
-    let mut entries = per_entry.into_iter();
+    let mut mcp_tools = mcp_entries.tool_indices.into_iter().zip(mcp_entries.values).peekable();
+    let mut resolutions = per_entry.into_iter();
 
-    for tool in tools {
-        if tool.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-            result.push(tool);
-            continue;
-        }
-
-        let resolution = entries.next().unwrap_or(EntryResolution::PassThrough);
-
-        match resolution {
-            EntryResolution::PassThrough => {
-                result.push(tool);
-            },
-            EntryResolution::SanitizeDeferred => {
-                result.push(sanitize_deferred_connector_tool(tool));
-            },
-            EntryResolution::Resolved(function_tools) => {
-                for ft in function_tools {
-                    if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
-                        generated_names.insert(name.to_owned());
-                    }
-                    result.push(ft);
+    for (tool_index, tool) in tools.into_iter().enumerate() {
+        match mcp_tools.next_if(|(index, _)| *index == tool_index) {
+            Some((_, mcp_tool)) => {
+                let resolution = resolutions.next().unwrap_or(EntryResolution::PassThrough);
+                match resolution {
+                    EntryResolution::PassThrough => {
+                        result.push(mcp_tool);
+                    },
+                    EntryResolution::SanitizeDeferred => {
+                        result.push(sanitize_deferred_connector_tool(mcp_tool));
+                    },
+                    EntryResolution::Resolved(function_tools) => {
+                        for ft in function_tools {
+                            if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
+                                generated_names.insert(name.to_owned());
+                            }
+                            result.push(ft);
+                        }
+                    },
                 }
             },
+            None => result.push(tool),
         }
     }
 
     (result, generated_names)
 }
 
-/// Copy only the client-visible deferred MCP fields into the outbound tool.
+/// Move only the client-visible deferred MCP fields into the outbound tool.
 fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Value {
-    let Some(obj) = tool.as_object() else {
-        return tool;
+    let mut obj = match tool {
+        serde_json::Value::Object(obj) => obj,
+        other => return other,
     };
     let mut sanitized = serde_json::Map::new();
     for key in [
@@ -1879,8 +1960,8 @@ fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Valu
         "allowed_callers",
         "require_approval",
     ] {
-        if let Some(value) = obj.get(key) {
-            sanitized.insert(key.to_owned(), value.clone());
+        if let Some(value) = obj.remove(key) {
+            sanitized.insert(key.to_owned(), value);
         }
     }
     serde_json::Value::Object(sanitized)
@@ -1918,21 +1999,32 @@ fn detect_name_collisions(tools: &[serde_json::Value], generated_names: &HashSet
 ///   `{"type":"allowed_tools","mode":"required","tools":[...]}`.
 ///
 /// - **MCP selectors in `allowed_tools`**: expands each MCP selector to its generated function equivalents.
+///
+/// The choice is removed from the request and consumed so unchanged fields
+/// and selectors can be moved back without cloning their JSON payloads.
 fn rewrite_tool_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<(), ResolveError> {
-    let Some(serde_json::Value::Object(choice_obj)) = obj.get("tool_choice").cloned() else {
+    let Some((choice_key, choice)) = obj.remove_entry("tool_choice") else {
         return Ok(());
     };
-    let choice_type = choice_obj.get("type").and_then(serde_json::Value::as_str);
-
-    match choice_type {
-        Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map, resolved_labels),
-        Some("allowed_tools") => rewrite_allowed_tools_choice(obj, &choice_obj, tool_map, resolved_labels),
-        _ => Ok(()),
-    }
+    let rewritten = match choice {
+        serde_json::Value::Object(choice_obj)
+            if choice_obj.get("type").and_then(serde_json::Value::as_str) == Some("mcp") =>
+        {
+            rewrite_mcp_tool_choice(choice_obj, tool_map, resolved_labels)?
+        },
+        serde_json::Value::Object(choice_obj)
+            if choice_obj.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools") =>
+        {
+            rewrite_allowed_tools_choice(choice_obj, tool_map, resolved_labels)?
+        },
+        choice => choice,
+    };
+    obj.insert(choice_key, rewritten);
+    Ok(())
 }
 
 /// Rewrite an MCP-typed `tool_choice` to its function equivalent.
@@ -1940,11 +2032,10 @@ fn rewrite_tool_choice(
 /// Returns [`ResolveError::EmptyResolvedToolChoice`] when the
 /// targeted label was resolved but produced zero eligible tools.
 fn rewrite_mcp_tool_choice(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    choice_obj: &serde_json::Map<String, serde_json::Value>,
+    choice_obj: serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
-) -> Result<(), ResolveError> {
+) -> Result<serde_json::Value, ResolveError> {
     let label = choice_obj
         .get("server_label")
         .and_then(serde_json::Value::as_str)
@@ -1953,26 +2044,25 @@ fn rewrite_mcp_tool_choice(
     if let Some(name) = choice_obj.get("name").and_then(serde_json::Value::as_str) {
         if tool_map.contains_key(&(label.to_owned(), name.to_owned())) {
             let function_name = encode_function_name(label, name);
-            obj.insert(
-                "tool_choice".to_owned(),
-                serde_json::json!({"type": "function", "name": function_name}),
-            );
+            return Ok(function_tool_reference(function_name));
         } else if resolved_labels.contains(label) {
             return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
         }
-        return Ok(());
+        return Ok(serde_json::Value::Object(choice_obj));
     }
 
     let function_refs = collect_function_refs_for_label(label, tool_map);
     if !function_refs.is_empty() {
-        obj.insert(
-            "tool_choice".to_owned(),
-            serde_json::json!({"type": "allowed_tools", "mode": "required", "tools": function_refs}),
-        );
+        let mut choice = serde_json::Map::new();
+        choice.insert("type".to_owned(), serde_json::Value::String("allowed_tools".to_owned()));
+        choice.insert("mode".to_owned(), serde_json::Value::String("required".to_owned()));
+        choice.insert("tools".to_owned(), serde_json::Value::Array(function_refs));
+        Ok(serde_json::Value::Object(choice))
     } else if resolved_labels.contains(label) {
-        return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
+        Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()))
+    } else {
+        Ok(serde_json::Value::Object(choice_obj))
     }
-    Ok(())
 }
 
 /// Rewrite MCP selectors inside an `allowed_tools`-typed
@@ -1993,19 +2083,23 @@ fn rewrite_mcp_tool_choice(
 /// and the model must not fall back to any other tool still supplied in
 /// the request.
 fn rewrite_allowed_tools_choice(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    choice_obj: &serde_json::Map<String, serde_json::Value>,
+    mut choice_obj: serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
-) -> Result<(), ResolveError> {
-    let Some(tools_arr) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
-        return Ok(());
+) -> Result<serde_json::Value, ResolveError> {
+    let Some((tools_key, tools)) = choice_obj.remove_entry("tools") else {
+        return Ok(serde_json::Value::Object(choice_obj));
+    };
+    let serde_json::Value::Array(tools_arr) = tools else {
+        choice_obj.insert(tools_key, tools);
+        return Ok(serde_json::Value::Object(choice_obj));
     };
 
     let (new_tools, changed, dropped_label) = rebuild_allowed_tools_selectors(tools_arr, tool_map, resolved_labels);
 
     if !changed {
-        return Ok(());
+        choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+        return Ok(serde_json::Value::Object(choice_obj));
     }
 
     if new_tools.is_empty() {
@@ -2022,14 +2116,11 @@ fn rewrite_allowed_tools_choice(
         // `"none"` rather than removing `tool_choice`: removal would let
         // the model call any other tool left in the request, which the
         // original choice deliberately excluded.
-        obj.insert("tool_choice".to_owned(), serde_json::Value::String("none".to_owned()));
-        return Ok(());
+        return Ok(serde_json::Value::String("none".to_owned()));
     }
 
-    let mut new_choice = choice_obj.clone();
-    new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
-    obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
-    Ok(())
+    choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+    Ok(serde_json::Value::Object(choice_obj))
 }
 
 /// Rebuild an `allowed_tools` selector list: expand resolved MCP
@@ -2040,7 +2131,7 @@ fn rewrite_allowed_tools_choice(
 /// input, and the first dropped `server_label` (used for error
 /// reporting when the list collapses to empty).
 fn rebuild_allowed_tools_selectors(
-    tools_arr: &[serde_json::Value],
+    tools_arr: Vec<serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> (Vec<serde_json::Value>, bool, Option<String>) {
@@ -2050,14 +2141,14 @@ fn rebuild_allowed_tools_selectors(
 
     for tool_ref in tools_arr {
         if tool_ref.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-            new_tools.push(tool_ref.clone());
+            new_tools.push(tool_ref);
             continue;
         }
         let before = new_tools.len();
-        expand_mcp_selector(tool_ref, tool_map, &mut new_tools);
+        expand_mcp_selector(&tool_ref, tool_map, &mut new_tools);
         if new_tools.len() > before {
             changed = true;
-        } else if selector_label_resolved(tool_ref, resolved_labels) {
+        } else if selector_label_resolved(&tool_ref, resolved_labels) {
             // The server was resolved locally but exposes no matching
             // tool; the selector is locally consumed. Drop it so the
             // MCP reference never reaches the inference backend.
@@ -2071,7 +2162,7 @@ fn rebuild_allowed_tools_selectors(
         } else {
             // Unresolved (deferred / connector-only / unknown) selector:
             // preserve it for the backend to handle.
-            new_tools.push(tool_ref.clone());
+            new_tools.push(tool_ref);
         }
     }
 
@@ -2102,7 +2193,7 @@ fn expand_mcp_selector(
 
     if let Some(name) = selector.get("name").and_then(serde_json::Value::as_str) {
         if tool_map.contains_key(&(label.to_owned(), name.to_owned())) {
-            out.push(serde_json::json!({"type": "function", "name": encode_function_name(label, name)}));
+            out.push(function_tool_reference(encode_function_name(label, name)));
         }
     } else {
         out.extend(collect_function_refs_for_label(label, tool_map));
@@ -2118,8 +2209,16 @@ fn collect_function_refs_for_label(
     tool_map
         .keys()
         .filter(|(l, _)| l == label)
-        .map(|(l, n)| serde_json::json!({"type": "function", "name": encode_function_name(l, n)}))
+        .map(|(l, n)| function_tool_reference(encode_function_name(l, n)))
         .collect()
+}
+
+/// Build a function-tool selector, consuming its encoded name.
+fn function_tool_reference(encoded_name: String) -> serde_json::Value {
+    let mut reference = serde_json::Map::new();
+    reference.insert("type".to_owned(), serde_json::Value::String("function".to_owned()));
+    reference.insert("name".to_owned(), serde_json::Value::String(encoded_name));
+    serde_json::Value::Object(reference)
 }
 
 /// Convert a single MCP tool definition to a Responses API
@@ -2152,8 +2251,8 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
         .unwrap_or_else(|| serde_json::json!({"type": "object"}));
 
     let mut obj = serde_json::Map::new();
-    obj.insert("type".to_owned(), serde_json::json!("function"));
-    obj.insert("name".to_owned(), serde_json::json!(encoded_name));
+    obj.insert("type".to_owned(), serde_json::Value::String("function".to_owned()));
+    obj.insert("name".to_owned(), serde_json::Value::String(encoded_name));
     if let Some(desc) = description {
         obj.insert("description".to_owned(), desc);
     }
@@ -2210,7 +2309,7 @@ fn mcp_tool_to_list_tools_entry(definition: &serde_json::Value) -> serde_json::V
 /// building the full tools array to catch this.
 pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
     let raw = format!("{label}__{tool_name}");
-    let sanitized: String = raw
+    let mut sanitized: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -2220,11 +2319,9 @@ pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
             }
         })
         .collect();
-    if sanitized.len() <= MAX_FUNCTION_NAME_LEN {
-        sanitized
-    } else {
-        sanitized.chars().take(MAX_FUNCTION_NAME_LEN).collect()
-    }
+    // Every character above is mapped to ASCII, so this byte index is always a character boundary.
+    sanitized.truncate(MAX_FUNCTION_NAME_LEN);
+    sanitized
 }
 
 /// Reverse lookup for model-facing MCP function names.
@@ -2299,7 +2396,7 @@ impl<'a> McpToolIndex<'a> {
 /// path in `openai_responses_proxy` which would strip it.
 fn write_state(
     ctx: &mut HttpFilterContext<'_>,
-    body: &[u8],
+    parsed: serde_json::Value,
     map: HashMap<(String, String), serde_json::Value>,
     deferred_mcp: Vec<DeferredMcpConnector>,
     connector_context_policy: McpConnectorContextPolicy,
@@ -2308,18 +2405,16 @@ fn write_state(
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
-            state.tools = parsed
-                .get("tools")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(tc) = parsed.get("tool_choice") {
-                state.tool_choice = tc.clone();
-            }
-            state.request_body = parsed;
+        state.tools = parsed
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(tc) = parsed.get("tool_choice") {
+            state.tool_choice = tc.clone();
         }
-    } else if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
+        state.request_body = parsed;
+    } else {
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
@@ -2439,22 +2534,24 @@ async fn prepare_deferred_listing(
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<PreparedDeferredListing, ResolveError> {
+    let entry = deferred_entry_view(connector);
     let listing = list_deferred_connector(
         connector,
+        &entry,
         forwarded_header_names,
         forwarded_headers,
         callout,
         connector_identity,
     )
     .await?;
-    let entry = deferred_entry_view(connector);
     let allowed = extract_allowed_tools(&entry)?;
     let filtered = apply_allowed_tools_filter(listing, &allowed);
     let functions: Vec<serde_json::Value> = filtered
         .iter()
         .map(|def| mcp_tool_to_function_tool(&connector.server_label, def))
         .collect();
-    let listing_item = mcp_list_tools_item(&connector.server_label, &filtered);
+    let listing_tools = filtered.iter().map(mcp_listing_tool_for_responses).collect();
+    let listing_item = mcp_list_tools_item(connector.server_label.clone(), listing_tools);
     Ok(PreparedDeferredListing {
         entry,
         filtered,
@@ -2532,14 +2629,18 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deferred discovery threads one owned entry through the existing callout security boundary"
+)]
 async fn list_deferred_connector(
     connector: &DeferredMcpConnector,
+    entry: &serde_json::Value,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
-    let entry = deferred_entry_view(connector);
     // No upfront SSRF classifier: `fetch_tools` always dials, and the subrequest
     // transport validates the target during the callout, so the SSRF rejection is
     // reconstructed from the transport signal below without a second DNS
@@ -2552,7 +2653,7 @@ async fn list_deferred_connector(
         callout,
         connector_identity,
     };
-    fetch_tools(&entry, &connector.server_url, options)
+    fetch_tools(entry, &connector.server_url, options)
         .await
         .map_err(|err| match err {
             ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
@@ -2603,18 +2704,19 @@ fn deferred_entry_view(connector: &DeferredMcpConnector) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Public `mcp_list_tools` item with no URL, credentials, or connector id.
-///
-/// MCP `tools/list` returns `inputSchema`; the Responses item schema requires
-/// `input_schema`. Map each listed tool onto the public shape so typed SDKs
-/// can parse a successful deferred listing.
-fn mcp_list_tools_item(server_label: &str, tools: &[serde_json::Value]) -> serde_json::Value {
-    serde_json::json!({
-        "id": mcp_list_tools_id(server_label),
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "tools": tools.iter().map(mcp_listing_tool_for_responses).collect::<Vec<_>>(),
-    })
+/// Build a public `mcp_list_tools` item from already normalized tools, moving
+/// the label and tools into the item with no URL, credentials, or connector id.
+fn mcp_list_tools_item(server_label: String, tools: Vec<serde_json::Value>) -> serde_json::Value {
+    let id = mcp_list_tools_id(&server_label);
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("mcp_list_tools".to_owned()),
+    );
+    item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
+    item.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    serde_json::Value::Object(item)
 }
 
 /// Map one MCP tool definition onto the Responses `mcp_list_tools` tool shape.
@@ -2689,7 +2791,7 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
     }
     // Assign ids up front (borrowing `id_generator`/`time_source`) so the mutable
     // `ResponsesState` borrow below never overlaps the id-generator borrow.
-    let items: Vec<serde_json::Value> = listings
+    let items: Vec<(serde_json::Value, Option<serde_json::Value>)> = listings
         .into_iter()
         .map(|listing| build_discovery_item(ctx, listing))
         .collect();
@@ -2697,40 +2799,72 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return;
     };
-    for item in items {
-        append_discovery_item(state, item);
+    for (item, cached) in items {
+        if append_discovery_item(state, item)
+            && let Some(cached) = cached
+        {
+            state.persisted_messages.push(cached);
+        }
     }
 }
 
-/// Build one `mcp_list_tools` output item with a fresh `mcpl_` id (issue #1022).
-fn build_discovery_item(ctx: &HttpFilterContext<'_>, listing: McpListing) -> serde_json::Value {
-    let McpListing { server_label, tools } = listing;
+/// Build a public listing and, where safe, a private cache record for the store.
+fn build_discovery_item(
+    ctx: &HttpFilterContext<'_>,
+    listing: McpListing,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    let McpListing {
+        server_label,
+        server_url,
+        tools,
+    } = listing;
     let id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
-    serde_json::json!({
-        "id": id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "tools": tools,
-    })
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("mcp_list_tools".to_owned()),
+    );
+    // The store's message history is never serialized as a Responses output item.
+    // A second copy of the tool definitions is necessary at this persistence
+    // boundary; the public item must not carry the target URL.
+    let cached = server_url.map(|server_url| {
+        let mut cached = serde_json::Map::new();
+        cached.insert(
+            "type".to_owned(),
+            serde_json::Value::String("praxis_mcp_cached_listing".to_owned()),
+        );
+        cached.insert(
+            "server_label".to_owned(),
+            serde_json::Value::String(server_label.clone()),
+        );
+        cached.insert("server_url".to_owned(), serde_json::Value::String(server_url));
+        cached.insert("tools".to_owned(), serde_json::Value::Array(tools.clone()));
+        serde_json::Value::Object(cached)
+    });
+    item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
+    item.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    (serde_json::Value::Object(item), cached)
 }
 
 /// Append a discovery item unless its server is already listed, recording the id
 /// in `locally_executed_output_items` so the item's lifecycle is synthesized. The
 /// dedup keeps an internal retry that re-runs resolution from emitting a second
 /// discovery for the same server (issue #1022).
-fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) {
+fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) -> bool {
     let server_label = item.get("server_label").and_then(serde_json::Value::as_str);
     let already_listed = state.accumulated_output.iter().any(|existing| {
         existing.get("type").and_then(serde_json::Value::as_str) == Some("mcp_list_tools")
             && existing.get("server_label").and_then(serde_json::Value::as_str) == server_label
     });
     if already_listed {
-        return;
+        return false;
     }
     if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
         state.locally_executed_output_items.insert(id.to_owned());
     }
     state.accumulated_output.push(item);
+    true
 }
 
 /// Check whether `openai_tool_parse` detected MCP tools.
@@ -2747,12 +2881,21 @@ fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Whether the entry carries per-entry credentials that
 /// affect the `tools/list` response.
+///
+/// URL query parameters are treated as credentials because they may contain
+/// API keys. Such URLs are resolved normally but never copied into a reusable
+/// private listing.
 fn has_entry_credentials(entry: &serde_json::Value) -> bool {
     entry.get("authorization").and_then(serde_json::Value::as_str).is_some()
         || entry
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+        || entry
+            .get("server_url")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| url::Url::parse(raw).ok())
+            .is_some_and(|url| url.query().is_some())
 }
 
 /// Whether a previous `tools/list` result is valid without current request context.
@@ -2764,6 +2907,16 @@ fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool) -> bo
     !is_connector && !has_entry_credentials(entry)
 }
 
+/// Return the exact target only when it is safe to persist privately and reuse.
+fn reusable_listing_server_url(entry: &serde_json::Value) -> Option<&str> {
+    let is_connector = entry.get("connector_id").is_some();
+    if can_reuse_cached_listing(entry, is_connector) {
+        resolvable_server_url(entry)
+    } else {
+        None
+    }
+}
+
 /// Extract `server_label` from an MCP tool entry.
 fn server_label(entry: &serde_json::Value) -> &str {
     entry
@@ -2772,21 +2925,29 @@ fn server_label(entry: &serde_json::Value) -> &str {
         .unwrap_or("unknown")
 }
 
-/// Extract MCP tool entries from the request body.
-fn extract_mcp_entries(body: &[u8]) -> Vec<serde_json::Value> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Vec::new();
+/// Move MCP tool entries out of the parsed request body for resolution.
+fn extract_mcp_entries(value: &mut serde_json::Value) -> ExtractedMcpEntries {
+    let Some(tools) = value.get_mut("tools").and_then(serde_json::Value::as_array_mut) else {
+        return ExtractedMcpEntries {
+            values: Vec::new(),
+            tool_indices: Vec::new(),
+        };
     };
 
-    let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
-    };
+    extract_mcp_entries_from_tools(tools)
+}
 
-    tools
-        .iter()
-        .filter(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("mcp"))
-        .cloned()
-        .collect()
+/// Move MCP entries out of a complete mixed tools array.
+fn extract_mcp_entries_from_tools(tools: &mut [serde_json::Value]) -> ExtractedMcpEntries {
+    let mut values = Vec::new();
+    let mut tool_indices = Vec::new();
+    for (index, tool) in tools.iter_mut().enumerate() {
+        if tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp") {
+            tool_indices.push(index);
+            values.push(tool.take());
+        }
+    }
+    ExtractedMcpEntries { values, tool_indices }
 }
 
 /// Extract `allowed_tools` from an MCP tool entry.
@@ -2909,53 +3070,33 @@ impl AllowedTools {
 }
 
 /// Check `previous_tools` for a cached listing matching
-/// `server_label` and `server_url`.
+/// `server_label` and the exact `server_url`.
 ///
-/// When the cached entry has `server_url`, both label and
-/// URL must match. When the cached entry lacks `server_url`
-/// (real `mcp_list_tools` output items from the API omit
-/// it), label-only matching is used.
-///
-/// # Safety of label-only matching
-///
-/// Real `mcp_list_tools` items in the API response carry
-/// `server_label` and `tools` but not `server_url`.
-/// Label-only matching is safe because:
-///
-/// 1. Tool dispatch uses the current request's `server_url`, so stale tools fail safely at call time.
-/// 2. When the cached entry _does_ carry `server_url` (e.g. enriched by a future storage layer), exact URL matching
-///    applies automatically.
+/// A listing without `server_url` has no target identity and
+/// must not be reused. Public API `mcp_list_tools` items lack the URL,
+/// so legacy listings cause a fresh `tools/list` request.
 ///
 /// Requires `allowed_tools` to be `Some` and verifies the
 /// cache covers all named tools. Returns `None` for
 /// unrestricted entries because the cached listing may be
 /// a filtered subset from a previous response.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "cache matching binds target, owner, allowlist, and connector URL policy"
-)]
 fn find_cached_listing(
     previous_tools: Option<&Vec<serde_json::Value>>,
     label: &str,
     server_url: &str,
     owner_fingerprint: Option<&str>,
     allowed_tools: Option<&[String]>,
-    require_url_match: bool,
 ) -> Option<Vec<serde_json::Value>> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
 
-    let entry = previous.iter().find(|pt| {
-        let label_matches = pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label);
-        let url_ok = match pt.get("server_url").and_then(serde_json::Value::as_str) {
-            Some(cached_url) => cached_url == server_url,
-            None => !require_url_match,
-        };
-        let cached_owner_fingerprint = pt
-            .get(super::mcp_dispatch::OWNER_FINGERPRINT)
-            .and_then(serde_json::Value::as_str);
-        let owner_matches = cached_owner_fingerprint == owner_fingerprint;
-        label_matches && url_ok && owner_matches
+    let entry = previous.iter().rev().find(|pt| {
+        pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label)
+            && pt.get("server_url").and_then(serde_json::Value::as_str) == Some(server_url)
+            && pt
+                .get(super::mcp_dispatch::OWNER_FINGERPRINT)
+                .and_then(serde_json::Value::as_str)
+                == owner_fingerprint
     })?;
 
     let cached_tools = entry.get("tools").and_then(serde_json::Value::as_array)?;
@@ -3011,6 +3152,10 @@ fn tool_read_only_hint(tool: &serde_json::Value) -> bool {
 
 /// Insert resolved tools into the tool map keyed by
 /// `(server_label, tool_name)`, consuming the definitions.
+#[expect(
+    clippy::too_many_lines,
+    reason = "explicit map construction moves tool definitions while preserving dispatch metadata"
+)]
 fn insert_tools(
     tools: Vec<serde_json::Value>,
     entry: &serde_json::Value,
@@ -3021,10 +3166,10 @@ fn insert_tools(
         .get("server_url")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let headers = entry.get("headers").cloned();
-    let authorization = entry.get("authorization").cloned();
-    let require_approval = entry.get("require_approval").cloned();
-    let connector_id = entry.get("connector_id").cloned();
+    let headers = entry.get("headers");
+    let authorization = entry.get("authorization");
+    let require_approval = entry.get("require_approval");
+    let connector_id = entry.get("connector_id");
 
     for tool in tools {
         let tool_name = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned);
@@ -3033,17 +3178,29 @@ fn insert_tools(
         };
 
         let key = (label.to_owned(), tool_name);
-        tool_map.insert(
-            key,
-            serde_json::json!({
-                "server_label": label,
-                "server_url": server_url,
-                "headers": headers,
-                "authorization": authorization,
-                "require_approval": require_approval,
-                "connector_id": connector_id,
-                "tool_definition": tool,
-            }),
+        let mut dispatch = serde_json::Map::new();
+        dispatch.insert("server_label".to_owned(), serde_json::Value::String(label.to_owned()));
+        dispatch.insert(
+            "server_url".to_owned(),
+            serde_json::Value::String(server_url.to_owned()),
         );
+        dispatch.insert(
+            "headers".to_owned(),
+            headers.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "authorization".to_owned(),
+            authorization.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "require_approval".to_owned(),
+            require_approval.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "connector_id".to_owned(),
+            connector_id.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert("tool_definition".to_owned(), tool);
+        tool_map.insert(key, serde_json::Value::Object(dispatch));
     }
 }

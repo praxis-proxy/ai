@@ -89,6 +89,13 @@ pub(super) struct Reservation {
     pub(super) estimate: u64,
     /// Monotonic timestamp at admission, in milliseconds.
     pub(super) created_at_ms: u64,
+    /// Total committed usage in the window after this reservation was
+    /// placed (settled + active + this estimate). Exposed for the
+    /// filter's graduated tier evaluation (S1).
+    pub(super) usage_after: u64,
+    /// Remaining budget for this key after the reservation, smallest across
+    /// budgets. Reported as the rule's `budget_remaining` gauge.
+    pub(super) remaining: u64,
 }
 
 /// Result of attempting admission.
@@ -102,6 +109,8 @@ pub(super) enum Decision {
         retry_after_ms: u64,
         /// Bounded reason used for operational counters.
         reason: DenialReason,
+        /// Remaining budget for this key at the time of the denial.
+        remaining: u64,
     },
 }
 
@@ -263,30 +272,36 @@ impl Ledger {
             return Decision::Denied {
                 retry_after_ms: 0,
                 reason: DenialReason::InvalidKey,
+                remaining: 0,
             };
         }
 
-        let state = match self.keys.entry(key.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                if self
-                    .key_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-                        (count < self.config.max_keys).then_some(count + 1)
-                    })
-                    .is_err()
-                {
-                    return Decision::Denied {
-                        retry_after_ms: 0,
-                        reason: DenialReason::KeyCapacity,
-                    };
-                }
-                let state = Arc::new(Mutex::new(KeyState::default()));
-                entry.insert(Arc::clone(&state));
-                state
-            },
+        let entry = loop {
+            if let Some(entry) = self.keys.get(key) {
+                break entry;
+            }
+            match self.keys.entry(key.to_owned()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {},
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .key_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                            (count < self.config.max_keys).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                            remaining: 0,
+                        };
+                    }
+                    let state = Arc::new(Mutex::new(KeyState::default()));
+                    entry.insert(state);
+                },
+            }
         };
-        let mut state = match state.lock() {
+        let mut state = match entry.value().lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -296,15 +311,21 @@ impl Ledger {
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
 
-        if self
-            .config
-            .budgets
-            .iter()
-            .any(|budget| state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate) > budget.capacity)
-        {
+        let mut max_usage = 0_u64;
+        let mut remaining = self.limit();
+        let mut exhausted = false;
+        for budget in &self.config.budgets {
+            let usage = state.usage_in_window(now_ms, budget.window_ms);
+            remaining = remaining.min(budget.capacity.saturating_sub(usage));
+            let usage = usage.saturating_add(estimate);
+            max_usage = max_usage.max(usage);
+            exhausted |= usage > budget.capacity;
+        }
+        if exhausted {
             return Decision::Denied {
                 retry_after_ms: state.retry_after_ms(now_ms, &self.config),
                 reason: DenialReason::WindowCapacity,
+                remaining,
             };
         }
         if self
@@ -317,6 +338,7 @@ impl Ledger {
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
                 reason: DenialReason::ReservationCapacity,
+                remaining,
             };
         }
 
@@ -330,10 +352,13 @@ impl Ledger {
         );
         self.reservations.insert(id, key.to_owned());
         drop(state);
+        drop(entry);
         Decision::Admitted(Reservation {
             id,
             estimate,
             created_at_ms: now_ms,
+            usage_after: max_usage,
+            remaining: remaining.saturating_sub(estimate),
         })
     }
 
@@ -431,7 +456,10 @@ impl Ledger {
     reason = "ledger tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{Arc, Barrier, mpsc},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -476,6 +504,65 @@ mod tests {
             .filter(|ok| *ok)
             .count();
         assert_eq!(admitted, 10, "exactly the capacity should be admitted");
+    }
+
+    #[test]
+    fn cleanup_cannot_remove_a_key_while_reserve_holds_its_map_entry() {
+        let ledger = Arc::new(ledger(&[(1_000, 10)]));
+        ledger
+            .keys
+            .insert("alice".into(), Arc::new(Mutex::new(KeyState::default())));
+        ledger.key_count.store(1, Ordering::Relaxed);
+
+        // `reserve` keeps this same DashMap entry guard while locking and
+        // changing KeyState, so cleanup must not remove its key in-between.
+        let entry = ledger.keys.get("alice").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleanup_ledger = Arc::clone(&ledger);
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cleanup_ledger.cleanup(0, 1);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(entry);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(ledger.key_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_reclaims_an_idle_key_while_a_busy_sibling_remains() {
+        let l = Ledger::new(LedgerConfig {
+            budgets: vec![Budget {
+                window_ms: 100,
+                capacity: 10,
+            }],
+            reservation_timeout_ms: 50,
+            max_keys: 2,
+            max_key_length: 256,
+            max_active_reservations: 32,
+        })
+        .unwrap();
+        let idle = match l.reserve("idle", 1, 0) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert!(matches!(l.reconcile(idle.id, Some(1), 0), Settlement::Applied { .. }));
+        let busy = match l.reserve("busy", 1, 150) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert!(matches!(l.reconcile(busy.id, Some(1), 150), Settlement::Applied { .. }));
+        assert_eq!(l.key_count(), 2);
+        let _ = l.cleanup(200, 16);
+        assert_eq!(
+            l.key_count(),
+            1,
+            "idle keys past the window must be reclaimed even when a busy sibling is present"
+        );
     }
 
     #[test]
@@ -763,5 +850,22 @@ mod tests {
         ));
         assert_eq!(l.active_count(), 0, "the stale sibling must be reaped too");
         assert_eq!(l.reconcile(stale.id, Some(1), 150), Settlement::Noop);
+    }
+
+    #[test]
+    fn decisions_carry_the_remaining_balance_of_the_key_they_decided() {
+        let l = ledger(&[(60_000, 100)]);
+        let Decision::Admitted(first) = l.reserve("alice", 30, 1_000) else {
+            panic!("30 of 100 must be admitted");
+        };
+        assert_eq!(first.remaining, 70, "100 minus the 30 just reserved");
+        let Decision::Denied { remaining, .. } = l.reserve("alice", 80, 1_000) else {
+            panic!("80 does not fit in the remaining 70");
+        };
+        assert_eq!(remaining, 70, "a denial reports the balance it was checked against");
+        let Decision::Admitted(bob) = l.reserve("bob", 10, 1_000) else {
+            panic!("bob has a fresh budget");
+        };
+        assert_eq!(bob.remaining, 90, "keys are independent");
     }
 }

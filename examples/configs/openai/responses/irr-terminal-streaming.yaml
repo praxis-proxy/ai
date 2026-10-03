@@ -35,10 +35,8 @@ listeners:
 filter_chains:
   - name: responses-terminal-stream
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: reject
-
-      - filter: openai_responses_validate
 
       - filter: iterative_request_router
         initial_step: inference

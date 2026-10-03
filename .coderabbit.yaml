@@ -1,0 +1,707 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review configuration for this repository. Tracked here so
+# the review behavior is reviewed like any other change to the project.
+#
+# The review policy and the conventions shared across the organization
+# live in praxis-proxy/coderabbit, which CodeRabbit applies to every
+# repository in the organization. `inheritance: true` merges that
+# configuration with this one; without it, this file would replace it
+# entirely. Only guidance specific to this repository's layout belongs
+# here.
+#
+# Inherited from praxis-proxy/coderabbit: the review profile, the policy
+# that CodeRabbit never approves, gates, or authors code, tool
+# de-duplication against CI, the knowledge base, and the **/*, **/*.rs,
+# **/Cargo.toml, and .github/workflows/** instructions.
+#
+# Merge behavior: a scalar defined here wins, objects deep-merge, and
+# path_instructions entries are deduplicated by path — an entry here
+# with the same path as an organization-wide entry replaces it rather
+# than adding to it. To avoid clobbering the inherited baseline, this
+# file never defines the four inherited paths above; it only adds
+# narrower, repository-specific globs that supplement them.
+#
+# CodeRabbit supplements human review; it does not replace it. Every
+# contributor remains responsible for the code they submit, per the Code
+# Responsibility section of .github/CONTRIBUTING.md.
+
+inheritance: true
+
+reviews:
+  auto_review:
+    # This repository's Git workflow stacks fixup commits on the PR
+    # branch for review feedback (never amend; squash-merge flattens
+    # them). The default pause after 5 reviewed commits would stop
+    # re-reviewing exactly those fixups, so raise the threshold to keep
+    # incremental review active across a fixup stack. Only this sub-key
+    # is set; the org's other auto_review settings deep-merge intact.
+    auto_pause_after_reviewed_commits: 20
+
+  # Recorded provider responses are large and mechanically maintained;
+  # reviewing them produces no signal. Cargo.lock, target/, and assets/
+  # are already excluded organization-wide.
+  path_filters:
+    - "!tests/integration/fixtures/inference/recordings/**"
+
+  path_instructions:
+    # ---------------------------------------------------------------
+    # Cross-cutting apis/ conventions
+    # ---------------------------------------------------------------
+    - path: "apis/src/**"
+      instructions: |
+        Comments answer WHY, not WHAT. Flag comments that narrate runtime
+        behavior ("parse the config", "reject the request", "skip this
+        filter") — that narration belongs in a tracing::debug!/trace!/info!
+        call, not a comment (see .github/CONTRIBUTING.md, Comments vs Tracing).
+
+    - path: "apis/src/json_body.rs"
+      instructions: |
+        Flag callers or changes that set Content-Length after a body
+        replacement (core repairs framing via mutated_request_body_len), and
+        any pre-commit length check that serializes the value twice or
+        clones/buffers the body instead of using the non-allocating
+        serialized_len / two-step serialize_json_body + commit.
+
+    - path: "apis/src/promotion.rs"
+      instructions: |
+        Shared body-derived promotion gate that every classifier/agentic/
+        inference filter relies on. Flag raising or bypassing
+        MAX_PROMOTED_VALUE_LEN (256), weakening is_safe_promoted_value /
+        is_promotable_value (control-character and header-safety checks), or
+        widening the overwritable namespaces so a client-supplied value can
+        land in an internal x-praxis-* header.
+
+    - path: "apis/src/http_hop.rs"
+      instructions: |
+        is_hop_by_hop is the shared RFC 9110 hop-by-hop predicate. Flag adding
+        path-specific denylist entries (Host, Content-Length, cookies, internal
+        x-praxis-* prefixes) here — those are not hop-by-hop and belong in each
+        caller. Outbound header-copy paths must strip Connection-nominated
+        fields before dropping Connection itself; flag a copy path that skips
+        this predicate.
+
+    # ---------------------------------------------------------------
+    # OpenAI API surface
+    # ---------------------------------------------------------------
+    - path: "apis/src/openai/**"
+      instructions: |
+        When a change reads, classifies, validates, transforms, stores,
+        rehydrates, streams, proxies, or synthesizes an OpenAI or OpenResponses
+        payload, check it against the authoritative contract before approving.
+        Local authority (vendored, pinned): docs/conformance/specs/
+        openai-openapi.yaml. Live authorities: the OpenAI API reference
+        (https://platform.openai.com/docs/api-reference/responses and
+        .../responses-streaming) and the source schema
+        (https://raw.githubusercontent.com/openai/openai-openapi/refs/heads/master/openapi.yaml);
+        OpenResponses (https://github.com/openresponses/openresponses/blob/main/public/openapi/openapi.json).
+        When OpenAI and OpenResponses differ, judge against the contract this
+        code claims to implement. Treat an unjustified divergence from the spec
+        as a major issue.
+
+        Verify: endpoint paths, HTTP methods, and content types; field names,
+        types, required/optional, nullability, defaults, and open- vs
+        closed-enum handling (items, tools, tool_choice, reasoning, usage,
+        error/status, lifecycle); for SSE, event names, ordering, sequence
+        numbers/ids, delta shapes, terminal events, malformed-frame handling,
+        and usage reporting; persistence/replay/rehydration and multi-round
+        response identity; forward compatibility with unknown fields (pass
+        through, do not drop); synthesized output stays schema-valid on BOTH
+        success and error paths; fixtures/coverage stay truthful to the spec.
+
+        Praxis validates only fields it needs for proxy-owned behavior; flag
+        re-validation of provider-owned concerns (parameter ranges, model
+        availability, role ordering, prompt shape) that the backend should
+        reject.
+
+        Changes here require SDK-level integration tests exercised through the
+        OpenAI client, added or extended under tests/integration/sdk/openai/
+        (e.g. test_openai_conversations.py, test_openai_responses_vllm.py).
+
+    - path: "apis/src/openai/sse/**"
+      instructions: |
+        This is the per-event Responses SSE codec hot path (frame, event,
+        parser). Flag full-response buffering: SSE handling must use
+        BodyMode::Stream and process events incrementally, never accumulating
+        the whole body. Flag per-event allocations (String/Vec, to_string,
+        to_vec, format!) or clones of chunk/event data in the parse/emit loop;
+        borrow the input slice, reuse a scratch buffer, or move completed
+        buffers instead.
+
+        Flag any SseFrameParser state retained across chunks (line, data, or
+        event buffers) that is not added to buffered_bytes() and checked by
+        check_buffer_limit; every retained byte — including
+        String::from_utf8_lossy expansion of event: values — must count toward
+        max_buffer_bytes or the parser can be driven to unbounded memory.
+
+        Terminal handling is fail-closed by contract. Flag changes that let a
+        stream validate as complete without a terminal lifecycle or
+        stream-level error event, that stop returning EventAfterTerminal for
+        events after a terminal state, or that surface the [DONE] sentinel as a
+        typed event or count it against max_events.
+
+    - path: "apis/src/openai/responses/**"
+      instructions: |
+        While https://github.com/praxis-proxy/ai/issues/32 remains open and
+        the asynchronous Responses lifecycle is unavailable locally, the
+        gateway-owned path (openai_responses_validate,
+        openai_responses_request) must return an OpenAI 400 for create
+        requests with background: true after logical provider binding.
+        Once that lifecycle is implemented, review it against the issue's
+        contract instead of requiring this rejection. Do not flag the
+        openai_responses_format classifier preserving background as routing
+        metadata, nor a provider-owned/direct passthrough (e.g. http-passthrough)
+        that forwards background=true unchanged to a native OpenAI backend —
+        that preservation is intentional; rejection is deliberately deferred to
+        the gateway-owned stage.
+
+        Validate only fields the proxy needs to route or transform.
+        Provider-owned concerns (parameter ranges, model availability, role
+        ordering, prompt shape) must pass through unchanged for the backend to
+        reject, not be re-validated here.
+
+    - path: "apis/src/openai/responses/store/**"
+      instructions: |
+        Keep persistence durable-before-observable: the record must be upserted
+        synchronously (block_in_place + Handle::block_on) before the completed
+        response is released to the client, so a following DELETE cannot race
+        the upsert. Flag async/fire-and-forget persistence or releasing the
+        final chunk before the upsert.
+
+        Locally owned endpoints (GET/DELETE, persistence, rehydrate) must
+        reject with 500 on store-init failure and never fall through to the
+        upstream.
+
+    - path: "apis/src/openai/responses/agentic_loop/**"
+      instructions: |
+        Flag agentic-loop or IRR re-entry changes that iterate tool rounds
+        without a hard bound (max rounds / max_tool_calls): the loop must
+        terminate deterministically. Flag re-entry that re-echoes prior input
+        without capture-once semantics — it must not re-emit accumulated echo
+        across rounds.
+
+    - path: "apis/src/openai/responses/stream_events/**"
+      instructions: |
+        Flag streaming accumulation that grows without the configured byte/item
+        budget (fail-closed + sticky), any path that forwards a private lowered
+        client-tool shape to the client instead of restoring the canonical
+        typed item, and malformed-SSE handling that continues open rather than
+        failing the logical stream closed.
+
+    # ---------------------------------------------------------------
+    # Anthropic API surface
+    # ---------------------------------------------------------------
+    - path: "apis/src/anthropic/**"
+      instructions: |
+        When a change reads, validates, transforms (in either direction),
+        streams, proxies, or synthesizes an Anthropic Messages payload, check it
+        against the authoritative contract before approving. Local authority
+        (vendored, pinned): docs/conformance/specs/anthropic-spec.json. Live
+        authority: the Anthropic Messages API reference
+        (https://platform.claude.com/docs/en/api/messages and
+        https://platform.claude.com/docs/en/api/messages-create). Treat an
+        unjustified divergence from the spec as a major issue.
+
+        Verify: the /v1/messages endpoint, method, and content type; on the
+        native Anthropic passthrough path (protocol filter, Anthropic backend)
+        the required, anthropic-version, and anthropic-beta headers are
+        preserved (a gateway default may be injected when absent) and never
+        silently dropped or rewritten, but when translating to a different
+        provider wire format (e.g. Chat Completions) intentional removal of
+        Anthropic-only headers such as anthropic-version and of credential
+        headers such as x-api-key is expected — do not flag it; field names,
+        types, required/optional, and nullability; content-block, tool_use,
+        tool_result, thinking, citation, document, image, and usage shapes;
+        stop_reason values and error/status mapping; for streaming, event names,
+        ordering, delta shapes, keepalive/ping, terminal events, malformed-frame
+        handling, and mid-stream disconnect/early-error; bidirectional
+        translation round-trips (including unknown fields passed through, not
+        dropped); synthesized output stays schema-valid on BOTH success and
+        error paths.
+
+        Praxis validates only fields it needs for proxy-owned behavior; flag
+        re-validation of provider-owned concerns (parameter ranges, model
+        availability, message/role ordering) that the backend should reject.
+
+        Changes here require SDK-level integration tests exercised through the
+        Anthropic client, added or extended under
+        tests/integration/sdk/anthropic/ (e.g.
+        test_anthropic_error_formatter.py).
+
+    - path: "apis/src/anthropic/messages_to_chat_completions_stream/**"
+      instructions: |
+        This streaming translator must convert SSE incrementally under
+        BodyMode::Stream. Flag buffering the full upstream stream before
+        emitting, or clone/to_vec/to_string of per-chunk SSE data rather than
+        borrowing or moving completed buffers.
+
+        Per-response streaming state lives in a stringly-typed metadata map.
+        Flag new tool-block, text-block, token, or buffer state that is not
+        bounded by max_tool_blocks / max_partial_event_bytes, and any
+        partial-line or split-UTF-8 buffering not carried and capped across
+        chunks. The transform must fail closed on malformed SSE.
+
+    - path: "apis/src/anthropic/validate/**"
+      instructions: |
+        Validate only fields the proxy itself needs to route or transform. Flag
+        added validation of provider-owned concerns (parameter ranges, model
+        availability, message/role ordering) that the backend should reject.
+
+    # ---------------------------------------------------------------
+    # Request classification
+    # ---------------------------------------------------------------
+    - path: "apis/src/classifier/**"
+      instructions: |
+        The classifier must stay a pure, I/O-free function that parses the
+        request body JSON exactly once and returns ClassifiedRequest. Flag
+        added I/O, async, network/filesystem access, mutable global state, or
+        repeated body parsing. Detection precedence (Responses > Anthropic
+        Messages > Chat Completions > UnknownJson > InvalidJson > NonJson) must
+        remain deterministic.
+
+        Flag mutation of the caller's parsed body or use of the move-out
+        take_string on the shared borrowed path (classify_object must
+        copy_string); classification is a coarse presence check and must never
+        empty a field the client sent, nor be relied on for per-entry
+        validation.
+
+    # ---------------------------------------------------------------
+    # Provider request/response translation (data ownership)
+    # ---------------------------------------------------------------
+    - path: "apis/src/azure/**"
+      instructions: |
+        Provider translation to/from the Azure OpenAI wire format. Flag
+        clone/to_vec/to_string/full-body buffering of request, response, or
+        streaming-chunk data used only for local control flow — borrow parsed
+        fields or move completed buffers. Translate only fields the proxy must
+        reshape; let the backend reject provider-owned concerns (parameter
+        ranges, model availability, role ordering).
+
+    - path: "apis/src/vertex/**"
+      instructions: |
+        Provider translation to/from the Vertex AI Gemini wire format. Flag
+        clone/to_vec/to_string/full-body buffering of request, response, or
+        streaming-chunk data used only for local control flow — borrow parsed
+        fields or move completed buffers. Translate only fields the proxy must
+        reshape; let the backend reject provider-owned concerns.
+
+    # ---------------------------------------------------------------
+    # Outbound callouts and secret-bearing apis/ code
+    # ---------------------------------------------------------------
+    - path: "apis/src/web_search/**"
+      instructions: |
+        Search-provider callouts must go through the bound
+        FilteredSubrequestExecutor/SubRequestClient chain (SSRF/DNS/Host
+        binding, admission control) — flag a direct HTTP client that bypasses
+        it. Enforce the response-size backstop (MAX_SEARCH_RESPONSE_BYTES); flag
+        reading an unbounded provider response body. The provider API key is a
+        SecretString: flag ExposeSecret into a tracing/log macro or storing the
+        key as a plain String.
+
+    - path: "apis/src/mcp_client/**"
+      instructions: |
+        Flag pooled-session reuse that does not honor the atomic checkout guard
+        (unpark() compare_exchange, is_closed, is_expired_at, and payload_limit
+        match) before issuing a call, and any outbound MCP exchange that
+        bypasses the bound FilteredSubrequestExecutor chain or its
+        response-size backstop — the transport relies on that chain for
+        SSRF/DNS/Host binding and on per-exchange TransportSignal capture so an
+        SSRF/ResponseTooLarge signal cannot leak across calls.
+
+        Flag secrets reaching logs/traces: pool_session_key, target
+        fingerprints, tokens, or credentials must never be written via
+        tracing/log macros. The empty target-fingerprint "do not pool" sentinel
+        must return None (no pool key) and never flow into the transport as a
+        real key. Flag pool/cache keys that omit filter-specific or
+        security-relevant inputs (config identity, credential scope, chain
+        binding): omission causes cross-config session reuse.
+
+    - path: "apis/src/callout_credentials.rs"
+      instructions: |
+        Captured credential/assertion slots must be typed SecretString and
+        their source ingress headers must be stripped so they never reach any
+        upstream — flag a slot stored as a plain String, an ingress credential
+        header that is not removed, or an assertion slot injected into a request
+        other than its configured connector. Flag any tracing/log macro that
+        emits a slot value or a source-header value bound to a secret.
+
+    # ---------------------------------------------------------------
+    # Persisted-state layer (tenant isolation, SSRF, TLS)
+    # ---------------------------------------------------------------
+    - path: "store/src/url_security.rs"
+      instructions: |
+        Store connection-host SSRF gate. DNS hostnames, localhost, loopback,
+        private, link-local, and unspecified addresses must be rejected by
+        default unless the narrow allow_private_database_url opt-in is set, and
+        host validation must re-run on every connection attempt (not cached at
+        construction) to defend against DNS rebinding. Flag weakening either
+        property.
+
+    - path: "store/src/factory.rs"
+      instructions: |
+        Flag a config selecting a store backend not compiled into the binary
+        being accepted at request time instead of rejected while the pipeline is
+        built — backend availability must fail closed at build, not at the first
+        request.
+
+    - path: "store-backends/**"
+      instructions: |
+        For per-tenant data-row queries against the response, conversation,
+        item, and approval tables, flag any statement (SELECT/UPDATE/DELETE/CAS/
+        upsert) that does not scope by the full owner identity tenant_id AND
+        owner_issuer AND owner_subject — a data-row query missing any owner
+        column is a cross-tenant leak. Do not flag schema, migration, DDL, or
+        introspection statements against tables with no owner columns by design
+        (the *_schema_version SELECT/INSERT, CREATE TABLE/INDEX, PRAGMA
+        table_info, and pragma_index_* queries). Flag list/sweep queries without
+        a bound LIMIT, and any body- or user-derived value interpolated into the
+        SQL string via format!/AssertSqlSafe instead of being passed as a bound
+        ? parameter.
+
+    - path: "store-backends/src/postgres*.rs"
+      instructions: |
+        Preserve the certificate-authentication compliance profile. When
+        require_certificate_authentication is set, PgTlsConfig::validate must
+        fail closed at from_config before any traffic is served. Flag weakening
+        of: ssl_mode must be verify-full; both ssl_client_cert and
+        ssl_client_key present; database_url must not carry a password, TLS
+        query params (sslmode/sslrootcert/…), or non-addressing params
+        (application_name/options/statement-cache-capacity); PGPASSWORD must be
+        unset; ssl_client_key must be a filesystem path (never inline secret),
+        reject ".." traversal, be unencrypted PKCS#8, and be Unix mode 0600.
+        Connections must be rebuilt via PgConnectOptions::new_without_pgpass
+        with addressing + TLS fields only so ~/.pgpass cannot inject a password.
+
+    # ---------------------------------------------------------------
+    # Filter conventions (classify -> route -> branch)
+    # ---------------------------------------------------------------
+    - path: "filters/src/**"
+      instructions: |
+        Filters follow classify -> route -> branch: classifier filters promote
+        facts to internal x-praxis-ai-* headers, and routing matches those
+        headers to select clusters. Flag filters that re-derive facts another
+        filter already promoted.
+
+        A new filter must be registered in praxis_ai_filters::register_ai_filters
+        (filters/src/register.rs) and ship with an example config and unit
+        tests, per docs/developing/adding-filters.md.
+
+    - path: "filters/src/routing/**"
+      instructions: |
+        Routers select clusters by matching facts other filters promoted to
+        x-praxis-ai-* headers/metadata, not by re-parsing the body — flag
+        re-derivation. Preserve the precedence that MCP tool-name metadata
+        (mcp.method/mcp.name) is matched before the client model header — flag a
+        change that lets a client-supplied model name override or hijack MCP
+        tool routing. A credential reference selected here must be consumed only
+        by credential_inject, never injected directly.
+
+    - path: "filters/src/routing/credential_inject.rs"
+      instructions: |
+        Must strip the incoming Authorization, x-api-key, and every configured
+        injection-header value BEFORE setting the selected credential, and set
+        exactly one provider credential header (Authorization: Bearer for
+        bearer_token, or the configured header for apikey) — flag a path that
+        forwards a caller-supplied credential header or sets more than one. The
+        credential-map values are secrets: flag any tracing/log macro that emits
+        the token or credential name. Act only on a credential reference written
+        by an authorized upstream routing filter (intelligent_route/
+        provider_route) in filter metadata; flag trusting a client-supplied
+        credential selector.
+
+    - path: "filters/src/inference/**"
+      instructions: |
+        Follow classify -> route -> branch: match on facts other filters
+        promoted to x-praxis-ai-* headers/metadata rather than re-deriving
+        them. Validate every promoted header/metadata value against the
+        256-byte limit and reject control characters before propagation.
+
+        A model/body-to-header promotion filter must queue removal of its own
+        client-supplied header before promoting (anti-spoofing, even when the
+        body carries no value), must not promote before end_of_stream, and must
+        target only headers validated as safe (reject x-api-key, credential,
+        framing/hop-by-hop, and internal x-praxis-* names).
+
+        iterative_request_router resets filter metadata per step for credential
+        isolation (only extensions persist). Flag any filter that reads
+        classifier metadata without ensuring the classifier re-runs inside its
+        own step — classifier metadata does not survive across router steps.
+
+    - path: "filters/src/identity_guard/**"
+      instructions: |
+        Every request header matching the configured prefix must be stripped
+        from the upstream request (so trusted-auth-layer identity headers never
+        leak to LLM providers) and surfaced to downstream filters only via
+        filter_metadata — flag a matched header forwarded upstream, or a
+        captured value promoted to a header instead of metadata. Keep the prefix
+        configurable, never hardcoded.
+
+    # ---------------------------------------------------------------
+    # Agentic protocol filters
+    # ---------------------------------------------------------------
+    - path: "filters/src/agentic/**"
+      instructions: |
+        Agentic filters (json_rpc, mcp, a2a) must enforce a 256-byte length
+        limit and reject control characters on every value promoted to a
+        header, filter metadata, or filter result BEFORE promotion, and bound
+        body parsing with a configurable max_body_bytes under
+        BodyMode::StreamBuffer. Flag unbounded or unsanitized body-derived
+        promotions. These filters are always compiled — flag adding a cargo
+        feature gate. MCP outbound transport must sanitize request-provided MCP
+        authorization/headers, not follow redirects, and only allow loopback
+        via its narrow opt-in.
+
+    - path: "filters/src/agentic/mcp/**"
+      instructions: |
+        Flag promotion of body-derived MCP values (Mcp-Method, Mcp-Name,
+        session ID) to upstream headers without validating them against
+        config.header_validation (mismatch/synthesize policy; invalid UTF-8
+        must fail closed), and JSON-RPC handling that does not enforce
+        max_batch_size and max_body_bytes.
+
+    # ---------------------------------------------------------------
+    # Outbound callout filters (SSRF boundary, fail-closed)
+    # ---------------------------------------------------------------
+    - path: "filters/src/callout/**"
+      instructions: |
+        This is the outbound SSRF boundary. Any callout must: default to public
+        addresses with a narrowly named private opt-in (e.g.
+        allow_private_addresses) and flag any default flip toward permissive;
+        resolve the target once per connection attempt and, only when that
+        opt-in is unset (AddressPolicy::PublicOnly), reject the ENTIRE resolved
+        address set if any address is private/loopback/link-local/unspecified, at
+        both build and execute time (validate_configured_http_target /
+        AddressPolicy::from_allow_private) — do not flag the conditional
+        !policy.allows_private() guard or an intentional AllowPrivate caller or
+        config/test that enables the opt-in; disable ambient HTTP
+        proxies and never follow redirects (no Location fetch); reject URL
+        userinfo; rebind Host to the target authority; and drop hop-by-hop and
+        other disallowed forward headers (is_disallowed_forward_header +
+        connection_nominates_header). Flag dropping the max_depth check.
+        Require tests covering loopback/private/link-local, mixed DNS answers,
+        redirects, userinfo rejection, and credential non-disclosure.
+
+    - path: "filters/src/guardrails/**"
+      instructions: |
+        The NeMo guardrails callout must reach its endpoint through the
+        configured outbound_chain, forward no downstream request headers by
+        default, never follow redirects, gate any private/loopback endpoint
+        behind allow_private_upstreams, and honor the IRR-capped deadline.
+
+        A pass verdict legitimately returns Continue and forwards the body
+        unchanged — do not flag it. Flag only a block verdict or an
+        evaluation/transport error (timeout, network failure, malformed provider
+        response) that returns Continue without failing closed: the request
+        phase must Reject and the response phase must replace the body through
+        fit_to_committed_length. Flag response-body replacement that does not go
+        through fit_to_committed_length; a replacement whose length differs from
+        the committed Content-Length corrupts framing. (The redact verdict
+        currently forwards unchanged pending #49 — a known gap, not a
+        regression.)
+
+    # ---------------------------------------------------------------
+    # Cloud-credential filters (experimental, secret-bearing)
+    # ---------------------------------------------------------------
+    - path: "filters/src/aws/**"
+      instructions: |
+        SigV4 signing must use the system OpenSSL SHA-256/HMAC-SHA256 path, not
+        the sha2/hmac crates (FIPS parity) — flag pure-Rust crypto reintroduced
+        here. The AWS secret access key, session token, and derived signing key
+        are secrets: flag any tracing/log macro that emits them.
+        x-amz-content-sha256 must be computed over the exact body that is
+        forwarded; flag a signed body that differs from the forwarded body, and
+        flag dropping x-amz-security-token when temporary credentials are used.
+        Keep region/service/host as configuration, never hardcoded.
+
+    - path: "filters/src/gcp/**"
+      instructions: |
+        Registers only under the off-by-default gcp-adc-filter (experimental)
+        cargo feature — flag registering it unconditionally or dropping the
+        gate. The GCE/GKE metadata endpoint (link-local 169.254.169.254) is the
+        one sanctioned link-local/loopback exception to the SSRF ban; keep the
+        metadata host/path pinned and do not extend the exception to configured
+        hosts. Bearer tokens and service-account key material are secrets: flag
+        any tracing/log macro that emits the access token, private key, or
+        key-file contents. Token caching must honor expiry; flag serving a
+        stale/expired token.
+
+    - path: "filters/src/azure/**"
+      instructions: |
+        Registers only under the off-by-default azure-ad-filter (experimental)
+        cargo feature — flag registering it unconditionally or dropping the gate
+        so default praxis-ai-proxy builds link it. The Entra ID client secret
+        and acquired bearer token are secrets — flag any tracing/log macro that
+        emits them. Token acquisition is cache-through (not refresh-ahead); flag
+        serving a cached token past its expiry or logging the client-credentials
+        response.
+
+    # ---------------------------------------------------------------
+    # Metering and token accounting
+    # ---------------------------------------------------------------
+    - path: "filters/src/metering/**"
+      instructions: |
+        The metering response hook must run AFTER token_count extraction; since
+        hooks run in reverse, metering must be declared BEFORE token_count in
+        the chain — flag example configs or ordering assertions that place it
+        after. It reads token counts from the token.input/token.output/
+        token.total/token.cache_read/token.cache_write filter_metadata keys;
+        flag reading a renamed/other key, and flag emitting a CloudEvent when
+        those keys are absent instead of skipping explicitly.
+
+    - path: "filters/src/token_usage/stream_usage/**"
+      instructions: |
+        Flag include_usage injection that targets anything other than a
+        normalized Chat Completions path (the Responses API rejects
+        include_usage), that rewrites a stream_options value which is present
+        but not an object/null instead of leaving provider-invalid input for
+        the upstream, or that mutates the body without going through
+        replace_json_body.
+
+    - path: "filters/src/token_rate_limit/**"
+      instructions: |
+        Settlement/state recording must call the existing
+        record_settlement_metrics, record_accounting_settlement, and
+        record_state_metrics helpers in mod.rs rather than open-coding an
+        equivalent or pasting the telemetry.update block. Flag metric labels
+        that are unbounded or that conflate distinct outcomes: an outage (503),
+        an auth miss (401), and a rate-limit denial (429) must stay separable,
+        and label values must come from a bounded set. Any new or changed
+        metric family must be documented in the config.rs metric contract and
+        in docs/architecture/opentelemetry.md, and gauge aggregation must match
+        the backend (Valkey/fleet-wide = max, in-memory/per-process = sum).
+
+        Flag injected tier signals that trust client input: header names an
+        inject tier writes (e.g. x-gateway-inference-fairness-id) must be
+        stripped from the incoming request before injection, and reserved/
+        hop-by-hop names (host, content-length, transfer-encoding) must be
+        rejected as configured tier header names.
+
+    - path: "filters/src/token_rate_limit/ledger.rs"
+      instructions: |
+        This is the per-request reserve/reconcile hot path. Flag process-wide
+        Mutex use and full-map rescans on every request. Flag the TOCTOU
+        pattern where an Arc<Mutex<KeyState>> is cloned out of a DashMap Entry
+        and the shard lock is released before the KeyState lock is
+        (re)acquired — cleanup can evict the key in the gap; keep the operation
+        under a single guard. Flag unbounded expired-reservation sweeps (reap
+        over all keys/reservations): they block on large keyspaces and
+        fail-close concurrent reserves with 503, so require a bounded
+        LIMIT/batch per pass.
+
+    - path: "filters/src/token_rate_limit/lua/**"
+      instructions: |
+        Flag hand-rolled base-1e9 (or any multi-limb) bignum arithmetic across
+        these scripts: Redis/Valkey INCRBY already maintains signed 64-bit
+        integers atomically, so accumulate with INCRBY instead of duplicating
+        bignum math per script. Flag unbounded key scans or expired-entry
+        sweeps inside a script — a single blocking call over a large keyspace
+        stalls Valkey for all clients; require SCAN/COUNT or an explicit
+        per-call LIMIT.
+
+    # ---------------------------------------------------------------
+    # Config modeling and binary wiring
+    # ---------------------------------------------------------------
+    - path: "**/config.rs"
+      instructions: |
+        Config deserialization structs must make invalid states
+        unrepresentable at parse time: use #[serde(rename_all="snake_case")]
+        enums instead of String for fixed value sets; a struct with
+        #[serde(deny_unknown_fields)] instead of HashMap/BTreeMap for known
+        keys; one N-variant enum instead of N Option<T> fields where exactly
+        one must be set; #[serde(default="fn")] on a concrete type instead of
+        Option<T> always resolved via unwrap_or; and #[serde(try_from="u16")]
+        for constrained numerics. Apply #[serde(deny_unknown_fields)] unless the
+        struct is an intentional open extension point. Flag violations.
+
+    - path: "server/src/**"
+      instructions: |
+        This is the binary entry point. A new AI filter must be registered via
+        register_ai_filters and reachable in the resolved pipeline. The
+        ResponseStoreRegistry is injected as a per-pipeline PipelineExtension
+        built fresh per pipeline build so dynamic reload swaps it cleanly — flag
+        store/registry state that is not per-pipeline, or references held across
+        a pipeline swap. Flag enabling admin-api/config-reload implicitly rather
+        than via the explicit praxis feature gates the proxy must turn on.
+
+    - path: "integrations/llmd/**"
+      instructions: |
+        The llm-d ext_proc compatibility layer is llm-d-only and publish=false.
+        Default praxis-ai-proxy builds must not link, register, or expose the
+        ext_proc filter — it registers only under the llmd-ext-proc feature.
+        Flag changes that make ext_proc a general-purpose Envoy extension point,
+        register it unconditionally, or drop publish=false.
+
+    # ---------------------------------------------------------------
+    # Tests
+    # ---------------------------------------------------------------
+    - path: "tests/integration/fixtures/inference/**"
+      instructions: |
+        A change in inference transformation behavior must update the scenario,
+        its focused tests, and tests/integration/fixtures/inference/coverage.yaml
+        (feature, scope, scenario, provider, and status links) in the same
+        change.
+
+        The generated coverage block in the fixture README is produced by
+        cargo xtask sync-inference-readme; flag hand edits to it. The manifest
+        is the coverage inventory, so the README should not enumerate Rust test
+        function names.
+
+        Recordings must retain truthful provider, model, and provenance
+        metadata.
+
+    - path: "tests/integration/sdk/**"
+      instructions: |
+        For protocol-conformance tests, cite the specific RFC number and
+        section in the test name or module/function docstring, and include the
+        IETF datatracker URL for the referenced RFC (these are Python pytest
+        files, so use a plain URL in the docstring, not a rustdoc link). Put an
+        invariant's explanation in the assert message (the second argument to
+        assert) so it prints on failure rather than in an inline comment.
+
+    - path: "tests/integration/tests/suite/**"
+      instructions: |
+        Flag tautological tests that would still pass if the code under test
+        were deleted — e.g. a test wired to a fixed backend (Backend::fixed)
+        that returns 200 regardless of request, so it never exercises
+        evaluate_tiers/routing/settlement logic. Require assertions on the
+        captured backend request(s) (headers injected, body forwarded,
+        tier/denial outcome), not merely a canned status code.
+
+    # ---------------------------------------------------------------
+    # Example configs
+    # ---------------------------------------------------------------
+    - path: "examples/configs/**"
+      instructions: |
+        A new or renamed example config needs a functional integration test in
+        tests/integration/tests/suite/examples/ and an entry in
+        examples/README.md.
+
+    - path: "examples/configs/token-rate-limit*.yaml"
+      instructions: |
+        Flag comments that contradict the config's actual behavior — e.g. a
+        comment saying a rule "never blocks" while a deny tier or the
+        algorithm's capacity still returns 429, or a described threshold that
+        differs from the numeric value. The prose must match what the
+        tiers/algorithm/limits actually do.
+
+    # ---------------------------------------------------------------
+    # Docs and build (must track code)
+    # ---------------------------------------------------------------
+    - path: "docs/architecture/opentelemetry.md"
+      instructions: |
+        Flag statements about span names, span lifetime/model, emitted
+        attributes, or metric families that no longer match the emitting code
+        (filters/apis). When span attributes or metric families are added,
+        changed, or removed, this file must be updated in the same change; a doc
+        claim the code contradicts is a defect.
+
+    - path: "{Makefile,Containerfile.fips,docs/developing/fips.md}"
+      instructions: |
+        Flag any FIPS test invocation or documentation that sets OPENSSL_CONF to
+        a repo-relative path: OpenSSL silently ignores a config file it cannot
+        find, so the test then passes under the default (non-FIPS) provider.
+        Require an absolute OPENSSL_CONF plus a provider-active assertion (e.g.
+        `openssl list -providers` shows fips, or the test asserts FIPS-approved
+        default properties and MD5 refusal) so a run that never reached the FIPS
+        provider fails instead of passing. Flag provider-active FIPS tests that
+        run only on developer machines and not in CI.

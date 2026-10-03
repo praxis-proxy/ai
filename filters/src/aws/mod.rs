@@ -3,6 +3,7 @@
 
 //! AWS-specific filters (request signing, and future AWS integrations).
 
+mod signing;
 mod sigv4;
 
 pub use sigv4::Sigv4SignFilter;

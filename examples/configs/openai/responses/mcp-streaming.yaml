@@ -58,14 +58,12 @@ listeners:
 filter_chains:
   - name: mcp-streaming-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
-
-      - filter: openai_responses_validate
 
       - filter: openai_tool_parse
 

@@ -6,7 +6,7 @@ use praxis_filter::{HttpFilter, HttpFilterContext};
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
     filter::AiGuardrailsFilter,
-    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult},
+    providers::GuardResult,
 };
 
 // =============================================================================
@@ -679,44 +679,10 @@ async fn on_request_body_modified_rewrites_all_user_messages() {
     );
 }
 
-/// Provider that returns one configured verdict.
-struct FixedGuard(GuardResult);
-
-/// Provider that rewrites message 0 to a fixed mask.
-struct RedactContent(&'static str);
-
-#[async_trait::async_trait]
-impl GuardProvider for FixedGuard {
-    async fn evaluate(
-        &self,
-        _messages: Vec<serde_json::Value>,
-        _phase: GuardPhase,
-        _runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, praxis_filter::FilterError> {
-        Ok(self.0.clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl GuardProvider for RedactContent {
-    async fn evaluate(
-        &self,
-        _messages: Vec<serde_json::Value>,
-        _phase: GuardPhase,
-        _runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, praxis_filter::FilterError> {
-        Ok(GuardResult::redact_message(0, self.0.to_owned(), "pii".into()))
-    }
-}
-
 #[tokio::test]
 async fn on_request_body_modified_without_user_message_fails_closed() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(FixedGuard(GuardResult::redact_message(
-            0,
-            "masked".into(),
-            "pii".into(),
-        ))),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "masked".into(), "pii".into()),
         PhaseConfig::default(),
     )
     .expect("test filter");
@@ -739,12 +705,8 @@ async fn on_request_body_modified_without_user_message_fails_closed() {
 
 #[tokio::test]
 async fn on_request_body_modified_refuses_non_string_content() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(FixedGuard(GuardResult::redact_message(
-            0,
-            "masked".into(),
-            "pii".into(),
-        ))),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "masked".into(), "pii".into()),
         PhaseConfig::default(),
     )
     .expect("test filter");
@@ -1579,8 +1541,8 @@ async fn on_response_body_modified_rewrites_assistant_content() {
 /// completion with HTTP 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_expanded_redaction_fails_closed() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(RedactContent("[REDACTED]")),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
         PhaseConfig {
             request: false,
             response: true,
@@ -1619,8 +1581,8 @@ async fn on_response_body_expanded_redaction_fails_closed() {
 /// still parse and must not keep the upstream secret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(RedactContent("[REDACTED]")),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
         PhaseConfig {
             request: false,
             response: true,
@@ -1654,8 +1616,8 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
 /// original completion tokens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_modified_clears_logprobs() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(RedactContent("[REDACTED]")),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
         PhaseConfig {
             request: false,
             response: true,
@@ -1714,12 +1676,8 @@ async fn on_response_body_modified_clears_logprobs() {
 /// with an `evaluation_failed` document and must not forward the original text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_redaction_failure_replaces_body() {
-    let filter = AiGuardrailsFilter::with_provider(
-        Box::new(FixedGuard(GuardResult::redact_message(
-            0,
-            "[REDACTED]".into(),
-            "pii".into(),
-        ))),
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
         PhaseConfig {
             request: false,
             response: true,

@@ -46,9 +46,10 @@ on:
         default: "120"
         type: string
       max_model_len:
-        description: vLLM --max-model-len (context window).
+        description: >-
+          vLLM --max-model-len. Keep at least 32768 for Claude Code auto mode.
         required: false
-        default: "16384"
+        default: "32768"
         type: string
       instance_type:
         description: EC2 GPU instance type.
@@ -154,7 +155,8 @@ jobs:
               --enable-auto-tool-choice \
               --tool-call-parser hermes \
               --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.9
+              --gpu-memory-utilization 0.97 \
+              --enforce-eager
           ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$MODEL" "$SERVED_MODEL_NAME" "$MAX_MODEL_LEN" "${gpu_args[@]}" \
             > /tmp/vllm-launch.log 2>&1 &
           echo $! > /tmp/vllm-launch.pid

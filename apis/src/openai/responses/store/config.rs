@@ -3,17 +3,46 @@
 
 //! Configuration types for the response store filter.
 
+use std::num::{NonZeroU32, NonZeroU64};
+
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use crate::store::StoreCompressionConfig;
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
+
+/// Default cap on the number of SSE events retained in a streamed response's
+/// replay log.
+pub(crate) const DEFAULT_MAX_EVENT_COUNT: NonZeroU32 = match NonZeroU32::new(10_000) {
+    Some(count) => count,
+    // 10_000 is non-zero, so this arm is unreachable.
+    None => NonZeroU32::MIN,
+};
+
+/// Default cap (16 MiB) on the total payload bytes retained in a streamed
+/// response's replay log.
+pub(crate) const DEFAULT_MAX_EVENT_BYTES: NonZeroU64 = match NonZeroU64::new(16 * 1024 * 1024) {
+    Some(bytes) => bytes,
+    // 16 MiB is non-zero, so this arm is unreachable.
+    None => NonZeroU64::MIN,
+};
+
+/// Serde default for [`ResponseStoreConfig::max_event_count`].
+const fn default_max_event_count() -> NonZeroU32 {
+    DEFAULT_MAX_EVENT_COUNT
+}
+
+/// Serde default for [`ResponseStoreConfig::max_event_bytes`].
+const fn default_max_event_bytes() -> NonZeroU64 {
+    DEFAULT_MAX_EVENT_BYTES
+}
 
 // -----------------------------------------------------------------------------
 // StorageBackend
@@ -112,8 +141,9 @@ pub(crate) struct ResponseStoreConfig {
     ///
     /// By default, DNS names, localhost, loopback, private,
     /// link-local, cloud metadata, unspecified, and Unix socket
-    /// targets are rejected. This opt-in is intended for local
-    /// development and tests.
+    /// targets are rejected. This opt-in is intended for local development
+    /// and tests; cloud metadata, unspecified, and multicast addresses remain
+    /// blocked when it is enabled.
     #[serde(default)]
     pub allow_private_database_url: bool,
 
@@ -131,6 +161,21 @@ pub(crate) struct ResponseStoreConfig {
     /// uncompressed records readable.
     #[serde(default)]
     pub compression: Option<StoreCompressionConfig>,
+
+    /// Maximum number of SSE events retained in a streamed response's replay
+    /// log (`GET /v1/responses/{id}?stream=true`).
+    ///
+    /// A stream that exceeds this stops event capture for that response, so its
+    /// terminal event is never recorded and the response becomes non-replayable.
+    /// The live client stream and the plain JSON record are unaffected.
+    #[serde(default = "default_max_event_count")]
+    pub max_event_count: NonZeroU32,
+
+    /// Maximum total payload bytes retained in a streamed response's replay log.
+    ///
+    /// Same over-budget behavior as `max_event_count`.
+    #[serde(default = "default_max_event_bytes")]
+    pub max_event_bytes: NonZeroU64,
 }
 
 #[cfg(feature = "store-postgres")]
@@ -235,21 +280,6 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Re-validate only the `PostgreSQL` host/IP portions of the
-/// connection URL immediately before `SQLx` resolves and connects.
-///
-/// Full config validation runs once at construction time in
-/// [`validate_config`]. This narrower check guards against DNS
-/// rebinding between validation and connection by re-checking
-/// the SSRF-sensitive host rules on every retry without
-/// redundantly re-validating immutable fields (table names, SSL
-/// config, URL scheme).
-#[cfg(feature = "store-postgres")]
-pub(crate) fn revalidate_postgres_host(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
-    let database_url = cfg.database_url.expose_secret();
-    postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
-}
-
 /// Validate `PostgreSQL` TLS options.
 #[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
@@ -286,14 +316,21 @@ fn reject_postgres_fields(cfg: &ResponseStoreConfig) -> Result<(), FilterError> 
 
 /// Return whether a SQLite URL targets an in-memory database.
 fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    url.split_once('?')
-        .map_or("", |(_, query)| query)
-        .split('&')
-        .any(|param| param == "mode=memory")
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Extract the file path component from a SQLite URL.

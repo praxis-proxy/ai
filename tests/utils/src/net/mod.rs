@@ -19,9 +19,9 @@ pub use backend::{
     HttpBackendEvent, HttpBackendGuard, HttpServerAction, RoutedBackend, StatefulBackend, StatefulBackendGuard,
     StatefulCapturingBackend, StatefulCapturingGuard, WsBackendEvent, WsBackendGuard, WsServerAction, start_backend,
     start_backend_v6, start_backend_with_shutdown, start_capturing_backend, start_echo_backend,
-    start_header_echo_backend, start_scripted_http_backend, start_scripted_http_backend_turns,
-    start_scripted_websocket_backend, start_scripted_websocket_backend_turns, start_stateful_backend,
-    start_uri_echo_backend,
+    start_header_echo_backend, start_keepalive_backend, start_scripted_http_backend, start_scripted_http_backend_turns,
+    start_scripted_websocket_backend, start_scripted_websocket_backend_turns, start_slow_backend,
+    start_stateful_backend, start_uri_echo_backend,
 };
 #[cfg(feature = "llmd-ext-proc")]
 pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};
@@ -33,7 +33,8 @@ pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_por
 pub use postgres::{PostgresCertAuthGuard, PostgresGuard, start_postgres, start_postgres_cert_auth};
 pub use simulator::{SimulatorGuard, start_simulator, start_simulator_with_model};
 pub use tls::{
-    ClientCert, TestCertificates, https_get, https_send, start_mtls_backend, start_tcp_echo_backend,
-    start_tcp_tagged_backend, start_tls_backend, tls_connection_rejected, tls_send_recv, wait_for_https, wait_for_tls,
+    ClientCert, TestCertificates, ensure_crypto_provider, https_get, https_send, start_mtls_backend,
+    start_tcp_echo_backend, start_tcp_tagged_backend, start_tls_backend, start_tls_backend_from_pem,
+    tls_connection_rejected, tls_send_recv, wait_for_https, wait_for_tls,
 };
 pub use wait::{wait_for_http, wait_for_http2, wait_for_tcp};

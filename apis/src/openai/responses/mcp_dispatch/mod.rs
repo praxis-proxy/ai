@@ -93,17 +93,6 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
-/// Maximum `mcp_approval_response` items accepted in one resume request.
-///
-/// A round may emit several `mcp_approval_request` items (batched or parallel
-/// tool calls), each persisted as its own server-owned pending record. Those are
-/// resumed one per follow-up request: a resume turn legitimately carries a single
-/// approval. Capping the batch bounds the fail-closed work per request and keeps
-/// the server-owned consume query within `PostgreSQL`'s 16-bit Bind parameter
-/// ceiling (it binds two scoping params plus one per approval id), which an
-/// unbounded batch could otherwise overflow into an HTTP 500.
-const MAX_APPROVAL_RESPONSES: usize = 1;
-
 /// Whether this internally resolved tool entry names a configured connector.
 ///
 /// Optional fields are serialized into the tool map as JSON `null`, so field
@@ -147,6 +136,9 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// receive ambient request headers. Credential headers are rejected; use the
 /// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
+    /// Per-filter namespace preventing sessions from crossing dispatcher
+    /// configuration boundaries within one logical execution.
+    pool_namespace: mcp_client::McpPoolNamespace,
     /// Optional per-user bearer slot required for configured connectors.
     user_credential_slot: Option<String>,
     /// Optional opaque assertion slot required for configured connectors.
@@ -247,6 +239,7 @@ impl McpDispatchFilter {
     /// Assemble the filter from a validated config and a bound outbound pipeline.
     fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         Box::new(Self {
+            pool_namespace: mcp_client::McpPoolNamespace::new(),
             user_credential_slot: validated.user_credential.clone(),
             authorization_assertion_slot: validated.authorization_assertion.clone(),
             outbound_pipeline,
@@ -281,6 +274,7 @@ impl McpDispatchFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        session_pool: &mcp_client::McpSessionPool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -298,6 +292,8 @@ impl McpDispatchFilter {
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
             connector_identity,
+            session_pool,
+            pool_namespace: self.pool_namespace,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -414,14 +410,22 @@ impl McpDispatchFilter {
             if responses.is_empty() {
                 return Ok(());
             }
-            // Bound the batch before any store work. Each round's approvals are
-            // resumed one per follow-up request, so a resume carries a single
-            // approval; a larger batch is a client error and, left unbounded,
-            // could overflow PostgreSQL's 16-bit Bind parameter ceiling in the
-            // consume query.
-            if responses.len() > MAX_APPROVAL_RESPONSES {
+            // Bound the batch before any store work. A single model round can emit
+            // several `mcp_approval_request` items (batched or parallel tool
+            // calls), so a resume turn legitimately carries several matching
+            // `mcp_approval_response` items. The per-round MCP cap already bounds
+            // how many approvals one round could have emitted, so it is the
+            // natural ceiling for the resume batch: it keeps the fail-closed work
+            // per request finite and holds the server-owned pending-approval load
+            // query (`get_pending_approvals`, one `IN (...)` placeholder per
+            // approval id in a single statement) far under PostgreSQL's 16-bit Bind
+            // parameter ceiling (max_calls_per_round is capped at 1024, versus the
+            // ~65k parameter limit). A larger batch than one round could have
+            // produced is a client error.
+            let max_batch = self.max_calls_per_round;
+            if responses.len() > max_batch {
                 let e = ApprovalError::Malformed(format!(
-                    "a request may carry at most {MAX_APPROVAL_RESPONSES} mcp_approval_response item(s), but {} were supplied",
+                    "a request may carry at most {max_batch} mcp_approval_response item(s) (max_calls_per_round), but {} were supplied",
                     responses.len()
                 ));
                 warn!(error = %e.message(), "mcp_dispatch: rejecting oversized approval-response batch");
@@ -448,6 +452,24 @@ impl McpDispatchFilter {
                         warn!(error = %e.message(), "mcp_dispatch: rejecting malformed approval response");
                         return Err(approval_rejection(&e));
                     },
+                }
+            }
+            // Reject a repeated approval_request_id before any store access. Each
+            // proxy-issued mcp_approval_request carries a unique id, so a batch that
+            // names one twice is ambiguous (which verdict wins?) and a client
+            // error. Failing closed here is clearer than letting the atomic
+            // all-or-nothing consume roll back the whole batch and misreport the
+            // repeat as an "already used" replay, and it keeps the store queries
+            // duplicate-free.
+            let mut seen_ids = HashSet::with_capacity(inputs.len());
+            for input in &inputs {
+                if !seen_ids.insert(input.approval_id.as_str()) {
+                    let e = ApprovalError::Malformed(format!(
+                        "an mcp_approval_response batch must not repeat approval_request_id '{}'",
+                        input.approval_id
+                    ));
+                    warn!(error = %e.message(), "mcp_dispatch: rejecting duplicate approval-response id");
+                    return Err(approval_rejection(&e));
                 }
             }
             (inputs, previous_response_id)
@@ -791,6 +813,10 @@ impl HttpFilter for McpDispatchFilter {
         clippy::too_many_lines,
         reason = "deferred discovery and MCP execution share one request-body path"
     )]
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "request-body dispatch retains admitted call state across bounded async MCP execution"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -852,6 +878,16 @@ impl HttpFilter for McpDispatchFilter {
             None
         };
         self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+
+        // Fetch (or lazily create) the per-execution MCP session pool. It lives
+        // in the request's threaded `RequestExtensions`, so this same pool is
+        // shared across every agentic round and dropped — cancelling every idle
+        // session — when the request completes, is cancelled, or the pipeline is
+        // reloaded. The handle is a cheap `Arc` clone threaded into each call.
+        let session_pool = ctx
+            .extensions
+            .get_or_insert_with(mcp_client::McpSessionPool::new)
+            .clone();
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -939,6 +975,7 @@ impl HttpFilter for McpDispatchFilter {
                 &forwarded_headers,
                 &callout,
                 connector_identity.as_ref(),
+                &session_pool,
             )
             .await
         {
@@ -1405,6 +1442,11 @@ struct McpExecutionOptions<'a> {
     forwarded_headers: Option<&'a http::HeaderMap>,
     /// Request-scoped context injected only for configured connector entries.
     connector_identity: Option<&'a McpCalloutIdentity>,
+    /// Per-execution pool of initialized MCP sessions reused across rounds.
+    session_pool: &'a mcp_client::McpSessionPool,
+    /// Namespace unique to the dispatcher whose transport configuration opened
+    /// the session.
+    pool_namespace: mcp_client::McpPoolNamespace,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1690,7 +1732,12 @@ async fn execute_single_call(
         ));
     }
 
+    // The opaque key binds target identity to this dispatcher's outbound
+    // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
+    // key and therefore remain fail-closed and unpooled.
+    let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
     let result = mcp_client::call_tool_with_forwarded_headers(
+        session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
         authorization,

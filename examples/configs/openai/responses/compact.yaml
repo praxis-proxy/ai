@@ -47,15 +47,13 @@ listeners:
 filter_chains:
   - name: compact-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
-
-      - filter: openai_responses_validate
 
       - filter: openai_tool_parse
 

@@ -167,11 +167,56 @@ fn responses_function_call_output_preserved() {
 }
 
 // -----------------------------------------------------------------------------
-// Non-Responses Traffic
+// Chat Completions Traffic
 // -----------------------------------------------------------------------------
 
 #[test]
-fn non_responses_chat_body_passes_unchanged() {
+fn chat_completions_model_alias_reaches_upstream() {
+    let echo_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_yaml(proxy_port, echo_guard.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"codex-mini-latest","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+
+    assert_eq!(parse_status(&raw), 200, "chat completions should return 200");
+    let echoed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        echoed["model"].as_str(),
+        Some("llama-3.3-70b"),
+        "chat completions model should be rewritten to the alias target"
+    );
+    assert_eq!(
+        echoed["messages"][0]["content"].as_str(),
+        Some("Hi"),
+        "chat completions messages should be preserved"
+    );
+}
+
+#[test]
+fn chat_completions_default_model_reaches_upstream() {
+    let echo_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_yaml(proxy_port, echo_guard.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+
+    assert_eq!(parse_status(&raw), 200, "chat completions should return 200");
+    let echoed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        echoed["model"].as_str(),
+        Some("llama-3.3-70b"),
+        "default model should be injected for chat completions"
+    );
+}
+
+#[test]
+fn chat_completions_unknown_model_reaches_upstream_unchanged() {
     let echo_guard = start_echo_backend();
     let proxy_port = free_port();
 
@@ -185,7 +230,30 @@ fn non_responses_chat_body_passes_unchanged() {
     assert_eq!(
         parse_body(&raw),
         body,
-        "chat completions body should pass through unchanged"
+        "unaliased chat completions body should pass through unchanged"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Non-Create Traffic
+// -----------------------------------------------------------------------------
+
+#[test]
+fn non_create_body_passes_unchanged() {
+    let echo_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_yaml(proxy_port, echo_guard.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"codex-mini-latest","input":"Hi"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/embeddings", body));
+
+    assert_eq!(parse_status(&raw), 200, "embeddings should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        body,
+        "non-create traffic should pass through unchanged"
     );
 }
 

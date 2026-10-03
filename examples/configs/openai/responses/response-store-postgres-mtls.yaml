@@ -40,7 +40,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
 
       - filter: state_owner
         mode: single_tenant

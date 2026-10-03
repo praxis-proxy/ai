@@ -10,9 +10,9 @@
 //! Chat Completions clients work transparently.
 //!
 //! Streaming (SSE) responses are parsed per-chunk through the shared
-//! [`SseFrameParser`]; each
-//! completed frame's `data:` payload is stripped of Azure-specific
-//! fields and re-emitted as standard SSE.
+//! [`SseFrameParser`]; each completed frame's `data:` payload is parsed
+//! once, stripped of Azure-specific fields when present, and re-emitted
+//! as standard SSE.
 
 mod config;
 pub(crate) mod request;
@@ -41,6 +41,8 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 const RESPONSE_TRANSFORM_SSE: &str = "sse";
 /// Metadata key preserving the upstream error status for the body phase.
 const RESPONSE_STATUS_KEY: &str = "azureai_translation.response_status";
+/// OpenAI Chat Completions SSE sentinel that marks logical stream completion.
+const DONE_SENTINEL: &[u8] = b"[DONE]";
 
 /// Transforms requests targeting Azure OpenAI deployments into standard
 /// Chat Completions-compatible form and normalizes responses back.
@@ -179,7 +181,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream),
+            Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream)?,
             Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => {
                 transform_error_body(ctx, body);
             },
@@ -305,68 +307,90 @@ fn transform_success_body(body: &mut Option<Bytes>) {
 
 /// Process an SSE chunk: parse frames via [`SseFrameParser`], strip
 /// Azure-specific fields from each frame's data, and re-emit as SSE.
-fn strip_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
-    let Some(bytes) = body.as_ref() else {
-        if end_of_stream {
-            *body = Some(Bytes::new());
-        }
-        return;
-    };
-
+fn strip_sse_chunk(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+) -> Result<(), FilterError> {
     let Some(mut parser) = ctx.remove_filter_state::<SseFrameParser>() else {
-        return;
+        return Ok(());
     };
 
-    let frames = match parser.parse_chunk(bytes) {
-        Ok(frames) => frames,
-        Err(e) => {
-            debug!(error = %e, "SSE parse error in azureai_translation");
-            ctx.insert_filter_state(parser);
-            *body = Some(Bytes::new());
-            return;
+    let frames = match body.as_ref() {
+        Some(bytes) => match parser.parse_chunk(bytes) {
+            Ok(frames) => frames,
+            Err(e) => {
+                debug!(error = %e, "SSE parse error in azureai_translation");
+                return Err(FilterError::from(format!("azureai_translation: SSE parse error: {e}")));
+            },
         },
+        None => Vec::new(),
     };
 
-    if !end_of_stream {
+    if end_of_stream {
+        if parser.has_incomplete_frame() {
+            debug!("incomplete SSE frame at end of stream in azureai_translation");
+            return Err(FilterError::from(
+                "azureai_translation: incomplete SSE frame at end of stream",
+            ));
+        }
+    } else {
         ctx.insert_filter_state(parser);
     }
 
-    *body = Some(Bytes::from(rebuild_sse_frames(&frames)));
+    if body.is_some() || end_of_stream {
+        *body = Some(Bytes::from(rebuild_sse_frames(&frames)));
+    }
+
+    Ok(())
 }
 
 /// Serialize parsed [`SseFrame`]s back to SSE wire format, stripping
 /// Azure-specific fields from each data payload.
 fn rebuild_sse_frames(frames: &[SseFrame]) -> Vec<u8> {
-    const DONE_SENTINEL: &[u8] = b"[DONE]";
-
     let mut output = Vec::new();
     for frame in frames {
-        if frame.data.starts_with(DONE_SENTINEL) {
-            output.extend_from_slice(b"data: [DONE]\n\n");
-            continue;
-        }
-
-        if let Some(event) = &frame.event_type {
-            output.extend_from_slice(b"event: ");
-            output.extend_from_slice(event.as_bytes());
-            output.extend_from_slice(b"\n");
-        }
-
-        let stripped = response::strip_azure_fields(&frame.data);
-        let data = stripped.as_deref().unwrap_or(&frame.data);
-
-        // Drop async-filter annotation chunks. They have no `delta` or
-        // `finish_reason` and crash standard OpenAI SDKs.
-        if response::is_filter_only_chunk(data) {
-            debug!("dropping Azure async-filter annotation SSE chunk");
-            continue;
-        }
-
-        output.extend_from_slice(b"data: ");
-        output.extend_from_slice(data);
-        output.extend_from_slice(b"\n\n");
+        append_sse_frame(&mut output, frame);
     }
     output
+}
+
+/// Append one SSE frame.
+///
+/// Filter-only payloads skip the `data:` record, while a preceding `event:`
+/// line is still written (pre-existing behavior).
+fn append_sse_frame(output: &mut Vec<u8>, frame: &SseFrame) {
+    if frame.data.starts_with(DONE_SENTINEL) {
+        output.extend_from_slice(b"data: [DONE]\n\n");
+        return;
+    }
+
+    if let Some(event) = &frame.event_type {
+        output.extend_from_slice(b"event: ");
+        output.extend_from_slice(event.as_bytes());
+        output.extend_from_slice(b"\n");
+    }
+
+    match response::normalize_sse_payload(&frame.data) {
+        response::SsePayloadAction::Drop => {
+            // Preserve pre-existing output: an unterminated `event:` line
+            // with no `data:` record. Correcting that is out of scope here.
+            debug!("dropping Azure async-filter annotation SSE chunk");
+        },
+        response::SsePayloadAction::ForwardOriginal(data) => {
+            append_sse_data(output, data);
+        },
+        response::SsePayloadAction::ForwardRewritten(data) => {
+            append_sse_data(output, &data);
+        },
+    }
+}
+
+/// Append a `data:` field terminated by a blank line.
+fn append_sse_data(output: &mut Vec<u8>, data: &[u8]) {
+    output.extend_from_slice(b"data: ");
+    output.extend_from_slice(data);
+    output.extend_from_slice(b"\n\n");
 }
 
 // -----------------------------------------------------------------------------
@@ -653,6 +677,19 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_sse_frames_preserves_done_sentinel_with_event_type() {
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: b"[DONE]".to_vec(),
+        }];
+        let output = rebuild_sse_frames(&frames);
+        assert_eq!(
+            output, b"data: [DONE]\n\n",
+            "[DONE] must ignore event: and emit the same bytes as a bare sentinel"
+        );
+    }
+
+    #[test]
     fn rebuild_sse_frames_preserves_clean_event() {
         let data = br#"{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}]}"#;
         let frames = vec![SseFrame {
@@ -684,6 +721,89 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_sse_frames_forwards_malformed_payload() {
+        let data = b"not json {";
+        let frames = vec![SseFrame {
+            event_type: None,
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(
+            rebuilt, b"data: not json {\n\n",
+            "malformed JSON must be forwarded unchanged"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_preserves_event_type_on_rewritten_payload() {
+        let data = br#"{"choices":[{"delta":{"content":"Hi"},"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        let output = std::str::from_utf8(&rebuilt).unwrap();
+        assert!(
+            output.starts_with("event: message\ndata: "),
+            "event type should be re-emitted on rewritten payloads, got: {output}"
+        );
+        assert!(
+            !output.contains("content_filter_results"),
+            "Azure filter fields must still be stripped on named events"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_named_event_filter_only_chunk_matches_legacy_bytes() {
+        let data = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(
+            rebuilt, b"event: message\n",
+            "filter-only named events must keep the pre-existing unterminated event: line"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_filter_only_without_event_is_empty() {
+        let data = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: None,
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(rebuilt, b"", "filter-only chunks without event: must emit no bytes");
+    }
+
+    #[test]
+    fn rebuild_sse_frames_named_event_filter_only_then_clean_matches_legacy_bytes() {
+        let filter_only = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let content = br#"{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}]}"#;
+        let frames = vec![
+            SseFrame {
+                event_type: Some("message".to_owned()),
+                data: filter_only.to_vec(),
+            },
+            SseFrame {
+                event_type: None,
+                data: content.to_vec(),
+            },
+        ];
+        let rebuilt = rebuild_sse_frames(&frames);
+        let mut expected = b"event: message\n".to_vec();
+        expected.extend_from_slice(b"data: ");
+        expected.extend_from_slice(content);
+        expected.extend_from_slice(b"\n\n");
+        assert_eq!(
+            rebuilt, expected,
+            "unterminated event: from a filter-only frame must prefix the next record"
+        );
+    }
+
+    #[test]
     fn strip_sse_chunk_processes_multi_event_chunk() {
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
@@ -693,7 +813,7 @@ mod tests {
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"A\"},\"content_filter_results\":{}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"B\"},\"content_filter_results\":{}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let bytes = body.unwrap();
         let output = std::str::from_utf8(bytes.as_ref()).unwrap();
@@ -714,7 +834,7 @@ mod tests {
 
         let chunk1 = b"data: {\"choices\":[{\"delta\":{\"con";
         let mut body1 = Some(Bytes::from(chunk1.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false);
+        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
 
         assert!(
             ctx.get_filter_state::<SseFrameParser>().is_some(),
@@ -727,7 +847,7 @@ mod tests {
 
         let chunk2 = b"tent\":\"Hi\"},\"content_filter_results\":{}}]}\n\n";
         let mut body2 = Some(Bytes::from(chunk2.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false);
+        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -736,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_sse_chunk_drops_chunk_on_parse_error() {
+    fn strip_sse_chunk_returns_error_on_parse_error() {
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
         ctx.current_filter_id = Some(0);
@@ -746,21 +866,33 @@ mod tests {
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        let err = strip_sse_chunk(&mut ctx, &mut body, false).unwrap_err();
+        assert!(
+            err.to_string().contains("SSE parse error"),
+            "parse error should be returned as FilterError, got: {err}"
+        );
+        assert!(
+            ctx.get_filter_state::<SseFrameParser>().is_none(),
+            "parser should NOT be retained after a parse error"
+        );
+    }
 
-        let output_bytes = body.unwrap();
+    #[test]
+    fn strip_sse_chunk_returns_error_on_incomplete_frame_at_eof() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(SseFrameParser::new(65_536));
+
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"con";
+        let mut body = Some(Bytes::from(chunk.to_vec()));
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+
+        let mut eof_body = None;
+        let err = strip_sse_chunk(&mut ctx, &mut eof_body, true).unwrap_err();
         assert!(
-            output_bytes.is_empty(),
-            "parse error must drop the chunk instead of forwarding it unstripped"
-        );
-        let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
-        assert!(
-            !output.contains("content_filter_results"),
-            "Azure filter fields must not leak on parse error"
-        );
-        assert!(
-            ctx.get_filter_state::<SseFrameParser>().is_some(),
-            "parser should be retained after a parse error"
+            err.to_string().contains("incomplete SSE frame at end of stream"),
+            "incomplete trailing frame at EOF should return FilterError, got: {err}"
         );
     }
 
@@ -776,10 +908,10 @@ mod tests {
         let split_at = full_bytes.len() / 2;
 
         let mut body1 = Some(Bytes::from(full_bytes[..split_at].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false);
+        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
 
         let mut body2 = Some(Bytes::from(full_bytes[split_at..].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false);
+        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -804,7 +936,7 @@ mod tests {
         );
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
@@ -832,7 +964,7 @@ mod tests {
         let chunk = "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();

@@ -5,10 +5,19 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send, json_post,
-    parse_body, parse_status, start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config,
-    start_proxy,
+    Backend, McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send,
+    json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
+    start_mcp_mock_server_with_config, start_proxy,
 };
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Controlled loopback address used for runtime connection-failure tests.
+/// Their configs explicitly opt into private upstreams so the requests pass
+/// address validation without contacting an external service.
+const CONTROLLED_MCP_FAILURE_HOST: &str = "127.0.0.1";
 
 // =============================================================================
 // Pass-Through (no MCP tools)
@@ -135,12 +144,12 @@ fn mcp_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -153,12 +162,12 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -292,15 +301,12 @@ fn run_streaming_mcp_failure_with_yaml(
     let dead_port = free_port();
     let db = TempSqlite::new(test_name);
 
-    let yaml = build_yaml(proxy_port, backend.port(), db.url(), 500);
+    let yaml = with_private_upstreams(build_yaml(proxy_port, backend.port(), db.url(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
-    // discovery attempt reaches runtime I/O and fails (a runtime failure), not a
-    // local request-policy failure like SSRF.
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
@@ -742,12 +748,12 @@ fn authorization_with_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://192.0.2.1:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -768,12 +774,12 @@ fn mcp_tool_names_filter_object_accepted() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -820,6 +826,139 @@ fn mcp_tools_list_succeeds_against_mock_server() {
     assert!(
         mcp_server.method_count("tools/list") >= 1,
         "should have called tools/list on MCP server"
+    );
+}
+
+#[test]
+fn same_direct_url_reuses_persisted_listing() {
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let backend_body = r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#;
+    let backend = Backend::fixed(backend_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_same_target");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
+    let first_response: serde_json::Value = serde_json::from_str(&parse_body(&first)).unwrap();
+    let persisted_listing = first_response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "mcp_list_tools"))
+        .expect("first response should contain the persisted MCP listing");
+    assert!(
+        persisted_listing.get("server_url").is_none(),
+        "public listing must not expose the target URL"
+    );
+    let (get_status, get_body) = http_get(proxy.addr(), "/v1/responses/resp_previous", None);
+    assert_eq!(get_status, 200, "stored response should be retrievable");
+    assert!(
+        !get_body.contains(&mcp_url),
+        "retrieved response must not expose the private target URL"
+    );
+    let list_calls = mcp.method_count("tools/list");
+    assert!(list_calls >= 1, "first request should discover MCP tools");
+
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        list_calls,
+        "an unchanged direct target should reuse its persisted listing"
+    );
+}
+
+#[test]
+fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
+    let old_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let new_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let backend = Backend::fixed(
+        r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#,
+    )
+    .header("content-type", "application/json")
+    .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_target_identity");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let old_url = format!("http://127.0.0.1:{}/mcp", old_mcp.port());
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{old_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
+    assert!(
+        old_mcp.method_count("tools/list") >= 1,
+        "first direct URL should be resolved"
+    );
+
+    let new_url = format!("http://127.0.0.1:{}/mcp", new_mcp.port());
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{new_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    let new_list_calls = new_mcp.method_count("tools/list");
+    assert!(new_list_calls >= 1, "changed direct URL must fetch its own listing");
+    let continuation_response: serde_json::Value = serde_json::from_str(&parse_body(&continuation)).unwrap();
+    assert!(
+        continuation_response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "mcp_list_tools")
+            .all(|item| item.get("server_url").is_none()),
+        "public output must not expose either target URL"
+    );
+
+    let third = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+    assert_eq!(parse_status(&third), 200, "second continuation should succeed");
+    assert_eq!(
+        new_mcp.method_count("tools/list"),
+        new_list_calls,
+        "A → B → B with identical tool names should reuse B's private listing"
     );
 }
 
@@ -1378,6 +1517,19 @@ fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
     resolve_yaml_with_timeout(proxy_port, backend_port, 5000)
 }
 
+/// Enable loopback MCP targets for tests that deliberately exercise transport
+/// failures after address-policy validation.
+fn with_private_upstreams(yaml: String) -> String {
+    if yaml.contains("  allow_private_upstreams: true") {
+        return yaml;
+    }
+    yaml.replacen(
+        "insecure_options:\n",
+        "insecure_options:\n  allow_private_upstreams: true\n",
+        1,
+    )
+}
+
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
 /// store retrieval: `openai_response_store` runs pre-IRR, before
 /// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
@@ -1482,6 +1634,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }

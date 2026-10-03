@@ -17,6 +17,14 @@ fn default_config_parses() {
 }
 
 #[test]
+fn declares_dual_phase_body_access() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+}
+
+#[test]
 fn config_with_custom_timeout() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
@@ -191,9 +199,17 @@ fn config_with_custom_max_tools() {
 // MCP Entry Extraction
 // =========================================================================
 
+fn rewrite_tools_array_for_test(
+    mut tools: Vec<serde_json::Value>,
+    per_entry: Vec<EntryResolution>,
+) -> (Vec<serde_json::Value>, HashSet<String>) {
+    let mcp_entries = extract_mcp_entries_from_tools(&mut tools);
+    rewrite_tools_array(tools, mcp_entries, per_entry)
+}
+
 #[test]
 fn extract_mcp_entries_from_mixed_tools() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [
             {"type": "function", "name": "calc"},
@@ -202,42 +218,56 @@ fn extract_mcp_entries_from_mixed_tools() {
             {"type": "mcp", "server_label": "calendar", "server_url": "http://localhost:8002/mcp"}
         ]
     });
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let entries = extract_mcp_entries(&mut body);
 
-    assert_eq!(entries.len(), 2, "should extract 2 MCP entries");
+    assert_eq!(entries.values.len(), 2, "should extract 2 MCP entries");
     assert_eq!(
-        entries[0]["server_label"].as_str(),
+        entries.values[0]["server_label"].as_str(),
         Some("weather"),
         "first entry server_label"
     );
     assert_eq!(
-        entries[1]["server_label"].as_str(),
+        entries.values[1]["server_label"].as_str(),
         Some("calendar"),
         "second entry server_label"
+    );
+    assert_eq!(
+        entries.tool_indices,
+        vec![1, 3],
+        "original positions should be retained"
+    );
+    assert!(body["tools"][1].is_null(), "first MCP entry should be moved out");
+    assert!(body["tools"][3].is_null(), "second MCP entry should be moved out");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain in place");
+    assert_eq!(
+        body["tools"][2]["type"], "web_search",
+        "non-MCP tool should remain in place"
     );
 }
 
 #[test]
 fn extract_mcp_entries_empty_when_no_mcp() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [{"type": "function", "name": "calc"}]
     });
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should find no MCP entries");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain untouched");
 }
 
 #[test]
 fn extract_mcp_entries_handles_no_tools() {
-    let body = serde_json::json!({"input": "test"});
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let mut body = serde_json::json!({"input": "test"});
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should handle missing tools array");
 }
 
 #[test]
-fn extract_mcp_entries_handles_invalid_json() {
-    let entries = extract_mcp_entries(b"not json");
-    assert!(entries.is_empty(), "should handle invalid JSON");
+fn extract_mcp_entries_handles_non_object() {
+    let mut body = serde_json::json!(["not", "an", "object"]);
+    let entries = extract_mcp_entries(&mut body);
+    assert!(entries.is_empty(), "should handle a non-object request body");
 }
 
 // =========================================================================
@@ -257,7 +287,7 @@ fn cache_hit_when_all_allowed_tools_present() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed));
     assert!(result.is_some(), "should hit cache");
     assert_eq!(result.unwrap().len(), 2, "should return full cached listing");
 }
@@ -272,7 +302,7 @@ fn cache_miss_when_allowed_tool_not_in_cache() {
     })];
     let allowed = vec!["unknown_tool".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed));
     assert!(result.is_none(), "should miss cache for unknown tool");
 }
 
@@ -285,7 +315,7 @@ fn cache_miss_when_unrestricted_allowed_tools() {
         "tools": [{"name": "get_weather"}, {"name": "get_forecast"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, None);
     assert!(
         result.is_none(),
         "unrestricted entries must miss to avoid reusing partial listings"
@@ -301,7 +331,7 @@ fn cache_miss_when_unrestricted_widens_narrow_cached_listing() {
         "tools": [{"name": "get_weather"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, None);
     assert!(
         result.is_none(),
         "unrestricted must miss when cached listing is a narrow subset"
@@ -318,14 +348,14 @@ fn cache_miss_when_wrong_server_label() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "calendar", url, None, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "calendar", url, None, Some(&allowed));
     assert!(result.is_none(), "should miss cache for different server");
 }
 
 #[test]
 fn cache_miss_when_no_previous_tools() {
     let allowed = vec!["get_weather".to_owned()];
-    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", None, Some(&allowed), false);
+    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", None, Some(&allowed));
     assert!(result.is_none(), "should miss when no previous_tools");
 }
 
@@ -338,14 +368,7 @@ fn cache_miss_when_server_url_changed() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.99/mcp",
-        None,
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.99/mcp", None, Some(&allowed));
     assert!(
         result.is_none(),
         "should miss cache when server_url differs from cached entry"
@@ -362,7 +385,7 @@ fn cache_miss_when_continuation_changes_allowed_tools() {
     })];
     let new_allowed = vec!["get_forecast".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&new_allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&new_allowed));
     assert!(
         result.is_none(),
         "cache should miss when continuation requests a tool not in the cached listing"
@@ -387,7 +410,6 @@ fn cache_miss_for_connector_when_cached_entry_lacks_server_url() {
         "https://drive.example.com/mcp",
         None,
         Some(&allowed),
-        true,
     );
     assert!(
         result.is_none(),
@@ -405,7 +427,7 @@ fn cache_hit_for_connector_when_cached_entry_has_matching_url() {
     })];
     let allowed = vec!["search".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "drive", url, None, Some(&allowed), true);
+    let result = find_cached_listing(Some(&previous), "drive", url, None, Some(&allowed));
     assert!(result.is_some(), "exact URL match should hit cache");
 }
 
@@ -420,7 +442,7 @@ fn cache_hit_for_same_owner_fingerprint() {
     })];
     let allowed = vec!["search".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-a"), Some(&allowed), true);
+    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-a"), Some(&allowed));
 
     assert!(result.is_some(), "the same owner should reuse its cache entry");
 }
@@ -436,30 +458,23 @@ fn cache_miss_for_different_owner_fingerprint() {
     })];
     let allowed = vec!["search".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-b"), Some(&allowed), true);
+    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-b"), Some(&allowed));
 
     assert!(result.is_none(), "another owner must not reuse this cache entry");
 }
 
 #[test]
-fn cache_hit_for_direct_url_label_only_still_works() {
+fn cache_miss_for_direct_url_when_cached_entry_lacks_server_url() {
     let previous = vec![serde_json::json!({
         "server_label": "weather",
         "tools": [{"name": "get_weather"}]
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.5/mcp",
-        None,
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", None, Some(&allowed));
     assert!(
-        result.is_some(),
-        "direct URL entries should still use label-only matching"
+        result.is_none(),
+        "a direct URL must not reuse a listing without target identity"
     );
 }
 
@@ -616,7 +631,7 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -652,7 +667,7 @@ async fn rewritten_body_over_limit_rejected_with_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -679,7 +694,7 @@ async fn rewritten_body_under_limit_committed() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -825,15 +840,13 @@ fn write_state_creates_state_when_missing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
     let mut map = HashMap::new();
     map.insert(
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
     let context_policy = McpConnectorContextPolicy::new(Some("connector_bearer"), Some("connector_assertion"));
-    write_state(&mut ctx, &body_bytes, map, Vec::new(), context_policy.clone());
+    write_state(&mut ctx, body_json, map, Vec::new(), context_policy.clone());
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -859,9 +872,7 @@ fn write_state_updates_existing_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
-    let mut state = ResponsesState::from_request_body(body_json);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_response_id = Some("resp_existing".to_owned());
     ctx.extensions.insert(state);
 
@@ -872,7 +883,7 @@ fn write_state_updates_existing_state() {
     );
     write_state(
         &mut ctx,
-        &body_bytes,
+        body_json,
         map,
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -1177,24 +1188,17 @@ fn dedup_entries_rejects_malformed_allowed_tools() {
 // =========================================================================
 
 #[test]
-fn cache_hit_when_cached_entry_has_no_server_url() {
+fn cache_miss_when_cached_entry_lacks_target_identity() {
     let previous = vec![serde_json::json!({
         "server_label": "weather",
         "tools": [{"name": "get_weather"}]
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.5/mcp",
-        None,
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", None, Some(&allowed));
     assert!(
-        result.is_some(),
-        "real mcp_list_tools items lack server_url; label-only match"
+        result.is_none(),
+        "a listing without its original URL must not be reused"
     );
 }
 
@@ -1207,14 +1211,7 @@ fn cache_miss_when_same_label_different_server_url() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.99/mcp",
-        None,
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.99/mcp", None, Some(&allowed));
     assert!(
         result.is_none(),
         "different server_url with same label should not match"
@@ -1260,6 +1257,18 @@ fn has_credentials_with_headers() {
     let entry =
         serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "headers": {"x-key": "val"}});
     assert!(has_entry_credentials(&entry));
+}
+
+#[test]
+fn has_credentials_with_server_url_query() {
+    let entry = serde_json::json!({
+        "server_label": "s",
+        "server_url": "https://mcp.example/mcp?api_key=secret"
+    });
+    assert!(
+        has_entry_credentials(&entry),
+        "query parameters can carry credentials and must not enter reusable listings"
+    );
 }
 
 #[test]
@@ -1367,6 +1376,40 @@ fn dedup_entries_groups_same_label_url() {
     assert_ne!(
         mapping[0], mapping[2],
         "different servers should map to different tasks"
+    );
+}
+
+#[test]
+fn task_result_is_retained_only_until_its_final_consumer() {
+    let entry_to_task = [Some(0), Some(0), Some(1)];
+    let mut task_results = vec![
+        Some(vec![serde_json::json!({"name": "shared"})]),
+        Some(vec![serde_json::json!({"name": "unique"})]),
+    ];
+    let mut remaining_consumers = task_consumer_counts(&entry_to_task, task_results.len());
+
+    let first_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert!(first_shared.is_some(), "the first shared consumer receives a result");
+    assert!(
+        task_results[0].is_some(),
+        "the shared result remains owned until its final consumer"
+    );
+
+    let final_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert_eq!(
+        final_shared, first_shared,
+        "both shared consumers receive the same result"
+    );
+    assert!(
+        task_results[0].is_none(),
+        "the final shared consumer takes the stored result"
+    );
+
+    let unique = consume_task_result(1, &mut task_results, &mut remaining_consumers);
+    assert!(unique.is_some(), "the unique consumer receives its result");
+    assert!(
+        task_results[1].is_none(),
+        "a uniquely consumed result is moved immediately"
     );
 }
 
@@ -1678,8 +1721,6 @@ fn write_state_skips_state_creation_with_previous_response_id() {
         "previous_response_id": "resp_abc",
         "tools": [{"type": "mcp", "server_label": "w", "server_url": "http://10.0.0.5/mcp"}]
     });
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
     let mut map = HashMap::new();
     map.insert(
         ("w".to_owned(), "get_weather".to_owned()),
@@ -1687,7 +1728,7 @@ fn write_state_skips_state_creation_with_previous_response_id() {
     );
     write_state(
         &mut ctx,
-        &body_bytes,
+        body_json,
         map,
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -1712,7 +1753,7 @@ fn rewrite_tools_array_drops_resolved_empty_entry() {
     ];
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "resolved-empty MCP entry should be dropped");
     assert_eq!(rewritten[0]["name"], "calc", "function tool preserved");
@@ -1729,7 +1770,7 @@ fn rewrite_tools_array_preserves_passthrough_entry() {
     })];
     let per_entry = vec![EntryResolution::PassThrough];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "passthrough entry should be preserved");
     assert_eq!(rewritten[0]["type"], "mcp", "passthrough keeps original type");
@@ -1743,7 +1784,7 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
         &serde_json::json!({"name": "tool_a", "description": "A"}),
     )])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "one MCP entry → one function tool");
     assert_eq!(rewritten[0]["type"], "function");
@@ -1767,7 +1808,7 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
 fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [{
@@ -1778,13 +1819,12 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
             "headers": {"x-api-key": "another-secret"}
         }]
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
@@ -1816,7 +1856,7 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
 fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [
@@ -1833,8 +1873,6 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
             }
         ]
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     let per_entry = vec![
         EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
             "weather",
@@ -1845,7 +1883,8 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("mixed request must be rewritten");
 
@@ -1872,7 +1911,7 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     reason = "request fixture plus tool_choice normalization and survival assertions"
 )]
 fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_tools_empties() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [
@@ -1890,14 +1929,13 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
             "tools": [{"type": "mcp", "server_label": "weather"}]
         }
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     // The single MCP entry resolves to zero permitted tools.
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("resolved-empty entry must trigger a rewrite");
 
@@ -1991,7 +2029,7 @@ fn rewrite_tools_array_converts_mcp_to_function() {
         "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
     })]];
     let resolution = make_resolution(&raw);
-    let (rewritten, generated) = rewrite_tools_array(tools, resolution.per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, resolution.per_entry);
 
     assert_eq!(rewritten.len(), 2, "should have 2 tools");
     assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
@@ -2020,7 +2058,7 @@ fn rewrite_tools_array_preserves_unresolved_mcp() {
         "server_url": "http://10.0.0.99/mcp"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::PassThrough]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::PassThrough]);
 
     assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
     assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
@@ -2043,7 +2081,7 @@ fn rewrite_tools_array_sanitizes_deferred_connectors() {
         "require_approval": "never"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::SanitizeDeferred]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::SanitizeDeferred]);
 
     assert_eq!(rewritten.len(), 1);
     assert_eq!(rewritten[0]["type"], "mcp");
@@ -2098,7 +2136,7 @@ fn rewrite_tools_array_expands_multiple_tools() {
         ),
     ])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
     let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -2153,13 +2191,13 @@ fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
 #[test]
 fn mcp_list_tools_item_emits_responses_input_schema() {
     let listing = mcp_list_tools_item(
-        "weather",
-        &[serde_json::json!({
+        "weather".to_owned(),
+        vec![mcp_listing_tool_for_responses(&serde_json::json!({
             "name": "get_weather",
             "description": "Get weather",
             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
             "annotations": {"readOnlyHint": true}
-        })],
+        }))],
     );
 
     assert_eq!(listing["type"], "mcp_list_tools");
@@ -2423,10 +2461,9 @@ fn write_state_syncs_request_body_and_tools_on_existing_state() {
     });
     ctx.extensions.insert(ResponsesState::from_request_body(original_body));
 
-    let body_bytes = serde_json::to_vec(&rewritten_body_json()).unwrap();
     write_state(
         &mut ctx,
-        &body_bytes,
+        rewritten_body_json(),
         weather_tool_map(),
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -2466,7 +2503,7 @@ fn rewrite_per_entry_respects_allowed_tools_filter() {
         )]),
     ];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "each entry expands independently");
     assert_eq!(rewritten[0]["name"], "s__tool_a", "first entry only has tool_a");
@@ -3082,7 +3119,7 @@ async fn expanded_body_exceeding_limit_returns_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -3119,7 +3156,7 @@ async fn expanded_body_within_limit_continues() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -3160,7 +3197,7 @@ async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value
 /// accepted (the guard rejects strictly *over* the limit).
 #[tokio::test]
 async fn expanded_body_at_exact_limit_continues() {
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let cached = vec![serde_json::json!({
         "name": "get_weather", "description": "Get weather",
         "inputSchema": {"type": "object"},
@@ -5006,7 +5043,7 @@ fn streaming_failure_snapshot_uses_api_defaults_without_captured_options() {
     }
 }
 
-/// `capture_echoed_options` copies only the whitelisted request options -- never
+/// `capture_echoed_options` retains only the whitelisted request options -- never
 /// `input` or the credentialed `tools` array -- so nothing that could leak a
 /// secret or bloat the snapshot survives the capture.
 #[test]
@@ -5056,6 +5093,126 @@ fn capture_echoed_options_none_without_whitelisted_fields() {
         capture_echoed_options(b"not json").is_none(),
         "an unparseable body captures nothing"
     );
+    assert!(
+        capture_echoed_options(br#"{"model":"x"#).is_none(),
+        "truncated JSON captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"[]").is_none(),
+        "a non-object body captures nothing"
+    );
+}
+
+/// The cap applies to the serialized value size. A field ending exactly at the
+/// cap survives; one byte beyond it is omitted rather than truncated.
+#[test]
+fn capture_echoed_options_respects_serialized_size_boundary() {
+    for (payload_len, captured_expected) in [
+        (MAX_ECHOED_OPTIONS_BYTES - 3, true),
+        (MAX_ECHOED_OPTIONS_BYTES - 2, true),
+        (MAX_ECHOED_OPTIONS_BYTES - 1, false),
+    ] {
+        let instructions = "x".repeat(payload_len);
+        let body = serde_json::to_vec(&serde_json::json!({"instructions": instructions})).unwrap();
+        let captured = capture_echoed_options(&body);
+        assert_eq!(
+            captured.as_ref().and_then(|value| value["instructions"].as_str()),
+            captured_expected.then_some(instructions.as_str()),
+            "payload length {payload_len} must honor the serialized-size cap"
+        );
+    }
+}
+
+/// Whitelist order, rather than input JSON order, decides which of two fields
+/// fits. A skipped metadata value leaves room for a later small instruction.
+#[test]
+fn capture_echoed_options_preserves_whitelist_order_and_skips_individual_fields() {
+    let metadata = serde_json::json!({"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES - 64)});
+    let body = serde_json::to_vec(&serde_json::json!({
+        "instructions": "y".repeat(100),
+        "metadata": metadata,
+    }))
+    .unwrap();
+    let captured = capture_echoed_options(&body).expect("metadata fits independently");
+    assert_eq!(
+        captured["metadata"], metadata,
+        "metadata precedes instructions in the whitelist"
+    );
+    assert!(
+        captured.get("instructions").is_none(),
+        "the later field exceeds the aggregate cap"
+    );
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "metadata": {"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES)},
+        "instructions": "small",
+    }))
+    .unwrap();
+    let captured = capture_echoed_options(&body).expect("a later small field survives");
+    assert!(captured.get("metadata").is_none(), "the oversized field is skipped");
+    assert_eq!(
+        captured["instructions"], "small",
+        "capture continues after a skipped field"
+    );
+}
+
+/// A near-cap field can be transferred from the disposable parse tree without
+/// allocating a second copy of its string. Compare the complete capture path
+/// with the previous get-and-clone implementation on the same request bytes.
+#[test]
+fn capture_echoed_options_moves_near_cap_field_without_deep_clone() {
+    fn legacy_capture(body: &[u8]) -> Option<serde_json::Value> {
+        let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let obj = parsed.as_object()?;
+        let mut total = 0_usize;
+        let mut captured = serde_json::Map::new();
+        for &field in ECHOED_REQUEST_FIELDS {
+            let Some(value) = obj.get(field) else {
+                continue;
+            };
+            let len = serialized_len(value).unwrap_or(usize::MAX);
+            if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
+                continue;
+            }
+            total += len;
+            captured.insert(field.to_owned(), value.clone());
+        }
+        (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
+    }
+
+    for (field, value) in [
+        (
+            "instructions",
+            serde_json::json!("x".repeat(MAX_ECHOED_OPTIONS_BYTES - 2)),
+        ),
+        (
+            "metadata",
+            serde_json::json!({"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES - 64)}),
+        ),
+    ] {
+        let mut request = serde_json::Map::new();
+        request.insert(field.to_owned(), value);
+        let body = serde_json::to_vec(&serde_json::Value::Object(request)).unwrap();
+        assert_eq!(
+            capture_echoed_options(&body),
+            legacy_capture(&body),
+            "{field} capture remains equivalent"
+        );
+
+        let moved = allocation_counter::measure(|| {
+            drop(std::hint::black_box(capture_echoed_options(&body)));
+        });
+        let cloned = allocation_counter::measure(|| {
+            drop(std::hint::black_box(legacy_capture(&body)));
+        });
+        assert!(
+            cloned.bytes_total.saturating_sub(moved.bytes_total)
+                >= u64::try_from(MAX_ECHOED_OPTIONS_BYTES - 64).expect("cap fits in u64"),
+            "moving near-cap {field} must save its deep copy: moved={} cloned={} bytes",
+            moved.bytes_total,
+            cloned.bytes_total
+        );
+    }
 }
 
 /// A single oversized field (`instructions`) is dropped from the capture so it
@@ -5356,8 +5513,51 @@ fn list_tools_items(state: &ResponsesState) -> Vec<&serde_json::Value> {
 fn single_tool_listing(label: &str, tool_name: &str) -> McpListing {
     McpListing {
         server_label: label.to_owned(),
+        server_url: None,
         tools: vec![mcp_tool_to_list_tools_entry(&serde_json::json!({"name": tool_name}))],
     }
+}
+
+#[test]
+fn collect_resolutions_preserves_only_reusable_target_identity() {
+    let entries = vec![
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "direct",
+            "server_url": "https://direct.example/mcp"
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "credentialed",
+            "server_url": "https://credentialed.example/mcp",
+            "authorization": "secret"
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "connector",
+            "connector_id": "configured",
+            "server_url": "https://connector.example/mcp"
+        }),
+    ];
+    let task_results = vec![
+        Some(vec![serde_json::json!({"name": "direct_tool"})]),
+        Some(vec![serde_json::json!({"name": "credentialed_tool"})]),
+        Some(vec![serde_json::json!({"name": "connector_tool"})]),
+    ];
+
+    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], task_results)
+        .expect("valid entries resolve to listings");
+    let target_urls: Vec<_> = resolution
+        .listings
+        .iter()
+        .map(|listing| listing.server_url.as_deref())
+        .collect();
+
+    assert_eq!(
+        target_urls,
+        vec![Some("https://direct.example/mcp"), None, None],
+        "only direct listings without request-specific credentials are reusable"
+    );
 }
 
 /// A cached `weather` listing carrying one `get_weather` tool, as a
@@ -5384,7 +5584,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![cached_weather_listing(server_url)];
@@ -5402,6 +5602,11 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let tools = item["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1, "one discovered tool");
     assert_eq!(tools[0]["name"], "get_weather", "real MCP tool name");
+    assert!(
+        item.get("server_url").is_none(),
+        "public listing must not expose target URL"
+    );
+    assert_eq!(state.persisted_messages.last().unwrap()["server_url"], server_url);
     assert!(
         tools[0]["input_schema"]["properties"]["city"].is_object(),
         "tool input_schema surfaced"
@@ -5443,6 +5648,34 @@ fn commit_discovery_items_preserves_request_order() {
     );
 }
 
+#[test]
+fn commit_discovery_items_persists_cacheable_direct_target() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::from_request_body(
+        serde_json::json!({"model": "gpt-4o"}),
+    ));
+
+    commit_discovery_items(
+        &mut ctx,
+        vec![McpListing {
+            server_label: "weather".to_owned(),
+            server_url: Some("https://weather.example/mcp".to_owned()),
+            tools: Vec::new(),
+        }],
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let item = list_tools_items(state)[0];
+    assert!(
+        item.get("server_url").is_none(),
+        "public listing must not expose target URL"
+    );
+    assert_eq!(state.persisted_messages.len(), 1);
+    assert_eq!(state.persisted_messages[0]["type"], "praxis_mcp_cached_listing");
+    assert_eq!(state.persisted_messages[0]["server_url"], "https://weather.example/mcp");
+}
+
 /// A zero-tool success still emits a listing item with an empty `tools` array.
 #[test]
 fn commit_discovery_items_emits_zero_tool_success() {
@@ -5456,6 +5689,7 @@ fn commit_discovery_items_emits_zero_tool_success() {
         &mut ctx,
         vec![McpListing {
             server_label: "empty".to_owned(),
+            server_url: None,
             tools: Vec::new(),
         }],
     );
@@ -5470,8 +5704,7 @@ fn commit_discovery_items_emits_zero_tool_success() {
     assert_eq!(item["tools"].as_array().unwrap().len(), 0, "empty tools array");
 }
 
-/// An internal retry that re-runs resolution reuses the existing item and id
-/// rather than emitting a second discovery for the same server.
+/// An internal retry reuses the existing item and private cache record.
 #[test]
 fn commit_discovery_items_dedups_existing_server() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -5483,6 +5716,7 @@ fn commit_discovery_items_dedups_existing_server() {
     let make_listing = || {
         vec![McpListing {
             server_label: "weather".to_owned(),
+            server_url: Some("https://weather.example/mcp".to_owned()),
             tools: vec![mcp_tool_to_list_tools_entry(
                 &serde_json::json!({"name": "get_weather"}),
             )],
@@ -5501,6 +5735,8 @@ fn commit_discovery_items_dedups_existing_server() {
     let items = list_tools_items(state);
     assert_eq!(items.len(), 1, "no duplicate discovery item for the same server");
     assert_eq!(items[0]["id"].as_str().unwrap(), first_id, "original id reused");
+    assert_eq!(state.persisted_messages.len(), 1, "no duplicate private cache record");
+    assert!(items[0].get("server_url").is_none(), "target URL stays private");
     assert_eq!(
         state.locally_executed_output_items.len(),
         1,
@@ -5524,6 +5760,7 @@ fn commit_discovery_items_appends_after_existing_output() {
         &mut ctx,
         vec![McpListing {
             server_label: "weather".to_owned(),
+            server_url: None,
             tools: Vec::new(),
         }],
     );

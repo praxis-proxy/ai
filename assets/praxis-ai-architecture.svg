@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="630" viewBox="0 0 1280 630" role="img" aria-labelledby="title description" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
   <title id="title">Praxis AI architecture</title>
-  <desc id="description">OpenAI, Anthropic, MCP, and A2A traffic enters a programmable Praxis AI filter layer running on the Praxis proxy runtime. Primary traffic reaches inference backends, while dashed connections show side calls to MCP servers, file and vector services, and SQLite or PostgreSQL state stores.</desc>
+  <desc id="description">Codex and other OpenAI clients, Claude Code and other Anthropic clients, and MCP and A2A traffic enter the Praxis AI gateway. AI filters classify and route requests, translate provider protocols, run tool workflows, manage response state, and apply policy and usage controls on the Praxis proxy runtime. Routed traffic reaches inference providers or MCP and A2A backends. Dashed connections show calls to MCP servers, search and file services, response stores, guardrails, and metering.</desc>
 
   <defs>
     <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
@@ -38,6 +38,7 @@
       .subhead { fill: #a2abc0; font-size: 16px; }
       .column-label { fill: #8791aa; font-size: 13px; font-weight: 700; letter-spacing: 1.7px; }
       .node-label { fill: #e1e6f3; font-size: 15px; font-weight: 600; }
+      .node-sub { fill: #9ca8c1; font-size: 12px; }
       .gateway-label { fill: #f5f7ff; font-size: 17px; font-weight: 700; letter-spacing: .7px; }
       .gateway-tag { fill: #939db5; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
       .layer-label { fill: #98a5c2; font-size: 12px; font-weight: 700; letter-spacing: 1.4px; }
@@ -61,21 +62,23 @@
 
   <text x="48" y="52" class="eyebrow">PRAXIS AI / ARCHITECTURE</text>
   <text x="48" y="96" class="headline">A programmable gateway for AI traffic.</text>
-  <text x="48" y="128" class="subhead">Provider-aware filters on the Praxis proxy runtime.</text>
+  <text x="48" y="128" class="subhead">Route, translate, and apply AI policy on the Praxis proxy runtime.</text>
 
-  <text x="48" y="184" class="column-label">INGRESS PROTOCOLS</text>
-  <text x="1020" y="184" class="column-label">PRIMARY UPSTREAM</text>
+  <text x="48" y="184" class="column-label">CLIENTS &amp; PROTOCOLS</text>
+  <text x="1020" y="184" class="column-label">ROUTED UPSTREAMS</text>
 
   <g id="ingress-nodes">
     <g transform="translate(48 202)">
       <rect width="212" height="56" rx="12" fill="#101522" stroke="#52c8f5" stroke-opacity=".42"/>
       <circle cx="20" cy="28" r="4" fill="#52c8f5"/>
-      <text x="36" y="33" class="node-label">OpenAI APIs</text>
+      <text x="36" y="27" class="node-label">OpenAI APIs</text>
+      <text x="36" y="44" class="node-sub">Codex and other clients</text>
     </g>
     <g transform="translate(48 276)">
       <rect width="212" height="56" rx="12" fill="#101522" stroke="#9e7bf7" stroke-opacity=".42"/>
       <circle cx="20" cy="28" r="4" fill="#9e7bf7"/>
-      <text x="36" y="33" class="node-label">Anthropic Messages</text>
+      <text x="36" y="27" class="node-label">Anthropic Messages</text>
+      <text x="36" y="44" class="node-sub">Claude Code and others</text>
     </g>
     <g transform="translate(48 350)">
       <rect width="212" height="56" rx="12" fill="#101522" stroke="#dc73dc" stroke-opacity=".42"/>
@@ -108,24 +111,20 @@
       <text x="374" y="276" class="layer-label">COMPOSABLE AI FILTERS</text>
 
       <g transform="translate(374 294)">
-        <rect width="96" height="46" rx="10" fill="#1b263c" stroke="#52c8f5" stroke-opacity=".45"/>
-        <text x="48" y="28" text-anchor="middle" class="chip-label">Classify</text>
+        <rect width="145" height="46" rx="10" fill="#1b263c" stroke="#52c8f5" stroke-opacity=".45"/>
+        <text x="72.5" y="28" text-anchor="middle" class="chip-label">Classify &amp; route</text>
       </g>
-      <g transform="translate(480 294)">
-        <rect width="94" height="46" rx="10" fill="#20223d" stroke="#7b8fda" stroke-opacity=".4"/>
-        <text x="47" y="28" text-anchor="middle" class="chip-label">Validate</text>
+      <g transform="translate(529 294)">
+        <rect width="107" height="46" rx="10" fill="#20223d" stroke="#7b8fda" stroke-opacity=".4"/>
+        <text x="53.5" y="28" text-anchor="middle" class="chip-label">Translate</text>
       </g>
-      <g transform="translate(584 294)">
-        <rect width="82" height="46" rx="10" fill="#24203d" stroke="#9e7bf7" stroke-opacity=".45"/>
-        <text x="41" y="28" text-anchor="middle" class="chip-label">Policy</text>
+      <g transform="translate(646 294)">
+        <rect width="124" height="46" rx="10" fill="#24203d" stroke="#9e7bf7" stroke-opacity=".45"/>
+        <text x="62" y="28" text-anchor="middle" class="chip-label">Tools &amp; state</text>
       </g>
-      <g transform="translate(676 294)">
-        <rect width="110" height="46" rx="10" fill="#271f39" stroke="#bd75e8" stroke-opacity=".42"/>
-        <text x="55" y="28" text-anchor="middle" class="chip-label">Transform</text>
-      </g>
-      <g transform="translate(796 294)">
-        <rect width="110" height="46" rx="10" fill="#281e33" stroke="#dc73dc" stroke-opacity=".42"/>
-        <text x="55" y="28" text-anchor="middle" class="chip-label">Observe</text>
+      <g transform="translate(780 294)">
+        <rect width="154" height="46" rx="10" fill="#281e33" stroke="#dc73dc" stroke-opacity=".42"/>
+        <text x="77" y="28" text-anchor="middle" class="chip-label">Policy &amp; usage</text>
       </g>
     </g>
 
@@ -137,37 +136,50 @@
   </g>
 
   <g id="primary-upstream">
-    <g transform="translate(1020 266)">
-      <rect width="212" height="82" rx="12" fill="#101522" stroke="#52c8f5" stroke-opacity=".42"/>
-      <circle cx="192" cy="41" r="4" fill="#52c8f5"/>
-      <text x="20" y="46" class="node-label">Inference backends</text>
+    <g transform="translate(1020 250)">
+      <rect width="212" height="72" rx="12" fill="#101522" stroke="#52c8f5" stroke-opacity=".42"/>
+      <circle cx="192" cy="36" r="4" fill="#52c8f5"/>
+      <text x="20" y="41" class="node-label">Inference providers</text>
     </g>
-    <text x="1020" y="218" class="route-label">REQUEST →</text>
-    <text x="1020" y="240" class="response-label">← RESPONSE / STREAM</text>
-    <path id="route-upstream-request" class="route" d="M970 292 H1012"/>
-    <path id="route-upstream-response" class="response-route" d="M1020 324 H978"/>
+    <g transform="translate(1020 350)">
+      <rect width="212" height="72" rx="12" fill="#101522" stroke="#dc73dc" stroke-opacity=".42"/>
+      <circle cx="192" cy="36" r="4" fill="#dc73dc"/>
+      <text x="20" y="41" class="node-label">MCP / A2A backends</text>
+    </g>
+    <text x="1020" y="218" class="route-label">REQUEST</text>
+    <text x="1020" y="240" class="response-label">RESPONSE / STREAM</text>
+    <path id="route-inference-request" class="route" d="M970 276 H1012"/>
+    <path id="route-inference-response" class="response-route" d="M1020 304 H978"/>
+    <path id="route-agent-request" class="route" d="M970 376 H1012"/>
+    <path id="route-agent-response" class="response-route" d="M1020 404 H978"/>
   </g>
 
   <g id="side-services">
     <text x="48" y="520" class="column-label">SIDE SERVICES &amp; STATE</text>
     <path class="side-route" d="M448 484 V536"/>
-    <path class="side-route" d="M675 484 V536"/>
-    <path class="side-route" d="M880 484 V536"/>
+    <path class="side-route" d="M667 484 V536"/>
+    <path class="side-route" d="M885 484 V536"/>
+    <path class="side-route" d="M930 484 V510 H1103 V536"/>
 
     <g transform="translate(350 540)">
-      <rect width="196" height="56" rx="12" fill="#101522" stroke="#9e7bf7" stroke-opacity=".36"/>
+      <rect width="198" height="56" rx="12" fill="#101522" stroke="#9e7bf7" stroke-opacity=".36"/>
       <circle cx="18" cy="28" r="3.5" fill="#9e7bf7"/>
       <text x="32" y="33" class="node-label">MCP servers</text>
     </g>
-    <g transform="translate(570 540)">
-      <rect width="210" height="56" rx="12" fill="#101522" stroke="#52c8f5" stroke-opacity=".36"/>
+    <g transform="translate(568 540)">
+      <rect width="198" height="56" rx="12" fill="#101522" stroke="#52c8f5" stroke-opacity=".36"/>
       <circle cx="18" cy="28" r="3.5" fill="#52c8f5"/>
-      <text x="32" y="33" class="node-label">Files / vector services</text>
+      <text x="32" y="33" class="node-label">Search / files</text>
     </g>
-    <g transform="translate(802 540)">
-      <rect width="168" height="56" rx="12" fill="#101522" stroke="#dc73dc" stroke-opacity=".36"/>
+    <g transform="translate(786 540)">
+      <rect width="198" height="56" rx="12" fill="#101522" stroke="#dc73dc" stroke-opacity=".36"/>
       <circle cx="18" cy="28" r="3.5" fill="#dc73dc"/>
       <text x="32" y="33" class="node-label">SQLite / PostgreSQL</text>
+    </g>
+    <g transform="translate(1004 540)">
+      <rect width="198" height="56" rx="12" fill="#101522" stroke="#bd75e8" stroke-opacity=".36"/>
+      <circle cx="18" cy="28" r="3.5" fill="#bd75e8"/>
+      <text x="32" y="33" class="node-label">Guardrails / metering</text>
     </g>
   </g>
 
@@ -182,10 +194,16 @@
       <animateMotion dur="2s" begin="-1.3s" repeatCount="indefinite" path="M260 378 H282 Q300 378 312 358"/>
     </circle>
     <circle class="packet" r="4" fill="#ffffff" style="color:#52c8f5">
-      <animateMotion dur="1.8s" begin="-.4s" repeatCount="indefinite" path="M970 292 H1012"/>
+      <animateMotion dur="1.8s" begin="-.4s" repeatCount="indefinite" path="M970 276 H1012"/>
     </circle>
     <circle class="packet" r="3.5" fill="#ffffff" style="color:#9e7bf7">
-      <animateMotion dur="2.2s" begin="-.9s" repeatCount="indefinite" path="M1020 324 H978"/>
+      <animateMotion dur="2.2s" begin="-.9s" repeatCount="indefinite" path="M1020 304 H978"/>
+    </circle>
+    <circle class="packet" r="4" fill="#ffffff" style="color:#8f9bb8">
+      <animateMotion dur="1.8s" begin="-.8s" repeatCount="indefinite" path="M970 376 H1012"/>
+    </circle>
+    <circle class="packet" r="3.5" fill="#ffffff" style="color:#9e7bf7">
+      <animateMotion dur="2.2s" begin="-1.2s" repeatCount="indefinite" path="M1020 404 H978"/>
     </circle>
   </g>
 

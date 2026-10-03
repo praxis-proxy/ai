@@ -51,6 +51,9 @@ jobs:
       startsWith(github.event.workflow_run.display_title, 'vLLM full suite label - PR #')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Generate token
         id: app-token
@@ -64,9 +67,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
-          RESULT: ${{ github.event.workflow_run.conclusion }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          GH_READ_TOKEN: ${{ github.token }}
         run: |
           marker="<!-- praxis:vllm-full-suite:${RUN_ID} -->"
           started=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
@@ -76,11 +79,28 @@ jobs:
             exit 0
           fi
 
-          case "$RESULT" in
-            success) icon="✅" ;;
-            failure) icon="❌" ;;
-            cancelled) icon="⏹️" ;;
-            *) icon="⚪" ;;
-          esac
-          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body \
-            "${icon} Full live vLLM Responses suite finished with **${RESULT}**: [run ${RUN_ID}](${RUN_URL})."
+          mkdir -p "$RUNNER_TEMP/qualification"
+          GH_TOKEN="$GH_READ_TOKEN" gh run download "$RUN_ID" --repo "$GH_REPO" \
+            --name vllm-qualification --dir "$RUNNER_TEMP/qualification" || true
+          python3 - "$RUNNER_TEMP/qualification/qualification.json" "$RUN_URL" \
+            > "$RUNNER_TEMP/qualification-notification.md" <<'PY'
+          import json, pathlib, sys
+          try:
+              report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          except (OSError, ValueError):
+              report = {"status": "incomplete", "reason": "report artifact unavailable"}
+          suites = report.get("suites", {})
+          def summary(name):
+              group = suites.get(name, {})
+              counts = group.get("totals", {})
+              totals = ", ".join(f"{key} {counts.get(key, 0)}" for key in
+                                 ("passed", "failed", "skipped", "xfailed", "xpassed", "unexecuted"))
+              return f"{group.get('status', 'unavailable')} ({totals})"
+          checkout = report.get("gateway", {}).get("checkout_sha") or "unavailable"
+          print(f"vLLM Responses gateway GPU qualification **{report['status']}** for `{checkout}`: "
+                f"native {summary('native_responses')}; translation {summary('translation')}; "
+                f"supporting {summary('supporting')}. {report.get('reason', '')} "
+                f"[Run and report]({sys.argv[2]}).")
+          PY
+          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" \
+            --body-file "$RUNNER_TEMP/qualification-notification.md"

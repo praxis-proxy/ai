@@ -11,29 +11,46 @@
 //!
 //! This filter validates that the body is JSON, then does targeted field
 //! extraction for `conversation.id` and mutually exclusive history
-//! selectors. It does **not** deserialize the full body into a typed
-//! struct or validate provider-owned parameter combinations.
+//! selectors. On managed-provider routes it also rejects gateway-unsupported
+//! `background=true` and non-null `prompt` requests. It does **not** deserialize
+//! the full body into a typed struct or validate other provider-owned parameter
+//! combinations.
 //!
 //! # YAML
 //!
 //! ```yaml
 //! filter: openai_responses_validate
+//! conditions:
+//!   - unless:
+//!       bound_upstream:
+//!         application_provider: openai
 //! ```
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+use serde::Deserialize;
 use tracing::{debug, trace};
 
 use super::{
+    bound_body_outcome,
     error::{responses_error_rejection, responses_error_rejection_with_code},
     extract_conversation_id,
     state::ResponsesState,
 };
+
+/// Configuration for `openai_responses_validate`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty mapping accepts omitted config while deny_unknown_fields rejects stale options"
+)]
+struct OpenaiResponsesValidateConfig {}
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -43,8 +60,11 @@ use super::{
 ///
 /// Parses the body as [`serde_json::Value`] for targeted field extraction.
 /// Does not deserialize the full body into a typed struct or validate other
-/// provider-owned parameter combinations. The preceding classifier rejects
-/// unsupported `background=true` requests before this filter runs.
+/// provider-owned parameter combinations. It rejects unsupported
+/// `background=true` and non-null `prompt` requests only after logical provider
+/// binding. Configure it with an `unless application_provider: openai`
+/// condition so OpenAI-owned passthrough requests preserve those provider-owned
+/// fields.
 ///
 /// Must be placed after `openai_responses_format` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
@@ -53,9 +73,6 @@ use super::{
 /// Generates metadata: `responses.response_id` (format: `resp_` + 32
 /// hex chars, CSPRNG), `responses.conversation_id`, `responses.store`,
 /// `responses.background`, `responses.stream`.
-///
-/// This filter has no configuration, body buffering is handled by
-/// the upstream `openai_responses_format` classifier.
 #[derive(Default)]
 pub struct OpenaiResponsesValidateFilter;
 
@@ -68,7 +85,7 @@ impl OpenaiResponsesValidateFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let _: EmptyFilterConfig = parse_filter_config("openai_responses_validate", config)?;
+        let _: OpenaiResponsesValidateConfig = parse_filter_config("openai_responses_validate", config)?;
         Ok(Box::new(Self))
     }
 }
@@ -83,6 +100,10 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -93,24 +114,22 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         Ok(FilterAction::Continue)
     }
 
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
-            trace!("skipping non-responses request");
-            return Ok(FilterAction::Release);
-        }
-
-        if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
-            trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
-            return Ok(FilterAction::Release);
+        if let Some(action) = early_validation_action(ctx, end_of_stream) {
+            return Ok(action);
         }
 
         let parsed = match parse_request_body(body) {
@@ -120,11 +139,16 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
             return Ok(action);
         }
+        if let Some(action) = super::reject_prompt_template(&parsed) {
+            return Ok(action);
+        }
 
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
         let conversation_id = resolve_conversation_id(ctx, &parsed);
 
         enrich_context(ctx, &response_id, &conversation_id);
+        #[cfg(feature = "openai-conversations")]
+        crate::openai::conversations::capture_validated_append_owner(ctx);
         insert_responses_state(ctx, parsed, &response_id);
 
         debug!(
@@ -135,11 +159,66 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
 
         Ok(FilterAction::Release)
     }
+
+    fn on_response_body(
+        &self,
+        #[cfg_attr(
+            not(feature = "openai-mcp-tools"),
+            expect(unused_variables, reason = "the response context only carries the MCP session pool")
+        )]
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            // This validator runs outside IRR. Its terminal response-body hook
+            // sees extensions restored after every finite or streamed agentic
+            // round, unlike the response-header hook, which precedes streamed
+            // body execution. Drain here so all warm sessions receive bounded
+            // graceful shutdown after their final opportunity for reuse.
+            #[cfg(feature = "openai-mcp-tools")]
+            if let Some(pool) = ctx.extensions.remove::<crate::mcp_client::McpSessionPool>() {
+                pool.drain_in_background();
+            }
+        }
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Return the lifecycle action for requests that should not enter JSON validation.
+fn early_validation_action(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> Option<FilterAction> {
+    if !end_of_stream {
+        return Some(FilterAction::Continue);
+    }
+    if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        trace!("skipping non-responses request");
+        return Some(FilterAction::Release);
+    }
+    if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
+        trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
+        return Some(FilterAction::Release);
+    }
+    (ctx.get_metadata("openai_responses_format.background") == Some("true")).then(|| {
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "background mode is not supported",
+        ))
+    })
+}
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
 fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
@@ -276,12 +355,49 @@ mod tests {
     }
 
     #[test]
-    fn body_access_is_read_only() {
+    fn declares_dual_phase_body_access() {
         let filter = OpenaiResponsesValidateFilter;
-        assert_eq!(
-            filter.request_body_access(),
-            BodyAccess::ReadOnly,
-            "filter should use read-only body access"
+        assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+        assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
+    }
+
+    #[cfg(feature = "openai-mcp-tools")]
+    #[tokio::test]
+    async fn response_body_teardown_removes_and_drains_mcp_session_pool_at_eos() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+        let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_none(),
+            "the outer response-body EOS hook must not leave live session ownership in request extensions"
+        );
+    }
+
+    #[cfg(feature = "openai-mcp-tools")]
+    #[tokio::test]
+    async fn response_body_teardown_keeps_pool_before_eos() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+        let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_some(),
+            "streaming response chunks must retain the pool for later agentic rounds"
         );
     }
 
@@ -364,13 +480,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_background_from_classifier_metadata() {
-        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_responses_format.background", "true")]).await;
+    async fn rejects_background_from_classifier_metadata() {
+        let action = run_filter_raw(r#"{"input": "Hi"}"#, &[("openai_responses_format.background", "true")]).await;
+        assert_background_unsupported(action);
+    }
 
+    #[tokio::test]
+    async fn rejects_non_null_prompt_template() {
+        let action = run_filter_raw(
+            r#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#,
+            &[],
+        )
+        .await;
+        let FilterAction::Reject(rejection) = action else {
+            panic!("managed-provider validation must reject prompt templates");
+        };
+        assert_eq!(rejection.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
-            ctx.filter_metadata.get("responses.background").map(String::as_str),
-            Some("true"),
-            "background should be read from classifier metadata"
+            body["error"]["message"],
+            "prompt templates are supported only for OpenAI-owned upstreams"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_null_prompt() {
+        let ctx = run_filter(r#"{"model":"gpt-4.1","input":"Hello","prompt":null}"#, &[]).await;
+
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_some(),
+            "a null prompt is semantically absent and must pass validation"
         );
     }
 
@@ -449,8 +589,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_and_background_accepted() {
-        let ctx = run_filter(
+    async fn stream_and_background_rejected() {
+        let action = run_filter_raw(
             r#"{"input": "test"}"#,
             &[
                 ("openai_responses_format.stream", "true"),
@@ -458,21 +598,12 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(
-            ctx.get_metadata("responses.stream"),
-            Some("true"),
-            "stream=true should be preserved"
-        );
-        assert_eq!(
-            ctx.get_metadata("responses.background"),
-            Some("true"),
-            "background=true should be preserved"
-        );
+        assert_background_unsupported(action);
     }
 
     #[tokio::test]
-    async fn background_without_store_accepted() {
-        let ctx = run_filter(
+    async fn background_without_store_rejected() {
+        let action = run_filter_raw(
             r#"{"input": "test"}"#,
             &[
                 ("openai_responses_format.background", "true"),
@@ -480,16 +611,7 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(
-            ctx.get_metadata("responses.background"),
-            Some("true"),
-            "background=true should be preserved"
-        );
-        assert_eq!(
-            ctx.get_metadata("responses.store"),
-            Some("false"),
-            "store=false should be preserved"
-        );
+        assert_background_unsupported(action);
     }
 
     #[tokio::test]
@@ -795,5 +917,15 @@ mod tests {
         let mut body = Some(Bytes::from(body_str.to_owned()));
 
         filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+    }
+
+    fn assert_background_unsupported(action: FilterAction) {
+        let FilterAction::Reject(rejection) = action else {
+            panic!("background=true should be rejected by managed-provider validation");
+        };
+        assert_eq!(rejection.status, 400);
+        let body: serde_json::Value =
+            serde_json::from_slice(rejection.body.as_deref().expect("rejection body")).unwrap();
+        assert_eq!(body["error"]["message"], "background mode is not supported");
     }
 }

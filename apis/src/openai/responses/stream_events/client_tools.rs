@@ -1267,7 +1267,7 @@ mod tests {
                     response["tools"],
                     serde_json::json!([{"type": "custom", "name": "run_python"}])
                 );
-                assert!(response.get("tool_choice").is_none());
+                assert_eq!(response["tool_choice"], "auto");
             },
             other => panic!("expected RestoreSnapshot, got {other:?}"),
         }

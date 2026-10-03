@@ -28,7 +28,7 @@ use crate::token_usage::{
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
 };
 
-/// Cap for the float→integer conversion. Matches the Lua `f64` safe-integer
+/// Cap for the float→integer conversion. Matches the `f64` safe-integer
 /// bound the ledgers already enforce on `capacity`, so a weighted cost can
 /// never be a value the backends cannot represent exactly.
 const COST_U64_CAP: u64 = 9_007_199_254_740_992; // 2^53

@@ -51,10 +51,13 @@ fn hint_location(crate_name: &str) -> &'static str {
         },
         "sha2" => {
             "sqlx-core's 'migrate' feature, which sqlx always enables (store, store-sqlite, store-postgres, \
-             openai-conversations, openai-compact, openai-mcp-tools); aws-sigv4 (aws-sigv4-filter); praxis-policy \
-             (policy-engine)"
+             openai-conversations, openai-compact, openai-mcp-tools); praxis-policy (policy-engine); aws-sigv4 \
+             outside dev-dependencies (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4)"
         },
-        "hmac" => "aws-sigv4 (aws-sigv4-filter); sqlx-postgres SCRAM (store-postgres); policy 'oauth' builtin",
+        "hmac" => {
+            "sqlx-postgres SCRAM (store-postgres); policy 'oauth' builtin; aws-sigv4 outside dev-dependencies \
+             (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4)"
+        },
         "md-5" | "rsa" | "hkdf" => "sqlx-postgres authentication (store-postgres)",
         "sha1" => "tokio-tungstenite WebSocket accept key (test utilities)",
         "openssl-src" => "the 'vendored' feature of the openssl crate, or OPENSSL_STATIC",
@@ -76,8 +79,8 @@ fn hint_fix(crate_name: &str) -> &'static str {
              no-provider features)"
         },
         "sha2" | "hmac" | "md-5" | "rsa" | "hkdf" => {
-            "keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, aws-sigv4, \
-             praxis-policy) has no OpenSSL backend to switch to"
+            "keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has \
+             no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
         },
         "sha1" => "keep it a dev-dependency; it must not appear in the release graph",
         "openssl-src" => "remove 'vendored', build with OPENSSL_NO_VENDOR=1, never set OPENSSL_STATIC",

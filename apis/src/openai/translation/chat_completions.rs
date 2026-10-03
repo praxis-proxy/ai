@@ -7,6 +7,9 @@ use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 
+use super::reasoning::{
+    ReasoningOptions, ReplayBuffer, extract_reasoning_item, message_has_reasoning, reasoning_item_id, requested_summary,
+};
 use crate::web_search::is_web_search_tool_type;
 
 /// Default prefix prepended to the summary when translating
@@ -114,6 +117,10 @@ pub(crate) struct ResponseContext<'a> {
     pub(crate) safety_identifier: Option<&'a Value>,
     /// Request prompt cache key to echo on the `Responses` resource.
     pub(crate) prompt_cache_key: Option<&'a Value>,
+    /// Original `Responses` reasoning controls to echo on the `Responses` resource.
+    pub(crate) reasoning: Option<&'a Value>,
+    /// Reasoning dialect behavior applied while translating the response.
+    pub(crate) reasoning_options: ReasoningOptions,
 }
 
 impl<'a> ResponseContext<'a> {
@@ -137,13 +144,15 @@ impl<'a> ResponseContext<'a> {
             previous_response_id: request.string("previous_response_id"),
             store: request.bool("store").unwrap_or(true),
             tools: request.array("tools").unwrap_or_default(),
-            tool_choice: request.value("tool_choice"),
+            tool_choice: request.value("tool_choice").filter(|v| !v.is_null()),
             presence_penalty: request.value("presence_penalty"),
             frequency_penalty: request.value("frequency_penalty"),
             top_logprobs: request.u64("top_logprobs"),
             service_tier: request.value("service_tier"),
             safety_identifier: request.value("safety_identifier"),
             prompt_cache_key: request.value("prompt_cache_key"),
+            reasoning: request.value("reasoning"),
+            reasoning_options: ReasoningOptions::default(),
         }
     }
 
@@ -151,6 +160,13 @@ impl<'a> ResponseContext<'a> {
     #[must_use]
     pub(crate) fn with_completed_at(mut self, completed_at: u64) -> Self {
         self.completed_at = Some(completed_at);
+        self
+    }
+
+    /// Return a response context configured with a reasoning dialect.
+    #[must_use]
+    pub(crate) fn with_reasoning_options(mut self, reasoning_options: ReasoningOptions) -> Self {
+        self.reasoning_options = reasoning_options;
         self
     }
 }
@@ -224,6 +240,12 @@ pub(crate) enum TranslationError {
         /// String field whose value had another JSON type.
         field: &'static str,
     },
+    /// A function output has no faithful Chat tool-message representation.
+    #[error("Responses function_call_output input item field `output` must be a string or array of input_text parts")]
+    InvalidFunctionCallOutput,
+    /// A function output array contains a part that cannot become tool text.
+    #[error("unsupported Responses function_call_output part for Chat Completions translation: {0}")]
+    UnsupportedFunctionCallOutputPart(String),
     /// A compaction item's `encrypted_content` is not valid base64 or UTF-8.
     #[error("Responses compaction input item field `encrypted_content` {0}")]
     InvalidCompactionContent(&'static str),
@@ -266,6 +288,41 @@ pub(crate) enum TranslationError {
     /// A file-search definition cannot be executed by the local callout.
     #[error("invalid Responses file_search tool for Chat Completions translation: {0}")]
     InvalidFileSearchTool(&'static str),
+    /// A reasoning summary was requested for a dialect without a safe-summary contract.
+    #[error("reasoning.summary is not supported by the configured reasoning dialect")]
+    UnsupportedReasoningSummary,
+    /// The request specified conflicting reasoning summary controls.
+    #[error("reasoning.summary and reasoning.generate_summary conflict")]
+    ConflictingReasoningSummary,
+    /// The provider returned more raw reasoning than the configured limit allows.
+    #[error("raw reasoning content ({bytes} bytes) exceeds the configured maximum of {max_bytes} bytes")]
+    ReasoningTooLarge {
+        /// Observed raw reasoning size in bytes.
+        bytes: usize,
+        /// Configured maximum raw reasoning size in bytes.
+        max_bytes: usize,
+    },
+    /// The provider returned raw reasoning in an unexpected shape.
+    #[error("provider returned malformed raw reasoning content: expected string, found {0}")]
+    MalformedReasoning(String),
+    /// A client-supplied reasoning input item carried raw reasoning in an
+    /// unexpected shape.
+    #[error("malformed reasoning input item: reasoning_text must be a string, found {0}")]
+    MalformedReasoningInput(String),
+    /// A reasoning input item cannot be faithfully replayed.
+    #[error("unsupported reasoning input item: {0}")]
+    UnsupportedReasoningInput(&'static str),
+    /// A reasoning summary control was present but not a string or null.
+    #[error("reasoning.{field} must be a string or null, found {actual}")]
+    MalformedReasoningSummary {
+        /// The summary control field name.
+        field: &'static str,
+        /// The observed JSON type.
+        actual: String,
+    },
+    /// The `reasoning` request field was present but not an object or null.
+    #[error("reasoning must be an object or null, found {0}")]
+    MalformedReasoningBlock(String),
     /// A Responses request parameter describes behavior this adapter cannot provide.
     #[error(
         "Responses `{parameter}` has no Chat Completions representation: got {value}, \
@@ -299,8 +356,11 @@ struct RequestOverrides<'a> {
 // -----------------------------------------------------------------------------
 
 /// Convert an `OpenAI` `Responses` create request into a Chat Completions request.
-pub(crate) fn responses_request_to_chat_request(request: &Value) -> Result<Value, TranslationError> {
-    translate_responses_request(request, RequestOverrides::default())
+pub(crate) fn responses_request_to_chat_request(
+    request: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<Value, TranslationError> {
+    translate_responses_request(request, RequestOverrides::default(), reasoning)
 }
 
 /// Convert canonical Responses state into a Chat Completions request.
@@ -309,6 +369,7 @@ pub(crate) fn responses_state_to_chat_request(
     messages: &[Value],
     tools: &[Value],
     tool_choice: &Value,
+    reasoning: &ReasoningOptions,
 ) -> Result<Value, TranslationError> {
     translate_responses_request(
         request,
@@ -317,11 +378,16 @@ pub(crate) fn responses_state_to_chat_request(
             tools: Some(tools),
             tool_choice: Some(tool_choice),
         },
+        reasoning,
     )
 }
 
 /// Convert a Responses request using optional borrowed canonical state overrides.
-fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>) -> Result<Value, TranslationError> {
+fn translate_responses_request(
+    request: &Value,
+    overrides: RequestOverrides<'_>,
+    reasoning: &ReasoningOptions,
+) -> Result<Value, TranslationError> {
     let obj = request
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
@@ -331,7 +397,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     let mut chat = Map::new();
     map_request_parameters(obj, &mut chat);
 
-    let messages = build_chat_messages(obj, overrides.messages)?;
+    let messages = build_chat_messages(obj, overrides.messages, reasoning)?;
     chat.insert("messages".to_owned(), Value::Array(messages));
 
     let tools = overrides
@@ -352,9 +418,10 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
 
 /// Resolve and insert the Chat Completions `tool_choice`, when one applies.
 ///
-/// A synthesized canonical `auto` is omitted when the request carried no tools
-/// and no explicit choice of its own, so translation does not invent a field the
-/// caller never sent.
+/// `auto` is omitted when the translated request carries no tools because Chat
+/// Completions backends may reject any `tool_choice` without a matching `tools`
+/// field. The original Responses request remains available when the response
+/// resource is built, so the client still observes its intended `auto` value.
 fn insert_chat_tool_choice(
     obj: &Map<String, Value>,
     chat: &mut Map<String, Value>,
@@ -363,10 +430,8 @@ fn insert_chat_tool_choice(
     has_file_search: bool,
 ) -> Result<(), TranslationError> {
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
-    let omit_synthesized_default = !chat.contains_key("tools")
-        && obj.get("tool_choice").is_none()
-        && overrides.tool_choice.and_then(Value::as_str) == Some("auto");
-    if !omit_synthesized_default
+    let omit_auto_without_tools = !chat.contains_key("tools") && tool_choice.and_then(Value::as_str) == Some("auto");
+    if !omit_auto_without_tools
         && let Some(tool_choice) = build_chat_tool_choice(tool_choice, has_web_search, has_file_search)?
     {
         chat.insert("tool_choice".to_owned(), tool_choice);
@@ -374,7 +439,7 @@ fn insert_chat_tool_choice(
     Ok(())
 }
 
-/// Copy supported scalar parameters into the Chat Completions request.
+/// Copy shared parameters and map Responses-only fields into the Chat request.
 fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value>) {
     copy_field(obj, chat, "model");
     copy_field(obj, chat, "temperature");
@@ -383,11 +448,16 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
     copy_field(obj, chat, "frequency_penalty");
     copy_field(obj, chat, "parallel_tool_calls");
     copy_field(obj, chat, "prompt_cache_key");
+    copy_field(obj, chat, "prompt_cache_retention");
+    copy_field(obj, chat, "prompt_cache_options");
+    copy_field(obj, chat, "safety_identifier");
+    copy_field(obj, chat, "user");
     copy_field(obj, chat, "service_tier");
     copy_field(obj, chat, "extra_body");
     map_top_logprobs(obj, chat);
     map_reasoning_effort(obj, chat);
     map_text_format(obj, chat);
+    map_text_verbosity(obj, chat);
     map_stream_options(obj, chat);
 
     if let Some(max_output_tokens) = obj.get("max_output_tokens") {
@@ -397,11 +467,12 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// `background`, `truncation`, and `moderation` describe behaviors the Chat
 /// Completions translation does not implement. Accepting an unsupported value
 /// would silently change the request semantics, so the request fails closed
 /// instead. Rejecting `background` and `truncation` here is what lets
-/// [`response_resource`] state their defaults truthfully.
+/// [`response_resource`] state their defaults truthfully. Managed-provider
+/// `prompt` policy belongs to request validation, before protocol translation.
 ///
 /// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
@@ -409,8 +480,7 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    validate_prompt_parameter(obj)?;
-
+    validate_moderation_parameter(obj)?;
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -442,19 +512,22 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     Ok(())
 }
 
-/// Reject a non-null prompt because Chat Completions cannot resolve it.
-fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    Err(TranslationError::UnrepresentableRequestParameter {
-        parameter: "prompt",
-        value: json_type_name(prompt),
-        supported: "`prompt` null",
-    })
+/// Reject moderation until both finite and streaming results can be represented.
+fn validate_moderation_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    // Chat moderation results have a different shape from Responses results,
+    // and Chat streaming chunks have no moderation field. Forwarding the
+    // request would falsely suggest the synthesized resource reports its result.
+    if let Some(moderation) = obj.get("moderation").filter(|value| !value.is_null()) {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "moderation",
+            value: json_type_name(moderation),
+            supported: "`moderation` null",
+        });
+    }
+    Ok(())
 }
 
-/// Copy a field from one JSON object to another.
+/// Copy a field into the owned Chat request while borrowing the Responses source.
 fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
     if let Some(value) = source.get(key) {
         target.insert(key.to_owned(), value.clone());
@@ -498,6 +571,13 @@ fn map_text_format(source: &Map<String, Value>, target: &mut Map<String, Value>)
             target.insert("response_format".to_owned(), json_schema_response_format(format));
         },
         _ => {},
+    }
+}
+
+/// Convert `Responses` text verbosity to the Chat Completions field.
+fn map_text_verbosity(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    if let Some(verbosity) = source.get("text").and_then(|text| text.get("verbosity")) {
+        target.insert("verbosity".to_owned(), verbosity.clone());
     }
 }
 
@@ -545,6 +625,7 @@ fn json_schema_response_format(format: &Map<String, Value>) -> Value {
 fn build_chat_messages(
     obj: &Map<String, Value>,
     messages_override: Option<&[Value]>,
+    reasoning: &ReasoningOptions,
 ) -> Result<Vec<Value>, TranslationError> {
     let mut messages = Vec::new();
 
@@ -555,20 +636,24 @@ fn build_chat_messages(
     }
 
     if let Some(override_messages) = messages_override {
-        append_input_item_sequence(&mut messages, override_messages)?;
+        append_input_item_sequence(&mut messages, override_messages, reasoning)?;
     } else if let Some(input) = obj.get("input") {
-        append_input_messages(&mut messages, input)?;
+        append_input_messages(&mut messages, input, reasoning)?;
     }
 
     Ok(messages)
 }
 
 /// Append converted input messages to a Chat Completions message list.
-fn append_input_messages(messages: &mut Vec<Value>, input: &Value) -> Result<(), TranslationError> {
+fn append_input_messages(
+    messages: &mut Vec<Value>,
+    input: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     match input {
         Value::String(text) => messages.push(json!({"role": "user", "content": text})),
-        Value::Array(items) => append_input_item_sequence(messages, items)?,
-        Value::Object(_) => append_input_item_sequence(messages, std::slice::from_ref(input))?,
+        Value::Array(items) => append_input_item_sequence(messages, items, reasoning)?,
+        Value::Object(_) => append_input_item_sequence(messages, std::slice::from_ref(input), reasoning)?,
         Value::Null => {},
         _ => return Err(unsupported_input_type(input)),
     }
@@ -577,47 +662,79 @@ fn append_input_messages(messages: &mut Vec<Value>, input: &Value) -> Result<(),
 }
 
 /// Append a sequence of Responses input items, batching adjacent function calls.
-fn append_input_item_sequence(messages: &mut Vec<Value>, items: &[Value]) -> Result<(), TranslationError> {
+fn append_input_item_sequence(
+    messages: &mut Vec<Value>,
+    items: &[Value],
+    reasoning: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     let mut pending_tool_calls = Vec::new();
+    let mut replay = ReplayBuffer::new(reasoning);
     for item in items {
-        if let Some(obj) = item.as_object()
-            && obj.get("type").and_then(Value::as_str) == Some("function_call")
-        {
-            pending_tool_calls.push(function_call_tool_call(obj)?);
-            continue;
+        if let Some(obj) = item.as_object() {
+            match obj.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    pending_tool_calls.push(function_call_tool_call(obj)?);
+                    continue;
+                },
+                Some("reasoning") => {
+                    replay.buffer(obj)?;
+                    continue;
+                },
+                _ => {},
+            }
         }
 
-        flush_pending_function_calls(messages, &mut pending_tool_calls);
-        append_input_item(messages, item)?;
+        flush_pending_function_calls(messages, &mut pending_tool_calls, &mut replay)?;
+        append_input_item(messages, item, &mut replay)?;
     }
-    flush_pending_function_calls(messages, &mut pending_tool_calls);
+    flush_pending_function_calls(messages, &mut pending_tool_calls, &mut replay)?;
+    replay.flush_standalone(messages)?;
     Ok(())
 }
 
-/// Flush adjacent Responses function calls into one assistant message.
-fn flush_pending_function_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+/// Flush adjacent Responses function calls and buffered reasoning into one assistant message.
+fn flush_pending_function_calls(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     if pending_tool_calls.is_empty() {
-        return;
+        return Ok(());
     }
 
-    messages.push(json!({
+    let mut message = json!({
         "role": "assistant",
         "content": null,
         "tool_calls": std::mem::take(pending_tool_calls),
-    }));
+    });
+    replay.attach(&mut message)?;
+    messages.push(message);
+    Ok(())
 }
 
 /// Convert a single `Responses` input item into one Chat Completions message.
-fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), TranslationError> {
+fn append_input_item(
+    messages: &mut Vec<Value>,
+    item: &Value,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     let Some(obj) = item.as_object() else {
         return Err(TranslationError::ExpectedObject("Responses input item"));
     };
 
     match input_item_type(obj)? {
-        Some("function_call_output") => append_tool_output(messages, obj)?,
-        Some("message") => append_message_item(messages, obj)?,
-        Some("compaction") => append_compaction_item(messages, obj)?,
-        None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
+        Some("function_call_output") => {
+            replay.flush_standalone(messages)?;
+            append_tool_output(messages, obj)?;
+        },
+        Some("message") => append_message_item(messages, obj, replay)?,
+        Some("compaction") => {
+            replay.flush_standalone(messages)?;
+            append_compaction_item(messages, obj)?;
+        },
+        None if obj.contains_key("role") || obj.contains_key("content") => {
+            append_message_item(messages, obj, replay)?;
+        },
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
     }
@@ -639,14 +756,24 @@ fn input_item_type(obj: &Map<String, Value>) -> Result<Option<&str>, Translation
 }
 
 /// Convert a Responses message item into a Chat Completions message.
-fn append_message_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
+fn append_message_item(
+    messages: &mut Vec<Value>,
+    obj: &Map<String, Value>,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     let role = required_input_item_string(obj, "message", "role")?;
     let content = obj.get("content").ok_or(TranslationError::MissingInputItemField {
         item_type: "message",
         field: "content",
     })?;
     let content = convert_input_content(content)?;
-    messages.push(json!({"role": role, "content": content}));
+    let mut message = json!({"role": role, "content": content});
+    if role == "assistant" {
+        replay.attach(&mut message)?;
+    } else {
+        replay.flush_standalone(messages)?;
+    }
+    messages.push(message);
     Ok(())
 }
 
@@ -706,13 +833,50 @@ fn append_tool_output(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Re
         item_type: "function_call_output",
         field: "output",
     })?;
+    let content = convert_function_call_output(output)?;
 
     messages.push(json!({
         "role": "tool",
         "tool_call_id": call_id,
-        "content": chat_string_field(Some(output))
+        "content": content
     }));
     Ok(())
+}
+
+/// Chat tool messages carry text, so only Responses text output parts can be
+/// lowered. Join their text in order, as for text-only message content.
+fn convert_function_call_output(output: &Value) -> Result<String, TranslationError> {
+    match output {
+        // The request history is borrowed; the owned Chat request keeps this text.
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(parts) => {
+            let mut content = String::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text") => {
+                        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                            TranslationError::UnsupportedFunctionCallOutputPart(
+                                "input_text requires a string `text` field".to_owned(),
+                            )
+                        })?;
+                        content.push_str(text);
+                    },
+                    Some(part_type) => {
+                        return Err(TranslationError::UnsupportedFunctionCallOutputPart(
+                            part_type.to_owned(),
+                        ));
+                    },
+                    None => {
+                        return Err(TranslationError::UnsupportedFunctionCallOutputPart(
+                            "unknown".to_owned(),
+                        ));
+                    },
+                }
+            }
+            Ok(content)
+        },
+        _ => Err(TranslationError::InvalidFunctionCallOutput),
+    }
 }
 
 /// Validate the outer Responses input shape before canonical state overrides
@@ -739,15 +903,6 @@ fn required_input_item_string<'a>(
         Some(Value::String(value)) => Ok(value),
         Some(_) => Err(TranslationError::InvalidInputItemStringField { item_type, field }),
         None => Err(TranslationError::MissingInputItemField { item_type, field }),
-    }
-}
-
-/// Convert an optional JSON field to Chat's string-valued history fields.
-fn chat_string_field(value: Option<&Value>) -> Value {
-    match value {
-        Some(Value::String(text)) => Value::String(text.clone()),
-        Some(value) => Value::String(value.to_string()),
-        None => Value::String(String::new()),
     }
 }
 
@@ -815,7 +970,14 @@ impl ConvertedContentParts {
             ));
         };
         self.text_parts.push(text.to_owned());
-        self.chat_parts.push(json!({"type": "text", "text": text}));
+        let mut chat_part = Map::new();
+        chat_part.insert("type".to_owned(), Value::String("text".to_owned()));
+        chat_part.insert("text".to_owned(), Value::String(text.to_owned()));
+        if copy_prompt_cache_breakpoint(part, &mut chat_part) {
+            // A string cannot carry a breakpoint at this content boundary.
+            self.all_text = false;
+        }
+        self.chat_parts.push(Value::Object(chat_part));
         Ok(())
     }
 
@@ -833,6 +995,15 @@ impl ConvertedContentParts {
             Value::Array(self.chat_parts)
         }
     }
+}
+
+/// Preserve an explicit cache boundary on the corresponding Chat content part.
+fn copy_prompt_cache_breakpoint(source: &Value, target: &mut Map<String, Value>) -> bool {
+    let Some(breakpoint) = source.get("prompt_cache_breakpoint").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    target.insert("prompt_cache_breakpoint".to_owned(), breakpoint.clone());
+    true
 }
 
 impl Default for ConvertedContentParts {
@@ -863,10 +1034,11 @@ fn convert_input_image_part(part: &Value) -> Result<Value, TranslationError> {
     image_url.insert("url".to_owned(), url);
     copy_field(obj, &mut image_url, "detail");
 
-    Ok(json!({
-        "type": "image_url",
-        "image_url": Value::Object(image_url)
-    }))
+    let mut chat_part = Map::new();
+    chat_part.insert("type".to_owned(), Value::String("image_url".to_owned()));
+    chat_part.insert("image_url".to_owned(), Value::Object(image_url));
+    copy_prompt_cache_breakpoint(part, &mut chat_part);
+    Ok(Value::Object(chat_part))
 }
 
 /// Convert a `Responses` file content part into Chat Completions shape.
@@ -888,10 +1060,11 @@ fn convert_input_file_part(part: &Value) -> Result<Value, TranslationError> {
         ));
     }
 
-    Ok(json!({
-        "type": "file",
-        "file": Value::Object(file)
-    }))
+    let mut chat_part = Map::new();
+    chat_part.insert("type".to_owned(), Value::String("file".to_owned()));
+    chat_part.insert("file".to_owned(), Value::Object(file));
+    copy_prompt_cache_breakpoint(part, &mut chat_part);
+    Ok(Value::Object(chat_part))
 }
 
 /// Chat tool translation plus facts needed to validate `tool_choice`.
@@ -1241,6 +1414,10 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
+///
+/// An explicit JSON `null` (or absent `None`) is treated as absent/default per
+/// observed OpenAI compatibility, returning `Ok(None)` so translation omits the
+/// `tool_choice` field from the outbound Chat Completions request.
 fn build_chat_tool_choice(
     choice: Option<&Value>,
     has_web_search: bool,
@@ -1251,6 +1428,7 @@ fn build_chat_tool_choice(
     };
 
     match choice {
+        Value::Null => Ok(None),
         Value::String(_) => Ok(Some(choice.clone())),
         Value::Object(choice_obj) => build_object_tool_choice(choice_obj, has_web_search, has_file_search).map(Some),
         _ => Err(TranslationError::UnsupportedToolChoiceType(
@@ -1297,7 +1475,7 @@ fn build_object_tool_choice(
 }
 
 /// Return a stable JSON type name for diagnostics.
-fn json_type_name(value: &Value) -> &'static str {
+pub(crate) fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -1321,7 +1499,7 @@ pub(crate) fn chat_response_to_response_resource(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Chat Completions response"))?;
 
-    let finish_reason = validate_chat_response(obj)?;
+    let finish_reason = validate_chat_response(obj, &context.reasoning_options)?;
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
@@ -1335,11 +1513,14 @@ pub(crate) fn chat_response_to_response_resource(
         service_tier: &service_tier,
     };
 
-    Ok(response_resource(context, parts))
+    response_resource(context, parts)
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
-fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationError> {
+fn validate_chat_response<'a>(
+    obj: &'a Map<String, Value>,
+    reasoning_options: &ReasoningOptions,
+) -> Result<&'a str, TranslationError> {
     let choices = obj
         .get("choices")
         .and_then(Value::as_array)
@@ -1361,12 +1542,16 @@ fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationE
         ));
     }
 
-    validate_chat_message(choice, finish_reason)?;
+    validate_chat_message(choice, finish_reason, reasoning_options)?;
     Ok(finish_reason)
 }
 
 /// Validate the assistant message fields that the translator consumes.
-fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Result<(), TranslationError> {
+fn validate_chat_message(
+    choice: &Map<String, Value>,
+    finish_reason: &str,
+    reasoning_options: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     let message = choice
         .get("message")
         .and_then(Value::as_object)
@@ -1382,11 +1567,12 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
     let has_content = validate_chat_content(message)?;
     let has_refusal = validate_chat_refusal(message)?;
     let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
+    let has_reasoning = message_has_reasoning(choice.get("message"), reasoning_options)?;
     // A completed terminal must carry at least one translatable output; without
     // one the translator would synthesize a counterfeit `completed` response with
     // an empty output array. Incomplete terminals (length, content_filter)
     // truthfully carry empty output, so they are exempt.
-    let has_output = has_content || has_refusal || has_tool_calls;
+    let has_output = has_content || has_refusal || has_tool_calls || has_reasoning;
     if response_status(finish_reason) == "completed" && !has_output {
         return Err(TranslationError::InvalidChatResponse(
             "first choice message has no supported output",
@@ -1485,7 +1671,7 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 /// Produces the same resource shape as the finite translation but with an empty
 /// output list, null usage, and `in_progress` status, matching the snapshot
 /// carried by `response.created` and `response.in_progress` streaming events.
-pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
+pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
     let service_tier = context
         .service_tier
         .filter(|value| value.is_string())
@@ -1517,7 +1703,10 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
-fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts<'_>) -> Value {
+fn response_resource(
+    context: &ResponseContext<'_>,
+    parts: ResponseResourceParts<'_>,
+) -> Result<Value, TranslationError> {
     let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
@@ -1533,7 +1722,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "output": Value::Array(parts.output),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
-        "reasoning": Value::Null,
+        "reasoning": reasoning_value(context)?,
         "store": context.store,
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
@@ -1551,7 +1740,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "service_tier": parts.service_tier
     });
     insert_request_resource_fields(&mut resource, context, status);
-    resource
+    Ok(resource)
 }
 
 /// Insert required response fields that are sourced from the original request.
@@ -1662,10 +1851,23 @@ fn previous_response_id_value(context: &ResponseContext<'_>) -> Value {
         .map_or(Value::Null, |response_id| Value::String(response_id.to_owned()))
 }
 
+/// Build the `reasoning` response field.
+fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
+    let Some(reasoning) = context.reasoning.and_then(Value::as_object) else {
+        return Ok(Value::Null);
+    };
+    let summary = requested_summary(reasoning)?.map_or(Value::Null, |summary| Value::String(summary.to_owned()));
+    Ok(json!({
+        "effort": reasoning.get("effort").cloned().unwrap_or(Value::Null),
+        "summary": summary,
+    }))
+}
+
 /// Build the `tool_choice` response field.
 fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
         .tool_choice
+        .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_TOOL_CHOICE.to_owned()))
 }
@@ -1740,6 +1942,15 @@ fn build_output_items(
     };
 
     let message = choice.get("message");
+    let chat_completion_id = obj.get("id").and_then(Value::as_str);
+    if let Some(reasoning_item) = extract_reasoning_item(
+        message,
+        reasoning_item_id(&context.response_id, chat_completion_id),
+        status,
+        &context.reasoning_options,
+    )? {
+        output.push(reasoning_item);
+    }
     let logprobs = chat_logprobs_content(choice);
     append_message_output(&mut output, message, context, status, logprobs);
     append_tool_call_outputs(&mut output, message, context, status)?;
@@ -2003,6 +2214,11 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .and_then(|usage| usage.get("completion_tokens_details"))
         .and_then(|details| details.get("reasoning_tokens"))
@@ -2012,7 +2228,8 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
     json!({
         "input_tokens": input_tokens,
         "input_tokens_details": {
-            "cached_tokens": cached_tokens
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens
         },
         "output_tokens": output_tokens,
         "output_tokens_details": {

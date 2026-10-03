@@ -6,7 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use praxis_ai_apis::{
@@ -20,7 +19,7 @@ use praxis_filter::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, MessageRedaction};
+use super::{GuardCalloutRuntime, GuardPhase, GuardResult, MessageRedaction};
 
 /// Default timeout for `NeMo` HTTP calls (10 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -182,9 +181,13 @@ impl NemoProvider {
     }
 }
 
-#[async_trait]
-impl GuardProvider for NemoProvider {
-    async fn evaluate(
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "separates construction from the async callout path"
+)]
+impl NemoProvider {
+    /// Evaluate extracted messages against the configured `NeMo` service.
+    pub(in crate::guardrails) async fn evaluate(
         &self,
         messages: Vec<serde_json::Value>,
         phase: GuardPhase,
@@ -197,13 +200,7 @@ impl GuardProvider for NemoProvider {
         ensure_check_limit(indices.len(), self.max_message_checks)?;
         self.evaluate_prefixes(messages, indices, phase, runtime).await
     }
-}
 
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "separates construction from the async callout path"
-)]
-impl NemoProvider {
     /// Evaluate each target prefix, accumulating `modified` replacements.
     async fn evaluate_prefixes(
         &self,

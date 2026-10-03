@@ -23,11 +23,11 @@ pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
-#[cfg(any(feature = "azure-ad-filter", feature = "gcp-adc-filter"))]
-mod pinned_client;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
+#[cfg(feature = "store")]
+mod store_readiness;
 mod time_to_first_token;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
@@ -49,10 +49,14 @@ pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
+#[cfg(feature = "store")]
+pub use store_readiness::{FILTER_NAME as STORE_READINESS_GATE_FILTER_NAME, StoreReadinessGateFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
-pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
+#[cfg(feature = "token-ceiling-filter")]
+pub use token_usage::TokenCeilingFilter;
+pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
 
 /// Build an isolated client after installing the process-wide crypto provider.
 ///
@@ -141,6 +145,7 @@ pub(crate) mod test_utils {
             downstream_tls: false,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
+            executed_branch_filters: Vec::new(),
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),

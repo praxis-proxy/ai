@@ -1,0 +1,29 @@
+{
+  "source": "Synthetic Vertex AI Gemini generateContent non-streaming recording",
+  "request": {
+    "model": "gemini-2.0-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2? Reply with just the number."
+      }
+    ]
+  },
+  "response": {
+    "candidates": [
+      {
+        "content": {
+          "parts": [{ "text": "4" }],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "index": 0
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 12,
+      "candidatesTokenCount": 1,
+      "totalTokenCount": 13
+    }
+  }
+}

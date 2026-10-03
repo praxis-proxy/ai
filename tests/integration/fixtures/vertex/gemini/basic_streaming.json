@@ -1,0 +1,14 @@
+{
+  "source": "Synthetic Vertex AI Gemini streamGenerateContent streaming recording",
+  "request": {
+    "model": "gemini-2.0-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello"
+      }
+    ],
+    "stream": true
+  },
+  "response_sse": "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"index\":0}],\"responseId\":\"resp-vertex-001\"}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5},\"responseId\":\"resp-vertex-001\"}\n\n"
+}

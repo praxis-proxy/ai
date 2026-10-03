@@ -24,7 +24,6 @@ pub(crate) mod sse;
     reason = "Responses translation helpers are wired into the HTTP filter in a later stack entry"
 )]
 pub(crate) mod translation;
-pub(crate) mod url_security;
 
 pub use chat_completions::routes::{
     ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
@@ -40,9 +39,11 @@ pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use responses::FileResolveFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub use responses::implementation_openapi_json as responses_openapi_json;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
-    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchCalloutFilter,
+    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchCalloutFilter, OpenaiResponsesRequestFilter,
     OpenaiResponsesValidateFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
     responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::OpenaiStreamEventsFilter,
 };

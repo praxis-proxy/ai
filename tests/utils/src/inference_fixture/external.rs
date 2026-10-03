@@ -255,7 +255,6 @@ fn validate_response_status(status: u16) -> Result<(), FixtureError> {
     Ok(())
 }
 
-
 fn external_error(message: &'static str) -> FixtureError {
     FixtureError::ExternalRecording { message }
 }

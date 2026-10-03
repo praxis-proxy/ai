@@ -1,0 +1,8 @@
+# Labels of the self-hosted runners this repository targets, so actionlint
+# can check runs-on entries instead of rejecting them as unknown. The fips
+# and rhel labels select the RHEL 9 runner in FIPS mode that the fips-host
+# jobs run on (docs/developing/fips.md, "The runner job").
+self-hosted-runner:
+  labels:
+    - fips
+    - rhel

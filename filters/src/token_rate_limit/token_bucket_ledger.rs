@@ -39,18 +39,17 @@ use std::{
 
 use dashmap::DashMap;
 
+use super::ledger::DenialReason;
+
+
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
 ///
-/// [`super::backend::TOKEN_BUCKET_RESERVE_SCRIPT`]'s Valkey/Lua path
-/// folds this ratio into a millisecond `PEXPIRE` TTL. Lua 5.1's `%.14g`
-/// number formatting switches to scientific notation past ~1e14, which
-/// `PEXPIRE`'s strict-integer parser rejects -- and since Redis doesn't
-/// roll back a script's earlier `redis.call()`s on a later error, that
-/// failure would permanently drain the bucket instead of just denying
-/// one request. Enforced here, shared by both backends, so a config
-/// rejected on one is rejected on both. 1e9 stays ~1e5x below the
-/// threshold, with margin for `reservation_timeout_ms` on top.
+/// The Valkey backend folds this ratio into the millisecond `PEXPIRE` TTL
+/// of every bucket hash; bounding it keeps that TTL a modest integer
+/// (at most ~1e12 ms, plus `reservation_timeout_ms`) rather than one that
+/// saturates or outlives any useful state. Enforced here, shared by both
+/// backends, so a config rejected on one is rejected on both.
 pub(super) const MAX_CAPACITY_REFILL_RATE_RATIO_SECS: f64 = 1e9;
 
 /// Upper bound on `capacity`/`reserved_tokens`, matching f64's 2^53
@@ -132,6 +131,13 @@ pub(super) struct Reservation {
     pub(super) estimate: u64,
     /// Monotonic timestamp at admission, in milliseconds.
     pub(super) created_at_ms: u64,
+    /// Tokens consumed from the bucket after this reservation
+    /// (`capacity - remaining`). Exposed for the filter's graduated
+    /// tier evaluation (S1).
+    pub(super) usage_after: u64,
+    /// Remaining token balance for this key after the reservation.
+    /// Reported as the rule's `budget_remaining` gauge.
+    pub(super) remaining: u64,
 }
 
 /// Result of attempting admission.
@@ -144,6 +150,10 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
+        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        reason: DenialReason,
+        /// Remaining budget for this key at the time of the denial.
+        remaining: u64,
     },
 }
 
@@ -297,27 +307,39 @@ impl TokenBucketLedger {
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
-            return Decision::Denied { retry_after_ms: 0 };
+            return Decision::Denied {
+                retry_after_ms: 0,
+                reason: DenialReason::InvalidKey,
+                remaining: 0,
+            };
         }
 
-        let state = match self.keys.entry(key.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                if self
-                    .key_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-                        (count < self.config.max_keys).then_some(count + 1)
-                    })
-                    .is_err()
-                {
-                    return Decision::Denied { retry_after_ms: 0 };
-                }
-                let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
-                entry.insert(Arc::clone(&state));
-                state
-            },
+        let entry = loop {
+            if let Some(entry) = self.keys.get(key) {
+                break entry;
+            }
+            match self.keys.entry(key.to_owned()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {},
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .key_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                            (count < self.config.max_keys).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                            remaining: 0,
+                        };
+                    }
+                    let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
+                    entry.insert(state);
+                },
+            }
         };
-        let mut state = match state.lock() {
+        let mut state = match entry.value().lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -328,6 +350,12 @@ impl TokenBucketLedger {
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "token balances are finite, non-negative, and bounded by validated capacity"
+        )]
+        let remaining_before = state.tokens.floor() as u64;
         #[expect(
             clippy::cast_precision_loss,
             reason = "token estimates are far below f64's 2^53 mantissa"
@@ -342,7 +370,11 @@ impl TokenBucketLedger {
                 reason = "retry_after_ms is a small positive duration bounded by realistic refill rates"
             )]
             let retry_after_ms = retry_after_ms.max(1.0) as u64;
-            return Decision::Denied { retry_after_ms };
+            return Decision::Denied {
+                retry_after_ms,
+                reason: DenialReason::WindowCapacity,
+                remaining: remaining_before,
+            };
         }
         if self
             .active_reservations
@@ -353,10 +385,25 @@ impl TokenBucketLedger {
         {
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
+                reason: DenialReason::ReservationCapacity,
+                remaining: remaining_before,
             };
         }
 
         state.tokens -= estimate_f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "capacity is bounded by MAX_F64_SAFE_INTEGER, difference is non-negative and within u64 range"
+        )]
+        let usage_after = (self.config.capacity as f64 - state.tokens).max(0.0) as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "token balances are finite, non-negative, and bounded by validated capacity"
+        )]
+        let remaining_after = state.tokens.floor() as u64;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.active.insert(
             id,
@@ -367,10 +414,13 @@ impl TokenBucketLedger {
         );
         self.reservations.insert(id, key.to_owned());
         drop(state);
+        drop(entry);
         Decision::Admitted(Reservation {
             id,
             estimate,
             created_at_ms: now_ms,
+            usage_after,
+            remaining: remaining_after,
         })
     }
 
@@ -476,7 +526,10 @@ impl TokenBucketLedger {
     reason = "ledger tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{Arc, Barrier, mpsc},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -670,6 +723,33 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_cannot_remove_a_key_while_reserve_holds_its_map_entry() {
+        let ledger = Arc::new(ledger(10, 1.0));
+        ledger
+            .keys
+            .insert("alice".into(), Arc::new(Mutex::new(BucketState::new(10))));
+        ledger.key_count.store(1, Ordering::Relaxed);
+
+        // `reserve` keeps this same DashMap entry guard while locking and
+        // changing BucketState, so cleanup must not remove its key in-between.
+        let entry = ledger.keys.get("alice").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleanup_ledger = Arc::clone(&ledger);
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cleanup_ledger.cleanup(100, 1);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(entry);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(ledger.key_count(), 0);
+    }
+
+    #[test]
     fn invalid_config_is_rejected() {
         assert!(
             TokenBucketLedger::new(TokenBucketConfig {
@@ -759,7 +839,13 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
-        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+        assert!(matches!(
+            l.reserve("b", 1, 0),
+            Decision::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -775,5 +861,21 @@ mod tests {
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
         assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+    }
+
+    #[test]
+    fn decisions_carry_the_whole_token_balance_of_the_key_they_decided() {
+        let l = ledger(100, 1.0);
+        let Decision::Admitted(first) = l.reserve("alice", 30, 1_000) else {
+            panic!("30 of 100 tokens must be admitted");
+        };
+        assert_eq!(first.remaining, 70, "100 minus the 30 just taken");
+        let Decision::Denied { remaining, .. } = l.reserve("alice", 80, 1_000) else {
+            panic!("80 tokens are not available");
+        };
+        assert_eq!(
+            remaining, 70,
+            "a denial reports the refilled balance it was checked against"
+        );
     }
 }

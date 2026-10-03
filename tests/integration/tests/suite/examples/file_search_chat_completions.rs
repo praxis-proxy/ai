@@ -120,7 +120,7 @@ fn file_search_chat_example_runs_model_search_model_round_trip() {
         response["usage"],
         json!({
             "input_tokens": 30,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
             "output_tokens": 12,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": 42

@@ -32,12 +32,13 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, EmptyFilterConfig, FilterAction, FilterError, HttpFilter,
+    HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::parser::{ParsedTools, parse_tools};
+use super::bound_body_outcome;
 use crate::{classifier::is_responses_create, promotion::is_promotable_value};
 
 // -----------------------------------------------------------------------------
@@ -87,6 +88,10 @@ impl HttpFilter for ToolParseFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
 
@@ -145,6 +150,15 @@ impl HttpFilter for ToolParseFilter {
         promote_filter_results(ctx, &parsed)?;
 
         Ok(FilterAction::Release)
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 

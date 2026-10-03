@@ -21,7 +21,7 @@ use praxis_filter::{
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, MessageRedaction, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, MessageRedaction, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -73,13 +73,16 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// ```
 pub struct AiGuardrailsFilter {
     /// Guard provider instance.
-    provider: Box<dyn GuardProvider>,
+    provider: nemo::NemoProvider,
     /// Which phases to evaluate.
     phase: PhaseConfig,
     /// Prebuilt outbound filter chain for provider callouts.
     outbound: Arc<FilterPipeline>,
     /// Per-callout deadline derived from the provider configuration.
     callout_timeout: std::time::Duration,
+    /// Chosen verdict for tests that must not call `NeMo`.
+    #[cfg(test)]
+    scripted_verdict: Option<GuardResult>,
 }
 
 impl AiGuardrailsFilter {
@@ -94,11 +97,11 @@ impl AiGuardrailsFilter {
         outbound: Arc<FilterPipeline>,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let (provider, callout_timeout): (Box<dyn GuardProvider>, _) = match config.provider.provider_type {
+        let (provider, callout_timeout) = match config.provider.provider_type {
             ProviderType::Nemo => {
                 let provider = nemo::NemoProvider::from_config(&config.provider.config, client)?;
                 let timeout = provider.callout_timeout();
-                (Box::new(provider), timeout)
+                (provider, timeout)
             },
         };
 
@@ -107,6 +110,8 @@ impl AiGuardrailsFilter {
             phase: config.phase,
             outbound,
             callout_timeout,
+            #[cfg(test)]
+            scripted_verdict: None,
         }))
     }
 
@@ -147,12 +152,16 @@ impl AiGuardrailsFilter {
     /// is no phase-target message, which would otherwise never produce
     /// [`GuardResult::Redact`].
     #[cfg(test)]
-    pub(super) fn with_provider(provider: Box<dyn GuardProvider>, phase: PhaseConfig) -> Result<Self, FilterError> {
+    pub(super) fn with_verdict(verdict: GuardResult, phase: PhaseConfig) -> Result<Self, FilterError> {
+        let client = crate::isolated_subrequest_client(4);
+        let config = serde_yaml::from_str("endpoint: \"http://127.0.0.1:9/v1/checks\"")
+            .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): {error}").into() })?;
         Ok(Self {
-            provider,
+            provider: nemo::NemoProvider::from_config(&config, client)?,
             phase,
             outbound: test_outbound_chain()?,
             callout_timeout: std::time::Duration::from_secs(5),
+            scripted_verdict: Some(verdict),
         })
     }
 
@@ -176,6 +185,20 @@ impl AiGuardrailsFilter {
             deadline,
             outbound: &self.outbound,
         }
+    }
+
+    /// Apply a scripted test verdict, or call the configured `NeMo` provider.
+    async fn evaluate(
+        &self,
+        messages: Vec<serde_json::Value>,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, FilterError> {
+        #[cfg(test)]
+        if let Some(verdict) = &self.scripted_verdict {
+            return Ok(verdict.clone());
+        }
+        self.provider.evaluate(messages, phase, runtime).await
     }
 }
 
@@ -262,7 +285,7 @@ impl HttpFilter for AiGuardrailsFilter {
 
         let messages = extract_messages(bytes)?;
         let runtime = self.callout_runtime(ctx);
-        let result = self.provider.evaluate(messages, GuardPhase::Request, &runtime).await?;
+        let result = self.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
     }
 
@@ -312,9 +335,7 @@ impl HttpFilter for AiGuardrailsFilter {
             let runtime = self.callout_runtime(ctx);
             // `on_response_body` is sync (Pingora constraint); use `block_in_place`
             // to bridge into async. See #51 for the plan to make this truly async.
-            tokio::task::block_in_place(|| {
-                handle.block_on(self.provider.evaluate(messages, GuardPhase::Response, &runtime))
-            })
+            tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
         });
 
         match evaluation {

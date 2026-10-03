@@ -55,7 +55,8 @@ pub(crate) struct FileSearchFilterConfig {
     /// registration time via [`ChainBindingContext::bind_chain`]. The
     /// destination is supplied by `vector_store_url`, so the chain never needs
     /// an upstream-selecting filter. Private-address gating is centralized in
-    /// `insecure_options.allow_private_upstreams`.
+    /// `insecure_options.allow_private_upstreams`. Cloud metadata,
+    /// unspecified, and multicast addresses remain blocked by that opt-in.
     ///
     /// Optional. Callouts always run through the shared sub-request executor;
     /// this chain only adds filters along the way. When omitted it defaults to
@@ -297,10 +298,11 @@ fn validated_timeout(configured: Option<u64>) -> Result<u64, FilterError> {
 ///
 /// Structural validation always rejects a non-`http(s)` scheme, embedded
 /// userinfo, and a query or fragment. Private-address gating is *not* decided
-/// here: `allow_private = true` defers every private/loopback decision — for
-/// both literal IPs and resolved DNS names — to the connect-time
+/// here: `allow_private = true` defers permitted private/loopback decisions to
+/// the connect-time
 /// `prepare_url_target` hook, which is the sole SSRF gate and honours the
-/// outbound pipeline's `insecure_options.allow_private_upstreams`. Deciding it
+/// outbound pipeline's `insecure_options.allow_private_upstreams`. Cloud
+/// metadata, unspecified, and multicast targets remain blocked. Deciding it
 /// at startup would be unable to see that flag (it is applied later via
 /// `apply_insecure_options`), so a literal private target could never be
 /// permitted even with the central opt-in set.

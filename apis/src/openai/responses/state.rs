@@ -21,6 +21,31 @@ use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
 use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
 
+/// Internal persisted field identifying a Praxis-generated compaction item.
+///
+/// This field is stored only in the private rehydration history. The outbound
+/// serializer removes it before any item reaches a provider or client.
+pub(crate) const LOCAL_COMPACTION_MARKER: &str = "_praxis_local_compaction";
+
+/// Mark a locally generated compaction item in private persisted history.
+#[cfg(feature = "openai-compact")]
+pub(crate) fn mark_local_compaction_item(item: &serde_json::Value) -> serde_json::Value {
+    let mut marked = item.clone();
+    if let Some(object) = marked.as_object_mut() {
+        object.insert(LOCAL_COMPACTION_MARKER.to_owned(), serde_json::Value::Bool(true));
+    }
+    marked
+}
+
+/// Remove private provenance metadata before replaying a stored item.
+#[cfg(feature = "store")]
+pub(crate) fn strip_local_compaction_marker(mut item: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = item.as_object_mut() {
+        object.remove(LOCAL_COMPACTION_MARKER);
+    }
+    item
+}
+
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
@@ -346,14 +371,17 @@ pub(crate) struct ResponsesState {
     /// [`Self::response_object`] and appends that non-end-of-stream terminal
     /// frame, so the store persists synchronously BEFORE releasing the chunk
     /// (failing closed on error) and then skips the redundant end-of-stream
-    /// persist. It is deliberately **not** set for a request-phase local
-    /// completion (`encode_local_completion`): that terminal is delivered as a
-    /// buffered `TerminalResponse` at end-of-stream, where the store already
-    /// persists before the body is written, so marking it here would suppress
-    /// that end-of-stream persist and lose the record.
+    /// persist. A request-phase local completion uses the separate
+    /// [`Self::local_stream_terminal_emitted`] flag because IRR can deliver its
+    /// terminal body as a non-end-of-stream chunk too.
     ///
     /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
     pub logical_stream_terminal_emitted: bool,
+
+    /// A request-phase dispatcher encoded a local `response.completed` frame.
+    /// IRR can deliver this as a non-EOS chunk, so outer persistence filters
+    /// must commit the canonical response before releasing that chunk.
+    pub local_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -464,6 +492,14 @@ pub(crate) struct ResponsesState {
     /// conversation. Internal continuations send only the remaining delta.
     pub provider_history_len: usize,
 
+    /// IDs of compaction items that came from a provider response.
+    ///
+    /// Locally generated Praxis summaries use the same public JSON shape as a
+    /// provider compaction item, so the outbound proxy must not infer native
+    /// support from the item type alone. Rehydration populates this set from
+    /// persisted provenance metadata; items absent from the set are translated.
+    pub provider_compaction_ids: HashSet<String>,
+
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
     #[cfg_attr(
@@ -487,7 +523,7 @@ pub(crate) struct ResponsesState {
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
     #[cfg(feature = "store")]
-    pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
+    pub pending_approvals: Vec<praxis_ai_store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
     ///
@@ -864,6 +900,7 @@ impl Default for ResponsesState {
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
             logical_stream_terminal_emitted: false,
+            local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
@@ -880,6 +917,7 @@ impl Default for ResponsesState {
             client_tool_echo: None,
             messages: Vec::new(),
             provider_history_len: 0,
+            provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             #[cfg(feature = "store")]
@@ -921,8 +959,10 @@ impl ResponsesState {
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
         let persisted_messages = messages.clone();
+        let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
         let tool_choice = body
             .get("tool_choice")
+            .filter(|v| !v.is_null())
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 
@@ -935,6 +975,7 @@ impl ResponsesState {
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
+            provider_compaction_ids,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
@@ -945,6 +986,20 @@ impl ResponsesState {
             pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
         }
+    }
+
+    /// Identify opaque provider compaction items already present in a stateless
+    /// input array. Locally generated summaries use the `compact_` ID prefix or
+    /// carry the private provenance marker and must still be translated.
+    pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
+        messages
+            .iter()
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -1228,14 +1283,26 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
 /// a single item object, or an array of items. Normalizes all three
 /// forms to a `Vec<Value>`.
 fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
-    match body.get("input") {
-        Some(serde_json::Value::Array(arr)) => arr.clone(),
-        Some(input @ serde_json::Value::Object(_)) => vec![input.clone()],
-        Some(serde_json::Value::String(s)) => {
+    normalize_input_value(body.get("input"))
+}
+
+/// Normalize one Responses API `input` value into a message array.
+pub(crate) fn normalize_input_value(input: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    input
+        .map(|input| normalize_input_owned(input.clone()))
+        .unwrap_or_default()
+}
+
+/// Normalize an owned `input` value without cloning array or object items.
+pub(crate) fn normalize_input_owned(input: serde_json::Value) -> Vec<serde_json::Value> {
+    match input {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(item) => vec![serde_json::Value::Object(item)],
+        serde_json::Value::String(s) => {
             vec![serde_json::json!({
                 "type": "message",
                 "role": "user",
-                "content": s,
+                "content": s
             })]
         },
         _ => Vec::new(),
@@ -1334,6 +1401,32 @@ mod tests {
         });
         let state = ResponsesState::from_request_body(body);
         assert_eq!(state.input.len(), 2, "array input should preserve all items");
+    }
+
+    #[test]
+    fn from_request_body_records_provider_compaction_ids_for_stateless_chaining() {
+        let provider_item = json!({
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "opaque"
+        });
+        let state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": [provider_item, {
+                "type": "compaction",
+                "id": "compact_local",
+                "encrypted_content": "local"
+            }]
+        }));
+
+        assert!(
+            state.provider_compaction_ids.contains("cmp_provider"),
+            "provider compaction IDs should include opaque provider item IDs"
+        );
+        assert!(
+            !state.provider_compaction_ids.contains("compact_local"),
+            "provider compaction IDs should exclude locally generated compaction IDs"
+        );
     }
 
     #[test]

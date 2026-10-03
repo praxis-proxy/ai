@@ -259,12 +259,77 @@ fn unmatched_path_passes_through() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
 
+    for request in [
+        "GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "PATCH /v1/conversations/conv_unsupported HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        "GET /v1/conversations//items HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /v1/conversations/conv_1/items/item_1/extra HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ] {
+        let raw = http_send(proxy.addr(), request);
+        assert_eq!(parse_status(&raw), 200, "unmatched route should reach fallback");
+        assert_eq!(parse_body(&raw), "ok");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodyless_operation_does_not_parse_invalid_body_bytes() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{"bodyless":"ok"}}"#);
+    let invalid = "this is not json";
+    let request = format!(
+        "GET /v1/conversations/{conv_id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid}",
+        invalid.len()
+    );
+
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "bodyless GET should ignore invalid body bytes");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["id"], conv_id);
+}
+
+#[test]
+fn websocket_upgrade_on_conversations_route_fails_closed() {
+    let proxy = start_test_proxy();
+
     let raw = http_send(
         proxy.addr(),
-        "GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /v1/conversations/conv_upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
     );
-    assert_eq!(parse_status(&raw), 200, "unmatched path should pass through");
-    assert_eq!(parse_body(&raw), "ok");
+
+    assert_eq!(
+        parse_status(&raw),
+        500,
+        "an HTTP-only Conversations route must not bypass the local filter through upgrade headers"
+    );
+}
+
+#[test]
+fn conditionally_skipped_classifier_cannot_bypass_conversations() {
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml.replace(
+        "      - filter: openai_operation\n",
+        "      - filter: openai_operation\n        conditions:\n          - when:\n              path_prefix: /never-matches\n",
+    );
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:"),
+        proxy_port,
+        &HashMap::new(),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/conversations/conv_conditionally_skipped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        500,
+        "a conditionally skipped classifier must not let the local route reach fallback"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

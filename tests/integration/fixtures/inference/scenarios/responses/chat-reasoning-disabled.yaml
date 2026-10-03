@@ -1,0 +1,33 @@
+version: 1
+id: responses/chat-reasoning-disabled
+description: Controlled reasoning replay and explicit rejection of unsupported input.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.reasoning.replay
+turns:
+  - name: disabled
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input:
+            - type: "reasoning"
+              content:
+                - type: "reasoning_text"
+                  text: "I picked 42."
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ''
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

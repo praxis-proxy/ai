@@ -111,7 +111,7 @@ impl ScenarioRunner {
         let mut proxy = start_proxy(&config);
         backend.finish_proxy_readiness();
 
-        let client = reqwest::Client::builder()
+        let client = crate::inference_fixture::http_client_builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -425,6 +425,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_responses_proxy"
             | "path_rewrite"
             | "openai_responses_format"
+            | "openai_responses_request"
             | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
@@ -432,7 +433,9 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_responses_rehydrate"
             | "openai_stream_events"
             | "openai_tool_parse"
+            | "openai_chat_completions_to_bedrock_converse"
             | "responses_to_chat_completions"
+            | "aws_sigv4_sign"
             | "router"
             | "load_balancer"
     )
@@ -539,6 +542,7 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 
 /// Contains file-backed fields and one dynamically nested database target.
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
+    contain_sigv4_credentials(mapping);
     if mapping
         .iter()
         .any(|(key, value)| key.as_str().is_some_and(is_file_resource_key) && !matches!(value, serde_yaml::Value::Null))
@@ -565,6 +569,28 @@ fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<
     validate_replay_database_target(backend.as_deref(), database_url)?;
     mapping.insert(database_key, serde_yaml::Value::String("sqlite::memory:".to_owned()));
     Ok(())
+}
+
+/// Redirect `SigV4`'s credential lookups to deterministic, non-secret Cargo
+/// process variables during offline replay. The signer performs no callout;
+/// its output credential headers are removed by fixture header policy.
+fn contain_sigv4_credentials(mapping: &mut serde_yaml::Mapping) {
+    let is_signer = mapping.iter().any(|(key, value)| {
+        key.as_str().is_some_and(|key| key == "filter") && value.as_str().is_some_and(|value| value == "aws_sigv4_sign")
+    });
+    if !is_signer {
+        return;
+    }
+
+    for (field, process_var) in [
+        ("access_key_env_var", "CARGO_PKG_NAME"),
+        ("secret_key_env_var", "CARGO_MANIFEST_DIR"),
+    ] {
+        mapping.insert(
+            serde_yaml::Value::String(field.to_owned()),
+            serde_yaml::Value::String(process_var.to_owned()),
+        );
+    }
 }
 
 /// Recognizes config fields whose values are loaded from the local filesystem.
@@ -1711,6 +1737,7 @@ mod tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    #[cfg(feature = "store")]
     use praxis_ai_apis::openai::ResponseStoreFilter;
     use praxis_core::config::Config;
     use serde_json::{Value, json};
@@ -2355,7 +2382,7 @@ mod tests {
     #[tokio::test]
     async fn replay_transport_error_never_exposes_request_query() {
         let port = free_port_guard().release();
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let request = RecordedRequest {
             method: "GET".to_owned(),
             path: "/?credential=transport-secret-never-log".to_owned(),
@@ -2611,6 +2638,8 @@ mod tests {
     // Asserts the live ResponseStore API accepts scheme-less sqlite paths, so it
     // needs the store-sqlite backend compiled in (run via
     // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_scheme_less_sqlite_paths() {
@@ -3191,6 +3220,8 @@ mod tests {
         assert_eq!(error.to_string(), "scenario outbound URL is not loopback");
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[test]
     fn replay_config_rejects_all_response_store_postgres_targets() {
         let cases = [
@@ -3284,6 +3315,8 @@ mod tests {
     // Asserts the live ResponseStore API accepts empty/temporary sqlite targets,
     // so it needs the store-sqlite backend compiled in (run via
     // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_empty_sqlite_temporary_databases() {
@@ -3331,7 +3364,7 @@ mod tests {
 
     #[tokio::test]
     async fn scenario_request_path_rejects_non_origin_forms_before_networking() {
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
         let invalid_paths = [
             "https://example.test/v1/messages",
@@ -3385,7 +3418,7 @@ mod tests {
             ),
         ] {
             let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
-            let client = reqwest::Client::new();
+            let client = crate::inference_fixture::http_client();
             let mut scenario = scenario_with_turns(vec![
                 scenario_turn("first", "must not reach the wire", false),
                 scenario_turn("invalid", "must fail during preflight", false),
@@ -3441,7 +3474,7 @@ mod tests {
             body: RecordedBody::Empty,
         }])
         .expect("loopback capture server should start");
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let path = "/v1/messages?mode=a%2Fb&author=O%27Reilly&dot=%2E&empty=";
         let request = RecordedRequest {
             method: "GET".to_owned(),
@@ -3594,6 +3627,8 @@ mod tests {
         std::fs::read_to_string(example_config_path(relative)).expect("example config should load")
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     fn response_store_filter_accepts_database_url(backend: &str, database_url: &str, allow_private: bool) {
         let database_url = serde_json::to_string(database_url).expect("database URL should serialize");
         let private_option = if allow_private {

@@ -268,7 +268,9 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         verify_egress_isolation(namespace);
     }
 
-    let prompt = "Inspect input.json, copy its expected_content value into result.txt, run ./verify.sh, then summarize what you changed.";
+    let prompt = r#"Use exec_command immediately to run exactly this single command:
+python3 -c 'import json, pathlib; data = json.load(open("input.json")); pathlib.Path("result.txt").write_text(data["expected_content"])' && ./verify.sh
+Do not run a different command and do not answer before it succeeds. Then summarize what changed. /no_think"#;
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
     let output = run_codex(
@@ -293,9 +295,9 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         stderr = output.stderr
     );
 
-    workspace.assert_successful_completion();
     observer.assert_http_only();
     assert_live_coding_codex_jsonl(&output.stdout);
+    workspace.assert_successful_completion();
 }
 
 /// Keep the live backend credential ephemeral rather than coupled to the example fixture.
@@ -1031,7 +1033,7 @@ fn http_response_script() -> Vec<HttpServerAction> {
                         })],
                         serde_json::json!({
                             "input_tokens": 0,
-                            "input_tokens_details": {"cached_tokens": 0},
+                            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                             "output_tokens": 0,
                             "output_tokens_details": {"reasoning_tokens": 0},
                             "total_tokens": 0
@@ -1104,7 +1106,7 @@ fn http_response_resource(status: &str, output: Vec<serde_json::Value>, usage: s
 /// fixture without vendoring unrelated response item variants.
 static OPENRESPONSES_RESPONSE_RESOURCE_VALIDATOR: LazyLock<Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(
-        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["id","object","created_at","completed_at","status","incomplete_details","model","previous_response_id","instructions","output","error","tools","tool_choice","truncation","parallel_tool_calls","text","top_p","presence_penalty","frequency_penalty","top_logprobs","temperature","reasoning","user","usage","max_output_tokens","max_tool_calls","store","background","service_tier","metadata","safety_identifier","prompt_cache_key"],"properties":{"id":{"type":"string"},"object":{"const":"response"},"created_at":{"type":"integer"},"completed_at":{"type":["integer","null"]},"status":{"type":"string"},"incomplete_details":{"type":["object","null"]},"model":{"type":"string"},"previous_response_id":{"type":["string","null"]},"instructions":{"type":["string","null"]},"output":{"type":"array"},"error":{"type":["object","null"]},"tools":{"type":"array"},"tool_choice":{"type":["string","object"]},"truncation":{"type":"string"},"parallel_tool_calls":{"type":"boolean"},"text":{"type":"object"},"top_p":{"type":"number"},"presence_penalty":{"type":"number"},"frequency_penalty":{"type":"number"},"top_logprobs":{"type":"integer"},"temperature":{"type":"number"},"reasoning":{"type":["object","null"]},"user":{"type":["string","null"]},"usage":{"anyOf":[{"type":"null"},{"type":"object","required":["input_tokens","output_tokens","total_tokens","input_tokens_details","output_tokens_details"],"properties":{"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"},"total_tokens":{"type":"integer"},"input_tokens_details":{"type":"object","required":["cached_tokens"],"properties":{"cached_tokens":{"type":"integer"}}},"output_tokens_details":{"type":"object","required":["reasoning_tokens"],"properties":{"reasoning_tokens":{"type":"integer"}}}}}]},"max_output_tokens":{"type":["integer","null"]},"max_tool_calls":{"type":["integer","null"]},"store":{"type":"boolean"},"background":{"type":"boolean"},"service_tier":{"type":"string"},"metadata":{"type":"object"},"safety_identifier":{"type":["string","null"]},"prompt_cache_key":{"type":["string","null"]}}}"#,
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["id","object","created_at","completed_at","status","incomplete_details","model","previous_response_id","instructions","output","error","tools","tool_choice","truncation","parallel_tool_calls","text","top_p","presence_penalty","frequency_penalty","top_logprobs","temperature","reasoning","user","usage","max_output_tokens","max_tool_calls","store","background","service_tier","metadata","safety_identifier","prompt_cache_key"],"properties":{"id":{"type":"string"},"object":{"const":"response"},"created_at":{"type":"integer"},"completed_at":{"type":["integer","null"]},"status":{"type":"string"},"incomplete_details":{"type":["object","null"]},"model":{"type":"string"},"previous_response_id":{"type":["string","null"]},"instructions":{"type":["string","null"]},"output":{"type":"array"},"error":{"type":["object","null"]},"tools":{"type":"array"},"tool_choice":{"type":["string","object"]},"truncation":{"type":"string"},"parallel_tool_calls":{"type":"boolean"},"text":{"type":"object"},"top_p":{"type":"number"},"presence_penalty":{"type":"number"},"frequency_penalty":{"type":"number"},"top_logprobs":{"type":"integer"},"temperature":{"type":"number"},"reasoning":{"type":["object","null"]},"user":{"type":["string","null"]},"usage":{"anyOf":[{"type":"null"},{"type":"object","required":["input_tokens","output_tokens","total_tokens","input_tokens_details","output_tokens_details"],"properties":{"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"},"total_tokens":{"type":"integer"},"input_tokens_details":{"type":"object","required":["cached_tokens","cache_write_tokens"],"properties":{"cached_tokens":{"type":"integer"},"cache_write_tokens":{"type":"integer"}}},"output_tokens_details":{"type":"object","required":["reasoning_tokens"],"properties":{"reasoning_tokens":{"type":"integer"}}}}}]},"max_output_tokens":{"type":["integer","null"]},"max_tool_calls":{"type":["integer","null"]},"store":{"type":"boolean"},"background":{"type":"boolean"},"service_tier":{"type":"string"},"metadata":{"type":"object"},"safety_identifier":{"type":["string","null"]},"prompt_cache_key":{"type":["string","null"]}}}"#,
     )
     .expect("OpenResponses fixture schema projection should parse");
     jsonschema::options()
