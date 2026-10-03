@@ -8,6 +8,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "openai-responses")]
+use praxis_ai_apis::openai::AgenticBudgetPolicy;
 use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
@@ -180,9 +182,15 @@ fn build_listener_pipelines(
         #[cfg(not(feature = "store"))]
         let _ = &gate_store_traffic;
 
+        #[cfg(feature = "openai-responses")]
+        let budget_policy = agentic_budget_policy(&entries, &chains)?;
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
+        #[cfg(feature = "openai-responses")]
+        if let Some(policy) = budget_policy {
+            pipeline.add_pipeline_extension(Box::new(policy));
+        }
         attach(listener, &mut pipeline);
 
         validate_provider_boundary(listener, &entries, &chains)?;
@@ -192,6 +200,69 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Discover nested loop limits at pipeline construction, before the first
+/// request filter can parse or copy a body. Branches are combined by the
+/// smallest reachable limit because their runtime selection is not yet known.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "recursive traversal of nested IRR steps and branch chains"
+)]
+fn agentic_budget_policy(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<Option<AgenticBudgetPolicy>, Box<dyn std::error::Error + Send + Sync>> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "recursive traversal of nested IRR steps and branch chains"
+    )]
+    fn visit(
+        entries: &[FilterEntry],
+        chains: &HashMap<&str, &[FilterEntry]>,
+        visited: &mut HashSet<String>,
+        policy: &mut Option<AgenticBudgetPolicy>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for entry in entries {
+            if entry.filter_type == "openai_agentic_loop" {
+                let next = AgenticBudgetPolicy::from_config(&entry.config)?;
+                *policy = Some(policy.map_or(next, |current| current.min(next)));
+            }
+            if entry.filter_type == "iterative_request_router"
+                && let Some(steps) = entry.config.get("steps").and_then(serde_yaml::Value::as_sequence)
+            {
+                for step in steps {
+                    if let Some(filters) = step.get("filters").and_then(serde_yaml::Value::as_sequence) {
+                        let nested: Vec<FilterEntry> = filters
+                            .iter()
+                            .cloned()
+                            .map(serde_yaml::from_value)
+                            .collect::<Result<_, _>>()?;
+                        visit(&nested, chains, visited, policy)?;
+                    }
+                }
+            }
+            if let Some(branches) = &entry.branch_chains {
+                for chain in branches.iter().flat_map(|branch| branch.chains.iter()) {
+                    match chain {
+                        ChainRef::Inline { filters, .. } => visit(filters, chains, visited, policy)?,
+                        ChainRef::Named(name) if visited.insert(name.clone()) => {
+                            if let Some(filters) = chains.get(name.as_str()) {
+                                visit(filters, chains, visited, policy)?;
+                            }
+                        },
+                        ChainRef::Named(_) => {},
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut policy = None;
+    visit(entries, chains, &mut HashSet::new(), &mut policy)?;
+    Ok(policy)
 }
 
 /// Build the server-owned gate placed before store consumers on a listener
@@ -442,6 +513,72 @@ mod tests {
     use praxis_filter::FilterRegistry;
 
     use super::*;
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn nested_agentic_budget_is_available_before_request_filters() {
+        let entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: openai_responses_format
+- filter: openai_responses_validate
+- filter: iterative_request_router
+  initial_step: inference
+  steps:
+    - name: inference
+      filters:
+        - filter: openai_agentic_loop
+          max_retained_bytes: 8192
+        - filter: openai_agentic_loop
+          max_retained_bytes: 4096
+",
+        )
+        .unwrap();
+        let policy = agentic_budget_policy(&entries, &HashMap::new()).unwrap().unwrap();
+        assert_eq!(policy.max_retained_bytes(), 4096);
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn branch_only_agentic_budget_is_discovered_before_branch_consumption() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+        branch_chains:
+          - name: bounded
+            rejoin: terminal
+            chains:
+              - name: bounded-inline
+                filters:
+                  - filter: openai_agentic_loop
+                    max_retained_bytes: 4096
+                  - filter: static_response
+                    status: 200
+      - filter: static_response
+        status: 200
+"#,
+        )
+        .unwrap();
+        let chains: HashMap<&str, &[FilterEntry]> = config
+            .filter_chains
+            .iter()
+            .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
+            .collect();
+        let entries = &config.filter_chains[0].filters;
+        assert_eq!(
+            agentic_budget_policy(entries, &chains)
+                .unwrap()
+                .unwrap()
+                .max_retained_bytes(),
+            4096,
+        );
+    }
 
     #[test]
     fn resolve_pipelines_builds_for_each_listener() {

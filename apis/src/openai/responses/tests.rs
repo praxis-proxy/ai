@@ -243,6 +243,34 @@ async fn on_request_body_rejects_invalid_json() {
     );
 }
 
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn agentic_budget_rejects_raw_body_before_classification() {
+    let filter = make_filter("on_invalid: reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(Bytes::from("x".repeat(513)));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized raw request body must be rejected");
+    };
+    assert_eq!(rejection.status, 413);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["error"]["message"],
+        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+    );
+    assert!(
+        ctx.get_metadata("openai_responses_format.format").is_none(),
+        "classification must not parse or publish the oversized body"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Body Parsing Edge Cases
 // -----------------------------------------------------------------------------

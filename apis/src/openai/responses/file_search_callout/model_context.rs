@@ -53,6 +53,9 @@ pub(super) struct FormatLimits<'a> {
     /// Citation mappings accumulated before this result set.
     pub known_citation_files: &'a HashMap<String, String>,
 
+    /// Citation mappings staged by earlier calls in the current transaction.
+    pub staged_citation_files: &'a HashMap<String, String>,
+
     /// Whether canonical raw results must be materialized for the response.
     pub include_public_results: bool,
 }
@@ -281,6 +284,7 @@ pub(super) fn format_search_results(
         let citation_compatible = citation_metadata_compatible(
             result,
             limits.known_citation_files,
+            limits.staged_citation_files,
             &citation_files,
             limits.max_new_citation_files,
         );
@@ -295,7 +299,11 @@ pub(super) fn format_search_results(
             render_context,
             limits.include_public_results,
         );
-        if rendered_file && emits_citation_marker && !limits.known_citation_files.contains_key(&result.file_id) {
+        if rendered_file
+            && emits_citation_marker
+            && !limits.known_citation_files.contains_key(&result.file_id)
+            && !limits.staged_citation_files.contains_key(&result.file_id)
+        {
             citation_files.insert(result.file_id.clone(), result.filename.clone());
         }
         public_results.extend(public_result);
@@ -317,6 +325,7 @@ pub(super) fn format_search_results(
 fn citation_metadata_compatible(
     result: &SearchResult,
     known_citation_files: &HashMap<String, String>,
+    staged_citation_files: &HashMap<String, String>,
     new_citation_files: &HashMap<String, String>,
     max_new_citation_files: usize,
 ) -> bool {
@@ -326,13 +335,17 @@ fn citation_metadata_compatible(
     let known_compatible = known_citation_files
         .get(&result.file_id)
         .is_none_or(|filename| filename == &result.filename);
+    let staged_compatible = staged_citation_files
+        .get(&result.file_id)
+        .is_none_or(|filename| filename == &result.filename);
     let local_compatible = new_citation_files
         .get(&result.file_id)
         .is_none_or(|filename| filename == &result.filename);
     let has_capacity = known_citation_files.contains_key(&result.file_id)
+        || staged_citation_files.contains_key(&result.file_id)
         || new_citation_files.contains_key(&result.file_id)
         || new_citation_files.len() < max_new_citation_files;
-    metadata_compatible && known_compatible && local_compatible && has_capacity
+    metadata_compatible && known_compatible && staged_compatible && local_compatible && has_capacity
 }
 
 /// Build one canonical public result while appending its private context.
@@ -457,6 +470,7 @@ mod tests {
             max_model_context_bytes: MAX_MODEL_CONTEXT_BYTES,
             max_new_citation_files: 0,
             known_citation_files: &HashMap::new(),
+            staged_citation_files: &HashMap::new(),
             include_public_results: true,
         };
 
@@ -500,6 +514,7 @@ mod tests {
                 max_model_context_bytes: MAX_MODEL_CONTEXT_BYTES,
                 max_new_citation_files: 0,
                 known_citation_files: &HashMap::new(),
+                staged_citation_files: &HashMap::new(),
                 include_public_results: true,
             },
         );
@@ -510,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "compares two complete escaped wrapper projections")]
     fn model_context_budget_counts_wrapper_and_json_escaping_once() {
         let make_result = |chunks: &[&str]| SearchResult {
             attributes: None,
@@ -532,6 +548,7 @@ mod tests {
             max_model_context_bytes: 10,
             max_new_citation_files: 0,
             known_citation_files: &HashMap::new(),
+            staged_citation_files: &HashMap::new(),
             include_public_results: false,
         };
 
@@ -574,6 +591,7 @@ mod tests {
                 max_model_context_bytes: MAX_MODEL_CONTEXT_BYTES,
                 max_new_citation_files: 1,
                 known_citation_files: &HashMap::new(),
+                staged_citation_files: &HashMap::new(),
                 include_public_results: false,
             },
         );
@@ -615,6 +633,7 @@ mod tests {
                 max_model_context_bytes: MAX_MODEL_CONTEXT_BYTES,
                 max_new_citation_files: crate::openai::responses::state::MAX_CITATION_FILES,
                 known_citation_files: &HashMap::new(),
+                staged_citation_files: &HashMap::new(),
                 include_public_results: true,
             },
         );

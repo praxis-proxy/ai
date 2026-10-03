@@ -34,6 +34,9 @@
 #   2. openai_responses_validate — validates parameters, generates IDs
 #   3. openai_response_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
+#   The serving pipeline discovers max_retained_bytes in the nested loop at
+#   build time and gives that limit to classification, validation, and bounded
+#   store reads before this IRR step begins.
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
@@ -285,6 +288,11 @@ filter_chains:
                   - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+                # Aggregate payload retained across response state, history,
+                # dispatch queues, SSE parser scratch, and output staging.
+                # Valid range: 4096..=268435456; the smallest value wins when
+                # multiple loop instances touch one request.
+                max_retained_bytes: 67108864
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy

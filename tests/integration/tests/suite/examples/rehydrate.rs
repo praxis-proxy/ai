@@ -89,6 +89,57 @@ async fn rehydrate_validates_previous_response_and_passes_body_through() {
     drop(proxy2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_continuation_without_agentic_loop_keeps_store_accounting() {
+    let first_backend = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let db = TempSqlite::new("rehydrate_stream_store_accounting");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/rehydrate.yaml"))
+        .expect("read rehydrate example");
+    let proxy_port = free_port();
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", first_backend.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("parse first-turn config");
+    let proxy = start_proxy(&config);
+    let first = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&first), 200, "first turn must be stored");
+    drop(proxy);
+    drop(first_backend);
+
+    let stream_backend = Backend::chunked(vec![
+        "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n".to_owned(),
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_second\",\"created_at\":1001,\"model\":\"gpt-4.1\",\"status\":\"completed\",\"output\":[]}}\n\n".to_owned(),
+    ])
+    .header("content-type", "text/event-stream")
+    .start_with_shutdown();
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        free_port(),
+        &HashMap::from([("127.0.0.1:8000", stream_backend.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("parse continuation config");
+    let proxy = start_proxy(&config);
+    let continuation = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Continue","previous_response_id":"resp_first","stream":true}"#,
+        ),
+    );
+    assert_eq!(parse_status(&continuation), 200, "{continuation}");
+    let body = parse_body(&continuation);
+    assert!(body.contains("response.in_progress"), "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+}
+
 #[test]
 fn rehydrate_passes_through_non_responses_traffic() {
     let backend_guard = Backend::fixed("fallback")

@@ -49,8 +49,9 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use super::{
+    agentic_loop::AgenticBudgetPolicy,
     config::{ResponsesFormatConfig, build_config},
-    error::responses_error_rejection_with_code,
+    error::{responses_error_rejection, responses_error_rejection_with_code},
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
@@ -102,6 +103,10 @@ impl OpenaiResponsesRequestFilter {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "request classification and early budget admission share one filter callback"
+)]
 #[async_trait]
 impl HttpFilter for OpenaiResponsesRequestFilter {
     fn name(&self) -> &'static str {
@@ -152,6 +157,14 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config);
         }
 
+        // The consolidated path owns the same pre-parse admission boundary as
+        // the legacy format filter. Reject before JSON and state allocate.
+        if matched.operation == ResponsesOperation::CreateResponse
+            && let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default())
+        {
+            return Ok(action);
+        }
+
         // The one parse feeds classification, promotion, and state alike. A body
         // that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
@@ -167,7 +180,9 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(action);
         }
 
-        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)?;
+        if let Some(action) = publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)? {
+            return Ok(action);
+        }
 
         Ok(FilterAction::Release)
     }
@@ -194,6 +209,9 @@ fn reject_unsupported_managed_fields(
 /// Kept out of `on_request_body` so the filter entry point stays a readable
 /// sequence of guards.
 ///
+/// Returns a rejection action when initialized state exceeds the active
+/// retained-payload policy.
+///
 /// # Errors
 ///
 /// Returns [`FilterError`] when a filter result cannot be published.
@@ -203,7 +221,7 @@ fn publish_request_facts(
     parsed: serde_json::Value,
     config: &ResponsesFormatConfig,
     operation: ResponsesOperation,
-) -> Result<(), FilterError> {
+) -> Result<Option<FilterAction>, FilterError> {
     let mode = super::compute_mode(classified);
 
     // Classification is published for every body, whatever it turned out to
@@ -220,7 +238,7 @@ fn publish_request_facts(
             format = classified.format.as_str(),
             "classified as another protocol, leaving Responses state uninitialized"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // `ResponsesState` describes a response being created — it carries the
@@ -233,14 +251,16 @@ fn publish_request_facts(
             operation = ?operation,
             "body-bearing operation that does not create a response, leaving state uninitialized"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
     let conversation_id = resolve_conversation_id(ctx, &parsed);
 
     enrich_context(ctx, classified, &response_id, &conversation_id);
-    insert_responses_state(ctx, parsed, &response_id);
+    if let Err(action) = insert_responses_state(ctx, parsed, &response_id) {
+        return Ok(Some(action));
+    }
 
     debug!(
         response_id = %response_id,
@@ -249,7 +269,7 @@ fn publish_request_facts(
         "create request processed and state initialized"
     );
 
-    Ok(())
+    Ok(None)
 }
 
 /// A matched Responses operation and its declared request-body shape.
@@ -446,8 +466,34 @@ fn enrich_context(
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+) -> Result<(), FilterAction> {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    #[cfg(feature = "store")]
+    {
+        state.set_retained_external_payload_bytes(
+            super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX),
+        );
+        state.store_persist_armed = super::store::request_persistence_armed(ctx);
+    }
+    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        if !state.can_retain_payload(0) {
+            #[cfg(feature = "store")]
+            super::store::discard_retained_request_payload(ctx);
+            return Err(FilterAction::Reject(responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+    }
     ctx.extensions.insert(state);
+    #[cfg(feature = "store")]
+    super::store::mark_retained_request_payload_charged(ctx);
+    Ok(())
 }

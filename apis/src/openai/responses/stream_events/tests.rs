@@ -97,6 +97,37 @@ fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterC
     make_armed_context_with_filter(make_filter())
 }
 
+#[tokio::test]
+async fn parser_payload_is_visible_to_a_different_agentic_filter_id() {
+    let (stream_filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState {
+        request_body: json!({"model": "m", "input": "hello", "stream": true}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(64 * 1024);
+    ctx.extensions.insert(responses);
+    let mut partial = Some(Bytes::from(format!("data: {}", "x".repeat(5_000))));
+    stream_filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    let parser_bytes = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_stream_parser_bytes;
+    assert!(parser_bytes >= 5_000, "unfinished frame must be published");
+
+    // Praxis's filter state is keyed by current_filter_id. The loop callback
+    // cannot read the parser's slot, but its shared budget must still reject it.
+    ctx.current_filter_id = Some(1);
+    assert!(ctx.get_filter_state::<StreamEventsState>().is_none());
+    let agentic = crate::openai::responses::agentic_loop::AgenticLoopFilter::from_config(
+        &serde_yaml::from_str("max_retained_bytes: 4096").unwrap(),
+    )
+    .unwrap();
+    let action = agentic.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(_)));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
 #[test]
 fn arm_decision_arms_streaming_responses_inside_irr() {
     assert_eq!(arm_decision(true, true), ArmDecision::Arm);
@@ -126,6 +157,36 @@ fn custom_config_overrides_apply() {
         serde_yaml::from_str("max_buffer_bytes: 1048576\nmax_events: 500\ntimeout_secs: 60").unwrap();
     let filter = OpenaiStreamEventsFilter::from_config(&yaml);
     assert!(filter.is_ok(), "custom config should parse");
+}
+
+#[test]
+fn stream_retained_payload_counts_parser_arguments_and_deferred_terminal() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let scratch = b"event: partial";
+    state.frame_parser.parse_chunk(scratch).unwrap();
+    state
+        .tool_call_args
+        .insert("item:call_1".to_owned(), "{\"x\":".to_owned());
+    state.rejected_tool_call_args.insert("item:rejected".to_owned());
+    state
+        .local_tool_items
+        .insert("item:local".to_owned(), super::local_tools::LocalToolMode::Suppress);
+    let payload = json!({"type":"response.completed","response":{"output":[]}});
+    state.deferred_terminal = Some(super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: payload.clone(),
+    });
+
+    let expected = scratch.len()
+        + "item:call_1".len()
+        + "{\"x\":".len()
+        + "item:rejected".len()
+        + "item:local".len()
+        + "response.completed".len()
+        + crate::openai::responses::state::retained_json_bytes(&payload).unwrap();
+    assert_eq!(state.retained_payload_bytes().unwrap() - baseline, expected);
 }
 
 #[test]
@@ -168,6 +229,312 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
     );
     assert_eq!(payload["response"]["usage"], state.usage);
     assert_eq!(state.logical_stream_sequence, 5);
+}
+
+#[test]
+fn local_completion_preflights_canonical_output_owners() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState {
+        accumulated_output: vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "x".repeat(4_096)}]
+        })],
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    state.apply_retained_payload_limit(baseline + staging - 1);
+    ctx.extensions.insert(state);
+
+    let encoded = encode_local_completion(&mut ctx).expect("budget failure should still emit an error");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    assert!(encoded.contains("event: error"), "{encoded}");
+    assert!(!encoded.contains("response.completed"), "{encoded}");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.response_object.is_null());
+}
+
+#[test]
+fn local_completion_preflights_the_wire_copy_of_the_response() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState {
+        response_object: json!({
+            "id": "resp_budget",
+            "object": "response",
+            "status": "completed",
+            "output": [],
+            "metadata": {"large": "x".repeat(4_096)}
+        }),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 256);
+    ctx.extensions.insert(state);
+
+    let encoded = encode_local_completion(&mut ctx).expect("budget failure should emit an error");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    assert!(encoded.contains("event: error"), "{encoded}");
+    assert!(!encoded.contains("response.completed"), "{encoded}");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn local_completion_preflights_synthesized_sse_output() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let item = json!({
+        "type": "mcp_call",
+        "id": "call_budget",
+        "status": "completed",
+        "name": "tool",
+        "arguments": "x".repeat(4_096)
+    });
+    let mut state = ResponsesState {
+        logical_stream_response_id: Some("resp_budget".to_owned()),
+        accumulated_output: vec![item],
+        locally_executed_output_items: ["call_budget".to_owned()].into_iter().collect(),
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let local_output = super::local_terminal_output_upper_bound(&state).unwrap();
+    let canonical_staging = super::canonicalization_staging_bytes(&state, local_output).unwrap();
+    state.apply_retained_payload_limit(baseline + canonical_staging - 1);
+    ctx.extensions.insert(state);
+
+    let encoded = encode_local_completion(&mut ctx).expect("budget failure should still emit an error");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    assert!(encoded.contains("event: error"), "{encoded}");
+    assert!(!encoded.contains("response.output_item.added"), "{encoded}");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_replaces_published_parser_charge_once() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    parser_state
+        .tool_call_args
+        .insert("item:large".to_owned(), "x".repeat(5_000));
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "response": {"id": "resp_budget", "object": "response", "status": "completed", "output": []}
+        }),
+    };
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let local_bytes = parser_state.retained_payload_bytes().unwrap();
+    state.retained_stream_parser_bytes = local_bytes + terminal.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let canonical_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    state.apply_retained_payload_limit(
+        baseline + canonical_staging + terminal.retained_payload_bytes().unwrap() + 2_000,
+    );
+    ctx.extensions.insert(state);
+
+    let mut output = Vec::new();
+    super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output)
+        .expect("the published parser owner must only be charged once");
+    assert!(String::from_utf8_lossy(&output).contains("event: response.completed"));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_preflights_canonical_output_owners() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        accumulated_output: vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "x".repeat(4_096)}]
+        })],
+        response_object: json!({"id": "resp_budget", "object": "response", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "response": {"id": "resp_budget", "status": "completed", "output": []}
+        }),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let staging =
+        super::canonicalization_staging_bytes(&state, 0).unwrap() + terminal.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + staging - 1);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+    let mut terminal = terminal;
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output,).is_err());
+    assert!(output.is_empty());
+    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let item = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "<|file-known|>".repeat(1_000)}],
+    });
+    let mut state = ResponsesState {
+        accumulated_output: vec![item],
+        response_object: json!({"id": "resp_citations", "object": "response", "status": "completed", "output": []}),
+        citation_files: [("file-known".to_owned(), "x".repeat(1_024))].into(),
+        ..ResponsesState::default()
+    };
+    let output_bytes = super::canonical_logical_output_bytes(&state).unwrap();
+    let expanded_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    assert!(
+        expanded_staging > output_bytes * 10,
+        "citation objects must be included in the preflight"
+    );
+    let terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": {"id": "resp_citations", "output": []}}),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state
+        .apply_retained_payload_limit(baseline + output_bytes * 2 + terminal.retained_payload_bytes().unwrap() + 1_000);
+    ctx.extensions.insert(state);
+    let mut terminal = terminal;
+    let mut output = Vec::new();
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn streaming_budget_cache_counts_stable_owners_once_per_round() {
+    let (_filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        request_body: json!({"input": "p".repeat(32_768)}),
+        input: vec![json!({"text": "history"})],
+        response_object: json!({"output": []}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(1_000_000);
+    ctx.extensions.insert(responses);
+    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({"output": [{"text": "new"}]});
+    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+}
+
+#[test]
+fn eos_remeasures_history_appended_after_the_first_stream_chunk() {
+    let (filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + 2_000);
+    ctx.extensions.insert(responses);
+    assert!(super::shared_retained_budget(&ctx, &stream).unwrap().1.is_some());
+    ctx.insert_filter_state(stream);
+
+    // Agentic collection runs before the stream-events EOS callback and copies
+    // the round's reasoning/tool item into both history owners.
+    let item = json!({"type": "reasoning", "id": "rs_eos", "summary": "x".repeat(3_000)});
+    let responses = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    responses.messages.push(item.clone());
+    responses.persisted_messages.push(item);
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some(super::RETAINED_PAYLOAD_OVERFLOW_MESSAGE)
+    );
+}
+
+#[test]
+fn finalized_parser_charge_does_not_follow_the_next_irr_step() {
+    use super::client_tools::{ClientToolPhase, ClientToolStreamItem};
+    use crate::openai::responses::state::ClientToolRestore;
+
+    let (_filter, mut ctx) = make_armed_context();
+    let mut stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    stream.client_tool_items.push(ClientToolStreamItem {
+        key: "item:call_done".to_owned(),
+        private_name: "private_tool".repeat(100),
+        restore: ClientToolRestore::Custom,
+        phase: ClientToolPhase::Done,
+        output_index: 0,
+        item_id: Some("call_done".to_owned()),
+    });
+    let parser_bytes = stream.retained_payload_bytes().unwrap();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "test", "input": "hi", "stream": true}));
+    let baseline = responses.retained_payload_bytes().unwrap();
+    responses.apply_retained_payload_limit(baseline + parser_bytes + 128);
+    ctx.extensions.insert(responses);
+    assert!(super::publish_stream_payload(&mut ctx, &stream));
+    ctx.insert_filter_state(stream);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop");
+
+    let mut output = None;
+    super::finalize_logical_stream(&mut ctx, &mut output);
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .retained_payload_bytes(),
+        Some(0)
+    );
+    let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(responses.retained_stream_parser_bytes, 0);
+    assert!(
+        responses.can_retain_payload(parser_bytes + 128),
+        "the next IRR step must have room for payload that the old parser released"
+    );
+}
+
+#[test]
+fn store_budget_error_drops_later_stream_events() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.set_metadata("responses.store_stream_budget_failed", "true");
+    let mut body = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+    ));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(body.is_none());
+    assert_eq!(ctx.get_metadata("responses.stream_completion"), Some("open"));
 }
 
 #[test]
@@ -331,6 +698,25 @@ fn local_error_flushes_file_search_lifecycle_before_terminal() {
             .is_empty(),
         "local error must drain the synthesis queue exactly once"
     );
+}
+
+#[test]
+fn local_error_preflights_its_message_and_wire_buffer() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::default();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 512);
+    ctx.extensions.insert(state);
+
+    let encoded =
+        encode_local_error(&mut ctx, "server_error", &"x".repeat(4_096)).expect("budget failure should emit an error");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    assert!(encoded.contains("event: error"), "{encoded}");
+    assert!(encoded.contains("max_retained_bytes"), "{encoded}");
+    assert!(!encoded.contains(&"x".repeat(128)), "{encoded}");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -1853,6 +2239,305 @@ async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
         Some("true"),
         "an over-cap terminal snapshot must not be persisted"
     );
+}
+
+#[tokio::test]
+async fn committed_stream_budget_overflow_emits_one_error_without_completion_or_done() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    let mut response_state = ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    }));
+    response_state.apply_retained_payload_limit(4_096);
+    response_state.store_persist_armed = true;
+    ctx.extensions.insert(response_state);
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_budget", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    assert!(created.is_some(), "the logical stream is committed before overflow");
+
+    let mut offending = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {
+                "id": "call_too_large",
+                "type": "function_call",
+                "name": "tool",
+                "arguments": "x".repeat(5_000),
+                "status": "completed"
+            }
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut offending, false).unwrap();
+    assert!(offending.is_none(), "the offending chunk must be suppressed");
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let terminal = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert_eq!(terminal.matches("event: error").count(), 1, "{terminal}");
+    assert!(!terminal.contains("response.completed"), "{terminal}");
+    assert!(!terminal.contains("[DONE]"), "{terminal}");
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    let response_state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(response_state.retained_payload_failed);
+    assert!(response_state.tool_calls.is_empty());
+    assert!(response_state.accumulated_output.is_empty());
+    assert!(!response_state.store_persist_armed);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .unwrap()
+            .frame_parser
+            .retained_bytes(),
+        0,
+        "the offending chunk must not remain in parser scratch"
+    );
+}
+
+#[tokio::test]
+async fn transient_frame_and_event_ownership_is_admitted_before_parsing() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    let response_state = ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    }));
+    let response_bytes = response_state.retained_payload_bytes().unwrap();
+    ctx.extensions.insert(response_state);
+    filter.arm(&mut ctx);
+
+    let chunk = make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"response_id": "resp_budget", "delta": "hello"}),
+    );
+    let split_at = chunk.len() - 1;
+    let partial_chunk = chunk.slice(..split_at);
+    let terminating_chunk = chunk.slice(split_at..);
+
+    let mut partial = Some(partial_chunk);
+    filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    assert!(partial.is_none(), "the incomplete frame must remain buffered");
+
+    let parser_state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let local_bytes = parser_state.retained_payload_bytes().unwrap();
+    let parser_scratch_bytes = parser_state.frame_parser.retained_bytes();
+    let persistent_local_bytes = local_bytes - parser_scratch_bytes;
+    assert!(local_bytes > 0, "the partial frame must be retained");
+
+    let mut parser = SseFrameParser::new(65_536);
+    let frames = parser.parse_chunk(&chunk).unwrap();
+    let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
+    let event_construction_bytes = frames
+        .iter()
+        .filter(|frame| frame.data != b"[DONE]")
+        .map(|frame| frame.data.len() + frame.event_type.as_ref().map_or(0, String::len))
+        .sum::<usize>();
+    let parser_projection_peak = response_bytes + local_bytes + terminating_chunk.len() * 4;
+    let frame_and_event_ownership_peak =
+        response_bytes + persistent_local_bytes + frame_bytes + event_construction_bytes;
+    let limit = parser_projection_peak + 1;
+    assert!(
+        limit < frame_and_event_ownership_peak,
+        "the cap must admit parser projection but reject simultaneous frame/event ownership"
+    );
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(terminating_chunk);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    assert!(body.is_none(), "the frame/event ownership peak must be rejected");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn parser_projection_is_reserved_without_retaining_framework_chunk() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response_state = ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    }));
+    let retained_before = response_state.retained_payload_bytes().unwrap();
+    let chunk = Bytes::from_static(b": framework-owned chunk\n");
+    let exact_limit = retained_before + chunk.len() * 4;
+    response_state.apply_retained_payload_limit(exact_limit);
+    ctx.extensions.insert(response_state);
+
+    // The framework chunk itself is not retained, while the parser's transient
+    // line/data projection is admitted before parsing and released afterward.
+    let mut body = Some(chunk);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.retained_payload_failed);
+    assert_eq!(state.retained_payload_bytes().unwrap(), retained_before);
+}
+
+#[tokio::test]
+async fn logical_output_is_admitted_before_allocation() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    let item = json!({
+        "type": "mcp_call",
+        "id": "call_budget",
+        "status": "completed",
+        "name": "tool",
+        "arguments": "x".repeat(4_096)
+    });
+    let mut response_state = ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    }));
+    response_state.logical_stream_response_id = Some("resp_budget".to_owned());
+    response_state.accumulated_output = vec![item];
+    response_state
+        .locally_executed_output_items
+        .insert("call_budget".to_owned());
+    let current = response_state.retained_payload_bytes().unwrap();
+    ctx.extensions.insert(response_state);
+    filter.arm(&mut ctx);
+
+    let chunk = make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"response_id": "resp_budget", "output_index": 1, "delta": "ok"}),
+    );
+    let mut parser = SseFrameParser::new(65_536);
+    let frames = parser.parse_chunk(&chunk).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, &[event]).unwrap();
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(current + output_upper_bound - 1);
+
+    let mut body = Some(chunk);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    assert!(body.is_none(), "the logical output must be rejected before allocation");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
+async fn commit_preflight_accounts_event_and_response_state_owners() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.arm(&mut ctx);
+
+    let chunk = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {
+                "id": "call_budget",
+                "type": "function_call",
+                "name": "tool",
+                "arguments": "x".repeat(4_096),
+                "status": "completed"
+            }
+        }),
+    );
+    let mut parser = SseFrameParser::new(65_536);
+    let frames = parser.parse_chunk(&chunk).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::from_frame(&frames[0]).unwrap();
+    let events = [event];
+    let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
+    let event_bytes = super::retained_event_payload_bytes(&events[0]).unwrap();
+    let projected_state_bytes = super::projected_responses_state_clone_bytes(&ctx, &events);
+    let output_upper_bound = super::logical_output_upper_bound(&ctx, &events).unwrap();
+    let current = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let limit = current + frame_bytes + event_bytes + projected_state_bytes.unwrap() + output_upper_bound - 1;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .apply_retained_payload_limit(limit);
+
+    let mut body = Some(chunk);
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    assert!(body.is_none(), "the commit must reject all simultaneous owners");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    let mut response_state = ResponsesState::default();
+    response_state.usage = json!({"input_tokens": 10});
+    ctx.extensions.insert(response_state);
+
+    let delta = crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDelta(json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "call_1",
+        "delta": "x".repeat(1_024)
+    }));
+    let delta_projection = super::projected_responses_state_clone_bytes(&ctx, &[delta]).unwrap();
+    assert!(delta_projection >= 1_024 + "item:call_1".len());
+    let unkeyed_delta = crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDelta(json!({
+        "type": "response.function_call_arguments.delta",
+        "delta": "ignored"
+    }));
+    assert!(super::projected_responses_state_clone_bytes(&ctx, &[unkeyed_delta]).is_some());
+
+    let response = json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "call_1",
+            "name": "tool",
+            "arguments": "x".repeat(1_024),
+            "status": "completed"
+        }],
+        "usage": {"input_tokens": 1}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "response": response
+    }));
+    let terminal_projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
+    assert!(terminal_projection >= response_bytes * 3);
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
@@ -3534,6 +4219,46 @@ async fn logical_stream_error_still_flushes_pending_local_items() {
 }
 
 #[tokio::test]
+async fn retained_overflow_while_flushing_local_items_emits_only_the_error() {
+    let (filter, mut ctx) = arm_resumed_round_with_accumulated(
+        "openai_mcp_dispatch",
+        vec![json!({
+            "type": "mcp_call",
+            "id": "mcp_must_not_leak",
+            "name": "tool",
+            "arguments": "x".repeat(4_096),
+            "status": "completed"
+        })],
+    )
+    .await;
+
+    let parser_bytes = ctx
+        .get_filter_state::<StreamEventsState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    let retained = state.retained_payload_bytes().unwrap();
+    let local_output = super::local_terminal_output_upper_bound(state).unwrap();
+    state.apply_retained_payload_limit(retained + parser_bytes + local_output - 1);
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", "upstream failed");
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "done")
+        .unwrap();
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert_eq!(eos.matches("event: error").count(), 1, "{eos}");
+    assert!(!eos.contains("mcp_must_not_leak"), "{eos}");
+    assert!(!eos.contains("response.output_item"), "{eos}");
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[tokio::test]
 async fn logical_stream_multi_frame_parse_error_still_flushes_pending_local_items() {
     // #276 (Finding 3): a resumed-round chunk that carries a VALID event followed
     // by a malformed frame must be handled atomically. The valid frame alone would
@@ -4322,6 +5047,7 @@ fn parse_error_sets_metadata() {
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
         stream_failed: false,
+        shared_stable_bytes: std::sync::OnceLock::new(),
     });
 
     let large_chunk =
@@ -4375,6 +5101,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             item_id: Some("call_1".to_owned()),
         }],
         stream_failed: false,
+        shared_stable_bytes: std::sync::OnceLock::new(),
     });
 
     validate_stream_end(&mut ctx);

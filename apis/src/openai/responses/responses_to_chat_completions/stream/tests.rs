@@ -914,6 +914,47 @@ fn tool_first_then_text_keeps_output_index_consistent() {
 }
 
 #[test]
+fn eof_preflight_reserves_json_escaped_closeout_frames() {
+    let body = request_body();
+    let mut conv = converter(wide_limits());
+    let mut earlier = Vec::new();
+    let control_text = "\u{0001}".repeat(2_000);
+    let content = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl_escape", "object": "chat.completion.chunk", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "delta": {"content": control_text}}]
+        })
+    );
+    push(&mut conv, &body, content.as_bytes(), &mut earlier);
+    push(
+        &mut conv,
+        &body,
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        &mut earlier,
+    );
+    let retained = conv.retained_payload_bytes().unwrap();
+    let wire = conv.terminal_wire_bytes(0, retained).unwrap();
+    let mut closeout = Vec::new();
+    finish(&mut conv, &body, &mut closeout);
+    assert!(
+        wire.checked_mul(12).unwrap() >= closeout.len(),
+        "escaped closeout was {} bytes but reserved only {}",
+        closeout.len(),
+        wire * 12
+    );
+    assert!(
+        wire > retained * 5,
+        "control characters must expand far beyond raw semantic bytes"
+    );
+    assert!(
+        closeout.len() > retained * 5,
+        "raw-byte preflight would admit this escaped EOF construction"
+    );
+    assert!(String::from_utf8_lossy(&closeout).contains("event: response.completed"));
+}
+
+#[test]
 fn clean_eof_without_done_emits_terminal() {
     let body = request_body();
     let mut conv = converter(wide_limits());
@@ -958,6 +999,48 @@ fn malformed_json_emits_failed_without_leaking_bytes() {
         !std::str::from_utf8(&raw).unwrap().contains("not valid json"),
         "the malformed provider bytes must never appear in the emitted stream",
     );
+}
+
+#[test]
+fn failure_terminal_budget_clears_same_callback_output_on_chunk_or_eof() {
+    let body = json!({
+        "model": "gpt-4.1-mini", "input": "hi", "stream": true,
+        "instructions": "x".repeat(16_384)
+    });
+    let inputs = SnapshotInputs {
+        request_body: &body,
+        tools: &[],
+        original_tool_choice: None,
+        now: NOW,
+    };
+    let first = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n";
+    let delta = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n";
+
+    for error_at_eof in [false, true] {
+        let mut conv = converter(wide_limits());
+        let mut initial_output = Vec::new();
+        conv.push_into(first, &inputs, &mut initial_output).unwrap();
+        assert!(!initial_output.is_empty());
+        conv.set_callback_output_limit(2_500);
+
+        let mut callback = Vec::from(delta.as_slice());
+        callback.extend_from_slice(if error_at_eof {
+            b"data: {malformed".as_slice()
+        } else {
+            b"data: {malformed\n\n".as_slice()
+        });
+        let mut out = Vec::new();
+        conv.push_into(&callback, &inputs, &mut out).unwrap();
+        if error_at_eof {
+            assert!(!out.is_empty(), "the valid delta should be staged before EOF");
+            conv.finish_into(&inputs, &mut out).unwrap();
+        }
+        assert!(
+            conv.callback_budget_failed(),
+            "failure closeout must report aggregate exhaustion"
+        );
+        assert!(out.is_empty(), "no partial delta may escape the failed callback");
+    }
 }
 
 #[test]

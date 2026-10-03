@@ -54,6 +54,22 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
 
+    /// Fetch a response only when its encoded and decoded JSON columns fit
+    /// `max_bytes`. Implementations must avoid loading oversized columns into
+    /// the caller process; unsupported backends fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    async fn get_response_bounded(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
@@ -85,6 +101,20 @@ pub trait ResponseStore: Send + Sync {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
+
+    /// Fetch a conversation only when its JSON columns fit `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    async fn get_conversation_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
 
     /// Record server-owned pending MCP approvals emitted by the proxy.
     ///
@@ -185,6 +215,21 @@ pub trait ResponseStore: Send + Sync {
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
+
+    /// Return matching approval payload bytes without materializing the rows.
+    /// Unknown backends fail aggregate admission closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend cannot measure the payload.
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(usize::MAX)
+    }
 
     /// Atomically claim single-use consumption of a batch of pending approvals
     /// issued by `response_id`.

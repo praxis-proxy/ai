@@ -75,6 +75,8 @@ pub(crate) mod stream_events;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticBudgetPolicy;
+#[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
@@ -332,6 +334,31 @@ impl ResponsesFormatFilter {
     }
 }
 
+/// Conservative raw-body allowance before JSON parsing creates owned copies.
+#[cfg(feature = "openai-responses")]
+pub(crate) const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
+
+/// Reject a known oversized create body before classification parses JSON.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>()
+    {
+        let raw_body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
+        if bytes.len() > raw_body_limit {
+            let message = format!(
+                "raw request body exceeds the {raw_body_limit}-byte limit derived from openai_agentic_loop.max_retained_bytes"
+            );
+            return Some(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                &message,
+            )));
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl HttpFilter for ResponsesFormatFilter {
     fn name(&self) -> &'static str {
@@ -368,6 +395,11 @@ impl HttpFilter for ResponsesFormatFilter {
             Some(b) => b.as_ref(),
             None => &[],
         };
+
+        #[cfg(feature = "openai-responses")]
+        if let Some(action) = initial_budget_rejection(ctx, bytes) {
+            return Ok(action);
+        }
 
         let (classified, websocket_handshake) = classify_request(ctx, bytes);
 

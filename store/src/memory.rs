@@ -15,6 +15,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io,
     sync::Mutex,
 };
 
@@ -31,6 +32,30 @@ use crate::{
 
 /// Owner-qualified key for owner-scoped rows.
 type OwnerKey = (StateOwner, String);
+
+/// Count compact JSON without materializing a second copy before cloning a
+/// bounded in-memory record.
+fn json_values_fit(values: &[&serde_json::Value], max_bytes: usize) -> bool {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(buf.len())
+                .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(max_bytes);
+    values
+        .iter()
+        .all(|value| serde_json::to_writer(&mut counter, value).is_ok())
+}
 
 /// A stored pending approval plus its single-use consumption stamp.
 #[derive(Clone)]
@@ -230,6 +255,22 @@ impl ResponseStore for InMemoryStore {
         Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
     }
 
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        if !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
+    }
+
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
         let removed = inner.responses.get(id).is_some_and(|record| &record.owner == owner);
@@ -257,6 +298,22 @@ impl ResponseStore for InMemoryStore {
             .conversations
             .get(&(owner.clone(), conversation_id.to_owned()))
             .cloned())
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.conversations.get(&(owner.clone(), conversation_id.to_owned())) else {
+            return Ok(None);
+        };
+        if !json_values_fit(&[&record.metadata, &record.messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
     }
 
     async fn record_pending_approvals(
@@ -302,6 +359,30 @@ impl ResponseStore for InMemoryStore {
             })
             .collect();
         Ok(found)
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        let inner = self.lock()?;
+        inner
+            .approvals
+            .iter()
+            .filter(|((stored_owner, stored_response, stored_id), _)| {
+                stored_owner == owner && stored_response == response_id && approval_ids.contains(&stored_id.as_str())
+            })
+            .try_fold(0_usize, |used, (_, stored)| {
+                let record = &stored.record;
+                used.checked_add(record.approval_id.len())
+                    .and_then(|bytes| bytes.checked_add(record.server_label.len()))
+                    .and_then(|bytes| bytes.checked_add(record.tool_name.len()))
+                    .and_then(|bytes| bytes.checked_add(record.arguments.len()))
+                    .and_then(|bytes| bytes.checked_add(record.target_fingerprint.len()))
+                    .ok_or_else(|| StoreError::Database("pending approval payload size overflow".to_owned()))
+            })
     }
 
     async fn consume_approvals(

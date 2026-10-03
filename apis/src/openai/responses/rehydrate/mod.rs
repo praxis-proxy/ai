@@ -22,10 +22,10 @@
 //! - **Streaming** (`text/event-stream`): frames pass through byte-for-byte; only a response-lifecycle frame's `data:`
 //!   JSON payload is rewritten in place, and only that. No frame is reconstructed, so `id:`, `retry:`, comments, and
 //!   unknown SSE fields survive untouched. At most one partial frame is ever buffered — never the whole stream
-//!   ([`restore_previous_response_id_stream_chunk`]).
+//!   ([`restore_previous_response_id_stream_chunk_with_budget`]).
 //!
-//! Both paths fail open: any parse error passes the bytes through
-//! untouched and never errors the request.
+//! Both paths pass malformed payloads through untouched. Aggregate retained
+//! payload exhaustion fails closed before allocating a rewritten copy.
 //!
 //! [`ResponsesState`]: super::state::ResponsesState
 
@@ -42,10 +42,16 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
+/// Wire error for response-side aggregate exhaustion during ID restoration.
+const RETAINED_RESTORE_OVERFLOW: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during response restoration";
+
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
+    DEFAULT_STORE_NAME,
+    agentic_loop::AgenticBudgetPolicy,
+    append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
     state::{ResponsesState, strip_local_compaction_marker},
@@ -53,7 +59,7 @@ use super::{
 use crate::{
     is_event_stream_content_type,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -142,7 +148,11 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id).await {
+        let read_limit = match history_read_limit(ctx) {
+            Ok(limit) => limit,
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id, read_limit).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
@@ -154,7 +164,9 @@ impl RehydrateFilter {
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
         let state = build_state(parsed_body, stored, previous_tools, previous_usage);
-        install_rehydrated_state(ctx, state);
+        if let Err(action) = install_rehydrated_state(ctx, state) {
+            return Ok(action);
+        }
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);
         Ok(FilterAction::Release)
@@ -175,13 +187,19 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
+        let read_limit = match history_read_limit(ctx) {
+            Ok(limit) => limit,
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_conversation(ctx, &owner, &conv_id, read_limit).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
         let stored = stored_messages_for_conversation(record);
         let state = build_state(parsed_body, stored, vec![], None);
-        install_rehydrated_state(ctx, state);
+        if let Err(action) = install_rehydrated_state(ctx, state) {
+            return Ok(action);
+        }
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
         Ok(FilterAction::Release)
     }
@@ -275,22 +293,44 @@ impl HttpFilter for RehydrateFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "finite and streaming response restoration share the final callback"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.get_filter_state::<RestoreBudgetFailed>().is_some() {
+            *body = None;
+            if end_of_stream {
+                ctx.remove_filter_state::<RestoreBudgetFailed>();
+            }
+            return Ok(FilterAction::Continue);
+        }
         // Streaming (SSE) restore runs on every chunk: rewrite the
         // `previous_response_id` inside response-lifecycle frames as they arrive,
         // never assembling the whole stream in memory.
         if let Some(mut armed) = ctx.remove_filter_state::<RestorePreviousResponseIdStream>() {
-            let keep_armed = restore_previous_response_id_stream_chunk(&mut armed, body, end_of_stream);
+            let budget = ctx.extensions.get::<ResponsesState>();
+            let restored =
+                restore_previous_response_id_stream_chunk_with_budget(&mut armed, body, end_of_stream, budget);
+            let Ok(keep_armed) = restored else {
+                fail_streaming_restore_budget(ctx, body, end_of_stream);
+                return Ok(FilterAction::Continue);
+            };
             // Re-arm for the next chunk unless the stream ended or an overflow
             // disarmed the restore (fail-open: the buffered remainder is flushed raw
             // and the rest of the stream passes through untouched).
             if keep_armed && !end_of_stream {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.retained_rehydrate_stream_bytes = armed.pending.len();
+                }
                 ctx.insert_filter_state(armed);
+            } else if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.retained_rehydrate_stream_bytes = 0;
             }
             return Ok(FilterAction::Continue);
         }
@@ -306,8 +346,56 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if !finite_restore_fits(ctx, body.as_deref(), &armed.previous_response_id) {
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                RETAINED_RESTORE_OVERFLOW,
+            )));
+        }
+
         restore_previous_response_id(armed.previous_response_id, body);
         Ok(FilterAction::Continue)
+    }
+}
+
+/// A failed rewrite must suppress later chunks after its single terminal error.
+struct RestoreBudgetFailed;
+
+/// Reserve the parsed tree, serialized replacement and original finite body.
+fn finite_restore_fits(ctx: &HttpFilterContext<'_>, body: Option<&[u8]>, previous_id: &str) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if body.is_none_or(<[u8]>::is_empty) {
+        return true;
+    }
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let raw_bytes = body.map_or(0, <[u8]>::len);
+    // A JSON string byte can expand to six wire bytes when escaped. The
+    // response body remains live while parsing and serializing its replacement.
+    let peak = raw_bytes
+        .checked_mul(5)
+        .and_then(|bytes| previous_id.len().checked_mul(12)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(128));
+    peak.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// The response may already be committed, so replace this chunk with one SSE
+/// error and stop both persistence and any later continuation or body chunks.
+fn fail_streaming_restore_budget(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_RESTORE_OVERFLOW);
+    *body = super::stream_events::encode_local_error(ctx, "server_error", RETAINED_RESTORE_OVERFLOW);
+    if !end_of_stream {
+        ctx.insert_filter_state(RestoreBudgetFailed);
     }
 }
 
@@ -359,7 +447,7 @@ fn arm_json_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
 ///
 /// Unlike the JSON path, the stream is **not** buffered: `BodyMode::Stream` (the
 /// default from [`RehydrateFilter::response_body_mode`]) is kept and each lifecycle
-/// frame is rewritten as it arrives (see `restore_previous_response_id_stream_chunk`).
+/// frame is rewritten as it arrives (see `restore_previous_response_id_stream_chunk_with_budget`).
 ///
 /// `eligible_previous_response_id_stream` already declined any response carrying a
 /// body validator / integrity digest (via [`describes_exact_upstream_bytes`]), so an
@@ -398,6 +486,7 @@ fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
         scan_at_line_start: true,
         max_buffer_bytes: MAX_JSON_BODY_BYTES,
         previous_response_id: prev_id,
+        stable_budget: None,
     });
 
     true
@@ -450,6 +539,53 @@ struct RestorePreviousResponseIdStream {
     /// The `previous_response_id` the caller supplied, echoed into every
     /// response-lifecycle frame.
     previous_response_id: String,
+    /// Cached request/history charge; changing response owners are metered on
+    /// every fragment and the cache key detects same-iteration history growth.
+    stable_budget: Option<RestoreStableBudget>,
+}
+
+/// Stable request/history charge and an O(1) invalidation key for streamed restore.
+#[derive(Clone, Copy)]
+struct RestoreStableBudget {
+    /// Logical agentic round when the stable owners were measured.
+    iteration: u32,
+    /// Revision for in-place request/history mutations between stream chunks.
+    revision: u64,
+    /// Lengths of every stable collection, including history appended during a round.
+    collection_lengths: [usize; 6],
+    /// Serialized bytes retained by the request and history owners.
+    bytes: usize,
+}
+
+impl RestoreStableBudget {
+    /// Capture the current stable collection shape and its measured charge.
+    fn new(state: &ResponsesState, revision: u64, bytes: usize) -> Self {
+        Self {
+            iteration: state.iteration,
+            revision,
+            collection_lengths: Self::collection_lengths(state),
+            bytes,
+        }
+    }
+
+    /// Detect a new round or any append to a stable request/history collection.
+    fn matches(self, state: &ResponsesState) -> bool {
+        self.iteration == state.iteration
+            && state.replay_stable_payload_revision == Some(self.revision)
+            && self.collection_lengths == Self::collection_lengths(state)
+    }
+
+    /// Read the sizes of the collections charged by the stable meter.
+    fn collection_lengths(state: &ResponsesState) -> [usize; 6] {
+        [
+            state.input.len(),
+            state.messages.len(),
+            state.persisted_messages.len(),
+            state.previous_tools.len(),
+            state.tools.len(),
+            state.provider_compaction_ids.len(),
+        ]
+    }
 }
 
 /// Return the caller's `previous_response_id` when it must be restored into the
@@ -636,17 +772,67 @@ fn restore_previous_response_id(prev_id: String, body: &mut Option<Bytes>) {
 /// dropped, nothing errored) and the restore disarms. At `end_of_stream` any
 /// unterminated trailing bytes are likewise flushed raw so no bytes are ever withheld
 /// from the client.
+#[cfg(all(test, feature = "store-sqlite"))]
 fn restore_previous_response_id_stream_chunk(
     armed: &mut RestorePreviousResponseIdStream,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
 ) -> bool {
+    restore_previous_response_id_stream_chunk_with_budget(armed, body, end_of_stream, None).unwrap_or_default()
+}
+
+/// Apply the same SSE restore with an optional aggregate admission check.
+fn restore_previous_response_id_stream_chunk_with_budget(
+    armed: &mut RestorePreviousResponseIdStream,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    budget: Option<&ResponsesState>,
+) -> Result<bool, ()> {
     let incoming = body.take().unwrap_or_default();
     if armed.pending.is_empty() {
-        restore_stream_fresh_chunk(armed, &incoming, body, end_of_stream)
+        restore_stream_fresh_chunk(armed, &incoming, body, end_of_stream, budget)
     } else {
-        restore_stream_buffered_chunk(armed, &incoming, body, end_of_stream)
+        restore_stream_buffered_chunk(armed, &incoming, body, end_of_stream, budget)
     }
+}
+
+/// Admit one rewrite staging allocation against a cached stable baseline and
+/// the current stream parser, canonical output, and other changing owners.
+fn streaming_restore_fits(
+    budget: Option<&ResponsesState>,
+    stable_budget: &mut Option<RestoreStableBudget>,
+    removed_bytes: usize,
+    staging_bytes: usize,
+) -> bool {
+    let Some(state) = budget else {
+        return true;
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return true;
+    };
+    let Some(revision) = state.replay_stable_payload_revision else {
+        return false;
+    };
+    if stable_budget.is_none_or(|cache| !cache.matches(state)) {
+        let Some(stable) = state.stream_stable_payload_bytes_bounded(limit) else {
+            return false;
+        };
+        *stable_budget = Some(RestoreStableBudget::new(state, revision, stable));
+    }
+    let Some(stable) = stable_budget.as_ref().map(|cache| cache.bytes) else {
+        return false;
+    };
+    let Some(remaining) = limit.checked_sub(stable) else {
+        return false;
+    };
+    let Some(measurement_limit) = remaining.checked_add(removed_bytes) else {
+        return false;
+    };
+    state
+        .rehydrate_stream_changing_payload_bytes_bounded(measurement_limit)
+        .and_then(|current| current.checked_sub(removed_bytes))
+        .and_then(|current| current.checked_add(staging_bytes))
+        .is_some_and(|peak| peak <= remaining)
 }
 
 /// Fast path: nothing carried over, so scan the incoming chunk directly and forward
@@ -657,7 +843,8 @@ fn restore_stream_fresh_chunk(
     incoming: &Bytes,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-) -> bool {
+    budget: Option<&ResponsesState>,
+) -> Result<bool, ()> {
     let scan = scan_complete_frames(
         incoming,
         &armed.previous_response_id,
@@ -667,19 +854,26 @@ fn restore_stream_fresh_chunk(
             at_line_start: true,
         },
         end_of_stream,
-    );
+        budget,
+        &mut armed.stable_budget,
+    )?;
     let remainder = incoming.len() - scan.cursor;
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = finalize_view(scan.out, incoming, scan.run_start, incoming.len());
-        return false;
+        return Ok(false);
     }
     *body = finalize_view(scan.out, incoming, scan.run_start, scan.cursor);
+    // A trailing partial is the only owned copy on an otherwise zero-copy
+    // chunk. Reserve it before extending the carry buffer.
+    if remainder > 0 && !streaming_restore_fits(budget, &mut armed.stable_budget, 0, remainder) {
+        return Err(());
+    }
     armed
         .pending
         .extend_from_slice(incoming.get(scan.cursor..).unwrap_or_default());
     armed.scan_from = scan.resume_from - scan.cursor;
     armed.scan_at_line_start = scan.resume_at_line_start;
-    true
+    Ok(true)
 }
 
 /// Carry-over path: a partial frame spans chunk boundaries. Append the chunk to
@@ -698,12 +892,44 @@ fn restore_stream_fresh_chunk(
 /// (the retained partial plus one transport chunk) before the shed — inherent to
 /// detecting a frame boundary across the pending/incoming seam, and only near the cap
 /// when a single frame is already near it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "carried frame append and boundary reconciliation are one transition"
+)]
 fn restore_stream_buffered_chunk(
     armed: &mut RestorePreviousResponseIdStream,
     incoming: &Bytes,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-) -> bool {
+    budget: Option<&ResponsesState>,
+) -> Result<bool, ()> {
+    // The old partial remains live if BytesMut grows a replacement allocation.
+    // The incoming Bytes also stays live through the append. No JSON parse is
+    // needed for this check, and each incoming byte is visited only once.
+    if let Some(state) = budget
+        && state.retained_payload_limit().is_some()
+    {
+        let next_len = armed.pending.len().checked_add(incoming.len());
+        let peak = next_len
+            .and_then(|bytes| bytes.checked_add(incoming.len()))
+            .and_then(|bytes| {
+                if next_len.is_some_and(|next| next <= armed.pending.capacity()) {
+                    Some(bytes)
+                } else {
+                    bytes.checked_add(armed.pending.len())
+                }
+            });
+        if !peak.is_some_and(|bytes| {
+            streaming_restore_fits(
+                budget,
+                &mut armed.stable_budget,
+                state.retained_rehydrate_stream_bytes,
+                bytes,
+            )
+        }) {
+            return Err(());
+        }
+    }
     armed.pending.extend_from_slice(incoming);
     let scan = scan_complete_frames(
         &armed.pending,
@@ -714,16 +940,18 @@ fn restore_stream_buffered_chunk(
             at_line_start: armed.scan_at_line_start,
         },
         end_of_stream,
-    );
+        budget,
+        &mut armed.stable_budget,
+    )?;
     let remainder = armed.pending.len() - scan.cursor;
     if flush_streaming_restore(&scan, remainder, armed.max_buffer_bytes, end_of_stream) {
         *body = flush_pending(scan.out, &mut armed.pending, scan.run_start);
-        return false;
+        return Ok(false);
     }
     *body = emit_pending_prefix(scan.out, &mut armed.pending, scan.cursor);
     armed.scan_from = scan.resume_from - scan.cursor;
     armed.scan_at_line_start = scan.resume_at_line_start;
-    true
+    Ok(true)
 }
 
 /// Decide whether the restore must fail open on this chunk — a complete frame exceeded
@@ -807,13 +1035,20 @@ struct ScanResume {
 /// frame is copied into it so the output stays contiguous. A complete frame that
 /// exceeds `max_buffer_bytes` stops the walk with `overflow`, before it is ever parsed.
 /// When `at_stream_end` is set, a final frame terminated by a bare CR is still detected.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the scanner needs its resume state and optional budget"
+)]
 fn scan_complete_frames(
     buf: &[u8],
     prev_id: &str,
     max_buffer_bytes: usize,
     resume: ScanResume,
     at_stream_end: bool,
-) -> FrameScan {
+    budget: Option<&ResponsesState>,
+    stable_budget: &mut Option<RestoreStableBudget>,
+) -> Result<FrameScan, ()> {
     let (mut out, mut overflow): (Option<Vec<u8>>, bool) = (None, false);
     let (mut cursor, mut run_start) = (0_usize, 0_usize);
     let (mut scan_pos, mut at_line_start) = (resume.from, resume.at_line_start);
@@ -828,21 +1063,29 @@ fn scan_complete_frames(
                     overflow = true;
                     break (end, true);
                 }
-                accumulate_frame(&mut out, &mut run_start, buf, cursor..end, prev_id);
+                accumulate_frame(
+                    &mut out,
+                    &mut run_start,
+                    buf,
+                    cursor..end,
+                    prev_id,
+                    budget,
+                    stable_budget,
+                )?;
                 cursor = end;
                 scan_pos = end;
                 at_line_start = true;
             },
         }
     };
-    FrameScan {
+    Ok(FrameScan {
         out,
         cursor,
         run_start,
         overflow,
         resume_from,
         resume_at_line_start,
-    }
+    })
 }
 
 /// Fold one complete frame `buf[cursor..end]` into the running output: rewrite a
@@ -850,22 +1093,224 @@ fn scan_complete_frames(
 /// pass-through prefix on the first rewrite), or, once `out` exists, copy a
 /// pass-through frame into it verbatim. While `out` is `None`, pass-through frames are
 /// left in place for a later zero-copy slice and `run_start` stays put.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the frame accumulator owns the single pre-parse admission boundary"
+)]
 fn accumulate_frame(
     out: &mut Option<Vec<u8>>,
     run_start: &mut usize,
     buf: &[u8],
     frame_range: core::ops::Range<usize>,
     prev_id: &str,
-) {
+    budget: Option<&ResponsesState>,
+    stable_budget: &mut Option<RestoreStableBudget>,
+) -> Result<(), ()> {
     let core::ops::Range { start, end } = frame_range;
     let frame = buf.get(start..end).unwrap_or_default();
-    if let Some(rewritten) = rewritten_lifecycle_frame(frame, prev_id) {
+    // A non-lifecycle frame is forwarded without even joining its data lines.
+    // The key scan never allocates and conservatively includes escaped keys.
+    let possible_response = frame_may_have_response_key(frame);
+    if possible_response
+        && let Some(state) = budget
+        && state.retained_payload_limit().is_some()
+    {
+        let id_growth = prev_id.len().checked_mul(6).and_then(|bytes| bytes.checked_add(64));
+        // Once a rewrite creates `out`, later plain frames can extend it
+        // without another rewrite check. Reserve the whole scanned buffer:
+        // one carried `pending` owner plus old and new Vec capacities during
+        // a later growth, even when that growth happens on a plain frame.
+        let peak = buf
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| {
+                out.as_ref()
+                    .map_or(Some(bytes), |out| out.len().checked_mul(4)?.checked_add(bytes))
+            })
+            .and_then(|bytes| frame.len().checked_mul(5)?.checked_add(bytes))
+            .and_then(|bytes| id_growth?.checked_mul(3)?.checked_add(bytes));
+        if !peak.is_some_and(|bytes| {
+            streaming_restore_fits(budget, stable_budget, state.retained_rehydrate_stream_bytes, bytes)
+        }) {
+            return Err(());
+        }
+    }
+    if possible_response && let Some(rewritten) = rewritten_lifecycle_frame(frame, prev_id) {
         let dst = out.get_or_insert_with(|| buf.get(*run_start..start).unwrap_or_default().to_vec());
         dst.extend_from_slice(&rewritten);
         *run_start = end;
     } else if let Some(dst) = out.as_mut() {
         dst.extend_from_slice(frame);
         *run_start = end;
+    }
+    Ok(())
+}
+
+/// Find a top-level JSON `response` key without joining or parsing SSE data.
+/// Nested keys and quoted delta text do not trigger a rewrite reservation.
+fn frame_may_have_response_key(frame: &[u8]) -> bool {
+    let mut probe = ResponseKeyProbe::default();
+    let mut had_data = false;
+    for_each_sse_line(frame, |line, _| {
+        if probe.found {
+            return;
+        }
+        let Some(value) = sse_field_value(line, b"data") else {
+            return;
+        };
+        if had_data {
+            probe.feed(b'\n');
+        }
+        had_data = true;
+        for &byte in value {
+            probe.feed(byte);
+            if probe.found {
+                break;
+            }
+        }
+    });
+    probe.found
+}
+
+/// Minimal JSON shape scanner for top-level object keys in joined SSE data.
+#[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "allocation-free JSON scan keeps independent lexical and key states"
+)]
+struct ResponseKeyProbe {
+    /// Current object/array nesting depth outside JSON strings.
+    depth: usize,
+    /// Whether the first JSON value was an object.
+    root_object: bool,
+    /// Whether the first non-whitespace byte was seen.
+    root_seen: bool,
+    /// Whether the scanner is inside a JSON string.
+    in_string: bool,
+    /// Whether the previous string byte was an escape introducer.
+    escaped: bool,
+    /// Hex digits remaining in a JSON Unicode escape inside a string.
+    unicode_digits: u8,
+    /// Code unit accumulated from the current JSON Unicode escape.
+    unicode_value: u16,
+    /// Whether this string began as a possible top-level object key.
+    possible_key: bool,
+    /// Index of the next literal `response` byte, or `None` on mismatch.
+    literal_match: Option<usize>,
+    /// A possible key ended and awaits a colon after optional whitespace.
+    pending_colon: bool,
+    /// A top-level response key was found.
+    found: bool,
+}
+
+impl ResponseKeyProbe {
+    /// Consume one joined SSE data byte without allocating a payload copy.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tracks JSON depth, strings, escapes, and key separators"
+    )]
+    fn feed(&mut self, byte: u8) {
+        if self.found {
+            return;
+        }
+        if self.in_string {
+            if self.unicode_digits > 0 {
+                let Some(digit) = json_hex_digit(byte) else {
+                    self.literal_match = None;
+                    self.unicode_digits = 0;
+                    return;
+                };
+                self.unicode_value = (self.unicode_value << 4) | u16::from(digit);
+                self.unicode_digits -= 1;
+                if self.unicode_digits == 0 {
+                    if let Ok(decoded) = u8::try_from(self.unicode_value) {
+                        self.match_key_byte(decoded);
+                    } else {
+                        self.literal_match = None;
+                    }
+                }
+                return;
+            }
+            if self.escaped {
+                self.escaped = false;
+                let decoded = match byte {
+                    b'"' => Some(b'"'),
+                    b'\\' => Some(b'\\'),
+                    b'/' => Some(b'/'),
+                    b'b' => Some(8),
+                    b'f' => Some(12),
+                    b'n' => Some(b'\n'),
+                    b'r' => Some(b'\r'),
+                    b't' => Some(b'\t'),
+                    b'u' => {
+                        self.unicode_digits = 4;
+                        self.unicode_value = 0;
+                        return;
+                    },
+                    _ => None,
+                };
+                if let Some(decoded) = decoded {
+                    self.match_key_byte(decoded);
+                } else {
+                    self.literal_match = None;
+                }
+                return;
+            }
+            match byte {
+                b'\\' => self.escaped = true,
+                b'"' => {
+                    self.in_string = false;
+                    self.pending_colon = self.possible_key && self.literal_match == Some(b"response".len());
+                },
+                _ => self.match_key_byte(byte),
+            }
+            return;
+        }
+        if self.pending_colon {
+            if byte.is_ascii_whitespace() {
+                return;
+            }
+            self.pending_colon = false;
+            if byte == b':' {
+                self.found = true;
+                return;
+            }
+        }
+        if !self.root_seen && !byte.is_ascii_whitespace() {
+            self.root_seen = true;
+            self.root_object = byte == b'{';
+        }
+        match byte {
+            b'{' | b'[' => self.depth = self.depth.saturating_add(1),
+            b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+            b'"' => {
+                self.in_string = true;
+                self.possible_key = self.root_object && self.depth == 1;
+                self.literal_match = Some(0);
+            },
+            _ => {},
+        }
+    }
+
+    /// Match one decoded key byte against the only key that triggers rewriting.
+    fn match_key_byte(&mut self, byte: u8) {
+        if self.possible_key {
+            self.literal_match = self
+                .literal_match
+                .filter(|&index| b"response".get(index) == Some(&byte))
+                .map(|index| index + 1);
+        }
+    }
+}
+
+/// Decode one ASCII hexadecimal digit in a JSON Unicode escape.
+const fn json_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1153,8 +1598,9 @@ async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ResponseRecord, FilterAction> {
-    let record = fetch_previous_response(ctx, owner, prev_id).await?;
+    let record = fetch_previous_response(ctx, owner, prev_id, read_limit).await?;
     validate_response_status(&record)?;
     Ok(record)
 }
@@ -1187,6 +1633,7 @@ async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     conv_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ConversationRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
@@ -1198,10 +1645,11 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(conv_id).await.map_err(|e| {
-        warn!(error = %e, "rehydrate: failed to fetch conversation");
-        reject_server_error("failed to fetch conversation")
-    })?;
+    let record = match read_limit {
+        Some(limit) => store.get_conversation_bounded(conv_id, limit).await,
+        None => store.get_conversation(conv_id).await,
+    }
+    .map_err(|error| map_history_read_error(&error))?;
 
     record.ok_or_else(|| {
         debug!(id = %conv_id, "rehydrate: conversation not found");
@@ -1288,11 +1736,56 @@ fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), Fi
 // Fetch & Validate
 // -----------------------------------------------------------------------------
 
+/// Reserve room for the validated request, its temporary rebuilt copy, the
+/// store snapshot, and replay/persistence histories before fetching payload.
+/// The store's bounded read checks encoded columns in SQL and decoded columns
+/// before JSON parsing, including compressed records.
+fn history_read_limit(ctx: &HttpFilterContext<'_>) -> Result<Option<usize>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let limit = policy.max_retained_bytes();
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .ok_or_else(reject_retained_payload)?;
+    let current = state
+        .retained_payload_bytes_bounded(limit)
+        .ok_or_else(reject_retained_payload)?;
+    let parsed_copy = super::state::retained_json_bytes(&state.request_body).ok_or_else(reject_retained_payload)?;
+    let store_bytes = super::store::retained_request_payload_bytes(ctx).ok_or_else(reject_retained_payload)?;
+    let remaining = limit
+        .checked_sub(current.checked_mul(2).ok_or_else(reject_retained_payload)?)
+        .and_then(|bytes| bytes.checked_sub(parsed_copy))
+        .and_then(|bytes| bytes.checked_sub(store_bytes))
+        .ok_or_else(reject_retained_payload)?;
+    Ok(Some(remaining / 4))
+}
+
+/// Respond with the initial request's Responses-formatted budget error.
+fn reject_retained_payload() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+    ))
+}
+
+/// Convert a bounded store read failure to its request wire response.
+fn map_history_read_error(error: &StoreError) -> FilterAction {
+    if matches!(error, StoreError::PayloadTooLarge) {
+        return reject_retained_payload();
+    }
+    warn!(error = %error, "rehydrate: failed to fetch stored history");
+    reject_server_error("failed to fetch stored history")
+}
+
 /// Fetch the previous response record from the store.
 async fn fetch_previous_response(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ResponseRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
@@ -1304,10 +1797,11 @@ async fn fetch_previous_response(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_response(prev_id).await.map_err(|e| {
-        warn!(error = %e, "rehydrate: failed to fetch previous response");
-        reject_server_error("failed to fetch previous response")
-    })?;
+    let record = match read_limit {
+        Some(limit) => store.get_response_bounded(prev_id, limit).await,
+        None => store.get_response(prev_id).await,
+    }
+    .map_err(|error| map_history_read_error(&error))?;
 
     record.ok_or_else(|| {
         debug!(id = %prev_id, "rehydrate: previous response not found");
@@ -1423,15 +1917,30 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// It also seeds [`ResponsesState::response_id`] from the `responses.response_id`
 /// metadata (assigned upstream), since the reconstructed state cannot derive it
 /// from the request body.
-fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: ResponsesState) {
+fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: ResponsesState) -> Result<(), FilterAction> {
     let store_persist_armed = ctx
         .extensions
         .get::<ResponsesState>()
         .is_some_and(|prev| prev.store_persist_armed);
     state.store_persist_armed = store_persist_armed;
     state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
+    // Rehydration replaces the whole state bag. The store's request input is
+    // still owned by its filter state even when no agentic policy is present.
+    let store_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+    state.set_retained_external_payload_bytes(store_bytes);
+    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        if !state.can_retain_payload(0) {
+            ctx.set_metadata("responses.skip_persist", "true");
+            super::store::discard_retained_request_payload(ctx);
+            ctx.extensions.remove::<ResponsesState>();
+            return Err(reject_retained_payload());
+        }
+    }
     write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
     ctx.extensions.insert(state);
+    super::store::mark_retained_request_payload_charged(ctx);
+    Ok(())
 }
 
 /// Extract token usage from the previous response and set

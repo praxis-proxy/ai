@@ -78,6 +78,11 @@ impl Framing {
     pub(super) fn has_incomplete_frame(&self) -> bool {
         self.parser.has_incomplete_frame()
     }
+
+    /// Bytes retained by an unfinished provider frame.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.parser.retained_bytes()
+    }
 }
 
 /// Translate a parser error into a framing error the state machine understands.

@@ -1,20 +1,18 @@
-# Agentic Loop Fixture
-# Requires `--features store-sqlite` because these filters are opt-in.
+# Agentic Loop Retained-Payload Overflow Fixture
 #
-# Minimal agentic loop pipeline for inference fixture replay.
-# Exercises parallel_tool_calls preservation without external
-# callout filters (no web_search, MCP dispatch, or MCP tool resolve).
-#
-# This config proves that the openai_agentic_loop filter preserves
-# the client's parallel_tool_calls value in the upstream request body.
+# Controlled inference fixture configuration with a small aggregate state
+# budget. The synthetic upstream first commits a small Responses SSE event and
+# then supplies an output item whose construction buffers exceed this limit.
+# MCP resolution and dispatch are included so the functional test proves that
+# a pending tool call cannot run after the committed-stream budget failure.
 
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:8080"
-    filter_chains: [agentic-fixture]
+    filter_chains: [agentic-overflow-fixture]
 
 filter_chains:
-  - name: agentic-fixture
+  - name: agentic-overflow-fixture
     filters:
       - filter: openai_responses_format
         on_invalid: reject
@@ -37,6 +35,8 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
+      - filter: openai_mcp_tool_resolve
+
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 2
@@ -44,9 +44,10 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
+              - filter: openai_mcp_dispatch
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-                max_retained_bytes: 67108864
+                max_retained_bytes: 16384
               - filter: openai_responses_proxy
               - filter: router
                 routes:

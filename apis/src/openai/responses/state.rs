@@ -19,7 +19,11 @@ use std::{
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
+use super::{
+    bounded_json_size,
+    error::responses_error_rejection,
+    file_search_callout::citations::{annotate_response, annotation_staging_bytes},
+};
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -328,6 +332,31 @@ pub(crate) enum McpApprovalState {
               not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
+    /// Request-wide aggregate retained-payload ceiling selected by
+    /// `openai_agentic_loop`. `None` until the first loop instance arms it.
+    /// Additional loop instances may only lower the limit.
+    pub(crate) retained_payload_limit: Option<usize>,
+
+    /// Payload retained by request-lifetime sibling filter state that is not
+    /// represented directly in this bag (the response-store input snapshot,
+    /// captured SSE replay rows, and the store decoder's unfinished record).
+    /// The loop owner refreshes this before initial admission.
+    pub(crate) retained_external_payload_bytes: usize,
+    /// Parser payload published by `openai_stream_events` for other filters.
+    pub(crate) retained_stream_parser_bytes: usize,
+    /// Incomplete SSE frame held by the outer rehydration response rewrite.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
+    /// Semantic and framing payload published by the Chat stream translator.
+    pub(crate) retained_chat_converter_bytes: usize,
+
+    /// Revision of request/history/output owners cached by response-store
+    /// replay admission. In-place changes do not alter collection lengths.
+    /// `None` means the counter overflowed and replay must fail closed.
+    pub(crate) replay_stable_payload_revision: Option<u64>,
+
+    /// Whether aggregate admission failed and only a terminal error may remain.
+    pub(crate) retained_payload_failed: bool,
+
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
 
@@ -416,10 +445,6 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
-    #[cfg_attr(
-        all(not(test), not(feature = "openai-mcp-tools")),
-        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
-    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
 
     /// Slot policy under which configured MCP connector state was resolved.
@@ -538,10 +563,6 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
-    #[cfg_attr(
-        all(not(test), not(feature = "store")),
-        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
-    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -827,10 +848,6 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
-    #[cfg_attr(
-        not(feature = "openai-mcp-tools"),
-        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
-    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
@@ -893,6 +910,13 @@ impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
+            retained_payload_limit: None,
+            retained_external_payload_bytes: 0,
+            retained_stream_parser_bytes: 0,
+            retained_rehydrate_stream_bytes: 0,
+            retained_chat_converter_bytes: 0,
+            replay_stable_payload_revision: Some(0),
+            retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
@@ -955,6 +979,386 @@ impl Default for ResponsesState {
 }
 
 impl ResponsesState {
+    /// Apply an aggregate retained-payload limit. The smallest limit seen by
+    /// this request wins, so conditionally composed loop instances cannot
+    /// weaken an earlier safety policy.
+    pub(crate) fn apply_retained_payload_limit(&mut self, limit: usize) {
+        self.retained_payload_limit = Some(self.retained_payload_limit.map_or(limit, |current| current.min(limit)));
+    }
+
+    /// Record payload retained for the request by sibling filter state.
+    pub(crate) fn set_retained_external_payload_bytes(&mut self, bytes: usize) {
+        self.retained_external_payload_bytes = bytes;
+    }
+
+    /// Update one sibling owner's charge without dropping charges held by
+    /// other filters during the same request.
+    #[cfg(feature = "store")]
+    pub(crate) fn replace_retained_external_payload_bytes(&mut self, previous: usize, next: usize) -> bool {
+        let Some(total) = self
+            .retained_external_payload_bytes
+            .checked_sub(previous)
+            .and_then(|remaining| remaining.checked_add(next))
+        else {
+            self.retained_external_payload_bytes = usize::MAX;
+            self.fail_retained_payload_budget();
+            return false;
+        };
+        self.retained_external_payload_bytes = total;
+        true
+    }
+
+    /// Transfer an owned payload out of this bag while keeping it charged to
+    /// the request-wide meter for the lifetime of its filter-local owner.
+    pub(crate) fn retain_external_payload_bytes(&mut self, bytes: usize) -> bool {
+        let Some(total) = self.retained_external_payload_bytes.checked_add(bytes) else {
+            return false;
+        };
+        self.retained_external_payload_bytes = total;
+        true
+    }
+
+    /// Release payload previously transferred to a filter-local owner.
+    pub(crate) fn release_external_payload_bytes(&mut self, bytes: usize) {
+        if let Some(remaining) = self.retained_external_payload_bytes.checked_sub(bytes) {
+            self.retained_external_payload_bytes = remaining;
+        } else {
+            self.retained_external_payload_bytes = usize::MAX;
+            self.fail_retained_payload_budget();
+        }
+    }
+
+    /// Return the active request-wide retained-payload limit.
+    pub(crate) const fn retained_payload_limit(&self) -> Option<usize> {
+        self.retained_payload_limit
+    }
+
+    /// Count every payload independently owned by this state.
+    ///
+    /// JSON values are charged by compact serialized size. Values held in
+    /// multiple collections are deliberately counted once per owner. Native
+    /// strings and byte-like buffers are charged by their raw length. Fixed-size
+    /// counters, flags, indices, and digests carry no payload charge.
+    #[cfg(test)]
+    pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
+        self.retained_payload_bytes_bounded(usize::MAX)
+    }
+
+    /// Count retained payload, returning `None` immediately above `max_bytes`.
+    pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false, false, true, true)
+    }
+
+    /// Request and history owners remain stable between upstream chunks.
+    /// Measure them once per round; `stream_events` refreshes this baseline at
+    /// EOS after the agentic owner may append the finished round to history.
+    pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json(&self.request_body)?;
+        for values in [
+            &self.input,
+            &self.messages,
+            &self.persisted_messages,
+            &self.previous_tools,
+            &self.tools,
+        ] {
+            meter.json_values(values)?;
+        }
+        for id in &self.provider_compaction_ids {
+            meter.raw(id.len())?;
+        }
+        Some(meter.used())
+    }
+
+    /// Count the owners which may change during a streaming response. The
+    /// stream-local meter adds the cached request/history charge separately.
+    pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
+    }
+
+    /// Rehydration runs after the stream parser and can see new canonical output
+    /// between chunks; count both while reusing only stable request/history bytes.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+    }
+
+    /// The response store caches request/history and prior output while
+    /// capturing replay chunks, but must still count all changing owners,
+    /// including the parser charge published by `openai_stream_events`.
+    #[cfg(feature = "store")]
+    pub(crate) fn store_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+    }
+
+    /// The translated upstream round cannot append prior output until its
+    /// converter has finished. The converter caches that large owner once;
+    /// this counts all other changing owners, including the stream parser.
+    pub(crate) fn stream_changing_payload_bytes_bounded_with_cached_output(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, true, true, true)
+    }
+
+    /// Count payload owned directly by this state, excluding sibling-filter
+    /// owners that participate only in the aggregate agentic budget.
+    ///
+    /// File search's legacy `max_state_bytes` option predates the aggregate
+    /// budget and covers iterative-router plus file-search continuation state;
+    /// response-store snapshots and other sibling-filter owners must not change
+    /// that independent compatibility limit.
+    pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false, false, false, false)
+    }
+
+    /// Shared implementation for aggregate and state-only payload accounting.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "exhaustive accounting for the request-scoped state bag"
+    )]
+    fn retained_payload_bytes_bounded_inner(
+        &self,
+        max_bytes: usize,
+        include_external: bool,
+        skip_stream_stable: bool,
+        skip_accumulated_output: bool,
+        include_stream_parser: bool,
+        include_chat_converter: bool,
+    ) -> Option<usize> {
+        let mut meter = PayloadMeter::new(max_bytes);
+        if include_external {
+            meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_rehydrate_stream_bytes)?;
+        }
+        if include_stream_parser {
+            meter.raw(self.retained_stream_parser_bytes)?;
+        }
+        if include_chat_converter {
+            meter.raw(self.retained_chat_converter_bytes)?;
+        }
+
+        if !skip_stream_stable {
+            meter.json(&self.request_body)?;
+            for values in [
+                &self.input,
+                &self.messages,
+                &self.persisted_messages,
+                &self.previous_tools,
+                &self.tools,
+            ] {
+                meter.json_values(values)?;
+            }
+            for id in &self.provider_compaction_ids {
+                meter.raw(id.len())?;
+            }
+        }
+        for value in [
+            &self.response_object,
+            &self.local_completion_response_template,
+            &self.tool_choice,
+            &self.usage,
+        ] {
+            meter.json(value)?;
+        }
+        if !skip_accumulated_output {
+            meter.json_values(&self.accumulated_output)?;
+        }
+        for values in [&self.tool_calls, &self.tool_search_calls, &self.web_search_calls] {
+            meter.json_values(values)?;
+        }
+        for value in [
+            self.context_management.as_ref(),
+            self.conversation.as_ref(),
+            self.original_tool_choice.as_ref(),
+            self.previous_usage.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.json(value)?;
+        }
+        for ((server, tool), value) in &self.mcp_tool_map {
+            meter.raw(server.len())?;
+            meter.raw(tool.len())?;
+            meter.json(value)?;
+        }
+        for (private_name, lowered) in &self.client_tool_lowering {
+            meter.raw(private_name.len())?;
+            meter.raw(lowered.original_name.len())?;
+            if let Some(namespace) = &lowered.namespace {
+                meter.raw(namespace.len())?;
+            }
+        }
+        if let Some(echo) = &self.client_tool_echo {
+            meter.json_values(&echo.tools)?;
+            meter.json(&echo.tool_choice)?;
+        }
+        for connector in &self.deferred_mcp {
+            meter.raw(connector.connector_id.len())?;
+            meter.raw(connector.server_label.len())?;
+            meter.raw(connector.server_url.len())?;
+            if let Some(authorization) = &connector.authorization {
+                meter.raw(authorization.len())?;
+            }
+            for value in [
+                connector.allowed_tools.as_ref(),
+                connector.headers.as_ref(),
+                connector.require_approval.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.json(value)?;
+            }
+        }
+        #[cfg(feature = "openai-mcp-tools")]
+        {
+            for slot in [
+                self.mcp_connector_context_policy.credential_slot.as_ref(),
+                self.mcp_connector_context_policy.authorization_slot.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                meter.raw(slot.len())?;
+            }
+        }
+        for (key, value) in &self.citation_files {
+            meter.raw(key.len())?;
+            meter.raw(value.len())?;
+        }
+        for value in &self.include {
+            meter.raw(value.len())?;
+        }
+        for value in [
+            self.logical_stream_response_id.as_ref(),
+            self.previous_response_id.as_ref(),
+            self.response_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            meter.raw(value.len())?;
+        }
+        for value in &self.provider_streamed_terminal_ids {
+            meter.raw(value.len())?;
+        }
+        for value in &self.locally_executed_output_items {
+            meter.raw(value.len())?;
+        }
+        for (id, emitted) in &self.emitted_output_items {
+            meter.raw(id.len())?;
+            for phase in &emitted.streamed_phases {
+                meter.raw(phase.len())?;
+            }
+        }
+        #[cfg(feature = "store")]
+        for record in &self.pending_approvals {
+            meter.raw(record.approval_id.len())?;
+            meter.raw(record.server_label.len())?;
+            meter.raw(record.tool_name.len())?;
+            meter.raw(record.arguments.len())?;
+            meter.raw(record.target_fingerprint.len())?;
+        }
+        if let Some(failure) = &self.dispatch_failure {
+            meter.raw(failure.message.len())?;
+        }
+        if let Some(failure) = &self.security_failure {
+            meter.raw(failure.message.len())?;
+        }
+        Some(meter.used())
+    }
+
+    /// Return whether the current state plus independently owned payload bytes
+    /// fits the active aggregate limit.
+    pub(crate) fn can_retain_payload(&self, additional_bytes: usize) -> bool {
+        self.can_replace_retained_payload(0, additional_bytes, 0)
+    }
+
+    /// Test a transactional payload replacement without mutating state.
+    ///
+    /// `removed_bytes` identifies owners that will be dropped by the same
+    /// commit, `added_bytes` the new owners, and `external_bytes` filter-local
+    /// parser or serialization staging retained alongside `ResponsesState`.
+    pub(crate) fn can_replace_retained_payload(
+        &self,
+        removed_bytes: usize,
+        added_bytes: usize,
+        external_bytes: usize,
+    ) -> bool {
+        let Some(limit) = self.retained_payload_limit else {
+            return true;
+        };
+        let Some(measurement_limit) = limit.checked_add(removed_bytes) else {
+            return false;
+        };
+        let Some(current) = self.retained_payload_bytes_bounded(measurement_limit) else {
+            return false;
+        };
+        current
+            .checked_sub(removed_bytes)
+            .and_then(|bytes| bytes.checked_add(added_bytes))
+            .and_then(|bytes| bytes.checked_add(external_bytes))
+            .is_some_and(|bytes| bytes <= limit)
+    }
+
+    /// Drop all dispatch selections and disable successful persistence after an
+    /// aggregate budget failure.
+    pub(crate) fn fail_retained_payload_budget(&mut self) {
+        self.retained_payload_failed = true;
+        self.tool_calls.clear();
+        self.tool_search_calls.clear();
+        self.web_search_calls.clear();
+        self.file_search_assignments.clear();
+        self.pending_local_tool_synthesis.clear();
+        self.deferred_tool_limit_completion = false;
+        self.mcp_approval_state = McpApprovalState::None;
+        self.store_persist_armed = false;
+    }
+
+    /// Release request payload after an already-committed stream exceeds the
+    /// aggregate budget. Only the transport bit and budget remain live; no
+    /// inference, dispatch, or successful persistence may follow this terminal
+    /// error, so retaining conversation or response trees would serve no owner.
+    #[expect(clippy::too_many_lines, reason = "explicitly drops each independently owned payload")]
+    pub(crate) fn discard_payload_for_budget_error(&mut self) {
+        let streaming = self.request_body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+        self.fail_retained_payload_budget();
+        self.citation_files.clear();
+        self.context_management = None;
+        self.conversation = None;
+        self.include.clear();
+        self.logical_stream_response_id = None;
+        self.input.clear();
+        self.deferred_mcp.clear();
+        self.mcp_tool_map.clear();
+        self.client_tool_lowering.clear();
+        self.client_tool_echo = None;
+        self.messages.clear();
+        self.persisted_messages.clear();
+        #[cfg(feature = "store")]
+        self.pending_approvals.clear();
+        self.previous_response_id = None;
+        self.previous_tools.clear();
+        self.previous_usage = None;
+        self.original_tool_choice = None;
+        self.response_id = None;
+        self.request_body = serde_json::json!({ "stream": streaming });
+        self.response_object = serde_json::Value::Null;
+        self.local_completion_response_template = serde_json::Value::Null;
+        self.tool_choice = serde_json::Value::Null;
+        self.tools.clear();
+        self.usage = serde_json::Value::Null;
+        self.accumulated_output.clear();
+        self.emitted_output_items.clear();
+        self.locally_executed_output_items.clear();
+        self.provider_streamed_terminal_ids.clear();
+        self.provider_compaction_ids.clear();
+        self.retained_rehydrate_stream_bytes = 0;
+        self.dispatch_failure = None;
+    }
+
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
@@ -994,12 +1398,18 @@ impl ResponsesState {
     pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
         messages
             .iter()
-            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
-            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
-            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
-            .filter(|id| !id.starts_with("compact_"))
+            .filter_map(Self::provider_compaction_id_from_message)
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    /// Borrow a provider compaction ID before a collector copies it into state.
+    pub(crate) fn provider_compaction_id_from_message(item: &serde_json::Value) -> Option<&str> {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .then_some(item)
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .and_then(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
@@ -1012,6 +1422,15 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+        self.mark_replay_stable_payload_changed();
+    }
+
+    /// Invalidate the store replay meter after an in-place mutation of a
+    /// cached request, history, tool, or accumulated output owner.
+    pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
+        self.replay_stable_payload_revision = self
+            .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
@@ -1107,11 +1526,44 @@ impl ResponsesState {
     /// Returns a [`FilterAction::Reject`] carrying an HTTP 502 error envelope on
     /// citation-annotation failure, JSON size overflow, or serialization
     /// failure, closing the prior fail-open serialization gap.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "in-place canonical response finalization with budget preflight"
+    )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
         if !self.response_object.is_object() {
             return Ok(());
         }
-        if let Some(obj) = self.response_object.as_object_mut() {
+        let final_output = if self.accumulated_output.is_empty() {
+            self.response_object
+                .get("output")
+                .and_then(serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+        } else {
+            &self.accumulated_output
+        };
+        let annotation_staging = annotation_staging_bytes(final_output, &self.citation_files).map_err(|error| {
+            tracing::warn!(%error, "failed to preflight final response annotations");
+            finalize_rejection("failed to annotate final response")
+        })?;
+        let usage_staging = if self.usage.is_null() {
+            Some(0)
+        } else {
+            retained_json_bytes(&self.usage)
+        };
+        let preflight_staging = usage_staging.and_then(|usage| annotation_staging.checked_add(usage));
+        if !preflight_staging.is_some_and(|staging| self.can_retain_payload(staging)) {
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection(
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final construction",
+            ));
+        }
+        // Build the canonical terminal tree off-state using moves. This keeps
+        // the retained-state mutation transactional through annotation and both
+        // size admissions; on failure no oversized response or serialization
+        // buffer becomes an additional state owner.
+        let mut response = std::mem::take(&mut self.response_object);
+        if let Some(obj) = response.as_object_mut() {
             if !self.accumulated_output.is_empty() {
                 obj.insert(
                     "output".to_owned(),
@@ -1122,18 +1574,43 @@ impl ResponsesState {
                 obj.insert("usage".to_owned(), self.usage.clone());
             }
         }
-        annotate_response(&mut self.response_object, &self.citation_files).map_err(|error| {
+        if let Err(error) = annotate_response(&mut response, &self.citation_files) {
             tracing::warn!(%error, "failed to annotate final response");
-            finalize_rejection("failed to annotate final response")
-        })?;
-        bounded_json_size(&self.response_object, MAX_JSON_BODY_BYTES)
-            .ok()
-            .flatten()
-            .ok_or_else(|| finalize_rejection("final response exceeds the JSON response byte limit"))?;
-        let serialized = serde_json::to_vec(&self.response_object).map_err(|error| {
-            tracing::warn!(%error, "failed to encode final response");
-            finalize_rejection("failed to encode final response")
-        })?;
+            self.response_object = response;
+            return Err(finalize_rejection("failed to annotate final response"));
+        }
+        let Some(serialized_bytes) = bounded_json_size(&response, MAX_JSON_BODY_BYTES).ok().flatten() else {
+            self.response_object = response;
+            return Err(finalize_rejection(
+                "final response exceeds the JSON response byte limit",
+            ));
+        };
+        // `response_object` and the final byte buffer coexist until the
+        // framework accepts the rewritten body, so charge both owners before
+        // allocating the buffer. `self.response_object` is temporarily `null`.
+        let Some(null_bytes) = retained_json_bytes(&self.response_object) else {
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection("failed to size final response state"));
+        };
+        if !self.can_replace_retained_payload(null_bytes, serialized_bytes, serialized_bytes) {
+            // Do not commit the canonicalized/annotated tree after its final
+            // serialization owner is denied. The local `response` is dropped
+            // on return and all request payload is released; only the bounded
+            // terminal-error state remains available to downstream filters.
+            self.discard_payload_for_budget_error();
+            return Err(finalize_rejection(
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final serialization",
+            ));
+        }
+        let serialized = match serde_json::to_vec(&response) {
+            Ok(serialized) => serialized,
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode final response");
+                self.response_object = response;
+                return Err(finalize_rejection("failed to encode final response"));
+            },
+        };
+        self.response_object = response;
         *body = Some(Bytes::from(serialized));
         Ok(())
     }
@@ -1151,6 +1628,62 @@ impl ResponsesState {
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
         std::mem::take(&mut self.file_search_assignments)
     }
+}
+
+/// Allocation-free compact-JSON/raw-byte accumulator shared by all aggregate
+/// retained-state checks.
+pub(crate) struct PayloadMeter {
+    /// Compact JSON and raw payload bytes admitted so far.
+    used: usize,
+
+    /// Inclusive request-wide byte ceiling.
+    limit: usize,
+}
+
+impl PayloadMeter {
+    /// Start an empty bounded measurement.
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    /// Charge one independently owned JSON value.
+    pub(crate) fn json<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Option<()> {
+        let remaining = self.limit.checked_sub(self.used)?;
+        let bytes = bounded_json_size(value, remaining).ok().flatten()?;
+        self.raw(bytes)
+    }
+
+    /// Charge each independently owned JSON value in a collection.
+    pub(crate) fn json_values(&mut self, values: &[serde_json::Value]) -> Option<()> {
+        for value in values {
+            self.json(value)?;
+        }
+        Some(())
+    }
+
+    /// Charge raw string or buffer bytes.
+    pub(crate) fn raw(&mut self, bytes: usize) -> Option<()> {
+        self.used = self.used.checked_add(bytes)?;
+        (self.used <= self.limit).then_some(())
+    }
+
+    /// Return charged bytes.
+    pub(crate) const fn used(&self) -> usize {
+        self.used
+    }
+}
+
+/// Return the compact representation size of one independently owned JSON
+/// value, or `None` on serialization/count overflow.
+pub(crate) fn retained_json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Option<usize> {
+    bounded_json_size(value, usize::MAX).ok().flatten()
+}
+
+/// Return the sum of compact sizes for independently owned JSON values.
+pub(crate) fn retained_json_values_bytes(values: &[serde_json::Value]) -> Option<usize> {
+    let mut meter = PayloadMeter::new(usize::MAX);
+    meter.json_values(values)?;
+    Some(meter.used())
 }
 
 /// Build the HTTP 502 rejection returned by [`ResponsesState::finalize_response_body`]
@@ -1370,6 +1903,136 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn retained_payload_admits_below_and_at_limit_but_rejects_above() {
+        let item = json!({"payload": "abc"});
+        let item_bytes = retained_json_bytes(&item).unwrap();
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(baseline + item_bytes);
+
+        assert!(state.can_retain_payload(item_bytes - 1), "below limit");
+        assert!(state.can_retain_payload(item_bytes), "at limit");
+        assert!(!state.can_retain_payload(item_bytes + 1), "above limit");
+    }
+
+    #[test]
+    fn retained_payload_counts_duplicate_json_owners_separately() {
+        let item = json!({"type": "message", "content": "owned four times"});
+        let bytes = retained_json_bytes(&item).unwrap();
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.input.push(item.clone());
+        state.messages.push(item.clone());
+        state.persisted_messages.push(item.clone());
+        state.accumulated_output.push(item);
+
+        assert_eq!(
+            state.retained_payload_bytes().unwrap() - baseline,
+            bytes * 4,
+            "each of the four owned JSON copies contributes its bytes"
+        );
+    }
+
+    #[test]
+    fn retained_payload_counts_and_releases_provider_compaction_ids() {
+        let id = "c".repeat(8_192);
+        let mut state = ResponsesState::from_request_body(json!({
+            "input": [{"type": "compaction", "id": &id, "encrypted_content": "opaque"}]
+        }));
+        let with_id = state.retained_payload_bytes().unwrap();
+        let stable_with_id = state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap();
+        state.provider_compaction_ids.clear();
+        assert_eq!(with_id - state.retained_payload_bytes().unwrap(), id.len());
+        assert_eq!(
+            stable_with_id - state.stream_stable_payload_bytes_bounded(usize::MAX).unwrap(),
+            id.len()
+        );
+
+        state.provider_compaction_ids.insert(id);
+        state.apply_retained_payload_limit(with_id - 1);
+        assert!(!state.can_retain_payload(0));
+        state.discard_payload_for_budget_error();
+        assert!(state.provider_compaction_ids.is_empty());
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven coverage of every retained owner class"
+    )]
+    fn retained_payload_counts_response_history_dispatch_and_raw_state() {
+        let value = json!({"payload": "v"});
+        let bytes = retained_json_bytes(&value).unwrap();
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.response_object = value.clone();
+        state.context_management = Some(value.clone());
+        state.conversation = Some(value.clone());
+        state.previous_usage = Some(value.clone());
+        state.original_tool_choice = Some(value.clone());
+        state.previous_tools.push(value.clone());
+        state.tool_calls.push(value.clone());
+        state.web_search_calls.push(value.clone());
+        state.tools.push(value.clone());
+        state
+            .mcp_tool_map
+            .insert(("server".to_owned(), "tool".to_owned()), value);
+        state.include.push("usage".to_owned());
+        state.provider_streamed_terminal_ids.insert("terminal".to_owned());
+        state.locally_executed_output_items.insert("executed".to_owned());
+        state.pending_approvals.push(crate::store::PendingApprovalRecord {
+            approval_id: "approval".to_owned(),
+            server_label: "label".to_owned(),
+            tool_name: "name".to_owned(),
+            arguments: "args".to_owned(),
+            target_fingerprint: "fingerprint".to_owned(),
+        });
+        state.dispatch_failure = Some(DispatchFailure {
+            status: 502,
+            code: "server_error",
+            message: "failure".to_owned(),
+        });
+
+        let replaced_null = retained_json_bytes(&serde_json::Value::Null).unwrap();
+        let json_delta = bytes * 10 - replaced_null;
+        let raw_delta = "server".len()
+            + "tool".len()
+            + "usage".len()
+            + "terminal".len()
+            + "executed".len()
+            + "approval".len()
+            + "label".len()
+            + "name".len()
+            + "args".len()
+            + "fingerprint".len()
+            + "failure".len();
+        assert_eq!(
+            state.retained_payload_bytes().unwrap() - baseline,
+            json_delta + raw_delta
+        );
+    }
+
+    #[test]
+    fn retained_payload_limit_can_only_decrease() {
+        let mut state = ResponsesState::default();
+        state.apply_retained_payload_limit(8_192);
+        state.apply_retained_payload_limit(16_384);
+        assert_eq!(state.retained_payload_limit(), Some(8_192));
+        state.apply_retained_payload_limit(4_096);
+        assert_eq!(state.retained_payload_limit(), Some(4_096));
+    }
+
+    #[test]
+    fn retained_payload_counts_request_lifetime_external_owners() {
+        let mut state = ResponsesState::default();
+        let baseline = state.retained_payload_bytes().unwrap();
+        state.set_retained_external_payload_bytes(1_337);
+
+        assert_eq!(state.retained_payload_bytes().unwrap(), baseline + 1_337);
+    }
 
     #[test]
     fn from_request_body_extracts_string_input() {
@@ -2124,6 +2787,80 @@ mod tests {
         let part = &state.response_object["output"][0]["content"][0];
         assert_eq!(part["text"], text, "marker text is untouched without citation files");
         assert!(part.get("annotations").is_none(), "no annotations are added");
+    }
+
+    #[test]
+    fn finalize_response_body_reserves_citation_staging_before_mutation() {
+        let text = format!("{} <|file-known|>", "x".repeat(8_192));
+        let item = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        });
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![item.clone()],
+            citation_files: HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]),
+            ..ResponsesState::default()
+        };
+        let current = state.retained_payload_bytes().unwrap();
+        let staging = annotation_staging_bytes(&state.accumulated_output, &state.citation_files).unwrap();
+        state.apply_retained_payload_limit(current + staging - 1);
+
+        let mut body = None;
+        assert!(
+            state.finalize_response_body(&mut body).is_err(),
+            "citation staging above the retained budget must fail finalization"
+        );
+        assert!(
+            state.retained_payload_failed,
+            "citation staging budget failure must mark retained payload as failed"
+        );
+        assert!(
+            state.accumulated_output.is_empty(),
+            "failed finalization releases retained output"
+        );
+        assert!(body.is_none(), "failed citation preflight must not produce a body");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts each payload owner is released after reservation fails"
+    )]
+    fn finalize_response_body_discards_canonical_tree_when_serialization_reservation_fails() {
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "x".repeat(4_096)}],
+            })],
+            ..ResponsesState::default()
+        };
+        state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
+
+        let mut body = None;
+        assert!(
+            state.finalize_response_body(&mut body).is_err(),
+            "serialization reservation above the retained budget must fail finalization"
+        );
+        assert!(
+            state.retained_payload_failed,
+            "serialization reservation failure must mark retained payload as failed"
+        );
+        assert!(
+            state.response_object.is_null(),
+            "canonical response must not be committed"
+        );
+        assert!(
+            state.accumulated_output.is_empty(),
+            "failed request payload is released"
+        );
+        assert!(
+            body.is_none(),
+            "failed serialization reservation must not produce a body"
+        );
     }
 
     #[test]

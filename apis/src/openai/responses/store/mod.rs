@@ -13,6 +13,10 @@ mod config;
 mod filter;
 
 pub use self::filter::ResponseStoreFilter;
+pub(crate) use self::filter::{
+    discard_retained_request_payload, mark_retained_request_payload_charged, request_persistence_armed,
+    retained_request_payload_bytes,
+};
 
 #[cfg(test)]
 #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]

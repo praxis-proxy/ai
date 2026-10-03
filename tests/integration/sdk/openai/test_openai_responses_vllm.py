@@ -41,6 +41,7 @@ import httpx
 import pytest
 from openai import (
     APIConnectionError,
+    APIStatusError,
     BadRequestError,
     NotFoundError,
     OpenAI,
@@ -5310,8 +5311,189 @@ class TestClientToolCompatChatVLLM:
         assert any(t.type == "custom" for t in second.tools), second.tools
 
 
+class RetainedToolSearchBackendHandler(BaseHTTPRequestHandler):
+    """Return a hosted search item that fits once but exceeds three owners."""
+
+    requests: ClassVar[int] = 0
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        type(self).requests += 1
+        payload = json.dumps(
+            {
+                "id": "resp_tool_search_budget",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "tool_search_call",
+                        "id": "tsc_budget",
+                        "status": "completed",
+                        "results": [{"description": "x" * 5_000}],
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture()
+def retained_tool_search_client(tmp_path, request):
+    """OpenAI SDK client backed by a fixed, oversized hosted search result."""
+    RetainedToolSearchBackendHandler.requests = 0
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), RetainedToolSearchBackendHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    proxy_port = _free_port()
+    with open("examples/configs/openai/responses/agentic-loop-overflow-fixture.yaml") as f:
+        config = f.read()
+    legacy_request_filters = (
+        "      - filter: openai_responses_format\n"
+        "        on_invalid: reject\n"
+        "        headers:\n"
+        "          format: x-praxis-ai-format\n"
+        "          model: x-praxis-ai-model\n"
+        "          stream: x-praxis-ai-stream\n\n"
+        "      - filter: openai_responses_validate\n"
+    )
+    if legacy_request_filters not in config:
+        raise RuntimeError("retained overflow fixture's request filters changed")
+    consolidated_request_filter = (
+        "      - filter: openai_responses_request\n"
+        "        on_invalid: reject\n"
+        "        headers:\n"
+        "          format: x-praxis-ai-format\n"
+        "          model: x-praxis-ai-model\n"
+        "          stream: x-praxis-ai-stream\n"
+    )
+    config = config.replace(
+        legacy_request_filters,
+        consolidated_request_filter,
+        1,
+    )
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    # This request uses store=False; omit the fixture's optional SQLite filters
+    # so the test runs against the production `full` binary.
+    store_filters = (
+        "      - filter: openai_response_store\n"
+        "        backend: sqlite\n"
+        '        database_url: "sqlite://responses.db?mode=rwc"\n'
+        "        responses_table: openai_responses\n"
+        "        conversations_table: openai_conversations\n\n"
+        "      - filter: openai_responses_rehydrate\n\n"
+    )
+    if store_filters not in config:
+        raise RuntimeError("retained overflow fixture's store filters changed")
+    config = config.replace(store_filters, "", 1)
+    config_path = _persist_config(config)
+    log_path = str(tmp_path / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(proxy_port, proc, log_path)
+        started = True
+        yield OpenAI(
+            base_url=f"http://127.0.0.1:{proxy_port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=60,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        server.server_close()
+        if not started or request.session.testsfailed > 0:
+            print(f"\n=== Retained tool search Praxis logs ===\n{_read_log_tail(log_path)}", file=sys.stderr)
+        os.unlink(config_path)
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
+
+    def test_initial_retained_budget_rejects_before_sdk_inference(self, agentic_client):
+        """The configured loop limit is enforced before request JSON is parsed."""
+        with pytest.raises(APIStatusError) as exc_info:
+            agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="x" * (8 * 1024 * 1024 + 1),
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+
+    def test_consolidated_request_rejects_raw_body_before_sdk_inference(
+        self, retained_tool_search_client
+    ):
+        """The consolidated request filter rejects before JSON or model dispatch."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input="x" * 2_000,
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert RetainedToolSearchBackendHandler.requests == 0
+
+    def test_hosted_tool_search_retained_copies_reject_through_sdk(
+        self, retained_tool_search_client
+    ):
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a tool.",
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 502
+        assert "agentic retained payload exceeded" in exc_info.value.response.text
+        assert RetainedToolSearchBackendHandler.requests == 1
+
+    def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
+        """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply with exactly BUDGET-OK. /no_think",
+            store=False,
+            max_output_tokens=64,
+        )
+
+        assert response.status in ("completed", "incomplete")
+        assert response.output
+
+    def test_explicit_retained_budget_streaming_happy_path(self, agentic_client):
+        """The same explicit budget preserves the normal logical SSE lifecycle."""
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply with exactly STREAM-BUDGET-OK. /no_think",
+            store=False,
+            stream=True,
+            max_output_tokens=64,
+        )
+
+        terminal = _assert_stream_contract(_collect_stream(stream))
+        assert terminal.status in ("completed", "incomplete")
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,

@@ -9,6 +9,8 @@
 
 use serde_json::{Value, json};
 
+use crate::openai::responses::state::retained_json_bytes;
+
 /// A Responses streaming event ready for sequencing and encoding.
 pub(super) struct StreamEvent {
     /// The Responses SSE `event:` name and payload `type`.
@@ -21,6 +23,16 @@ impl StreamEvent {
     /// Construct an event from its type and partial payload.
     fn new(event_type: &'static str, payload: Value) -> Self {
         Self { event_type, payload }
+    }
+
+    /// Bound the complete encoded frame before its bytes grow the callback Vec.
+    /// Encoding adds `type` and `sequence_number` to the JSON object; 128 bytes
+    /// covers both keys, punctuation, and the largest numeric sequence value.
+    pub(super) fn encoded_len_upper_bound(&self) -> Option<usize> {
+        retained_json_bytes(&self.payload)?
+            .checked_add(self.event_type.len().checked_mul(2)?)?
+            .checked_add(b"event: \ndata: \n\n".len())?
+            .checked_add(128)
     }
 }
 
@@ -226,6 +238,15 @@ pub(super) fn response_failed(resource: &Value) -> StreamEvent {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_bound_covers_escaped_content_and_max_sequence() {
+        let event = output_text_delta(&"i".repeat(1_024), 0, 0, &"\u{0001}".repeat(1_024), &json!([]));
+        let upper = event.encoded_len_upper_bound().unwrap();
+        let mut out = Vec::new();
+        encode(event, u64::MAX, &mut out).unwrap();
+        assert!(upper >= out.len(), "wire frame exceeded its pre-encoding upper bound");
+    }
 
     #[test]
     fn encode_injects_type_and_sequence_number() {

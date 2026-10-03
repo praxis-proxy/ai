@@ -11,11 +11,14 @@ Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non
 
 Also extracts `tool_search_call` items into `ResponsesState.tool_search_calls` so `openai_mcp_dispatch` can load deferred connectors on the next iteration without forwarding those items to the inference backend.
 
+Retained-payload admission conservatively reserves space for independently owned JSON, histories, tool results, SSE parser state, and transient output construction. The serving pipeline shares the smallest reachable loop limit with classification, validation, and bounded store reads, so oversized initial bodies and stored histories fail before their large copies are made. If branches on one listener have different loop limits, early admission conservatively uses the smallest reachable value. A request may be rejected before its configured byte count is physically allocated. Initial overflow returns HTTP 413; buffered continuation overflow returns HTTP 502. Once SSE is committed, overflow emits one `error` event with no `response.completed` or `[DONE]`, and the failed response is not persisted.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
+| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. Must be between 1 and [`MAX_ITERATIONS_CEILING`] (currently 100); defaults to 10. |
+| `max_retained_bytes` | RetainedBytes | no | Maximum aggregate payload bytes retained by the Responses agentic execution. Counts compact JSON for each independently owned value and raw bytes for owned strings and streaming buffers. When several loop filters touch one request, the smallest configured value wins. Valid from 4 `KiB` through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`. Initial Responses create bodies are capped at one eighth of the smallest reachable budget; the default therefore allows 8 `MiB`, which may reject larger bodies accepted previously. To admit bodies up to `B` bytes, set the effective budget to at least `8 × B` and `body_limits.max_request_bytes` to at least `B`. |
 
 ## Examples
 
@@ -30,4 +33,5 @@ filter: openai_agentic_loop
 ```yaml
 filter: openai_agentic_loop
 max_infer_iters: 10
+max_retained_bytes: 67108864
 ```

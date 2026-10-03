@@ -73,6 +73,15 @@ impl OwnerScopedStore {
         self.store.get_response(&self.owner, id).await
     }
 
+    /// Fetch a response within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_response_bounded(&self, id: &str, max_bytes: usize) -> Result<Option<ResponseRecord>, StoreError> {
+        self.store.get_response_bounded(&self.owner, id, max_bytes).await
+    }
+
     /// Delete a response visible to this owner.
     ///
     /// # Errors
@@ -92,6 +101,20 @@ impl OwnerScopedStore {
         // ResponseStore read-only view. Upcast to disambiguate.
         let store: &dyn ResponseStore = self.store.as_ref();
         store.get_conversation(&self.owner, id).await
+    }
+
+    /// Fetch a conversation within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_conversation_bounded(
+        &self,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let store: &dyn ResponseStore = self.store.as_ref();
+        store.get_conversation_bounded(&self.owner, id, max_bytes).await
     }
 
     /// Persist a response only when its immutable owner matches this handle.
@@ -136,6 +159,21 @@ impl OwnerScopedStore {
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
         self.store
             .get_pending_approvals(&self.owner, response_id, approval_ids)
+            .await
+    }
+
+    /// Size matching pending approvals before fetching their payload columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn pending_approval_payload_bytes(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        self.store
+            .pending_approval_payload_bytes(&self.owner, response_id, approval_ids)
             .await
     }
 

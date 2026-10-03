@@ -21,8 +21,8 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status, patch_yaml,
+    start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -33,6 +33,354 @@ use praxis_test_utils::{
 fn example_config_builds_pipeline() {
     let config = load_agentic_config(free_port(), 19901);
     let _pipeline = build_pipeline(&config);
+}
+
+#[test]
+fn retained_overflow_fixture_config_builds_pipeline() {
+    let config = load_example_config(
+        "openai/responses/agentic-loop-overflow-fixture.yaml",
+        free_port(),
+        HashMap::from([("127.0.0.1:3001", 19901)]),
+    );
+    let _pipeline = build_pipeline(&config);
+}
+
+#[test]
+fn initial_retained_overflow_returns_413_without_inference() {
+    let model = StatefulCapturingBackend::new(vec![(200, r#"{"object":"response","output":[]}"#.to_owned())])
+        .start_with_shutdown();
+    let db = TempSqlite::new("agentic_initial_retained_overflow");
+    let config = load_retained_budget_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_000),
+        "store": true
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 413, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        model.requests().is_empty(),
+        "initial overflow must stop before inference"
+    );
+}
+
+#[test]
+fn oversized_stored_history_returns_413_before_replay_or_inference() {
+    let model_response = serde_json::json!({
+        "id": "resp_large_history",
+        "object": "response",
+        "created_at": 1_780_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_large_history",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "x".repeat(12_000)}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, model_response.to_string())]).start_with_shutdown();
+    let db = TempSqlite::new("agentic_pre_rehydrate_retained_overflow");
+
+    let first_raw = {
+        let config = load_approval_config(free_port(), model.port(), db.url());
+        let proxy = start_proxy(&config);
+        let first = serde_json::json!({"model": "gpt-4.1", "input": "Seed history", "store": true});
+        http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()))
+    };
+    assert_eq!(parse_status(&first_raw), 200, "{first_raw}");
+    let first_body: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    let previous_id = first_body["id"].as_str().unwrap();
+
+    let config = load_retained_budget_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+    let next = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Continue",
+        "previous_response_id": previous_id,
+        "store": true
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+
+    assert_eq!(parse_status(&raw), 413, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(model.requests().len(), 1, "oversized history must not reach inference");
+}
+
+#[test]
+fn buffered_retained_overflow_stops_tool_dispatch_and_persistence() {
+    let model_response = serde_json::json!({
+        "id": "resp_retained_overflow",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_retained_overflow",
+            "call_id": "call_retained_overflow",
+            "name": "weather__get_weather",
+            "arguments": "x".repeat(12_000),
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, model_response.to_string())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("agentic_buffered_retained_overflow");
+    let config = load_retained_budget_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Check the weather.",
+        "store": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "overflow must stop before another inference round"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "overflow must stop before tool execution"
+    );
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_retained_overflow", None);
+    assert_eq!(status, 404, "failed response must not be stored");
+}
+
+#[test]
+fn committed_stream_retained_overflow_emits_one_error_and_is_not_stored() {
+    let response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_stream_retained", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "id": "fc_stream_retained",
+                    "type": "function_call",
+                    "call_id": "call_stream_retained",
+                    "name": "weather__get_weather",
+                    "arguments": "",
+                    "status": "in_progress"
+                },
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.output_item.done",
+            serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "id": "fc_stream_retained",
+                    "type": "function_call",
+                    "call_id": "call_stream_retained",
+                    "name": "weather__get_weather",
+                    "arguments": "{}",
+                    "status": "completed"
+                },
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "output_index": 1,
+                "item": {
+                    "id": "msg_stream_retained",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "x".repeat(6_000)}]
+                },
+                "sequence_number": 3
+            }),
+        ),
+    ];
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("agentic_stream_retained_overflow");
+    let config = load_overflow_fixture_config(free_port(), model_port, db.url());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Trigger the retained overflow.",
+        "stream": true,
+        "store": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+    assert_eq!(event_count(&frames, "response.created"), 1, "{body}");
+    assert_eq!(event_count(&frames, "error"), 1, "{body}");
+    assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert!(!body.contains("[DONE]"), "{body}");
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "overflow must stop the pending tool call"
+    );
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_stream_retained", None);
+    assert_eq!(status, 404, "failed stream must not be stored");
+}
+
+#[test]
+fn store_replay_rows_exhaust_shared_retained_budget() {
+    let mut response = vec![sse_event(
+        "response.created",
+        serde_json::json!({
+            "response": {"id": "resp_store_replay_budget", "object": "response", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    )];
+    for sequence in 1..80 {
+        response.push(sse_event(
+            "response.in_progress",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_store_replay_budget",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                    "metadata": {"padding": "x".repeat(180)}
+                },
+                "sequence_number": sequence
+            }),
+        ));
+    }
+    response.push(sse_event(
+        "response.completed",
+        serde_json::json!({
+            "response": {"id": "resp_store_replay_budget", "object": "response", "status": "completed", "output": []},
+            "sequence_number": 80
+        }),
+    ));
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let db = TempSqlite::new("agentic_store_replay_budget");
+    let config = load_overflow_fixture_config(free_port(), model_port, db.url());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({"model": "gpt-4.1", "input": "Budget replay.", "stream": true, "store": true});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+    assert_eq!(event_count(&frames, "error"), 1, "{body}");
+    assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert!(
+        !body.contains("[DONE]"),
+        "a failed stream must not emit a success sentinel: {body}"
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_store_replay_budget", None);
+    assert_eq!(status, 404, "failed stream must not be stored");
+}
+
+#[test]
+fn rehydrated_stream_rewrite_overflow_emits_error_without_persisting_completion() {
+    let db = TempSqlite::new("agentic_rehydrate_response_budget");
+    let first_response = serde_json::json!({
+        "id": "resp_rehydrate_seed",
+        "object": "response",
+        "created_at": 1_780_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": []
+    });
+    let first_model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let first_config = load_rehydrate_budget_fixture_config(free_port(), first_model.port(), db.url(), 67_108_864);
+    let first_proxy = start_proxy(&first_config);
+    let first_request = serde_json::json!({"model": "gpt-4.1", "input": "Seed history", "store": true});
+    let first = http_send(
+        first_proxy.addr(),
+        &json_post("/v1/responses", &first_request.to_string()),
+    );
+    assert_eq!(parse_status(&first), 200, "{first}");
+    drop(first_proxy);
+    drop(first_model);
+
+    let response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "sequence_number": 0,
+                "response": {"id": "resp_rehydrate_rewrite", "object": "response", "status": "in_progress", "output": []}
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "sequence_number": 1,
+                "response": {
+                    "id": "resp_rehydrate_rewrite", "object": "response", "status": "completed",
+                    "previous_response_id": null,
+                    "output": [{"type": "message", "id": "msg_rehydrate_rewrite", "role": "assistant",
+                        "status": "completed", "content": [{"type": "output_text", "text": "x".repeat(2_000)}]}]
+                }
+            }),
+        ),
+    ];
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let config = load_rehydrate_budget_fixture_config(free_port(), model_port, db.url(), 20_480);
+    let proxy = start_proxy(&config);
+    let next = serde_json::json!({
+        "model": "gpt-4.1", "input": "Continue", "previous_response_id": "resp_rehydrate_seed",
+        "stream": true, "store": true
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+    assert_eq!(event_count(&frames, "error"), 1, "{body}");
+    assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert!(
+        body.contains("during response restoration"),
+        "the outer rehydrate gate should fail: {body}"
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_rehydrate_rewrite", None);
+    assert_eq!(status, 404, "the failed terminal must not be stored");
 }
 
 // -----------------------------------------------------------------------------
@@ -7421,6 +7769,41 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
+fn load_retained_budget_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replace("max_retained_bytes: 67108864", "max_retained_bytes: 4096");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse retained-budget agentic config")
+}
+
+fn load_overflow_fixture_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-overflow-fixture.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read retained overflow fixture");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse retained overflow fixture")
+}
+
+fn load_rehydrate_budget_fixture_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-fixture.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic fixture");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = yaml.replace(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse rehydrate budget fixture")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

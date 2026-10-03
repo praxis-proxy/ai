@@ -14,11 +14,13 @@ use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
-    McpDispatchFilter, McpExecutionOptions, admitted_result_limits, build_error_result, build_success_result,
-    content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
-    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
-    mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
+    McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
+    approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
+    content_blocks_to_output, denial_message_projection_bytes, execute_mcp_calls, execute_single_call,
+    extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry,
+    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments,
+    parse_call_arguments, partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry,
+    result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -27,14 +29,17 @@ use crate::{
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
-                ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
-                bind_owner_context, build_approved_tool_call, build_denial_message, extract_approval_responses,
-                is_approval_response, owner_fingerprint, parse_approval_response, resolve_approval, target_fingerprint,
+                ApprovalError, ApprovalResponseInput, ResolvedApproval, bind_credential_context,
+                bind_forwarded_header_context, bind_owner_context, build_approved_tool_call, build_denial_message,
+                extract_approval_responses, is_approval_response, owner_fingerprint, parse_approval_response,
+                resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
-        openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
-        state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
+        openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch, encode_function_name},
+        state::{
+            DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState, retained_json_bytes,
+        },
     },
     store::{
         PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry,
@@ -564,6 +569,135 @@ fn build_success_result_output_item_format() {
     assert!(
         result.output_item.get("error").is_none(),
         "should not have error field on success"
+    );
+}
+
+#[test]
+fn append_results_rejects_when_incoming_result_staging_exceeds_budget() {
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": "call_1",
+        "arguments": {}
+    });
+    let result = build_success_result("call_1", "weather", "get_weather", "{}", &"x".repeat(4096), false, None);
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call.clone()],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    let staging = result.retained_bytes().unwrap() * 2;
+    state.apply_retained_payload_limit(current + staging - 1);
+
+    assert!(!mcp_result_commit_fits(&state, &[result]));
+    assert_eq!(state.tool_calls, vec![call]);
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution() {
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": "call_1",
+        "arguments": {}
+    });
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    let result_id_bytes = "call_1".len();
+    state.apply_retained_payload_limit(current + result_id_bytes + 4_000);
+    let calls = call_refs(&state.tool_calls);
+
+    let arguments = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+        panic!("weather tool must resolve")
+    };
+    let entry = retained_json_bytes(entry).unwrap();
+    assert_eq!(
+        aggregate_mcp_result_limit(&state, &calls, 8_192),
+        Some(((4_000 - arguments - entry) / 3, true))
+    );
+}
+
+#[test]
+fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
+    let arguments = "x".repeat(4_096);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": "call_1",
+        "arguments": arguments
+    });
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    let argument_staging = retained_json_bytes(&state.tool_calls[0]["arguments"]).unwrap() * 3;
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
+        panic!("weather tool must resolve")
+    };
+    let entry_staging = retained_json_bytes(entry).unwrap();
+    state.apply_retained_payload_limit(current + "call_1".len() + argument_staging + entry_staging - 1);
+    let calls = call_refs(&state.tool_calls);
+
+    assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
+}
+
+#[test]
+fn approval_resume_peak_charges_stored_arguments_before_resolved_clone() {
+    let input = ApprovalResponseInput {
+        approval_id: "approval_1".to_owned(),
+        approve: true,
+        reason: None,
+    };
+    let record = PendingApprovalRecord {
+        approval_id: "approval_1".to_owned(),
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        arguments: "x".repeat(8_192),
+        target_fingerprint: "f".repeat(64),
+    };
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+    let request = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions.insert(state);
+
+    assert!(!approval_resume_peak_fits(&ctx, &[input], &[record], 0,));
+}
+
+#[test]
+fn approval_projection_bounds_constructed_values_with_escaping() {
+    let approval_id = "approval_\n_1";
+    let encoded_name = "weather__lookup";
+    let arguments = r#"{"query":"line\n\"quoted\""}"#;
+    let resolved = ResolvedApproval {
+        approval_id: approval_id.to_owned(),
+        approve: true,
+        reason: None,
+        server_label: "weather".to_owned(),
+        tool_name: "lookup".to_owned(),
+        encoded_name: encoded_name.to_owned(),
+        arguments: arguments.to_owned(),
+    };
+    let approved = build_approved_tool_call(&resolved);
+    assert!(
+        approved_tool_call_projection_bytes(approval_id, encoded_name, arguments).unwrap()
+            >= retained_json_bytes(&approved).unwrap()
+    );
+
+    let reason = "line\n\"quoted\"";
+    let denial = build_denial_message(approval_id, Some(reason));
+    assert!(
+        denial_message_projection_bytes(approval_id, Some(reason)).unwrap() >= retained_json_bytes(&denial).unwrap()
     );
 }
 
@@ -1629,6 +1763,28 @@ fn prepare_response_round_emits_resumable_approval() {
         state.accumulated_output[0]["arguments"], "{\"city\":\"Paris\"}",
         "approval arguments must remain encoded exactly once"
     );
+}
+
+#[test]
+fn prepare_response_round_rejects_approval_before_output_projection() {
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "x".repeat(16_384)
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
+
+    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.pending_approvals.is_empty());
+    assert!(state.accumulated_output.is_empty());
 }
 
 #[test]

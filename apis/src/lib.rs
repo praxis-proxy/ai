@@ -107,6 +107,32 @@ pub(crate) mod test_utils {
         reason = "test context constructor mirrors all context fields"
     )]
     pub(crate) fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
+        make_filter_context_with_subrequest_client(req, Some(&TEST_SUBREQUEST_CLIENT))
+    }
+
+    /// Build a minimal filter context for tests that do not make sub-requests.
+    ///
+    /// Avoids initializing the system-trust connector, which some restricted
+    /// test environments cannot load.
+    #[cfg(feature = "openai-responses")]
+    #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test context constructor mirrors all context fields"
+    )]
+    pub(crate) fn make_filter_context_without_subrequest_client(req: &Request) -> HttpFilterContext<'_> {
+        make_filter_context_with_subrequest_client(req, None)
+    }
+
+    #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test context constructor mirrors all context fields"
+    )]
+    fn make_filter_context_with_subrequest_client<'a>(
+        req: &'a Request,
+        subrequest_client: Option<&'a praxis_core::subrequest::SubRequestClient>,
+    ) -> HttpFilterContext<'a> {
         HttpFilterContext {
             buffered_request_body: None,
             body_done_indices: Vec::new(),
@@ -142,7 +168,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
-            subrequest_client: Some(&TEST_SUBREQUEST_CLIENT),
+            subrequest_client,
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             attempted_endpoints: Vec::new(),
             retry_policy: None,

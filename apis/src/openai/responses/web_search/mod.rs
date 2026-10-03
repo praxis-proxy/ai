@@ -47,7 +47,7 @@ use super::{
     error::responses_error_rejection,
     state::{
         DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
-        current_round_tool_call_admissions,
+        current_round_tool_call_admissions, retained_json_bytes, retained_json_values_bytes,
     },
 };
 use crate::{
@@ -56,6 +56,7 @@ use crate::{
     web_search::{
         CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
         SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+        provider::MAX_SEARCH_RESPONSE_BYTES,
     },
 };
 
@@ -287,6 +288,7 @@ impl WebSearchFilter {
     /// Returns how many queries were dispatched.
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "threads the batch-resolved caller identity into the provider search"
     )]
     async fn execute_single_search(
@@ -302,6 +304,17 @@ impl WebSearchFilter {
         let mut dispatched = 0_usize;
         let mut successful = 0_usize;
         for query in queries.iter().take(query_cap) {
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.retained_payload_failed)
+            {
+                break;
+            }
+            let Some(response_limit) = web_search_response_limit(ctx, query, &results) else {
+                record_web_search_budget_failure(ctx);
+                break;
+            };
             dispatched = dispatched.saturating_add(1);
             // Capture the originating client's attributes and current outbound depth
             // so the callout's outbound chain sees the real caller and the executor
@@ -309,10 +322,21 @@ impl WebSearchFilter {
             let callout = CalloutContext::from_filter_context(ctx);
             match self
                 .search_client
-                .search(&self.outbound, callout, query, Some(context_size), identity)
+                .search_with_response_limit(
+                    &self.outbound,
+                    callout,
+                    query,
+                    Some(context_size),
+                    identity,
+                    response_limit,
+                )
                 .await
             {
                 SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
+                SearchOutcome::RetainedLimitExceeded => {
+                    record_web_search_budget_failure(ctx);
+                    break;
+                },
                 SearchOutcome::Failed => {
                     warn!(
                         call_id = ids.public,
@@ -324,6 +348,13 @@ impl WebSearchFilter {
                 },
             }
             successful = successful.saturating_add(1);
+        }
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_failed)
+        {
+            return dispatched;
         }
         let (status, notice) = status_and_notice(successful, queries.len(), query_cap);
         append_search_turn(ctx, &ids, status, action, &results, notice);
@@ -390,6 +421,10 @@ impl WebSearchFilter {
     /// obtained. Returns whether any call was rejected by the response-wide
     /// ordered admission pass, which forces local completion without another
     /// model round.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "charges each hosted search owner before scheduling the next callout"
+    )]
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         // A missing per-user credential recorded a write-once security failure in
         // `resolve_batch_identity`. The agentic loop consults `security_failure.take()`
@@ -402,6 +437,13 @@ impl WebSearchFilter {
         let mut queries_dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
         for prepared in batch.calls {
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.retained_payload_failed)
+            {
+                break;
+            }
             let rejected = rejected(batch.admissions, prepared.ids.index);
             tool_limit_exceeded |= rejected;
             let query_cap = batch.query_budget.saturating_sub(queries_dispatched);
@@ -521,11 +563,14 @@ impl HttpFilter for WebSearchFilter {
         // still live, then move the web search calls out instead of cloning
         // and then removing them from state.
         let call_budget = remaining_web_search_budget(state);
-        let calls: Vec<Value> = ctx
+        let Some((calls, held_bytes)) = ctx
             .extensions
             .get_mut::<ResponsesState>()
-            .map(|state| mem::take(&mut state.web_search_calls))
-            .unwrap_or_default();
+            .and_then(take_pending_search_calls)
+        else {
+            record_web_search_budget_failure(ctx);
+            return Ok(FilterAction::Continue);
+        };
 
         // Parse each pending action once here; every dispatch branch below
         // reuses the same parse instead of re-reading the raw call.
@@ -556,8 +601,23 @@ impl HttpFilter for WebSearchFilter {
         if tool_limit_exceeded && let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.deferred_tool_limit_completion = true;
         }
+        drop(calls);
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.release_external_payload_bytes(held_bytes);
+        }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Transfer the pending call queue into this filter's local owner and reserve
+/// one additional copy for the parsed action values in `prepare_calls`.
+fn take_pending_search_calls(state: &mut ResponsesState) -> Option<(Vec<Value>, usize)> {
+    let bytes = retained_json_values_bytes(&state.web_search_calls)?;
+    let held = bytes.checked_mul(2)?;
+    if !state.retain_external_payload_bytes(held) || !state.can_retain_payload(0) {
+        return None;
+    }
+    Some((mem::take(&mut state.web_search_calls), held))
 }
 
 /// Return the response fan-out cap this dispatcher published for the owner.
@@ -829,9 +889,17 @@ fn append_search_turn(
     notice: Option<&'static str>,
 ) {
     let include_sources = include_action_sources(ctx);
+    let Some(source_bytes) = web_search_results_bytes(results) else {
+        record_web_search_budget_failure(ctx);
+        return;
+    };
+    if !web_search_construction_fits(ctx, ids, &action, source_bytes) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let bridge = build_tool_result_messages(&ids.bridge, &action, results, notice);
     let output_item = build_output_item(ids.public, status, action, results, include_sources);
-    push_search_turn(ctx, output_item, bridge, ids.index);
+    push_search_turn(ctx, output_item, bridge, ids.index, source_bytes);
 }
 
 /// Append a malformed search turn to [`ResponsesState`].
@@ -842,6 +910,10 @@ fn append_search_turn(
 /// as a successful search with zero results.
 fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     let include_sources = include_action_sources(ctx);
+    if !web_search_construction_fits(ctx, ids, &Value::Null, 0) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let output_item = build_output_item(
         ids.public,
         "incomplete",
@@ -850,7 +922,7 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
         include_sources,
     );
     let bridge = build_incomplete_tool_result_messages(&ids.bridge);
-    push_search_turn(ctx, output_item, bridge, ids.index);
+    push_search_turn(ctx, output_item, bridge, ids.index, 0);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -869,8 +941,50 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// distinct owners of the bridge messages. The public `output_item` is upserted
 /// so the placeholder accumulated during the response phase is replaced in
 /// place, never duplicated.
-fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "stages and commits all owners of one hosted search result"
+)]
+fn push_search_turn(
+    ctx: &mut HttpFilterContext<'_>,
+    output_item: Value,
+    bridge: [Value; 2],
+    index: usize,
+    source_bytes: usize,
+) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        if state.retained_payload_failed {
+            return;
+        }
+        let round_start = state
+            .current_round_output_start
+            .unwrap_or(state.accumulated_output.len());
+        let replaced = state.accumulated_output.get(round_start..).and_then(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+                .nth(index)
+        });
+        let removed = replaced.map_or(Some(0), retained_json_bytes);
+        let bridge_bytes = retained_json_values_bytes(&bridge);
+        let output_bytes = retained_json_bytes(&output_item);
+        let added = output_bytes
+            .zip(bridge_bytes)
+            .and_then(|(output, bridge)| output.checked_add(bridge.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(output_item.get("id").and_then(Value::as_str).map_or(0, str::len)));
+        let staging = output_bytes
+            .zip(bridge_bytes)
+            .and_then(|(output, bridge)| output.checked_add(bridge))
+            .and_then(|bytes| bytes.checked_add(source_bytes));
+        if !removed
+            .zip(added)
+            .zip(staging)
+            .is_some_and(|((removed, added), staging)| state.can_replace_retained_payload(removed, added, staging))
+        {
+            state.discard_payload_for_budget_error();
+            state.dispatch_failure = Some(web_search_budget_failure());
+            return;
+        }
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
@@ -880,11 +994,81 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        let round_start = state
-            .current_round_output_start
-            .unwrap_or(state.accumulated_output.len());
         upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
+        state.mark_replay_stable_payload_changed();
     }
+}
+
+/// Count decoded result strings held while hosted searches are in flight.
+fn web_search_results_bytes(results: &[SearchResult]) -> Option<usize> {
+    results.iter().try_fold(0_usize, |used, result| {
+        used.checked_add(result.title.len())?
+            .checked_add(result.url.len())?
+            .checked_add(result.snippet.len())
+    })
+}
+
+/// Thirty-two owners conservatively cover the raw provider body, decoded
+/// strings, JSON escaping, public output, formatted bridge, and both histories.
+fn web_search_response_limit(
+    ctx: &HttpFilterContext<'_>,
+    query: &str,
+    prior_results: &[SearchResult],
+) -> Option<usize> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Some(MAX_SEARCH_RESPONSE_BYTES);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Some(MAX_SEARCH_RESPONSE_BYTES);
+    };
+    let current = state.retained_payload_bytes_bounded(limit)?;
+    let prior = web_search_results_bytes(prior_results)?.checked_mul(32)?;
+    let request = query.len().checked_mul(8)?.checked_add(4_096)?;
+    let available = limit.checked_sub(current)?.checked_sub(prior)?.checked_sub(request)?;
+    let response_limit = available / 32;
+    (response_limit > 0).then_some(response_limit.min(MAX_SEARCH_RESPONSE_BYTES))
+}
+
+/// Preflight the public output and backend bridge built from a search result.
+fn web_search_construction_fits(
+    ctx: &HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    action: &Value,
+    source_bytes: usize,
+) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    let projection = source_bytes
+        .checked_mul(32)
+        .and_then(|bytes| retained_json_bytes(action)?.checked_mul(8)?.checked_add(bytes))
+        .and_then(|bytes| {
+            ids.public
+                .len()
+                .checked_add(ids.bridge.len())?
+                .checked_mul(8)?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| bytes.checked_add(4_096));
+    projection.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Describe a failed hosted-search result admission.
+fn web_search_budget_failure() -> DispatchFailure {
+    DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending web-search results".to_owned(),
+    }
+}
+
+/// Clear request payload and prevent further dispatch or successful persistence.
+fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+        state.dispatch_failure = Some(web_search_budget_failure());
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
 }
 
 /// Replace one current-round `web_search_call` by model position, or append it.

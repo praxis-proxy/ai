@@ -84,7 +84,7 @@ impl SseFrameParser {
         mut count_frame: impl FnMut(&SseFrame) -> bool,
     ) -> Result<Vec<SseFrame>, SseParseError> {
         if chunk.is_empty() {
-            self.scratch_bytes = self.buffered_bytes();
+            self.scratch_bytes = self.retained_bytes();
             return Ok(Vec::new());
         }
 
@@ -107,7 +107,7 @@ impl SseFrameParser {
                     frames.push(frame);
                 }
                 self.line_buf.clear();
-                self.scratch_bytes = self.buffered_bytes();
+                self.scratch_bytes = self.retained_bytes();
 
                 if b == b'\r' {
                     if let Some(&next) = chunk.get(i + 1) {
@@ -128,7 +128,7 @@ impl SseFrameParser {
             i += 1;
         }
 
-        self.scratch_bytes = self.buffered_bytes();
+        self.scratch_bytes = self.retained_bytes();
         Ok(frames)
     }
 
@@ -144,11 +144,21 @@ impl SseFrameParser {
     }
 
     /// Return the number of bytes currently retained by the parser.
-    fn buffered_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         self.line_buf
             .len()
             .saturating_add(self.data_buf.len())
             .saturating_add(self.event_type.as_ref().map_or(0, String::len))
+    }
+
+    /// Release all partial frame payload after a terminal aggregate failure.
+    pub(crate) fn clear(&mut self) {
+        self.line_buf.clear();
+        self.event_type = None;
+        self.data_buf.clear();
+        self.has_data = false;
+        self.prev_cr = false;
+        self.scratch_bytes = 0;
     }
 
     /// Check whether the current retained byte count exceeds the buffer limit.

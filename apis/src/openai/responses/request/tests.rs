@@ -3,7 +3,13 @@
 
 //! Unit tests for the consolidated Responses create request processor.
 
-#![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
 
 use bytes::Bytes;
 use praxis_filter::{
@@ -14,8 +20,8 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    openai::responses::state::ResponsesState,
-    test_utils::{make_filter_context, make_request},
+    openai::responses::{AgenticBudgetPolicy, state::ResponsesState},
+    test_utils::{make_filter_context, make_filter_context_without_subrequest_client, make_request},
 };
 
 /// Build the filter from YAML, defaulting to an empty mapping.
@@ -124,6 +130,35 @@ async fn a_create_request_publishes_validated_facts_and_state_from_one_parse() {
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state initialized");
     assert!(state.response_id.as_ref().is_some_and(|id| id.starts_with("resp_")));
+}
+
+#[tokio::test]
+async fn create_request_rejects_raw_body_before_state_allocation() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context_without_subrequest_client(&request);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "x".repeat(1_200)})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("state exceeding the retained-payload budget must be rejected");
+    };
+    assert_eq!(rejection.status, 413);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["error"]["message"],
+        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "state that exceeds the request budget must not be published"
+    );
 }
 
 /// Classification once moved `model` out of the parsed value, which a shared

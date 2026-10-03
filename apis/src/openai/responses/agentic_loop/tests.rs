@@ -55,6 +55,22 @@ fn from_config_rejects_zero_max_infer_iters() {
     assert!(result.is_err(), "max_infer_iters=0 should be rejected");
 }
 
+#[test]
+fn from_config_rejects_out_of_range_retained_byte_budgets() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4095").unwrap();
+    let expected = "openai_agentic_loop: max_retained_bytes must be in 4096..=268435456, got 4095";
+
+    let filter_error = super::AgenticLoopFilter::from_config(&yaml)
+        .err()
+        .expect("filter config should reject an out-of-range byte budget");
+    assert!(filter_error.to_string().contains(expected));
+
+    let policy_error = super::AgenticBudgetPolicy::from_config(&yaml)
+        .err()
+        .expect("budget policy should reject an out-of-range byte budget");
+    assert!(policy_error.to_string().contains(expected));
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough Without State
 // -----------------------------------------------------------------------------
@@ -2904,7 +2920,7 @@ fn streamed_provider_conversation_marks_persisted_history() {
         ..ResponsesState::default()
     };
 
-    super::collect_streaming_output_items(&mut state);
+    super::collect_streaming_output_items(&mut state).unwrap();
 
     assert_eq!(
         state.provider_history_len,
@@ -2932,7 +2948,7 @@ fn appends_streamed_provider_compaction_to_replay_state() {
         ..ResponsesState::default()
     };
 
-    super::collect_streaming_output_items(&mut state);
+    super::collect_streaming_output_items(&mut state).unwrap();
 
     assert_eq!(state.messages[1]["type"], "compaction");
     assert_eq!(state.persisted_messages[1]["id"], "cmp_streamed");
@@ -3219,4 +3235,424 @@ fn assert_action(ctx: &praxis_filter::HttpFilterContext<'_>, expected: &str) {
         .expect("filter_results should contain openai_agentic_loop entry");
     let action = results.get("action").expect("should have action key");
     assert_eq!(action, expected, "openai_agentic_loop action mismatch");
+}
+
+#[tokio::test]
+async fn on_request_rejects_oversized_initial_state_with_413() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "x".repeat(2_000)
+    }));
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized starting state must be rejected before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_action(&ctx, "done");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(!state.store_persist_armed);
+    assert!(state.input.is_empty());
+    assert!(state.messages.is_empty());
+    assert!(state.persisted_messages.is_empty());
+    assert!(state.response_object.is_null());
+}
+
+#[tokio::test]
+#[cfg(feature = "store")]
+async fn on_request_charges_response_store_input_snapshot() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.store_request_payload_bytes", "4096");
+    ctx.extensions.insert(ResponsesState::default());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the independently retained store input must be admitted before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_external_payload_bytes, 0);
+    assert_eq!(
+        super::super::store::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "the rejected store snapshot must be released"
+    );
+}
+
+#[tokio::test]
+async fn smallest_loop_retained_limit_wins_for_one_request() {
+    let lower: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 8192").unwrap();
+    let higher: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 16384").unwrap();
+    let lower = super::AgenticLoopFilter::from_config(&lower).unwrap();
+    let higher = super::AgenticLoopFilter::from_config(&higher).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    assert!(matches!(
+        lower.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        higher.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_limit(),
+        Some(8192)
+    );
+}
+
+#[test]
+fn only_one_loop_instance_claims_each_router_response() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    assert!(super::claim_response_round(&mut ctx, Some(0)));
+    assert!(!super::claim_response_round(&mut ctx, Some(0)));
+    assert!(super::claim_response_round(&mut ctx, Some(1)));
+    assert!(!super::claim_response_round(&mut ctx, Some(1)));
+}
+
+#[test]
+fn cumulative_buffered_round_overflow_is_transactional() {
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(4_096);
+    let response = |id: &str, fill: char| {
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "id": id,
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "id": format!("rs_{id}"),
+                    "type": "reasoning",
+                    "summary": fill.to_string().repeat(600)
+                }]
+            }))
+            .unwrap(),
+        )
+    };
+
+    super::extract_tool_calls_from_body(&response("one", 'a'), &mut state).unwrap();
+    assert_eq!(state.accumulated_output.len(), 1);
+    let retained_after_first = state.retained_payload_bytes().unwrap();
+
+    let failure = super::extract_tool_calls_from_body(&response("two", 'b'), &mut state).unwrap_err();
+    assert_eq!(failure.status, 502);
+    assert_eq!(state.accumulated_output.len(), 1, "second round committed nothing");
+    assert_eq!(state.response_object["id"], "one");
+    assert_eq!(state.retained_payload_bytes().unwrap(), retained_after_first);
+}
+
+fn large_completed_tool_search_cases() -> [(Value, usize); 2] {
+    [
+        (
+            json!({
+                "type": "tool_search_call",
+                "id": "tsc_hosted",
+                "status": "completed",
+                "results": "x".repeat(2_048)
+            }),
+            3,
+        ),
+        (
+            json!({
+                "type": "tool_search_call",
+                "id": "tsc_client",
+                "status": "completed",
+                "execution": "client",
+                "results": "x".repeat(2_048)
+            }),
+            2,
+        ),
+    ]
+}
+
+#[test]
+fn buffered_tool_search_preflight_charges_every_retained_copy() {
+    for (item, copies) in large_completed_tool_search_cases() {
+        let response = json!({"object": "response", "output": [item]});
+        let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+        let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+        let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+        let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+        let exact_peak = baseline + response_bytes + copies * item_bytes;
+
+        let mut rejected = ResponsesState::default();
+        rejected.apply_retained_payload_limit(exact_peak - 1);
+        let failure = super::extract_tool_calls_from_body(&body, &mut rejected).unwrap_err();
+        assert_eq!(failure.status, 502);
+        assert!(
+            rejected.response_object.is_null(),
+            "preflight must leave the prior response intact"
+        );
+        assert!(
+            rejected.accumulated_output.is_empty(),
+            "preflight must not commit caller output"
+        );
+        assert!(
+            rejected.tool_search_calls.is_empty(),
+            "preflight must not queue discovery"
+        );
+        assert!(
+            rejected.persisted_messages.is_empty(),
+            "preflight must not persist the item"
+        );
+
+        let mut admitted = ResponsesState::default();
+        admitted.apply_retained_payload_limit(exact_peak);
+        super::extract_tool_calls_from_body(&body, &mut admitted).unwrap();
+        assert!(admitted.retained_payload_bytes().unwrap() <= exact_peak);
+        assert_eq!(admitted.accumulated_output.len(), 1);
+        assert_eq!(admitted.tool_search_calls.len(), copies - 2);
+        assert_eq!(admitted.persisted_messages.len(), 1);
+    }
+}
+
+#[test]
+fn streamed_tool_search_preflight_charges_every_retained_copy() {
+    for (item, copies) in large_completed_tool_search_cases() {
+        let response = json!({"object": "response", "output": [item]});
+        let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+        let output_bytes = super::super::state::retained_json_bytes(&response["output"]).unwrap();
+        let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+        let mut rejected = ResponsesState {
+            response_object: response.clone(),
+            ..ResponsesState::default()
+        };
+        let baseline_without_response = rejected.retained_payload_bytes().unwrap() - response_bytes;
+        let exact_retained = baseline_without_response + response_bytes - output_bytes + 2 + copies * item_bytes;
+        rejected.apply_retained_payload_limit(exact_retained - 1);
+        assert!(!super::streaming_collection_retention_fits(&rejected));
+        let failure = super::collect_streaming_output_items(&mut rejected).unwrap_err();
+        assert_eq!(failure.status, 502);
+        assert!(rejected.retained_payload_failed);
+        assert!(rejected.accumulated_output.is_empty());
+        assert!(rejected.tool_search_calls.is_empty());
+        assert!(rejected.persisted_messages.is_empty());
+
+        let mut admitted = ResponsesState {
+            response_object: response,
+            ..ResponsesState::default()
+        };
+        admitted.apply_retained_payload_limit(exact_retained);
+        super::collect_streaming_output_items(&mut admitted).unwrap();
+        assert_eq!(admitted.retained_payload_bytes().unwrap(), exact_retained);
+        assert_eq!(admitted.accumulated_output.len(), 1);
+        assert_eq!(admitted.tool_search_calls.len(), copies - 2);
+        assert_eq!(admitted.persisted_messages.len(), 1);
+    }
+}
+
+#[test]
+fn compaction_collection_preflights_history_copies_and_provenance_id() {
+    let id = format!("cmp_{}", "x".repeat(4_096));
+    let response = json!({
+        "object": "response",
+        "output": [{"type": "compaction", "id": id, "encrypted_content": "opaque"}]
+    });
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let output_bytes = super::super::state::retained_json_bytes(&response["output"]).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let id_bytes = response["output"][0]["id"].as_str().unwrap().len();
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let buffered_peak = baseline + response_bytes + 3 * item_bytes + id_bytes;
+    let mut buffered = ResponsesState::default();
+    buffered.apply_retained_payload_limit(buffered_peak - 1);
+    assert!(super::extract_tool_calls_from_body(&body, &mut buffered).is_err());
+    assert!(buffered.accumulated_output.is_empty());
+    assert!(buffered.provider_compaction_ids.is_empty());
+
+    let mut streamed = ResponsesState {
+        response_object: response,
+        ..ResponsesState::default()
+    };
+    let streamed_retained = baseline - 4 + response_bytes - output_bytes + 2 + 3 * item_bytes + id_bytes;
+    streamed.apply_retained_payload_limit(streamed_retained - 1);
+    assert!(!super::streaming_collection_retention_fits(&streamed));
+    assert!(streamed.provider_compaction_ids.is_empty());
+    assert_eq!(streamed.response_object["output"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
+    let response = json!({
+        "id": "resp_exact",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_exact",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "retained"}]
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let exact_peak = baseline + response_bytes + item_bytes;
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(exact_peak);
+    super::extract_tool_calls_from_body(&body, &mut state).unwrap();
+
+    assert!(state.retained_payload_bytes().unwrap() <= exact_peak);
+}
+
+#[test]
+fn buffered_usage_projection_rejects_before_copying_large_usage() {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "object": "response",
+            "output": [],
+            "usage": {"detail": "x".repeat(2_000_000)}
+        }))
+        .unwrap(),
+    );
+    let limit = 3_000_000;
+    assert!(body.len() < limit, "the initial parsed response fits");
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(limit);
+
+    let mut rejected = false;
+    let allocation = allocation_counter::measure(|| {
+        rejected = super::extract_tool_calls_from_body(&body, &mut state).is_err();
+    });
+
+    assert!(rejected, "the duplicate usage owner exceeds the budget");
+    assert!(
+        allocation.bytes_max < 3_000_000,
+        "reject before the second large usage allocation: {allocation:?}"
+    );
+    assert!(state.response_object.is_null());
+    assert!(state.usage.is_null());
+}
+
+#[test]
+fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
+    let old_usage = json!({"detail": "a".repeat(1_000_000)});
+    let response = json!({
+        "object": "response",
+        "output": [{"type": "message", "id": "msg_1", "content": "x".repeat(2_000_000)}],
+        "usage": {"detail": "b".repeat(1_500_000)}
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut state = ResponsesState {
+        usage: old_usage,
+        ..ResponsesState::default()
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let old_usage_bytes = super::super::state::retained_json_bytes(&state.usage).unwrap();
+    let incoming_usage_bytes = super::super::state::retained_json_bytes(&response["usage"]).unwrap();
+    let usage_growth = incoming_usage_bytes - old_usage_bytes;
+    let limit = baseline + response_bytes + item_bytes + usage_growth + 64_000;
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(response_bytes + old_usage_bytes + incoming_usage_bytes),
+        "the usage projection alone fits; copied output makes commit unsafe"
+    );
+
+    assert!(super::extract_tool_calls_from_body(&body, &mut state).is_err());
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.response_object.is_null());
+    assert_eq!(state.usage["detail"].as_str().unwrap().len(), 1_000_000);
+}
+
+#[test]
+fn buffered_parse_projection_is_rejected_before_state_mutation() {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "object": "response",
+            "output": [{"type": "message", "content": "x".repeat(8_192)}]
+        }))
+        .unwrap(),
+    );
+    let mut state = ResponsesState::default();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + body.len() - 1);
+
+    let failure = super::extract_tool_calls_from_body(&body, &mut state).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
+fn file_search_argument_normalization_is_reserved_before_allocation() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_large",
+            "arguments": serde_json::json!({"query": "x".repeat(4096)}).to_string()
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut state = ResponsesState {
+        tools: vec![json!({"type": "file_search"})],
+        ..ResponsesState::default()
+    };
+    let retained = state.retained_payload_bytes().unwrap();
+    // The parsed response fits, but its arguments parser/query copy does not.
+    state.apply_retained_payload_limit(retained + body.len());
+
+    let failure = super::extract_tool_calls_from_body(&body, &mut state).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[tokio::test]
+async fn dispatcher_failure_does_not_become_retained_budget_failure() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.accumulated_output.push(json!({
+        "type": "file_search_call",
+        "id": "fs_executed",
+        "status": "completed",
+        "results": []
+    }));
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+
+    let failure = DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "MCP call validation failed".to_owned(),
+    };
+    let action = super::finish_response_failure(&mut ctx, state, &failure, false).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.retained_payload_failed);
+    assert_eq!(
+        state.pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Private)],
+        "unrelated dispatcher failures must preserve already-executed tool synthesis"
+    );
 }

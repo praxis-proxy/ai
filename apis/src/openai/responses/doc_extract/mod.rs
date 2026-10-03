@@ -299,6 +299,7 @@ fn sync_state_after_rewrite(
     };
 
     state.request_body = resolved_body;
+    state.mark_replay_stable_payload_changed();
 
     let input_len = state.input.len();
     let ResponsesState {

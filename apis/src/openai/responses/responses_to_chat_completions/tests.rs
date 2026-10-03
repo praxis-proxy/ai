@@ -18,6 +18,119 @@ use crate::openai::{
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
 
+fn wide_stream_limits() -> super::stream::StreamLimits {
+    super::stream::StreamLimits {
+        max_sse_buffer_bytes: 1 << 20,
+        max_stream_events: 10_000,
+        max_tool_call_argument_bytes: 1 << 20,
+        max_tool_calls: 128,
+        stream_timeout_secs: 0,
+        max_body_bytes: 1 << 24,
+        max_stream_frames: 10_000,
+        max_emitted_sse_frame_bytes: 1 << 24,
+    }
+}
+
+#[test]
+fn first_stream_callback_reserves_both_request_echo_lifecycle_frames() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1", "stream": true, "input": "hi", "instructions": "x".repeat(100_000)
+    }));
+    state.apply_retained_payload_limit(600_000);
+    let mut converter = super::stream::StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
+    converter.set_echo_projection(&state.request_body, &state.tools, None);
+    context.extensions.insert(state);
+    assert!(
+        !super::converter_construction_fits(&context, &mut converter, 100),
+        "two lifecycle frames and their cloned echo resources exceed this ceiling"
+    );
+}
+
+#[test]
+fn later_stream_round_reserves_original_tool_choice_echo() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1", "stream": true, "input": "hi", "tool_choice": "auto"
+    }));
+    state.original_tool_choice = Some(json!({"type": "function", "name": "x".repeat(100_000)}));
+    state.apply_retained_payload_limit(600_000);
+    let mut converter = super::stream::StreamConverter::new("resp_echo".to_owned(), 1, wide_stream_limits());
+    converter.set_echo_projection(&state.request_body, &state.tools, state.original_tool_choice.as_ref());
+    context.extensions.insert(state);
+    assert!(
+        !super::converter_construction_fits(&context, &mut converter, 100),
+        "the preserved client tool choice is cloned into each lifecycle resource"
+    );
+}
+
+#[test]
+fn batched_tool_deltas_stop_before_repeated_ids_fill_the_wire_buffer() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    state.apply_retained_payload_limit(8 * 1024 * 1024);
+    let mut converter = super::stream::StreamConverter::new("resp_batched".to_owned(), 1, wide_stream_limits());
+    converter.set_echo_projection(&state.request_body, &state.tools, None);
+    context.extensions.insert(state);
+    let initial = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chat_batched", "model": "m", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "i".repeat(32_768), "type": "function",
+                "function": {"name": "f", "arguments": "{"}
+            }]}}]
+        })
+    );
+    assert!(super::converter_construction_fits(
+        &context,
+        &mut converter,
+        initial.len()
+    ));
+    let mut out = Vec::new();
+    {
+        let state = context.extensions.get::<ResponsesState>().unwrap();
+        let inputs = super::SnapshotInputs {
+            request_body: &state.request_body,
+            tools: &state.tools,
+            original_tool_choice: None,
+            now: 1,
+        };
+        converter.push_into(initial.as_bytes(), &inputs, &mut out).unwrap();
+    }
+    assert!(!converter.callback_budget_failed());
+    context
+        .extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .retained_chat_converter_bytes = converter.retained_payload_bytes().unwrap();
+    let delta = format!(
+        "data: {}\n\n",
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": "x"}
+        }]}}]})
+    );
+    let batch = delta.repeat(512);
+    assert!(
+        super::converter_construction_fits(&context, &mut converter, batch.len()),
+        "the aggregate preflight alone cannot see the repeated ID wire expansion"
+    );
+    out.clear();
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    let inputs = super::SnapshotInputs {
+        request_body: &state.request_body,
+        tools: &state.tools,
+        original_tool_choice: None,
+        now: 1,
+    };
+    converter.push_into(batch.as_bytes(), &inputs, &mut out).unwrap();
+    assert!(converter.callback_budget_failed());
+    assert!(out.is_empty(), "the offending callback must not expose partial deltas");
+}
+
 #[test]
 fn default_config_parses() {
     let yaml = serde_yaml::from_str("{}").unwrap();

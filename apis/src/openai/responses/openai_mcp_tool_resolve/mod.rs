@@ -2414,6 +2414,7 @@ fn write_state(
             state.tool_choice = tc.clone();
         }
         state.request_body = parsed;
+        state.mark_replay_stable_payload_changed();
     } else {
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;

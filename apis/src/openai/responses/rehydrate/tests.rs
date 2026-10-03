@@ -51,6 +51,22 @@ fn declares_dual_phase_body_access() {
     assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
+#[test]
+fn rehydrated_state_keeps_store_input_charge_without_agentic_policy() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("responses.store_request_payload_bytes", "123");
+    install_rehydrated_state(&mut ctx, ResponsesState::default()).expect("rehydration should install state");
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        123,
+        "the store input remains owned after rehydration replaces ResponsesState",
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Bypass
 // -----------------------------------------------------------------------------
@@ -1757,6 +1773,45 @@ async fn restores_previous_response_id_into_response_body() {
 }
 
 #[tokio::test]
+async fn finite_restore_rejects_before_copying_a_near_limit_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let body_bytes = serde_json::to_vec(&json!({
+        "id": "resp_new",
+        "object": "response",
+        "previous_response_id": null,
+        "output": [{"type": "message", "content": "x".repeat(32_000)}],
+    }))
+    .unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + body_bytes.len() * 2);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 502),
+        other => panic!("expected response-side budget rejection, got {other:?}"),
+    }
+    assert_eq!(
+        body.as_deref(),
+        Some(body_bytes.as_slice()),
+        "the rejected body was not rewritten"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn does_not_restore_without_rehydration() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1963,6 +2018,233 @@ async fn restores_for_streaming_response() {
 }
 
 #[tokio::test]
+async fn streaming_restore_emits_one_error_before_near_limit_frame_rewrite() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.request_body["stream"] = json!(true);
+    state.messages.push(json!("h".repeat(32_000)));
+    let frame = format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {"id": "resp_new", "object": "response", "previous_response_id": null,
+                "output": [{"type": "message", "content": "x".repeat(32_000)}]},
+        })
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + frame.len() * 2);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::from(frame));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = body.expect("one terminal error should replace the frame");
+    let frames = parse_sse_frames(&error);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+
+    let mut later = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut later, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(later.is_none(), "no later completed frame may escape after the error");
+}
+
+#[tokio::test]
+async fn buffered_rewrite_reserves_later_plain_frame_output_growth() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let head = format!(
+        "event: response.created\ndata: {}\n",
+        json!({"type": "response.created", "response": {"id": "resp_new", "object": "response"}})
+    );
+    let plain =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
+    let tail = format!("\n{}", plain.repeat(100));
+    let buffered_len = head.len() + tail.len();
+
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + buffered_len * 3);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut body = Some(Bytes::copy_from_slice(head.as_bytes()));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+    let mut body = Some(Bytes::from(tail));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let error = body.expect("the pending-frame output growth must be rejected");
+    let frames = parse_sse_frames(&error);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].event_type.as_deref(), Some("error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn streaming_restore_forwards_plain_delta_with_no_rewrite_headroom() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 16);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let input = Bytes::from_static(
+        b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"line\\nmore\"}\n\n",
+    );
+    let mut body = Some(input.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(input), "a delta needs no restoration copy");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+}
+
+#[test]
+fn response_key_probe_skips_comments_and_preserves_escaped_keys() {
+    assert!(!frame_may_have_response_key(b": {\"response\":{}}\n\n"));
+    assert!(!frame_may_have_response_key(
+        b"event: response.output_text.delta\ndata: {\"delta\":\"line\\nmore\"}\n\n"
+    ));
+    assert!(frame_may_have_response_key(
+        b"data: {\"response\"\ndata: :{\"object\":\"response\"}}\n\n"
+    ));
+    assert!(frame_may_have_response_key(
+        b"data: {\"\\u0072esponse\":{\"object\":\"response\"}}\n\n"
+    ));
+    assert!(!frame_may_have_response_key(
+        b"data: {\"type\":\"response.output_item.done\",\"item\":{\"response\":{}}}\n\n"
+    ));
+    assert!(!frame_may_have_response_key(
+        b"data: {\"ty\\u0070e\":\"response.output_item.done\"}\n\n"
+    ));
+}
+
+#[tokio::test]
+async fn streaming_restore_forwards_nested_response_with_no_rewrite_headroom() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 16);
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let input = Bytes::from_static(
+        b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"response\":{\"id\":\"nested\"}}}\n\n",
+    );
+    let mut body = Some(input.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(input));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+
+    let escaped_key = Bytes::from_static(
+        b"event: response.output_item.done\ndata: {\"ty\\u0070e\":\"response.output_item.done\"}\n\n",
+    );
+    let mut body = Some(escaped_key.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(escaped_key));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), None);
+}
+
+#[test]
+fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
+    let mut state = rehydrated_state("resp_prev");
+    state.messages.push(json!("h".repeat(32_000)));
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + 128);
+    let mut stable_budget = None;
+    assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+    let cached = stable_budget.unwrap();
+
+    // Dispatch can append history after a round has already advanced. The
+    // cache must refresh even when the logical iteration did not change.
+    state.messages.push(json!("new".repeat(80)));
+    assert!(!cached.matches(&state));
+    assert!(!streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
+
+    state.messages.pop();
+    state.retained_stream_parser_bytes = 80;
+    state.accumulated_output.push(json!("o".repeat(80)));
+    assert!(cached.matches(&state));
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "the changing meter must include parser bytes and canonical output"
+    );
+
+    state.retained_stream_parser_bytes = 0;
+    state.accumulated_output.clear();
+    state.messages[0] = json!("h".repeat(33_000));
+    state.mark_replay_stable_payload_changed();
+    assert!(!cached.matches(&state));
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "an in-place history replacement must invalidate the cached charge"
+    );
+
+    state.messages[0] = json!("h".repeat(32_000));
+    state.replay_stable_payload_revision = None;
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "an exhausted revision must fail closed"
+    );
+}
+
+#[tokio::test]
 async fn restores_streaming_across_chunk_boundary() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1970,7 +2252,10 @@ async fn restores_streaming_across_chunk_boundary() {
 
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    let mut state = rehydrated_state("resp_prev");
+    state.apply_retained_payload_limit(1_000_000);
+    let baseline = state.retained_payload_bytes().unwrap();
+    ctx.extensions.insert(state);
     ctx.response_header = Some(&mut response);
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "on_response should continue");
@@ -1996,6 +2281,9 @@ async fn restores_streaming_across_chunk_boundary() {
         body.is_none(),
         "an incomplete frame must not emit partial bytes (they stay buffered)"
     );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_rehydrate_stream_bytes, head.len());
+    assert_eq!(state.retained_payload_bytes(), Some(baseline + head.len()));
 
     let mut body = Some(Bytes::from_static(tail.as_bytes()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -2006,6 +2294,13 @@ async fn restores_streaming_across_chunk_boundary() {
     if let Some(chunk) = &body {
         assembled.extend_from_slice(chunk);
     }
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_rehydrate_stream_bytes,
+        0
+    );
 
     let frames = parse_sse_frames(&assembled);
     assert_eq!(frames.len(), 1, "the frame split across chunks should complete once");
@@ -3053,6 +3348,7 @@ fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousRespon
         scan_at_line_start: true,
         max_buffer_bytes,
         previous_response_id: prev_id.to_owned(),
+        stable_budget: None,
     }
 }
 
@@ -3644,6 +3940,15 @@ impl ResponseStore for MockStore {
     ) -> Result<EventLogStatus, StoreError> {
         // Rehydration never inspects the event log; this stub satisfies the trait.
         Ok(EventLogStatus::default())
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(0)
     }
 
     async fn get_conversation(

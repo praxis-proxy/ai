@@ -419,6 +419,115 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_before_state_creator_transfers_snapshot_into_shared_budget() {
+    use crate::openai::responses::{AgenticBudgetPolicy, OpenaiResponsesRequestFilter, OpenaiResponsesValidateFilter};
+
+    let policy: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    for creator in [
+        OpenaiResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap(),
+        OpenaiResponsesRequestFilter::from_config(&serde_yaml::Value::Null).unwrap(),
+    ] {
+        let store = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        install_store(&mut ctx).await;
+        ctx.extensions
+            .insert(AgenticBudgetPolicy::from_config(&policy).unwrap());
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+        assert!(matches!(
+            store.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(ctx.extensions.get::<ResponsesState>().is_none());
+        let snapshot_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+        assert!(snapshot_bytes > 0);
+
+        let action = creator.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(!matches!(action, FilterAction::Reject(_)));
+        let responses = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .expect("later filter created state");
+        assert_eq!(responses.retained_external_payload_bytes, snapshot_bytes);
+        assert!(
+            responses.store_persist_armed,
+            "late state must inherit store approval arming"
+        );
+        assert!(responses.can_retain_payload(0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_before_state_creator_rejects_oversized_snapshot_before_parse() {
+    use crate::openai::responses::AgenticBudgetPolicy;
+
+    let store = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "x".repeat(600)})).unwrap(),
+    ));
+
+    let action = store.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(super::filter::retained_request_payload_bytes(&ctx), Some(0));
+    assert!(!super::filter::request_persistence_armed(&ctx));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_store_before_request_creator_preserves_budget_and_approval_arming() {
+    use crate::openai::responses::AgenticBudgetPolicy;
+
+    let (db_url, db_path) = temp_sqlite_url("pipeline_store_before_request_creator");
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
+        r#"
+- filter: openai_responses_format
+- filter: openai_response_store
+  backend: sqlite
+  database_url: "{db_url}"
+  responses_table: test_responses
+  conversations_table: test_conversations
+- filter: openai_responses_request
+"#
+    ))
+    .unwrap();
+    let mut registry = crate::test_utils::make_ai_registry();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_responses_request" => crate::openai::responses::OpenaiResponsesRequestFilter::from_config
+    );
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+    let action = pipeline
+        .execute_http_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(!matches!(action, FilterAction::Reject(_)));
+    let snapshot_bytes = super::filter::retained_request_payload_bytes(&ctx).unwrap();
+    let responses = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("request filter created state");
+    assert_eq!(responses.retained_external_payload_bytes, snapshot_bytes);
+    assert!(responses.store_persist_armed);
+    drop(ctx);
+    drop(std::fs::remove_file(db_path));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_request_body_does_not_arm_persistence_when_store_false() {
     // store=false will not persist, so persistence must not be armed. mcp_dispatch
     // rejects such an approval with a client-facing 400 before this point, but the
@@ -767,6 +876,132 @@ async fn on_response_body_releases_when_skip_persist_is_true() {
     assert!(
         matches!(action, FilterAction::Release),
         "should release when skip_persist is true"
+    );
+}
+
+#[test]
+fn retained_request_payload_counts_store_input_snapshot() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "retained by store"}]);
+    ctx.set_metadata(
+        "responses.store_request_payload_bytes",
+        crate::openai::responses::state::retained_json_bytes(&input)
+            .unwrap()
+            .to_string(),
+    );
+
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        crate::openai::responses::state::retained_json_bytes(&input),
+        "the retained request charge must match the store input snapshot size"
+    );
+}
+
+#[test]
+fn discarded_store_snapshot_releases_its_aggregate_charge() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "retained by store"}]);
+    let bytes = crate::openai::responses::state::retained_json_bytes(&input).unwrap();
+    ctx.set_metadata("responses.store_request_payload_bytes", bytes.to_string());
+    let mut state = ResponsesState::default();
+    state.set_retained_external_payload_bytes(bytes);
+    ctx.extensions.insert(state);
+
+    super::filter::discard_retained_request_payload(&mut ctx);
+
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "discarding the store snapshot must release its request payload charge"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        0,
+        "discarding the store snapshot must release its external payload charge"
+    );
+}
+
+#[test]
+fn failed_stream_releases_store_snapshot_at_end_of_stream() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let snapshot_bytes = 512;
+    ctx.set_metadata("responses.store_request_payload_bytes", snapshot_bytes.to_string());
+    ctx.set_metadata("responses.skip_persist", "true");
+    let mut state = ResponsesState::default();
+    state.set_retained_external_payload_bytes(snapshot_bytes);
+    state.fail_retained_payload_budget();
+    ctx.extensions.insert(state);
+    let mut body = None;
+
+    let chunk_action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        matches!(chunk_action, FilterAction::Release),
+        "a failed retained budget must release the response chunk"
+    );
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(snapshot_bytes),
+        "the store snapshot charge remains retained until end of stream"
+    );
+
+    let eos_action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(eos_action, FilterAction::Release),
+        "a failed retained budget must release the end-of-stream action"
+    );
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "end of stream must release the aggregate store snapshot charge"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        0,
+        "end of stream must release the external store snapshot charge"
+    );
+}
+
+#[test]
+fn persistence_construction_is_rejected_before_payload_clones() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "request input"}]);
+    let input_bytes = crate::openai::responses::state::retained_json_bytes(&input).unwrap();
+    ctx.set_metadata("responses.store_request_payload_bytes", input_bytes.to_string());
+    let mut state = ResponsesState {
+        response_object: json!({
+            "id": "resp_budget",
+            "created_at": 1,
+            "model": "test",
+            "output": [{"type": "message", "content": "x".repeat(1_024)}],
+        }),
+        persisted_messages: vec![json!({"role": "assistant", "content": "x".repeat(1_024)})],
+        ..ResponsesState::default()
+    };
+    state.set_retained_external_payload_bytes(input_bytes);
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current);
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
+    ctx.extensions.insert(state);
+
+    assert!(
+        !super::filter::persistence_construction_fits(&ctx, response_bytes),
+        "persistence construction must be rejected when its retained bytes exceed the budget"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.retained_payload_failed,
+        "preflight must not mutate canonical state"
     );
 }
 

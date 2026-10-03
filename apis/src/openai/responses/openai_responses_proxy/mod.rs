@@ -550,10 +550,6 @@ fn scan_json_value(body: &[u8], start: usize) -> Result<usize, &'static str> {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "request and selected-upstream body phases share one filter implementation"
-)]
 #[async_trait]
 impl HttpFilter for ResponsesProxyFilter {
     fn name(&self) -> &'static str {
@@ -615,12 +611,40 @@ impl HttpFilter for ResponsesProxyFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "selected-upstream body processing now admits deferred first-turn MCP dispatch"
+    )]
+    #[cfg_attr(
+        feature = "openai-mcp-tools",
+        expect(
+            clippy::large_stack_frames,
+            reason = "deferred MCP dispatch expands this async frame"
+        )
+    )]
     async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
         let preserve_native_compaction = selected_backend_uses_native_responses(ctx);
+
+        #[cfg(feature = "openai-mcp-tools")]
+        if super::mcp_dispatch::initial_dispatch_is_deferred(ctx) {
+            match super::mcp_dispatch::dispatch_after_budget_admission(ctx, body).await? {
+                FilterAction::Continue => {},
+                FilterAction::Reject(rejection) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                _ => return Err("openai_responses_proxy: invalid deferred dispatch outcome".into()),
+            }
+        }
+        if super::agentic_loop::request_finish_is_deferred(ctx) {
+            match super::agentic_loop::finish_request_after_deferred_dispatch(ctx)? {
+                FilterAction::Continue => {},
+                FilterAction::Reject(rejection) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                _ => return Err("openai_responses_proxy: invalid deferred loop outcome".into()),
+            }
+        }
+
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
             if let Some(rejection) = enforce_agentic_stream_guard(ctx) {

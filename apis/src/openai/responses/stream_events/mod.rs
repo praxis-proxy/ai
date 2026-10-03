@@ -23,6 +23,7 @@ mod local_tools;
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -48,11 +49,15 @@ use crate::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
-            state::{EmittedItem, ResponsesState},
+            state::{EmittedItem, ResponsesState, retained_json_bytes, retained_json_values_bytes},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
 };
+
+/// Client-visible terminal message for an exhausted agentic payload budget.
+pub(crate) const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
 
 /// A per-turn terminal event held until the agentic transition is known.
 struct DeferredTerminalEvent {
@@ -60,6 +65,14 @@ struct DeferredTerminalEvent {
     event_type: String,
     /// Parsed event payload.
     payload: Value,
+}
+
+impl DeferredTerminalEvent {
+    /// Payload bytes retained while the loop owner decides whether this round
+    /// is terminal.
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        self.event_type.len().checked_add(retained_json_bytes(&self.payload)?)
+    }
 }
 
 /// Completion state observed while parsing a Responses SSE stream.
@@ -136,6 +149,59 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
+    /// Request and history charge cached across ordinary upstream chunks.
+    /// Refreshed at EOS after the agentic owner may append round output.
+    shared_stable_bytes: OnceLock<usize>,
+}
+
+impl StreamEventsState {
+    /// Raw parser, argument, deferred-terminal, and local suppression payload
+    /// retained outside [`ResponsesState`].
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        let argument_bytes = self.tool_call_args.iter().try_fold(0_usize, |used, (key, value)| {
+            used.checked_add(key.len())?.checked_add(value.len())
+        })?;
+        let rejected_bytes = self
+            .rejected_tool_call_args
+            .iter()
+            .try_fold(0_usize, |used, key| used.checked_add(key.len()))?;
+        let local_key_bytes = self
+            .local_tool_items
+            .keys()
+            .try_fold(0_usize, |used, key| used.checked_add(key.len()))?;
+        let client_tool_bytes = self.client_tool_items.iter().try_fold(0_usize, |used, item| {
+            used.checked_add(item.key.len())?
+                .checked_add(item.private_name.len())?
+                .checked_add(item.item_id.as_ref().map_or(0, String::len))
+        })?;
+        self.frame_parser
+            .retained_bytes()
+            .checked_add(argument_bytes)?
+            .checked_add(rejected_bytes)?
+            .checked_add(local_key_bytes)?
+            .checked_add(client_tool_bytes)?
+            .checked_add(
+                self.deferred_terminal
+                    .as_ref()
+                    .map_or(Some(0), DeferredTerminalEvent::retained_payload_bytes)?,
+            )
+    }
+}
+
+/// Publish this filter's local owner in request-shared state. The agentic-loop
+/// filter has a different filter ID and cannot read our local state directly.
+fn publish_stream_payload(ctx: &mut HttpFilterContext<'_>, state: &StreamEventsState) -> bool {
+    let Some(bytes) = state.retained_payload_bytes() else {
+        return false;
+    };
+    if !stream_payload_fits(ctx, state, 0) {
+        return false;
+    }
+    let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return true;
+    };
+    responses.retained_stream_parser_bytes = bytes;
+    true
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -228,6 +294,7 @@ impl OpenaiStreamEventsFilter {
             local_tool_items: std::collections::HashMap::new(),
             client_tool_items: Vec::new(),
             stream_failed: false,
+            shared_stable_bytes: OnceLock::new(),
         }
     }
 
@@ -249,6 +316,11 @@ impl OpenaiStreamEventsFilter {
             }
             (state.iteration, output_index_offset)
         });
+        // Re-arming drops the preceding round's parser owner. Publish the new
+        // empty owner before the loop filter's request-side admission runs.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.retained_stream_parser_bytes = 0;
+        }
         ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
@@ -485,7 +557,15 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        process_chunk(ctx, body);
+        // The store can discover an aggregate overflow after this filter has
+        // emitted an earlier chunk. Suppress every later provider frame and
+        // its finalizer so only the store's in-band error reaches the client.
+        if ctx.get_metadata("responses.store_stream_budget_failed") == Some("true") {
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
+
+        process_chunk(ctx, body, end_of_stream);
 
         if end_of_stream {
             record_idle_transport_timeout(ctx);
@@ -564,7 +644,7 @@ fn publish_idle_timeout_if_incomplete(ctx: &mut HttpFilterContext<'_>) {
 }
 
 /// Parse SSE frames, accumulating state and optionally normalizing output.
-fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
     let Some(bytes) = body.as_ref() else {
         return;
     };
@@ -572,6 +652,23 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
+
+    if end_of_stream {
+        // The agentic-loop callback can append streamed output to history
+        // immediately before this EOS callback. Re-measure that changed
+        // baseline before admitting even the final provider chunk.
+        state.shared_stable_bytes = OnceLock::new();
+    }
+
+    // Aggregate overflow is terminal for the logical stream. Suppress every
+    // later upstream frame without reparsing it so the first bounded budget
+    // error remains authoritative and cannot be overwritten by an
+    // event-after-terminal parse error.
+    if ctx.get_metadata("responses.stream_error_message") == Some(RETAINED_PAYLOAD_OVERFLOW_MESSAGE) {
+        *body = None;
+        ctx.insert_filter_state(state);
+        return;
+    }
 
     let now = Instant::now();
     state.started_at.get_or_insert(now);
@@ -585,6 +682,11 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
         state.stream_failed = true;
     }
     handle_parse_result(ctx, body, &state, parsed);
+
+    if !publish_stream_payload(ctx, &state) {
+        *body = None;
+        record_retained_payload_overflow(ctx, &mut state);
+    }
 
     if let Some(deadline) = stream_deadline_at(&state) {
         recap_stream_deadline(ctx, deadline);
@@ -650,6 +752,10 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
 }
 
 /// Parse frames from raw bytes and accumulate events.
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional parser, construction, and emission accounting"
+)]
 fn parse_and_accumulate(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -674,6 +780,25 @@ fn parse_and_accumulate(
     if let Some(error) = accumulation_budget_exceeded(state, ctx) {
         return Err(error);
     }
+    // Parsing changes only the stream-local buffers and a numeric accumulation
+    // counter in ResponsesState. Reuse one shared JSON measurement for every
+    // pre-commit admission in this chunk; measure again after commit mutates
+    // the shared response tree.
+    let shared_budget = shared_retained_budget(ctx, state);
+    // The incoming chunk is framework-owned, but parsing can temporarily own
+    // both the current line and the copied data/event field before the line is
+    // cleared. An invalid UTF-8 event field can expand each input byte to the
+    // three-byte replacement character, so four times the chunk length bounds
+    // the line plus its decoded field. Existing parser scratch is already
+    // included by `stream_payload_fits`.
+    let Some(parser_projection_bytes) = bytes.len().checked_mul(4) else {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    };
+    if !stream_payload_fits_with_budget(state, parser_projection_bytes, shared_budget) {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
 
     let frames = state.frame_parser.parse_chunk_with_counted_event_limit(
         bytes,
@@ -682,19 +807,373 @@ fn parse_and_accumulate(
         |frame| frame.data != b"[DONE]",
     )?;
 
+    let frame_payload_bytes = retained_frame_payload_bytes(&frames);
+    let event_construction_bytes =
+        frames
+            .iter()
+            .filter(|frame| frame.data != b"[DONE]")
+            .try_fold(0_usize, |used, frame| {
+                used.checked_add(frame.data.len())
+                    .and_then(|used| used.checked_add(frame.event_type.as_ref().map_or(0, String::len)))
+            });
+    // `frames` stays live while `ResponsesEvent` owns newly parsed JSON values.
+    // The incoming chunk is framework-owned and separately bounded, so reserve
+    // only the parser products before constructing the event vector.
+    let parse_staging_bytes = frame_payload_bytes
+        .zip(event_construction_bytes)
+        .and_then(|(frames, events)| frames.checked_add(events));
+    if !parse_staging_bytes.is_some_and(|bytes| stream_payload_fits_with_budget(state, bytes, shared_budget)) {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
+
     // Parse and validate every frame before mutating shared state or emitting a
     // byte, then commit accumulation and emission only once the whole chunk
     // parses. A malformed frame aborts the chunk atomically, so no local-tool
     // milestone is recorded for bytes that never reach the client and EOS
     // recovery still re-synthesizes the executed tool items (#276 finding 3).
     let events = parse_chunk_events(state, ctx, &frames, now)?;
-    // Commit accumulates the retained output, enforces the item-count budget
-    // against it, and only then records delivery milestones and emits bytes — so a
-    // count overflow fails the chunk closed before any milestone is committed (see
-    // [`commit_chunk_events`]).
+    let construction_bytes = frame_payload_bytes.and_then(|frame_bytes| {
+        events.iter().try_fold(frame_bytes, |used, event| {
+            used.checked_add(retained_event_payload_bytes(event)?)
+        })
+    });
+    if !construction_bytes.is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget)) {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
+    let Some(logical_output_upper_bound) = logical_output_upper_bound(ctx, &events) else {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    };
+    let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
+    if !construction_bytes
+        .and_then(|staging| staging.checked_add(projected_state_clone_bytes?))
+        .and_then(|staging| staging.checked_add(logical_output_upper_bound.checked_mul(2)?))
+        .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
+    {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
+    // The existing two-phase commit enforces the stream's own item and byte caps
+    // before it records any client-visible lifecycle milestones.
     let logical_output = commit_chunk_events(state, ctx, events)?;
+    let output_staging_bytes = frame_payload_bytes.and_then(|frames| frames.checked_add(logical_output.len()));
+    if !output_staging_bytes.is_some_and(|staging| stream_payload_fits(ctx, state, staging)) {
+        record_retained_payload_overflow(ctx, state);
+        return Ok(None);
+    }
 
     Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
+}
+
+/// Count the independently owned payloads in the completed frame collection.
+fn retained_frame_payload_bytes(frames: &[SseFrame]) -> Option<usize> {
+    frames.iter().try_fold(0_usize, |used, frame| {
+        used.checked_add(frame.event_type.as_ref().map_or(0, String::len))?
+            .checked_add(frame.data.len())
+    })
+}
+
+/// Count one parsed event's independently owned payloads.
+fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
+    let payload_bytes = retained_json_bytes(event.payload())?;
+    match event {
+        // Unknown events retain a second owned copy of their discriminator;
+        // known variants use the static match arm returned by `event_type()`.
+        ResponsesEvent::Unknown { event_type, .. } => payload_bytes.checked_add(event_type.len()),
+        _ => Some(payload_bytes),
+    }
+}
+
+/// Count payloads that accumulation may clone into [`ResponsesState`] while
+/// the parsed event vector is still live.
+///
+/// This is intentionally an upper bound: replacement writes may release the
+/// previous state owner during commit, but charging the projected owner keeps
+/// the preflight transactional at the allocation peak. Function-call completion
+/// includes the event and its matched output item because the accumulator may
+/// clone the completed item into `tool_calls` while retaining the event.
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive per-event transactional projection accounting"
+)]
+fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
+    let state = ctx.extensions.get::<ResponsesState>();
+    events.iter().try_fold(0_usize, |used, event| {
+        let event_bytes = retained_event_payload_bytes(event)?;
+        let additional = match event {
+            ResponsesEvent::ResponseCompleted(payload)
+            | ResponsesEvent::ResponseIncomplete(payload)
+            | ResponsesEvent::ResponseFailed(payload) => {
+                let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
+                let usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
+                // Terminal accumulation retains the response, clones completed
+                // calls out of its output, merges a distinct usage owner, and
+                // may insert that merged usage back into the response. Three
+                // response projections plus the prior usage size bound all of
+                // those simultaneous owners before the event is consumed.
+                response_bytes.checked_mul(3)?.checked_add(usage_bytes)?
+            },
+            ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
+                let item_bytes = payload.get("item").map_or(Some(0), retained_json_bytes)?;
+                // Besides the canonical output item, logical-stream
+                // reconciliation can retain item ids, local-tool keys, and a
+                // normalized payload while the parsed event is still live.
+                item_bytes.checked_add(event_bytes.checked_mul(2)?)?
+            },
+            ResponsesEvent::FunctionCallArgumentsDelta(payload) => {
+                let key_bytes = projected_tool_call_key_bytes(payload)?;
+                let delta_bytes = payload.get("delta").and_then(Value::as_str).map_or(0, str::len);
+                key_bytes.checked_add(delta_bytes)?.checked_add(event_bytes)?
+            },
+            ResponsesEvent::FunctionCallArgumentsDone(payload) => {
+                let matched_item = state.and_then(|state| {
+                    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str) {
+                        state
+                            .output_items()
+                            .iter()
+                            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
+                    } else {
+                        payload
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .and_then(|index| usize::try_from(index).ok())
+                            .and_then(|index| state.output_items().get(index))
+                    }
+                });
+                // Completion may own an extracted argument string, grow the
+                // canonical item, and clone that completed item into
+                // `tool_calls` before the event is consumed.
+                event_bytes
+                    .checked_mul(3)?
+                    .checked_add(matched_item.map_or(Some(0), retained_json_bytes)?)?
+            },
+            // Other events can still acquire logical-stream bookkeeping keys
+            // or grow their normalized payload before serialization.
+            _ => event_bytes,
+        };
+        used.checked_add(additional)
+    })
+}
+
+/// Bound the owned key created while accumulating a function-call argument
+/// delta, without allocating the formatted key.
+fn projected_tool_call_key_bytes(payload: &Value) -> Option<usize> {
+    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str) {
+        return 5_usize.checked_add(item_id.len());
+    }
+    let Some(index) = payload.get("output_index").and_then(Value::as_u64) else {
+        return Some(0);
+    };
+    let digits = if index == 0 {
+        1
+    } else {
+        usize::try_from(index.ilog10()).ok()?.checked_add(1)?
+    };
+    6_usize.checked_add(digits)
+}
+
+/// Return whether shared response state, filter-local parser state, and one
+/// transient construction/staging buffer fit the active aggregate budget.
+fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, staging_bytes: usize) -> bool {
+    stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx, state))
+}
+
+/// Snapshot the shared retained JSON total once for pre-commit checks.
+/// `None` means no aggregate budget is active; the inner `None` signals that
+/// the current retained state already exceeds the limit.
+fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsState) -> Option<(usize, Option<usize>)> {
+    let responses = ctx.extensions.get::<ResponsesState>()?;
+    let limit = responses.retained_payload_limit()?;
+    let stable = *stream.shared_stable_bytes.get_or_init(|| {
+        responses
+            .stream_stable_payload_bytes_bounded(limit)
+            .unwrap_or(usize::MAX)
+    });
+    let current = limit
+        .checked_sub(stable)
+        .and_then(|remaining| responses.stream_changing_payload_bytes_bounded(remaining))
+        .and_then(|changing| stable.checked_add(changing));
+    Some((limit, current))
+}
+
+/// Check a staging projection against a previously measured shared state.
+fn stream_payload_fits_with_budget(
+    state: &StreamEventsState,
+    staging_bytes: usize,
+    shared_budget: Option<(usize, Option<usize>)>,
+) -> bool {
+    let Some(local_bytes) = state.retained_payload_bytes() else {
+        return false;
+    };
+    let Some(external_bytes) = local_bytes.checked_add(staging_bytes) else {
+        return false;
+    };
+    match shared_budget {
+        None => true,
+        Some((limit, Some(current))) => current.checked_add(external_bytes).is_some_and(|total| total <= limit),
+        Some((_, None)) => false,
+    }
+}
+
+/// Return an allocation-safe upper bound for one normalized SSE event.
+///
+/// Normalization can replace an existing response id/output index and always
+/// writes a sequence number. Count the original JSON plus the replacement
+/// values and fixed envelope overhead; retaining the old values in the bound is
+/// deliberate and makes this an upper bound without cloning the payload.
+fn normalized_sse_event_upper_bound(ctx: &HttpFilterContext<'_>, event_type: &str, payload: &Value) -> Option<usize> {
+    let mut bound = retained_json_bytes(payload)?
+        .checked_add(event_type.len())?
+        .checked_add(b"event: \ndata: \n\n".len())?
+        .checked_add(64)?; // sequence_number key/value and object punctuation
+    let Some(object) = payload.as_object() else {
+        return Some(bound);
+    };
+
+    if object.contains_key("output_index") {
+        bound = bound.checked_add(20)?; // max serialized u64
+    }
+    let logical_id = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.logical_stream_response_id.as_deref());
+    if let Some(logical_id) = logical_id {
+        let id_bytes = retained_json_bytes(logical_id)?;
+        if object.contains_key("response_id") {
+            bound = bound.checked_add(id_bytes)?;
+        }
+        if object
+            .get("response")
+            .and_then(Value::as_object)
+            .is_some_and(|response| response.contains_key("id"))
+        {
+            bound = bound.checked_add(id_bytes)?;
+        }
+    }
+    Some(bound)
+}
+
+/// Return a conservative bound for the lifecycle SSE events synthesized for a
+/// locally executed output item. The item is serialized at most twice (added
+/// and done), while up to three phase events repeat its id. The fixed allowance
+/// covers SSE/object envelopes and normalized sequence/response-id fields.
+fn local_item_sse_upper_bound(state: &ResponsesState, item: &Value) -> Option<usize> {
+    let item_bytes = retained_json_bytes(item)?;
+    let item_id_bytes = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(Some(0), retained_json_bytes)?;
+    let logical_id_bytes = state
+        .logical_stream_response_id
+        .as_deref()
+        .map_or(Some(0), retained_json_bytes)?;
+    item_bytes
+        .checked_mul(5)?
+        .checked_add(item_id_bytes.checked_mul(3)?)?
+        .checked_add(logical_id_bytes.checked_mul(2)?)?
+        .checked_add(5 * 320)
+}
+
+/// Bound local lifecycle output without constructing any synthesized payloads.
+fn local_terminal_output_upper_bound(state: &ResponsesState) -> Option<usize> {
+    let mut bound = 0_usize;
+    for item in &state.accumulated_output {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if is_local_tool_item(item) && state.locally_executed_output_items.contains(id) {
+            bound = bound.checked_add(local_item_sse_upper_bound(state, item)?)?;
+        }
+    }
+    for (index, _) in &state.pending_local_tool_synthesis {
+        let item = state.accumulated_output.get(*index)?;
+        bound = bound.checked_add(local_item_sse_upper_bound(state, item)?)?;
+    }
+    Some(bound)
+}
+
+/// Bound all output that `commit_chunk_events` can append for this chunk.
+fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
+    let mut bound = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map_or(Some(0), local_terminal_output_upper_bound)?;
+    for event in events {
+        bound = bound.checked_add(normalized_sse_event_upper_bound(
+            ctx,
+            event.event_type(),
+            event.payload(),
+        )?)?;
+    }
+    Some(bound)
+}
+
+/// Return the compact size of the output that canonicalization will duplicate.
+fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
+    if state.accumulated_output.is_empty() {
+        retained_json_values_bytes(state.output_items())
+    } else {
+        retained_json_values_bytes(&state.accumulated_output)
+    }
+}
+
+/// Reserve the transient owners created before a logical terminal is emitted.
+///
+/// `canonicalize_logical_response` keeps one output in the returned terminal
+/// and clones another into `response_object`. The caller's existing terminal
+/// and already-emitted bytes remain live while those owners are constructed,
+/// so this admission must happen before canonicalization, not only after the
+/// terminal has been mutated.
+fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
+    let output = if state.accumulated_output.is_empty() {
+        state.output_items()
+    } else {
+        &state.accumulated_output
+    };
+    let output_bytes = canonical_logical_output_bytes(state)?;
+    // Annotation staging includes the cleaned text and projected citation
+    // objects. Both the terminal and response_object retain the expanded
+    // output after canonicalization, so reserve two expanded copies as well
+    // as the temporary annotation owner.
+    let annotation_bytes = crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(
+        output,
+        &state.citation_files,
+    )
+    .ok()?;
+    output_bytes
+        .checked_mul(2)?
+        .checked_add(annotation_bytes.checked_mul(3)?)?
+        .checked_add(existing_output_bytes)
+}
+
+/// Abort an offending chunk after aggregate admission fails. The caller drops
+/// its bytes, the logical finalizer emits exactly one bounded error event, and
+/// all dispatch/persistence paths are disabled before another round can run.
+fn record_retained_payload_overflow(ctx: &mut HttpFilterContext<'_>, state: &mut StreamEventsState) {
+    warn!("Responses streaming state exceeded openai_agentic_loop.max_retained_bytes");
+    if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
+        responses.discard_payload_for_budget_error();
+        responses.deferred_stream_done = false;
+    }
+    state.tool_call_args.clear();
+    state.rejected_tool_call_args.clear();
+    state.frame_parser.clear();
+    state.deferred_terminal = None;
+    state.deferred_done = false;
+    state.local_tool_items.clear();
+    state.client_tool_items.clear();
+    if let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() {
+        responses.retained_stream_parser_bytes = 0;
+    }
+    state.stream_failed = true;
+    state.completion_state = CompletionState::Error;
+    state.completed_at.get_or_insert_with(Instant::now);
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    ctx.set_metadata("responses.skip_persist", "true");
+    crate::openai::responses::fs_arm_stream_stop(ctx);
 }
 
 /// Phase 1: parse and validate every frame in a chunk before any mutation.
@@ -781,7 +1260,13 @@ fn charge_accumulation_budget(
     }
     let accumulated_bytes = {
         let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-        responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.saturating_add(frame.data.len());
+        responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.checked_add(frame.data.len()).ok_or(
+            SseParseError::AccumulationLimitExceeded {
+                dimension: "accumulated_bytes",
+                value: usize::MAX,
+                limit: state.max_accumulated_bytes,
+            },
+        )?;
         responses.stream_accumulated_bytes
     };
     accumulation_bytes_exceeded(state, accumulated_bytes).map_or(Ok(()), Err)
@@ -942,8 +1427,14 @@ fn accumulate_chunk(
         if retained_clone_bytes > 0 {
             let accumulated_bytes = {
                 let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-                responses.stream_accumulated_bytes =
-                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
+                responses.stream_accumulated_bytes = responses
+                    .stream_accumulated_bytes
+                    .checked_add(retained_clone_bytes)
+                    .ok_or(SseParseError::AccumulationLimitExceeded {
+                        dimension: "accumulated_bytes",
+                        value: usize::MAX,
+                        limit: state.max_accumulated_bytes,
+                    })?;
                 responses.stream_accumulated_bytes
             };
             if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
@@ -2052,15 +2543,42 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 /// the response-body finalizer cannot emit the deferred terminal event. Build
 /// the same canonical terminal representation directly from shared response
 /// state for IRR to append after already-emitted logical stream chunks.
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical local terminal construction and budget fallback"
+)]
 pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option<Bytes> {
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
-    let mut output = prepare_local_terminal_events(ctx);
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let Some(local_output_upper_bound) = local_terminal_output_upper_bound(state) else {
+        return Some(encode_retained_payload_error(ctx));
+    };
+    let local_output_capacity = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(ResponsesState::retained_payload_limit)
+        .map_or(0, |_| local_output_upper_bound);
+    {
+        let state = ctx.extensions.get::<ResponsesState>()?;
+        if !canonicalization_staging_bytes(state, local_output_upper_bound)
+            .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
+        {
+            return Some(encode_retained_payload_error(ctx));
+        }
+    }
+    let mut output = prepare_local_terminal_events(ctx, local_output_capacity);
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
     if !state.response_object.is_object() {
         state.response_object = std::mem::take(&mut state.local_completion_response_template);
+    }
+    if !canonicalization_staging_bytes(state, output.len())
+        .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
+    {
+        drop(output);
+        return Some(encode_retained_payload_error(ctx));
     }
     // A local completion synthesizes both the wire terminal (below) and the store
     // source from this same `response_object`, so they cannot diverge; restore the
@@ -2080,6 +2598,23 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
+    // The canonical response remains in state while its JSON is written into
+    // the outgoing SSE buffer. Admit that independent wire owner first.
+    let terminal_copy_fits = retained_json_bytes(&state.response_object)
+        .and_then(|bytes| output.len().checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(128))
+        .is_some_and(|bytes| state.can_retain_payload(bytes));
+    if !terminal_copy_fits {
+        drop(output);
+        return Some(encode_retained_payload_error(ctx));
+    }
+
+    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
+    // Unlike `emit_deferred_terminal`, this local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream (see
+    // `finish_deferred_local_response`), where the store already persists before
+    // the body is written. Marking the flag would make the store skip that
+    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -2087,6 +2622,10 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     output.extend_from_slice(b"}\n\n");
     if deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    if !state.can_replace_retained_payload(0, 0, output.len()) {
+        drop(output);
+        return Some(encode_retained_payload_error(ctx));
     }
     // IRR can surface the local terminal body to outer filters as a non-EOS
     // chunk. Mark it only after encoding succeeded so they persist before
@@ -2135,8 +2674,41 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
 /// A terminal `error` frame is never followed by a `[DONE]` sentinel — the SSE
 /// error event is itself the stream terminator, matching the response-body
 /// finalizer's own error branch, which emits the error and stops.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflights local output and the error frame before encoding"
+)]
 pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) -> Option<Bytes> {
-    let mut output = prepare_local_terminal_events(ctx);
+    let budget_failed = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.retained_payload_failed);
+    let output_capacity = if budget_failed {
+        0
+    } else {
+        let state = ctx.extensions.get::<ResponsesState>()?;
+        let Some(local_output_upper_bound) = local_terminal_output_upper_bound(state) else {
+            return Some(encode_retained_payload_error(ctx));
+        };
+        // `responses_error_sse_payload` owns a copy of the message while its
+        // escaped JSON is written into the wire buffer. Eight bytes per input
+        // byte cover both owners even for maximal JSON escaping.
+        let error_upper_bound = message
+            .len()
+            .checked_add(code.len())
+            .and_then(|bytes| bytes.checked_mul(8))
+            .and_then(|bytes| bytes.checked_add(512));
+        let projected = error_upper_bound.and_then(|bytes| bytes.checked_add(local_output_upper_bound));
+        if !projected.is_some_and(|bytes| state.can_retain_payload(bytes)) {
+            return Some(encode_retained_payload_error(ctx));
+        }
+        state.retained_payload_limit().map_or(0, |_| local_output_upper_bound)
+    };
+    let mut output = if budget_failed {
+        Vec::new()
+    } else {
+        prepare_local_terminal_events(ctx, output_capacity)
+    };
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
@@ -2154,8 +2726,12 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
 /// Request-phase completion and dispatch failure have no later upstream
 /// response, so the normal response-body finalizer cannot drain pending
 /// synthesis or flush locally generated output items for them.
-fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Vec<u8> {
-    let mut output = Vec::new();
+fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>, output_capacity: usize) -> Vec<u8> {
+    let mut output = if output_capacity == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(output_capacity)
+    };
     local_tools::drain_local_tool_synthesis(ctx, &mut output);
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.provider_streamed_terminal_ids.clear();
@@ -2164,7 +2740,35 @@ fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Vec<u8> {
     output
 }
 
+/// Drop retained payload and construct the bounded terminal error used after a
+/// local-output admission failure.
+fn encode_retained_payload_error(ctx: &mut HttpFilterContext<'_>) -> Bytes {
+    let state = ctx.extensions.get_mut::<ResponsesState>();
+    let sequence_number = state.map_or(0, |state| {
+        state.discard_payload_for_budget_error();
+        let sequence_number = state.logical_stream_sequence;
+        state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+        sequence_number
+    });
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    ctx.set_metadata("responses.skip_persist", "true");
+    let mut output = Vec::new();
+    let mut payload = responses_error_sse_payload("server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    encode_sse_event("error", &payload, &mut output);
+    Bytes::from(output)
+}
+
 /// Emit the held terminal event only when the current IRR step is terminal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "deferred terminal finalization and published charge update"
+)]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
@@ -2195,6 +2799,14 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.provider_streamed_terminal_ids.clear();
     }
+    // The agentic-loop callback runs before this finalizer and can append the
+    // just-finished round to messages/persisted_messages. Their per-stream
+    // baseline from the first chunk is therefore stale at EOS.
+    parser_state.shared_stable_bytes = OnceLock::new();
+    if !stream_payload_fits(ctx, &parser_state, output.len()) {
+        output.clear();
+        record_retained_payload_overflow(ctx, &mut parser_state);
+    }
     // #1046 P1: a terminal failure recorded after the owner already published its
     // per-round continuation — our own parse/validation error (`stream_error_code`, e.g.
     // set by validate_stream_end at EOS, which runs AFTER the owner records assignments)
@@ -2216,7 +2828,32 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
     // (b)-site failure or the arm-stop above flips the owner action=done.
     finalize_emit_terminal(ctx, &mut parser_state, &mut output, continues);
+    if !publish_stream_payload(ctx, &parser_state) {
+        output.clear();
+        record_retained_payload_overflow(ctx, &mut parser_state);
+        if let Some(error) = encode_local_error(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE) {
+            output.extend_from_slice(&error);
+        }
+    }
     *body = (!output.is_empty()).then(|| Bytes::from(output));
+    // This upstream round is finished. IRR carries ResponsesState into the
+    // next step but drops filter-local state; leaving its published charge
+    // behind would make the next agentic admission see a ghost parser owner.
+    // Keep only lifecycle metadata for downstream inspection of this step.
+    parser_state.frame_parser.clear();
+    parser_state.tool_call_args.clear();
+    parser_state.rejected_tool_call_args.clear();
+    parser_state.deferred_terminal = None;
+    parser_state.local_tool_items.clear();
+    parser_state.client_tool_items.clear();
+    debug_assert_eq!(
+        parser_state.retained_payload_bytes(),
+        Some(0),
+        "all parser payload owners must be released before the shared charge is cleared"
+    );
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.retained_stream_parser_bytes = 0;
+    }
     ctx.insert_filter_state(parser_state);
 }
 
@@ -2233,55 +2870,82 @@ fn finalize_emit_terminal(
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
         // tool activity is not silently dropped by a resumed-round parse failure.
-        flush_local_output_items(ctx, output);
+        if !flush_local_output_items_with_budget(ctx, parser_state, output) {
+            error = logical_stream_error(ctx).unwrap_or(error);
+        }
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
         encode_sse_event("error", &error, output);
     } else if !continues
         && let Some(mut terminal) = parser_state.deferred_terminal.take()
         && let Err(e) = emit_deferred_terminal(ctx, &mut terminal, parser_state, output)
     {
-        // #1159: a lossy terminal client-tool restore fails the whole logical stream
-        // closed. `emit_deferred_terminal` bailed before writing the terminal frame,
-        // so `output` holds only the flushed local items.
-        emit_deferred_terminal_restore_error(ctx, output, &e);
+        output.clear();
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_failed)
+        {
+            if let Some(mut error) = logical_stream_error(ctx) {
+                normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
+                encode_sse_event("error", &error, output);
+            }
+        } else {
+            emit_deferred_terminal_restore_error(ctx, output, &e);
+        }
     }
 }
 
 /// Emit the deferred terminal snapshot as the logical stream's final event,
 /// preceded by any locally generated tool items not yet streamed to the client.
+#[expect(clippy::too_many_lines, reason = "ordered logical stream terminal reconciliation")]
 fn emit_deferred_terminal(
     ctx: &mut HttpFilterContext<'_>,
     terminal: &mut DeferredTerminalEvent,
-    parser_state: &StreamEventsState,
+    parser_state: &mut StreamEventsState,
     output: &mut Vec<u8>,
 ) -> Result<(), SseParseError> {
-    // #276: stream any locally generated tool items that never reached the
-    // client as incremental events before the terminal snapshot.
-    flush_local_output_items(ctx, output);
+    if !flush_local_output_items_with_budget(ctx, parser_state, output) {
+        return Err(SseParseError::StreamPoisoned);
+    }
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     // Match the wire-rewrite decision so the persisted store source cannot disagree
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
+    let preflight = canonicalization_staging_bytes(state, output.len())
+        .and_then(|staging| terminal.retained_payload_bytes()?.checked_add(staging));
+    // The parser owner is already published in ResponsesState for cross-filter
+    // admission. Replace that published charge with the current local size;
+    // only the terminal-construction copy above is additional staging.
+    if !preflight.is_some_and(|staging| {
+        parser_state.retained_payload_bytes().is_some_and(|parser_bytes| {
+            state.can_replace_retained_payload(state.retained_stream_parser_bytes, parser_bytes, staging)
+        })
+    }) {
+        output.clear();
+        record_retained_payload_overflow(ctx, parser_state);
+        return Err(SseParseError::StreamPoisoned);
+    }
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
-    // #937: `response_object` is now canonical and the client-visible terminal
-    // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
-    // pre-IRR `openai_response_store` to persist BEFORE it releases that chunk so
-    // completion is never observed before the record is durable. Only this
-    // deferred path sets the flag; a buffered local completion
-    // (`encode_local_completion`) persists at end-of-stream and must not.
-    state.logical_stream_terminal_emitted = true;
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {
             response.insert("usage".to_owned(), usage);
         }
     }
-    // #1159: the upstream deferred terminal echoes the LOWERED private tools/tool_choice.
-    // Restore them on the wire copy — this is the only place tools are restored on the
-    // deferred path (the output items were already restored inside canonicalize). No-op
-    // when nothing was lowered (echo is None).
+    // Restore the original client-visible tools before admitting the wire copy.
     if let Some(response) = terminal.payload.get_mut("response") {
         restore_snapshot_tools(response, state.client_tool_echo.as_ref());
+    }
+    let terminal_bytes = retained_json_bytes(&terminal.payload);
+    let staging = terminal_bytes.and_then(|bytes| output.len().checked_add(bytes));
+    if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
+        output.clear();
+        record_retained_payload_overflow(ctx, parser_state);
+        return Err(SseParseError::StreamPoisoned);
+    }
+    // Persist before the deferred terminal chunk can be released to the client.
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.logical_stream_terminal_emitted = true;
     }
     normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
     encode_sse_event(&terminal.event_type, &terminal.payload, output);
@@ -2302,6 +2966,38 @@ fn emit_deferred_terminal_restore_error(ctx: &mut HttpFilterContext<'_>, output:
         output.extend_from_slice(&err_bytes);
     }
     ctx.set_metadata("responses.stream_error_message", message);
+}
+
+/// Emit pending local lifecycle events only when their complete SSE staging
+/// fits the active aggregate budget.
+///
+/// On failure the entire current chunk is suppressed before the caller appends
+/// the single bounded terminal error. The emitted-item bookkeeping performed by
+/// [`flush_local_output_items`] is request payload and is cleared by
+/// [`record_retained_payload_overflow`] along with the rest of the failed state.
+fn flush_local_output_items_with_budget(
+    ctx: &mut HttpFilterContext<'_>,
+    parser_state: &mut StreamEventsState,
+    output: &mut Vec<u8>,
+) -> bool {
+    let Some(responses) = ctx.extensions.get::<ResponsesState>() else {
+        flush_local_output_items(ctx, output);
+        return true;
+    };
+    let projected = local_terminal_output_upper_bound(responses).and_then(|bytes| output.len().checked_add(bytes));
+    if !projected.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
+        output.clear();
+        record_retained_payload_overflow(ctx, parser_state);
+        return false;
+    }
+
+    flush_local_output_items(ctx, output);
+    if !stream_payload_fits(ctx, parser_state, output.len()) {
+        output.clear();
+        record_retained_payload_overflow(ctx, parser_state);
+        return false;
+    }
+    true
 }
 
 /// Whether the agentic-loop owner requested another inference step.
