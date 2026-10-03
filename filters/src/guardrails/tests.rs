@@ -683,6 +683,21 @@ async fn on_request_body_modified_rewrites_all_user_messages() {
 /// path can be tested when `NeMo` would skip `/v1/checks` (no user turn).
 struct AlwaysRedactProvider;
 
+/// Provider that rewrites message 0 to a fixed mask.
+struct RedactContent(&'static str);
+
+#[async_trait::async_trait]
+impl GuardProvider for RedactContent {
+    async fn evaluate(
+        &self,
+        _messages: Vec<serde_json::Value>,
+        _phase: GuardPhase,
+        _runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, praxis_filter::FilterError> {
+        Ok(GuardResult::redact_message(0, self.0.to_owned(), "pii".into()))
+    }
+}
+
 #[async_trait::async_trait]
 impl GuardProvider for AlwaysRedactProvider {
     async fn evaluate(
@@ -1124,6 +1139,74 @@ fn fit_to_committed_length_none_body_returns_empty() {
     );
 }
 
+#[test]
+fn length_fitting_error_keeps_full_message_when_it_fits() {
+    use super::filter::length_fitting_error;
+
+    let result = length_fitting_error("too big", "guardrail_error", "evaluation_failed", 120);
+    assert_eq!(result.len(), 120);
+    let json: serde_json::Value = serde_json::from_slice(result.trim_ascii_end()).expect("padded error should parse");
+    assert_eq!(
+        json.pointer("/error/message").and_then(serde_json::Value::as_str),
+        Some("too big")
+    );
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+}
+
+#[test]
+fn length_fitting_error_shortens_message_instead_of_truncating_json() {
+    use super::filter::length_fitting_error;
+
+    let message = "x".repeat(400);
+    let result = length_fitting_error(&message, "guardrail_error", "evaluation_failed", 90);
+    assert_eq!(result.len(), 90);
+    let json: serde_json::Value =
+        serde_json::from_slice(result.trim_ascii_end()).expect("shortened error should parse");
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+    let kept = json
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(kept.len() < message.len(), "message should be shortened to fit");
+    assert!(message.starts_with(kept));
+}
+
+#[test]
+fn length_fitting_error_drops_to_code_only_when_message_cannot_fit() {
+    use super::filter::length_fitting_error;
+
+    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 40);
+    assert_eq!(result.len(), 40);
+    let json: serde_json::Value =
+        serde_json::from_slice(result.trim_ascii_end()).expect("code-only error should parse");
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+}
+
+#[test]
+fn length_fitting_error_uses_empty_object_when_code_cannot_fit() {
+    use super::filter::length_fitting_error;
+
+    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 4);
+    assert_eq!(result, bytes::Bytes::from_static(b"{}  "));
+}
+
+#[test]
+fn length_fitting_error_zero_length_is_empty() {
+    use super::filter::length_fitting_error;
+
+    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 0);
+    assert!(result.is_empty());
+}
+
 // =============================================================================
 // Response body access
 // =============================================================================
@@ -1448,4 +1531,80 @@ async fn on_response_body_modified_rewrites_assistant_content() {
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
     let replaced = body.expect("body should be rewritten, not cleared");
     assert_redacted_assistant_content(&ctx, &replaced, original_len, "My SSN is [REDACTED]");
+}
+
+/// `"x"` → `"[REDACTED]"` grows the chat completion past the committed
+/// `Content-Length`. The client must get a parseable error, not a truncated
+/// completion with HTTP 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_expanded_redaction_fails_closed() {
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(RedactContent("[REDACTED]")),
+        PhaseConfig {
+            request: false,
+            response: true,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = chat_completion_response("x");
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be replaced, not cleared");
+    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("fail-closed body must be valid JSON");
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+    let rendered = String::from_utf8_lossy(&replaced);
+    assert!(
+        !rendered.contains("[REDACTED]"),
+        "expanded mask must not be copied into the client body"
+    );
+    assert!(
+        !rendered.contains("chatcmpl-test"),
+        "original completion must not be partially forwarded"
+    );
+}
+
+/// A short completion cannot hold the full error text. The replacement must
+/// still parse and must not keep the upstream secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(RedactContent("[REDACTED]")),
+        PhaseConfig {
+            request: false,
+            response: true,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = bytes::Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"SECRET-9"}}]}"#);
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be replaced, not cleared");
+    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("short fail-closed body must be valid JSON");
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+    assert!(
+        !String::from_utf8_lossy(&replaced).contains("SECRET-9"),
+        "upstream secret must not reach the client"
+    );
 }

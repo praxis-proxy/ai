@@ -397,8 +397,10 @@ fn record_verdict(
 /// Rewrite the buffered body with each `NeMo` masked turn and continue.
 ///
 /// Request-phase framing is repaired by core via `mutated_request_body_len`.
-/// Response headers are already committed, so the rewritten JSON is fitted to
-/// the original body length.
+/// Response headers are already committed. A rewrite that fits is space-padded
+/// to that length. A rewrite that would grow the body is refused: truncating
+/// it would return malformed JSON with the original 200, so the client receives
+/// a valid fail-closed document fitted to the committed length instead.
 fn apply_redaction(
     body: &mut Option<Bytes>,
     replacements: Vec<MessageRedaction>,
@@ -412,7 +414,7 @@ fn apply_redaction(
         GuardPhase::Response => {
             if let Err(error) = apply_response_redaction(body, replacements) {
                 tracing::error!(%error, "ai_guardrails: response-phase redaction failed");
-                replace_body_with_error(
+                install_length_fitting_error(
                     body,
                     &format!("Guardrail redaction failed: {error}"),
                     "guardrail_error",
@@ -439,7 +441,10 @@ fn apply_request_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRe
     Ok(())
 }
 
-/// Replace each redacted choice message's `content` and keep the committed length.
+/// Replace each redacted choice message's `content` when the rewrite fits.
+///
+/// A longer document is refused. The caller emits a fail-closed body instead
+/// of truncating the chat completion to the committed `Content-Length`.
 fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
     if replacements.is_empty() {
         return Err("ai_guardrails: cannot redact: no message replacements".into());
@@ -463,6 +468,10 @@ fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageR
     }
     let serialized = serde_json::to_string(&value)
         .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    let original_len = body.as_ref().map_or(0, Bytes::len);
+    if serialized.len() > original_len {
+        return Err("ai_guardrails: redacted response exceeds committed Content-Length".into());
+    }
     *body = Some(fit_to_committed_length(serialized, body));
     Ok(())
 }
@@ -539,15 +548,105 @@ fn enforce_block(
 
 /// Replace the response body with an error JSON payload.
 fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
-    let error_json = serde_json::json!({
+    let error_json = error_document(message, error_type, code);
+    *body = Some(fit_to_committed_length(error_json, body));
+}
+
+/// Replace the response body with a valid error document of the committed length.
+///
+/// Response headers, including `Content-Length`, are already on the wire. The
+/// message is shortened until the document fits, then padded with spaces.
+/// Trailing spaces are JSON whitespace, so the client still parses one value.
+fn install_length_fitting_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
+    let original_len = body.as_ref().map_or(0, Bytes::len);
+    let full = error_document(message, error_type, code);
+    if full.len() > original_len {
+        tracing::warn!(
+            new_len = full.len(),
+            original_len,
+            "ai_guardrails: fail-closed response shortened to fit committed Content-Length",
+        );
+    }
+    *body = Some(length_fitting_error(message, error_type, code, original_len));
+}
+
+/// OpenAI-style error JSON with `message`, `type`, and `code`.
+fn error_document(message: &str, error_type: &str, code: &str) -> String {
+    serde_json::json!({
         "error": {
             "message": message,
             "type": error_type,
             "code": code,
         }
     })
-    .to_string();
-    *body = Some(fit_to_committed_length(error_json, body));
+    .to_string()
+}
+
+/// Error JSON that parses and occupies exactly `original_len` bytes.
+///
+/// Prefers the full message, then the longest message prefix that fits, then a
+/// code-only object, then `{}`. A body shorter than two bytes cannot hold a
+/// JSON object, so it is filled with spaces and does not echo the upstream text.
+pub(super) fn length_fitting_error(message: &str, error_type: &str, code: &str, original_len: usize) -> Bytes {
+    if original_len == 0 {
+        return Bytes::new();
+    }
+    if let Some(document) = longest_error_document(message, error_type, code, original_len) {
+        return pad_to_len(document, original_len);
+    }
+    for document in fallback_error_documents(code) {
+        if document.len() <= original_len {
+            return pad_to_len(document, original_len);
+        }
+    }
+    Bytes::from(vec![b' '; original_len])
+}
+
+/// Longest `error_document` whose message is a prefix of `message` and whose
+/// serialized form is at most `original_len` bytes.
+fn longest_error_document(message: &str, error_type: &str, code: &str, original_len: usize) -> Option<String> {
+    let full = error_document(message, error_type, code);
+    if full.len() <= original_len {
+        return Some(full);
+    }
+
+    let chars: Vec<char> = message.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    let mut best = None;
+    while low <= high {
+        let mid = low.midpoint(high);
+        let prefix: String = chars.iter().take(mid).collect();
+        let candidate = error_document(&prefix, error_type, code);
+        if candidate.len() <= original_len {
+            best = Some(candidate);
+            if mid == high {
+                break;
+            }
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+/// Documents used when even an empty message does not fit.
+fn fallback_error_documents(code: &str) -> [String; 2] {
+    [
+        serde_json::json!({"error": {"code": code}}).to_string(),
+        "{}".to_owned(),
+    ]
+}
+
+/// Pad `text` with trailing spaces out to `len`.
+fn pad_to_len(text: String, len: usize) -> Bytes {
+    let mut bytes = text.into_bytes();
+    debug_assert!(bytes.len() <= len);
+    bytes.resize(len, b' ');
+    Bytes::from(bytes)
 }
 
 /// Fit `replacement` bytes to the original response body length.
