@@ -380,24 +380,30 @@ fn merge_redact(pending: Option<GuardResult>, extra: Vec<MessageRedaction>, reas
     }
 }
 
-/// Indices of messages whose role matches the active guard phase.
+/// Indices of messages checked for the active guard phase.
 ///
-/// `/v1/checks` evaluates only the last message of the relevant role per
-/// call. To preserve full-conversation coverage, the provider issues one
-/// HTTP request per target message, each carrying the prefix of the
-/// conversation up to and including that message.
+/// `/v1/checks` evaluates only the last message of a slice. Request phase
+/// issues one call per user turn, each carrying the conversation prefix up to
+/// that turn. Response `choices` are alternative completions, not turns, so
+/// only `choices[0].message` is checked and redacted.
 fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> Vec<usize> {
-    let target_role = match phase {
-        GuardPhase::Request => "user",
-        GuardPhase::Response => "assistant",
-    };
+    match phase {
+        GuardPhase::Request => messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message_role(message) == Some("user"))
+            .map(|(index, _)| index)
+            .collect(),
+        GuardPhase::Response => match messages.first() {
+            Some(message) if message_role(message) == Some("assistant") => vec![0],
+            _ => Vec::new(),
+        },
+    }
+}
 
-    messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.get("role").and_then(|role| role.as_str()) == Some(target_role))
-        .map(|(index, _)| index)
-        .collect()
+/// Role string of a chat message, when the field is present.
+fn message_role(message: &serde_json::Value) -> Option<&str> {
+    message.get("role").and_then(serde_json::Value::as_str)
 }
 
 /// `NeMo` rail types for the active guard phase.
@@ -583,13 +589,23 @@ guardrails:
     }
 
     #[test]
-    fn target_message_indices_response_collects_assistant_turns() {
+    fn target_message_indices_response_checks_only_first_choice() {
         let messages = vec![
             serde_json::json!({"role": "assistant", "content": "a"}),
             serde_json::json!({"role": "assistant", "content": "b"}),
         ];
 
-        assert_eq!(target_message_indices(&messages, GuardPhase::Response), vec![0, 1]);
+        assert_eq!(target_message_indices(&messages, GuardPhase::Response), vec![0]);
+    }
+
+    #[test]
+    fn target_message_indices_response_skips_when_first_choice_is_not_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "echo"}),
+            serde_json::json!({"role": "assistant", "content": "later"}),
+        ];
+
+        assert!(target_message_indices(&messages, GuardPhase::Response).is_empty());
     }
 
     #[test]
