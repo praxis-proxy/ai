@@ -454,10 +454,14 @@ fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageR
         return Err("ai_guardrails: response body does not contain recognizable choices".into());
     };
     for replacement in replacements {
-        let Some(message) = choices
-            .get_mut(replacement.index)
-            .and_then(|choice| choice.get_mut("message"))
-        else {
+        let Some(choice) = choices.get_mut(replacement.index) else {
+            return Err(format!(
+                "ai_guardrails: cannot redact: choice index {} has no message",
+                replacement.index
+            )
+            .into());
+        };
+        let Some(message) = choice.get_mut("message") else {
             return Err(format!(
                 "ai_guardrails: cannot redact: choice index {} has no message",
                 replacement.index
@@ -465,6 +469,14 @@ fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageR
             .into());
         };
         set_message_content(message, replacement.modified_text)?;
+        let Some(choice) = choice.as_object_mut() else {
+            return Err("ai_guardrails: choice is not a JSON object".into());
+        };
+        // Token logprobs repeat the original completion. Clear an existing
+        // field only: inserting one would grow the committed response.
+        if choice.contains_key("logprobs") {
+            choice.insert("logprobs".to_owned(), serde_json::Value::Null);
+        }
     }
     let serialized = serde_json::to_string(&value)
         .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
@@ -516,6 +528,12 @@ fn set_message_content(message: &mut serde_json::Value, modified_text: String) -
     let Some(object) = message.as_object_mut() else {
         return Err("ai_guardrails: message is not a JSON object".into());
     };
+    if object
+        .get("content")
+        .is_some_and(|content| !content.is_string() && !content.is_null())
+    {
+        return Err("ai_guardrails: cannot redact: message content is not a string".into());
+    }
     object.insert("content".to_owned(), serde_json::Value::String(modified_text));
     Ok(())
 }

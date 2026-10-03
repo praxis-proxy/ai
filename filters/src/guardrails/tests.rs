@@ -679,12 +679,23 @@ async fn on_request_body_modified_rewrites_all_user_messages() {
     );
 }
 
-/// Provider that always returns [`GuardResult::Redact`] so the rewrite
-/// path can be tested when `NeMo` would skip `/v1/checks` (no user turn).
-struct AlwaysRedactProvider;
+/// Provider that returns one configured verdict.
+struct FixedGuard(GuardResult);
 
 /// Provider that rewrites message 0 to a fixed mask.
 struct RedactContent(&'static str);
+
+#[async_trait::async_trait]
+impl GuardProvider for FixedGuard {
+    async fn evaluate(
+        &self,
+        _messages: Vec<serde_json::Value>,
+        _phase: GuardPhase,
+        _runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, praxis_filter::FilterError> {
+        Ok(self.0.clone())
+    }
+}
 
 #[async_trait::async_trait]
 impl GuardProvider for RedactContent {
@@ -698,35 +709,65 @@ impl GuardProvider for RedactContent {
     }
 }
 
-#[async_trait::async_trait]
-impl GuardProvider for AlwaysRedactProvider {
-    async fn evaluate(
-        &self,
-        _messages: Vec<serde_json::Value>,
-        _phase: GuardPhase,
-        _runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, praxis_filter::FilterError> {
-        Ok(GuardResult::Redact {
-            replacements: Vec::new(),
-            reason: "pii".into(),
-        })
-    }
-}
-
 #[tokio::test]
 async fn on_request_body_modified_without_user_message_fails_closed() {
-    let filter =
-        AiGuardrailsFilter::with_provider(Box::new(AlwaysRedactProvider), PhaseConfig::default()).expect("test filter");
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(FixedGuard(GuardResult::redact_message(
+            0,
+            "masked".into(),
+            "pii".into(),
+        ))),
+        PhaseConfig::default(),
+    )
+    .expect("test filter");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
         br#"{"messages":[{"role":"system","content":"Be helpful"}]}"#,
     ));
 
-    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+    let error = filter
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .expect_err("redacting a system-only body should fail closed");
+    let error = error.to_string();
     assert!(
-        result.is_err(),
-        "modified with no user message to rewrite should fail closed"
+        error.contains("is not a user turn"),
+        "system message must not be rewritten, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_modified_refuses_non_string_content() {
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(FixedGuard(GuardResult::redact_message(
+            0,
+            "masked".into(),
+            "pii".into(),
+        ))),
+        PhaseConfig::default(),
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let original = bytes::Bytes::from_static(
+        br#"{"model":"test","messages":[{"role":"user","content":[{"type":"text","text":"ssn 123-45-6789"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#,
+    );
+    let mut body = Some(original.clone());
+
+    let error = filter
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .expect_err("array content must not be replaced with a string");
+    let error = error.to_string();
+    assert!(
+        error.contains("message content is not a string"),
+        "non-string content should fail closed, got: {error}"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "original multipart body must be kept"
     );
 }
 
@@ -1606,5 +1647,126 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
     assert!(
         !String::from_utf8_lossy(&replaced).contains("SECRET-9"),
         "upstream secret must not reach the client"
+    );
+}
+
+/// Rewriting `message.content` must also drop `logprobs`, which repeat the
+/// original completion tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_modified_clears_logprobs() {
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(RedactContent("[REDACTED]")),
+        PhaseConfig {
+            request: false,
+            response: true,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "123-45-6789"},
+                "logprobs": {
+                    "content": [
+                        {"token": "123", "logprob": -0.1, "bytes": [49, 50, 51]},
+                        {"token": "-45-", "logprob": -0.2, "bytes": [45, 52, 53, 45]},
+                        {"token": "6789", "logprob": -0.3, "bytes": [54, 55, 56, 57]}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap(),
+    );
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be rewritten, not cleared");
+    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
+    assert_eq!(
+        json.pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert!(
+        json.pointer("/choices/0/logprobs")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    let rendered = String::from_utf8_lossy(&replaced);
+    assert!(
+        !rendered.contains("123-45-6789"),
+        "original digits must not reach the client"
+    );
+    assert!(!rendered.contains("6789"), "logprob tokens must not reach the client");
+}
+
+/// A configured redaction that cannot be applied must replace the response
+/// with an `evaluation_failed` document and must not forward the original text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_redaction_failure_replaces_body() {
+    let filter = AiGuardrailsFilter::with_provider(
+        Box::new(FixedGuard(GuardResult::redact_message(
+            0,
+            "[REDACTED]".into(),
+            "pii".into(),
+        ))),
+        PhaseConfig {
+            request: false,
+            response: true,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ssn 123-45-6789"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap(),
+    );
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be replaced, not cleared");
+    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("fail-closed body must be valid JSON");
+    assert_eq!(
+        json.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("evaluation_failed")
+    );
+    let rendered = String::from_utf8_lossy(&replaced);
+    assert!(
+        !rendered.contains("123-45-6789"),
+        "original digits must not reach the client"
+    );
+    assert!(
+        !rendered.contains("image_url"),
+        "original content parts must not reach the client"
     );
 }
