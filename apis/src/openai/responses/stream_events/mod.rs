@@ -1588,6 +1588,28 @@ fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes:
         .checked_add(existing_output_bytes)
 }
 
+/// Reserve response IDs copied into the deferred event envelope by
+/// `normalize_logical_payload`. The canonical response's own ID copy is
+/// covered separately by `canonicalization_staging_bytes`.
+fn terminal_metadata_normalization_bytes(state: &ResponsesState, payload: &Value) -> Option<usize> {
+    let response_id = state.logical_stream_response_id.as_deref().or_else(|| {
+        payload
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .or_else(|| payload.get("response_id"))
+            .and_then(Value::as_str)
+    });
+    let Some(response_id) = response_id else {
+        return Some(0);
+    };
+    let copies = usize::from(state.logical_stream_response_id.is_none())
+        .checked_add(usize::from(payload.get("response_id").is_some()))?
+        .checked_add(usize::from(
+            payload.get("response").and_then(Value::as_object).is_some(),
+        ))?;
+    retained_json_bytes(response_id)?.checked_add(64)?.checked_mul(copies)
+}
+
 /// Abort an offending chunk after aggregate admission fails. The caller drops
 /// its bytes, the logical finalizer emits exactly one bounded error event, and
 /// all dispatch/persistence paths are disabled before another round can run.
@@ -3692,6 +3714,7 @@ fn emit_deferred_terminal(
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
     let preflight = canonicalization_staging_bytes(state, output.len())
+        .and_then(|staging| staging.checked_add(terminal_metadata_normalization_bytes(state, &terminal.payload)?))
         .and_then(|staging| terminal.retained_payload_bytes()?.checked_add(staging));
     // The parser owner is already published in ResponsesState for cross-filter
     // admission. Replace that published charge with the current local size;

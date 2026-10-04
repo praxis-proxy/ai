@@ -9048,6 +9048,69 @@ async fn chat_budget_failure_replaces_deferred_terminal_with_error() {
 }
 
 #[test]
+fn deferred_terminal_normalization_admits_id_copy_before_allocation() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        logical_stream_response_id: Some("r".repeat(100 * 1024)),
+        response_object: json!({"id":"r", "output":[], "status":"completed"}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type":"response.completed", "response":null, "response_id":"r"}),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    let cap = 225 * 1024;
+    state.apply_retained_payload_limit(cap);
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+    let allocations = allocation_counter::measure(|| {
+        drop(super::emit_deferred_terminal(
+            &mut ctx,
+            &mut terminal,
+            &mut parser,
+            &mut output,
+        ));
+    });
+    assert!(
+        allocations.bytes_max as usize <= cap - baseline,
+        "normalization allocates an unreserved second logical ID before admission"
+    );
+}
+
+#[test]
+fn canonical_local_completion_admits_wire_capacity_near_limit() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut state = ResponsesState {
+        accumulated_output: vec![
+            json!({"type":"message", "id":"msg_large", "content":[{"type":"output_text", "text":"x".repeat(300 * 1024)}]}),
+        ],
+        local_completion_response_template: json!({"id":"resp_local", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    };
+    let cap = 700 * 1024;
+    state.apply_retained_payload_limit(cap);
+    ctx.extensions.insert(state);
+
+    let result = encode_local_completion(&mut ctx).unwrap();
+    assert!(
+        result
+            .as_ref()
+            .windows(b"event: response.completed".len())
+            .any(|window| window == b"event: response.completed"),
+    );
+    let retained = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .retained_payload_bytes()
+        .unwrap();
+    let wire_capacity = result.try_into_mut().unwrap().capacity();
+    assert!(retained + wire_capacity <= cap);
+}
+
+#[test]
 fn local_completion_admits_retained_wire_capacity() {
     let (_filter, mut ctx) = make_armed_context();
     let mut state = ResponsesState {
