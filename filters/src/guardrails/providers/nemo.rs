@@ -412,7 +412,7 @@ fn rail_types_for_phase(phase: GuardPhase) -> &'static [&'static str] {
     }
 }
 
-/// Build the outbound `NeMo` JSON callout. 
+/// Build the outbound `NeMo` JSON callout.
 fn build_request<'a>(
     model: &'a str,
     messages: &[serde_json::Value],
