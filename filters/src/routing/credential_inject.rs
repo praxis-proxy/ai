@@ -291,8 +291,32 @@ struct ProjectedCacheEntry {
 
 /// Secret identity and injection strategy used for dynamic cache lookup.
 type ProjectedCacheKey = (CredentialRef, &'static str);
+/// Shared per-reference lock and cached value.
+type ProjectedCacheEntryRef = Arc<tokio::sync::Mutex<ProjectedCacheEntry>>;
+/// Cache entries paired with their last-use timestamps.
+type ProjectedCacheEntries = HashMap<ProjectedCacheKey, (ProjectedCacheEntryRef, Instant)>;
 /// Bounded set of per-reference cache entries and their last use times.
-type ProjectedCache = Mutex<HashMap<ProjectedCacheKey, (Arc<tokio::sync::Mutex<ProjectedCacheEntry>>, Instant)>>;
+type ProjectedCache = Mutex<ProjectedCacheEntries>;
+
+/// Evict least-recently-used entries that have no active callers. A caller
+/// holds an `Arc` while it waits for or performs a per-reference refresh, so
+/// removing only entries with a single strong reference keeps that refresh
+/// discoverable to every concurrent request.
+fn trim_projected_cache(entries: &mut ProjectedCacheEntries, target_len: usize) {
+    while entries.len() > target_len {
+        let oldest_idle = entries
+            .iter()
+            .filter(|(_, (entry, _))| Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, (_, last_used))| *last_used)
+            .map(|(key, _)| key.clone());
+        let Some(oldest_idle) = oldest_idle else {
+            // All entries are in use. Let the cache exceed its target briefly;
+            // callers trim it again after their refreshes release their Arcs.
+            break;
+        };
+        entries.remove(&oldest_idle);
+    }
+}
 
 /// File-backed credential and its reference identity.
 struct WatchedCredential {
@@ -413,7 +437,7 @@ impl CredentialInjectFilter {
             let resolved = match (&entry.value, &entry.env_var, &entry.file) {
                 (None, None, Some(path)) => {
                     validate_bounded("file", path, MAX_SOURCE_LEN)?;
-                    resolve_file_credential(path, &cred_ref, strategy, &header_name)?
+                    resolve_file_credential(Path::new(path), &cred_ref, strategy, &header_name)?
                 },
                 _ => resolve_credential(entry, strategy, &header_name)?,
             };
@@ -472,14 +496,7 @@ impl CredentialInjectFilter {
                 *last_used = now;
                 Arc::clone(entry)
             } else {
-                if entries.len() >= MAX_CREDENTIALS
-                    && let Some(oldest) = entries
-                        .iter()
-                        .min_by_key(|(_, (_, used))| *used)
-                        .map(|(key, _)| key.clone())
-                {
-                    entries.remove(&oldest);
-                }
+                trim_projected_cache(&mut entries, MAX_CREDENTIALS.saturating_sub(1));
                 let entry = Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
                     loaded_at: None,
                     credential: None,
@@ -488,19 +505,26 @@ impl CredentialInjectFilter {
                 entry
             }
         };
-        let mut cached = entry.lock().await;
-        if cached
-            .loaded_at
-            .is_some_and(|loaded| loaded.elapsed() < PROJECTED_CACHE_TTL)
-        {
-            return cached
-                .credential
-                .clone()
-                .ok_or_else(|| "credential_inject: projected credential unavailable".into());
-        }
-        let result = resolve_projected_credential(base.to_path_buf(), selected.clone()).await;
-        cached.loaded_at = Some(Instant::now());
-        cached.credential = result.as_ref().ok().cloned();
+        let result = {
+            let mut cached = entry.lock().await;
+            if cached
+                .loaded_at
+                .is_some_and(|loaded| loaded.elapsed() < PROJECTED_CACHE_TTL)
+            {
+                cached
+                    .credential
+                    .clone()
+                    .ok_or_else(|| "credential_inject: projected credential unavailable".into())
+            } else {
+                let result = resolve_projected_credential(base.to_path_buf(), selected.clone()).await;
+                cached.loaded_at = Some(Instant::now());
+                cached.credential = result.as_ref().ok().cloned();
+                result
+            }
+        };
+        drop(entry);
+        let mut entries = self.projected_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        trim_projected_cache(&mut entries, MAX_CREDENTIALS);
         result
     }
 }
@@ -772,7 +796,7 @@ fn resolve_credential(
 
 /// Resolve a credential from one projected Secret file.
 fn resolve_file_credential(
-    path: &str,
+    path: &Path,
     reference: &CredentialRef,
     strategy: &'static str,
     header_name: &HeaderName,
@@ -846,10 +870,6 @@ fn projected_credential_path(base: &Path, reference: &CredentialRef) -> Result<P
 /// Resolve a credential introduced by an accepted overlay from the configured
 /// Secret projection root. File I/O runs on Tokio's blocking pool and uses the
 /// same bounded validation and zeroization path as configured file entries.
-#[expect(
-    clippy::too_many_lines,
-    reason = "path containment and file resolution are one blocking operation"
-)]
 async fn resolve_projected_credential(
     base: PathBuf,
     selected: SelectedCredential,
@@ -872,12 +892,7 @@ async fn resolve_projected_credential(
         if !resolved_path.starts_with(&resolved_root) {
             return Err("credential_inject: projected credential resolves outside configured root".into());
         }
-        resolve_file_credential(
-            resolved_path.to_string_lossy().as_ref(),
-            &reference,
-            strategy,
-            &header_name,
-        )
+        resolve_file_credential(&resolved_path, &reference, strategy, &header_name)
     })
     .await
     .map_err(|error| -> FilterError {
@@ -887,11 +902,14 @@ async fn resolve_projected_credential(
 
 /// Read one projected credential using the same bounded validation path for
 /// startup and reload. The credential value is never included in diagnostics.
-fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizing<String>, FilterError> {
-    let file = File::open(Path::new(path)).map_err(|error| {
+fn read_projected_token(path: &Path, reference: &CredentialRef) -> Result<Zeroizing<String>, FilterError> {
+    let file = File::open(path).map_err(|error| {
         format!(
-            "credential_inject: cannot read file '{path}' for '{}/{}/{}': {error}",
-            reference.name, reference.namespace, reference.key
+            "credential_inject: cannot read file '{}' for '{}/{}/{}': {error}",
+            path.display(),
+            reference.name,
+            reference.namespace,
+            reference.key
         )
     })?;
     let mut content = Zeroizing::new(String::new());
@@ -914,12 +932,7 @@ fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizi
 /// Publish the current file state, failing closed when it cannot be read or
 /// validated.
 fn reload_credential(item: &WatchedCredential) {
-    let credential = match resolve_file_credential(
-        item.path.to_string_lossy().as_ref(),
-        &item.reference,
-        item.strategy,
-        &item.header_name,
-    ) {
+    let credential = match resolve_file_credential(&item.path, &item.reference, item.strategy, &item.header_name) {
         Ok(credential) => Some(credential),
         Err(error) => {
             tracing::warn!(
@@ -1012,12 +1025,7 @@ fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<Credentia
             // complete startup snapshot.
             let mut initial = Vec::with_capacity(watched.len());
             for item in &watched {
-                match resolve_file_credential(
-                    item.path.to_string_lossy().as_ref(),
-                    &item.reference,
-                    item.strategy,
-                    &item.header_name,
-                ) {
+                match resolve_file_credential(&item.path, &item.reference, item.strategy, &item.header_name) {
                     Ok(credential) => initial.push((Arc::clone(&item.snapshot), credential)),
                     Err(error) => {
                         drop(ready_tx.send(Err(format!("failed authoritative credential read: {error}"))));
@@ -1087,7 +1095,7 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
                 namespace: entry.namespace.clone(),
                 key: entry.key.clone(),
             };
-            read_projected_token(path, &reference)
+            read_projected_token(Path::new(path), &reference)
         },
         (None, None, None) => Err(format!(
             "credential_inject: '{}/{}/{}' must have exactly one of 'value', 'env_var', or 'file'",
@@ -1514,6 +1522,35 @@ mod tests {
         symlink("..data/token", inside.join("token")).unwrap();
         let mut ctx = crate::test_utils::make_filter_context(&request);
         set_credential_metadata(&mut ctx, "bearer_token", "provider-secret", "inside-ns", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.request_headers_to_set[0].1, "Bearer inside-token");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn projected_secret_reads_preserve_non_utf8_canonical_paths() {
+        use std::{
+            ffi::OsStr,
+            os::unix::{ffi::OsStrExt as _, fs::symlink},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let projected_dir = root.join("test-ns/provider-secret");
+        std::fs::create_dir_all(&projected_dir).unwrap();
+        let target = root.join(OsStr::from_bytes(b"target-\xff"));
+        std::fs::write(&target, "inside-token").unwrap();
+        symlink(&target, projected_dir.join("token")).unwrap();
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            root.display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "bearer_token", "provider-secret", "test-ns", "token");
+
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
         assert_eq!(ctx.request_headers_to_set[0].1, "Bearer inside-token");
@@ -2241,6 +2278,47 @@ mod tests {
     // Test Utilities
     // -------------------------------------------------------------------------
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "active and idle entry lifetimes form one eviction regression test"
+    )]
+    #[test]
+    fn projected_cache_eviction_preserves_entries_with_active_callers() {
+        let mut entries = HashMap::new();
+        let active_key = (credential_reference("active"), STRATEGY_BEARER_TOKEN);
+        let idle_key = (credential_reference("idle"), STRATEGY_BEARER_TOKEN);
+        let active_entry = Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
+            loaded_at: None,
+            credential: None,
+        }));
+        let active_caller = Arc::clone(&active_entry);
+        entries.insert(active_key.clone(), (active_entry, Instant::now()));
+        entries.insert(
+            idle_key.clone(),
+            (
+                Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
+                    loaded_at: None,
+                    credential: None,
+                })),
+                Instant::now(),
+            ),
+        );
+
+        trim_projected_cache(&mut entries, 1);
+        assert!(
+            entries.contains_key(&active_key),
+            "active per-key state must remain discoverable"
+        );
+        assert!(
+            !entries.contains_key(&idle_key),
+            "idle entries remain evictable at capacity"
+        );
+
+        drop(active_caller);
+        trim_projected_cache(&mut entries, 0);
+        assert!(entries.is_empty(), "released entries can be trimmed back to capacity");
+    }
+
     fn credential_reference(name: &str) -> CredentialRef {
         CredentialRef {
             name: name.to_owned(),
@@ -2252,15 +2330,7 @@ mod tests {
     fn initial_snapshot(path: &Path, name: &str) -> Arc<ArcSwap<CredentialSnapshot>> {
         let reference = credential_reference(name);
         Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
-            credential: Some(
-                resolve_file_credential(
-                    path.to_string_lossy().as_ref(),
-                    &reference,
-                    STRATEGY_BEARER_TOKEN,
-                    &AUTHORIZATION,
-                )
-                .unwrap(),
-            ),
+            credential: Some(resolve_file_credential(path, &reference, STRATEGY_BEARER_TOKEN, &AUTHORIZATION).unwrap()),
         }))
     }
 

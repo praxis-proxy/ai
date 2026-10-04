@@ -1342,6 +1342,9 @@ mod tests {
         );
 
         std::fs::write(&path, "{ malformed").unwrap();
+        // The watcher waits for the configured 10 ms debounce before parsing
+        // the update; allow it to retain the last-known-good snapshot first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let retained = route_path_model_with_session(filter.as_ref(), "llama-3", "session-1").await;
         assert!(matches!(retained.0, FilterAction::Reject(rejection) if rejection.status == 404));
         assert!(
