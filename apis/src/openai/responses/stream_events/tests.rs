@@ -9074,7 +9074,7 @@ fn deferred_terminal_normalization_admits_id_copy_before_allocation() {
         ));
     });
     assert!(
-        allocations.bytes_max as usize <= cap - baseline,
+        allocations.bytes_max <= u64::try_from(cap - baseline).unwrap(),
         "normalization allocates an unreserved second logical ID before admission"
     );
 }
