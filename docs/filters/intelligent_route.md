@@ -27,11 +27,11 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 
 Any reserved envelope field selects strict envelope parsing; malformed envelopes never fall back to legacy. When `expected_overlay_scope` is configured, legacy payloads are rejected so scope validation cannot be bypassed. Praxis AI recomputes the RFC 8785 canonical SHA-256 digest over `network`, `local_site`, and the ordered candidate list before accepting a snapshot.
 
-The revision lifecycle is observable as: - **rendered:** The producer constructed the envelope. - **distributed:** The producer applied it to the destination `ConfigMap`. - **accepted:** Praxis AI parsed, scope-checked, and digest-verified it. - **serving:** a request selected a route from that exact snapshot.
+The revision lifecycle is observable as: - **rendered:** The producer constructed the envelope. - **distributed:** The producer applied it to the destination `ConfigMap`. - **accepted:** Praxis AI parsed, scope-checked, and digest-verified it. - **serving:** the active snapshot used for new routing decisions, including an authoritative no-route decision from an empty candidate list.
 
 Invalid cold-start envelopes fail filter construction. Invalid reloads retain the same-process last-known-good snapshot. Envelope-mode provider hops carry the serving revision from the same immutable snapshot used for candidate selection.
 
-**Scope:** overlay hot reload swaps the candidate list and `local_site` only.  It cannot add or remove `load_balancer` clusters, change cluster endpoints or TLS configuration, or inject credential values. Those changes require a full pipeline reload or pod restart. Every cluster name that may appear in any overlay version must already be configured in the downstream `load_balancer` filter. An overlay that references an unknown cluster will cause request-time failures, not a reload rejection.
+**Scope:** overlay hot reload swaps the candidate list and `local_site` only. It cannot add or remove `load_balancer` clusters or change cluster endpoints or TLS configuration; those changes require a full pipeline reload or pod restart. Overlay files never carry credential values. An already-configured projected credential resolver can use a newly selected, already-mounted Secret without rebuilding the filter pipeline. Every cluster name that may appear in any overlay version must already be configured in the downstream `load_balancer` filter. An overlay that references an unknown cluster will cause request-time failures, not a reload rejection.
 
 Supports two modes:
 

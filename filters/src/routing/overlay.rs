@@ -526,7 +526,7 @@ impl RouteSnapshot {
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
         descriptor::validate_local_site(&envelope.overlay.local_site)?;
-        let candidates = overlay_to_candidates(&envelope.overlay)?;
+        let candidates = overlay_to_candidates(&envelope.overlay, true)?;
         validate_selection_mode(&candidates, selection_mode)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
@@ -554,7 +554,7 @@ impl RouteSnapshot {
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
-        let candidates = overlay_to_candidates(&doc)?;
+        let candidates = overlay_to_candidates(&doc, false)?;
         validate_selection_mode(&candidates, selection_mode)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
@@ -765,7 +765,11 @@ fn validate_selection_mode(candidates: &[RouteCandidate], mode: PickerPolicy) ->
 // -----------------------------------------------------------------------------
 
 /// Convert overlay candidates to validated [`RouteCandidate`]s.
-fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, FilterError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "overlay conversion keeps candidate fields in one mapping"
+)]
+fn overlay_to_candidates(doc: &OverlayDocument, allow_empty: bool) -> Result<Vec<RouteCandidate>, FilterError> {
     let raw: Vec<CandidateConfig> = doc
         .candidates
         .iter()
@@ -790,7 +794,11 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
         })
         .collect::<Result<Vec<_>, FilterError>>()?;
 
-    let mut candidates = descriptor::validate_candidates(raw)?;
+    let mut candidates = if allow_empty {
+        descriptor::validate_overlay_candidates(raw)?
+    } else {
+        descriptor::validate_candidates(raw)?
+    };
     enrich_from_overlay(&mut candidates, &doc.candidates)?;
     validate_unique_stable_ids(&candidates)?;
     Ok(candidates)
@@ -1248,6 +1256,7 @@ fn watch_dir_for_path(path: &Path) -> PathBuf {
 )]
 mod tests {
     use super::*;
+    use crate::routing::picker;
 
     // -------------------------------------------------------------------------
     // Overlay parsing
@@ -2013,6 +2022,47 @@ mod tests {
         .unwrap()
     }
 
+    fn make_empty_envelope_json(local_site: &str, network: &str) -> String {
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&make_envelope_json(local_site, "unused", "unused", network)).unwrap();
+        envelope["overlay"]["candidates"] = serde_json::json!([]);
+        let semantic = serde_json::json!({
+            "candidates": envelope["overlay"]["candidates"],
+            "local_site": envelope["overlay"]["local_site"],
+            "network": envelope["overlay"]["network"],
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&semantic).unwrap();
+        let digest = Sha256::digest(&canonical);
+        let mut hex = String::with_capacity(64);
+        for byte in &digest {
+            let _unused = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        }
+        envelope["revision"]["value"] = serde_json::json!(hex);
+        envelope["content_digest"]["value"] = serde_json::json!(hex);
+        serde_json::to_string_pretty(&envelope).unwrap()
+    }
+
+    fn make_empty_envelope_with_policy_json(local_site: &str, network: &str, mode: &str) -> String {
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&make_empty_envelope_json(local_site, network)).unwrap();
+        envelope["overlay"]["selection_policy"] = serde_json::json!({"mode": mode});
+        let semantic = serde_json::json!({
+            "candidates": envelope["overlay"]["candidates"],
+            "local_site": envelope["overlay"]["local_site"],
+            "network": envelope["overlay"]["network"],
+            "selection_policy": envelope["overlay"]["selection_policy"],
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&semantic).unwrap();
+        let digest = Sha256::digest(&canonical);
+        let mut hex = String::with_capacity(64);
+        for byte in &digest {
+            let _unused = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        }
+        envelope["revision"]["value"] = serde_json::json!(hex);
+        envelope["content_digest"]["value"] = serde_json::json!(hex);
+        serde_json::to_string_pretty(&envelope).unwrap()
+    }
+
     #[test]
     fn envelope_accepted_with_valid_digest() {
         let json = make_envelope_json("site-a", "llama-3", "local", "test-net");
@@ -2022,6 +2072,107 @@ mod tests {
         assert!(snap.semantic_revision.is_some());
         assert_eq!(snap.candidates.len(), 1);
         assert_eq!(&*snap.local_site, "site-a");
+    }
+
+    #[test]
+    fn valid_empty_envelope_is_authoritative_no_route_snapshot() {
+        let json = make_empty_envelope_json("site-a", "test-net");
+        let snap = RouteSnapshot::from_overlay_with_scope(
+            json.as_bytes(),
+            Some(&ExpectedOverlayScope {
+                network: Some("test-net".to_owned()),
+                gateway: Some("gw".to_owned()),
+                namespace: Some("ns".to_owned()),
+                local_site: Some("site-a".to_owned()),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+        assert!(snap.candidates.is_empty());
+        assert!(snap.semantic_revision.is_some());
+        assert!(snap.group_index.is_empty());
+    }
+
+    #[test]
+    fn empty_envelope_snapshot_selects_no_candidate() {
+        let json = make_empty_envelope_json("site-a", "test-net");
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+
+        assert!(
+            picker::select_candidate(
+                &snap.candidates,
+                &snap.group_index,
+                CapabilityKind::InferenceModel,
+                "llama-3",
+                snap.selection_mode,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_versioned_revision_is_valid_for_every_selection_mode() {
+        for mode in ["deterministic", "roundRobin", "random", "weightedRandom"] {
+            let json = make_empty_envelope_with_policy_json("site-a", "test-net", mode);
+            let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap_or_else(|error| {
+                panic!("empty {mode} overlay must be valid: {error}");
+            });
+            assert!(snapshot.candidates.is_empty(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn malformed_empty_envelope_digest_is_rejected() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&make_empty_envelope_json("site-a", "test-net")).unwrap();
+        json["revision"]["value"] = serde_json::json!("0".repeat(64));
+        json["content_digest"]["value"] = serde_json::json!("0".repeat(64));
+
+        let result = RouteSnapshot::from_overlay(&serde_json::to_vec(&json).unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn empty_envelope_reload_replaces_nonempty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let original = make_envelope_json("site-a", "llama-3", "provider-a", "test-net");
+        std::fs::write(&path, &original).unwrap();
+        let initial = RouteSnapshot::from_overlay(original.as_bytes()).unwrap();
+        let initial_revision = initial.semantic_revision.clone();
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial));
+
+        let empty = make_empty_envelope_json("site-a", "test-net");
+        std::fs::write(&path, &empty).unwrap();
+        handle_overlay_reload(&path, &snapshot, None);
+
+        let serving = snapshot.load();
+        assert!(serving.candidates.is_empty());
+        assert_ne!(serving.semantic_revision, initial_revision);
+    }
+
+    #[test]
+    fn malformed_update_after_empty_retains_empty_last_known_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let empty = make_empty_envelope_json("site-a", "test-net");
+        std::fs::write(&path, &empty).unwrap();
+        let initial = RouteSnapshot::from_overlay(empty.as_bytes()).unwrap();
+        let revision = initial.semantic_revision.clone();
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial));
+
+        std::fs::write(
+            &path,
+            r#"{"schema_version":"1.0.0","overlay":{"local_site":"site-a","candidates":[]}}"#,
+        )
+        .unwrap();
+        handle_overlay_reload(&path, &snapshot, None);
+
+        let serving = snapshot.load();
+        assert!(serving.candidates.is_empty());
+        assert_eq!(serving.semantic_revision, revision);
     }
 
     #[test]
@@ -2443,7 +2594,7 @@ mod tests {
     }
 
     fn select_round_robin_cluster(snapshot: &RouteSnapshot) -> String {
-        crate::routing::picker::select_candidate(
+        picker::select_candidate(
             &snapshot.candidates,
             &snapshot.group_index,
             CapabilityKind::InferenceModel,
