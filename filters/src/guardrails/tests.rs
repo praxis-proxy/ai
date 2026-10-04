@@ -1609,11 +1609,8 @@ fn assert_evaluation_failed(replaced: &bytes::Bytes, absent: &[&str]) {
         "failed redaction should be an evaluation_failed error"
     );
     let rendered = String::from_utf8_lossy(replaced);
-    for secret in absent {
-        assert!(
-            !rendered.contains(secret),
-            "upstream text must not reach the client: {secret}"
-        );
+    for forbidden in absent {
+        assert!(!rendered.contains(forbidden), "upstream text must not reach the client");
     }
 }
 
