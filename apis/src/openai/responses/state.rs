@@ -3438,6 +3438,7 @@ mod tests {
             ..ResponsesState::default()
         };
         state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
+        state.buffered_canonical_finalized = true;
 
         let mut body = None;
         assert!(
@@ -3459,6 +3460,10 @@ mod tests {
         assert!(
             body.is_none(),
             "failed serialization reservation must not produce a body"
+        );
+        assert!(
+            !state.buffered_canonical_finalized,
+            "a failed finalization cannot authorize buffered header persistence"
         );
     }
 

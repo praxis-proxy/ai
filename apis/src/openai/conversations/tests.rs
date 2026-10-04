@@ -4118,6 +4118,7 @@ async fn store_false_buffered_canonical_output_appends_after_finalization() {
     let mut body = None;
     state.finalize_response_body(&mut body).unwrap();
     assert!(state.accumulated_output.is_empty());
+    assert!(state.buffered_canonical_finalized);
     assert_eq!(
         state.response_object["output"][0]["content"][0]["text"],
         "canonical answer"
