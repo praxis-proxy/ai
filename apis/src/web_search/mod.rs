@@ -64,7 +64,21 @@ pub(crate) fn is_web_search_tool_type(tool_type: &str) -> bool {
 
 /// Format search results as readable text for a model prompt.
 pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
-    let mut output = String::with_capacity(results.len() * 200);
+    // Provider snippets vary widely in size. Reserve the complete text once
+    // from borrowed fields so growth never retains an old large allocation
+    // alongside a new one while building the model-facing bridge.
+    let capacity = results.iter().enumerate().fold(0_usize, |bytes, (index, result)| {
+        let digits = usize::try_from(index.saturating_add(1).ilog10())
+            .unwrap_or_default()
+            .saturating_add(1);
+        bytes
+            .saturating_add(usize::from(index > 0) * 2)
+            .saturating_add(digits + 5)
+            .saturating_add(result.title.len())
+            .saturating_add(result.url.len())
+            .saturating_add(result.snippet.len())
+    });
+    let mut output = String::with_capacity(capacity);
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
             output.push_str("\n\n");
@@ -79,4 +93,59 @@ pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
         );
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare full-size formatter output and fixed allocation baseline"
+    )]
+    fn large_web_result_format_allocation_uses_one_output_buffer() {
+        let results = (0..64)
+            .map(|index| SearchResult {
+                title: format!("title {index}"),
+                url: format!("https://example.test/{index}"),
+                snippet: "s".repeat(4_096),
+            })
+            .collect::<Vec<_>>();
+        let legacy = || {
+            let mut output = String::with_capacity(results.len() * 200);
+            for (index, result) in results.iter().enumerate() {
+                if index > 0 {
+                    output.push_str("\n\n");
+                }
+                let _infallible = write!(
+                    output,
+                    "[{}] {}\n{}\n{}",
+                    index + 1,
+                    result.title,
+                    result.url,
+                    result.snippet
+                );
+            }
+            output
+        };
+        assert_eq!(format_search_results(&results), legacy());
+
+        let optimized = allocation_counter::measure(|| {
+            std::hint::black_box(format_search_results(&results));
+        });
+        let baseline = allocation_counter::measure(|| {
+            std::hint::black_box(legacy());
+        });
+        eprintln!("hosted web formatting allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+        assert!(
+            optimized.count_total < baseline.count_total,
+            "pre-sizing must avoid repeated growth"
+        );
+        assert!(
+            optimized.bytes_max < baseline.bytes_max,
+            "pre-sizing must avoid overlapping large buffers"
+        );
+    }
 }

@@ -352,6 +352,45 @@ fn output_update_accounts_exact_prospective_json_bytes() {
 }
 
 #[test]
+#[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+fn large_output_reconciliation_allocation_avoids_cloning_the_old_result() {
+    // Fixed pre-refactor baseline: clone the complete public item, mutate the
+    // clone, then serialize it to size the prospective replacement.
+    let source = json!({
+        "type": "file_search_call",
+        "id": "fs-allocation",
+        "status": "searching",
+        "results": [{"text": "x".repeat(512 * 1024)}],
+    });
+    let object = source.as_object().unwrap();
+    let legacy = || {
+        let mut projected = source.clone();
+        let fields = projected.as_object_mut().unwrap();
+        fields.insert("status".to_owned(), Value::String("completed".to_owned()));
+        fields.remove("results");
+        retained_json_bytes(&projected).unwrap()
+    };
+    let update = OutputUpdate::new(0, object, None, "completed", None).unwrap();
+    assert_eq!(update.updated_bytes, legacy());
+
+    let optimized = allocation_counter::measure(|| {
+        std::hint::black_box(OutputUpdate::new(0, object, None, "completed", None).unwrap());
+    });
+    let baseline = allocation_counter::measure(|| {
+        std::hint::black_box(legacy());
+    });
+    eprintln!("hosted output reconciliation allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+    assert!(
+        optimized.count_total < baseline.count_total,
+        "exact member sizing must avoid a full result clone"
+    );
+    assert!(
+        optimized.bytes_max < baseline.bytes_max,
+        "the old result must not have a staged copy"
+    );
+}
+
+#[test]
 fn file_search_state_limit_rejects_batch_before_canonical_mutation() {
     let mut state = one_pending_state(&[]);
     let assignments = state.drain_file_search_assignments();

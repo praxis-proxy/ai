@@ -9300,7 +9300,7 @@ class TestFileSearchStreamingVLLM:
         self, file_search_streaming_client, vector_store
     ):
         """The hosted file_search lifecycle is synthesized onto the stream."""
-        store_id, _marker = vector_store
+        store_id, marker = vector_store
         stream = file_search_streaming_client.responses.create(
             model=VLLM_MODEL,
             input=self._INPUT,
@@ -9346,6 +9346,14 @@ class TestFileSearchStreamingVLLM:
                 "file_search_call status should be a known lifecycle state; "
                 f"got: {item.status}"
             )
+        assert any(
+            item.status == "completed"
+            and marker in json.dumps(item.model_dump(), default=str)
+            for item in file_search_items
+        ), (
+            "the completed hosted search must carry the indexed source in its "
+            "budgeted public result"
+        )
 
     def test_streaming_file_search_single_logical_stream(
         self, file_search_streaming_client, vector_store

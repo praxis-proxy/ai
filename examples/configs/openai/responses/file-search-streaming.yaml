@@ -112,6 +112,9 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
+                # Shared across model state, streamed output, vector-store
+                # bodies, decoded results, model context, and citations.
+                max_retained_bytes: 67108864
               - filter: openai_responses_proxy
               - filter: headers
                 request_set:

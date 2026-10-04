@@ -1562,6 +1562,53 @@ async fn on_request_body_honors_client_max_tool_calls() {
 }
 
 #[tokio::test]
+async fn mixed_file_then_web_round_preserves_model_order_under_max_tool_calls() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let file = serde_json::json!({"type": "file_search_call", "id": "fs_first", "status": "searching"});
+    let web = web_search_call("ws_second", "should not run");
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1}));
+    state.accumulated_output = vec![file.clone(), web.clone()];
+    state.response_object = serde_json::json!({"output": [file, web.clone()]});
+    state.select_test_output("web_search_call", vec![web]);
+    // The test helper starts the round at its first selected web call. The
+    // production parse owner starts at the first model output item, including
+    // the earlier file-search placeholder.
+    state.current_round_output_start = Some(0);
+    assert_eq!(
+        current_round_tool_call_admissions(&state, &state.selected_web_search_calls()),
+        vec![false]
+    );
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output.len(),
+        2,
+        "both output slots remain in model order"
+    );
+    assert_eq!(state.accumulated_output[0]["id"], "fs_first");
+    assert_eq!(state.accumulated_output[0]["status"], "searching");
+    assert_eq!(state.accumulated_output[1]["id"], "ws_second");
+    assert_eq!(state.accumulated_output[1]["status"], "failed");
+    assert_eq!(state.web_search_calls_executed, 0);
+    assert!(state.deferred_tool_limit_completion);
+    let bridge = find_bridge_output(&state.messages, "should not run").expect("truthful web bridge");
+    assert_eq!(bridge["output"], TOOL_LIMIT_OUTPUT);
+}
+
+#[tokio::test]
 async fn on_request_body_budget_spans_iterations() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2366,6 +2413,35 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
     );
 }
 
+#[test]
+#[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+fn large_web_search_argument_allocation_avoids_a_second_query_tree() {
+    // Fixed pre-refactor baseline: json! first clones the query array into a
+    // second Value tree, then to_string allocates the serialized arguments.
+    let action = serde_json::json!({
+        "type": "search",
+        "queries": (0..64).map(|index| format!("{index}:{}", "q".repeat(4_096))).collect::<Vec<_>>()
+    });
+    let legacy = || serde_json::json!({"queries": action["queries"]}).to_string();
+    assert_eq!(search_arguments(&action), legacy());
+
+    let optimized = allocation_counter::measure(|| {
+        std::hint::black_box(search_arguments(&action));
+    });
+    let baseline = allocation_counter::measure(|| {
+        std::hint::black_box(legacy());
+    });
+    eprintln!("hosted web arguments allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+    assert!(
+        optimized.count_total < baseline.count_total,
+        "borrowed serialization must remove query clones"
+    );
+    assert!(
+        optimized.bytes_max < baseline.bytes_max,
+        "the query tree must not coexist with its serialized copy"
+    );
+}
+
 
 #[test]
 fn web_search_construction_reserves_provider_result_owners() {
@@ -2403,6 +2479,25 @@ fn web_search_response_limit_is_derived_before_dispatch() {
     let limit = web_search_response_limit(&ctx, "query", &[]).unwrap();
     assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
     assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn web_search_body_admission_respects_below_at_above_boundary() {
+    let query = "query";
+    let request_reserve = crate::subrequest::MAX_TRANSPORT_STAGING_BYTES + 4_096 + query.len() * 8;
+    let admitted = |extra: usize| {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+        let current = state.retained_payload_bytes().unwrap();
+        state.apply_retained_payload_limit(current + request_reserve + extra);
+        ctx.extensions.insert(state);
+        web_search_response_limit(&ctx, query, &[])
+    };
+
+    assert_eq!(admitted(31), None, "31 bytes cannot reserve one 32-byte response unit");
+    assert_eq!(admitted(32), Some(1));
+    assert_eq!(admitted(64), Some(2));
 }
 
 #[test]

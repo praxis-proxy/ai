@@ -1501,6 +1501,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregate_constrained_web_response_has_distinct_failure() {
+        let client = test_search_client();
+        let oversized = || CalloutOutcome::ResponseTooLarge {
+            actual: Some(33),
+            limit: 32,
+        };
+        assert!(
+            matches!(client.map_callout_success(oversized(), false), SearchOutcome::Failed),
+            "ordinary provider overflow must remain a provider failure"
+        );
+        assert!(
+            matches!(
+                client.map_callout_success(oversized(), true),
+                SearchOutcome::RetainedLimitExceeded
+            ),
+            "aggregate admission overflow must stay distinct"
+        );
+    }
+
     /// Outbound filter that rejects every request, standing in for a security or
     /// policy filter that denies the callout before it can reach the provider.
     struct RejectingFilter;

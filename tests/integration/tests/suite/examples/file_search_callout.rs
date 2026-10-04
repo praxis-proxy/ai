@@ -146,6 +146,78 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
 }
 
 #[test]
+fn file_search_example_budget_rejects_large_result_before_public_success() {
+    let model = start_stateful_backend(vec![
+        (200, r#"{"status":"ready"}"#.to_owned()),
+        (
+            200,
+            json!({
+                "id": "resp_search_over_budget",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "id": "fs_over_budget",
+                    "type": "file_search_call",
+                    "status": "searching",
+                    "queries": ["large result"]
+                }]
+            })
+            .to_string(),
+        ),
+    ]);
+    let search = start_stateful_backend(vec![(
+        200,
+        json!({
+            "data": [{
+                "file_id": "file-large",
+                "filename": "large.txt",
+                "score": 1.0,
+                "content": [{"type": "text", "text": "x".repeat(32 * 1024)}]
+            }]
+        })
+        .to_string(),
+    )]);
+    let path = praxis_test_utils::example_config_path("openai/responses/file-search-callout.yaml");
+    let yaml = std::fs::read_to_string(path).expect("example config should exist");
+    let yaml = yaml.replace("max_retained_bytes: 67108864", "max_retained_bytes: 16384");
+    let proxy_port = free_port();
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
+    );
+    let config = Config::from_yaml(&patched).expect("small-budget example should parse");
+    let proxy = start_file_search_proxy(&config);
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Find the large result",
+        "include": ["file_search_call.results"],
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_large"]}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "budget overflow must fail closed: {raw}");
+    assert!(
+        parse_body(&raw).contains("agentic retained payload exceeded"),
+        "the error must identify the retained-payload budget"
+    );
+    assert!(
+        search.requests().is_empty(),
+        "budget preflight must not start the search callout"
+    );
+    assert_eq!(
+        model
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("POST /v1/responses "))
+            .count(),
+        1,
+        "over-budget search must not start a second inference round"
+    );
+}
+
+#[test]
 fn reused_file_search_ids_do_not_restore_response_wide_budget() {
     let file_call = |query: &str| {
         json!({

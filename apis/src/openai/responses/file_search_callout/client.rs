@@ -2846,6 +2846,55 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::print_stderr, reason = "record the fixed-baseline allocation result")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "build and compare the full high-cardinality legacy decode fixture"
+    )]
+    #[expect(clippy::expect_used, reason = "the deterministic fixture must decode successfully")]
+    fn high_cardinality_decode_avoids_full_result_tree_allocation() {
+        // Fixed legacy baseline: parse every provider result into an owned
+        // Value tree before selecting the first 50 retained candidates.
+        let result_count = 10_000;
+        let mut body = Vec::with_capacity(MINIMAL_RESULT.len() * result_count + result_count + 10);
+        body.extend_from_slice(br#"{"data":["#);
+        for index in 0..result_count {
+            if index != 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(MINIMAL_RESULT);
+        }
+        body.extend_from_slice(b"]}");
+        let legacy = || {
+            let mut document: Value = serde_json::from_slice(&body).expect("valid fixed fixture");
+            document
+                .get_mut("data")
+                .and_then(Value::as_array_mut)
+                .expect("data array")
+                .drain(..50)
+                .map(|value| serde_json::from_value::<SearchResult>(value).expect("valid result"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(decode(&body, 50).expect("valid fixed fixture").len(), legacy().len());
+
+        let optimized = allocation_counter::measure(|| {
+            std::hint::black_box(decode(&body, 50).expect("valid fixed fixture"));
+        });
+        let baseline = allocation_counter::measure(|| {
+            std::hint::black_box(legacy());
+        });
+        eprintln!("hosted file decode allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+        assert!(
+            optimized.count_total < baseline.count_total,
+            "discarded results must remain borrowed"
+        );
+        assert!(
+            optimized.bytes_max < baseline.bytes_max,
+            "the full decoded provider tree must not coexist with retained results"
+        );
+    }
+
+    #[test]
     fn decode_error_retains_only_location_metadata() {
         let body = br#"{"data":[{"content":[{"type":"text","text":"x"}],"file_id":"file-a","filename":"a.txt","score":"NaN"}]}"#;
         let error = parse_response_body(body, "store-a", 10).expect_err("invalid response must fail");

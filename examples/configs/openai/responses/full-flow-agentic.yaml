@@ -720,6 +720,8 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
+                # Shared by both hosted search dispatchers and final output.
+                max_retained_bytes: 67108864
               # Protocol adapters run after the load balancer publishes the
               # selected cluster's typed application metadata.
               - filter: headers
