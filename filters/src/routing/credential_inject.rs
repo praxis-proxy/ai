@@ -248,7 +248,6 @@ struct CredentialRef {
 }
 
 /// Resolved credential ready for request-time injection.
-#[derive(Clone)]
 struct ResolvedCredential {
     /// Strategy this credential injects under, cross-checked against the
     /// strategy declared by the overlay candidate.
@@ -283,16 +282,58 @@ struct ConfiguredCredential {
 
 /// One projected reference's last validated value, refreshed on demand.
 struct ProjectedCacheEntry {
+    /// Short-lived state protected independently of filesystem refreshes.
+    state: Mutex<ProjectedCacheState>,
+    /// Wakes requests waiting for a per-reference refresh.
+    refreshed: tokio::sync::Notify,
+}
+
+/// Cached value and single-flight refresh state for one reference.
+struct ProjectedCacheState {
     /// Time of the last filesystem refresh.
     loaded_at: Option<Instant>,
     /// Last validated value, or no value after a failed refresh.
-    credential: Option<ResolvedCredential>,
+    credential: Option<Arc<ResolvedCredential>>,
+    /// True while one request is refreshing the projected file.
+    refreshing: bool,
+}
+
+/// Releases waiters if the refreshing request is cancelled.
+struct ProjectedRefreshGuard {
+    /// Entry whose refresh state this guard owns.
+    entry: Arc<ProjectedCacheEntry>,
+    /// Whether the refresh published a cache result.
+    completed: bool,
+}
+
+impl ProjectedRefreshGuard {
+    /// Publish a refresh result and wake concurrent requests.
+    fn complete(mut self, result: &Result<Arc<ResolvedCredential>, FilterError>) {
+        let mut state = self.entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.loaded_at = Some(Instant::now());
+        state.credential = result.as_ref().ok().cloned();
+        state.refreshing = false;
+        self.completed = true;
+        drop(state);
+        self.entry.refreshed.notify_waiters();
+    }
+}
+
+impl Drop for ProjectedRefreshGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut state = self.entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.refreshing = false;
+            drop(state);
+            self.entry.refreshed.notify_waiters();
+        }
+    }
 }
 
 /// Secret identity and injection strategy used for dynamic cache lookup.
 type ProjectedCacheKey = (CredentialRef, &'static str);
 /// Shared per-reference lock and cached value.
-type ProjectedCacheEntryRef = Arc<tokio::sync::Mutex<ProjectedCacheEntry>>;
+type ProjectedCacheEntryRef = Arc<ProjectedCacheEntry>;
 /// Cache entries paired with their last-use timestamps.
 type ProjectedCacheEntries = HashMap<ProjectedCacheKey, (ProjectedCacheEntryRef, Instant)>;
 /// Bounded set of per-reference cache entries and their last use times.
@@ -478,7 +519,7 @@ impl CredentialInjectFilter {
     }
 
     /// Reuse a validated value between bounded refreshes. A per-reference
-    /// async lock prevents concurrent requests from stampeding the filesystem.
+    /// refresh state prevents concurrent requests from stampeding the filesystem.
     #[expect(
         clippy::too_many_lines,
         reason = "bounded cache admission and refresh share one per-reference operation"
@@ -487,7 +528,7 @@ impl CredentialInjectFilter {
         &self,
         base: &Path,
         selected: &SelectedCredential,
-    ) -> Result<ResolvedCredential, FilterError> {
+    ) -> Result<Arc<ResolvedCredential>, FilterError> {
         let key = (selected.reference.clone(), selected.strategy);
         let entry = {
             let mut entries = self.projected_cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -497,30 +538,60 @@ impl CredentialInjectFilter {
                 Arc::clone(entry)
             } else {
                 trim_projected_cache(&mut entries, MAX_CREDENTIALS.saturating_sub(1));
-                let entry = Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
-                    loaded_at: None,
-                    credential: None,
-                }));
+                let entry = Arc::new(ProjectedCacheEntry {
+                    state: Mutex::new(ProjectedCacheState {
+                        loaded_at: None,
+                        credential: None,
+                        refreshing: false,
+                    }),
+                    refreshed: tokio::sync::Notify::new(),
+                });
                 entries.insert(key, (Arc::clone(&entry), now));
                 entry
             }
         };
-        let result = {
-            let mut cached = entry.lock().await;
-            if cached
-                .loaded_at
-                .is_some_and(|loaded| loaded.elapsed() < PROJECTED_CACHE_TTL)
-            {
-                cached
-                    .credential
-                    .clone()
-                    .ok_or_else(|| "credential_inject: projected credential unavailable".into())
-            } else {
-                let result = resolve_projected_credential(base.to_path_buf(), selected.clone()).await;
-                cached.loaded_at = Some(Instant::now());
-                cached.credential = result.as_ref().ok().cloned();
-                result
+        let result = loop {
+            enum CacheAction {
+                Hit(Option<Arc<ResolvedCredential>>),
+                Wait,
+                Refresh,
             }
+            let notified = entry.refreshed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let action = {
+                let mut cached = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if cached
+                    .loaded_at
+                    .is_some_and(|loaded| loaded.elapsed() < PROJECTED_CACHE_TTL)
+                {
+                    CacheAction::Hit(cached.credential.clone())
+                } else if cached.refreshing {
+                    CacheAction::Wait
+                } else {
+                    cached.refreshing = true;
+                    CacheAction::Refresh
+                }
+            };
+            match action {
+                CacheAction::Hit(credential) => {
+                    break credential.ok_or_else(|| "credential_inject: projected credential unavailable".into());
+                },
+                CacheAction::Wait => {
+                    notified.await;
+                    continue;
+                },
+                CacheAction::Refresh => {},
+            }
+            let refresh = ProjectedRefreshGuard {
+                entry: Arc::clone(&entry),
+                completed: false,
+            };
+            let result = resolve_projected_credential(base.to_path_buf(), selected.clone())
+                .await
+                .map(Arc::new);
+            refresh.complete(&result);
+            break result;
         };
         drop(entry);
         let mut entries = self.projected_cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -548,26 +619,31 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let cred = if let Some(configured) = self.credentials.get(&selected.reference) {
+        let configured_snapshot = self
+            .credentials
+            .get(&selected.reference)
+            .map(|configured| configured.snapshot.load_full());
+        let projected_credential;
+        let cred = if let Some(snapshot) = configured_snapshot.as_ref() {
             // Configured entries retain the existing atomically refreshed
             // snapshot path. A configured-but-invalid entry must not fall
             // through to a second source.
-            let snapshot = configured.snapshot.load_full();
             let Some(credential) = snapshot.credential.as_ref() else {
                 return Ok(FilterAction::Reject(Rejection::status(503)));
             };
-            credential.clone()
+            credential
         } else if let Some(base) = &self.projected_credential_mount_base {
             // Candidate references are part of the validated, scoped routing
             // overlay. Resolve newly introduced references only below the
             // configured mount root; missing/invalid files fail closed.
-            match self.cached_projected_credential(base, &selected).await {
+            projected_credential = match self.cached_projected_credential(base, &selected).await {
                 Ok(credential) => credential,
                 Err(error) => {
                     tracing::debug!(error = %error, "credential_inject: projected credential unavailable; failing closed");
                     return Ok(FilterAction::Reject(Rejection::status(503)));
                 },
-            }
+            };
+            projected_credential.as_ref()
         } else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
@@ -2278,31 +2354,25 @@ mod tests {
     // Test Utilities
     // -------------------------------------------------------------------------
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "active and idle entry lifetimes form one eviction regression test"
-    )]
     #[test]
     fn projected_cache_eviction_preserves_entries_with_active_callers() {
         let mut entries = HashMap::new();
         let active_key = (credential_reference("active"), STRATEGY_BEARER_TOKEN);
         let idle_key = (credential_reference("idle"), STRATEGY_BEARER_TOKEN);
-        let active_entry = Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
-            loaded_at: None,
-            credential: None,
-        }));
-        let active_caller = Arc::clone(&active_entry);
-        entries.insert(active_key.clone(), (active_entry, Instant::now()));
-        entries.insert(
-            idle_key.clone(),
-            (
-                Arc::new(tokio::sync::Mutex::new(ProjectedCacheEntry {
+        let new_entry = || {
+            Arc::new(ProjectedCacheEntry {
+                state: Mutex::new(ProjectedCacheState {
                     loaded_at: None,
                     credential: None,
-                })),
-                Instant::now(),
-            ),
-        );
+                    refreshing: false,
+                }),
+                refreshed: tokio::sync::Notify::new(),
+            })
+        };
+        let active_entry = new_entry();
+        let active_caller = Arc::clone(&active_entry);
+        entries.insert(active_key.clone(), (active_entry, Instant::now()));
+        entries.insert(idle_key.clone(), (new_entry(), Instant::now()));
 
         trim_projected_cache(&mut entries, 1);
         assert!(
@@ -2317,6 +2387,56 @@ mod tests {
         drop(active_caller);
         trim_projected_cache(&mut entries, 0);
         assert!(entries.is_empty(), "released entries can be trimmed back to capacity");
+    }
+
+    #[tokio::test]
+    async fn projected_cache_warm_hit_shares_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("ns").join("shared");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("k"), "token").unwrap();
+        let filter = CredentialInjectFilter {
+            credentials: HashMap::new(),
+            projected_credential_mount_base: Some(dir.path().to_path_buf()),
+            projected_cache: Mutex::new(HashMap::new()),
+            _reload_handle: None,
+        };
+        let selected = SelectedCredential {
+            strategy: STRATEGY_BEARER_TOKEN,
+            reference: credential_reference("shared"),
+        };
+
+        let first = filter.cached_projected_credential(dir.path(), &selected).await.unwrap();
+        let second = filter.cached_projected_credential(dir.path(), &selected).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "warm hits must share the token-bearing credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_projected_refresh_wakes_waiters() {
+        let entry = Arc::new(ProjectedCacheEntry {
+            state: Mutex::new(ProjectedCacheState {
+                loaded_at: None,
+                credential: None,
+                refreshing: true,
+            }),
+            refreshed: tokio::sync::Notify::new(),
+        });
+        let refresh = ProjectedRefreshGuard {
+            entry: Arc::clone(&entry),
+            completed: false,
+        };
+        let notified = entry.refreshed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(refresh);
+        notified.await;
+        assert!(
+            !entry.state.lock().unwrap_or_else(PoisonError::into_inner).refreshing,
+            "cancelled refresh must release per-reference single-flight state"
+        );
     }
 
     fn credential_reference(name: &str) -> CredentialRef {
