@@ -353,6 +353,7 @@ def _write_full_flow_config(
             + "                  - when:\n"
             + "                      headers:\n"
             + "                        x-test-run-agentic: \"true\"\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
