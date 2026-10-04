@@ -23,7 +23,9 @@ use super::{
 };
 use crate::{
     openai::{
-        responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
+        responses::state::{
+            ClientToolEcho, ClientToolRestore, LoweredClientTool, OutputAssignment, ResponsesState, SynthesisKind,
+        },
         sse::{SseFrameParser, SseParseError},
     },
     test_utils::{make_filter_context, make_request},
@@ -175,70 +177,6 @@ fn lowered_terminal_avoids_duplicate_restoration_staging() {
 }
 
 #[test]
-fn lowered_completion_snapshots_count_toward_both_budgets() {
-    for aggregate_limit in [None, Some(65_536)] {
-        let stream_limit = if aggregate_limit.is_some() { 1_048_576 } else { 65_536 };
-        let (filter, mut ctx) =
-            make_armed_context_with_filter(make_filter_from(&format!("max_accumulated_bytes: {stream_limit}")));
-        let mut responses = ResponsesState::default();
-        responses.client_tool_lowering.insert(
-            "agentic_ns__fs__read".to_owned(),
-            LoweredClientTool {
-                original_name: "read".to_owned(),
-                namespace: Some("fs".to_owned()),
-                restore: ClientToolRestore::Namespace,
-            },
-        );
-        ctx.extensions.insert(responses);
-
-        let mut added = Some(make_sse_chunk(
-            "response.output_item.added",
-            &json!({
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "name": "agentic_ns__fs__read",
-                    "call_id": "c1",
-                    "id": "fc_1",
-                    "arguments": "",
-                    "status": "in_progress",
-                    "padding": "x".repeat(8_192)
-                }
-            }),
-        ));
-        filter.on_response_body(&mut ctx, &mut added, false).unwrap();
-        assert!(added.is_some(), "the large item itself must fit");
-        if let Some(limit) = aggregate_limit {
-            ctx.extensions
-                .get_mut::<ResponsesState>()
-                .unwrap()
-                .apply_retained_payload_limit(limit);
-        }
-
-        // Small done frames each clone the large completed item into the
-        // restoration plan. Their snapshots coexist until planning finishes.
-        let mut frames = Vec::new();
-        for _ in 0..50 {
-            frames.extend_from_slice(&make_sse_chunk(
-                "response.function_call_arguments.done",
-                &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
-            ));
-        }
-        let mut body = Some(Bytes::from(frames));
-        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-        assert!(body.is_none(), "the snapshot copies must trip the byte ceiling");
-        if aggregate_limit.is_some() {
-            let responses = ctx.extensions.get::<ResponsesState>().unwrap();
-            assert!(responses.retained_payload_failed);
-            assert_eq!(responses.retained_external_payload_bytes, 0);
-        } else {
-            assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
-        }
-        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    }
-}
-
-#[test]
 fn lowered_completion_uses_post_accumulation_staging_near_cap() {
     let (filter, mut ctx) = make_armed_context();
     let mut responses = ResponsesState::default();
@@ -371,7 +309,9 @@ fn co_batched_completion_snapshots_reject_before_next_large_clone() {
         "response.function_call_arguments.done",
         &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
     );
-    let mut body = Some(Bytes::from([frame.as_ref(), frame.as_ref()].concat()));
+    // Canonical output no longer clones a call into the dispatch queue. Four
+    // restoration snapshots still exceed the remaining headroom.
+    let mut body = Some(Bytes::from(frame.repeat(4)));
     let allocations = allocation_counter::measure(|| {
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
     });
@@ -383,6 +323,83 @@ fn co_batched_completion_snapshots_reject_before_next_large_clone() {
     assert!(
         allocations.bytes_max < u64::try_from(65_536 - baseline).unwrap(),
         "reject before the next clone exceeds remaining headroom: {allocations:?}"
+    );
+}
+
+#[test]
+fn done_delta_transfer_rechecks_shared_charge_before_next_snapshot() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut stream = filter.new_round_state(0, 0);
+    let mut responses = ResponsesState::default();
+    responses.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some("ns".to_owned()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    let mut events = Vec::new();
+    for index in 0..8 {
+        let id = format!("fc_{index}");
+        responses.output_items_mut().push(json!({
+            "type": "function_call", "id": id, "call_id": format!("c_{index}"),
+            "name": "private", "arguments": "", "status": "in_progress"
+        }));
+        stream
+            .tool_call_args
+            .insert(format!("item:{id}"), format!("{{\"text\":\"{}\"}}", "x".repeat(10_000)));
+        events.push(
+            crate::openai::sse::responses::ResponsesEvent::FunctionCallArgumentsDone(
+                json!({"output_index": index, "item_id": id}),
+            ),
+        );
+    }
+    let parsed_owner_bytes: usize = events
+        .iter()
+        .map(|event| super::retained_event_payload_bytes(event).unwrap())
+        .sum();
+    responses.apply_retained_payload_limit(120_000);
+    ctx.extensions.insert(responses);
+    assert!(super::stream_payload_fits(&ctx, &stream, parsed_owner_bytes));
+
+    let snapshots = super::accumulate_chunk(&mut stream, &mut ctx, &events, parsed_owner_bytes).unwrap();
+
+    assert!(
+        snapshots.is_none(),
+        "transferred arguments and live snapshots exceed the cap"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        0,
+        "rejected snapshots release their shared charge"
+    );
+}
+
+#[test]
+fn terminal_usage_merge_peak_is_reserved_before_accumulation() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState::default());
+    let mut stream = filter.new_round_state(0, 0);
+    let event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_1", "object": "response", "status": "completed", "output": [],
+            "usage": {"detail": "x".repeat(1_000_000)}
+        }
+    }));
+    let projected = super::projected_responses_state_clone_bytes(&ctx, std::slice::from_ref(&event)).unwrap();
+    let allocations = allocation_counter::measure(|| {
+        super::accumulate_event(&mut ctx, &mut stream, &event);
+    });
+
+    assert!(
+        allocations.bytes_max <= u64::try_from(projected + 64_000).unwrap(),
+        "projected {projected} additional bytes, but accumulation allocated {} bytes at peak",
+        allocations.bytes_max
     );
 }
 
@@ -1030,7 +1047,8 @@ fn streaming_budget_reuses_unchanged_current_output_charge() {
     });
     let mut responses = ResponsesState {
         response_object: json!({"output": [call.clone()]}),
-        tool_calls: vec![call],
+        tool_calls: vec![OutputAssignment::new(0, &call).unwrap()],
+        accumulated_output: vec![call],
         ..ResponsesState::default()
     };
     let expected = responses.retained_payload_bytes().unwrap();
@@ -2682,81 +2700,48 @@ async fn accumulation_count_dedups_added_done_pair() {
 }
 
 #[tokio::test]
-async fn accumulation_charges_retained_tool_call_clone() {
-    // A `function_call_arguments.done` clones the whole retained output item into
-    // `tool_calls`. When the item carries a large `name` (charged once on its
-    // `output_item.added`) but no `id`/`call_id`, `upsert_tool_call` cannot dedup
-    // and every later tiny `done` frame appends another full clone. Charging only
-    // `frame.data.len()` left the counter near zero while megabytes were retained,
-    // so the clone-to-be must be charged too (#556 review finding: retained
-    // tool-call copies escaped the byte budget).
-    let big_name = "n".repeat(5000);
-
-    // The cap admits the announced item and its first clone but not many. Fifty
-    // tiny `done` frames alone (~2 KiB) stay well under it, so without charging the
-    // clone the stream would never fail closed in this loop.
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+async fn repeated_function_call_done_reuses_one_output_item() {
+    let filter = make_filter_from("max_accumulated_bytes: 65536");
     let mut ctx = arm_plain_stream(&filter);
-
-    // An id-less, call_id-less function-call item announced once.
     let mut added = Some(make_sse_chunk(
         "response.output_item.added",
         &json!({
-            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "item": {"type": "function_call", "name": "n".repeat(5000), "arguments": "", "status": "in_progress"},
             "output_index": 0,
         }),
     ));
     filter.on_response_body(&mut ctx, &mut added, false).unwrap();
-    assert!(added.is_some(), "the announced function call is within the cap");
+    assert!(added.is_some());
 
-    let mut failed = false;
     for _ in 0..50 {
         let mut done = Some(make_sse_chunk(
             "response.function_call_arguments.done",
             &json!({"output_index": 0, "arguments": "{}"}),
         ));
         filter.on_response_body(&mut ctx, &mut done, false).unwrap();
-        if done.is_none() {
-            failed = true;
-            break;
-        }
+        assert!(
+            done.is_some(),
+            "repeated completion must not clone the full output item"
+        );
     }
-
+    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items().len(), 1);
     assert!(
-        failed,
-        "re-cloned tool-call copies must be charged and eventually fail the stream closed"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a stream whose retained tool-call clones overflow the byte budget must not be persisted"
+        state.tool_calls.is_empty(),
+        "dispatch is selected after the round moves to accumulated output"
     );
 }
 
 #[tokio::test]
-async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
-    // The coalesced variant of `accumulation_charges_retained_tool_call_clone`: the
-    // id-less `output_item.added` and every re-cloning `function_call_arguments.done`
-    // arrive in ONE chunk. The clone charge is measured in phase 2 as each `done`
-    // actually clones the item into `tool_calls`, so a coalesced added + repeated
-    // dones fails the stream closed the instant the retained clones cross the cap —
-    // never accepting the full amplification of tool-call copies while the counter
-    // stays near zero (#556 re-review finding: same-chunk added + repeated dones).
-    let big_name = "n".repeat(5000);
-
-    // The cap admits the announced item and a clone or two but not fifty. The fifty
-    // tiny `done` frames alone (~2 KiB) stay far under it, so only charging the
-    // same-chunk clones fails this single chunk closed.
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+async fn coalesced_function_call_done_reuses_one_output_item() {
+    let filter = make_filter_from("max_accumulated_bytes: 65536");
     let mut ctx = arm_plain_stream(&filter);
-
-    // One chunk: the id-less, call_id-less function-call item announced once, then
-    // fifty `done` frames each re-cloning it into `tool_calls`.
     let mut coalesced = Vec::new();
     coalesced.extend_from_slice(&make_sse_chunk(
         "response.output_item.added",
         &json!({
-            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "item": {"type": "function_call", "name": "n".repeat(5000), "arguments": "", "status": "in_progress"},
             "output_index": 0,
         }),
     ));
@@ -2766,33 +2751,16 @@ async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
             &json!({"output_index": 0, "arguments": "{}"}),
         ));
     }
-
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        chunk.is_none(),
-        "a single chunk whose coalesced added + repeated dones retain megabytes of clones must fail closed"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a coalesced-chunk clone overflow must not be persisted"
-    );
-
-    // The chunk fails closed inside phase 2, the moment the measured clones cross the
-    // cap — after retaining only a bounded handful, never the full 50-way
-    // amplification. Bounded retention with rejection is the fix; the earlier phase-1
-    // prediction under-charged the coalesced case and never rejected at all.
+    assert!(chunk.is_some(), "a coalesced batch must retain one completed item");
+    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(
-        state.tool_calls.len() < 50,
-        "the per-event byte guard must fail closed before the full amplification, got {} clones",
-        state.tool_calls.len()
-    );
+    assert_eq!(state.output_items().len(), 1);
 }
 
 #[test]
-fn co_batched_native_completions_reject_before_retaining_large_clones() {
+fn co_batched_native_completions_reuse_canonical_output_without_amplification() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_accumulated_bytes: 67108864"));
     let mut responses = ResponsesState::default();
     responses.apply_retained_payload_limit(1_048_576);
@@ -2818,47 +2786,33 @@ fn co_batched_native_completions_reject_before_retaining_large_clones() {
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
     });
     let responses = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(body.is_none(), "co-batched completion amplification must fail closed");
+    assert!(body.is_some(), "repeated done events reuse one canonical output item");
     assert!(
-        responses.retained_payload_failed,
-        "the aggregate budget must be the rejection source"
+        !responses.retained_payload_failed,
+        "reusing the item stays within the retained payload budget"
     );
     assert!(
         responses.retained_payload_bytes_bounded(1_048_576).is_some(),
         "no completion clone may put retained state beyond the admitted budget"
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(responses.output_items().len(), 1);
+    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     assert!(
         allocations.bytes_max < 2 * 1_048_576,
-        "native done clones must be rejected before multi-megabyte amplification: {}",
+        "repeated native done events must not amplify owned output: {}",
         allocations.bytes_max
     );
 }
 
 #[tokio::test]
-async fn accumulation_charges_clone_when_added_output_index_mismatches() {
-    // Finding 1 (#556 re-review): the clone charge must follow the accumulator's
-    // actual append/replace rules, not an advertised `output_index`.
-    // `handle_output_item_added` IGNORES `output_index` and pushes, so an item
-    // announced with `output_index: 7` still lands at actual index 0. A
-    // `function_call_arguments.done` targeting index 0 then clones that large item.
-    // The former phase-1 prediction resolved the pending item by the advertised
-    // index 7, matched nothing, charged zero, and never rejected — retaining
-    // megabytes uncharged. Measuring the clone where it is made closes the gap: the
-    // done resolves the real index-0 item, clones it, and is charged.
-    let big_name = "n".repeat(5000);
-
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+async fn mismatched_announced_index_still_updates_the_real_output_item() {
+    let filter = make_filter_from("max_accumulated_bytes: 65536");
     let mut ctx = arm_plain_stream(&filter);
-
-    // One chunk: an id-less function call announced with a MISMATCHED output_index
-    // (7, though `added` ignores it and lands the item at index 0), then repeated
-    // dones targeting the real index 0.
     let mut coalesced = Vec::new();
     coalesced.extend_from_slice(&make_sse_chunk(
         "response.output_item.added",
         &json!({
-            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "item": {"type": "function_call", "name": "n".repeat(5000), "arguments": "", "status": "in_progress"},
             "output_index": 7,
         }),
     ));
@@ -2868,26 +2822,13 @@ async fn accumulation_charges_clone_when_added_output_index_mismatches() {
             &json!({"output_index": 0, "arguments": "{}"}),
         ));
     }
-
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        chunk.is_none(),
-        "an added item whose advertised output_index differs from its landing index must still have \
-         its repeated clones charged and fail the stream closed"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a mismatched-index clone overflow must not be persisted"
-    );
-
+    assert!(chunk.is_some());
+    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(
-        state.tool_calls.len() < 50,
-        "the clone charge must fail closed before the full amplification, got {} clones",
-        state.tool_calls.len()
-    );
+    assert_eq!(state.output_items().len(), 1);
+    assert_eq!(state.output_items()[0]["arguments"], "{}");
 }
 
 #[tokio::test]
@@ -3016,6 +2957,73 @@ async fn accumulation_byte_budget_spans_irr_rounds() {
         Some("true"),
         "a stream that overflows the request-wide byte budget must not be persisted"
     );
+}
+
+#[test]
+fn lowered_completion_snapshots_count_toward_both_budgets() {
+    for aggregate_limit in [None, Some(65_536)] {
+        let stream_limit = if aggregate_limit.is_some() { 1_048_576 } else { 65_536 };
+        let (filter, mut ctx) =
+            make_armed_context_with_filter(make_filter_from(&format!("max_accumulated_bytes: {stream_limit}")));
+        let mut responses = ResponsesState::default();
+        responses.client_tool_lowering.insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
+        ctx.extensions.insert(responses);
+
+        let mut added = Some(make_sse_chunk(
+            "response.output_item.added",
+            &json!({
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "name": "agentic_ns__fs__read",
+                    "call_id": "c1",
+                    "id": "fc_1",
+                    "arguments": "",
+                    "status": "in_progress",
+                    "padding": "x".repeat(8_192)
+                }
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+        assert!(added.is_some(), "the large item itself must fit");
+        if let Some(limit) = aggregate_limit {
+            ctx.extensions
+                .get_mut::<ResponsesState>()
+                .unwrap()
+                .apply_retained_payload_limit(limit);
+        }
+
+        // Each small frame would clone the large completed item into the
+        // restoration plan. All snapshots coexist until the chunk is planned.
+        let mut frames = Vec::new();
+        for _ in 0..50 {
+            frames.extend_from_slice(&make_sse_chunk(
+                "response.function_call_arguments.done",
+                &json!({"output_index": 0, "item_id": "fc_1", "arguments": "{}"}),
+            ));
+        }
+        let mut body = Some(Bytes::from(frames));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(body.is_none(), "the snapshot copies must trip the byte ceiling");
+        if aggregate_limit.is_some() {
+            let responses = ctx.extensions.get::<ResponsesState>().unwrap();
+            assert!(responses.retained_payload_failed);
+            assert_eq!(
+                responses.retained_external_payload_bytes, 0,
+                "dropped snapshots must release their charge"
+            );
+        } else {
+            assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+        }
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
 }
 
 #[tokio::test]
@@ -3492,7 +3500,7 @@ fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
         "response": response
     }));
     let terminal_projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
-    assert!(terminal_projection >= response_bytes * 3);
+    assert!(terminal_projection >= response_bytes * 2);
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
@@ -5479,18 +5487,17 @@ async fn deferred_terminal_arms_store_persistence_at_terminal_frame() {
 async fn terminal_event_authoritatively_populates_completed_function_calls() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::default());
-    ctx.extensions
-        .get_mut::<ResponsesState>()
-        .unwrap()
-        .tool_calls
-        .push(json!({
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().select_test_output(
+        "function_call",
+        vec![json!({
             "type": "function_call",
             "id": "fc_stale",
             "call_id": "call_stale",
             "name": "stale",
             "arguments": "{}",
             "status": "completed"
-        }));
+        })],
+    );
 
     let completed = json!({
         "id": "resp_123",
@@ -5509,12 +5516,13 @@ async fn terminal_event_authoritatively_populates_completed_function_calls() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
-        state.tool_calls.len(),
+        state.output_items().len(),
         1,
-        "the authoritative terminal response must replace incremental tool calls"
+        "the authoritative terminal response owns the completed call"
     );
     assert_eq!(
-        state.tool_calls[0]["call_id"], "call_final",
+        state.output_items()[0]["call_id"],
+        "call_final",
         "a terminal-only completed function call must be dispatchable"
     );
 }
@@ -5652,12 +5660,12 @@ async fn function_call_accumulation() {
     filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1);
-    assert_eq!(state.tool_calls[0]["id"], "fc_item_1");
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
-    assert_eq!(state.tool_calls[0]["name"], "get_weather");
-    assert_eq!(state.tool_calls[0]["arguments"], "{\"city\":\"NYC\"}");
-    assert_eq!(state.tool_calls[0]["status"], "completed");
+    assert_eq!(state.output_items().len(), 1);
+    assert_eq!(state.output_items()[0]["id"], "fc_item_1");
+    assert_eq!(state.output_items()[0]["call_id"], "call_1");
+    assert_eq!(state.output_items()[0]["name"], "get_weather");
+    assert_eq!(state.output_items()[0]["arguments"], "{\"city\":\"NYC\"}");
+    assert_eq!(state.output_items()[0]["status"], "completed");
     assert_eq!(state.output_items()[0]["arguments"], "{\"city\":\"NYC\"}");
 }
 
@@ -6260,15 +6268,15 @@ async fn upsert_tool_call_dedup() {
     let mut b2 = Some(make_sse_chunk("response.function_call_arguments.done", &done1));
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 1);
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().output_items().len(), 1);
 
     let done2 = json!({"item_id": "fc_dup", "output_index": 0, "arguments": "{\"q\":\"v2\"}"});
     let mut b3 = Some(make_sse_chunk("response.function_call_arguments.done", &done2));
     filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1, "should replace, not append duplicate");
-    assert_eq!(state.tool_calls[0]["arguments"], "{\"q\":\"v2\"}");
+    assert_eq!(state.output_items().len(), 1, "should replace, not append duplicate");
+    assert_eq!(state.output_items()[0]["arguments"], "{\"q\":\"v2\"}");
 }
 
 #[tokio::test]
@@ -6298,9 +6306,10 @@ async fn function_call_done_without_prior_deltas() {
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1);
+    assert_eq!(state.output_items().len(), 1);
     assert_eq!(
-        state.tool_calls[0]["arguments"], "{\"tz\":\"UTC\"}",
+        state.output_items()[0]["arguments"],
+        "{\"tz\":\"UTC\"}",
         "should use payload arguments when no deltas were accumulated"
     );
 }
@@ -6337,7 +6346,8 @@ async fn done_payload_wins_over_accumulated_deltas() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
-        state.tool_calls[0]["arguments"], "{\"from\":\"done_payload\"}",
+        state.output_items()[0]["arguments"],
+        "{\"from\":\"done_payload\"}",
         "done-event arguments should take precedence over accumulated deltas"
     );
 }

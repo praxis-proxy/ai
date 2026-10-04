@@ -14,7 +14,7 @@ use super::{
     ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
 };
 use crate::openai::{
-    responses::state::ResponsesState,
+    responses::state::{OutputAssignment, ResponsesState},
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
 
@@ -189,6 +189,31 @@ fn repeated_stream_budget_checks_do_not_reserialize_unchanged_current_output() {
         converter.current_output_measurements(),
         4,
         "an exhausted revision cannot reuse the cache"
+    );
+}
+
+#[test]
+fn translated_stream_cache_charges_canonical_call_assignment_once() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "stream": true, "input": "hi"}));
+    let call = json!({"type": "function_call", "id": "f".repeat(2_048), "arguments": "x".repeat(32_768)});
+    let assignment = OutputAssignment::new(0, &call).unwrap();
+    state.accumulated_output.push(call.clone());
+    state.response_object = json!({"output": [call]});
+    state.tool_calls.push(assignment);
+
+    let full = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(full + 128);
+    let mut converter =
+        super::stream::StreamConverter::new("resp_assignment_cache".to_owned(), 1, wide_stream_limits());
+    let expected_current = super::super::state::retained_json_bytes(&state.response_object).unwrap()
+        + super::super::state::retained_json_bytes(&state.local_completion_response_template).unwrap();
+    assert_eq!(
+        converter.current_output_bytes(&state, full + 128),
+        Some(expected_current)
+    );
+    assert_eq!(
+        super::converter_budget_remaining(&state, &mut converter, 0, 0),
+        Some(128)
     );
 }
 

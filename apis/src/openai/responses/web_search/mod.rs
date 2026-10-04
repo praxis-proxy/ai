@@ -32,7 +32,7 @@
 )]
 mod tests;
 
-use std::{mem, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -294,7 +294,7 @@ impl WebSearchFilter {
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        prepared: PreparedCall<'_>,
+        prepared: PreparedCall,
         context_size: SearchContextSize,
         identity: &CalloutIdentity,
         query_cap: usize,
@@ -547,26 +547,26 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Reject(rejection));
         }
 
-        if state.web_search_calls.is_empty() {
+        if state.selected_web_search_calls().is_empty() {
             return Ok(FilterAction::Continue);
         }
 
+        let selected_calls = state.selected_web_search_calls();
         let admissions = state
             .max_tool_calls
-            .map(|_| current_round_tool_call_admissions(state, &state.web_search_calls));
+            .map(|_| current_round_tool_call_admissions(state, &selected_calls));
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
-        // Compute the remaining budget while the shared immutable borrow is
-        // still live, then move the web search calls out instead of cloning
-        // and then removing them from state.
+        // Parse only the action and query fields into the local async batch.
+        // The complete public output items stay in their canonical owner.
         let call_budget = remaining_web_search_budget(state);
-        let Some((calls, held_bytes)) = ctx
+        let Some(held_bytes) = ctx
             .extensions
             .get_mut::<ResponsesState>()
-            .and_then(take_pending_search_calls)
+            .and_then(reserve_pending_search_projection)
         else {
             record_web_search_budget_failure(ctx);
             return Ok(FilterAction::Continue);
@@ -574,7 +574,11 @@ impl HttpFilter for WebSearchFilter {
 
         // Parse each pending action once here; every dispatch branch below
         // reuses the same parse instead of re-reading the raw call.
-        let prepared = prepare_calls(&calls);
+        let prepared = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .map(|state| prepare_calls(&state.selected_web_search_outputs()))
+            .unwrap_or_default();
 
         let execute_count = admissions.as_ref().map_or(prepared.len(), |values| {
             values.iter().filter(|admitted| **admitted).count()
@@ -601,7 +605,6 @@ impl HttpFilter for WebSearchFilter {
         if tool_limit_exceeded && let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.deferred_tool_limit_completion = true;
         }
-        drop(calls);
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.release_external_payload_bytes(held_bytes);
         }
@@ -609,22 +612,20 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
-/// Transfer the pending call queue into this filter's local owner and reserve
-/// one additional copy for the parsed action values in `prepare_calls`.
-fn take_pending_search_calls(state: &mut ResponsesState) -> Option<(Vec<Value>, usize)> {
-    let bytes = retained_json_values_bytes(&state.web_search_calls)?;
-    let held = bytes.checked_mul(2)?;
-    // The queue moves into `calls`; it does not remain an additional owner in
-    // state. Admit the replacement before moving, then publish its local charge.
-    if !state.can_replace_retained_payload(bytes, held, 0) {
+/// Reserve the parsed action/query projection while the canonical call items
+/// remain in shared state across the asynchronous provider requests.
+fn reserve_pending_search_projection(state: &mut ResponsesState) -> Option<usize> {
+    let calls = state.selected_web_search_calls();
+    let bytes = calls
+        .iter()
+        .try_fold(0_usize, |used, call| used.checked_add(retained_json_bytes(call)?))?;
+    // The parsed action and query strings each retain a copy of selected
+    // fields. The fixed allowance covers the bounded bridge ID and metadata.
+    let held = bytes.checked_mul(2)?.checked_add(calls.len().checked_mul(128)?)?;
+    if !state.can_retain_payload(held) || !state.retain_external_payload_bytes(held) {
         return None;
     }
-    let calls = mem::take(&mut state.web_search_calls);
-    if !state.retain_external_payload_bytes(held) {
-        state.web_search_calls = calls;
-        return None;
-    }
-    Some((calls, held))
+    Some(held)
 }
 
 /// Return the response fan-out cap this dispatcher published for the owner.
@@ -675,7 +676,7 @@ fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
 /// Borrowed inputs for one request-side web-search dispatch batch.
 struct PendingSearchBatch<'a> {
     /// Calls retained from the current model round, parsed once.
-    calls: Vec<PreparedCall<'a>>,
+    calls: Vec<PreparedCall>,
     /// Ordered response-wide budget decisions, when the client set a limit.
     admissions: Option<&'a [bool]>,
     /// Remaining built-in tool calls allowed by the client's `max_tool_calls`.
@@ -695,60 +696,64 @@ struct PendingSearchBatch<'a> {
 /// #808).
 ///
 /// Owned by the [`PreparedCall`] it identifies, so both derive from one parse.
-struct SearchCallIds<'a> {
+struct SearchCallIds {
     /// Client-facing `web_search_call.id` for the public output item.
-    public: &'a str,
+    public: String,
     /// Bounded, backend-valid id for the synthetic bridge pair.
     bridge: String,
     /// Position within the current model round.
     index: usize,
+    /// Absolute index of the selected public placeholder.
+    output_index: usize,
 }
 
-impl<'a> SearchCallIds<'a> {
+impl SearchCallIds {
     /// Derive the bounded bridge ID for one provider-facing ID and round position.
-    fn new(public: &'a str, queries: &[&str], index: usize) -> Self {
+    fn new(public: &str, queries: &[&str], index: usize, output_index: usize) -> Self {
         Self {
-            public,
+            public: public.to_owned(),
             bridge: bridge_call_id(public, queries, index),
             index,
+            output_index,
         }
     }
 }
 
 /// One pending call, with its hosted action parsed once for the whole batch.
-struct PreparedCall<'a> {
+struct PreparedCall {
     /// Identities derived from this call's id, queries, and round position.
-    ids: SearchCallIds<'a>,
+    ids: SearchCallIds,
     /// Queries in provider-supplied order; empty when the call is malformed.
-    queries: Vec<&'a str>,
+    queries: Vec<String>,
     /// Canonical client-visible search action; `Null` when the call is malformed.
     action: Value,
 }
 
-impl<'a> PreparedCall<'a> {
+impl PreparedCall {
     /// Pair a parsed action with the identities its queries and position derive.
-    fn new(call_id: &'a str, index: usize, queries: Vec<&'a str>, action: Value) -> Self {
+    fn new(call_id: &str, index: usize, output_index: usize, queries: Vec<&str>, action: Value) -> Self {
         Self {
-            ids: SearchCallIds::new(call_id, &queries, index),
-            queries,
+            ids: SearchCallIds::new(call_id, &queries, index, output_index),
+            queries: queries.into_iter().map(str::to_owned).collect(),
             action,
         }
     }
 
     /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
-    fn malformed(call_id: &'a str, index: usize) -> Self {
-        Self::new(call_id, index, Vec::new(), Value::Null)
+    fn malformed(call_id: &str, index: usize, output_index: usize) -> Self {
+        Self::new(call_id, index, output_index, Vec::new(), Value::Null)
     }
 }
 
 /// Parse each pending call once, preserving pending-queue order.
-fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
+fn prepare_calls(calls: &[(usize, &Value)]) -> Vec<PreparedCall> {
     calls
         .iter()
         .enumerate()
-        .map(|(index, call)| {
+        .map(|(index, (output_index, call))| {
             let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-            parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
+            parse_search_request(call, call_id, index, *output_index)
+                .unwrap_or_else(|| PreparedCall::malformed(call_id, index, *output_index))
         })
         .collect()
 }
@@ -770,12 +775,12 @@ fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
 /// without another model round. An `over_budget` call — one that can spend
 /// neither a tool-call unit nor a single provider request — is surfaced as
 /// incomplete without reaching the provider.
-fn admit_call<'a>(
+fn admit_call(
     ctx: &mut HttpFilterContext<'_>,
-    prepared: PreparedCall<'a>,
+    prepared: PreparedCall,
     rejected: bool,
     over_budget: bool,
-) -> Option<PreparedCall<'a>> {
+) -> Option<PreparedCall> {
     if prepared.queries.is_empty() {
         warn!(
             call_id = prepared.ids.public,
@@ -826,7 +831,7 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
 
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
 /// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
-fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> Option<PreparedCall<'a>> {
+fn parse_search_request(call: &Value, call_id: &str, index: usize, output_index: usize) -> Option<PreparedCall> {
     let action = call.get("action")?;
     let legacy_query = action.get("query").and_then(Value::as_str);
     match action.get("queries") {
@@ -839,11 +844,11 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> 
                 );
             }
             let action = serde_json::json!({"type": "search", "queries": queries});
-            Some(PreparedCall::new(call_id, index, queries, action))
+            Some(PreparedCall::new(call_id, index, output_index, queries, action))
         },
         Some(Value::Array(_)) | None => legacy_query.map(|query| {
             let action = serde_json::json!({"type": "search", "query": query});
-            PreparedCall::new(call_id, index, vec![query], action)
+            PreparedCall::new(call_id, index, output_index, vec![query], action)
         }),
         Some(_) => None,
     }
@@ -889,7 +894,7 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
 )]
 fn append_search_turn(
     ctx: &mut HttpFilterContext<'_>,
-    ids: &SearchCallIds<'_>,
+    ids: &SearchCallIds,
     status: &str,
     action: Value,
     results: &[SearchResult],
@@ -905,8 +910,8 @@ fn append_search_turn(
         return;
     }
     let bridge = build_tool_result_messages(&ids.bridge, &action, results, notice);
-    let output_item = build_output_item(ids.public, status, action, results, include_sources);
-    push_search_turn(ctx, output_item, bridge, ids.index, source_bytes);
+    let output_item = build_output_item(&ids.public, status, action, results, include_sources);
+    push_search_turn(ctx, output_item, bridge, ids, source_bytes);
 }
 
 /// Append a malformed search turn to [`ResponsesState`].
@@ -915,21 +920,21 @@ fn append_search_turn(
 /// the missing arguments and an explicit failure message. This prevents the
 /// next inference iteration and persisted replay from treating a missing query
 /// as a successful search with zero results.
-fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
+fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds) {
     let include_sources = include_action_sources(ctx);
     if !web_search_construction_fits(ctx, ids, &Value::Null, 0) {
         record_web_search_budget_failure(ctx);
         return;
     }
     let output_item = build_output_item(
-        ids.public,
+        &ids.public,
         "incomplete",
         serde_json::json!({"type": "search", "query": ""}),
         &[],
         include_sources,
     );
     let bridge = build_incomplete_tool_result_messages(&ids.bridge);
-    push_search_turn(ctx, output_item, bridge, ids.index, 0);
+    push_search_turn(ctx, output_item, bridge, ids, 0);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -956,23 +961,29 @@ fn push_search_turn(
     ctx: &mut HttpFilterContext<'_>,
     output_item: Value,
     bridge: [Value; 2],
-    index: usize,
+    ids: &SearchCallIds,
     source_bytes: usize,
 ) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         if state.retained_payload_failed {
             return;
         }
-        let round_start = state
-            .current_round_output_start
-            .unwrap_or(state.accumulated_output.len());
-        let replaced = state.accumulated_output.get(round_start..).and_then(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
-                .nth(index)
-        });
-        let removed = replaced.map_or(Some(0), retained_json_bytes);
+        let round_start = state.current_round_output_start.unwrap_or(0);
+        let replaced = (ids.output_index >= round_start)
+            .then(|| state.accumulated_output.get(ids.output_index))
+            .flatten()
+            .filter(|item| {
+                item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                    && item.get("id").and_then(Value::as_str) == Some(ids.public.as_str())
+            });
+        let Some(removed) = replaced.and_then(retained_json_bytes) else {
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "web-search output selection became stale before result commit".to_owned(),
+            });
+            return;
+        };
         let bridge_bytes = retained_json_values_bytes(&bridge);
         let output_bytes = retained_json_bytes(&output_item);
         let added = output_bytes
@@ -983,15 +994,22 @@ fn push_search_turn(
             .zip(bridge_bytes)
             .and_then(|(output, bridge)| output.checked_add(bridge))
             .and_then(|bytes| bytes.checked_add(source_bytes));
-        if !removed
-            .zip(added)
+        if !added
             .zip(staging)
-            .is_some_and(|((removed, added), staging)| state.can_replace_retained_payload(removed, added, staging))
+            .is_some_and(|(added, staging)| state.can_replace_retained_payload(removed, added, staging))
         {
             state.discard_payload_for_budget_error();
             state.dispatch_failure = Some(web_search_budget_failure());
             return;
         }
+        let Some(slot) = state.accumulated_output.get_mut(ids.output_index) else {
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "web-search output selection became stale before result commit".to_owned(),
+            });
+            return;
+        };
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
@@ -1001,7 +1019,7 @@ fn push_search_turn(
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
+        *slot = output_item;
         state.mark_replay_stable_payload_changed();
     }
 }
@@ -1041,7 +1059,7 @@ fn web_search_response_limit(
 /// Preflight the public output and backend bridge built from a search result.
 fn web_search_construction_fits(
     ctx: &HttpFilterContext<'_>,
-    ids: &SearchCallIds<'_>,
+    ids: &SearchCallIds,
     action: &Value,
     source_bytes: usize,
 ) -> bool {
@@ -1078,25 +1096,6 @@ fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
         state.dispatch_failure = Some(web_search_budget_failure());
     }
     ctx.set_metadata("responses.skip_persist", "true");
-}
-
-/// Replace one current-round `web_search_call` by model position, or append it.
-///
-/// The response phase (`agentic_loop::collect_output_items`) already
-/// accumulated each model placeholder in output order. Updating the indexed
-/// placeholder keeps duplicate and absent provider IDs distinct. When no
-/// current-round placeholder exists (isolated unit contexts), append instead.
-fn upsert_output_item(accumulated: &mut Vec<Value>, round_start: usize, index: usize, output_item: Value) {
-    if let Some(slot) = accumulated.get_mut(round_start..).and_then(|items| {
-        items
-            .iter_mut()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
-            .nth(index)
-    }) {
-        *slot = output_item;
-        return;
-    }
-    accumulated.push(output_item);
 }
 
 // -----------------------------------------------------------------------------

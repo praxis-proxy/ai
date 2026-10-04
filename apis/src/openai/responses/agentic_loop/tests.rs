@@ -16,6 +16,295 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
+#[test]
+fn buffered_round_moves_public_output_payload_without_reallocating_it() {
+    let mut response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "client_tool",
+            "arguments": "x".repeat(256 * 1024),
+            "status": "completed"
+        }]
+    });
+    let payload_ptr = response["output"][0]["arguments"].as_str().unwrap().as_ptr();
+    let mut state = ResponsesState::default();
+    super::collect_output_items(&mut response, &mut state, &[]);
+
+    assert!(response["output"].as_array().unwrap().is_empty());
+    assert_eq!(
+        state.accumulated_output[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+    assert_ne!(state.messages[0]["arguments"].as_str().unwrap().as_ptr(), payload_ptr);
+    assert_ne!(
+        state.persisted_messages[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+}
+
+#[test]
+fn indexed_buffered_collection_allocates_less_than_payload_dispatch_copies() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_large",
+            "call_id": "call_large",
+            "name": "server__lookup",
+            "arguments": "x".repeat(256 * 1024),
+            "status": "completed"
+        }]
+    });
+    let mut old_response = response.clone();
+    let mut new_response = response;
+    let mut old_state = ResponsesState::default();
+    let mut new_state = ResponsesState::default();
+    let mut old_dispatch = Vec::new();
+
+    let old = allocation_counter::measure(|| {
+        for item in old_response["output"].as_array_mut().unwrap().iter() {
+            old_state.accumulated_output.push(item.clone());
+            old_dispatch.push(item.clone());
+            old_state.messages.push(item.clone());
+            old_state.persisted_messages.push(item.clone());
+        }
+        std::hint::black_box(&old_dispatch);
+    });
+    let new = allocation_counter::measure(|| {
+        super::collect_output_items(&mut new_response, &mut new_state, &[]);
+        std::hint::black_box(&new_state);
+    });
+
+    assert_eq!(new_state.selected_tool_calls().len(), 1);
+    assert_eq!(new_state.messages, old_state.messages);
+    assert_eq!(new_state.persisted_messages, old_state.persisted_messages);
+    assert_eq!(new_state.accumulated_output, old_state.accumulated_output);
+    assert!(
+        old.bytes_total >= new.bytes_total + 2 * 256 * 1024,
+        "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
+        old.bytes_total,
+        new.bytes_total
+    );
+}
+
+#[test]
+fn streamed_round_moves_public_output_payload_without_reallocating_it() {
+    let mut state = ResponsesState {
+        response_object: json!({
+            "object": "response",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "client_tool",
+                "arguments": "x".repeat(256 * 1024),
+                "status": "completed"
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+    let payload_ptr = state.response_object["output"][0]["arguments"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    super::collect_streaming_output_items(&mut state).unwrap();
+
+    assert!(state.output_items().is_empty());
+    assert_eq!(
+        state.accumulated_output[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+}
+
+#[test]
+fn buffered_round_assignments_keep_output_and_history_order_across_rounds() {
+    let mut state = ResponsesState::default();
+    let mut first = json!({"object": "response", "output": [
+        {"type": "reasoning", "id": "r_1", "summary": []},
+        {"type": "function_call", "id": "fc_1", "call_id": "c_1", "name": "server__lookup", "arguments": "{}", "status": "completed"},
+        {"type": "function_call", "id": "fc_partial", "call_id": "c_partial", "name": "client", "status": "in_progress"},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": "q"}},
+        {"type": "tool_search_call", "id": "ts_1", "status": "completed"}
+    ]});
+    super::collect_output_items(&mut first, &mut state, &[]);
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_web_search_calls().len(), 1);
+    assert_eq!(state.selected_tool_search_calls().len(), 1);
+    let first_assignment = state.tool_calls[0].clone();
+
+    let tool_output = json!({"type": "function_call_output", "call_id": "c_1", "output": "found"});
+    state.messages.push(tool_output.clone());
+    state.persisted_messages.push(tool_output);
+    super::prepare_iteration(&mut state);
+    let mut second = json!({"object": "response", "output": [
+        {"type": "reasoning", "id": "r_2", "summary": []},
+        {"type": "function_call", "id": "fc_2", "call_id": "c_2", "name": "client", "arguments": "{}", "status": "completed"}
+    ]});
+    super::collect_output_items(&mut second, &mut state, &[]);
+
+    let ids: Vec<_> = state
+        .accumulated_output
+        .iter()
+        .map(|item| item["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            Some("r_1"),
+            Some("fc_1"),
+            Some("fc_partial"),
+            Some("ws_1"),
+            Some("ts_1"),
+            Some("r_2"),
+            Some("fc_2")
+        ]
+    );
+    let message_types: Vec<_> = state.messages.iter().map(|item| item["type"].as_str()).collect();
+    assert_eq!(
+        message_types,
+        vec![
+            Some("reasoning"),
+            Some("function_call"),
+            Some("function_call_output"),
+            Some("reasoning"),
+            Some("function_call")
+        ]
+    );
+    let persisted_types: Vec<_> = state
+        .persisted_messages
+        .iter()
+        .map(|item| item["type"].as_str())
+        .collect();
+    assert_eq!(
+        persisted_types,
+        vec![
+            Some("reasoning"),
+            Some("function_call"),
+            Some("web_search_call"),
+            Some("tool_search_call"),
+            Some("function_call_output"),
+            Some("reasoning"),
+            Some("function_call")
+        ]
+    );
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_2");
+    assert!(
+        first_assignment
+            .resolve(&state.accumulated_output, "web_search_call")
+            .is_none()
+    );
+}
+
+#[test]
+fn streamed_round_assignments_keep_one_output_owner_across_rounds() {
+    let mut state = ResponsesState {
+        response_object: json!({"object": "response", "status": "completed", "output": [
+            {"type": "function_call", "id": "fc_1", "call_id": "c_1", "name": "server__lookup", "arguments": "{}", "status": "completed"},
+            {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": "first"}}
+        ]}),
+        ..ResponsesState::default()
+    };
+    super::collect_streaming_output_items(&mut state).unwrap();
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
+    let first_assignment = state.tool_calls[0].clone();
+
+    super::prepare_iteration(&mut state);
+    state.response_object = json!({"object": "response", "status": "completed", "output": [
+        {"type": "reasoning", "id": "r_2", "summary": []},
+        {"type": "function_call", "id": "fc_2", "call_id": "c_2", "name": "client", "arguments": "{}", "status": "completed"},
+        {"type": "tool_search_call", "id": "ts_2", "status": "completed"}
+    ]});
+    super::collect_streaming_output_items(&mut state).unwrap();
+
+    assert_eq!(state.current_round_output_start, Some(2));
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_2");
+    assert!(state.selected_web_search_calls().is_empty());
+    assert_eq!(state.selected_tool_search_calls()[0]["id"], "ts_2");
+    assert_eq!(
+        state
+            .accumulated_output
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("r_2"), Some("fc_2")]
+    );
+    assert_eq!(
+        state
+            .persisted_messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    state.tool_calls.push(first_assignment);
+    assert_eq!(
+        state.selected_tool_calls().len(),
+        1,
+        "a stale prior-round selection cannot dispatch"
+    );
+}
+
+#[test]
+fn stale_tool_search_selection_cannot_rewrite_prior_output_or_history() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current],
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![state.accumulated_output[1].clone()]);
+    state.accumulated_output[1] = json!({"type": "function_call", "id": "ts_duplicate"});
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0]["status"], "completed");
+    assert_eq!(state.persisted_messages[1]["status"], "completed");
+}
+
+#[test]
+fn over_budget_tool_search_reusing_prior_id_marks_only_current_round() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current.clone()],
+        current_round_output_start: Some(1),
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![current]);
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0], prior);
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.persisted_messages[1]["status"], "incomplete");
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -687,23 +976,14 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_partial",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
-    }));
-    state.tool_search_calls.push(json!({
-        "type": "tool_search_call",
-        "id": "tsc_partial",
-        "status": "completed"
-    }));
     state.response_object = json!({
         "id": "resp_incomplete",
         "object": "response",
         "status": "incomplete",
-        "output": [{
+        "output": [
+        {"type": "function_call", "call_id": "call_partial", "name": "must_not_run", "arguments": "{}", "status": "completed"},
+        {"type": "tool_search_call", "id": "tsc_partial", "status": "completed"},
+        {
             "type": "message",
             "id": "msg_partial",
             "status": "incomplete",
@@ -711,13 +991,6 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "partial"}]
         }]
     });
-    let partial_output = state
-        .response_object
-        .get("output")
-        .and_then(Value::as_array)
-        .expect("incomplete response should have output")
-        .clone();
-    state.output_items_mut().clone_from(&partial_output);
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -740,7 +1013,7 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "a tool_search_call from a truncated stream must not remain dispatchable"
     );
     assert_eq!(
-        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[2]["id"],
         "msg_partial",
         "partial output from an incomplete response must remain client-visible"
     );
@@ -757,18 +1030,13 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_failed",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
-    }));
     state.response_object = json!({
         "id": "resp_failed",
         "object": "response",
         "status": "failed",
-        "output": [{
+        "output": [
+        {"type": "function_call", "call_id": "call_failed", "name": "must_not_run", "arguments": "{}", "status": "completed"},
+        {
             "type": "message",
             "id": "msg_before_failure",
             "status": "incomplete",
@@ -776,13 +1044,6 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "before failure"}]
         }]
     });
-    let partial_output = state
-        .response_object
-        .get("output")
-        .and_then(Value::as_array)
-        .expect("failed response should retain partial output")
-        .clone();
-    state.output_items_mut().clone_from(&partial_output);
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -797,7 +1058,7 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
         "a provider-failed response must not authorize tool execution"
     );
     assert_eq!(
-        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[1]["id"],
         "msg_before_failure",
         "partial output preceding a provider failure must remain client-visible"
     );
@@ -862,11 +1123,10 @@ fn multiple_streamed_client_function_calls_end_done() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
-    ];
-    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"},
+        {"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -898,15 +1158,14 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}),
-    ];
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
     );
-    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"},
+        {"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -955,9 +1214,8 @@ fn streamed_mcp_ownership_index_rejects_near_retained_limit() {
             "arguments": "{}",
             "status": "completed"
         });
-        // On the root branch the SSE parser records function calls before the
-        // agentic collector moves the final response output.
-        state.tool_calls.push(call.clone());
+        // The canonical collector records the function-call selection after
+        // moving the final response output.
         state.response_object = json!({
             "id": "resp_index_budget",
             "object": "response",
@@ -1012,18 +1270,10 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
     );
-    state.tool_calls = vec![json!({
-        "type": "function_call",
-        "call_id": "call_limit",
-        "name": "server__lookup",
-        "status": "completed"
-    })];
-    state.tool_search_calls = vec![json!({
-        "type": "tool_search_call",
-        "id": "tsc_limit",
-        "status": "completed"
-    })];
-    state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_limit", "name": "server__lookup", "status": "completed"},
+        {"type": "tool_search_call", "id": "tsc_limit", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -1239,7 +1489,11 @@ fn any_dispatchable_call_type_sets_loop() {
     let mcp = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
 
     let mut web = make_state_with_tool_calls(vec![]);
-    web.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
+    web.response_object = json!({
+        "object": "response",
+        "status": "completed",
+        "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}],
+    });
 
     // A pending hosted file_search_call is recorded by the parse owner as a
     // `FileSearchAssignment` (issue #1046), so drive it through the response
@@ -1304,7 +1558,7 @@ fn default_config_has_max_infer_iters_ten() {
 
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 10, "iteration should have incremented to 10");
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.response_object["output"] = json!([mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1335,7 +1589,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 1, "should have incremented to 1");
 
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.response_object["output"] = json!([mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1504,7 +1758,7 @@ fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
         // the streamed round out of `response_object` before the check runs), so
         // the client-owned call must sit in `accumulated_output` from index
         // the explicit `current_round_output_start` onward.
-        state.accumulated_output = vec![client_call.clone()];
+        state.accumulated_output.push(client_call.clone());
         state.current_round_output_start = Some(0);
 
         assert!(
@@ -1526,10 +1780,10 @@ fn hosted_container_shell_call_does_not_conflict_with_mcp_dispatch() {
     // A container-referenced shell_call is hosted, not client-executed, so even
     // in this round's accumulated output it must not trip the mixed-ownership
     // guard.
-    state.accumulated_output = vec![json!({
+    state.accumulated_output.push(json!({
         "type":"shell_call", "call_id":"c2",
         "environment":{"type":"container_reference", "container_id":"cntr_1"}
-    })];
+    }));
     state.current_round_output_start = Some(0);
 
     assert!(
@@ -1543,9 +1797,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
     let mut state = make_state_with_tool_calls(vec![json!({
         "type":"function_call", "call_id":"c1", "name":"get_weather", "status":"completed"
     })]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         super::has_mixed_function_call_ownership(&state),
@@ -1556,9 +1813,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
 #[test]
 fn hosted_tool_search_alone_is_not_mixed_ownership() {
     let mut state = make_state_with_tool_calls(vec![]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         !super::has_mixed_function_call_ownership(&state),
@@ -1826,7 +2086,11 @@ fn extracts_tool_calls_from_non_streaming_body() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tool_calls.len(), 1);
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
+    assert_eq!(state.tool_calls[0].item_id, "fc_1");
+    assert_eq!(
+        serde_json::from_slice::<Value>(body.as_ref().unwrap()).unwrap()["output"][0]["call_id"],
+        "call_1"
+    );
 }
 
 #[test]
@@ -2136,7 +2400,7 @@ fn web_search_call_extracted_to_web_search_calls_not_tool_calls() {
         1,
         "web_search_call must appear in web_search_calls"
     );
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
 }
 
 #[test]
@@ -2146,11 +2410,11 @@ fn web_search_call_triggers_loop() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -2165,11 +2429,11 @@ fn web_search_call_alone_increments_iteration() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     ctx.extensions.insert(state);
 
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
@@ -2286,11 +2550,11 @@ fn web_search_call_subject_to_iteration_limit() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     state.iteration = 2;
     ctx.extensions.insert(state);
 
@@ -2308,11 +2572,14 @@ async fn web_search_calls_cleared_on_prepare() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_stale",
-        "action": {"type": "search", "query": "old query"}
-    })];
+    state.select_test_output(
+        "web_search_call",
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_stale",
+            "action": {"type": "search", "query": "old query"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
@@ -2363,7 +2630,7 @@ fn web_search_call_excluded_from_messages_but_persisted() {
 
     assert!(
         state
-            .web_search_calls
+            .selected_web_search_calls()
             .iter()
             .any(|item| item.get("id").and_then(Value::as_str) == Some("ws_1")),
         "web_search_call should be queued in web_search_calls for dispatch"
@@ -2567,7 +2834,7 @@ fn hosted_tool_search_cap_keeps_only_first_of_two_calls() {
     assert_action(&ctx, "loop");
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.tool_search_calls.len(), 1);
-    assert_eq!(state.tool_search_calls[0]["id"], "ts_first");
+    assert_eq!(state.selected_tool_search_calls()[0]["id"], "ts_first");
     assert_eq!(state.accumulated_output[0]["status"], "completed");
     assert_eq!(state.accumulated_output[1]["status"], "incomplete");
     let stored_calls: Vec<_> = state
@@ -3013,7 +3280,7 @@ fn model_output_ordering_survives_all_three_dispatchers() {
 
     // Each dispatcher's target is recorded against its absolute index.
     assert_eq!(state.web_search_calls.len(), 1, "web_search dispatcher target recorded");
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
     assert_eq!(
         state.file_search_assignments.len(),
         1,
@@ -3029,7 +3296,7 @@ fn model_output_ordering_survives_all_three_dispatchers() {
         "a normalized private call records the private synthesis origin"
     );
     assert_eq!(state.tool_calls.len(), 1, "MCP dispatcher target recorded");
-    assert_eq!(state.tool_calls[0]["name"], "server__lookup");
+    assert_eq!(state.selected_tool_calls()[0]["name"], "server__lookup");
 }
 
 #[test]
@@ -3173,10 +3440,17 @@ async fn dispatch_failure_buffered_rejects_with_json_envelope() {
 
     let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "test"}));
     // Stale per-round bookkeeping the conversion must drop.
-    state.tool_calls = vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})];
-    state.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1"})];
+    state.select_test_output(
+        "function_call",
+        vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})],
+    );
+    state.select_test_output(
+        "web_search_call",
+        vec![json!({"type": "web_search_call", "id": "ws_1"})],
+    );
     state.file_search_assignments = vec![FileSearchAssignment {
         output_index: 0,
+        item_id: "fs_stale".to_owned(),
         synthesis: SynthesisKind::Native,
     }];
     state.dispatch_failure = Some(DispatchFailure {
@@ -3305,7 +3579,7 @@ fn make_filter() -> Box<dyn HttpFilter> {
 fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     let body = json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.tool_calls = tool_calls;
+    state.select_test_output("function_call", tool_calls);
     state
 }
 
@@ -3350,7 +3624,12 @@ fn mcp_tool_call(call_id: &str) -> Value {
 /// Client (non-MCP) `function_call`s resolve to no dispatcher and signal `done`;
 /// tests that need the loop to continue must drive it with a dispatchable call.
 fn make_state_with_mcp_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
-    let mut state = make_state_with_tool_calls(tool_calls);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.response_object = json!({
+        "object": "response",
+        "status": "completed",
+    });
+    state.response_object["output"] = Value::Array(tool_calls);
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
@@ -3459,7 +3738,6 @@ fn only_one_loop_instance_claims_each_router_response() {
 #[test]
 fn cumulative_buffered_round_overflow_is_transactional() {
     let mut state = ResponsesState::default();
-    state.apply_retained_payload_limit(4_096);
     let response = |id: &str, fill: char| {
         Bytes::from(
             serde_json::to_vec(&json!({
@@ -3479,6 +3757,7 @@ fn cumulative_buffered_round_overflow_is_transactional() {
     super::extract_tool_calls_from_body(&response("one", 'a'), &mut state).unwrap();
     assert_eq!(state.accumulated_output.len(), 1);
     let retained_after_first = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained_after_first + response("two", 'b').len() - 1);
 
     let failure = super::extract_tool_calls_from_body(&response("two", 'b'), &mut state).unwrap_err();
     assert_eq!(failure.status, 502);
@@ -3519,7 +3798,12 @@ fn buffered_tool_search_preflight_charges_every_retained_copy() {
         let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
         let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
         let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
-        let exact_peak = baseline + response_bytes + copies * item_bytes;
+        let selection_id_bytes = if copies == 3 {
+            response["output"][0]["id"].as_str().unwrap().len()
+        } else {
+            0
+        };
+        let exact_peak = baseline + response_bytes + item_bytes + selection_id_bytes;
 
         let mut rejected = ResponsesState::default();
         rejected.apply_retained_payload_limit(exact_peak - 1);
@@ -3547,7 +3831,7 @@ fn buffered_tool_search_preflight_charges_every_retained_copy() {
         super::extract_tool_calls_from_body(&body, &mut admitted).unwrap();
         assert!(admitted.retained_payload_bytes().unwrap() <= exact_peak);
         assert_eq!(admitted.accumulated_output.len(), 1);
-        assert_eq!(admitted.tool_search_calls.len(), copies - 2);
+        assert_eq!(admitted.tool_search_calls.len(), usize::from(copies == 3));
         assert_eq!(admitted.persisted_messages.len(), 1);
     }
 }
@@ -3564,7 +3848,13 @@ fn streamed_tool_search_preflight_charges_every_retained_copy() {
             ..ResponsesState::default()
         };
         let baseline_without_response = rejected.retained_payload_bytes().unwrap() - response_bytes;
-        let exact_retained = baseline_without_response + response_bytes - output_bytes + 2 + copies * item_bytes;
+        let selection_id_bytes = if copies == 3 {
+            response["output"][0]["id"].as_str().unwrap().len()
+        } else {
+            0
+        };
+        let exact_retained =
+            baseline_without_response + response_bytes - output_bytes + 2 + 2 * item_bytes + selection_id_bytes;
         rejected.apply_retained_payload_limit(exact_retained - 1);
         assert!(!super::streaming_collection_retention_fits(&rejected));
         let failure = super::collect_streaming_output_items(&mut rejected).unwrap_err();
@@ -3582,7 +3872,7 @@ fn streamed_tool_search_preflight_charges_every_retained_copy() {
         super::collect_streaming_output_items(&mut admitted).unwrap();
         assert_eq!(admitted.retained_payload_bytes().unwrap(), exact_retained);
         assert_eq!(admitted.accumulated_output.len(), 1);
-        assert_eq!(admitted.tool_search_calls.len(), copies - 2);
+        assert_eq!(admitted.tool_search_calls.len(), usize::from(copies == 3));
         assert_eq!(admitted.persisted_messages.len(), 1);
     }
 }
@@ -3601,7 +3891,7 @@ fn compaction_collection_preflights_history_copies_and_provenance_id() {
     let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
 
     let body = Bytes::from(serde_json::to_vec(&response).unwrap());
-    let buffered_peak = baseline + response_bytes + 3 * item_bytes + id_bytes;
+    let buffered_peak = baseline + response_bytes + 2 * item_bytes + id_bytes;
     let mut buffered = ResponsesState::default();
     buffered.apply_retained_payload_limit(buffered_peak - 1);
     assert!(super::extract_tool_calls_from_body(&body, &mut buffered).is_err());
@@ -3635,8 +3925,8 @@ fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
     let body = Bytes::from(serde_json::to_vec(&response).unwrap());
     let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
     let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
-    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
-    let exact_peak = baseline + response_bytes + item_bytes;
+    let usage_projection = super::super::state::retained_json_bytes(&Value::Null).unwrap();
+    let exact_peak = baseline + response_bytes + usage_projection;
 
     let mut state = ResponsesState::default();
     state.apply_retained_payload_limit(exact_peak);
@@ -3768,7 +4058,11 @@ fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
     let old_usage = json!({"detail": "a".repeat(1_000_000)});
     let response = json!({
         "object": "response",
-        "output": [{"type": "message", "id": "msg_1", "content": "x".repeat(2_000_000)}],
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "x".repeat(2_000_000)}]
+        }],
         "usage": {"detail": "b".repeat(1_500_000)}
     });
     let body = Bytes::from(serde_json::to_vec(&response).unwrap());
@@ -3782,7 +4076,7 @@ fn buffered_usage_replacement_charges_commit_peak_with_copied_output() {
     let old_usage_bytes = super::super::state::retained_json_bytes(&state.usage).unwrap();
     let incoming_usage_bytes = super::super::state::retained_json_bytes(&response["usage"]).unwrap();
     let usage_growth = incoming_usage_bytes - old_usage_bytes;
-    let limit = baseline + response_bytes + item_bytes + usage_growth + 64_000;
+    let limit = baseline + response_bytes + 2 * item_bytes + usage_growth + 64_000;
     state.apply_retained_payload_limit(limit);
     assert!(
         state.can_retain_payload(response_bytes + old_usage_bytes + incoming_usage_bytes),
@@ -3860,8 +4154,8 @@ fn over_budget_file_search_reconciles_persisted_history_in_both_collectors() {
             state.response_object = json!({"output": [file.clone()]});
             super::collect_streaming_output_items(&mut state).unwrap();
         } else {
-            let response = json!({"output": [file.clone()]});
-            super::collect_output_items(&response, &mut state, &[]);
+            let mut response = json!({"output": [file.clone()]});
+            super::collect_output_items(&mut response, &mut state, &[]);
         }
 
         assert_eq!(state.accumulated_output[0]["status"], "incomplete");
@@ -3878,12 +4172,12 @@ fn over_budget_file_search_with_reused_id_updates_only_rejected_history_item() {
         max_tool_calls: Some(1),
         ..ResponsesState::default()
     };
-    let response = json!({"output": [
+    let mut response = json!({"output": [
         {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["first"]},
         {"type": "file_search_call", "id": "fs_reused", "status": "searching", "results": ["second"]}
     ]});
 
-    super::collect_output_items(&response, &mut state, &[]);
+    super::collect_output_items(&mut response, &mut state, &[]);
 
     assert_eq!(state.file_search_assignments.len(), 1);
     assert_eq!(state.persisted_messages[0]["status"], "searching");

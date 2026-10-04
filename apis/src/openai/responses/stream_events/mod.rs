@@ -1017,13 +1017,7 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 ///
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
-/// the preflight transactional at the allocation peak. Function-call completion
-/// includes the event and its matched output item because the accumulator may
-/// clone the completed item into `tool_calls` while retaining the event.
-#[expect(
-    clippy::too_many_lines,
-    reason = "exhaustive per-event transactional projection accounting"
-)]
+/// the preflight transactional at the allocation peak.
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     events.iter().try_fold(0_usize, |used, event| {
@@ -1034,11 +1028,10 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             | ResponsesEvent::ResponseFailed(payload) => {
                 let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
                 let usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                // Terminal accumulation retains the response, clones completed
-                // calls out of its output, merges a distinct usage owner, and
-                // may insert that merged usage back into the response. Three
-                // response projections plus the prior usage size bound all of
-                // those simultaneous owners before the event is consumed.
+                // Terminal accumulation retains the response, merges a
+                // distinct usage owner, and may insert that merged usage back
+                // into the response. Three response projections plus prior
+                // usage bound those simultaneous owners before commit.
                 response_bytes.checked_mul(3)?.checked_add(usage_bytes)?
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
@@ -1053,27 +1046,11 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
                 let delta_bytes = payload.get("delta").and_then(Value::as_str).map_or(0, str::len);
                 key_bytes.checked_add(delta_bytes)?.checked_add(event_bytes)?
             },
-            ResponsesEvent::FunctionCallArgumentsDone(payload) => {
-                let matched_item = state.and_then(|state| {
-                    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str) {
-                        state
-                            .output_items()
-                            .iter()
-                            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
-                    } else {
-                        payload
-                            .get("output_index")
-                            .and_then(Value::as_u64)
-                            .and_then(|index| usize::try_from(index).ok())
-                            .and_then(|index| state.output_items().get(index))
-                    }
-                });
-                // Completion may own an extracted argument string, grow the
-                // canonical item, and clone that completed item into
-                // `tool_calls` before the event is consumed.
-                event_bytes
-                    .checked_mul(3)?
-                    .checked_add(matched_item.map_or(Some(0), retained_json_bytes)?)?
+            ResponsesEvent::FunctionCallArgumentsDone(_) => {
+                // Lowered client-tool completion can snapshot this item too.
+                // That copy is reserved against the live item during commit,
+                // including when added earlier in the same chunk.
+                event_bytes.checked_mul(3)?
             },
             // Other events can still acquire logical-stream bookkeeping keys
             // or grow their normalized payload before serialization.
@@ -1334,7 +1311,6 @@ fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsStat
             let mut meter = PayloadMeter::new(limit);
             meter.json(&responses.response_object)?;
             meter.json(&responses.local_completion_response_template)?;
-            meter.json_values(&responses.tool_calls)?;
             let bytes = meter.used();
             stream.shared_current_output_bytes.store(bytes, Ordering::Relaxed);
             Some(bytes)
@@ -1636,14 +1612,6 @@ fn parse_chunk_events(
 /// contributes to shared state, and the budget bounds total accumulated memory even
 /// when every individual event stays within `max_buffer_bytes`.
 ///
-/// The one accumulator whose growth is *not* bounded by the driving frame is the
-/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
-/// output item (whose payload arrived in an earlier frame) rather than the small
-/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
-/// it is actually performed and its size is known exactly, instead of being
-/// predicted here — so the byte budget cannot diverge from the item the commit
-/// retains, and no per-event history rescan is needed.
-///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
 /// stream cannot reset the counter between IRR rounds and accumulate unbounded
@@ -1777,22 +1745,18 @@ struct CommitChunkStaging {
 /// Split into two passes so both retained-state budgets are validated before any
 /// delivery milestone is recorded:
 ///
-/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
-///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
-///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
-///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
-///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
-///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
+/// - Phase 2a accumulates every event into the retained output (`output_items`, `response_object`) — the only state the
+///   count derives from, and state no delivery milestone depends on. Lowered-tool completion snapshots are admitted
+///   before cloning each completed item.
 /// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
 ///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
 ///   would trust for bytes the client never received (review finding: the former post-commit count check let an
 ///   already-executed tool's milestone survive a rejected chunk, dropping that tool from the client-visible stream).
 /// - Phase 2b records milestones and emits the logical bytes.
 ///
-/// On a rejected chunk phase 2a has already grown the retained output past a cap, so
+/// On a rejected count-overflow chunk phase 2a has already grown the retained output past a cap, so
 /// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
-/// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b's only
+/// later chunk and round. Phase 2b's only
 /// fallible step, the client-tool restoration plan pass (see
 /// [`restore_and_append_chunk`]), runs before any byte is appended or milestone is
 /// recorded, so a malformed lowered lifecycle fails the chunk closed with nothing
@@ -1816,14 +1780,15 @@ fn commit_chunk_events(
     };
 
     let result = (|| {
-        // The retained item count exists only after phase 2a grows it. Check before
-        // phase 2b records any client-visible delivery milestone.
+        // The retained item count only exists after phase 2a grows it. Enforce it here,
+        // before phase 2b records any delivery milestone, so a rejected chunk leaves no
+        // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
         if let Some(error) = accumulation_count_exceeded(state, ctx) {
             return Err(error);
         }
 
-        // Native passthrough has no restoration plan. For lowered traffic, measure
-        // event owners again after the shared state changes during accumulation.
+        // Restoration can add logical output after phase 2a has grown shared
+        // state. Admit that peak before recording a delivery milestone.
         let has_restoration_plan = ctx
             .extensions
             .get::<ResponsesState>()
@@ -1843,18 +1808,24 @@ fn commit_chunk_events(
             }
         }
 
-        // Phase 2b restores lowered client tools and emits the logical stream.
+        // Phase 2b: plan lowered client-tool restoration (fallible) then append every
+        // committed event to the logical stream applying its disposition (infallible).
         let logical_output = restore_and_append_chunk(state, ctx, events, &completions)?;
 
-        // The parser state is re-armed before request-side dispatchers run on the
-        // next IRR step, so the deferred sentinel must survive in shared state.
+        // Mirror the parser's deferred-`[DONE]` decision into shared response state,
+        // but only now that the whole chunk has parsed and committed. Filter-local
+        // parser state is re-armed before request-side dispatchers run on the next
+        // IRR step, so the sentinel must survive in shared state as well.
         if state.deferred_done
             && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
         {
             response_state.deferred_stream_done = true;
         }
+
         Ok(Some(logical_output))
     })();
+    // The restoration plan is the last owner of these snapshots. Release their
+    // aggregate charge on success and on every count/restore error.
     release_client_tool_completions(ctx, completions, completion_bytes);
     result
 }
@@ -1887,9 +1858,8 @@ fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
     }
 }
 
-/// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`,
-/// charge the retained-clone byte budget, and capture lowered client-tool
-/// completion artifacts for the phase-2b restore plan (#1159).
+/// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`
+/// and capture lowered client-tool completion artifacts for phase 2b (#1159).
 ///
 /// Split out of [`commit_chunk_events`] so the per-event byte charge and the
 /// artifact capture stay under one owner. Fails closed the instant the request-wide
@@ -1925,7 +1895,21 @@ fn accumulate_chunk(
             release_client_tool_completions(ctx, completions, completion_bytes);
             return Ok(None);
         }
-        let retained_clone_bytes = accumulate_event(ctx, state, event);
+        // A done event moves previously buffered arguments into the canonical
+        // output item. The filter-local owner shrinks, but the cached shared
+        // charge must grow before the next completion snapshot is admitted.
+        let transferred_arguments = if admission.shared_upper_bound.is_some() {
+            match event {
+                ResponsesEvent::FunctionCallArgumentsDone(payload) => tool_call_key(payload)
+                    .as_ref()
+                    .and_then(|key| state.tool_call_args.get(key))
+                    .map_or(Some(0), retained_json_bytes),
+                _ => Some(0),
+            }
+        } else {
+            Some(0)
+        };
+        accumulate_event(ctx, state, event);
         if matches!(
             event,
             ResponsesEvent::ResponseCompleted(_)
@@ -1940,41 +1924,13 @@ fn accumulate_chunk(
                 responses.mark_current_output_changed();
             }
         }
-        if matches!(event, ResponsesEvent::FunctionCallArgumentsDone(_))
-            && let Some(upper) = admission.shared_upper_bound.as_mut()
-        {
-            // A done event can grow the response item's arguments/status and
-            // retain one full tool-call clone. Two clone sizes plus the event
-            // JSON and field overhead bound both owners, including arguments
-            // previously held in the parser's delta buffer.
-            let growth = retained_clone_bytes
-                .checked_mul(2)
-                .and_then(|bytes| bytes.checked_add(retained_event_payload_bytes(event)?))
+        if let Some(upper) = admission.shared_upper_bound.as_mut() {
+            // The event projection bounds new copies; the transferred string
+            // bounds growth of the shared owner that held no such arguments.
+            let growth = projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event))
+                .and_then(|bytes| bytes.checked_add(transferred_arguments?))
                 .and_then(|bytes| bytes.checked_add(64));
             *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
-        } else if let Some(upper) = admission.shared_upper_bound.as_mut() {
-            // The preflight's clone projection also bounds the shared growth
-            // retained by an interleaved output, delta, or terminal event.
-            let growth = projected_responses_state_clone_bytes(ctx, std::slice::from_ref(event));
-            *upper = upper.checked_add(growth.unwrap_or(usize::MAX)).unwrap_or(usize::MAX);
-        }
-        // `function_call_arguments.done` can clone a completed item whose
-        // payload arrived in an earlier frame. Keep the stream byte cap sticky.
-        if retained_clone_bytes > 0 {
-            let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-            let Some(total) = responses.stream_accumulated_bytes.checked_add(retained_clone_bytes) else {
-                release_client_tool_completions(ctx, completions, completion_bytes);
-                return Err(SseParseError::AccumulationLimitExceeded {
-                    dimension: "accumulated_bytes",
-                    value: usize::MAX,
-                    limit: state.max_accumulated_bytes,
-                });
-            };
-            responses.stream_accumulated_bytes = total;
-            if let Some(error) = accumulation_bytes_exceeded(state, total) {
-                release_client_tool_completions(ctx, completions, completion_bytes);
-                return Err(error);
-            }
         }
         match capture_client_tool_completion(state, ctx, &mut completions, event, &mut admission) {
             Ok(Some(bytes)) => {
@@ -2150,8 +2106,9 @@ fn capture_client_tool_completion(
         release_client_tool_charge(ctx, snapshot_bytes);
         return Ok(None);
     };
-    // The plan needs an owned snapshot while later events may mutate shared
-    // output; the aggregate charge is released when the plan finishes.
+    // Necessary clone (AGENTS.md boundary): the restoration plan retains a
+    // completed lowered call while subsequent events can mutate shared output.
+    // It cannot hold a borrow of `ResponsesState` across that plan (#1159).
     completions.push(client_tools::ClientToolCompletion {
         key,
         item: item.clone(),

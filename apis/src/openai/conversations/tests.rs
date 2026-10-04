@@ -4089,6 +4089,79 @@ async fn on_response_body_appends_completed_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_false_buffered_canonical_output_appends_after_finalization() {
+    let (filter, store) = sqlite_harness().await;
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.store", "false");
+
+    let mut state = ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"canonical question"})],
+        response_object: serde_json::json!({
+            "id":"resp_canonical_conversation",
+            "object":"response",
+            "status":"completed",
+            "output":[]
+        }),
+        accumulated_output: vec![serde_json::json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"canonical answer"}]
+        })],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 64 * 1024);
+    let mut body = None;
+    state.finalize_response_body(&mut body).unwrap();
+    assert!(state.accumulated_output.is_empty());
+    assert_eq!(
+        state.response_object["output"][0]["content"][0]["text"],
+        "canonical answer"
+    );
+    ctx.extensions.insert(state);
+    mark_buffered_agentic_done(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        serde_json::from_slice::<Value>(body.as_ref().unwrap()).unwrap()["output"][0]["content"][0]["text"],
+        "canonical answer"
+    );
+
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let items = store
+        .list_conversation_items(&owner, &conv_id, None, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].item_data["content"][0]["text"], "canonical question");
+    assert_eq!(items[1].item_data["content"][0]["text"], "canonical answer");
+    assert!(
+        store
+            .get_response(&owner, "resp_canonical_conversation")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_false_buffered_append_rejects_before_response_headers() {
     let (filter, store) = sqlite_harness().await;
     let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;

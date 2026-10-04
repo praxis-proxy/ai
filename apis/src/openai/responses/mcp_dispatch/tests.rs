@@ -16,12 +16,13 @@ use serde_json::json;
 
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, aggregate_mcp_result_limit,
-    approval_resume_peak_fits, approved_tool_call_projection_bytes, build_error_result, build_success_result,
-    content_blocks_to_output, denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls,
-    execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
-    is_connector_tool_entry, is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits,
-    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
-    process_call_result, resolve_tool_entry, result_payload_limit,
+    approval_record_and_output_staging_bytes, approval_resume_peak_fits, approved_tool_call_projection_bytes,
+    build_error_result, build_success_result, check_single_approval, content_blocks_to_output,
+    denial_message_projection_bytes, discover_pending_connectors, execute_mcp_calls, execute_single_call,
+    extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry,
+    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, mcp_result_commit_fits, normalize_arguments,
+    parse_call_arguments, partition_calls_by_approval, prepare_response_round, process_call_result, resolve_tool_entry,
+    result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -644,17 +645,20 @@ fn append_results_rejects_when_incoming_result_staging_exceeds_budget() {
         "arguments": {}
     });
     let result = build_success_result("call_1", "weather", "get_weather", "{}", &"x".repeat(4096), false, None);
-    let mut state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call.clone()],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("function_call", vec![call.clone()]);
+        state
     };
     let current = state.retained_payload_bytes().unwrap();
     let staging = result.retained_bytes().unwrap() * 2;
     state.apply_retained_payload_limit(current + staging - 1);
 
     assert!(!mcp_result_commit_fits(&state, &[result]));
-    assert_eq!(state.tool_calls, vec![call]);
+    assert_eq!(state.selected_tool_calls()[0]["call_id"], call["call_id"]);
 }
 
 #[test]
@@ -664,18 +668,21 @@ fn aggregate_mcp_limit_reserves_staging_commit_and_result_ids_before_execution()
         "call_id": "call_1",
         "arguments": {}
     });
-    let mut state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("function_call", vec![call]);
+        state
     };
     let current = state.retained_payload_bytes().unwrap();
     let result_id_bytes = "call_1".len();
     let headroom = 1_100_000;
     state.apply_retained_payload_limit(current + result_id_bytes + headroom);
-    let calls = call_refs(&state.tool_calls);
+    let calls = state.selected_tool_calls();
 
-    let arguments = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    let arguments = super::mcp_argument_staging_bytes(&state.selected_tool_calls()[0]["arguments"]).unwrap();
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
@@ -707,14 +714,14 @@ fn aggregate_mcp_limit_rejects_when_tool_wire_envelope_exceeds_headroom() {
     let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
     let mut state = ResponsesState {
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call],
         ..ResponsesState::default()
     };
+    state.select_test_output("function_call", vec![call]);
     let current = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(current + 20_000);
 
     assert!(
-        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        aggregate_mcp_result_limit(&state, &state.selected_tool_calls(), 8_192).is_none(),
         "the tools/call wire envelope alone can exceed 20 KiB of request headroom"
     );
 }
@@ -724,15 +731,15 @@ fn aggregate_mcp_limit_reserves_parked_get_parser_before_execution() {
     let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": {}});
     let mut state = ResponsesState {
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call],
         ..ResponsesState::default()
     };
+    state.select_test_output("function_call", vec![call]);
     let current = state.retained_payload_bytes().unwrap();
     // The old wire/result reservation admitted this call with 200 KiB of
     // headroom, although a session-ID server could park a live GET parser.
     state.apply_retained_payload_limit(current + 200_000);
     assert!(
-        aggregate_mcp_result_limit(&state, &call_refs(&state.tool_calls), 8_192).is_none(),
+        aggregate_mcp_result_limit(&state, &state.selected_tool_calls(), 8_192).is_none(),
         "the standalone GET parser must be reserved before an external tool call"
     );
 }
@@ -744,7 +751,7 @@ fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
         mcp_tool_map: sample_tool_map(),
         ..ResponsesState::default()
     };
-    state.tool_calls = vec![call];
+    state.select_test_output("function_call", vec![call]);
     let without_pool = state.retained_payload_bytes().unwrap();
     let state_only = state
         .retained_payload_bytes_bounded_without_external(usize::MAX)
@@ -757,7 +764,7 @@ fn aggregate_mcp_limit_reserves_initialize_and_parked_peer_info() {
         Some(state_only)
     );
     state.apply_retained_payload_limit(current + 4 * crate::mcp_client::MIN_TOOL_INITIALIZE_BYTES - 1);
-    let calls = call_refs(&state.tool_calls);
+    let calls = state.selected_tool_calls();
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
 }
 
@@ -769,20 +776,23 @@ fn aggregate_mcp_limit_reserves_argument_normalization_before_execution() {
         "call_id": "call_1",
         "arguments": arguments
     });
-    let mut state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("function_call", vec![call]);
+        state
     };
     let current = state.retained_payload_bytes().unwrap();
-    let argument_staging = super::mcp_argument_staging_bytes(&state.tool_calls[0]["arguments"]).unwrap();
+    let argument_staging = super::mcp_argument_staging_bytes(&state.selected_tool_calls()[0]["arguments"]).unwrap();
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let Some(McpToolMatch::Unique { entry, .. }) = tool_index.get("weather__get_weather") else {
         panic!("weather tool must resolve")
     };
     let entry_staging = retained_json_bytes(entry).unwrap();
     state.apply_retained_payload_limit(current + "call_1".len() + argument_staging + entry_staging - 1);
-    let calls = call_refs(&state.tool_calls);
+    let calls = state.selected_tool_calls();
 
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
 }
@@ -793,13 +803,13 @@ fn exponent_arguments_reject_before_dispatch_normalization() {
     let call = json!({"name": "weather__get_weather", "call_id": "call_1", "arguments": arguments});
     let mut state = ResponsesState {
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![call],
         ..ResponsesState::default()
     };
-    let (parsed, copied_text) = normalize_arguments(&state.tool_calls[0]["arguments"]).unwrap();
+    state.select_test_output("function_call", vec![call]);
+    let (parsed, copied_text) = normalize_arguments(&state.selected_tool_calls()[0]["arguments"]).unwrap();
     let live_peak = state.retained_payload_bytes().unwrap() + retained_json_bytes(&parsed).unwrap() + copied_text.len();
     state.apply_retained_payload_limit(live_peak - 1);
-    let calls = call_refs(&state.tool_calls);
+    let calls = state.selected_tool_calls();
     assert_eq!(aggregate_mcp_result_limit(&state, &calls, 8_192), None);
 }
 
@@ -824,7 +834,7 @@ fn exponent_arguments_reject_before_approval_claim() {
         ..ResponsesState::default()
     };
     super::apply_decision(&mut committed, &decision);
-    let (parsed, copied_text) = normalize_arguments(&committed.tool_calls[0]["arguments"]).unwrap();
+    let (parsed, copied_text) = normalize_arguments(&committed.approved_tool_calls[0]["arguments"]).unwrap();
     let live_peak =
         committed.retained_payload_bytes().unwrap() + retained_json_bytes(&parsed).unwrap() + copied_text.len();
     state.apply_retained_payload_limit(live_peak - 1);
@@ -2052,13 +2062,19 @@ fn response_hook_is_execution_only_noop() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        mcp_tool_map: auto_approval_tool_map(),
-        tool_calls: vec![json!({
-            "name": "weather__get_weather",
-            "call_id": "c1"
-        })],
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_tool_map: auto_approval_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "name": "weather__get_weather",
+                "call_id": "c1"
+            })],
+        );
+        state
     });
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -2080,13 +2096,19 @@ fn response_hook_is_execution_only_noop() {
 
 #[test]
 fn prepare_response_round_keeps_executable_calls() {
-    let mut state = ResponsesState {
-        mcp_tool_map: auto_approval_tool_map(),
-        tool_calls: vec![json!({
-            "name": "weather__get_weather",
-            "call_id": "c1"
-        })],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: auto_approval_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "name": "weather__get_weather",
+                "call_id": "c1"
+            })],
+        );
+        state
     };
 
     prepare_response_round(&mut state, 1).unwrap();
@@ -2120,11 +2142,14 @@ fn prepare_response_round_rejects_invalid_call_ids() {
             })],
         ),
     ] {
-        let mut state = ResponsesState {
-            mcp_tool_map: auto_approval_tool_map(),
-            tool_calls: calls,
-            accumulated_output: accumulated,
-            ..ResponsesState::default()
+        let mut state = {
+            let mut state = ResponsesState {
+                mcp_tool_map: auto_approval_tool_map(),
+                accumulated_output: accumulated,
+                ..ResponsesState::default()
+            };
+            state.select_test_output("function_call", calls);
+            state
         };
 
         let failure = prepare_response_round(&mut state, 2).unwrap_err();
@@ -2140,13 +2165,19 @@ fn prepare_response_round_rejects_invalid_call_ids() {
 
 #[test]
 fn prepare_response_round_enforces_configured_cap() {
-    let mut state = ResponsesState {
-        mcp_tool_map: auto_approval_tool_map(),
-        tool_calls: vec![
-            json!({"name":"weather__get_weather", "call_id":"c1"}),
-            json!({"name":"docs__search_docs", "call_id":"c2"}),
-        ],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: auto_approval_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![
+                json!({"name":"weather__get_weather", "call_id":"c1"}),
+                json!({"name":"docs__search_docs", "call_id":"c2"}),
+            ],
+        );
+        state
     };
 
     let failure = prepare_response_round(&mut state, 1).unwrap_err();
@@ -2160,15 +2191,21 @@ fn prepare_response_round_enforces_configured_cap() {
 
 #[test]
 fn prepare_response_round_emits_resumable_approval() {
-    let mut state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({
-            "name": "weather__get_weather",
-            "call_id": "c1",
-            "arguments": "{\"city\":\"Paris\"}"
-        })],
-        store_persist_armed: true,
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            store_persist_armed: true,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "name": "weather__get_weather",
+                "call_id": "c1",
+                "arguments": "{\"city\":\"Paris\"}"
+            })],
+        );
+        state
     };
 
     prepare_response_round(&mut state, 1).unwrap();
@@ -2179,26 +2216,40 @@ fn prepare_response_round_emits_resumable_approval() {
     );
     assert_eq!(state.mcp_approval_state, McpApprovalState::ApprovalPendingThenReturn);
     assert_eq!(state.pending_approvals.len(), 1);
-    assert_eq!(state.accumulated_output.len(), 1);
-    assert_eq!(state.accumulated_output[0]["type"], "mcp_approval_request");
-    assert_eq!(state.accumulated_output[0]["id"], "c1");
     assert_eq!(
-        state.accumulated_output[0]["arguments"], "{\"city\":\"Paris\"}",
+        state.accumulated_output.len(),
+        2,
+        "model call and approval request remain canonical"
+    );
+    let approval = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("gated call should emit an approval request");
+    assert_eq!(approval["id"], "c1");
+    assert_eq!(
+        approval["arguments"], "{\"city\":\"Paris\"}",
         "approval arguments must remain encoded exactly once"
     );
 }
 
 #[test]
 fn prepare_response_round_rejects_approval_before_output_projection() {
-    let mut state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({
-            "name": "weather__get_weather",
-            "call_id": "c1",
-            "arguments": "x".repeat(16_384)
-        })],
-        store_persist_armed: true,
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            store_persist_armed: true,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "name": "weather__get_weather",
+                "call_id": "c1",
+                "arguments": "x".repeat(16_384)
+            })],
+        );
+        state
     };
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
 
@@ -2221,10 +2272,13 @@ fn prepare_response_round_rejects_escaped_approval_output_before_recording() {
     });
     let mut state = ResponsesState {
         mcp_tool_map: HashMap::from([((label, "tool".to_owned()), entry)]),
-        tool_calls: vec![json!({"name": name, "call_id": "call_1", "arguments": "{}"})],
         store_persist_armed: true,
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "function_call",
+        vec![json!({"name": name, "call_id": "call_1", "arguments": "{}"})],
+    );
     let before = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(before + 300_000);
 
@@ -2238,20 +2292,82 @@ fn prepare_response_round_rejects_escaped_approval_output_before_recording() {
 }
 
 #[test]
+fn prepare_response_round_reserves_executable_assignment_ids_with_approval() {
+    let approval_label = "\u{1}".repeat(65_536);
+    let approval_name = encode_function_name(&approval_label, "tool");
+    let executable_id = "e".repeat(16_384);
+    let mut state = ResponsesState {
+        mcp_tool_map: HashMap::from([
+            (
+                (approval_label.clone(), "tool".to_owned()),
+                json!({
+                    "server_label": approval_label,
+                    "server_url": "https://example.com/approval",
+                    "require_approval": "always"
+                }),
+            ),
+            (
+                ("weather".to_owned(), "get_weather".to_owned()),
+                json!({
+                    "server_label": "weather",
+                    "server_url": "https://example.com/weather",
+                    "require_approval": "never"
+                }),
+            ),
+        ]),
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+    state.select_test_output(
+        "function_call",
+        vec![
+            json!({"id":"pending", "name":approval_name, "call_id":"approval_call", "arguments":"{}"}),
+            json!({"id":executable_id, "name":"weather__get_weather", "call_id":"weather_call", "arguments":"{}"}),
+        ],
+    );
+    let pending_staging = {
+        let index = McpToolIndex::new(&state.mcp_tool_map);
+        let pending = state
+            .selected_tool_calls()
+            .into_iter()
+            .filter_map(|call| check_single_approval(call, &index))
+            .collect::<Vec<_>>();
+        assert_eq!(pending.len(), 1);
+        approval_record_and_output_staging_bytes(&pending).unwrap()
+    };
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + pending_staging + 16_384 - 1);
+    assert!(state.can_retain_payload(pending_staging));
+
+    let failure = prepare_response_round(&mut state, 2).expect_err("the copied executable ID must fit before approval");
+
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.pending_approvals.is_empty());
+    assert!(state.locally_executed_output_items.is_empty());
+}
+
+#[test]
 fn prepare_response_round_rejects_unresumable_approval() {
     for (request_body, expected_status) in [
         (json!({"model":"gpt-4.1", "store":false}), 400),
         (json!({"model":"gpt-4.1"}), 500),
     ] {
-        let mut state = ResponsesState {
-            request_body,
-            mcp_tool_map: sample_tool_map(),
-            tool_calls: vec![json!({
-                "name": "weather__get_weather",
-                "call_id": "c1"
-            })],
-            store_persist_armed: false,
-            ..ResponsesState::default()
+        let mut state = {
+            let mut state = ResponsesState {
+                request_body,
+                mcp_tool_map: sample_tool_map(),
+                store_persist_armed: false,
+                ..ResponsesState::default()
+            };
+            state.select_test_output(
+                "function_call",
+                vec![json!({
+                    "name": "weather__get_weather",
+                    "call_id": "c1"
+                })],
+            );
+            state
         };
 
         let failure = prepare_response_round(&mut state, 1).unwrap_err();
@@ -2266,7 +2382,10 @@ fn prepare_response_round_rejects_unresumable_approval() {
             "a rejected approval must not create durable pending state"
         );
         assert!(
-            state.accumulated_output.is_empty(),
+            state
+                .accumulated_output
+                .iter()
+                .all(|item| item["type"] != "mcp_approval_request"),
             "a rejected approval must not emit a stranded approval request"
         );
     }
@@ -2281,30 +2400,36 @@ fn prepare_response_round_partitions_gated_and_executable_calls() {
     tool_map
         .get_mut(&("docs".to_owned(), "search_docs".to_owned()))
         .unwrap()["require_approval"] = json!("never");
-    let mut state = ResponsesState {
-        mcp_tool_map: tool_map,
-        tool_calls: vec![
-            json!({"name":"weather__get_weather", "call_id":"c1", "arguments":"{}"}),
-            json!({"name":"docs__search_docs", "call_id":"c2", "arguments":"{}"}),
-        ],
-        store_persist_armed: true,
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: tool_map,
+            store_persist_armed: true,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![
+                json!({"name":"weather__get_weather", "call_id":"c1", "arguments":"{}"}),
+                json!({"name":"docs__search_docs", "call_id":"c2", "arguments":"{}"}),
+            ],
+        );
+        state
     };
 
     prepare_response_round(&mut state, 2).unwrap();
 
     assert_eq!(state.mcp_approval_state, McpApprovalState::ExecuteUngatedThenReturn);
-    assert_eq!(
-        state.tool_calls,
-        vec![json!({
-            "name":"docs__search_docs",
-            "call_id":"c2",
-            "arguments":"{}"
-        })],
-        "only the ungated sibling remains executable"
-    );
-    assert_eq!(state.accumulated_output[0]["type"], "mcp_approval_request");
-    assert_eq!(state.accumulated_output[0]["id"], "c1");
+    let executable = state.selected_tool_calls();
+    assert_eq!(executable.len(), 1, "only the ungated sibling remains executable");
+    assert_eq!(executable[0]["name"], "docs__search_docs");
+    assert_eq!(executable[0]["call_id"], "c2");
+    assert_eq!(executable[0]["arguments"], "{}");
+    let approval = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("gated call should emit an approval request");
+    assert_eq!(approval["id"], "c1");
 }
 
 #[test]
@@ -2439,24 +2564,27 @@ async fn configured_deferred_connector_missing_assertion_records_security_failur
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
     let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-    ctx.extensions.insert(ResponsesState {
-        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
-        deferred_mcp: vec![DeferredMcpConnector {
-            authorization: None,
-            allowed_tools: None,
-            connector_id: "corp_drive".to_owned(),
-            headers: None,
-            max_rewritten_body_bytes: 67_108_864,
-            max_tools: 128,
-            require_approval: None,
-            server_label: "drive".to_owned(),
-            server_url: "https://mcp.example/mcp".to_owned(),
-            timeout: std::time::Duration::from_secs(1),
-        }],
-        tool_search_calls: vec![search.clone()],
-        accumulated_output: vec![search.clone()],
-        response_object: json!({"output": [search]}),
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+            deferred_mcp: vec![DeferredMcpConnector {
+                authorization: None,
+                allowed_tools: None,
+                connector_id: "corp_drive".to_owned(),
+                headers: None,
+                max_rewritten_body_bytes: 67_108_864,
+                max_tools: 128,
+                require_approval: None,
+                server_label: "drive".to_owned(),
+                server_url: "https://mcp.example/mcp".to_owned(),
+                timeout: std::time::Duration::from_secs(1),
+            }],
+            accumulated_output: vec![search.clone()],
+            response_object: json!({"output": [search]}),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("tool_search_call", vec![search.clone()]);
+        state
     });
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
 
@@ -2487,16 +2615,22 @@ async fn configured_connector_call_missing_assertion_records_security_failure_be
             "name": "search"
         }),
     );
-    ctx.extensions.insert(ResponsesState {
-        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
-        mcp_tool_map: tool_map,
-        tool_calls: vec![json!({
-            "type": "function_call",
-            "name": encode_function_name("drive", "search"),
-            "call_id": "call_1",
-            "arguments": "{}"
-        })],
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+            mcp_tool_map: tool_map,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "type": "function_call",
+                "name": encode_function_name("drive", "search"),
+                "call_id": "call_1",
+                "arguments": "{}"
+            })],
+        );
+        state
     });
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
 
@@ -2527,16 +2661,22 @@ async fn connector_call_rejects_dispatch_context_policy_mismatch_before_dispatch
             "name": "search"
         }),
     );
-    ctx.extensions.insert(ResponsesState {
-        mcp_connector_context_policy: McpConnectorContextPolicy::new(Some("different_bearer"), None),
-        mcp_tool_map: tool_map,
-        tool_calls: vec![json!({
-            "type": "function_call",
-            "name": encode_function_name("drive", "search"),
-            "call_id": "call_1",
-            "arguments": "{}"
-        })],
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_connector_context_policy: McpConnectorContextPolicy::new(Some("different_bearer"), None),
+            mcp_tool_map: tool_map,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({
+                "type": "function_call",
+                "name": encode_function_name("drive", "search"),
+                "call_id": "call_1",
+                "arguments": "{}"
+            })],
+        );
+        state
     });
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
 
@@ -2563,24 +2703,27 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-    ctx.extensions.insert(ResponsesState {
-        deferred_mcp: vec![DeferredMcpConnector {
-            authorization: None,
-            allowed_tools: None,
-            connector_id: "corp_drive".to_owned(),
-            headers: None,
-            max_rewritten_body_bytes: 67_108_864,
-            max_tools: 128,
-            require_approval: None,
-            server_label: "drive".to_owned(),
-            server_url,
-            timeout: std::time::Duration::from_secs(1),
-        }],
-        max_tool_calls: Some(0),
-        tool_search_calls: vec![search.clone()],
-        accumulated_output: vec![search.clone()],
-        response_object: json!({"output": [search]}),
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            deferred_mcp: vec![DeferredMcpConnector {
+                authorization: None,
+                allowed_tools: None,
+                connector_id: "corp_drive".to_owned(),
+                headers: None,
+                max_rewritten_body_bytes: 67_108_864,
+                max_tools: 128,
+                require_approval: None,
+                server_label: "drive".to_owned(),
+                server_url,
+                timeout: std::time::Duration::from_secs(1),
+            }],
+            max_tool_calls: Some(0),
+            accumulated_output: vec![search.clone()],
+            response_object: json!({"output": [search]}),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("tool_search_call", vec![search.clone()]);
+        state
     });
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
 
@@ -2623,8 +2766,7 @@ async fn deferred_budget_failure_skips_successful_response_persistence() {
         ..ResponsesState::default()
     };
     let search = json!({"type": "tool_search_call", "id": "tsc_budget"});
-    state.tool_search_calls = vec![search.clone()];
-    state.accumulated_output = vec![search.clone()];
+    state.select_test_output("tool_search_call", vec![search.clone()]);
     state.response_object = json!({"output": [search]});
     state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
     ctx.extensions.insert(state);
@@ -2690,7 +2832,10 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
         server_url,
         timeout: std::time::Duration::from_secs(1),
     }];
-    state.tool_search_calls = vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})],
+    );
     ctx.extensions.insert(state);
 
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -2755,8 +2900,7 @@ fn bodyless_deferred_failure_does_not_copy_full_retained_request_for_echo() {
         timeout: std::time::Duration::from_secs(1),
     }];
     let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-    state.tool_search_calls = vec![search.clone()];
-    state.accumulated_output = vec![search.clone()];
+    state.select_test_output("tool_search_call", vec![search.clone()]);
     state.response_object = json!({"output": [search]});
     let retained = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(retained + 25 * 1024 * 1024);
@@ -2796,10 +2940,16 @@ async fn on_request_body_executes_and_appends_results_before_proxy_serialization
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
-    let state = ResponsesState {
-        mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})],
-        ..ResponsesState::default()
+    let state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: sample_tool_map(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})],
+        );
+        state
     };
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
@@ -2827,17 +2977,23 @@ async fn max_tool_calls_does_not_gate_mcp_execution() {
     for entry in tool_map.values_mut() {
         entry["require_approval"] = json!("never");
     }
-    ctx.extensions.insert(ResponsesState {
-        mcp_tool_map: tool_map,
-        // A zero built-in budget must not block MCP execution: MCP is exempt and
-        // bounded only by its own per-round limit.
-        max_tool_calls: Some(0),
-        tool_calls: vec![
-            json!({"name":"weather__get_weather", "call_id":"c1", "arguments":{}}),
-            json!({"name":"docs__search_docs", "call_id":"c2", "arguments":{}}),
-        ],
-        response_object: json!({"id":"resp_limit", "object":"response", "status":"completed", "output":[]}),
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_tool_map: tool_map,
+            // A zero built-in budget must not block MCP execution: MCP is exempt and
+            // bounded only by its own per-round limit.
+            max_tool_calls: Some(0),
+            response_object: json!({"id":"resp_limit", "object":"response", "status":"completed", "output":[]}),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![
+                json!({"name":"weather__get_weather", "call_id":"c1", "arguments":{}}),
+                json!({"name":"docs__search_docs", "call_id":"c2", "arguments":{}}),
+            ],
+        );
+        state
     });
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
 
@@ -2846,17 +3002,17 @@ async fn max_tool_calls_does_not_gate_mcp_execution() {
     assert!(matches!(action, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(state.tool_calls.is_empty(), "executed MCP calls are cleared");
-    assert_eq!(
-        state.accumulated_output.len(),
-        2,
-        "both MCP calls execute despite max_tool_calls=0"
-    );
+    let mcp_results: Vec<_> = state
+        .accumulated_output
+        .iter()
+        .filter(|item| item["type"] == "mcp_call")
+        .collect();
+    assert_eq!(mcp_results.len(), 2, "both MCP calls execute despite max_tool_calls=0");
     assert!(
-        state.accumulated_output.iter().all(|item| {
-            item["type"] == "mcp_call"
-                && item["error"]
-                    .as_str()
-                    .is_none_or(|error| !error.contains("max_tool_calls"))
+        mcp_results.iter().all(|item| {
+            item["error"]
+                .as_str()
+                .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
         "MCP results must never carry a max_tool_calls rejection"
     );
@@ -2876,32 +3032,38 @@ async fn deferred_web_limit_does_not_gate_mcp_siblings() {
     for entry in tool_map.values_mut() {
         entry["require_approval"] = json!("never");
     }
-    ctx.extensions.insert(ResponsesState {
-        mcp_tool_map: tool_map,
-        max_tool_calls: Some(1),
-        // A sibling web-search dispatcher already exhausted the built-in budget.
-        deferred_tool_limit_completion: true,
-        tool_calls: vec![
-            json!({"name":"weather__get_weather", "call_id":"mcp_1", "arguments":{}}),
-            json!({"name":"docs__search_docs", "call_id":"mcp_2", "arguments":{}}),
-        ],
-        accumulated_output: vec![
-            json!({"type":"web_search_call", "id":"ws_1", "status":"completed"}),
-            json!({"type":"web_search_call", "id":"ws_2", "status":"failed"}),
-        ],
-        response_object: json!({"id":"resp_mixed", "object":"response", "status":"completed", "output":[]}),
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_tool_map: tool_map,
+            max_tool_calls: Some(1),
+            // A sibling web-search dispatcher already exhausted the built-in budget.
+            deferred_tool_limit_completion: true,
+            accumulated_output: vec![
+                json!({"type":"web_search_call", "id":"ws_1", "status":"completed"}),
+                json!({"type":"web_search_call", "id":"ws_2", "status":"failed"}),
+            ],
+            response_object: json!({"id":"resp_mixed", "object":"response", "status":"completed", "output":[]}),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![
+                json!({"name":"weather__get_weather", "call_id":"mcp_1", "arguments":{}}),
+                json!({"name":"docs__search_docs", "call_id":"mcp_2", "arguments":{}}),
+            ],
+        );
+        state
     });
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.accumulated_output.len(), 4);
+    assert_eq!(state.accumulated_output.len(), 6);
     assert_eq!(state.accumulated_output[0]["id"], "ws_1");
     assert_eq!(state.accumulated_output[1]["id"], "ws_2");
     assert!(
-        state.accumulated_output[2..].iter().all(|item| {
+        state.accumulated_output[4..].iter().all(|item| {
             item["type"] == "mcp_call"
                 && item["error"]
                     .as_str()
@@ -2954,10 +3116,13 @@ fn resolve_to_dispatch_encoded_name_roundtrip() {
         json!({"name": "plain_function", "call_id": "c2"}),
     ];
 
-    let mut state = ResponsesState {
-        mcp_tool_map: tool_map.clone(),
-        tool_calls: tool_calls.clone(),
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            mcp_tool_map: tool_map.clone(),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("function_call", tool_calls.clone());
+        state
     };
 
     prepare_response_round(&mut state, 1).unwrap();
@@ -2987,10 +3152,16 @@ async fn resolve_to_dispatch_execute_with_original_name() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        mcp_tool_map: tool_map,
-        tool_calls: vec![json!({"name": encoded_name, "call_id": "c1", "arguments": "{\"city\":\"NYC\"}"})],
-        ..ResponsesState::default()
+    ctx.extensions.insert({
+        let mut state = ResponsesState {
+            mcp_tool_map: tool_map,
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "function_call",
+            vec![json!({"name": encoded_name, "call_id": "c1", "arguments": "{\"city\":\"NYC\"}"})],
+        );
+        state
     });
 
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
@@ -3000,14 +3171,13 @@ async fn resolve_to_dispatch_execute_with_original_name() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.messages.is_empty(), "should append result messages");
 
-    let output = &state.accumulated_output;
-    assert!(!output.is_empty(), "should append output items to accumulated_output");
-    assert_eq!(output[0]["type"], "mcp_call");
-    assert_eq!(
-        output[0]["name"], tool_name,
-        "should use original tool name, not encoded"
-    );
-    assert_eq!(output[0]["server_label"], label);
+    let output = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["type"] == "mcp_call")
+        .expect("should append MCP result to accumulated_output");
+    assert_eq!(output["name"], tool_name, "should use original tool name, not encoded");
+    assert_eq!(output["server_label"], label);
     assert!(state.tool_calls.is_empty(), "should clear executed MCP tool calls");
 }
 

@@ -513,8 +513,8 @@ impl ResponseStoreFilter {
                 return false;
             };
             // Completed output stays unchanged across ordinary text deltas. Measure
-            // its three independent JSON owners once per revision, just as the
-            // stream parser does for its own filter-local admission checks.
+            // its response and template owners once per revision. Canonical
+            // tool-call assignments retain only IDs, charged by ResponsesState.
             let Some(remaining) = limit.checked_sub(stable) else {
                 ctx.extensions.insert(state);
                 return false;
@@ -524,7 +524,6 @@ impl ResponseStoreFilter {
                 || current_output_meter
                     .json(&responses.local_completion_response_template)
                     .is_none()
-                || current_output_meter.json_values(&responses.tool_calls).is_none()
             {
                 ctx.extensions.insert(state);
                 return false;
@@ -1057,7 +1056,8 @@ impl StoreStableCache {
         let mut meter = PayloadMeter::new(limit.checked_sub(self.bytes)?);
         meter.json(&state.response_object)?;
         meter.json(&state.local_completion_response_template)?;
-        meter.json_values(&state.tool_calls)?;
+        // Canonical tool-call assignments are charged by ResponsesState's
+        // inner meter; this cache owns only the two changing response trees.
         self.current_output_bytes = meter.used();
         self.current_output_revision = revision;
         Some(())
@@ -3098,7 +3098,10 @@ mod encode_replay_event_tests {
         capture_request_input, encode_replay_event, encoded_column_headroom, persistence_budget_failure,
         persistence_construction_fits,
     };
-    use crate::openai::responses::{ObservedResponsesSse, state::ResponsesState};
+    use crate::openai::responses::{
+        ObservedResponsesSse,
+        state::{OutputAssignment, ResponsesState},
+    };
 
     #[test]
     fn encoded_responses_are_not_persistable() {
@@ -4224,10 +4227,12 @@ mod encode_replay_event_tests {
             ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
-        let call = json!({"type": "function_call", "arguments": "x".repeat(512 * 1_024)});
+        let call = json!({"type": "function_call", "id": "fc_stable", "arguments": "x".repeat(512 * 1_024)});
+        let assignment = OutputAssignment::new(0, &call).unwrap();
         let mut responses = ResponsesState {
             response_object: json!({"output": [call.clone()]}),
-            tool_calls: vec![call],
+            accumulated_output: vec![call],
+            tool_calls: vec![assignment],
             ..ResponsesState::default()
         };
         responses.apply_retained_payload_limit(4 * 1_048_576);
@@ -4240,7 +4245,11 @@ mod encode_replay_event_tests {
             .unwrap()
             .shared_stable_bytes
             .unwrap();
-        assert!(cache.current_output_bytes > 1_048_576);
+        assert!(cache.current_output_bytes > 512 * 1_024);
+        assert!(
+            cache.current_output_bytes < 1_048_576,
+            "the assignment does not own another full call"
+        );
 
         for _ in 0..200 {
             assert!(filter.capture_stream_events(&mut ctx, &frame, false));

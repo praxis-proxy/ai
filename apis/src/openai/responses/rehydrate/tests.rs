@@ -9,7 +9,10 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    openai::sse::{SseFrame, SseFrameParser},
+    openai::{
+        responses::state::OutputAssignment,
+        sse::{SseFrame, SseFrameParser},
+    },
     store::{
         ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
         ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
@@ -1417,6 +1420,80 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
+async fn non_create_operations_rehydrate_small_history_with_agentic_budget() {
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
+        .expect("valid budget policy");
+    let stored = json!([{"role": "user", "content": "Earlier turn"}]);
+
+    for path in ["/v1/responses/input_tokens", "/v1/responses/compact"] {
+        for use_conversation in [false, true] {
+            let store = if use_conversation {
+                MockStore::with_conversation("conv_prev", stored.clone())
+            } else {
+                MockStore::with_completed_response("resp_prev", json!("Earlier turn"), stored.clone())
+            };
+            let registry = setup_registry(store);
+            let req = crate::test_utils::make_request(http::Method::POST, path);
+            let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+            ctx.extensions.insert(registry);
+            ctx.extensions.insert(policy);
+            ctx.set_metadata("openai_responses_format.format", "openai_responses");
+            ctx.set_metadata("responses.store_request_payload_bytes", "0");
+            assert!(ctx.extensions.get::<ResponsesState>().is_none());
+            let selector = if use_conversation {
+                json!({"conversation": "conv_prev"})
+            } else {
+                json!({"previous_response_id": "resp_prev"})
+            };
+            let mut request_body = json!({"model": "gpt-4.1", "input": "Count this"});
+            request_body
+                .as_object_mut()
+                .unwrap()
+                .extend(selector.as_object().unwrap().clone());
+            let mut body = Some(Bytes::from(request_body.to_string()));
+
+            let action = default_filter()
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "{path}, conversation={use_conversation}: {action:?}"
+            );
+            let state = ctx.extensions.get::<ResponsesState>().expect("history was rehydrated");
+            assert!(state.history_rehydrated);
+            assert_eq!(state.messages[0]["content"], "Earlier turn");
+            assert_eq!(state.retained_payload_limit(), Some(65_536));
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_create_history_read_still_rejects_oversized_record() {
+    let store = MockStore::with_completed_response(
+        "resp_large",
+        json!("Earlier turn"),
+        json!([{"role": "user", "content": "x".repeat(8_192)}]),
+    );
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(setup_registry(store));
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Count","previous_response_id":"resp_large"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
 async fn token_count_without_history_does_not_use_create_body_allowance() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -2777,14 +2854,17 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
 #[test]
 fn streaming_restore_reuses_completed_output_across_small_fragments() {
     let mut state = rehydrated_state("resp_prev");
-    let call = json!({"type": "function_call", "arguments": "x".repeat(512 * 1_024)});
+    let call = json!({"type": "function_call", "id": "fc_stable", "arguments": "x".repeat(512 * 1_024)});
+    let assignment = OutputAssignment::new(state.accumulated_output.len(), &call).unwrap();
     state.response_object = json!({"output": [call.clone()]});
-    state.tool_calls.push(call);
+    state.accumulated_output.push(call);
+    state.tool_calls.push(assignment);
     let baseline = state.retained_payload_bytes().unwrap();
     state.apply_retained_payload_limit(baseline + 128);
     let mut stable_budget = None;
     assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
-    assert!(stable_budget.unwrap().current_output_bytes > 1_048_576);
+    assert!(stable_budget.unwrap().current_output_bytes > 512 * 1_024);
+    assert!(stable_budget.unwrap().current_output_bytes < 1_048_576);
 
     for _ in 0..200 {
         assert!(streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16));
@@ -4462,21 +4542,15 @@ impl ResponseStore for MockStore {
 
     async fn get_response_bounded(
         &self,
-        tenant_id: &StateOwner,
+        owner: &StateOwner,
         id: &str,
         max_bytes: usize,
     ) -> Result<Option<ResponseRecord>, StoreError> {
-        if let Some(record) = self.records.get(id).filter(|record| &record.owner == tenant_id) {
-            let bytes = [&record.response_object, &record.input, &record.messages]
-                .iter()
-                .try_fold(0_usize, |used, value| {
-                    super::super::state::retained_json_bytes(*value).and_then(|bytes| used.checked_add(bytes))
-                });
-            if bytes.is_none_or(|bytes| bytes > max_bytes) {
-                return Err(StoreError::PayloadTooLarge);
-            }
+        let record = self.get_response(owner, id).await?;
+        if let Some(record) = &record {
+            bounded_mock_json(&[&record.response_object, &record.input, &record.messages], max_bytes)?;
         }
-        ResponseStore::get_response(self, tenant_id, id).await
+        Ok(record)
     }
 
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {
@@ -4579,23 +4653,29 @@ impl ResponseStore for MockStore {
 
     async fn get_conversation_bounded(
         &self,
-        tenant_id: &StateOwner,
-        conversation_id: &str,
+        owner: &StateOwner,
+        id: &str,
         max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        if let Some(record) = self
-            .conversations
-            .get(conversation_id)
-            .filter(|record| &record.owner == tenant_id)
-        {
-            let bytes = super::super::state::retained_json_bytes(&record.metadata)
-                .and_then(|metadata| super::super::state::retained_json_bytes(&record.messages)?.checked_add(metadata));
-            if bytes.is_none_or(|bytes| bytes > max_bytes) {
-                return Err(StoreError::PayloadTooLarge);
-            }
+        let record = ResponseStore::get_conversation(self, owner, id).await?;
+        if let Some(record) = &record {
+            bounded_mock_json(&[&record.metadata, &record.messages], max_bytes)?;
         }
-        ResponseStore::get_conversation(self, tenant_id, conversation_id).await
+        Ok(record)
     }
+}
+
+/// Model the store's bounded-column contract for policy tests. The production
+/// backends preflight before materializing these values; this mock already owns
+/// the records in memory.
+fn bounded_mock_json(values: &[&Value], max_bytes: usize) -> Result<(), StoreError> {
+    let used = values.iter().try_fold(0_usize, |used, value| {
+        used.checked_add(crate::openai::responses::state::retained_json_bytes(*value)?)
+    });
+    if used.is_none_or(|used| used > max_bytes) {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(())
 }
 
 fn setup_registry(store: MockStore) -> ResponseStoreRegistry {

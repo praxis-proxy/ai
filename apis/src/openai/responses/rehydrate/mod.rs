@@ -142,9 +142,10 @@ impl RehydrateFilter {
         if let Some(action) = super::initial_budget_rejection(ctx, bytes) {
             return Ok(action);
         }
+        let raw_body_bytes = bytes.len();
         match parse_body_and_extract_id(bytes) {
-            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id, bytes.len()).await,
-            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body, bytes.len()).await,
+            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id, raw_body_bytes).await,
+            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body, raw_body_bytes).await,
             Err(action) => Ok(action),
         }
     }
@@ -155,13 +156,13 @@ impl RehydrateFilter {
         ctx: &mut HttpFilterContext<'_>,
         parsed_body: Value,
         prev_id: String,
-        raw_body_len: usize,
+        raw_body_bytes: usize,
     ) -> Result<FilterAction, FilterError> {
         let owner = match require_state_owner(ctx) {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let read_limit = match history_read_limit(ctx, &parsed_body, raw_body_len) {
+        let read_limit = match history_read_limit(ctx, &parsed_body, raw_body_bytes) {
             Ok(limit) => limit,
             Err(action) => return Ok(action),
         };
@@ -191,7 +192,7 @@ impl RehydrateFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         parsed_body: Value,
-        raw_body_len: usize,
+        raw_body_bytes: usize,
     ) -> Result<FilterAction, FilterError> {
         let conv_id = match resolve_conversation_id(&parsed_body) {
             Ok(id) => id,
@@ -201,7 +202,7 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let read_limit = match history_read_limit(ctx, &parsed_body, raw_body_len) {
+        let read_limit = match history_read_limit(ctx, &parsed_body, raw_body_bytes) {
             Ok(limit) => limit,
             Err(action) => return Ok(action),
         };
@@ -697,7 +698,6 @@ impl RestoreStableBudget {
         let mut current_meter = PayloadMeter::new(limit.checked_sub(stable)?);
         current_meter.json(&state.response_object)?;
         current_meter.json(&state.local_completion_response_template)?;
-        current_meter.json_values(&state.tool_calls)?;
         Some(Self::new(
             state,
             revision,
@@ -720,7 +720,8 @@ impl RestoreStableBudget {
         let mut meter = PayloadMeter::new(limit.checked_sub(self.bytes)?);
         meter.json(&state.response_object)?;
         meter.json(&state.local_completion_response_template)?;
-        meter.json_values(&state.tool_calls)?;
+        // Canonical tool-call assignments are charged by ResponsesState's
+        // inner meter; this cache owns only the two changing response trees.
         self.current_output_bytes = meter.used();
         self.current_output_revision = revision;
         Some(())
@@ -2188,14 +2189,12 @@ fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), Fi
 fn history_read_limit(
     ctx: &HttpFilterContext<'_>,
     parsed_body: &Value,
-    raw_body_len: usize,
+    raw_body_bytes: usize,
 ) -> Result<Option<usize>, FilterAction> {
     let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
         return Ok(None);
     };
     let limit = policy.max_retained_bytes();
-    // Token-count requests intentionally have no create-response state yet.
-    // Charge their parsed request directly while still bounding the store read.
     let (current, parsed_copy) = if let Some(state) = ctx.extensions.get::<ResponsesState>() {
         (
             state
@@ -2204,14 +2203,17 @@ fn history_read_limit(
             super::state::retained_json_bytes(&state.request_body).ok_or_else(reject_retained_payload)?,
         )
     } else {
+        // Count and compact operations have no create-state yet. The buffered
+        // request and parsed operation body are both live during this read;
+        // use the larger size for each of the two request owners below.
         let parsed_bytes = super::state::retained_json_bytes(parsed_body).ok_or_else(reject_retained_payload)?;
-        (parsed_bytes, parsed_bytes)
+        (parsed_bytes.max(raw_body_bytes), parsed_bytes)
     };
     let store_bytes = super::store::retained_request_payload_bytes(ctx).ok_or_else(reject_retained_payload)?;
     let remaining = limit
         .checked_sub(current.checked_mul(2).ok_or_else(reject_retained_payload)?)
         .and_then(|bytes| bytes.checked_sub(parsed_copy))
-        .and_then(|bytes| bytes.checked_sub(raw_body_len))
+        .and_then(|bytes| bytes.checked_sub(raw_body_bytes))
         .and_then(|bytes| bytes.checked_sub(store_bytes))
         .ok_or_else(reject_retained_payload)?;
     Ok(Some(remaining / 4))

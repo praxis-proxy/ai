@@ -408,9 +408,9 @@ struct CurrentOutputCharge {
     template_is_object: bool,
     /// Number of fallback template output items.
     template_output_len: usize,
-    /// Number of completed call copies.
+    /// Number of canonical call assignments.
     tool_calls_len: usize,
-    /// Exact compact JSON charge of all three owners.
+    /// Exact compact JSON charge of the response and fallback template.
     bytes: usize,
 }
 
@@ -566,7 +566,7 @@ impl StreamConverter {
         let mut meter = PayloadMeter::new(limit);
         meter.json(&state.response_object)?;
         meter.json(&state.local_completion_response_template)?;
-        meter.json_values(&state.tool_calls)?;
+        // Assignments retain only item IDs, charged by ResponsesState's live meter.
         let bytes = meter.used();
         self.current_output_charge = CurrentOutputCharge::from_state(state, bytes);
         Some(bytes)

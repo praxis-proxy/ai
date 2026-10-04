@@ -731,6 +731,65 @@ async fn local_calls_keep_public_ids() {
 }
 
 #[tokio::test]
+async fn stale_file_search_assignment_cannot_dispatch_or_rewrite_another_item() {
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));
+    let filter = make_filter(server.port, "");
+
+    for stale in ["id", "type", "round", "index", "status"] {
+        let mut state = one_pending_state(&["vs-a"]);
+        match stale {
+            "id" => state.accumulated_output[0]["id"] = json!("fs-replaced"),
+            "type" => state.accumulated_output[0]["type"] = json!("web_search_call"),
+            "round" => state.current_round_output_start = Some(1),
+            "index" => state.file_search_assignments[0].output_index = 99,
+            "status" => state.accumulated_output[0]["status"] = json!("completed"),
+            _ => unreachable!(),
+        }
+        let output_before = state.accumulated_output.clone();
+        let mut ctx = make_context(Some(state));
+
+        assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert_eq!(state.accumulated_output, output_before, "stale {stale} selection");
+        assert!(state.messages.is_empty(), "stale {stale} selection");
+        assert_eq!(
+            state.dispatch_failure.as_ref().map(|failure| failure.status),
+            Some(502),
+            "stale {stale} selection must fail closed"
+        );
+    }
+    assert!(
+        server.requests().is_empty(),
+        "stale selections cannot reach a vector store"
+    );
+}
+
+#[test]
+fn drained_file_search_assignment_keeps_its_id_in_the_request_budget() {
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "x".repeat(16_384),
+            "status": "searching",
+            "queries": ["query"],
+        })],
+    );
+    let before = state.retained_payload_bytes().unwrap();
+    let (assignments, charged_bytes) = take_charged_file_search_assignments(&mut state).unwrap();
+    assert_eq!(charged_bytes, 16_384);
+    assert_eq!(state.retained_payload_bytes().unwrap(), before);
+
+    state.apply_retained_payload_limit(before + 128);
+    assert!(state.can_retain_payload(128));
+    assert!(!state.can_retain_payload(129));
+
+    drop(assignments);
+    state.release_external_payload_bytes(charged_bytes);
+    assert_eq!(state.retained_payload_bytes().unwrap(), before - charged_bytes);
+}
+
+#[tokio::test]
 async fn mixed_valid_and_empty_calls_are_both_terminalized() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));
     let filter = make_filter(server.port, "");
@@ -2269,13 +2328,20 @@ fn state_with(store_ids: &[&str], output_items: Vec<Value>) -> ResponsesState {
 /// `FileSearchAssignment` for every pending `file_search_call`, mirroring the
 /// owner's `collect_output_items`.
 fn register_assignments(state: &mut ResponsesState, output_items: Vec<Value>) {
-    for item in output_items {
+    for mut item in output_items {
         let output_index = state.accumulated_output.len();
         let pending = is_pending_file_search_call(&item);
+        if pending && item.get("id").and_then(Value::as_str).is_none() {
+            item.as_object_mut()
+                .expect("file-search item")
+                .insert("id".to_owned(), json!(format!("fs_test_{output_index}")));
+        }
+        let item_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
         state.accumulated_output.push(item);
         if pending {
             state.file_search_assignments.push(FileSearchAssignment {
                 output_index,
+                item_id: item_id.expect("pending file-search item id"),
                 synthesis: SynthesisKind::Native,
             });
         }

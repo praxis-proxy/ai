@@ -505,15 +505,33 @@ impl FileSearchCalloutFilter {
     /// extending citations). It records a [`DispatchFailure`] on failure but never
     /// decides whether another inference round occurs and never commits a terminal
     /// response.
-    #[expect(clippy::too_many_lines, reason = "sequential drain, plan, execute, and reconcile")]
     async fn dispatch(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let assignments = match ctx.extensions.get_mut::<ResponsesState>() {
-            Some(state) => state.drain_file_search_assignments(),
-            None => return Ok(FilterAction::Continue),
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some((assignments, assignment_bytes)) = take_charged_file_search_assignments(state) else {
+            state.discard_payload_for_budget_error();
+            state.dispatch_failure = Some(file_search_budget_failure());
+            return Ok(FilterAction::Continue);
         };
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        let result = self.dispatch_assignments(ctx, &assignments).await;
+        drop(assignments);
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.release_external_payload_bytes(assignment_bytes);
+        }
+        result
+    }
+
+    /// Execute assignments while their ID payload remains charged to the request.
+    #[expect(clippy::too_many_lines, reason = "sequential plan, execute, and reconcile")]
+    async fn dispatch_assignments(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        assignments: &[FileSearchAssignment],
+    ) -> Result<FilterAction, FilterError> {
         let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
             Ok(identity) => identity,
             Err(CalloutContextMissing::Credential { slot }) => {
@@ -523,14 +541,28 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        if !file_search_plan_projection_fits(state, &assignments) {
+        if assignments.iter().any(|assignment| {
+            assignment
+                .resolve(state)
+                .is_none_or(|item| !is_pending_file_search_call(item))
+        }) {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.dispatch_failure = Some(DispatchFailure {
+                    status: 502,
+                    code: "server_error",
+                    message: "file-search output selection became stale before dispatch".to_owned(),
+                });
+            }
+            return Ok(FilterAction::Continue);
+        }
+        if !file_search_plan_projection_fits(state, assignments) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
             return Ok(FilterAction::Continue);
         }
-        let plan = build_search_plan(state, &assignments);
+        let plan = build_search_plan(state, assignments);
         let Some(plan_bytes) = plan.retained_payload_bytes() else {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.discard_payload_for_budget_error();
@@ -594,14 +626,7 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        let apply_result = Self::apply_batch(
-            state,
-            &assignments,
-            &plan,
-            &batch,
-            framework_bytes,
-            self.max_state_bytes,
-        );
+        let apply_result = Self::apply_batch(state, assignments, &plan, &batch, framework_bytes, self.max_state_bytes);
         drop(batch);
         if let Err(failure) = apply_result {
             state.dispatch_failure = Some(failure);
@@ -609,6 +634,18 @@ impl FileSearchCalloutFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Move compact file-search selections to the dispatcher without losing their
+/// request-wide payload charge while the local vector owns their IDs.
+fn take_charged_file_search_assignments(state: &mut ResponsesState) -> Option<(Vec<FileSearchAssignment>, usize)> {
+    let assignments = state.drain_file_search_assignments();
+    let bytes = assignments
+        .iter()
+        .try_fold(0_usize, |used, assignment| used.checked_add(assignment.item_id.len()))?;
+    state
+        .retain_external_payload_bytes(bytes)
+        .then_some((assignments, bytes))
 }
 
 /// Record a write-once security-context terminal before vector-store dispatch.
