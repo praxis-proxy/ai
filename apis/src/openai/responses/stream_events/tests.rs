@@ -841,6 +841,89 @@ fn deferred_terminal_replaces_published_parser_charge_once() {
 }
 
 #[test]
+fn deferred_terminal_reserves_final_wire_capacity_before_serializing() {
+    let fixture = || {
+        let (_filter, ctx) = make_armed_context();
+        let state = ResponsesState {
+            accumulated_output: vec![json!({
+                "type": "message",
+                "content": [{"type": "output_text", "text": "x".repeat(256 * 1024)}]
+            })],
+            response_object: json!({"id": "resp_wire", "object": "response", "status": "completed", "output": []}),
+            ..ResponsesState::default()
+        };
+        let terminal = super::DeferredTerminalEvent {
+            event_type: "response.completed".to_owned(),
+            payload: json!({"type": "response.completed", "response": null}),
+        };
+        (ctx, state, terminal, vec![b'x'; 64 * 1024])
+    };
+    let (mut ctx, mut state, mut terminal, mut output) = fixture();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let initial_capacity = output.capacity();
+    state.apply_retained_payload_limit(900 * 1024);
+    ctx.extensions.insert(state);
+
+    let allocations = allocation_counter::measure(|| {
+        super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output)
+            .expect("an admitted terminal should serialize within its reserved wire owner");
+    });
+    assert!(output.ends_with(b"\n\n"));
+    let measured_peak_bound = output.len() + initial_capacity + 64 * 1024;
+    assert!(
+        allocations.bytes_max <= u64::try_from(measured_peak_bound).unwrap(),
+        "terminal serialization must stay within the admitted wire and old-buffer peak: {allocations:?}"
+    );
+    assert!(
+        output.capacity() <= output.len() + initial_capacity,
+        "terminal writer should reserve its final capacity before serializing: len={} capacity={}",
+        output.len(),
+        output.capacity()
+    );
+
+    // At this cap the canonical response and final wire fit, but replacing
+    // the already allocated output buffer would keep its old capacity alive
+    // during the new allocation. Reject before that uncharged peak occurs.
+    let post_state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let near_cap = post_state.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap()
+        + output.len()
+        + terminal.retained_payload_bytes().unwrap()
+        + initial_capacity / 2;
+    let (mut tight_ctx, mut tight_state, mut tight_terminal, mut tight_output) = fixture();
+    let mut tight_parser = tight_ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(tight_output.capacity(), initial_capacity);
+    let initial_preflight = tight_state.retained_payload_bytes().unwrap()
+        + tight_parser.retained_payload_bytes().unwrap()
+        + super::canonicalization_staging_bytes(&tight_state, tight_output.len()).unwrap()
+        + tight_terminal.retained_payload_bytes().unwrap();
+    assert!(
+        initial_preflight <= near_cap,
+        "the canonicalization preflight should fit"
+    );
+    tight_state.apply_retained_payload_limit(near_cap);
+    tight_ctx.extensions.insert(tight_state);
+    assert!(
+        super::emit_deferred_terminal(
+            &mut tight_ctx,
+            &mut tight_terminal,
+            &mut tight_parser,
+            &mut tight_output
+        )
+        .is_err(),
+        "a cap below the old-buffer relocation peak must reject the terminal"
+    );
+    assert!(tight_output.is_empty());
+    assert!(
+        tight_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_failed
+    );
+}
+
+#[test]
 fn deferred_terminal_preflights_canonical_output_owners() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
