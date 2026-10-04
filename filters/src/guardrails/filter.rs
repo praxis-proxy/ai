@@ -36,6 +36,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// response bodies. The provider determines whether content should
 /// be passed, blocked, or redacted.
 ///
+/// Registered as a security filter. Pipeline validation rejects
+/// `failure_mode: open` unless `insecure_options.allow_open_security_filters`
+/// is set, so a provider timeout or error cannot silently skip screening.
+///
 /// Every provider callout runs through Praxis's filtered-subrequest executor.
 /// The optional `outbound_chain` adds destination-bound authentication,
 /// authorization, audit, and static service credentials; when omitted it
@@ -125,11 +129,11 @@ impl AiGuardrailsFilter {
 
     /// Create a filter from parsed YAML config.
     ///
-    /// Production pipelines must register `ai_guardrails` through
-    /// [`register_chain_binding`](praxis_filter::FilterRegistry::register_chain_binding)
-    /// so the outbound chain is resolved at construction time. This
-    /// constructor exists for tests and builds a permissive outbound test
-    /// pipeline directly.
+    /// Production pipelines register `ai_guardrails` through
+    /// [`register_chain_binding_with_class`](praxis_filter::FilterRegistry::register_chain_binding_with_class)
+    /// as a security filter, so the outbound chain is resolved at construction
+    /// time. This constructor exists for tests and builds a permissive outbound
+    /// test pipeline directly.
     ///
     /// # Errors
     ///
