@@ -4700,7 +4700,9 @@ class TestResponsesCompactionVLLM:
         try:
             first = client.responses.create(
                 model=VLLM_MODEL,
-                input="abcdefghijklmnopqrstuvwxyz0123456789" * 90,
+                # Fit the initial rewrite and conversation append at 64 KiB;
+                # the rehydrated history still exceeds tokenizer staging.
+                input="abcdefghijklmnopqrstuvwxyz0123456789" * 40,
                 conversation=conversation.id,
                 store=True,
             )
