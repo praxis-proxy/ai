@@ -7,6 +7,8 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 
 ## Configuration Notes
 
+Registered as a security filter. Pipeline validation rejects `failure_mode: open` unless `insecure_options.allow_open_security_filters` is set, so a provider timeout or error cannot silently skip screening.
+
 Every provider callout runs through Praxis's filtered-subrequest executor. The optional `outbound_chain` adds destination-bound authentication, authorization, audit, and static service credentials; when omitted it defaults to an empty pass-through chain. Parent and child contexts stay isolated; user-scoped credential projection is handled separately in #880.
 
 Because this filter reads the request body before the header-phase security filters on the main chain run, operators should treat the pre-read body as untrusted input and configure an outbound chain whenever the provider requires destination-bound policy enforcement.
