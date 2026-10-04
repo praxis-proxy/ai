@@ -90,14 +90,14 @@ use crate::{
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
 pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
 
-/// Raw control page, decoded listing, converted JSON, function tools, public
-/// listing, and one owner for transformation overlap.
-const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
-
 /// Eager resolution retains the decoded task result, per-entry filtered and
 /// converted tools, dispatch map, rewritten body, public listing, private
 /// cache listing, and serialization overlap alongside the raw control body.
 const EAGER_LISTING_OWNER_RESERVATION: usize = 12;
+
+/// Raw control page, decoded listing, converted JSON, function tools, public
+/// listing, and one owner for transformation overlap.
+const DEFERRED_LISTING_OWNER_RESERVATION: usize = 6;
 
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter

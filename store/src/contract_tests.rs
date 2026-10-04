@@ -95,6 +95,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     responses_are_owner_scoped(backend).await;
     response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
+    approval_payload_size_is_scoped(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
     persist_pairs_response_and_approvals(backend).await;
     conversation_messages_cas(backend).await;
@@ -274,6 +275,103 @@ async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
             .expect("consume a2"),
         None,
         "outstanding approval must survive an aborted batch"
+    );
+}
+
+/// The size-only query sees exactly the issuing owner's matching records.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear owner and issuing-response scope contract assertions"
+)]
+async fn approval_payload_size_is_scoped(backend: &dyn PersistedStateBackend) {
+    let issuing_owner = owner("approval-size");
+    let other_owner = owner("approval-size-other");
+    let first_response = "resp_approval_size_first";
+    let second_response = "resp_approval_size_second";
+    let third_response = "resp_approval_size_third";
+    for (response_id, response_owner) in [
+        (first_response, &issuing_owner),
+        (second_response, &other_owner),
+        (third_response, &issuing_owner),
+    ] {
+        backend
+            .upsert_response(&ResponseRecord {
+                id: response_id.to_owned(),
+                owner: response_owner.clone(),
+                created_at: 1,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .expect("upsert issuing response for size query");
+    }
+    let mut first = approval("shared-approval");
+    first.arguments = "☃".repeat(32);
+    let mut second = approval("shared-approval");
+    second.arguments = "x".repeat(1024);
+    let mut third = approval("shared-approval");
+    third.arguments = "y".repeat(2048);
+    backend
+        .record_pending_approvals(&issuing_owner, first_response, std::slice::from_ref(&first), 1)
+        .await
+        .expect("record first pending approval");
+    backend
+        .record_pending_approvals(&other_owner, second_response, std::slice::from_ref(&second), 1)
+        .await
+        .expect("record second pending approval");
+    backend
+        .record_pending_approvals(&issuing_owner, third_response, std::slice::from_ref(&third), 1)
+        .await
+        .expect("record third pending approval");
+
+    let bytes = |record: &PendingApprovalRecord| {
+        record.approval_id.len()
+            + record.server_label.len()
+            + record.tool_name.len()
+            + record.arguments.len()
+            + record.target_fingerprint.len()
+    };
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, first_response, &["shared-approval", "missing"])
+            .await
+            .expect("size first approval"),
+        bytes(&first),
+        "size query must count UTF-8 bytes only for matching rows"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&other_owner, second_response, &["shared-approval"])
+            .await
+            .expect("size second approval"),
+        bytes(&second),
+        "a matching ID in another owner scope has an independent size"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, third_response, &["shared-approval"])
+            .await
+            .expect("size same-owner approval under another response"),
+        bytes(&third),
+        "the same approval ID under another issuing response has an independent size"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, second_response, &["shared-approval"])
+            .await
+            .expect("size cross-owner approval"),
+        0,
+        "another owner's issuing response must not expose its pending payload"
+    );
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&issuing_owner, first_response, &["missing"])
+            .await
+            .expect("size absent approval"),
+        0,
+        "an absent ID contributes no stored payload"
     );
 }
 

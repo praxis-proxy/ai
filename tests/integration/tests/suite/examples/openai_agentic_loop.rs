@@ -3163,6 +3163,98 @@ fn deferred_connector_loads_on_tool_search_then_dispatches() {
 }
 
 #[test]
+fn deferred_connector_approval_resumes_with_same_target() {
+    let search_response = serde_json::json!({
+        "id": "resp_deferred_search",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "tool_search_call", "id": "tsc_deferred", "status": "completed"}]
+    });
+    let call_response = serde_json::json!({
+        "id": "resp_deferred_call",
+        "object": "response",
+        "created_at": 1001,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_deferred",
+            "call_id": "call_deferred",
+            "name": "drive__search",
+            "arguments": r#"{"query":"reports"}"#,
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_deferred_final",
+        "object": "response",
+        "created_at": 1002,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Found quarterly reports."}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, search_response.to_string()),
+        (200, call_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("search").with_description("Search files")],
+        ..McpMockConfig::default()
+    });
+    let db = TempSqlite::new("deferred_approval");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_deferred_approval_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    let eager = serde_json::json!({
+        "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+        "allowed_tools": ["search"], "require_approval": "always"
+    });
+    let deferred = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find quarterly reports",
+        "tools": [{"type": "tool_search"}, {
+            "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+            "defer_loading": true, "allowed_tools": ["search"], "require_approval": "always"
+        }]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &deferred.to_string()));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "deferred request should pause for approval: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let approval = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "mcp_approval_request")
+        .expect("deferred call should request approval");
+    let approval_id = approval["id"].as_str().unwrap();
+    let previous_response_id = response["id"].as_str().unwrap();
+    assert_eq!(mcp.method_count("tools/call"), 0, "approval must pause execution");
+
+    // A fresh request must resolve the same connector eagerly to rebuild its
+    // private tool map before the pending approval can be matched.
+    let followup = approval_followup(previous_response_id, approval_id, true, &serde_json::json!([eager]));
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(parse_status(&raw), 200, "same-target approval should resume: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["id"], "resp_deferred_final");
+    assert_eq!(mcp.tool_call_count("search"), 1, "approved deferred tool executes once");
+    assert_eq!(model.requests().len(), 3, "search, call, then approved result");
+}
+
+#[test]
 fn streamed_deferred_connector_loads_on_tool_search() {
     let first_response = vec![
         sse_event(
@@ -8034,6 +8126,27 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
+}
+
+/// Persist approval state while resolving one configured connector through the
+/// example pipeline's deferred `tool_search` path.
+fn load_deferred_approval_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    mcp_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replacen(
+        "          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!("          - id: corp_drive\n            server_url: {mcp_url}\n"),
+        1,
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse deferred approval config")
 }
 
 /// Like [`load_approval_config`] but with the `openai_response_store` backend

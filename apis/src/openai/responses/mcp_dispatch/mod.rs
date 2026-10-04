@@ -1450,7 +1450,12 @@ impl McpDispatchFilter {
                 return Ok(action);
             }
             // Deferred discovery inserts new map entries after the initial
-            // binding check. Its projected commit also needs a final admission.
+            // binding check. Bind their approval context before constructing a
+            // pending target fingerprint, then check the aggregate post-commit
+            // state before any call can run.
+            if !self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref()) {
+                return Ok(Self::aggregate_budget_action(ctx));
+            }
             if ctx
                 .extensions
                 .get::<ResponsesState>()

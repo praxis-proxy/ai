@@ -4264,6 +4264,140 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
 }
 
 #[tokio::test]
+async fn deferred_discovery_budget_rejects_before_any_tools_list_call() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut state = ResponsesState {
+        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+        ..ResponsesState::default()
+    };
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(
+        state.deferred_mcp.len(),
+        1,
+        "a rejected discovery must leave its connector pending"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "no tools/list request may reach the MCP server after budget preflight fails"
+    );
+}
+
+#[tokio::test]
+async fn escaped_deferred_label_is_reserved_before_tools_list() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut connector = deferred_connector(&server_url, None, None);
+    connector.server_label = "\0".repeat(1024);
+    assert_eq!(
+        deferred_entry_json_bytes(&connector),
+        retained_json_bytes(&deferred_entry_view(&connector)),
+        "entry projection must include JSON escaping"
+    );
+    let empty_prepared = PreparedDeferredListing {
+        entry: deferred_entry_view(&connector),
+        filtered: Vec::new(),
+        functions: Vec::new(),
+        listing_item: mcp_list_tools_item(connector.server_label.clone(), Vec::new()),
+        server_label: connector.server_label.clone(),
+    };
+    assert!(
+        deferred_listing_staging_bytes(&connector).unwrap() >= prepared_deferred_bytes(&[empty_prepared]).unwrap(),
+        "preflight must cover even an empty listing's retained owners"
+    );
+    let mut state = ResponsesState {
+        deferred_mcp: vec![connector],
+        ..ResponsesState::default()
+    };
+    select_deferred_discovery_search(&mut state);
+    let baseline = state.retained_payload_bytes().unwrap();
+    let old_staging = deferred_connector_bytes(&state.deferred_mcp[0]).unwrap() * 2;
+    let old_admission_limit =
+        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + old_staging;
+    assert!(deferred_listing_batch_fits(
+        baseline,
+        0,
+        old_staging,
+        1,
+        old_admission_limit
+    ));
+    state.apply_retained_payload_limit(old_admission_limit);
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert_eq!(state.deferred_mcp.len(), 1);
+    assert!(state.mcp_tool_map.is_empty());
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "escaped label copies must be admitted before any tools/list side effect"
+    );
+}
+
+#[tokio::test]
+async fn deferred_discovery_stops_before_the_next_call_when_prepared_results_fill_budget() {
+    let (first_url, cancel_first, first_list_calls) = start_counted_single_tool_mcp_server().await;
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_url = format!("http://{}/mcp", second_listener.local_addr().unwrap());
+    let first = deferred_connector(&first_url, None, None);
+    let first_staging_bytes = deferred_listing_staging_bytes(&first).unwrap();
+    let mut second = deferred_connector(&second_url, None, None);
+    second.connector_id = "c2".to_owned();
+    second.server_label = "other".to_owned();
+    let mut state = ResponsesState {
+        deferred_mcp: vec![first, second],
+        ..ResponsesState::default()
+    };
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_budget"})],
+    );
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(
+        baseline + mcp_client::MAX_LISTING_RESPONSE_BYTES * DEFERRED_LISTING_OWNER_RESERVATION + first_staging_bytes,
+    );
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+    cancel_first.cancel();
+
+    assert!(matches!(error, ResolveError::RetainedBudget));
+    assert!(
+        first_list_calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the first listing must run before the second batch is rejected"
+    );
+    assert_eq!(
+        state.deferred_mcp.len(),
+        2,
+        "neither connector is committed on overflow"
+    );
+    assert!(state.mcp_tool_map.is_empty());
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(state.accumulated_output[0]["type"], "tool_search_call");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second_listener.accept())
+            .await
+            .is_err(),
+        "the second server must not be contacted after the first listing fills the budget"
+    );
+}
+
+#[tokio::test]
 async fn connector_missing_label_rejected_at_filter_level() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         "
@@ -4553,6 +4687,61 @@ async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::Cancellati
         );
     });
     (format!("http://{addr}/mcp"), ct)
+}
+
+/// Start a single-tool server that counts completed tools/list requests.
+async fn start_counted_single_tool_mcp_server() -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<SingleToolMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), Arc::default(), config);
+    let counted = Arc::clone(&list_calls);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    if serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("method")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("tools/list")
+                    {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    next.run(http::Request::from_parts(parts, axum::body::Body::from(bytes)))
+                        .await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, list_calls)
 }
 
 /// End-to-end regression: a credentialed MCP entry whose permitted
@@ -5991,6 +6180,54 @@ async fn aggregate_budget_rejects_cached_mcp_listing_before_commit() {
     assert!(state.retained_payload_failed);
     assert!(state.mcp_tool_map.is_empty());
     assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
+fn near_limit_rehydrated_history_rejects_before_second_body_parse() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut body_json = mcp_body("http://8.8.8.8/mcp");
+    body_json["metadata"] = serde_json::json!({"note": "x".repeat(300_000)});
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut state = ResponsesState::from_request_body(body_json);
+    state
+        .messages
+        .push(serde_json::json!({"content": "y".repeat(4_000_000)}));
+    let retained = state.retained_payload_bytes().unwrap();
+    let limit = retained + original.len() / 2;
+    assert!(
+        original.len() <= limit / 8,
+        "raw create body passes the initial budget gate"
+    );
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(original.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut action = None;
+
+    let allocation = allocation_counter::measure(|| {
+        action = Some(
+            runtime
+                .block_on(filter.on_request_body(&mut ctx, &mut body, true))
+                .unwrap(),
+        );
+    });
+
+    assert!(matches!(&action, Some(FilterAction::Reject(rejection)) if rejection.status == 413));
+    assert!(
+        allocation.bytes_max < u64::try_from(original.len()).unwrap() / 4,
+        "budget rejection must precede the second JSON tree: {allocation:?}"
+    );
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(state.messages.is_empty());
 }
 
 #[tokio::test]

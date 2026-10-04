@@ -3906,6 +3906,82 @@ async fn resume_approval_batch_exceeding_cap_is_rejected() {
 }
 
 #[tokio::test]
+async fn oversized_pending_approval_is_retryable_with_a_larger_budget() {
+    let filter = make_dispatch_filter();
+    let store = make_approval_store().await;
+    let arguments = format!("{{\"padding\":\"{}\"}}", "x".repeat(8_192));
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_budget", &arguments).await;
+
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    register_store(&mut ctx, Arc::clone(&store));
+    let mut state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + 4_096);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    let failed = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(failed.retained_payload_failed);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(
+        failed.accumulated_output.is_empty(),
+        "no MCP call may execute after size rejection"
+    );
+
+    let retry_req = make_request(http::Method::POST, "/v1/responses");
+    let mut retry_ctx = make_owned_filter_context(&retry_req);
+    register_store(&mut retry_ctx, Arc::clone(&store));
+    let mut retry_state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    retry_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    retry_ctx.extensions.insert(retry_state);
+    let mut retry_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let retry_action = filter
+        .on_request_body(&mut retry_ctx, &mut retry_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(retry_action, FilterAction::Continue));
+    let resumed = retry_ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        resumed.accumulated_output.len(),
+        1,
+        "the larger budget executes the approval once"
+    );
+
+    let replay_req = make_request(http::Method::POST, "/v1/responses");
+    let mut replay_ctx = make_owned_filter_context(&replay_req);
+    register_store(&mut replay_ctx, store);
+    let mut replay_state = ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    };
+    replay_state.apply_retained_payload_limit(2 * 1024 * 1024);
+    replay_ctx.extensions.insert(replay_state);
+    let mut replay_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(
+        filter
+            .on_request_body(&mut replay_ctx, &mut replay_body, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rejection.status, 400);
+    assert!(reject_message(&rejection).contains("already been used"));
+}
+
+#[tokio::test]
 async fn resume_applies_multiple_approvals_in_one_batch() {
     // A round can emit multiple approval requests (batched/parallel tool calls),
     // so a resume turn may legitimately carry several matching approval responses.

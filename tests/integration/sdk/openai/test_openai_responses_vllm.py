@@ -6845,6 +6845,26 @@ class TestAgenticLoopVLLM:
             f"approved response should resume to model output; got: {output_types}"
         )
 
+        with pytest.raises(APIStatusError) as replay:
+            agentic_client.responses.create(
+                model=VLLM_MODEL,
+                previous_response_id=approval_response.id,
+                input=[
+                    {
+                        "type": "mcp_approval_response",
+                        "approval_request_id": approval.id,
+                        "approve": True,
+                    }
+                ],
+                tools=tools,
+                store=True,
+                max_output_tokens=512,
+            )
+        assert replay.value.status_code == 400
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "a consumed approval must never execute a second MCP call"
+        )
+
     @requires_vllm_compat
     def test_mcp_approval_resume_streams_without_index_error(
         self, agentic_client, agentic_proxy,
