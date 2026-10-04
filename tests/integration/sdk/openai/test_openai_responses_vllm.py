@@ -3135,6 +3135,9 @@ class TestOpenAIResponsesVLLM:
             assert len(completed) == 1
             first = completed[0].response
             assert first.status == "completed"
+            assert [item.type for item in first.output] == ["message"]
+            assert first.output[0].id == f"msg_{first.id}"
+            assert first.output[0].content[0].text == "SDK streamed turn"
             assert client.responses.retrieve(first.id).output == first.output
 
             items = client.conversations.items.list(conversation.id, order="asc")

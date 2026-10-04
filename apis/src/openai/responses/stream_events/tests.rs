@@ -363,7 +363,7 @@ fn done_delta_transfer_rechecks_shared_charge_before_next_snapshot() {
     ctx.extensions.insert(responses);
     assert!(super::stream_payload_fits(&ctx, &stream, parsed_owner_bytes));
 
-    let snapshots = super::accumulate_chunk(&mut stream, &mut ctx, &events, parsed_owner_bytes).unwrap();
+    let snapshots = super::accumulate_chunk(&mut stream, &mut ctx, &mut events, parsed_owner_bytes).unwrap();
 
     assert!(
         snapshots.is_none(),
@@ -384,7 +384,7 @@ fn terminal_usage_merge_peak_is_reserved_before_accumulation() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::default());
     let mut stream = filter.new_round_state(0, 0);
-    let event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+    let mut event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
         "type": "response.completed",
         "response": {
             "id": "resp_1", "object": "response", "status": "completed", "output": [],
@@ -393,7 +393,7 @@ fn terminal_usage_merge_peak_is_reserved_before_accumulation() {
     }));
     let projected = super::projected_responses_state_clone_bytes(&ctx, std::slice::from_ref(&event)).unwrap();
     let allocations = allocation_counter::measure(|| {
-        super::accumulate_event(&mut ctx, &mut stream, &event);
+        super::accumulate_event(&mut ctx, &mut stream, &mut event);
     });
 
     assert!(
@@ -422,6 +422,67 @@ fn assert_terminal_avoids_duplicate_staging(lowered: bool) {
         });
     }
     responses.apply_retained_payload_limit(30_000);
+    ctx.extensions.insert(responses);
+    let metadata: serde_json::Map<String, serde_json::Value> =
+        (0..8).map(|i| (format!("key{i}"), json!("x".repeat(512)))).collect();
+    let terminal = make_sse_chunk(
+        "response.completed",
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_budget",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "metadata": metadata,
+            }
+        }),
+    );
+    for slice in terminal.chunks(256) {
+        let mut body = Some(Bytes::copy_from_slice(slice));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(
+            ctx.get_metadata("responses.stream_error_code").is_none(),
+            "{:?}",
+            ctx.get_metadata("responses.stream_error_message")
+        );
+    }
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let body = std::str::from_utf8(eos.as_ref().unwrap()).unwrap();
+    assert!(body.contains("event: response.completed"), "{body}");
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+}
+
+#[test]
+fn native_terminal_does_not_pay_restoration_staging_after_move() {
+    assert_terminal_does_not_pay_moved_staging(false);
+}
+
+#[test]
+fn lowered_terminal_does_not_pay_restoration_staging_after_move() {
+    assert_terminal_does_not_pay_moved_staging(true);
+}
+
+/// A terminal payload moves into shared state before the restoration plan.
+fn assert_terminal_does_not_pay_moved_staging(lowered: bool) {
+    let (filter, mut ctx) = make_armed_context();
+    let mut responses = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    if lowered {
+        responses.client_tool_lowering.insert(
+            "private".to_owned(),
+            LoweredClientTool {
+                original_name: "public".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+        responses.client_tool_echo = Some(ClientToolEcho {
+            tools: vec![json!({"type": "custom", "name": "public"})],
+            tool_choice: json!("auto"),
+        });
+    }
+    responses.apply_retained_payload_limit(12_000);
     ctx.extensions.insert(responses);
     let metadata: serde_json::Map<String, serde_json::Value> =
         (0..8).map(|i| (format!("key{i}"), json!("x".repeat(512)))).collect();
@@ -650,7 +711,11 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
     assert_eq!(payload["response"]["id"], "resp_logical");
     assert_eq!(
         payload["response"]["output"].as_array().map(Vec::as_slice),
-        Some(state.accumulated_output.as_slice())
+        state.response_object["output"].as_array().map(Vec::as_slice)
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "terminal output moved into response_object"
     );
     assert_eq!(payload["response"]["usage"], state.usage);
     assert_eq!(state.logical_stream_sequence, 5);
@@ -810,41 +875,81 @@ fn deferred_terminal_preflights_canonical_output_owners() {
 }
 
 #[test]
-fn deferred_terminal_reserves_wire_copy_before_serializing() {
+fn deferred_terminal_wire_overflow_keeps_sequence_for_error() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut state = ResponsesState {
-        accumulated_output: vec![json!({
-            "type": "message", "role": "assistant",
-            "content": [{"type": "output_text", "text": "x".repeat(65_536)}]
-        })],
-        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[]}),
+        logical_stream_sequence: 4,
+        accumulated_output: vec![json!({"type": "message", "content": [{"text": "x".repeat(4_096)}]})],
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
         ..ResponsesState::default()
     };
     let mut terminal = super::DeferredTerminalEvent {
         event_type: "response.completed".to_owned(),
-        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "status":"completed", "output":[]}}),
+        payload: json!({"type": "response.completed", "sequence_number": 4, "response": null}),
     };
-    state.retained_stream_parser_bytes = terminal.retained_payload_bytes().unwrap();
-    let limit =
-        state.retained_payload_bytes().unwrap() + super::canonicalization_staging_bytes(&state, 0).unwrap() + 1_000;
-    state.apply_retained_payload_limit(limit);
+    let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
+        + terminal.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap() + preflight + 128);
     ctx.extensions.insert(state);
     let mut output = Vec::new();
 
     assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
     assert!(output.is_empty());
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().logical_stream_sequence,
+        4
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[test]
-fn deferred_terminal_reserves_client_tool_echo_before_canonicalization() {
+fn deferred_terminal_reserves_metadata_while_serializing_wire() {
     let (_filter, mut ctx) = make_armed_context();
     let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let mut state = ResponsesState {
-        response_object: json!({"id":"resp_budget", "object":"response", "status":"completed", "output":[], "tools":[]}),
+        logical_stream_response_id: Some("resp_budget".to_owned()),
+        accumulated_output: vec![json!({"type": "message", "content": [{"text": "x".repeat(256 * 1024)}]})],
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": null,
+            "provider_metadata": "m".repeat(64 * 1024)
+        }),
+    };
+    state.apply_retained_payload_limit(600 * 1024);
+    let preflight = super::canonicalization_staging_bytes(&state, 0).unwrap()
+        + terminal.retained_payload_bytes().unwrap()
+        + parser_state.retained_payload_bytes().unwrap();
+    assert!(
+        state.can_replace_retained_payload(0, 0, preflight),
+        "canonicalization must fit so this exercises the later wire admission"
+    );
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(
+        output.is_empty(),
+        "over-budget terminal and metadata must stay off the wire"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn deferred_terminal_preflights_one_echo_owner_before_canonicalization() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": [], "tools": []}),
         client_tool_echo: Some(ClientToolEcho {
-            tools: vec![json!({"type":"custom", "name":"public", "description":"x".repeat(65_536)})],
+            tools: vec![json!({"type": "custom", "name": "public", "description": "x".repeat(65_536)})],
             tool_choice: json!("auto"),
         }),
         ..ResponsesState::default()
@@ -859,16 +964,91 @@ fn deferred_terminal_reserves_client_tool_echo_before_canonicalization() {
     );
     let mut terminal = super::DeferredTerminalEvent {
         event_type: "response.completed".to_owned(),
-        payload: json!({"type":"response.completed", "response":{"id":"resp_budget", "output":[]}}),
+        payload: json!({"type": "response.completed", "response": null}),
     };
-    let limit = state.retained_payload_bytes().unwrap() + terminal.retained_payload_bytes().unwrap() + 1_024;
-    state.apply_retained_payload_limit(limit);
+    let echo = state.client_tool_echo.as_ref().unwrap();
+    let echo_bytes = crate::openai::responses::state::retained_json_values_bytes(&echo.tools).unwrap()
+        + crate::openai::responses::state::retained_json_bytes(&echo.tool_choice).unwrap()
+        + 64;
+    let staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    let terminal_bytes = terminal.retained_payload_bytes().unwrap();
+    let parser_bytes = parser_state.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    let no_echo_staging = staging - echo_bytes;
+    state.apply_retained_payload_limit(baseline + parser_bytes + terminal_bytes + no_echo_staging + 1_024);
+    assert!(
+        state.can_replace_retained_payload(0, parser_bytes, terminal_bytes + no_echo_staging),
+        "the other terminal owners fit this budget"
+    );
+    assert!(
+        !state.can_replace_retained_payload(0, parser_bytes, terminal_bytes + staging),
+        "the restored echo owner must be charged before mutation"
+    );
     ctx.extensions.insert(state);
     let mut output = Vec::new();
 
     assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
     assert!(output.is_empty());
-    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert!(
+        terminal.payload.get("sequence_number").is_none(),
+        "preflight must reject before it mutates the deferred envelope"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn deferred_terminal_preflights_namespaced_call_fanout_before_canonicalization() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let namespace = "n".repeat(8 * 1024);
+    let mut state = ResponsesState {
+        accumulated_output: (0..128)
+            .map(|index| {
+                json!({
+                    "type": "function_call", "id": format!("fc_{index}"),
+                    "call_id": format!("call_{index}"), "name": "private", "arguments": "{}"
+                })
+            })
+            .collect(),
+        response_object: json!({"id": "resp_budget", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    state.client_tool_lowering.insert(
+        "private".to_owned(),
+        LoweredClientTool {
+            original_name: "public".to_owned(),
+            namespace: Some(namespace.clone()),
+            restore: ClientToolRestore::Namespace,
+        },
+    );
+    let mut terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": null}),
+    };
+    let restored_name_bytes = (crate::openai::responses::state::retained_json_bytes("public").unwrap()
+        + crate::openai::responses::state::retained_json_bytes(&namespace).unwrap()
+        + 64)
+        * 128;
+    let staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    let without_fanout = staging - restored_name_bytes;
+    let parser_bytes = parser_state.retained_payload_bytes().unwrap();
+    let terminal_bytes = terminal.retained_payload_bytes().unwrap();
+    let baseline = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(baseline + parser_bytes + terminal_bytes + without_fanout + 1_024);
+    assert!(
+        state.can_replace_retained_payload(0, parser_bytes, terminal_bytes + without_fanout),
+        "the other terminal owners fit this budget"
+    );
+    assert!(
+        !state.can_replace_retained_payload(0, parser_bytes, terminal_bytes + staging),
+        "the public namespace is copied into every canonical call"
+    );
+    ctx.extensions.insert(state);
+    let mut output = Vec::new();
+
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(terminal.payload.get("sequence_number").is_none());
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
@@ -935,7 +1115,7 @@ fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
         citation_files: [("file-known".to_owned(), "x".repeat(1_024))].into(),
         ..ResponsesState::default()
     };
-    let output_bytes = super::canonical_logical_output_bytes(&state).unwrap();
+    let output_bytes = crate::openai::responses::state::retained_json_values_bytes(&state.accumulated_output).unwrap();
     let expanded_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
     assert!(
         expanded_staging > output_bytes * 10,
@@ -1679,7 +1859,8 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
         ..ResponsesState::default()
     };
 
-    let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    let output = state.response_object["output"].as_array().unwrap();
 
     assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
     assert_eq!(
@@ -3112,6 +3293,19 @@ async fn committed_stream_budget_overflow_emits_one_error_without_completion_or_
     filter.on_response_body(&mut ctx, &mut offending, false).unwrap();
     assert!(offending.is_none(), "the offending chunk must be suppressed");
 
+    let mut after_failure = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"id": "call_after_failure", "type": "function_call", "name": "tool", "arguments": "{}"}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut after_failure, false).unwrap();
+    assert!(
+        after_failure.is_none(),
+        "later input must not revive the poisoned stream"
+    );
+
     let mut eos = None;
     filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
     let terminal = String::from_utf8(eos.unwrap().to_vec()).unwrap();
@@ -3461,7 +3655,7 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
 }
 
 #[test]
-fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
+fn commit_projection_charges_argument_delta_and_terminal_usage_owners() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     let mut response_state = ResponsesState::default();
@@ -3495,12 +3689,42 @@ fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
         "usage": {"input_tokens": 1}
     });
     let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let old_usage_bytes =
+        crate::openai::responses::state::retained_json_bytes(&ctx.extensions.get::<ResponsesState>().unwrap().usage)
+            .unwrap();
+    let new_usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
     let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
         "type": "response.completed",
-        "response": response
+        "response": response.clone()
     }));
     let terminal_projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
-    assert!(terminal_projection >= response_bytes * 2);
+    assert_eq!(terminal_projection, (old_usage_bytes + new_usage_bytes) * 2);
+    assert!(
+        terminal_projection < response_bytes,
+        "the response tree moves from the parsed event"
+    );
+}
+
+#[test]
+fn commit_projection_charges_bare_terminal_usage_clones() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let response = json!({
+        "type": "response.completed",
+        "id": "resp_bare_usage",
+        "output": [],
+        "usage": {"large_detail": "x".repeat(64 * 1024)}
+    });
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
+    let usage_bytes = crate::openai::responses::state::retained_json_bytes(&response["usage"]).unwrap();
+    let event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(response);
+
+    let projection = super::projected_responses_state_clone_bytes(&ctx, &[event]).unwrap();
+    assert!(
+        projection >= response_bytes + usage_bytes * 2,
+        "the bare fallback clones the response and usage merging retains two more owners"
+    );
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
@@ -5987,6 +6211,143 @@ fn deferred_terminal_stores_moved_payload_without_deep_clone() {
 }
 
 #[test]
+fn terminal_canonicalization_moves_large_output_without_a_payload_clone() {
+    let text = "x".repeat(256 * 1024);
+    let mut state = ResponsesState {
+        response_object: json!({"id": "resp_move", "output": []}),
+        accumulated_output: vec![json!({
+            "type": "message",
+            "id": "msg_move",
+            "content": [{"type": "output_text", "text": text}]
+        })],
+        ..ResponsesState::default()
+    };
+    let old_ptr = state.accumulated_output[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    let clone_baseline = allocation_counter::measure(|| {
+        std::hint::black_box(state.accumulated_output.clone());
+    });
+    let moved = allocation_counter::measure(|| {
+        canonicalize_logical_response(&mut state, false).unwrap();
+    });
+    let new_ptr = state.response_object["output"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    assert_eq!(new_ptr, old_ptr, "canonical output keeps the original text allocation");
+    assert!(state.accumulated_output.is_empty());
+    assert!(clone_baseline.bytes_total >= 256 * 1024);
+    assert!(
+        moved.bytes_total < clone_baseline.bytes_total / 4,
+        "canonicalization allocated {} bytes versus {} for the old output clone",
+        moved.bytes_total,
+        clone_baseline.bytes_total
+    );
+}
+
+#[test]
+fn terminal_accumulation_moves_parsed_response_into_shared_state() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "sequence_number": 9,
+        "response": {
+            "id": "resp_move",
+            "output": [{"type": "message", "text": "x".repeat(256 * 1024)}]
+        }
+    }));
+    let original_text = event.payload()["response"]["output"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+
+    super::accumulator::accumulate_event(&mut ctx, &mut parser_state, &mut event);
+
+    let retained = &ctx.extensions.get::<ResponsesState>().unwrap().response_object;
+    assert_eq!(retained["output"][0]["text"].as_str().unwrap().as_ptr(), original_text);
+    assert!(event.payload()["response"].is_null());
+    assert_eq!(event.payload()["sequence_number"], 9);
+}
+
+#[test]
+fn borrowed_terminal_serializes_canonical_response_without_cloning_it() {
+    let response = json!({"id": "resp_borrow", "output": [{"text": "x".repeat(256 * 1024)}]});
+    let metadata = json!({"type": "response.completed", "sequence_number": 7, "response": null});
+    let expected = json!({
+        "type": "response.completed",
+        "sequence_number": 7,
+        "response": response
+    });
+    let baseline = allocation_counter::measure(|| {
+        std::hint::black_box(response.clone());
+    });
+    let terminal = super::BorrowedTerminalPayload {
+        metadata: &metadata,
+        response: &response,
+    };
+    let mut wire = Vec::with_capacity(serde_json::to_vec(&expected).unwrap().len());
+    let borrowed = allocation_counter::measure(|| {
+        serde_json::to_writer(&mut wire, &terminal).unwrap();
+    });
+    assert_eq!(
+        wire,
+        serde_json::to_vec(&expected).unwrap(),
+        "terminal wire key order stays stable"
+    );
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&wire).unwrap(), expected);
+    assert!(baseline.bytes_total >= 256 * 1024);
+    assert!(
+        borrowed.bytes_total < baseline.bytes_total / 4,
+        "borrowed serialization allocated {} bytes versus {} for a response clone",
+        borrowed.bytes_total,
+        baseline.bytes_total
+    );
+}
+
+#[test]
+fn bare_terminal_payload_keeps_its_original_wire_shape() {
+    let response = json!({"id": "resp_bare", "output": []});
+    let metadata = json!({"type": "response.completed", "id": "resp_bare", "output": []});
+    let borrowed = super::BorrowedTerminalPayload {
+        metadata: &metadata,
+        response: &response,
+    };
+    assert_eq!(
+        serde_json::to_vec(&borrowed).unwrap(),
+        serde_json::to_vec(&metadata).unwrap(),
+        "bare upstream terminal has no response wrapper to replace"
+    );
+}
+
+#[test]
+fn bare_upstream_terminal_remains_bare_after_deferred_emission() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({"id": "resp_bare", "status": "completed", "output": []}),
+    ));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(
+        terminal.is_none(),
+        "terminal remains deferred until stream finalization"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let wire = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    let data = wire.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert!(
+        payload.get("response").is_none(),
+        "bare upstream payload must stay bare: {wire}"
+    );
+    assert_eq!(payload["id"], "resp_bare");
+}
+
+#[test]
 fn parse_error_sets_metadata() {
     let (filter, mut ctx) = make_armed_context();
     ctx.insert_filter_state(StreamEventsState {
@@ -7677,6 +8038,108 @@ fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
         ctx.get_metadata("responses.stream_error_code").is_some(),
         "validation failure sets the five-write"
     );
+}
+
+#[test]
+fn file_search_synthesis_peak_is_rejected_before_draining() {
+    let item = json!({
+        "type": "file_search_call",
+        "id": "fs_peak",
+        "status": "completed",
+        "queries": ["q"],
+        "results": [{"file_id": "file-a", "text": "x".repeat(32 * 1024)}]
+    });
+    // The old post-drain check saw only the serialized output. Measure that
+    // wire size separately to show it fits while the simultaneous ready clone,
+    // lifecycle payload, and output buffer do not.
+    let mut preview_ctx = test_ctx_without_file_search_tool();
+    let mut preview_state = ResponsesState::default();
+    preview_state.accumulated_output = vec![item.clone()];
+    preview_state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    preview_ctx.extensions.insert(preview_state);
+    let mut preview = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut preview_ctx, &mut preview);
+
+    let (_filter, mut ctx) = make_armed_context();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    state.accumulated_output = vec![item.clone()];
+    state.response_object = json!({
+        "id": "resp_peak", "object": "response", "status": "completed", "output": [item]
+    });
+    state.logical_stream_response_id = Some("resp_peak".to_owned());
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    let baseline = state.retained_payload_bytes().unwrap();
+    let limit = 128 * 1024;
+    let staging = super::ready_file_search_synthesis_staging_bytes(&state).unwrap();
+    assert!(
+        baseline + preview.len() < limit,
+        "the old post-drain check would admit the wire copy"
+    );
+    assert!(
+        baseline + staging > limit,
+        "the simultaneous synthesis owners exceed the ceiling"
+    );
+    state.apply_retained_payload_limit(limit);
+    ctx.extensions.insert(state);
+    ctx.filter_results
+        .entry("openai_agentic_loop")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+
+    let mut eos = None;
+    super::finalize_logical_stream(&mut ctx, &mut eos);
+    let wire = String::from_utf8(eos.expect("bounded error frame").to_vec()).unwrap();
+    assert_eq!(wire.matches("event: error").count(), 1, "one terminal error: {wire}");
+    assert!(
+        !wire.contains("response.output_item.done"),
+        "no synthesis escaped: {wire}"
+    );
+    assert!(
+        !wire.contains("event: response.completed"),
+        "no success terminal escaped: {wire}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_agentic_loop")
+            .and_then(|result| result.get("action")),
+        Some("done")
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn local_completion_charges_ready_file_search_clone_before_drain() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    let item = json!({
+        "type": "file_search_call", "id": "fs_local_peak", "status": "completed",
+        "results": [{"file_id": "file-a", "text": "x".repeat(8 * 1024)}]
+    });
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "q", "stream": true}));
+    state.accumulated_output = vec![item.clone()];
+    state.response_object = json!({"id": "resp_local_peak", "object": "response", "output": [item]});
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    let baseline = state.retained_payload_bytes().unwrap();
+    let wire_bound = super::local_terminal_output_upper_bound(&state).unwrap();
+    let old_projection = super::canonicalization_staging_bytes(&state, wire_bound).unwrap();
+    let ready_clone = super::ready_file_search_clone_bytes(&state).unwrap();
+    let limit = baseline + old_projection + ready_clone / 2;
+    state.apply_retained_payload_limit(limit);
+    assert!(
+        state.can_retain_payload(old_projection),
+        "the old local-completion preflight admitted the peak"
+    );
+    ctx.extensions.insert(state);
+
+    let wire = String::from_utf8(encode_local_completion(&mut ctx).unwrap().to_vec()).unwrap();
+    assert_eq!(wire.matches("event: error").count(), 1, "one bounded error: {wire}");
+    assert!(
+        !wire.contains("response.output_item.done"),
+        "no synthesis escaped: {wire}"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
 // #1159 Task 4: end-to-end proof that a lowered `Namespace` member is retyped in

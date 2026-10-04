@@ -26,14 +26,12 @@ use crate::openai::{
 pub(super) fn accumulate_event(
     ctx: &mut HttpFilterContext<'_>,
     filter_state: &mut StreamEventsState,
-    event: &ResponsesEvent,
+    event: &mut ResponsesEvent,
 ) {
     match event {
-        ResponsesEvent::ResponseCompleted(payload)
-        | ResponsesEvent::ResponseIncomplete(payload)
-        | ResponsesEvent::ResponseFailed(payload) => {
-            handle_terminal_event(ctx, payload, event);
-        },
+        ResponsesEvent::ResponseCompleted(payload) => handle_terminal_event(ctx, payload, "completed"),
+        ResponsesEvent::ResponseIncomplete(payload) => handle_terminal_event(ctx, payload, "incomplete"),
+        ResponsesEvent::ResponseFailed(payload) => handle_terminal_event(ctx, payload, "failed"),
 
         ResponsesEvent::OutputItemAdded(payload) => {
             handle_output_item_added(ctx, payload);
@@ -60,18 +58,16 @@ pub(super) fn accumulate_event(
 }
 
 /// Overwrite `ResponsesState` from a terminal event's authoritative payload.
-fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &Value, event: &ResponsesEvent) {
-    let response = payload.get("response").unwrap_or(payload);
-
-    let status = match event {
-        ResponsesEvent::ResponseCompleted(_) => "completed",
-        ResponsesEvent::ResponseIncomplete(_) => "incomplete",
-        ResponsesEvent::ResponseFailed(_) => "failed",
-        _ => "unknown",
+fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &mut Value, status: &str) {
+    // The parsed event owns the terminal response. Move it into the canonical
+    // state owner before the event is deferred; the remaining envelope keeps
+    // only the small lifecycle metadata. Malformed bare-response events retain
+    // the old fallback copy so their original envelope remains available.
+    let response = match payload.as_object_mut().and_then(|object| object.get_mut("response")) {
+        Some(response) => std::mem::take(response),
+        None => payload.clone(),
     };
-    // SSE payloads are borrowed from the frame parser, so terminal accumulation
-    // is the one path that must clone a complete response object.
-    let _ = accumulate_response_object(ctx, response.clone(), Some(status));
+    let _ = accumulate_response_object(ctx, response, Some(status));
 }
 
 /// Overwrite response fields from an authoritative complete response object.

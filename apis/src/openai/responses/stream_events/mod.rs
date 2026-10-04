@@ -36,6 +36,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
     StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -69,7 +70,8 @@ pub(crate) const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
 struct DeferredTerminalEvent {
     /// Canonical event type.
     event_type: String,
-    /// Parsed event payload.
+    /// Parsed envelope fields. A `response: null` marker replaces the moved
+    /// tree, so the live stream holds only metadata on conformant terminals.
     payload: Value,
 }
 
@@ -161,8 +163,8 @@ pub(super) struct StreamEventsState {
     /// Prior-round output is immutable during an inference stream. Cache its
     /// charge separately from current-round output and parser state.
     shared_prior_output_bytes: OnceLock<Option<PriorOutputCache>>,
-    /// Exact charge for the current response, fallback terminal template, and
-    /// completed call copies. Output/terminal/done events change these owners
+    /// Exact charge for the current response and fallback terminal template.
+    /// Output/terminal/done events change these owners
     /// during a live stream; later argument deltas leave them intact.
     /// Zero means unmeasured; the serialized `response_object` is always at
     /// least `null` (four bytes), so every valid measurement is nonzero.
@@ -1018,6 +1020,7 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
 /// This is intentionally an upper bound: replacement writes may release the
 /// previous state owner during commit, but charging the projected owner keeps
 /// the preflight transactional at the allocation peak.
+#[expect(clippy::too_many_lines, reason = "event variants require distinct clone projections")]
 fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     let state = ctx.extensions.get::<ResponsesState>();
     events.iter().try_fold(0_usize, |used, event| {
@@ -1026,13 +1029,21 @@ fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[
             ResponsesEvent::ResponseCompleted(payload)
             | ResponsesEvent::ResponseIncomplete(payload)
             | ResponsesEvent::ResponseFailed(payload) => {
-                let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
-                let usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                // Terminal accumulation retains the response, merges a
-                // distinct usage owner, and may insert that merged usage back
-                // into the response. Three response projections plus prior
-                // usage bound those simultaneous owners before commit.
-                response_bytes.checked_mul(3)?.checked_add(usage_bytes)?
+                let response = payload.get("response").unwrap_or(payload);
+                let response_bytes = retained_json_bytes(response)?;
+                let previous_usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
+                let incoming_usage_bytes = response.get("usage").map_or(Some(0), retained_json_bytes)?;
+                // The conformant terminal response moves from the parsed event
+                // into shared state. Usage merging can still grow the distinct
+                // accumulator and clone the merged usage into that response.
+                let usage_peak = previous_usage_bytes.checked_add(incoming_usage_bytes)?.checked_mul(2)?;
+                if payload.get("response").is_some() {
+                    usage_peak
+                } else {
+                    // Preserve the old bare-response fallback, which clones
+                    // the whole payload so its envelope can still be emitted.
+                    usage_peak.checked_add(response_bytes)?
+                }
             },
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
                 let item_bytes = payload.get("item").map_or(Some(0), retained_json_bytes)?;
@@ -1421,7 +1432,11 @@ fn local_terminal_output_upper_bound(state: &ResponsesState) -> Option<usize> {
     Some(bound)
 }
 
-/// Reserve ready file-search item copies and wire growth before EOS synthesis.
+/// Reserve the owned ready-item copies and wire buffer before file-search EOS
+/// synthesis. Pending items are only re-queued, so they create no payload here.
+/// The lifecycle bound covers the two item envelopes, progress events, and
+/// temporary payload/Vec growth; the extra item charge covers the ready queue's
+/// clone, which stays live while those events are built.
 fn ready_file_search_synthesis_staging_bytes(state: &ResponsesState) -> Option<usize> {
     state
         .pending_local_tool_synthesis
@@ -1436,6 +1451,24 @@ fn ready_file_search_synthesis_staging_bytes(state: &ResponsesState) -> Option<u
             }
             used.checked_add(retained_json_bytes(item)?)?
                 .checked_add(local_item_sse_upper_bound(state, item)?)
+        })
+}
+
+/// Request-side local terminal builders already reserve the synthesized wire;
+/// add the ready queue's independent item clones before either builder drains it.
+fn ready_file_search_clone_bytes(state: &ResponsesState) -> Option<usize> {
+    state
+        .pending_local_tool_synthesis
+        .iter()
+        .try_fold(0_usize, |used, (index, _)| {
+            let item = state.accumulated_output.get(*index)?;
+            if !matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("completed" | "incomplete")
+            ) {
+                return Some(used);
+            }
+            used.checked_add(retained_json_bytes(item)?)
         })
 }
 
@@ -1469,78 +1502,89 @@ fn logical_output_upper_bound(
     Some(bound)
 }
 
-/// Return the compact size of the output that canonicalization will duplicate.
-fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
-    if state.accumulated_output.is_empty() {
-        retained_json_values_bytes(state.output_items())
-    } else {
-        retained_json_values_bytes(&state.accumulated_output)
-    }
-}
-
-/// Reserve names copied into each restored client-tool output item. A single
-/// namespace in the reverse map can expand into many public call items while
-/// the canonical response and returned terminal output both remain live.
-fn terminal_restored_name_staging_bytes(state: &ResponsesState, output: &[Value]) -> Option<usize> {
-    let mut names = 0_usize;
-    for item in output {
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            continue;
-        }
-        let Some(lowered) = item
-            .get("name")
-            .and_then(Value::as_str)
-            .and_then(|name| state.client_tool_lowering.get(name))
-        else {
-            continue;
-        };
-        names = names
-            .checked_add(retained_json_bytes(&lowered.original_name)?)?
-            .checked_add(lowered.namespace.as_deref().map_or(Some(0), retained_json_bytes)?)?
-            .checked_add(128)?;
-    }
-    // One name can be temporarily owned by the retyped item as well as both
-    // completed output trees during restoration.
-    names.checked_mul(3)
-}
-
 /// Reserve the transient owners created before a logical terminal is emitted.
 ///
-/// `canonicalize_logical_response` keeps one output in the returned terminal
-/// and clones another into `response_object`. The caller's existing terminal
-/// and already-emitted bytes remain live while those owners are constructed,
-/// so this admission must happen before canonicalization, not only after the
-/// terminal has been mutated.
+/// Canonicalization moves the accumulated output into `response_object` and
+/// borrows it for the wire. Reserve metadata, usage, citation, and client-tool
+/// restoration copies before mutating the canonical response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one terminal projection covers several independent owners"
+)]
 fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
     let output = if state.accumulated_output.is_empty() {
         state.output_items()
     } else {
         &state.accumulated_output
     };
-    let output_bytes = canonical_logical_output_bytes(state)?;
     // Annotation staging includes the cleaned text and projected citation
-    // objects. Both the terminal and response_object retain the expanded
-    // output after canonicalization, so reserve two expanded copies as well
-    // as the temporary annotation owner.
+    // objects. Reserve the temporary annotation owners before rewriting the
+    // canonical output in place.
     let annotation_bytes = crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(
         output,
         &state.citation_files,
     )
     .ok()?;
-    // Client-tool restoration copies the echoed declarations into the
-    // canonical response and the deferred terminal before the final wire
-    // preflight. Admit those owners before either response is mutated.
-    let echoed_tools_bytes = state.client_tool_echo.as_ref().map_or(Some(0), |echo| {
-        retained_json_bytes(&echo.tools)?
+    let id_bytes = state
+        .logical_stream_response_id
+        .as_ref()
+        .map_or(Some(0), retained_json_bytes)?;
+    let previous_id_bytes = state
+        .previous_response_id
+        .as_ref()
+        .map_or(Some(0), retained_json_bytes)?;
+    let usage_bytes = if state.usage.is_null() {
+        0
+    } else {
+        retained_json_bytes(&state.usage)?
+    };
+    let client_tool_bytes = if state.client_tool_lowering.is_empty() {
+        0
+    } else {
+        // Rich client-tool restoration parses and rebuilds individual output
+        // items in place. A second output-sized allowance bounds those local
+        // construction owners. Namespaced calls also copy the public name and
+        // namespace into every restored item; one reverse-map entry can fan
+        // out across many short private calls.
+        let restored_names = output.iter().try_fold(0_usize, |used, item| {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return Some(used);
+            }
+            let Some(lowered) = item
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| state.client_tool_lowering.get(name))
+            else {
+                return Some(used);
+            };
+            if !matches!(
+                lowered.restore,
+                ClientToolRestore::Namespace | ClientToolRestore::NamespaceCustom
+            ) {
+                return Some(used);
+            }
+            used.checked_add(retained_json_bytes(&lowered.original_name)?)?
+                .checked_add(lowered.namespace.as_ref().map_or(Some(0), retained_json_bytes)?)?
+                .checked_add(64)
+        })?;
+        retained_json_values_bytes(output)?
+            .checked_mul(2)?
+            .checked_add(restored_names)?
+    };
+    let echo_bytes = state.client_tool_echo.as_ref().map_or(Some(0), |echo| {
+        // Restoration adds one tools/choice owner to the canonical response;
+        // the deferred terminal only borrows that response for the wire.
+        retained_json_values_bytes(&echo.tools)?
             .checked_add(retained_json_bytes(&echo.tool_choice)?)?
             .checked_add(64)
     })?;
-    let restored_names_bytes = terminal_restored_name_staging_bytes(state, output)?;
-    output_bytes
-        .checked_mul(2)?
-        .checked_add(annotation_bytes.checked_mul(3)?)?
-        .checked_add(echoed_tools_bytes.checked_mul(2)?)?
-        .checked_add(restored_names_bytes)?
+    annotation_bytes
+        .checked_mul(3)?
+        .checked_add(id_bytes)?
+        .checked_add(previous_id_bytes)?
+        .checked_add(usage_bytes)?
+        .checked_add(client_tool_bytes)?
+        .checked_add(echo_bytes)?
         .checked_add(existing_output_bytes)
 }
 
@@ -1626,10 +1670,10 @@ fn parse_chunk_events(
 /// buffered path would accept.
 ///
 /// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
-/// charged: their payload snapshots the full accumulated output plus usage into
-/// `response_object` and is retained a second time as the deferred terminal, so a
-/// terminal frame that alone exceeds the ceiling (yet still fits
-/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
+/// charged: their frame owns a full response snapshot while the parsed response
+/// moves into `response_object`, so a terminal frame that alone exceeds the
+/// ceiling (yet still fits `max_buffer_bytes`) must fail closed. The deferred
+/// terminal retains only envelope metadata after that move. The
 /// per-frame `added`/`done`/terminal charges over-count an item that also streams
 /// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
 /// byte bound. The distinct item-count dimension is enforced separately from the
@@ -1770,11 +1814,11 @@ struct CommitChunkStaging {
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    events: Vec<ResponsesEvent>,
+    mut events: Vec<ResponsesEvent>,
     staging: &CommitChunkStaging,
 ) -> Result<Option<Vec<u8>>, SseParseError> {
     // Phase 2a accumulates shared output and captures charged completion snapshots.
-    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &events, staging.parsed_owner_bytes)?
+    let Some((completions, completion_bytes)) = accumulate_chunk(state, ctx, &mut events, staging.parsed_owner_bytes)?
     else {
         return Ok(None);
     };
@@ -1787,8 +1831,9 @@ fn commit_chunk_events(
             return Err(error);
         }
 
-        // Restoration can add logical output after phase 2a has grown shared
-        // state. Admit that peak before recording a delivery milestone.
+        // Native passthrough has no restoration plan. For lowered traffic,
+        // remeasure event owners after accumulation because a terminal response
+        // may already have moved from the event into shared state.
         let has_restoration_plan = ctx
             .extensions
             .get::<ResponsesState>()
@@ -1873,7 +1918,7 @@ fn release_client_tool_charge(ctx: &mut HttpFilterContext<'_>, bytes: usize) {
 fn accumulate_chunk(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    events: &[ResponsesEvent],
+    events: &mut [ResponsesEvent],
     parsed_owner_bytes: usize,
 ) -> Result<Option<ChargedClientToolCompletions>, SseParseError> {
     let mut completions = Vec::new();
@@ -3167,7 +3212,7 @@ fn normalize_logical_payload(ctx: &mut HttpFilterContext<'_>, payload: &mut Valu
 }
 
 /// Encode one canonical single-line SSE event.
-fn encode_sse_event(event_type: &str, payload: &Value, output: &mut Vec<u8>) {
+fn encode_sse_event<T: Serialize + ?Sized>(event_type: &str, payload: &T, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
@@ -3222,6 +3267,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     {
         let state = ctx.extensions.get::<ResponsesState>()?;
         if !canonicalization_staging_bytes(state, local_output_upper_bound)
+            .and_then(|staging| staging.checked_add(ready_file_search_clone_bytes(state)?))
             .is_some_and(|staging| state.can_replace_retained_payload(0, 0, staging))
         {
             return Some(encode_retained_payload_error(ctx));
@@ -3382,7 +3428,9 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
             .checked_add(code.len())
             .and_then(|bytes| bytes.checked_mul(8))
             .and_then(|bytes| bytes.checked_add(512));
-        let projected = error_upper_bound.and_then(|bytes| bytes.checked_add(local_output_upper_bound));
+        let projected = error_upper_bound
+            .and_then(|bytes| bytes.checked_add(local_output_upper_bound))
+            .and_then(|bytes| bytes.checked_add(ready_file_search_clone_bytes(state)?));
         if !projected.is_some_and(|bytes| state.can_retain_payload(bytes)) {
             return Some(encode_retained_payload_error(ctx));
         }
@@ -3657,46 +3705,62 @@ fn emit_deferred_terminal(
         record_retained_payload_overflow(ctx, parser_state);
         return Err(SseParseError::StreamPoisoned);
     }
-    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
-    parser_state.shared_current_output_bytes.store(0, Ordering::Relaxed);
+    let sequence_before_terminal = state.logical_stream_sequence;
+    canonicalize_logical_response(state, restore_previous_response_id)?;
     state.mark_current_output_changed();
-    if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
-        response.insert("output".to_owned(), Value::Array(accumulated_output));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage);
-        }
-    }
-    // Restore the original client-visible tools before admitting the wire copy.
-    if let Some(response) = terminal.payload.get_mut("response") {
-        restore_snapshot_tools(response, state.client_tool_echo.as_ref());
-    }
-    // The held JSON terminal remains live while its independently owned SSE
-    // serialization is appended. Reserve both owners, including normalization
-    // and the optional [DONE] frame, before writing to the output buffer.
-    let staging = normalized_sse_event_upper_bound(ctx, &terminal.event_type, &terminal.payload)
-        // Normalization can grow the held JSON owner as well as the wire copy.
-        .and_then(|event_bytes| event_bytes.checked_mul(2))
-        .and_then(|bytes| bytes.checked_add(output.len()))
+    parser_state.shared_current_output_bytes.store(0, Ordering::Relaxed);
+    normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
+    let terminal_bytes = ctx.extensions.get::<ResponsesState>().and_then(|state| {
+        retained_json_bytes(&BorrowedTerminalPayload {
+            metadata: &terminal.payload,
+            response: &state.response_object,
+        })
+    });
+    let terminal_frame_bytes = terminal_bytes
+        .and_then(|bytes| bytes.checked_add(b"event: ".len()))
+        .and_then(|bytes| bytes.checked_add(terminal.event_type.len()))
+        .and_then(|bytes| bytes.checked_add(b"\ndata: ".len()))
+        .and_then(|bytes| bytes.checked_add(b"\n\n".len()))
         .and_then(|bytes| {
-            bytes.checked_add(if parser_state.deferred_done {
-                b"data: [DONE]\n\n".len()
+            if parser_state.deferred_done {
+                bytes.checked_add(b"data: [DONE]\n\n".len())
             } else {
-                0
-            })
+                Some(bytes)
+            }
         });
+    // The deferred metadata remains independently owned while the borrowed
+    // response is serialized into the wire buffer. The wire and metadata
+    // therefore coexist even though the response tree itself is only borrowed.
+    let staging = terminal_frame_bytes
+        .and_then(|bytes| output.len().checked_add(bytes))
+        .and_then(|bytes| terminal.retained_payload_bytes()?.checked_add(bytes));
     if !staging.is_some_and(|bytes| stream_payload_fits(ctx, parser_state, bytes)) {
+        // The failed terminal never reached the client. Reuse its sequence
+        // number for the single error event emitted by the finalizer.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.logical_stream_sequence = sequence_before_terminal;
+        }
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);
         return Err(SseParseError::StreamPoisoned);
     }
     // Persist before the deferred terminal chunk can be released to the client.
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.logical_stream_terminal_emitted = true;
-    }
-    normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
-    encode_sse_event(&terminal.event_type, &terminal.payload, output);
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Err(SseParseError::StreamPoisoned);
+    };
+    encode_sse_event(
+        &terminal.event_type,
+        &BorrowedTerminalPayload {
+            metadata: &terminal.payload,
+            response: &state.response_object,
+        },
+        output,
+    );
     if parser_state.deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.logical_stream_terminal_emitted = true;
     }
     Ok(())
 }
@@ -3782,12 +3846,15 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical terminal construction follows ordered state transitions"
+)]
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
-) -> Result<(Vec<Value>, Value), SseParseError> {
+) -> Result<(), SseParseError> {
     let logical_id = state.logical_stream_response_id.clone();
-    let usage = state.usage.clone();
     let restored_previous_response_id = restore_previous_response_id
         .then(|| state.previous_response_id.clone())
         .flatten();
@@ -3795,11 +3862,19 @@ fn canonicalize_logical_response(
     // (agentic pipelines). When no such filter ran — a plain one-round logical
     // stream — it stays empty, so fall back to the terminal event's own output
     // rather than clobber it with nothing. Mirrors `finalize_response_body`.
-    let mut output = if state.accumulated_output.is_empty() {
-        state.output_items().to_vec()
-    } else {
-        state.accumulated_output.clone()
-    };
+    if !state.accumulated_output.is_empty()
+        && let Some(response) = state.response_object.as_object_mut()
+    {
+        response.insert(
+            "output".to_owned(),
+            Value::Array(std::mem::take(&mut state.accumulated_output)),
+        );
+    }
+    // No dispatcher runs after terminal canonicalization. The assignments
+    // index the old accumulator and must not outlive its moved output.
+    state.tool_calls.clear();
+    state.tool_search_calls.clear();
+    state.web_search_calls.clear();
     // Rewrite file_search citation markers into typed annotations on the final
     // assistant message, mirroring the buffered `annotate_response` finalize
     // path. In streaming the dispatcher reconciled `citation_files` during a
@@ -3808,10 +3883,15 @@ fn canonicalize_logical_response(
     // No-op when no dispatcher recorded citation files. Best-effort: the logical
     // stream is already committed here, so a malformed marker degrades to
     // un-annotated text rather than aborting the terminal.
-    if let Err(error) = crate::openai::responses::file_search_callout::citations::annotate_output_items(
-        &mut output,
-        &state.citation_files,
-    ) {
+    let output = state
+        .response_object
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+        .map(Vec::as_mut_slice)
+        .unwrap_or_default();
+    if let Err(error) =
+        crate::openai::responses::file_search_callout::citations::annotate_output_items(output, &state.citation_files)
+    {
         tracing::warn!(%error, "failed to annotate logical stream response citations");
     }
     if let Some(response) = state.response_object.as_object_mut() {
@@ -3821,49 +3901,72 @@ fn canonicalize_logical_response(
         if let Some(prev_id) = restored_previous_response_id {
             response.insert("previous_response_id".to_owned(), Value::String(prev_id));
         }
-        response.insert("output".to_owned(), Value::Array(output.clone()));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage.clone());
+        if !state.usage.is_null() {
+            // Keep the request-wide usage accumulator available to downstream
+            // consumers after the terminal response is recorded.
+            response.insert("usage".to_owned(), state.usage.clone());
         }
     }
-    restore_terminal_client_tools(state, &mut output)?;
-    Ok((output, usage))
+    restore_terminal_client_tools(state)
 }
 
 /// #1159: last-chance restoration of every lowered client-tool call plus
 /// `tools`/`tool_choice` on the terminal response object. A lossy restore fails
 /// the whole logical stream closed rather than leaking a private lowered shape.
 ///
-/// Re-syncs `output` from the now-restored `response_object`, since the
-/// deferred-terminal caller writes THAT vec to the wire (not the object). No-op
-/// when nothing was lowered.
-fn restore_terminal_client_tools(state: &mut ResponsesState, output: &mut Vec<Value>) -> Result<(), SseParseError> {
-    if state.client_tool_lowering.is_empty() {
-        return Ok(());
-    }
-    // The output items were inserted into `response_object` above; restore needs
-    // that object. If it is not an object we cannot restore -> fail closed rather
-    // than return the un-restored (lowered) output.
-    if !state.response_object.is_object() {
-        return Err(SseParseError::ClientToolRestore {
-            key: "terminal".to_owned(),
-            reason: "terminal response object unavailable for client-tool restore".to_owned(),
-        });
-    }
-    restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
-        SseParseError::ClientToolRestore {
-            key: "terminal".to_owned(),
-            reason: format!("lossy restore of {item_type}"),
+/// The deferred terminal borrows this same restored response object for the
+/// wire, so there is no second output tree to synchronize.
+fn restore_terminal_client_tools(state: &mut ResponsesState) -> Result<(), SseParseError> {
+    if !state.client_tool_lowering.is_empty() {
+        // The output items were moved into `response_object` above. A lossy
+        // restore must fail closed before that object is sent or persisted.
+        if !state.response_object.is_object() {
+            return Err(SseParseError::ClientToolRestore {
+                key: "terminal".to_owned(),
+                reason: "terminal response object unavailable for client-tool restore".to_owned(),
+            });
         }
-    })?;
-    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
-    // Re-sync the returned vec from the now-restored object (an ownership boundary
-    // returning an owned restored vec) — a once-per-logical-stream terminal clone,
-    // not a per-chunk clone.
-    if let Some(restored) = state.response_object.get("output").and_then(Value::as_array) {
-        output.clone_from(restored);
+        restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
+            SseParseError::ClientToolRestore {
+                key: "terminal".to_owned(),
+                reason: format!("lossy restore of {item_type}"),
+            }
+        })?;
     }
+    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
     Ok(())
+}
+
+/// Serialize the terminal envelope while borrowing the canonical response
+/// owned by `ResponsesState` for persistence. The deferred metadata never owns
+/// another full response tree.
+struct BorrowedTerminalPayload<'a> {
+    /// Deferred lifecycle metadata and event type.
+    metadata: &'a Value,
+    /// Canonical response owned by request state.
+    response: &'a Value,
+}
+
+impl Serialize for BorrowedTerminalPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some(metadata) = self.metadata.as_object() else {
+            return self.metadata.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(metadata.len()))?;
+        for (key, value) in metadata {
+            if key == "response" {
+                // Keep the existing map position, including JSON key order,
+                // while borrowing the canonical response from shared state.
+                map.serialize_entry(key, self.response)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.

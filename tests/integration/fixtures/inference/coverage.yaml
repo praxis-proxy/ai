@@ -302,6 +302,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.canonical_terminal_output
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/irr-terminal-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.agentic.deferred_mcp_connectors
     scopes:
       - responses_agentic_loop

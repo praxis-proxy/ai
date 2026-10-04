@@ -1258,6 +1258,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1320,6 +1321,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
@@ -1341,7 +1343,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 52, "manifest feature inventory count");
+        assert_eq!(report.features_total, 53, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 47, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 52, "manifest recording inventory count");
         assert_eq!(
@@ -1396,7 +1398,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 52, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 53, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1555,6 +1557,10 @@ mod tests {
                 ),
                 (
                     &"responses.agentic.irr_terminal_streaming".to_owned(),
+                    &vec!["responses/irr-terminal-streaming".to_owned()]
+                ),
+                (
+                    &"responses.agentic.canonical_terminal_output".to_owned(),
                     &vec!["responses/irr-terminal-streaming".to_owned()]
                 ),
                 (
@@ -1765,7 +1771,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[20..33] {
+        for feature in &manifest.features[20..34] {
             assert_eq!(
                 feature
                     .providers
@@ -1775,7 +1781,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[33..35] {
+        for feature in &manifest.features[34..36] {
             assert_eq!(
                 feature
                     .providers
@@ -1785,7 +1791,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[35..47] {
+        for feature in &manifest.features[36..48] {
             assert_eq!(
                 feature
                     .providers
@@ -1796,14 +1802,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[47]
+            manifest.features[48]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[48..52] {
+        for feature in &manifest.features[49..53] {
             assert_eq!(
                 feature
                     .providers
