@@ -338,9 +338,11 @@ def _write_full_flow_config(
             + anchor,
         )
     if retained_limit is not None:
-        anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
+        anchor = "                max_retained_bytes: 67108864\n"
         assert config.count(anchor) == 1
-        config = config.replace(anchor, anchor + f"                max_retained_bytes: {retained_limit}\n")
+        config = config.replace(
+            anchor, f"                max_retained_bytes: {retained_limit}\n", 1
+        )
     if skip_agentic_response:
         anchor = "              - filter: openai_agentic_loop\n                max_infer_iters: 7\n"
         assert config.count(anchor) == 1
@@ -351,7 +353,6 @@ def _write_full_flow_config(
             + "                  - when:\n"
             + "                      headers:\n"
             + "                        x-test-run-agentic: \"true\"\n",
-        )
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -514,6 +515,20 @@ def test_store_url_survives_endpoint_rewrites(writer, args, postgres_port, monke
         with open(path) as config_file:
             config = config_file.read()
         assert f'database_url: "{database_url}"' in config
+    finally:
+        os.unlink(path)
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize("retained_limit", [8_192, 67_108_864])
+def test_full_flow_budget_override_replaces_default(retained_limit):
+    """The budgeted SDK fixtures must produce one parseable filter setting."""
+    path = _write_full_flow_config(18_080, "/unused.db", retained_limit=retained_limit)
+    try:
+        with open(path) as config_file:
+            config = config_file.read()
+        assert config.count("max_retained_bytes:") == 1
+        assert f"max_retained_bytes: {retained_limit}\n" in config
     finally:
         os.unlink(path)
 
