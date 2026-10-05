@@ -133,12 +133,15 @@ pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
         index += 1;
     }
     // Two wire-like owners may coexist: the transport body and SSE `data` or
-    // serde's string allocation. One structural node needs at most 128 bytes
-    // including container slack and map entry links.
+    // serde's string allocation. rmcp's untagged JSON-RPC deserializer can
+    // hold intermediate Value trees alongside the final one. With serde_json's
+    // preserve_order maps, dense arrays of small nested objects need more than
+    // 128 bytes per structural token before those intermediates are dropped.
+    const NODE_PEAK_BYTES: usize = 512;
     raw.len()
         .checked_mul(2)?
         .checked_add(normalized)?
-        .checked_add(nodes.checked_mul(128)?)
+        .checked_add(nodes.checked_mul(NODE_PEAK_BYTES)?)
 }
 
 /// True when the raw message and its worst-case parsed owners fit the optional cap.
@@ -2133,6 +2136,25 @@ mod tests {
             ),
             "an ordinary tool result must still fit"
         );
+    }
+
+    #[test]
+    fn dense_structured_content_is_rejected_before_rmcp_parse() {
+        // rmcp's untagged response deserializer can hold intermediate Value
+        // trees while constructing the final nested structuredContent value.
+        let values = vec![r#"{"a":[0]}"#; 10_000].join(",");
+        let wire = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[],\"structuredContent\":{{\"values\":[{values}]}}}}}}"
+        );
+        let parse_cap = 6 * 1_048_576;
+        assert!(wire.len() < tool_result_wire_cap(3 * 1_048_576));
+        assert!(wire.len() < parse_cap, "the raw body fits the parse allowance");
+        let signal = test_signal();
+        assert!(matches!(
+            admit_json_preparse(wire.as_bytes(), Some(parse_cap), &signal),
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit }) if *limit == parse_cap));
     }
 
     #[test]
