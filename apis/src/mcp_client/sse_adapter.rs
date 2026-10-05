@@ -210,6 +210,8 @@ struct ByteState {
     raw_event: RawSseEventWindow,
     /// Conservative charge for every event the parser may queue from one chunk.
     batch_charge: Arc<AtomicUsize>,
+    /// `sse-stream` retains its `VecDeque<Sse>` allocation after draining it.
+    queued_capacity_charge: usize,
     /// Out-of-band signal for recording `ResponseTooLarge`.
     signal: SseSignalTarget,
 }
@@ -224,12 +226,17 @@ struct RawSseEventWindow {
     line_has_content: bool,
     /// Treat a CRLF pair as one line ending across chunks.
     previous_was_cr: bool,
+    /// Length of the line currently held in `sse-stream`'s unfinished-line Vec.
+    unfinished_line_bytes: usize,
+    /// Largest unfinished line ever buffered; its cleared Vec keeps capacity.
+    max_buffered_line_bytes: usize,
 }
 
 impl RawSseEventWindow {
     /// Count completed frames while advancing the borrowed raw event window.
     fn observe(&mut self, chunk: &[u8]) -> usize {
         let mut completed = 0_usize;
+        let mut line_was_buffered = self.unfinished_line_bytes != 0;
         for &byte in chunk {
             self.bytes = self.bytes.saturating_add(1);
             if self.previous_was_cr {
@@ -240,6 +247,11 @@ impl RawSseEventWindow {
             }
             match byte {
                 b'\r' | b'\n' => {
+                    if line_was_buffered {
+                        self.max_buffered_line_bytes = self.max_buffered_line_bytes.max(self.unfinished_line_bytes);
+                    }
+                    self.unfinished_line_bytes = 0;
+                    line_was_buffered = false;
                     if !self.line_has_content {
                         self.bytes = 0;
                         completed = completed.saturating_add(1);
@@ -247,8 +259,14 @@ impl RawSseEventWindow {
                     self.line_has_content = false;
                     self.previous_was_cr = byte == b'\r';
                 },
-                _ => self.line_has_content = true,
+                _ => {
+                    self.line_has_content = true;
+                    self.unfinished_line_bytes = self.unfinished_line_bytes.saturating_add(1);
+                },
             }
+        }
+        if self.unfinished_line_bytes != 0 {
+            self.max_buffered_line_bytes = self.max_buffered_line_bytes.max(self.unfinished_line_bytes);
         }
         completed
     }
@@ -292,6 +310,7 @@ pub(super) fn sse_stream_from_body(
         per_event: SseEventSizeLimiter::new(effective_per_event),
         raw_event: RawSseEventWindow::default(),
         batch_charge: Arc::clone(&batch_charge),
+        queued_capacity_charge: 0,
         signal,
     };
 
@@ -315,22 +334,32 @@ pub(super) fn sse_stream_from_body(
                                 .map(|slots| slots.max(4))
                                 .and_then(|slots| slots.checked_mul(size_of::<Sse>()))
                         };
+                        // `sse-stream` drains the parsed events before reading
+                        // another chunk, but its VecDeque allocation survives.
+                        let queued_capacity = st.queued_capacity_charge.max(queued_nodes.unwrap_or(limit));
+                        // Its unfinished-line Vec is also cleared, not freed.
+                        // Vec's amortized growth can reserve up to twice the
+                        // largest fragmented line. Charge the previous capacity
+                        // before handing this chunk to the parser.
+                        let previous_line_capacity = st.raw_event.max_buffered_line_bytes.checked_mul(2);
                         if raw_window
                             .and_then(|bytes| bytes.checked_mul(3))
-                            .and_then(|bytes| bytes.checked_add(queued_nodes?))
+                            .and_then(|bytes| bytes.checked_add(queued_capacity))
+                            .and_then(|bytes| bytes.checked_add(previous_line_capacity?))
                             .is_none_or(|bytes| bytes > limit)
                         {
                             st.signal.record(TransportSignal::ResponseTooLarge { limit });
                             return Err(SseByteStreamError::JsonExpansion { limit });
                         }
-                        // The parser has consumed the raw chunk before its
-                        // map callback; only one logical copy of its queued
-                        // fields and unfinished line remains alongside the
-                        // VecDeque node storage.
+                        // Keep both parser allocations charged after the raw
+                        // event window resets or the queued events drain.
+                        let line_capacity = next_window.max_buffered_line_bytes.checked_mul(2);
                         let charge = raw_window
-                            .and_then(|bytes| bytes.checked_add(queued_nodes.unwrap_or(limit)))
+                            .and_then(|bytes| bytes.checked_add(queued_capacity))
+                            .and_then(|bytes| bytes.checked_add(line_capacity?))
                             .unwrap_or(limit);
                         st.batch_charge.store(charge, Ordering::Relaxed);
+                        st.queued_capacity_charge = queued_capacity;
                         st.raw_event = next_window;
                     }
                     // Per-event (per-message) ceiling, before parsing.
@@ -407,6 +436,8 @@ pub(super) struct FakeStreamingBody {
     /// Core ceiling to return instead of a generic upstream error.
     overflow_limit: Option<usize>,
     yielded: usize,
+    /// Optional probe for confirming the chunk that trips parser admission.
+    yielded_count: Option<Arc<AtomicUsize>>,
 }
 
 #[cfg(test)]
@@ -421,7 +452,17 @@ impl FakeStreamingBody {
             err_after: None,
             overflow_limit: None,
             yielded: 0,
+            yielded_count: None,
         }
+    }
+
+    fn counting_chunks<I>(chunks: I, cancelled: Arc<std::sync::atomic::AtomicBool>, count: Arc<AtomicUsize>) -> Self
+    where
+        I: IntoIterator<Item = bytes::Bytes>,
+    {
+        let mut body = Self::from_chunks(chunks, cancelled);
+        body.yielded_count = Some(count);
+        body
     }
 
     pub(super) fn erroring_after<I>(chunks: I, cancelled: Arc<std::sync::atomic::AtomicBool>) -> Self
@@ -467,6 +508,9 @@ impl StreamingResponseBody for FakeStreamingBody {
         match self.chunks.pop_front() {
             Some(chunk) => {
                 self.yielded += 1;
+                if let Some(count) = &self.yielded_count {
+                    count.store(self.yielded, Ordering::Relaxed);
+                }
                 Ok(Some(chunk))
             },
             None => Ok(None),
@@ -491,7 +535,10 @@ impl StreamingResponseBody for FakeStreamingBody {
     reason = "tests use unwrap/expect/indexing for brevity"
 )]
 mod tests {
-    use std::sync::{Arc, OnceLock, atomic::AtomicBool};
+    use std::sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use bytes::Bytes;
     use futures::StreamExt as _;
@@ -715,6 +762,82 @@ mod tests {
         assert!(matches!(
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 32_768 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn prior_queue_and_cleared_comment_line_remain_charged_before_later_result() {
+        // Ten batches leave 2,000 parsed ID-only events and a reusable
+        // VecDeque allocation. The fragmented comment leaves a large cleared
+        // unfinished-line Vec. Both allocations still exist when the result
+        // chunk reaches the byte layer.
+        let id_batch = Bytes::from("id:a\n\n".repeat(200));
+        let mut chunks = vec![id_batch; 10];
+        chunks.push(Bytes::from(format!(":{}", "x".repeat(45_000))));
+        chunks.push(Bytes::from(format!("{}\n\n", "x".repeat(45_000))));
+        chunks.push(Bytes::from(format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"value\":\"{}\"}}}}\n\n",
+            "y".repeat(90_000)
+        )));
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let body = Box::new(FakeStreamingBody::counting_chunks(
+            chunks,
+            cancelled_flag(),
+            Arc::clone(&yielded),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            200_000,
+            300_000,
+            200_000,
+            Arc::clone(&signal).into(),
+            Some(400_500),
+        );
+        for _ in 0..2_000 {
+            let event = stream
+                .next()
+                .await
+                .expect("ID-only event")
+                .expect("admitted ID-only event");
+            assert_eq!(event.id.as_deref(), Some("a"));
+        }
+        assert!(stream.next().await.expect("later result rejected").is_err());
+        assert_eq!(
+            yielded.load(Ordering::Relaxed),
+            13,
+            "the result chunk reaches pre-parse admission"
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 400_500 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn drained_sse_queue_capacity_is_charged_in_json_map() {
+        let first = Bytes::from("id:a\n\n".repeat(2_000));
+        let second = Bytes::from(format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"value\":\"{}\"}}}}\n\n",
+            "z".repeat(15_000)
+        ));
+        let body = Box::new(FakeStreamingBody::from_chunks([first, second], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            200_000,
+            300_000,
+            200_000,
+            Arc::clone(&signal).into(),
+            Some(400_500),
+        );
+        for _ in 0..2_000 {
+            assert!(stream.next().await.expect("ID-only event").is_ok());
+        }
+        assert!(stream.next().await.expect("JSON peak rejected").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 400_500 })
         ));
     }
 
