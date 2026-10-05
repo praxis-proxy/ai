@@ -399,6 +399,13 @@ struct Turn {
 }
 
 impl Turn {
+    /// The read-only planning turn of the issue #1418 regression.
+    const PLANNING: Self = Self {
+        prompt: PLANNING_PROMPT,
+        launch_flags: PLANNING_LAUNCH_FLAGS,
+        permission_scenario: PermissionScenario::ReadOnlyPlanning,
+    };
+
     /// The deterministic coding task under one of its permission scenarios.
     const fn coding(permission_scenario: PermissionScenario) -> Self {
         Self {
@@ -407,13 +414,6 @@ impl Turn {
             permission_scenario,
         }
     }
-
-    /// The read-only planning turn of the issue #1418 regression.
-    const PLANNING: Self = Self {
-        prompt: PLANNING_PROMPT,
-        launch_flags: PLANNING_LAUNCH_FLAGS,
-        permission_scenario: PermissionScenario::ReadOnlyPlanning,
-    };
 }
 
 // -----------------------------------------------------------------------------
