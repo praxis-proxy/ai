@@ -2038,6 +2038,7 @@ fn row_to_response_record_bounded(row: &PgRow, max_bytes: usize) -> Result<Respo
     reason = "reads three stored columns and constructs one record"
 )]
 fn row_to_response_record_with_limit(row: &PgRow, max_bytes: Option<usize>) -> Result<ResponseRecord, StoreError> {
+    let model: &str = row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?;
     let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -2046,7 +2047,8 @@ fn row_to_response_record_with_limit(row: &PgRow, max_bytes: Option<usize>) -> R
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-    let (response_object, input, messages) = if let Some(mut remaining) = max_bytes {
+    let (response_object, input, messages) = if let Some(max_bytes) = max_bytes {
+        let mut remaining = max_bytes.checked_sub(model.len()).ok_or(StoreError::PayloadTooLarge)?;
         let mut bounded = |stored: &[u8]| {
             let (value, bytes) = decode_bounded(stored, remaining)?;
             remaining -= bytes;
@@ -2071,7 +2073,7 @@ fn row_to_response_record_with_limit(row: &PgRow, max_bytes: Option<usize>) -> R
         created_at: row
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
+        model: model.to_owned(),
         response_object,
         input,
         messages,

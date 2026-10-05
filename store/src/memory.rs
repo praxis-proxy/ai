@@ -265,7 +265,13 @@ impl ResponseStore for InMemoryStore {
         let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
             return Ok(None);
         };
-        if !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes) {
+        let Some(json_allowance) = max_bytes.checked_sub(record.model.len()) else {
+            return Err(StoreError::PayloadTooLarge);
+        };
+        if !json_values_fit(
+            &[&record.response_object, &record.input, &record.messages],
+            json_allowance,
+        ) {
             return Err(StoreError::PayloadTooLarge);
         }
         Ok(Some(record.clone()))
@@ -895,6 +901,28 @@ mod tests {
             .unwrap();
         assert!(store.get_response(&a, "r1").await.unwrap().is_some());
         assert!(store.get_response(&b, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_response_counts_model_before_cloning() {
+        let store = InMemoryStore::new();
+        let owner = owner("a");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                model: "m".repeat(16_384),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.get_response_bounded(&owner, "r1", 4_096).await,
+            Err(StoreError::PayloadTooLarge)
+        ));
     }
 
     #[tokio::test]

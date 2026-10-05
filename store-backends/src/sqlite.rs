@@ -1923,6 +1923,7 @@ fn row_to_response_record_with_limit(
     row: &sqlx::sqlite::SqliteRow,
     max_bytes: Option<usize>,
 ) -> Result<ResponseRecord, StoreError> {
+    let model: &str = row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?;
     let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1931,7 +1932,8 @@ fn row_to_response_record_with_limit(
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-    let (response_object, input, messages) = if let Some(mut remaining) = max_bytes {
+    let (response_object, input, messages) = if let Some(max_bytes) = max_bytes {
+        let mut remaining = max_bytes.checked_sub(model.len()).ok_or(StoreError::PayloadTooLarge)?;
         let mut bounded = |stored: &[u8]| {
             let (value, bytes) = decode_bounded(stored, remaining)?;
             remaining -= bytes;
@@ -1956,7 +1958,7 @@ fn row_to_response_record_with_limit(
         created_at: row
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
+        model: model.to_owned(),
         response_object,
         input,
         messages,
@@ -2183,6 +2185,51 @@ mod tests {
                 Err(StoreError::PayloadTooLarge)
             ),
             "oversized raw conversation messages must exceed the bounded read limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_response_read_counts_model_with_decoded_json() {
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let codec = StoreCompressionConfig {
+            algorithm: praxis_ai_store::CompressionAlgorithm::Zstd,
+            level: None,
+        };
+        let store = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "bounded_model_responses",
+            "bounded_model_conversations",
+            None,
+            None,
+            Some(&codec),
+        )
+        .await
+        .unwrap();
+        let record = ResponseRecord {
+            id: "resp_bounded_model".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "m".repeat(3_900),
+            response_object: serde_json::json!({"output": "x".repeat(512)}),
+            input: serde_json::json!([]),
+            messages: serde_json::json!([]),
+        };
+        store.upsert_response(&record).await.unwrap();
+        let encoded_bytes: i64 = sqlx::query_scalar(
+            "SELECT length(CAST(model AS BLOB)) + length(response_object) + length(input) + length(messages) \
+             FROM bounded_model_responses WHERE id = ?",
+        )
+        .bind(&record.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(encoded_bytes <= 4_096, "the encoded SQL row must pass its preflight");
+        assert!(
+            matches!(
+                store.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "the decoded JSON and model must share the same response limit"
         );
     }
 
