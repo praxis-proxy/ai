@@ -102,7 +102,8 @@ fn buffered_preparse_wire_cap(wire_cap: usize, peak_limit: Option<usize>) -> usi
 pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
     // The transport body and rmcp's untagged JSON-RPC intermediates overlap.
     // Even one string escape can make serde retain additional scratch copies
-    // while trying variants, so escaped bodies need a larger wire allowance.
+    // while trying variants. Legacy server requests such as elicitation/create
+    // need a wider allowance than tool results for the same escaped field.
     // preserve_order maps also need a structural allowance for dense trees.
     const NODE_PEAK_BYTES: usize = 512;
     let mut normalized = raw.len();
@@ -148,7 +149,7 @@ pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
         index += 1;
     }
     raw.len()
-        .checked_mul(if saw_string_escape { 7 } else { 2 })?
+        .checked_mul(if saw_string_escape { 15 } else { 2 })?
         .checked_add(normalized)?
         .checked_add(nodes.checked_mul(NODE_PEAK_BYTES)?)
 }
@@ -2404,6 +2405,29 @@ mod tests {
             );
             assert!(!json_preparse_fits(wire.as_bytes(), Some(actual_peak - 1)));
         }
+    }
+
+    #[test]
+    fn escaped_elicitation_schema_peak_is_reserved_before_parse() {
+        let description = format!("{}\\n", "x".repeat(1_000_000));
+        let wire = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"elicitation/create","params":{{"message":"x","requestedSchema":{{"type":"object","properties":{{"x":{{"type":"string","description":"{description}"}}}}}}}}}}"#
+        );
+        let mut parsed = None;
+        let measured = allocation_counter::measure(|| {
+            parsed = Some(serde_json::from_slice::<ServerJsonRpcMessage>(wire.as_bytes()));
+        });
+        assert!(parsed.expect("parse was measured").is_ok());
+        let actual_peak = wire
+            .len()
+            .checked_add(usize::try_from(measured.bytes_max).expect("allocation peak fits usize"))
+            .expect("wire plus parse peak fits usize");
+        let estimate = json_preparse_peak_bytes(wire.as_bytes()).expect("estimate fits usize");
+        assert!(
+            estimate >= actual_peak,
+            "elicitation peak {actual_peak} exceeds estimate {estimate}"
+        );
+        assert!(!json_preparse_fits(wire.as_bytes(), Some(actual_peak - 1)));
     }
 
     #[test]

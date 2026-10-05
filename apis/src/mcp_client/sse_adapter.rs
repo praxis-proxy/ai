@@ -210,6 +210,8 @@ struct ByteState {
     raw_event: RawSseEventWindow,
     /// Conservative charge for every event the parser may queue from one chunk.
     batch_charge: Arc<AtomicUsize>,
+    /// Upper bound for data Strings still queued inside `sse-stream`.
+    queued_data_charge: Arc<AtomicUsize>,
     /// Parsed messages rmcp may still hold after this adapter yields them.
     yielded_charge: Arc<AtomicUsize>,
     /// `sse-stream` retains its `VecDeque<Sse>` allocation after draining it.
@@ -329,6 +331,7 @@ pub(super) fn sse_stream_from_body(
         .min(preparse_peak_limit.unwrap_or(usize::MAX));
     let parse_signal = signal.clone();
     let batch_charge = Arc::new(AtomicUsize::new(0));
+    let queued_data_charge = Arc::new(AtomicUsize::new(0));
     let yielded_charge = Arc::new(AtomicUsize::new(0));
     let state = ByteState {
         body,
@@ -337,6 +340,7 @@ pub(super) fn sse_stream_from_body(
         per_event: SseEventSizeLimiter::new(effective_per_event),
         raw_event: RawSseEventWindow::default(),
         batch_charge: Arc::clone(&batch_charge),
+        queued_data_charge: Arc::clone(&queued_data_charge),
         yielded_charge: Arc::clone(&yielded_charge),
         queued_capacity_charge: 0,
         parse_chunk_cap: false,
@@ -346,6 +350,15 @@ pub(super) fn sse_stream_from_body(
     let byte_stream = futures::stream::try_unfold(state, move |mut st| async move {
         loop {
             if let Some(limit) = preparse_peak_limit {
+                // `sse-stream` drains its parsed queue before asking for the
+                // next raw chunk. Only the unfinished current event can still
+                // own a data String at this boundary.
+                let pending_data = if st.raw_event.has_data {
+                    st.raw_event.bytes.checked_mul(2).unwrap_or(limit)
+                } else {
+                    0
+                };
+                st.queued_data_charge.store(pending_data, Ordering::Relaxed);
                 // The parser can retain a data String with up to twice its
                 // logical length, a cleared unfinished-line allocation, and
                 // the drained event queue between pulls. Do not hand it a raw
@@ -401,6 +414,20 @@ pub(super) fn sse_stream_from_body(
                         // another chunk, but its VecDeque allocation survives.
                         let queued_capacity = st.queued_capacity_charge.max(queued_nodes.unwrap_or(limit));
                         let queued_preparse_peak = st.queued_capacity_charge.max(queued_growth_peak.unwrap_or(limit));
+                        // After parsing this chunk, more than one completed
+                        // event (or one completed plus an unfinished data
+                        // event) can leave additional owned data Strings in
+                        // the parser while the first event is deserialized.
+                        // Every data byte comes from this raw window; double
+                        // it for String capacity, then remove each yielded
+                        // frame's own data from the charge in the map stage.
+                        let queued_data = if saw_data && (completed > 1 || (completed > 0 && next_window.has_data)) {
+                            raw_window.and_then(|bytes| bytes.checked_mul(2)).unwrap_or(limit)
+                        } else if next_window.has_data {
+                            next_window.bytes.checked_mul(2).unwrap_or(limit)
+                        } else {
+                            0
+                        };
                         // Its unfinished-line Vec is also cleared, not freed.
                         // A `data:` field can grow the parser's String while
                         // that Vec is live, so reserve both old/new String
@@ -431,6 +458,7 @@ pub(super) fn sse_stream_from_body(
                             .and_then(|bytes| bytes.checked_add(line_capacity?))
                             .unwrap_or(limit);
                         st.batch_charge.store(charge, Ordering::Relaxed);
+                        st.queued_data_charge.store(queued_data, Ordering::Relaxed);
                         st.queued_capacity_charge = queued_capacity;
                         st.raw_event = next_window;
                     }
@@ -499,8 +527,14 @@ pub(super) fn sse_stream_from_body(
                     });
                 let next_yielded =
                     frame_charge.and_then(|bytes| bytes.checked_add(yielded_charge.load(Ordering::Relaxed)));
+                let queued_after_current = frame
+                    .data
+                    .as_ref()
+                    .map_or(Some(0), |data| data.len().checked_mul(2))
+                    .map(|current| queued_data_charge.load(Ordering::Relaxed).saturating_sub(current));
                 if next_yielded
                     .and_then(|bytes| bytes.checked_add(batch_charge.load(Ordering::Relaxed)))
+                    .and_then(|bytes| bytes.checked_add(queued_after_current?))
                     .is_none_or(|bytes| bytes > limit)
                 {
                     parse_signal.record(TransportSignal::ResponseTooLarge { limit });
@@ -508,6 +542,9 @@ pub(super) fn sse_stream_from_body(
                 }
                 if let Some(bytes) = next_yielded {
                     yielded_charge.store(bytes, Ordering::Relaxed);
+                }
+                if let Some(bytes) = queued_after_current {
+                    queued_data_charge.store(bytes, Ordering::Relaxed);
                 }
             }
             Ok(frame)
@@ -736,6 +773,60 @@ mod tests {
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 430_000 })
         ));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "checks batch admission and typed failure signal")]
+    async fn queued_data_strings_share_the_first_frame_parse_allowance() {
+        let first = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"{}\n"}}]"#,
+            "x".repeat(400_000)
+        );
+        let second = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"{}"}}]"#,
+            "y".repeat(600_000)
+        );
+        let raw = format!("data: {first}\ndata: }}}}\n\ndata: {second}\ndata: }}}}\n\n");
+        // The 16x escaped-message reserve and batch copies fit below this
+        // allowance. The extra queued data String must make it fail.
+        let limit = 8_000_000;
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(raw)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            10_000_000,
+            10_000_000,
+            10_000_000,
+            Arc::clone(&signal).into(),
+            Some(limit),
+        );
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("first frame rejected before JSON parse")
+                .is_err(),
+            "the second queued data String must remain charged while the first frame is deserialized"
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: recorded }) if *recorded == limit
+        ));
+    }
+
+    #[tokio::test]
+    async fn small_two_event_batch_remains_admitted() {
+        let chunk = Bytes::from_static(
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+              data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+        );
+        let body = Box::new(FakeStreamingBody::from_chunks([chunk], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 20_000, 20_000, 20_000, Arc::clone(&signal).into(), Some(20_000));
+        assert!(stream.next().await.expect("first small event").is_ok());
+        assert!(stream.next().await.expect("second small event").is_ok());
+        assert!(stream.next().await.is_none(), "batch ends cleanly");
+        assert!(signal.get().is_none(), "small batches should not exhaust the allowance");
     }
 
     #[tokio::test]
