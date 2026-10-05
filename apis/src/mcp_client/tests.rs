@@ -2038,10 +2038,10 @@ async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
     ct.cancel();
     assert_eq!(method_count(&methods, "initialize"), 1);
     assert_eq!(method_count(&methods, "tools/call"), 1);
-    assert!(matches!(
-        result,
-        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
-    ));
+    assert!(
+        matches!(&result, Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })),
+        "unexpected budgeted tool outcome: {result:?}"
+    );
 }
 
 /// rmcp may resume a failed SSE stream after an event id and return a later

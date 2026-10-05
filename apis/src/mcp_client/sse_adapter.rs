@@ -49,6 +49,8 @@ struct SessionSseCounters {
     yielded: usize,
     /// Sum of all live stream parser reservations.
     active_parser: usize,
+    /// Transient POST response envelopes reserved before core may buffer.
+    active_buffered: usize,
 }
 
 impl SessionSseLedger {
@@ -82,6 +84,78 @@ impl SessionSseLedger {
         self.limit
             .map_or(local_limit, |session_limit| session_limit.min(local_limit))
     }
+
+    /// Reserve half the free session allowance before core can materialize a
+    /// buffered POST response. The other half remains available to a common
+    /// GET stream that may carry the reply. The permit is released after POST
+    /// classification, or before a live SSE body starts using its own permit.
+    pub(super) fn reserve_buffered(
+        self: &Arc<Self>,
+        local_limit: usize,
+        outbound_capacity: usize,
+    ) -> Option<BufferedResponsePermit> {
+        let mut counters = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let used = counters
+            .yielded
+            .checked_add(counters.active_parser)?
+            .checked_add(counters.active_buffered)?;
+        let free = self.effective_limit(local_limit).checked_sub(used)?;
+        let reserved = free.div_ceil(2);
+        let peak_limit = reserved.checked_sub(outbound_capacity)?;
+        if peak_limit == 0 {
+            return None;
+        }
+        counters.active_buffered = counters.active_buffered.checked_add(reserved)?;
+        drop(counters);
+        Some(BufferedResponsePermit {
+            ledger: Arc::clone(self),
+            reserved,
+            peak_limit,
+        })
+    }
+}
+
+/// A POST's core buffer, JSON collection and parse allowance. Dropping this
+/// releases its entire pre-execute reservation under the session lock.
+pub(super) struct BufferedResponsePermit {
+    /// Session whose counter holds this temporary envelope.
+    ledger: Arc<SessionSseLedger>,
+    /// Full transient reservation, including the outbound body capacity.
+    reserved: usize,
+    /// Remaining room for the buffered response and its decoded owners.
+    peak_limit: usize,
+}
+
+impl BufferedResponsePermit {
+    /// Return the response-only portion of this permit.
+    pub(super) fn peak_limit(&self) -> usize {
+        self.peak_limit
+    }
+
+    /// rmcp can queue a returned JSON message after this POST method exits.
+    /// Keep the conservative envelope charged until the session is retired.
+    pub(super) fn retain_json(mut self, charge: usize) {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.active_buffered -= self.reserved;
+        counters.yielded = counters.yielded.saturating_add(charge.min(self.peak_limit));
+        drop(counters);
+        self.reserved = 0;
+    }
+}
+
+impl Drop for BufferedResponsePermit {
+    fn drop(&mut self) {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.active_buffered = counters.active_buffered.saturating_sub(self.reserved);
+    }
 }
 
 /// The two halves of one SSE adapter share this permit. No lock spans an
@@ -112,6 +186,7 @@ impl StreamPermit {
         if counters
             .yielded
             .checked_add(active_parser)
+            .and_then(|total| total.checked_add(counters.active_buffered))
             .is_none_or(|total| total > self.ledger.effective_limit(local_limit))
         {
             return false;
@@ -132,7 +207,10 @@ impl StreamPermit {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = self.parser.load(Ordering::Relaxed);
-        let total = counters.yielded.checked_add(counters.active_parser)?;
+        let total = counters
+            .yielded
+            .checked_add(counters.active_parser)?
+            .checked_add(counters.active_buffered)?;
         let free = self.ledger.effective_limit(local_limit).checked_sub(total)?;
         let slice = if self.ledger.limit.is_some() {
             free.div_ceil(2)
@@ -168,6 +246,7 @@ impl StreamPermit {
         };
         if yielded
             .checked_add(active_parser)
+            .and_then(|total| total.checked_add(counters.active_buffered))
             .is_none_or(|total| total > self.ledger.effective_limit(local_limit))
         {
             return false;
