@@ -335,9 +335,21 @@ pub(super) fn sse_stream_from_body(
                                 .map(|slots| slots.max(4))
                                 .and_then(|slots| slots.checked_mul(size_of::<Sse>()))
                         };
+                        // A growing VecDeque can hold its old and new backing
+                        // allocations during realloc. Its old capacity is at
+                        // most half the new bound for this chunk.
+                        let queued_growth_peak = if completed == 0 {
+                            Some(0)
+                        } else {
+                            completed
+                                .checked_mul(3)
+                                .map(|slots| slots.max(4))
+                                .and_then(|slots| slots.checked_mul(size_of::<Sse>()))
+                        };
                         // `sse-stream` drains the parsed events before reading
                         // another chunk, but its VecDeque allocation survives.
                         let queued_capacity = st.queued_capacity_charge.max(queued_nodes.unwrap_or(limit));
+                        let queued_preparse_peak = st.queued_capacity_charge.max(queued_growth_peak.unwrap_or(limit));
                         // Its unfinished-line Vec is also cleared, not freed.
                         // Vec's amortized growth can reserve up to twice the
                         // largest fragmented line. Charge the previous capacity
@@ -345,7 +357,7 @@ pub(super) fn sse_stream_from_body(
                         let previous_line_capacity = st.raw_event.max_buffered_line_bytes.checked_mul(2);
                         if raw_window
                             .and_then(|bytes| bytes.checked_mul(3))
-                            .and_then(|bytes| bytes.checked_add(queued_capacity))
+                            .and_then(|bytes| bytes.checked_add(queued_preparse_peak))
                             .and_then(|bytes| bytes.checked_add(previous_line_capacity?))
                             .is_none_or(|bytes| bytes > limit)
                         {
@@ -824,25 +836,44 @@ mod tests {
         let first = Bytes::from("id:a\n\n".repeat(2_000));
         let second = Bytes::from(format!(
             "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"value\":\"{}\"}}}}\n\n",
-            "z".repeat(15_000)
+            "z".repeat(80_000)
         ));
+        let cap = 600_000;
+        assert!(
+            first.len() * 3 + 2_000 * 3 * size_of::<super::Sse>() <= cap,
+            "the ID batch fits the queue growth peak"
+        );
+        assert!(
+            second.len() * 3 + 2_000 * 2 * size_of::<super::Sse>() <= cap,
+            "the result chunk fits preparse before JSON mapping"
+        );
         let body = Box::new(FakeStreamingBody::from_chunks([first, second], cancelled_flag()));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(
-            body,
-            200_000,
-            300_000,
-            200_000,
-            Arc::clone(&signal).into(),
-            Some(400_500),
-        );
+        let mut stream = sse_stream_from_body(body, 200_000, 300_000, 200_000, Arc::clone(&signal).into(), Some(cap));
         for _ in 0..2_000 {
             assert!(stream.next().await.expect("ID-only event").is_ok());
         }
         assert!(stream.next().await.expect("JSON peak rejected").is_err());
         assert!(matches!(
             signal.get(),
-            Some(TransportSignal::ResponseTooLarge { limit: 400_500 })
+            Some(TransportSignal::ResponseTooLarge { limit: 600_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_growth_peak_is_rejected_before_sse_parser_allocates() {
+        // The 1,025th event can grow VecDeque from 1,024 to 2,048 slots.
+        // Both backing allocations may be live during that growth.
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from("id:a\n\n".repeat(1_025))],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 10_000, 10_000, 10_000, Arc::clone(&signal).into(), Some(220_000));
+        assert!(stream.next().await.expect("queue growth rejected").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 220_000 })
         ));
     }
 
