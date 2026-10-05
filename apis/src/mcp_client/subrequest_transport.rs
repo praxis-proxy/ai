@@ -34,9 +34,10 @@ use praxis_core::{
     subrequest::{DEPTH_HEADER, SubRequestClient},
 };
 use praxis_filter::{
-    BodyMode, CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline,
-    FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
-    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime, TraceContext,
+    BodyMode, CalloutOutcome, CalloutResponse, CalloutResponseTooLarge, ChainBindingContext, FilterEntry, FilterError,
+    FilterPipeline, FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions,
+    StagedUpstream, StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime,
+    TraceContext,
 };
 use rmcp::{
     model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
@@ -82,6 +83,13 @@ fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
     max_result_bytes
         .saturating_mul(MAX_JSON_STRING_EXPANSION)
         .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
+}
+
+/// Cap a buffered reply before it is materialized. The JSON preparse estimate
+/// always includes at least three wire-sized owners, so a larger raw body
+/// cannot pass the later parse gate even if its payload is otherwise valid.
+fn buffered_preparse_wire_cap(wire_cap: usize, peak_limit: Option<usize>) -> usize {
+    wire_cap.min(peak_limit.map_or(usize::MAX, |peak| peak / 3))
 }
 
 /// Bound the raw response, decoded strings/numbers, and JSON tree nodes before
@@ -812,7 +820,8 @@ impl McpSubrequestClient {
         uri: &str,
         body: Bytes,
         headers: HeaderMap,
-        max_response_bytes: usize,
+        max_buffered_response_bytes: usize,
+        max_streaming_response_bytes: usize,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<
         (FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant),
@@ -858,11 +867,12 @@ impl McpSubrequestClient {
             extensions.insert(trace_context.clone());
         }
 
-        let executor = FilteredSubrequestExecutor::for_callout(
+        let executor = FilteredSubrequestExecutor::for_callout_with_limits(
             self.callout.client.clone(),
             self.callout.downstream.clone(),
             self.callout.depth,
-            max_response_bytes,
+            max_buffered_response_bytes,
+            max_streaming_response_bytes,
             self.step_timeout,
         );
         Ok((executor, request, extensions, deadline))
@@ -887,7 +897,15 @@ impl McpSubrequestClient {
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
         let (executor, request, extensions, deadline) = self
-            .prepare_staged_request(method, uri, body, headers, max_response_bytes, signal)
+            .prepare_staged_request(
+                method,
+                uri,
+                body,
+                headers,
+                max_response_bytes,
+                max_response_bytes,
+                signal,
+            )
             .await?;
         let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
             .await
@@ -1056,11 +1074,20 @@ impl McpSubrequestClient {
         uri: &str,
         body: Bytes,
         headers: HeaderMap,
-        max_response_bytes: usize,
+        max_buffered_response_bytes: usize,
+        max_streaming_response_bytes: usize,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
         let (executor, request, mut extensions, deadline) = self
-            .prepare_staged_request(method, uri, body, headers, max_response_bytes, signal)
+            .prepare_staged_request(
+                method,
+                uri,
+                body,
+                headers,
+                max_buffered_response_bytes,
+                max_streaming_response_bytes,
+                signal,
+            )
             .await?;
         extensions.insert(McpStreamingRequested);
         let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
@@ -1148,6 +1175,12 @@ impl McpSubrequestClient {
             // spurious 413 (see collect_capped). Exactly one of the two branches
             // cancels the body.
             if content_type.as_deref().is_some_and(is_json_content_type) {
+                if preparse_peak_limit.is_some() && !body.try_cap_chunk_bytes(self.control_response_bytes) {
+                    body.cancel().await;
+                    return Err(StreamableHttpError::UnexpectedServerResponse(
+                        format!("HTTP {status}").into(),
+                    ));
+                }
                 if let Some(bytes) = collect_capped(&mut body, self.control_response_bytes).await
                     && json_preparse_fits(&bytes, preparse_peak_limit)
                     && let Ok(text) = std::str::from_utf8(&bytes)
@@ -1183,7 +1216,14 @@ impl McpSubrequestClient {
                 // terminal message. A Request always needs a reply, so an
                 // unparseable body is a typed UnexpectedServerResponse, never an
                 // Accepted ack (which is reserved for one-way messages).
-                let buffered = collect_body(&mut body, per_event_cap, &signal).await?;
+                if let Some(limit) = preparse_peak_limit
+                    && !body.try_cap_chunk_bytes(buffered_preparse_wire_cap(per_event_cap, Some(limit)))
+                {
+                    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                    body.cancel().await;
+                    return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+                }
+                let buffered = collect_body(&mut body, per_event_cap, preparse_peak_limit, &signal).await?;
                 admit_json_preparse(&buffered, preparse_peak_limit, &signal)?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
@@ -1215,18 +1255,12 @@ impl StreamableHttpClient for McpSubrequestClient {
         let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
         let max_response_bytes = self.response_limit(&message);
         let preparse_peak_limit = self.preparse_limit(&message);
+        let buffered_cap = buffered_preparse_wire_cap(max_response_bytes, preparse_peak_limit);
         let signal = self.signal_handle();
         let body =
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
-        let response = Box::pin(self.execute(
-            Method::POST,
-            &uri,
-            Bytes::from(body),
-            headers,
-            max_response_bytes,
-            &signal,
-        ))
-        .await?;
+        let response =
+            Box::pin(self.execute(Method::POST, &uri, Bytes::from(body), headers, buffered_cap, &signal)).await?;
         classify_buffered_post_response(response, &message, session_was_attached, preparse_peak_limit, &signal)
     }
 
@@ -1312,6 +1346,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::new(),
                 headers,
                 streaming_executor_backstop(self.stream_cumulative_cap()),
+                streaming_executor_backstop(self.stream_cumulative_cap()),
                 &signal,
             )
             .await?;
@@ -1361,6 +1396,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 &uri,
                 Bytes::from(body),
                 headers,
+                buffered_preparse_wire_cap(max_response_bytes, preparse_peak_limit),
                 streaming_executor_backstop(max_response_bytes),
                 &signal,
             )
@@ -1498,46 +1534,69 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// Collect a streaming body into a single `Bytes` buffer, failing closed.
 ///
 /// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
-/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
+/// byte `cap` and a separate peak allowance before growing its buffer. On
+/// overflow the size signal is recorded into
 /// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
 /// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
 /// returned — never the truncated buffer.
 ///
-/// A `next_chunk()` error also fails closed the same way. On this armed
-/// streaming-JSON drain the body is wrapped at the loosened `2×` executor
-/// backstop specifically so that response *size* is the dominant failure mode:
-/// praxis withholds an oversize chunk as an error, so mapping any
-/// `next_chunk()` error to `ResponseTooLarge` keeps the typed 413. Conflating a
-/// rare genuine transport error with a 413 on this path is still fail-closed and
-/// never turns an error into a success. Clean EOF (`Ok(None)`) cancels the body
-/// and returns the buffered bytes.
+/// A `next_chunk()` error also fails closed the same way. The caller tightens
+/// the streaming body's per-chunk cap before this drain; praxis withholds an
+/// oversize chunk as a typed error. A rare unrelated read error also becomes
+/// `ResponseTooLarge` on this size-bounded path. Clean EOF (`Ok(None)`) cancels
+/// the body and returns the buffered bytes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "buffer admission and cancellation share one body loop"
+)]
 async fn collect_body(
     body: &mut Box<dyn StreamingResponseBody>,
     cap: usize,
+    preparse_peak_limit: Option<usize>,
     signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<Bytes, StreamableHttpError<McpTransportError>> {
     let mut buf = bytes::BytesMut::new();
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                let next_len = buf.len().checked_add(chunk.len());
+                if next_len.is_none_or(|bytes| bytes > cap) {
                     signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
                     body.cancel().await;
                     return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
                 }
+                if let Some(limit) = preparse_peak_limit {
+                    // BytesMut may replace its backing allocation when it grows.
+                    // Keep the incoming chunk, old capacity, and at most twice
+                    // the new logical length inside the parse allowance.
+                    let growth_peak = next_len.and_then(|next| {
+                        let live = buf.capacity().checked_add(chunk.len())?;
+                        if next > buf.capacity() {
+                            live.checked_add(next.checked_mul(2)?.max(8))
+                        } else {
+                            Some(live)
+                        }
+                    });
+                    if growth_peak.is_none_or(|bytes| bytes > limit) {
+                        signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                        body.cancel().await;
+                        return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+                    }
+                }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
                 return Ok(buf.freeze());
             },
-            Err(_error) => {
-                // The armed streaming body withholds an oversize chunk at the 2x
-                // executor backstop as an error; on this drain size is the
-                // dominant failure mode, so any next_chunk error fails closed as a
-                // 413. This never yields a false success and never returns the
-                // partial buffer.
-                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+            Err(error) => {
+                // The armed streaming body withholds an oversize chunk before
+                // delivery. Preserve its typed limit when present; other read
+                // errors still fail closed as a 413 on this size-bounded drain.
+                let limit = error
+                    .downcast_ref::<CalloutResponseTooLarge>()
+                    .map_or(cap, |error| error.limit);
+                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
                 body.cancel().await;
                 return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
             },
@@ -1559,11 +1618,11 @@ async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|bytes| bytes > cap) {
                     body.cancel().await;
                     return None;
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
@@ -1879,9 +1938,11 @@ fn parse_buffered_sse_terminal(
             .len()
             .checked_add(usize::from(has_data))
             .and_then(|bytes| bytes.checked_add(rest.len()));
+        // String growth can temporarily retain the old allocation alongside
+        // a doubled replacement while the wire body lives.
         if let Some(limit) = preparse_peak_limit
             && next_len
-                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_mul(3))
                 .and_then(|bytes| bytes.checked_add(body.len()))
                 .and_then(|bytes| bytes.checked_add(last_charge))
                 .is_none_or(|bytes| bytes > limit)
@@ -2046,6 +2107,21 @@ mod tests {
             body.len() * 2 > cap,
             "copying every data event would exceed this allowance"
         );
+    }
+
+    #[test]
+    fn buffered_sse_rejects_string_growth_before_allocating_it() {
+        let body = format!("data: {}\ndata: y\n\n", "x".repeat(100_000));
+        let cap = body.len() * 3 + 1_000;
+        let signal = test_signal();
+        assert!(matches!(
+            parse_buffered_sse_terminal(body.as_bytes(), Some(cap), &signal),
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit }) if *limit == cap
+        ));
     }
 
     #[test]
@@ -2422,6 +2498,7 @@ mod tests {
                 Bytes::new(),
                 HeaderMap::new(),
                 MAX_CONTROL_RESPONSE_BYTES,
+                MAX_CONTROL_RESPONSE_BYTES,
                 &signal,
             )
             .await
@@ -2797,7 +2874,7 @@ mod tests {
         // a typed 413, record the signal, cancel, and NOT return the partial buffer.
         let (mut body, cancelled) = erroring_body([Bytes::from_static(b"partial")]);
         let signal = Arc::new(OnceLock::new());
-        let result = collect_body(&mut body, 1024, &signal).await;
+        let result = collect_body(&mut body, 1024, None, &signal).await;
         assert!(matches!(
             result,
             Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
@@ -2813,11 +2890,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_body_preserves_core_chunk_limit_in_size_signal() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut body: Box<dyn StreamingResponseBody> =
+            Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::overflowing_after(
+                [Bytes::from_static(b"partial")],
+                Arc::clone(&cancelled),
+                512,
+            ));
+        let signal = test_signal();
+        let result = collect_body(&mut body, 1_024, None, &signal).await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 512 })
+        ));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "a typed core size error cancels the partial body"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_body_fails_closed_when_buffer_exceeds_cap() {
         // Two 4-byte chunks exceed a 6-byte cap on the second chunk.
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]);
         let signal = Arc::new(OnceLock::new());
-        let result = collect_body(&mut body, 6, &signal).await;
+        let result = collect_body(&mut body, 6, None, &signal).await;
         assert!(matches!(
             result,
             Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
@@ -2833,10 +2935,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_body_rejects_json_peak_before_buffering_a_large_chunk() {
+        let (mut body, cancelled) = fake_body([Bytes::from(vec![b'x'; 3 * 1_048_576])]);
+        let signal = Arc::new(OnceLock::new());
+        let result = collect_body(&mut body, 6 * 1_048_576, Some(2 * 1_048_576), &signal).await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_097_152 })
+        ));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "parse allowance breach cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn budgeted_json_rejects_a_stream_body_without_chunk_admission() {
+        let (body, cancelled) = fake_body([Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")]);
+        let signal = test_signal();
+        let result = client()
+            .classify_streaming_post_response(
+                sub_response(200, Some("application/json"), b""),
+                body,
+                false,
+                4_096,
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                Some(2_048),
+                Arc::clone(&signal),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "unsupported body is cancelled before a JSON chunk is pulled"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_body_returns_bytes_on_clean_eof() {
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"hello "), Bytes::from_static(b"world")]);
         let signal = Arc::new(OnceLock::new());
-        let bytes = collect_body(&mut body, 1024, &signal)
+        let bytes = collect_body(&mut body, 1024, None, &signal)
             .await
             .expect("clean body collects");
         assert_eq!(bytes.as_ref(), b"hello world");

@@ -2970,19 +2970,15 @@ async fn list_tools_rejects_oversized_response() {
     // dedicated `ResponseTooLarge` variant, which callers map to HTTP 413 —
     // distinct from the generic 502 a plain `ListTools` failure yields.
     //
-    // NOTE: tools/list is a ClientRequest, so rmcp routes it through the
-    // streaming post_message_with_max_sse_event_size path. The server returns
-    // JSON (not SSE), so praxis buffers anyway (Blocker 5). The executor
-    // backstop passed to execute_streaming is 2x the binding cap (spec §4.5 F3),
-    // so when praxis buffers and trips on an oversized response, it reports the
-    // 2x limit. This is intentional: the buffered fallback is memory-bounded at
-    // 2x the cap (see subrequest_transport.rs streaming_executor_backstop doc).
+    // tools/list is a ClientRequest, so rmcp uses the streaming POST path.
+    // This server returns JSON and praxis buffers it; the separate buffered
+    // cap stops the body at the control ceiling while SSE keeps its cumulative
+    // streaming backstop.
     match err {
         McpClientError::ResponseTooLarge { limit, .. } => {
             assert_eq!(
-                limit,
-                2 * MAX_CONTROL_RESPONSE_BYTES,
-                "buffered fallback in execute_streaming is bounded at 2x the binding cap"
+                limit, MAX_CONTROL_RESPONSE_BYTES,
+                "buffered fallback uses the control response ceiling"
             );
         },
         other => panic!("oversized response should surface as ResponseTooLarge, got: {other:?}"),
