@@ -313,7 +313,7 @@ impl WebSearchFilter {
                 .await
             {
                 SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
-                SearchOutcome::Failed => {
+                SearchOutcome::Failed | SearchOutcome::RetainedLimitExceeded => {
                     warn!(
                         call_id = ids.public,
                         "web search provider failed; continuing with a failed tool result"

@@ -36,7 +36,7 @@ use crate::{
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
-const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -66,6 +66,8 @@ pub(crate) enum SearchOutcome {
     /// response, or unparseable body. Callers continue with a truthful failed
     /// tool result rather than exposing provider details to the client.
     Failed,
+    /// The response exceeded the caller's aggregate retained-payload allowance.
+    RetainedLimitExceeded,
 }
 
 // -----------------------------------------------------------------------------
@@ -291,6 +293,34 @@ impl SearchClient {
         context_size: Option<SearchContextSize>,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
+        self.search_with_response_limit(
+            outbound,
+            callout,
+            query,
+            context_size,
+            identity,
+            MAX_SEARCH_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    /// Execute with a response cap derived from the request-wide agentic budget.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "callout identity and budget are independent bounds"
+    )]
+    pub(crate) async fn search_with_response_limit(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        query: &str,
+        context_size: Option<SearchContextSize>,
+        identity: &CalloutIdentity,
+        max_response_bytes: usize,
+    ) -> SearchOutcome {
+        if max_response_bytes == 0 {
+            return SearchOutcome::RetainedLimitExceeded;
+        }
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -304,7 +334,25 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count),
         };
-        self.execute_search(outbound, callout, &url, request, identity).await
+        self.execute_search_with_limit(outbound, callout, &url, request, identity, max_response_bytes)
+            .await
+    }
+
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test wrapper forwards the production callout parameters"
+    )]
+    async fn execute_search(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        url: &str,
+        request: SubRequest,
+        identity: &CalloutIdentity,
+    ) -> SearchOutcome {
+        self.execute_search_with_limit(outbound, callout, url, request, identity, MAX_SEARCH_RESPONSE_BYTES)
+            .await
     }
 
     /// Execute a search request through the outbound chain and map the response
@@ -326,13 +374,14 @@ impl SearchClient {
         clippy::too_many_arguments,
         reason = "threads the caller's per-callout identity through the fixed staging chain"
     )]
-    async fn execute_search(
+    async fn execute_search_with_limit(
         &self,
         outbound: &Arc<FilterPipeline>,
         callout: CalloutContext,
         url: &str,
         request: SubRequest,
         identity: &CalloutIdentity,
+        max_response_bytes: usize,
     ) -> SearchOutcome {
         // A callout receives at most its configured timeout and never a fresh
         // budget beyond the enclosing IRR's absolute request deadline. This is
@@ -349,11 +398,11 @@ impl SearchClient {
             self.client.clone(),
             callout.runtime,
             callout.depth,
-            MAX_SEARCH_RESPONSE_BYTES,
+            max_response_bytes.min(MAX_SEARCH_RESPONSE_BYTES),
             self.timeout,
         );
         let result = Self::dispatch_callout(executor, outbound, prepared.request(), extensions, deadline).await;
-        self.map_callout_outcome(result)
+        self.map_callout_outcome(result, max_response_bytes < MAX_SEARCH_RESPONSE_BYTES)
     }
 
     /// Resolve and stage the provider destination for a callout.
@@ -503,9 +552,13 @@ impl SearchClient {
     /// loop and never surfaces a provider-response status to the client, so
     /// [`CalloutOutcome::ResponseTooLarge`] fails the callout closed — the model
     /// then continues with a truthful "search unavailable" result.
-    fn map_callout_outcome(&self, result: Result<CalloutOutcome, FilterError>) -> SearchOutcome {
+    fn map_callout_outcome(
+        &self,
+        result: Result<CalloutOutcome, FilterError>,
+        aggregate_constrained: bool,
+    ) -> SearchOutcome {
         match result {
-            Ok(outcome) => self.map_callout_success(outcome),
+            Ok(outcome) => self.map_callout_success(outcome, aggregate_constrained),
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
                 SearchOutcome::Failed
@@ -517,7 +570,7 @@ impl SearchClient {
     /// [`SearchOutcome`], failing closed on anything but a bounded buffered
     /// response. Split from [`map_callout_outcome`](Self::map_callout_outcome)
     /// so each stays within the cognitive-complexity budget.
-    fn map_callout_success(&self, outcome: CalloutOutcome) -> SearchOutcome {
+    fn map_callout_success(&self, outcome: CalloutOutcome, aggregate_constrained: bool) -> SearchOutcome {
         match outcome {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => self.map_search_result(&response),
             CalloutOutcome::Response(CalloutResponse::Streaming { .. }) => {
@@ -534,7 +587,11 @@ impl SearchClient {
                     limit,
                     "search callout response exceeded the size limit; treating as failed"
                 );
-                SearchOutcome::Failed
+                if aggregate_constrained {
+                    SearchOutcome::RetainedLimitExceeded
+                } else {
+                    SearchOutcome::Failed
+                }
             },
             // `CalloutOutcome` is `#[non_exhaustive]`: a future classified outcome
             // fails the callout closed rather than being read as a success.
@@ -972,6 +1029,29 @@ mod tests {
             base_url: None,
             user_credential: None,
         }
+    }
+
+    #[test]
+    fn caller_limited_search_reports_aggregate_exhaustion() {
+        let client = test_client_for(SearchProvider::Brave);
+        let oversized = CalloutOutcome::ResponseTooLarge {
+            actual: None,
+            limit: 1_024,
+        };
+        assert!(matches!(
+            client.map_callout_success(oversized, true),
+            SearchOutcome::RetainedLimitExceeded
+        ));
+        assert!(matches!(
+            client.map_callout_success(
+                CalloutOutcome::ResponseTooLarge {
+                    actual: None,
+                    limit: 1_024,
+                },
+                false
+            ),
+            SearchOutcome::Failed
+        ));
     }
 
     #[test]
