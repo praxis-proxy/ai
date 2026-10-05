@@ -1,0 +1,195 @@
+{
+  "version": 1,
+  "scenario_id": "vertex/invalid-content",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-vertex-model",
+    "source_id": "controlled-vertex-invalid-content"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "unsupported-image-part",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-vertex-model",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "image_url",
+                      "image_url": {}
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "image_url part requires a supported URL",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "text-metadata-response",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-vertex-model",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Hi"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp-text-meta",
+              "object": "chat.completion",
+              "created": 0,
+              "model": "synthetic-vertex-model",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "Hello"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {}
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "contents": [
+                {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Hi"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "responseId": "resp-text-meta",
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      {
+                        "text": "Hello",
+                        "thought": false,
+                        "thoughtSignature": "sig-text"
+                      },
+                      {
+                        "thoughtSignature": "sig-only"
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

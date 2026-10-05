@@ -86,6 +86,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [chat-completions-to-openai-fixture.yaml](configs/azure/chat-completions-to-openai-fixture.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 | [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 
 ### Bedrock

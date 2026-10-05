@@ -378,9 +378,11 @@ fn translate_user_content(msg: &Value) -> Result<Vec<Value>, String> {
                 let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
                 match part_type {
                     "text" => {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            blocks.push(serde_json::json!({"text": text}));
-                        }
+                        let text = part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("user text content part is missing `text`")?;
+                        blocks.push(serde_json::json!({"text": text}));
                     },
                     "image_url" => {
                         return Err("`image_url` content parts are not supported by this translator".to_owned());
@@ -415,8 +417,10 @@ fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
 
     // Text content (may be null when the message is tool-calls only).
     match msg.get("content") {
-        Some(Value::String(s)) if !s.is_empty() => {
-            blocks.push(serde_json::json!({"text": s}));
+        Some(Value::String(s)) => {
+            if !s.is_empty() {
+                blocks.push(serde_json::json!({"text": s}));
+            }
         },
         Some(Value::Array(parts)) => {
             for part in parts {
@@ -433,11 +437,15 @@ fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
                 }
             }
         },
-        _ => {},
+        None | Some(Value::Null) => {},
+        _ => return Err("assistant message `content` must be a string, array, or null".to_owned()),
     }
 
     // Tool calls → `toolUse` blocks.
-    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+    if let Some(tool_calls) = msg.get("tool_calls").filter(|calls| !calls.is_null()) {
+        let tool_calls = tool_calls
+            .as_array()
+            .ok_or("assistant message `tool_calls` must be an array")?;
         for tc in tool_calls {
             let id = tc
                 .get("id")
@@ -1236,6 +1244,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("tool content part type"));
+    }
+
+    #[test]
+    fn malformed_content_and_tool_calls_are_rejected_before_translation() {
+        for (request, expected) in [
+            (
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": 42}]}),
+                "user text",
+            ),
+            (
+                serde_json::json!({"role": "assistant", "content": 42}),
+                "assistant message `content`",
+            ),
+            (
+                serde_json::json!({"role": "assistant", "content": null, "tool_calls": "lookup"}),
+                "tool_calls",
+            ),
+        ] {
+            let body = serde_json::json!({"model": "m", "messages": [request]});
+            let error = transform_request(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn empty_assistant_text_preserves_tool_calls() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"t1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]}
+            ]}"#,
+        );
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["toolUse"]["toolUseId"], "t1");
+        assert_eq!(blocks[0]["toolUse"]["name"], "lookup");
     }
 
     /// Parallel tool calls produce multiple back-to-back `tool` messages.

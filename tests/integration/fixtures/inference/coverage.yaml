@@ -7,6 +7,8 @@ scope:
   - responses_native_passthrough
   - responses_to_chat_completions
   - responses_client_tool_compat
+  - openai_chat_completions_to_azureai_chat_completions
+  - openai_chat_completions_to_vertexai_gemini
 features:
   - id: bedrock.converse.request.text
     scopes:
@@ -492,6 +494,78 @@ features:
     status: synthetic_only
     scenarios:
       - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: azure.chat.response.annotation_stream
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/annotation-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.request.invalid_content
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/invalid-content
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.invalid_content
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.untranslatable_content
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.invalid_tools
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.empty_citations
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.response.text_metadata
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/invalid-content
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.error.malformed_success_status
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-success
     providers:
       synthetic:
         status: synthetic_only

@@ -1,6 +1,6 @@
 version: 1
 id: messages/typed-server-tools
-description: Typed Anthropic server tools are omitted when translating client tools to Chat Completions.
+description: Typed Anthropic server tools are rejected before Chat Completions translation.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
@@ -36,9 +36,9 @@ turns:
                 required:
                   - city
     expect:
-      client_status: 200
+      client_status: 400
       client_body_kind: json
-      upstream_path: /v1/chat/completions
-      upstream_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
       client_sse_events: []
       upstream_sse_events: []

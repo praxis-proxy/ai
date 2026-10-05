@@ -9,6 +9,7 @@ features:
   - bedrock.converse.response.text
   - bedrock.converse.request.tool_results
   - bedrock.converse.request.invalid_types
+  - bedrock.converse.request.invalid_content
   - bedrock.converse.streaming.malformed_event
 turns:
   - name: initial
@@ -50,7 +51,7 @@ turns:
             - role: user
               content: Second question.
             - role: assistant
-              content: null
+              content: ""
               tool_calls:
                 - id: call_weather
                   type: function
@@ -96,6 +97,29 @@ turns:
           model: ${MODEL}
           messages: []
           temperature: "0.5"
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: invalid-user-text
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content:
+                - type: text
+                  text: 42
     expect:
       client_status: 400
       client_body_kind: json

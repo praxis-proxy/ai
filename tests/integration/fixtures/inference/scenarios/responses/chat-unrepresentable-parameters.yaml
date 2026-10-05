@@ -6,6 +6,7 @@ example_config: openai/responses/responses-to-chat-completions.yaml
 upstream_authority: 127.0.0.1:3001
 features:
   - responses.chat.unrepresentable_parameters
+  - responses.chat.invalid_tools
 turns:
   - name: truncation
     request:
@@ -45,6 +46,29 @@ turns:
             id: pmpt_123
             variables:
               name: Ada
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: malformed-tools
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Hello
+          tools:
+            - 42
           store: false
           stream: false
     expect:

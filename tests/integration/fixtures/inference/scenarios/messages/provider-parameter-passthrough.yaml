@@ -1,11 +1,12 @@
 version: 1
 id: messages/provider-parameter-passthrough
-description: Unmapped Anthropic request fields reach the Chat Completions backend untouched, metadata.user_id and output_config are mapped, and thinking is dropped.
+description: Unmapped Anthropic request fields reach the Chat Completions backend untouched, while metadata.user_id and output_config are mapped.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
 features:
   - messages.request.provider_parameter_passthrough
+  - messages.request.empty_citations
 turns:
   - name: initial
     request:
@@ -21,9 +22,6 @@ turns:
           max_tokens: 64
           stream: false
           top_k: 40
-          thinking:
-            type: enabled
-            budget_tokens: 1024
           metadata:
             user_id: user-1
           output_config:
@@ -40,7 +38,10 @@ turns:
                 additionalProperties: false
           messages:
             - role: user
-              content: What is 2+2? Reply with just the number.
+              content:
+                - type: text
+                  text: What is 2+2? Reply with just the number.
+                  citations: []
     expect:
       client_status: 200
       client_body_kind: json

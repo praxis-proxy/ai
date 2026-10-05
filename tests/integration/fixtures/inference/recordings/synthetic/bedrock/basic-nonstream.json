@@ -157,7 +157,7 @@
                   "role": "user"
                 },
                 {
-                  "content": null,
+                  "content": "",
                   "role": "assistant",
                   "tool_calls": [
                     {
@@ -392,6 +392,72 @@
                 "code": "invalid_request",
                 "message": "`temperature` must be a number",
                 "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-user-text",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-bedrock-model",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": 42
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request",
+                "message": "user text content part is missing `text`"
               }
             }
           }

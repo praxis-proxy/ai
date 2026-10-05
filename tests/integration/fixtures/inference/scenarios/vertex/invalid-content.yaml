@@ -1,0 +1,54 @@
+version: 1
+id: vertex/invalid-content
+description: Reject untranslatable Chat content and accept valid Gemini text metadata.
+protocol: openai_chat_completions
+example_config: vertex/chat-completions-to-gemini.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - vertex.gemini.request.invalid_content
+  - vertex.gemini.response.text_metadata
+turns:
+  - name: unsupported-image-part
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content:
+                - type: image_url
+                  image_url: {}
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: text-metadata-response
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

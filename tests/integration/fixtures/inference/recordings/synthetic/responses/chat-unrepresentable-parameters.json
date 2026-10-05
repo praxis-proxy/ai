@@ -137,6 +137,68 @@
           }
         }
       }
+    },
+    {
+      "name": "malformed-tools",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-unrepresentable-parameters-model",
+              "input": "Hello",
+              "tools": [
+                42
+              ],
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "unsupported Responses tool type for Chat Completions translation: unknown",
+                "param": null
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
     }
   ]
 }

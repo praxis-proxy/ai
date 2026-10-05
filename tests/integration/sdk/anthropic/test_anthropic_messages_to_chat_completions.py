@@ -13,7 +13,7 @@ Completions translation.
 Starts Praxis with the shipped `messages-to-openai` example, retargeted at a
 local stub backend that records the translated request, and verifies through
 the official Anthropic Python SDK that unmapped fields reach the backend, that
-`metadata.user_id` becomes a hashed `safety_identifier`, that `thinking` is dropped,
+`metadata.user_id` becomes a hashed `safety_identifier`, that `thinking` is rejected,
 that fields the translation cannot honor are rejected before any backend call,
 and that malformed streamed tool calls fail closed at the client boundary.
 
@@ -77,6 +77,8 @@ class RecordingBackend(BaseHTTPRequestHandler):
 
     bodies: list[dict] = []
     response_content_type = "application/json"
+    send_tool_reply_once = False
+    untranslatable_reply_once: str | None = None
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
@@ -91,6 +93,25 @@ class RecordingBackend(BaseHTTPRequestHandler):
             "message": {"role": "assistant", "content": "4"},
             "finish_reason": "stop",
         }
+        if RecordingBackend.send_tool_reply_once:
+            RecordingBackend.send_tool_reply_once = False
+            choice["message"] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }],
+            }
+            choice["finish_reason"] = "tool_calls"
+        if RecordingBackend.untranslatable_reply_once:
+            kind = RecordingBackend.untranslatable_reply_once
+            RecordingBackend.untranslatable_reply_once = None
+            if kind == "finish_reason":
+                choice["finish_reason"] = "content_filter"
+            else:
+                choice["message"]["refusal"] = "blocked"
         if body.get("stop"):
             # vLLM reports the matched stop string in a choice-level
             # `stop_reason`; pretend the first sequence was generated.
@@ -266,7 +287,6 @@ class TestRequestFieldHandling:
             model=MODEL,
             max_tokens=64,
             metadata={"user_id": "user-1"},
-            thinking={"type": "enabled", "budget_tokens": 1024},
             extra_body={"top_k": 40},
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
@@ -276,7 +296,21 @@ class TestRequestFieldHandling:
         assert upstream["top_k"] == 40
         assert upstream["safety_identifier"] == hashlib.sha256(b"user-1").hexdigest()
         assert "metadata" not in upstream
-        assert "thinking" not in upstream
+
+    def test_thinking_cannot_be_silently_dropped(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                thinking={"type": "enabled", "budget_tokens": 1024},
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "thinking" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
 
     def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -293,6 +327,56 @@ class TestRequestFieldHandling:
         [upstream] = RecordingBackend.bodies
         assert "n" not in upstream, "default-valued n must be dropped, not forwarded"
         assert "service_tier" not in upstream, "default-valued service_tier must be dropped, not forwarded"
+
+    def test_serialized_tool_history_and_empty_result_continue(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.send_tool_reply_once = True
+
+        first = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+        )
+        tool_use = next(block for block in first.content if block.type == "tool_use")
+        history_block = tool_use.model_dump()
+        history_block.setdefault("toolset_name", None)
+
+        second = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {"role": "assistant", "content": [history_block]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
+                    "toolset_name": None,
+                }]},
+            ],
+        )
+
+        assert second.content[0].text == "4"
+        assert len(RecordingBackend.bodies) == 2
+        upstream = RecordingBackend.bodies[-1]
+        assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert upstream["messages"][2]["content"] == ""
+
+    def test_empty_citations_in_history_reach_the_backend(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": [{"type": "text", "text": "Hi", "citations": []}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hello", "citations": []}]},
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        assert [message["content"] for message in upstream["messages"]] == ["Hi", "Hello", "Continue"]
 
     def test_unrepresentable_field_is_rejected_before_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -364,6 +448,25 @@ class TestResponseUsage:
         # key to None too, so check the wire payload actually carried it.
         assert "output_tokens_details" in response.usage.model_fields_set
         assert response.usage.output_tokens_details is None
+
+
+class TestResponseValidation:
+    @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
+    def test_untranslatable_success_is_http_error(self, anthropic_client, kind):
+        RecordingBackend.untranslatable_reply_once = kind
+        try:
+            with pytest.raises(APIStatusError) as excinfo:
+                anthropic_client.messages.create(
+                    model=MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+        finally:
+            RecordingBackend.untranslatable_reply_once = None
+
+        assert excinfo.value.status_code == 500
+        assert excinfo.value.body["type"] == "error"
+        assert excinfo.value.body["error"]["type"] == "api_error"
 
 
 class TestStreamingResponseValidation:

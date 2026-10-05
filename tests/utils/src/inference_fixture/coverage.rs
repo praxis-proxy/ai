@@ -1217,6 +1217,8 @@ mod tests {
                 "responses_native_passthrough",
                 "responses_to_chat_completions",
                 "responses_client_tool_compat",
+                "openai_chat_completions_to_azureai_chat_completions",
+                "openai_chat_completions_to_vertexai_gemini",
             ]
         );
         assert_eq!(
@@ -1277,6 +1279,14 @@ mod tests {
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
+                vec!["openai_chat_completions_to_azureai_chat_completions"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["chat_completions_to_bedrock_converse"],
+                vec!["messages_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["messages_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1337,14 +1347,23 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 51, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 46, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 51, "manifest recording inventory count");
+        assert_eq!(report.features_total, 59, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 48, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 53, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
+                "azure/annotation-stream",
                 "bedrock/basic-nonstream",
                 "messages/basic-nonstream",
                 "messages/basic-stream",
@@ -1391,9 +1410,10 @@ mod tests {
                 "responses/native-continuation",
                 "responses/native-continuation-stream",
                 "responses/native-tool-call",
+                "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 51, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 59, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1644,6 +1664,38 @@ mod tests {
                     &"bedrock.converse.streaming.malformed_event".to_owned(),
                     &vec!["bedrock/basic-nonstream".to_owned()]
                 ),
+                (
+                    &"azure.chat.response.annotation_stream".to_owned(),
+                    &vec!["azure/annotation-stream".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.request.invalid_content".to_owned(),
+                    &vec!["vertex/invalid-content".to_owned()]
+                ),
+                (
+                    &"bedrock.converse.request.invalid_content".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
+                    &"messages.request.untranslatable_content".to_owned(),
+                    &vec!["messages/unrepresentable-parameters".to_owned()]
+                ),
+                (
+                    &"responses.chat.invalid_tools".to_owned(),
+                    &vec!["responses/chat-unrepresentable-parameters".to_owned()]
+                ),
+                (
+                    &"messages.request.empty_citations".to_owned(),
+                    &vec!["messages/provider-parameter-passthrough".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.response.text_metadata".to_owned(),
+                    &vec!["vertex/invalid-content".to_owned()]
+                ),
+                (
+                    &"messages.error.malformed_success_status".to_owned(),
+                    &vec!["messages/malformed-success".to_owned()]
+                ),
             ]
         );
         assert_eq!(
@@ -1806,6 +1858,16 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
+        for feature in &manifest.features[51..59] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
         }));
@@ -1866,12 +1928,15 @@ mod tests {
         assert_scenario(
             &malformed_success,
             "messages/malformed-success",
-            "Malformed Chat Completions success converted to an Anthropic API error envelope.",
-            &["messages.error.malformed_success"],
+            "Malformed Chat Completions success becomes an HTTP 500 Anthropic API error.",
+            &[
+                "messages.error.malformed_success",
+                "messages.error.malformed_success_status",
+            ],
             "What is 2+2? Reply with just the number.",
             false,
             BodyKind::Json,
-            200,
+            500,
             &[],
         );
         let malformed_tool_arguments =
@@ -1879,12 +1944,12 @@ mod tests {
         assert_scenario(
             &malformed_tool_arguments,
             "messages/malformed-tool-arguments",
-            "Malformed Chat Completions tool arguments convert to an Anthropic API error envelope instead of a fabricated tool_use.",
+            "Malformed Chat Completions tool arguments become an HTTP 500 Anthropic API error instead of a fabricated tool_use.",
             &["messages.response.malformed_tool_arguments"],
             "Use the weather tool.",
             false,
             BodyKind::Json,
-            200,
+            500,
             &[],
         );
 

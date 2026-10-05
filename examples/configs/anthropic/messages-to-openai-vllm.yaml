@@ -3,10 +3,10 @@
 # Translates native Anthropic Messages API traffic into OpenAI Chat Completions
 # for a vLLM backend that serves `/v1/chat/completions`, with the same
 # three-boundary credential isolation as the native passthrough config. This is
-# the config a real Claude Code client uses to reach a Chat-Completions-only
-# vLLM backend through Praxis: the client speaks the Anthropic wire format,
-# Praxis rewrites both the request and the response, and vLLM only ever sees
-# OpenAI Chat Completions.
+# a config a Claude Code client can use for requests Chat Completions can
+# represent faithfully. Requests with Anthropic-only features such as thinking
+# are rejected. The client speaks the Anthropic wire format, Praxis rewrites
+# both the request and the response, and vLLM only sees Chat Completions.
 #
 # Contrast with `messages-native-vllm.yaml`, which passes the Anthropic wire
 # format through UNCHANGED to a vLLM backend that serves `/v1/messages`

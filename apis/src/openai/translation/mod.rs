@@ -2111,14 +2111,20 @@ mod tests {
     }
 
     #[test]
-    fn non_object_tool_entries_are_skipped() {
-        let mapped = map(&json!({
+    fn non_object_tool_entries_are_rejected() {
+        let error = map_error(&json!({
             "model": "m",
             "input": "hello",
             "tools": ["not_an_object"]
         }));
 
-        assert!(mapped.get("tools").is_none());
+        assert!(error.contains("unsupported Responses tool type"), "{error}");
+    }
+
+    #[test]
+    fn non_array_tools_field_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tools": "function"}));
+        assert!(error.contains("`tools` must be an array"), "{error}");
     }
 
     // -------------------------------------------------------------------------

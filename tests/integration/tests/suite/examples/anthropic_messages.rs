@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, Recording, free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown,
-    start_capturing_backend, start_header_echo_backend, start_proxy,
+    Backend, Recording, free_port, http_send, json_post, json_post_with_header, parse_body, parse_status,
+    start_backend_with_shutdown, start_capturing_backend, start_header_echo_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -203,24 +203,21 @@ fn anthropic_messages_to_chat_completions_returns_api_error_for_malformed_tool_a
         "messages": [{"role": "user", "content": "Use the weather tool."}]
     });
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request.to_string(), "x-request-id: req_malformed_tool"),
+    );
     let client_body: serde_json::Value =
         serde_json::from_str(&parse_body(&raw)).expect("error envelope should be JSON");
 
-    assert_eq!(parse_status(&raw), 200, "upstream status should be preserved");
+    assert_eq!(parse_status(&raw), 500, "invalid upstream success must fail");
     assert_eq!(
         client_body["type"], "error",
         "malformed tool arguments must yield an error envelope"
     );
     assert_eq!(client_body["error"]["type"], "api_error");
-    assert_eq!(
-        client_body["error"]["message"],
-        "upstream response could not be transformed"
-    );
-    assert!(
-        client_body["request_id"].is_null(),
-        "absent upstream request-id must yield a null request_id"
-    );
+    assert_eq!(client_body["error"]["message"], "Internal proxy error");
+    assert_eq!(client_body["request_id"], "req_malformed_tool");
     assert!(
         client_body.get("choices").is_none() && client_body.get("content").is_none(),
         "translation failure must not fabricate a tool_use or pass through the raw upstream body"
@@ -246,12 +243,16 @@ fn anthropic_messages_to_chat_completions_replaces_malformed_success_body() {
         "messages": [{"role": "user", "content": "Hello"}],
     });
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request_body.to_string()));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request_body.to_string(), "x-request-id: req_malformed"),
+    );
     let parsed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("fallback response should be JSON");
 
     assert_eq!(parsed["type"], "error");
     assert_eq!(parsed["error"]["type"], "api_error");
-    assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");
+    assert_eq!(parse_status(&raw), 500);
+    assert_eq!(parsed["error"]["message"], "Internal proxy error");
     assert_eq!(parsed["request_id"], "req_malformed");
 }
 
