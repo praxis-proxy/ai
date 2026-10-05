@@ -55,10 +55,7 @@ impl CryptoReadiness {
     pub fn fips_ready(&self) -> bool {
         self.openssl_fips_properties
             && self.kernel_fips == Some(true)
-            && self
-                .crypto_policy
-                .as_ref()
-                .is_some_and(|policy| policy.starts_with("FIPS"))
+            && self.crypto_policy.as_ref().is_some_and(|policy| is_fips_policy(policy))
     }
 
     /// Whether the platform cannot give a definitive readiness answer.
@@ -88,7 +85,7 @@ impl CryptoReadiness {
         if let Some(false) | None = self.kernel_fips {
             r.push(kernel_fips_reason(self.kernel_fips));
         }
-        if !self.crypto_policy.as_ref().is_some_and(|p| p.starts_with("FIPS")) {
+        if !self.crypto_policy.as_ref().is_some_and(|p| is_fips_policy(p)) {
             r.push(crypto_policy_reason(self.crypto_policy.as_deref()));
         }
         r
@@ -170,6 +167,11 @@ fn crypto_policy_from(contents: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether the base policy name (before the first `:`) is exactly `FIPS`.
+fn is_fips_policy(policy: &str) -> bool {
+    policy.split(':').next() == Some("FIPS")
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -230,6 +232,19 @@ mod tests {
         };
         assert!(fips_ospp.fips_ready(), "FIPS:OSPP is a FIPS policy");
         assert!(fips_ospp.unmet().is_empty());
+    }
+
+    #[test]
+    fn fips_prefix_lookalikes_are_rejected() {
+        for policy in ["FIPSXYZ", "FIPS-DRAFT", "fips", "DEFAULT:FIPS"] {
+            let lookalike = CryptoReadiness {
+                openssl_fips_properties: true,
+                kernel_fips: Some(true),
+                crypto_policy: Some(policy.to_owned()),
+            };
+            assert!(!lookalike.fips_ready(), "{policy:?} must not pass as a FIPS policy");
+            assert!(!lookalike.unmet().is_empty(), "{policy:?} must be reported as unmet");
+        }
     }
 
     #[test]
