@@ -60,14 +60,17 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
     async fn get_response_bounded(
         &self,
         _owner: &StateOwner,
         _id: &str,
         _max_bytes: usize,
     ) -> Result<Option<ResponseRecord>, StoreError> {
-        Err(StoreError::PayloadTooLarge)
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded response reads".to_owned(),
+        ))
     }
 
     /// Delete a response by ID, scoped to an exact owner.
@@ -106,14 +109,17 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
     async fn get_conversation_bounded(
         &self,
         _owner: &StateOwner,
         _conversation_id: &str,
         _max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        Err(StoreError::PayloadTooLarge)
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation reads".to_owned(),
+        ))
     }
 
     /// Record server-owned pending MCP approvals emitted by the proxy.
@@ -194,7 +200,9 @@ pub trait ResponseStore: Send + Sync {
         _record: &ResponseRecord,
         _pending_approvals: &[PendingApprovalRecord],
     ) -> Result<bool, StoreError> {
-        Err(StoreError::PayloadTooLarge)
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic insert-if-absent persistence".to_owned(),
+        ))
     }
 
     /// Fetch the server-owned pending approvals matching `approval_ids` that
@@ -584,7 +592,8 @@ pub trait ConversationItemStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`StoreError::PayloadTooLarge`] when the cache would exceed the
-    /// allowance, including for backends without a bounded implementation.
+    /// allowance, or [`StoreError::Unavailable`] when the backend has no
+    /// bounded rebuild.
     async fn create_items_and_sync_messages_bounded(
         &self,
         _owner: &StateOwner,
@@ -592,7 +601,9 @@ pub trait ConversationItemStore: Send + Sync {
         _items: &[ConversationItemRecord],
         _max_rebuild_bytes: usize,
     ) -> Result<(), StoreError> {
-        Err(StoreError::PayloadTooLarge)
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation rebuilds".to_owned(),
+        ))
     }
 
     /// Atomically delete an item and rebuild the conversation message cache.
