@@ -212,6 +212,8 @@ struct ByteState {
     batch_charge: Arc<AtomicUsize>,
     /// `sse-stream` retains its `VecDeque<Sse>` allocation after draining it.
     queued_capacity_charge: usize,
+    /// Whether the last tightened chunk cap came from parse headroom.
+    parse_chunk_cap: bool,
     /// Out-of-band signal for recording `ResponseTooLarge`.
     signal: SseSignalTarget,
 }
@@ -219,6 +221,10 @@ struct ByteState {
 /// Track the borrowed raw SSE window before the parser can allocate owners.
 /// A blank line ends the current event; CRLF is one line ending.
 #[derive(Clone, Copy, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SSE scanning tracks independent line, CRLF, and data-field facts"
+)]
 struct RawSseEventWindow {
     /// Raw bytes since the last blank event boundary.
     bytes: usize,
@@ -230,13 +236,20 @@ struct RawSseEventWindow {
     unfinished_line_bytes: usize,
     /// Largest unfinished line ever buffered; its cleared Vec keeps capacity.
     max_buffered_line_bytes: usize,
+    /// First five bytes of the current line, including fragments across chunks.
+    line_prefix: [u8; 5],
+    /// Number of prefix bytes captured for the current line.
+    line_prefix_len: u8,
+    /// Whether the current event contains a `data:` field.
+    has_data: bool,
 }
 
 impl RawSseEventWindow {
     /// Count completed frames while advancing the borrowed raw event window.
     #[expect(clippy::too_many_lines, reason = "scans SSE line and frame boundaries in one pass")]
-    fn observe(&mut self, chunk: &[u8]) -> usize {
+    fn observe(&mut self, chunk: &[u8]) -> (usize, bool) {
         let mut completed = 0_usize;
+        let mut saw_data = self.has_data;
         let mut line_was_buffered = self.unfinished_line_bytes != 0;
         for &byte in chunk {
             self.bytes = self.bytes.saturating_add(1);
@@ -256,11 +269,21 @@ impl RawSseEventWindow {
                     if !self.line_has_content {
                         self.bytes = 0;
                         completed = completed.saturating_add(1);
+                        self.has_data = false;
                     }
                     self.line_has_content = false;
+                    self.line_prefix_len = 0;
                     self.previous_was_cr = byte == b'\r';
                 },
                 _ => {
+                    if let Some(slot) = self.line_prefix.get_mut(usize::from(self.line_prefix_len)) {
+                        *slot = byte;
+                        self.line_prefix_len += 1;
+                        if self.line_prefix_len == 5 && self.line_prefix == *b"data:" {
+                            self.has_data = true;
+                            saw_data = true;
+                        }
+                    }
                     self.line_has_content = true;
                     self.unfinished_line_bytes = self.unfinished_line_bytes.saturating_add(1);
                 },
@@ -269,7 +292,7 @@ impl RawSseEventWindow {
         if self.unfinished_line_bytes != 0 {
             self.max_buffered_line_bytes = self.max_buffered_line_bytes.max(self.unfinished_line_bytes);
         }
-        completed
+        (completed, saw_data)
     }
 }
 
@@ -312,11 +335,34 @@ pub(super) fn sse_stream_from_body(
         raw_event: RawSseEventWindow::default(),
         batch_charge: Arc::clone(&batch_charge),
         queued_capacity_charge: 0,
+        parse_chunk_cap: false,
         signal,
     };
 
     let byte_stream = futures::stream::try_unfold(state, move |mut st| async move {
         loop {
+            if let Some(limit) = preparse_peak_limit {
+                // The parser can retain a data String with up to twice its
+                // logical length, a cleared unfinished-line allocation, and
+                // the drained event queue between pulls. Do not hand it a raw
+                // chunk that cannot coexist with those prior owners.
+                let line_capacity = st.raw_event.max_buffered_line_bytes.checked_mul(2);
+                let parse_headroom = st
+                    .raw_event
+                    .bytes
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(st.queued_capacity_charge))
+                    .and_then(|bytes| bytes.checked_add(line_capacity?))
+                    .map_or(0, |retained| limit.saturating_sub(retained));
+                let operation_headroom = st.operation_cap.saturating_sub(st.emitted);
+                let chunk_cap = parse_headroom.min(operation_headroom);
+                st.parse_chunk_cap = parse_headroom <= operation_headroom;
+                if !st.body.try_cap_chunk_bytes(chunk_cap) {
+                    st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                    st.body.cancel().await;
+                    return Err(SseByteStreamError::JsonExpansion { limit });
+                }
+            }
             match st.body.next_chunk().await {
                 Ok(Some(chunk)) => {
                     if let Some(limit) = preparse_peak_limit {
@@ -326,7 +372,7 @@ pub(super) fn sse_stream_from_body(
                         // intentionally excludes.
                         let raw_window = st.raw_event.bytes.checked_add(chunk.len());
                         let mut next_window = st.raw_event;
-                        let completed = next_window.observe(&chunk);
+                        let (completed, saw_data) = next_window.observe(&chunk);
                         let queued_nodes = if completed == 0 {
                             Some(0)
                         } else {
@@ -351,14 +397,22 @@ pub(super) fn sse_stream_from_body(
                         let queued_capacity = st.queued_capacity_charge.max(queued_nodes.unwrap_or(limit));
                         let queued_preparse_peak = st.queued_capacity_charge.max(queued_growth_peak.unwrap_or(limit));
                         // Its unfinished-line Vec is also cleared, not freed.
-                        // Vec's amortized growth can reserve up to twice the
-                        // largest fragmented line. Charge the previous capacity
-                        // before handing this chunk to the parser.
+                        // A `data:` field can grow the parser's String while
+                        // that Vec is live, so reserve both old/new String
+                        // allocations plus the projected line capacity. A
+                        // comment-only batch cannot grow the data String and
+                        // keeps the smaller existing three-copy admission.
+                        let line_capacity = next_window.max_buffered_line_bytes.checked_mul(2);
                         let previous_line_capacity = st.raw_event.max_buffered_line_bytes.checked_mul(2);
+                        let parse_line_capacity = if saw_data {
+                            line_capacity
+                        } else {
+                            previous_line_capacity
+                        };
                         if raw_window
-                            .and_then(|bytes| bytes.checked_mul(3))
+                            .and_then(|bytes| bytes.checked_mul(if saw_data { 4 } else { 3 }))
                             .and_then(|bytes| bytes.checked_add(queued_preparse_peak))
-                            .and_then(|bytes| bytes.checked_add(previous_line_capacity?))
+                            .and_then(|bytes| bytes.checked_add(parse_line_capacity?))
                             .is_none_or(|bytes| bytes > limit)
                         {
                             st.signal.record(TransportSignal::ResponseTooLarge { limit });
@@ -366,7 +420,6 @@ pub(super) fn sse_stream_from_body(
                         }
                         // Keep both parser allocations charged after the raw
                         // event window resets or the queued events drain.
-                        let line_capacity = next_window.max_buffered_line_bytes.checked_mul(2);
                         let charge = raw_window
                             .and_then(|bytes| bytes.checked_add(queued_capacity))
                             .and_then(|bytes| bytes.checked_add(line_capacity?))
@@ -396,11 +449,20 @@ pub(super) fn sse_stream_from_body(
                 Ok(None) => return Ok(None),
                 Err(error) => {
                     if error.downcast_ref::<CalloutResponseTooLarge>().is_some() {
-                        // The core backstop is deliberately wider than this
-                        // adapter's operation cap. Report the binding cap.
-                        let limit = st.operation_cap;
+                        // An armed chunk cap reports the binding limit whose
+                        // remaining headroom was exhausted. Without a parse
+                        // allowance, this is the cumulative core backstop.
+                        let limit = if st.parse_chunk_cap {
+                            preparse_peak_limit.unwrap_or(st.operation_cap)
+                        } else {
+                            st.operation_cap
+                        };
                         st.signal.record(TransportSignal::ResponseTooLarge { limit });
-                        return Err(SseByteStreamError::Ceiling { limit });
+                        return Err(if st.parse_chunk_cap {
+                            SseByteStreamError::JsonExpansion { limit }
+                        } else {
+                            SseByteStreamError::Ceiling { limit }
+                        });
                     }
                     return Err(SseByteStreamError::Upstream);
                 },
@@ -451,6 +513,10 @@ pub(super) struct FakeStreamingBody {
     yielded: usize,
     /// Optional probe for confirming the chunk that trips parser admission.
     yielded_count: Option<Arc<AtomicUsize>>,
+    /// Emulate the core body's per-chunk admission for budgeted SSE tests.
+    max_chunk_bytes: Option<usize>,
+    /// Exercise fail-closed handling for other streaming body implementations.
+    supports_chunk_cap: bool,
 }
 
 #[cfg(test)]
@@ -466,6 +532,8 @@ impl FakeStreamingBody {
             overflow_limit: None,
             yielded: 0,
             yielded_count: None,
+            max_chunk_bytes: None,
+            supports_chunk_cap: true,
         }
     }
 
@@ -501,6 +569,12 @@ impl FakeStreamingBody {
     pub(super) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Model a body that cannot enforce per-chunk admission.
+    fn without_chunk_cap(mut self) -> Self {
+        self.supports_chunk_cap = false;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +583,14 @@ use async_trait::async_trait;
 #[cfg(test)]
 #[async_trait]
 impl StreamingResponseBody for FakeStreamingBody {
+    fn try_cap_chunk_bytes(&mut self, limit: usize) -> bool {
+        if !self.supports_chunk_cap {
+            return false;
+        }
+        self.max_chunk_bytes = Some(self.max_chunk_bytes.map_or(limit, |current| current.min(limit)));
+        true
+    }
+
     async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, praxis_filter::FilterError> {
         if let Some(n) = self.err_after
             && self.yielded >= n
@@ -520,6 +602,12 @@ impl StreamingResponseBody for FakeStreamingBody {
         }
         match self.chunks.pop_front() {
             Some(chunk) => {
+                if let Some(limit) = self.max_chunk_bytes
+                    && chunk.len() > limit
+                {
+                    self.chunks.clear();
+                    return Err(Box::new(CalloutResponseTooLarge { limit }));
+                }
                 self.yielded += 1;
                 if let Some(count) = &self.yielded_count {
                     count.store(self.yielded, Ordering::Relaxed);
@@ -601,6 +689,121 @@ mod tests {
         assert!(matches!(
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 40_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_multiline_data_string_growth_before_parser_allocation() {
+        let raw = format!("id:a\n\ndata: {}\ndata: y\n\n", "x".repeat(100_000));
+        let limit = raw.len() * 3 + 1_000;
+        assert!(
+            raw.len() * 4 > limit,
+            "the old three-copy bound would admit this multiline growth"
+        );
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(raw)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            Arc::clone(&signal).into(),
+            Some(limit),
+        );
+        assert!(stream.next().await.expect("multiline growth rejected").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: recorded }) if *recorded == limit
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_data_prefix_still_reserves_multiline_growth() {
+        let continuation = format!("ta: {}\ndata: y\n\n", "x".repeat(1_000));
+        let raw_len = 2 + continuation.len();
+        let limit = raw_len * 3 + 100;
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"da"), Bytes::from(continuation)],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 10_000, 10_000, 10_000, Arc::clone(&signal).into(), Some(limit));
+        assert!(stream.next().await.expect("split data prefix rejected").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: recorded }) if *recorded == limit
+        ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_sse_requires_chunk_admission_before_first_pull() {
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let cancelled = cancelled_flag();
+        let body = Box::new(
+            FakeStreamingBody::counting_chunks(
+                [Bytes::from_static(b"data: {}\n\n")],
+                Arc::clone(&cancelled),
+                Arc::clone(&yielded),
+            )
+            .without_chunk_cap(),
+        );
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 1_024, Arc::clone(&signal).into(), Some(2_048));
+        assert!(stream.next().await.expect("unsupported body rejected").is_err());
+        assert_eq!(yielded.load(Ordering::Relaxed), 0, "no chunk was pulled");
+        assert!(cancelled.load(Ordering::SeqCst), "the body was cancelled");
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_sse_withholds_oversized_first_chunk() {
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let body = Box::new(FakeStreamingBody::counting_chunks(
+            [Bytes::from("x".repeat(3_000))],
+            cancelled_flag(),
+            Arc::clone(&yielded),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 10_000, 10_000, 10_000, Arc::clone(&signal).into(), Some(2_048));
+        assert!(stream.next().await.expect("oversized chunk withheld").is_err());
+        assert_eq!(yielded.load(Ordering::Relaxed), 0, "chunk did not reach the adapter");
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn prior_parser_owners_tighten_chunk_cap_before_next_pull() {
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let body = Box::new(FakeStreamingBody::counting_chunks(
+            [
+                Bytes::from(format!("data: {}", "x".repeat(1_000))),
+                Bytes::from("y".repeat(3_000)),
+            ],
+            cancelled_flag(),
+            Arc::clone(&yielded),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 10_000, 10_000, 10_000, Arc::clone(&signal).into(), Some(6_500));
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("prior retained line rejects next chunk")
+                .is_err()
+        );
+        assert_eq!(
+            yielded.load(Ordering::Relaxed),
+            1,
+            "second chunk was withheld by core cap"
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 6_500 })
         ));
     }
 

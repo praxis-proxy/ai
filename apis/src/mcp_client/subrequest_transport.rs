@@ -768,6 +768,15 @@ impl McpSubrequestClient {
         self.stream_cumulative_cap
     }
 
+    /// A non-streaming outbound chain can buffer a GET before the SSE path
+    /// rejects it. Apply the parse allowance at that core admission boundary.
+    fn buffered_get_response_cap(&self) -> usize {
+        buffered_preparse_wire_cap(
+            streaming_executor_backstop(self.stream_cumulative_cap()),
+            self.preparse_peak_limit,
+        )
+    }
+
     /// Select the wire byte ceiling for one outbound message.
     ///
     /// `tools/call` responses use the configured tool-result ceiling; every other
@@ -1345,7 +1354,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 &uri,
                 Bytes::new(),
                 headers,
-                streaming_executor_backstop(self.stream_cumulative_cap()),
+                self.buffered_get_response_cap(),
                 streaming_executor_backstop(self.stream_cumulative_cap()),
                 &signal,
             )
@@ -2726,6 +2735,20 @@ mod tests {
             client.stream_cumulative_cap(),
             expected_wire + MAX_CONTROL_RESPONSE_BYTES
         );
+    }
+
+    #[test]
+    fn budgeted_get_bounds_non_streaming_fallback_before_buffering() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(1),
+            1_024,
+            1_024,
+            Some(2_048),
+            None,
+        );
+        assert_eq!(client.buffered_get_response_cap(), 2_048 / 3);
+        assert!(client.stream_cumulative_cap() > client.buffered_get_response_cap());
     }
 
     // -- Streaming POST path (Task 6) --
