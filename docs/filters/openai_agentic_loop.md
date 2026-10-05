@@ -15,7 +15,7 @@ Also extracts `tool_search_call` items into `ResponsesState.tool_search_calls` s
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
+| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. Valid values are 1 through [`MAX_ITERATIONS_CEILING`] (currently 100); defaults to 10. |
 
 ## Examples
 

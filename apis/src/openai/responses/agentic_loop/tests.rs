@@ -55,6 +55,19 @@ fn from_config_rejects_zero_max_infer_iters() {
     assert!(result.is_err(), "max_infer_iters=0 should be rejected");
 }
 
+#[test]
+fn from_config_matches_router_iteration_ceiling() {
+    let ceiling = praxis_core::config::MAX_ITERATIONS_CEILING;
+    for (value, accepted) in [(1, true), (ceiling, true), (ceiling.saturating_add(1), false)] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_infer_iters: {value}")).unwrap();
+        assert_eq!(
+            super::AgenticLoopFilter::from_config(&yaml).is_ok(),
+            accepted,
+            "max_infer_iters={value}"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough Without State
 // -----------------------------------------------------------------------------

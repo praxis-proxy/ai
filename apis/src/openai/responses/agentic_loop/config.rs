@@ -3,6 +3,7 @@
 
 //! Configuration types for the agentic loop filter.
 
+use praxis_core::config::MAX_ITERATIONS_CEILING;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -37,6 +38,8 @@ pub(super) struct AgenticLoopConfig {
     /// Maximum number of inference loop iterations (Praxis-only,
     /// not part of the OpenAI API spec). When the iteration counter
     /// reaches this limit, the loop returns a 508 Loop Detected error.
+    /// Valid values are 1 through [`MAX_ITERATIONS_CEILING`] (currently 100);
+    /// defaults to 10.
     #[serde(default = "default_max_infer_iters")]
     pub max_infer_iters: u32,
 }
@@ -55,8 +58,12 @@ impl Default for AgenticLoopConfig {
 
 /// Validate the parsed configuration.
 pub(super) fn build_config(cfg: AgenticLoopConfig) -> Result<AgenticLoopConfig, FilterError> {
-    if cfg.max_infer_iters == 0 {
-        return Err("openai_agentic_loop: max_infer_iters must be > 0".into());
+    if !(1..=MAX_ITERATIONS_CEILING).contains(&cfg.max_infer_iters) {
+        return Err(format!(
+            "openai_agentic_loop: max_infer_iters must be in 1..={MAX_ITERATIONS_CEILING}, got {}",
+            cfg.max_infer_iters
+        )
+        .into());
     }
     Ok(cfg)
 }
