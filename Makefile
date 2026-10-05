@@ -189,6 +189,8 @@ test-integration:
 	cargo build -p praxis-ai-proxy --bin praxis-ai
 	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features $(INTEGRATION_EXPERIMENTAL_FEATURES)
+	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling \
 		$(if $(V),--nocapture)

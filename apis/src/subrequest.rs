@@ -759,9 +759,17 @@ mod tests {
                 }
                 impl tracing::field::Visit for FieldCollector {
                     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        // `{value:?}` quotes strings; strip so message matching works
+                        // whether the field arrives via `record_str` or `record_debug`.
+                        let rendered = format!("{value:?}");
+                        let normalized = rendered
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(rendered.as_str())
+                            .to_owned();
                         match field.name() {
-                            "message" => self.message = Some(format!("{value:?}")),
-                            "uri" => self.uri = Some(format!("{value:?}")),
+                            "message" => self.message = Some(normalized),
+                            "uri" => self.uri = Some(normalized),
                             _ => {},
                         }
                     }
