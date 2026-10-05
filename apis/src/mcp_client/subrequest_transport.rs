@@ -100,23 +100,24 @@ fn buffered_preparse_wire_cap(wire_cap: usize, peak_limit: Option<usize>) -> usi
     reason = "one lexical pass counts numeric expansion and JSON nodes"
 )]
 pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
-    // Two wire-like owners may coexist: the transport body and SSE `data` or
-    // serde's string allocation. rmcp's untagged JSON-RPC deserializer can
-    // hold intermediate Value trees alongside the final one. With serde_json's
-    // preserve_order maps, dense arrays of small nested objects need more than
-    // 128 bytes per structural token before those intermediates are dropped.
+    // The transport body and rmcp's untagged JSON-RPC intermediates overlap.
+    // Even one string escape can make serde retain additional scratch copies
+    // while trying variants, so escaped bodies need a larger wire allowance.
+    // preserve_order maps also need a structural allowance for dense trees.
     const NODE_PEAK_BYTES: usize = 512;
     let mut normalized = raw.len();
     let mut nodes = 1_usize;
     let mut index = 0;
     let mut quoted = false;
     let mut escaped = false;
+    let mut saw_string_escape = false;
     while let Some(&byte) = raw.get(index) {
         if quoted {
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
+                saw_string_escape = true;
             } else if byte == b'"' {
                 quoted = false;
             }
@@ -147,7 +148,7 @@ pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
         index += 1;
     }
     raw.len()
-        .checked_mul(2)?
+        .checked_mul(if saw_string_escape { 7 } else { 2 })?
         .checked_add(normalized)?
         .checked_add(nodes.checked_mul(NODE_PEAK_BYTES)?)
 }
@@ -1199,7 +1200,13 @@ impl McpSubrequestClient {
                     return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
                 }
             } else {
-                drain_body(&mut body).await;
+                // A budgeted error has no structured body to inspect. Cancel
+                // without pulling a potentially oversized raw chunk into AI.
+                if preparse_peak_limit.is_some() {
+                    body.cancel().await;
+                } else {
+                    drain_body(&mut body).await;
+                }
             }
             return Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("HTTP {status}").into(),
@@ -2377,6 +2384,29 @@ mod tests {
     }
 
     #[test]
+    fn escaped_json_rpc_string_peak_is_reserved_before_parse() {
+        for escaped in ["\\\"".repeat(100_000), format!("{}\\n", "x".repeat(100_000))] {
+            let wire =
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"{escaped}"}}]}}}}"#);
+            let mut parsed = None;
+            let measured = allocation_counter::measure(|| {
+                parsed = Some(serde_json::from_slice::<ServerJsonRpcMessage>(wire.as_bytes()));
+            });
+            assert!(parsed.expect("parse was measured").is_ok());
+            let actual_peak = wire
+                .len()
+                .checked_add(usize::try_from(measured.bytes_max).expect("allocation peak fits usize"))
+                .expect("wire plus parse peak fits usize");
+            let estimate = json_preparse_peak_bytes(wire.as_bytes()).expect("estimate fits usize");
+            assert!(
+                estimate >= actual_peak,
+                "escaped string peak {actual_peak} exceeds estimate {estimate}"
+            );
+            assert!(!json_preparse_fits(wire.as_bytes(), Some(actual_peak - 1)));
+        }
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "one numeric control witness covers JSON and SSE admission"
@@ -3227,6 +3257,36 @@ mod tests {
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "a non-JSON error body is drained and cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn budgeted_non_json_error_cancels_before_reading_oversized_chunk() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let yielded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::counting_chunks(
+            [Bytes::from(vec![b'x'; 65 * 1_024])],
+            Arc::clone(&cancelled),
+            Arc::clone(&yielded),
+        ));
+        let signal = test_signal();
+        let result = client()
+            .classify_streaming_post_response(
+                sub_response(500, Some("text/plain"), b""),
+                body,
+                false,
+                1_024,
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                Some(2_048),
+                Arc::clone(&signal),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedServerResponse(message)) if message.contains("HTTP 500")
+        ));
+        assert_eq!(yielded.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(signal.get().is_none());
     }
 
     // -- GET SSE stream path (Task 7) --
