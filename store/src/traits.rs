@@ -54,6 +54,22 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
 
+    /// Fetch a response only when its encoded and decoded JSON columns fit
+    /// `max_bytes`. Implementations must avoid loading oversized columns into
+    /// the caller process; unsupported backends fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    async fn get_response_bounded(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
@@ -85,6 +101,20 @@ pub trait ResponseStore: Send + Sync {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
+
+    /// Fetch a conversation only when its JSON columns fit `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record.
+    async fn get_conversation_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
 
     /// Record server-owned pending MCP approvals emitted by the proxy.
     ///
@@ -155,6 +185,18 @@ pub trait ResponseStore: Send + Sync {
         Ok(())
     }
 
+    /// Insert a response and its approvals atomically only when its ID is
+    /// unused. A later budget failure may roll back this exchange's row, so
+    /// replacing a prior response is unsafe. Backends without an atomic
+    /// implementation fail closed.
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        _record: &ResponseRecord,
+        _pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///
@@ -185,6 +227,21 @@ pub trait ResponseStore: Send + Sync {
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
+
+    /// Return matching approval payload bytes without materializing the rows.
+    /// Unknown backends fail aggregate admission closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend cannot measure the payload.
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(usize::MAX)
+    }
 
     /// Atomically claim single-use consumption of a batch of pending approvals
     /// issued by `response_id`.
@@ -519,6 +576,24 @@ pub trait ConversationItemStore: Send + Sync {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
+
+    /// Append and rebuild the message cache only when the complete rebuild
+    /// fits `max_rebuild_bytes`. Backends must check stored row sizes inside
+    /// the append transaction before loading item data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the cache would exceed the
+    /// allowance, including for backends without a bounded implementation.
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+        _max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::PayloadTooLarge)
+    }
 
     /// Atomically delete an item and rebuild the conversation message cache.
     ///

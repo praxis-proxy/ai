@@ -15,6 +15,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io,
     sync::Mutex,
 };
 
@@ -31,6 +32,30 @@ use crate::{
 
 /// Owner-qualified key for owner-scoped rows.
 type OwnerKey = (StateOwner, String);
+
+/// Count compact JSON without materializing a second copy before cloning a
+/// bounded in-memory record.
+fn json_values_fit(values: &[&serde_json::Value], max_bytes: usize) -> bool {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(buf.len())
+                .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(max_bytes);
+    values
+        .iter()
+        .all(|value| serde_json::to_writer(&mut counter, value).is_ok())
+}
 
 /// A stored pending approval plus its single-use consumption stamp.
 #[derive(Clone)]
@@ -230,6 +255,22 @@ impl ResponseStore for InMemoryStore {
         Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
     }
 
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        if !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
+    }
+
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
         let removed = inner.responses.get(id).is_some_and(|record| &record.owner == owner);
@@ -259,6 +300,22 @@ impl ResponseStore for InMemoryStore {
             .cloned())
     }
 
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.conversations.get(&(owner.clone(), conversation_id.to_owned())) else {
+            return Ok(None);
+        };
+        if !json_values_fit(&[&record.metadata, &record.messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
+    }
+
     async fn record_pending_approvals(
         &self,
         owner: &StateOwner,
@@ -285,6 +342,20 @@ impl ResponseStore for InMemoryStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        if inner.responses.contains_key(&record.id) {
+            return Ok(false);
+        }
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,
@@ -302,6 +373,30 @@ impl ResponseStore for InMemoryStore {
             })
             .collect();
         Ok(found)
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        let inner = self.lock()?;
+        inner
+            .approvals
+            .iter()
+            .filter(|((stored_owner, stored_response, stored_id), _)| {
+                stored_owner == owner && stored_response == response_id && approval_ids.contains(&stored_id.as_str())
+            })
+            .try_fold(0_usize, |used, (_, stored)| {
+                let record = &stored.record;
+                used.checked_add(record.approval_id.len())
+                    .and_then(|bytes| bytes.checked_add(record.server_label.len()))
+                    .and_then(|bytes| bytes.checked_add(record.tool_name.len()))
+                    .and_then(|bytes| bytes.checked_add(record.arguments.len()))
+                    .and_then(|bytes| bytes.checked_add(record.target_fingerprint.len()))
+                    .ok_or_else(|| StoreError::Database("pending approval payload size overflow".to_owned()))
+            })
     }
 
     async fn consume_approvals(
@@ -629,29 +724,17 @@ impl ConversationItemStore for InMemoryStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        let mut inner = self.lock()?;
-        let key = (owner.clone(), conversation_id.to_owned());
-        require_conversation_scope(&inner, owner, conversation_id, items)?;
-        reject_duplicate_item_ids(&inner, items)?;
-        let mut next = inner
-            .items
-            .get(&key)
-            .and_then(|items| items.iter().map(|i| i.position).max())
-            .unwrap_or(0);
-        for item in items {
-            next += 1;
-            // Positions are assigned within the "transaction"; the input
-            // position field is ignored.
-            let mut stored = item.clone();
-            stored.position = next;
-            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
-            inner.items.entry(key.clone()).or_default().push(stored);
-        }
-        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
-        if let Some(conversation) = inner.conversations.get_mut(&key) {
-            conversation.messages = rebuilt;
-        }
-        Ok(())
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
     }
 
     async fn delete_item_and_sync_messages(
@@ -685,6 +768,80 @@ impl ConversationItemStore for InMemoryStore {
             conversation.messages = rebuilt;
         }
         Ok(true)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "bounded cache helper sits beside its trait implementation"
+)]
+impl InMemoryStore {
+    /// Validate the complete message-cache projection before updating items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and the mutex-protected commit form one atomic operation"
+    )]
+    fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        require_conversation_scope(&inner, owner, conversation_id, items)?;
+        reject_duplicate_item_ids(&inner, items)?;
+        if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+            let previous = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+            let count = previous
+                .len()
+                .checked_add(items.len())
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let raw_allowance = max_rebuild_bytes
+                .checked_sub(count.checked_mul(4).ok_or(StoreError::PayloadTooLarge)?)
+                .and_then(|bytes| bytes.checked_sub(4))
+                .map(|bytes| bytes / 26)
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let mut remaining = raw_allowance;
+            for item in previous.iter().chain(items) {
+                struct Counter<'a>(&'a mut usize);
+                impl io::Write for Counter<'_> {
+                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                        *self.0 = self
+                            .0
+                            .checked_sub(buf.len())
+                            .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
+                        Ok(buf.len())
+                    }
+
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                serde_json::to_writer(Counter(&mut remaining), &item.item_data)
+                    .map_err(|_error| StoreError::PayloadTooLarge)?;
+            }
+        }
+        let mut next = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().map(|i| i.position).max())
+            .unwrap_or(0);
+        for item in items {
+            next += 1;
+            // Positions are assigned within the "transaction"; the input
+            // position field is ignored.
+            let mut stored = item.clone();
+            stored.position = next;
+            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
+            inner.items.entry(key.clone()).or_default().push(stored);
+        }
+        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
+        if let Some(conversation) = inner.conversations.get_mut(&key) {
+            conversation.messages = rebuilt;
+        }
+        Ok(())
     }
 }
 
@@ -738,6 +895,38 @@ mod tests {
             .unwrap();
         assert!(store.get_response(&a, "r1").await.unwrap().is_some());
         assert!(store.get_response(&b, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_append_keeps_prior_cache_on_overflow() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .create_items_and_sync_messages(&o, "c1", &[item(&o, "c1", "prior", 0)])
+            .await
+            .unwrap();
+        let rejected = store
+            .create_items_and_sync_messages_bounded(&o, "c1", &[item(&o, "c1", "new", 0)], 1)
+            .await;
+        assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+        let listed = store.list_conversation_items(&o, "c1", None, 10, true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.first().map(|item| item.item_id.as_str()), Some("prior"));
+        let conversation = ResponseStore::get_conversation(&store, &o, "c1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.messages.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     approvals_consume_all_or_nothing(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
     persist_pairs_response_and_approvals(backend).await;
+    insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
@@ -373,6 +374,85 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
             .expect("get after delete")
             .is_empty(),
         "approval orphaned after its response was deleted"
+    );
+}
+
+/// A rollback candidate must never replace a preexisting response or its
+/// approvals, including when a provider reuses an ID for the same owner.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks same-owner and cross-owner collisions with approvals"
+)]
+async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateBackend) {
+    let first_owner = owner("insert-first");
+    let second_owner = owner("insert-second");
+    let original = ResponseRecord {
+        id: "resp_insert_once".to_owned(),
+        owner: first_owner.clone(),
+        created_at: 1,
+        model: "old".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "old"}),
+        input: serde_json::json!([]),
+        messages: serde_json::json!([]),
+    };
+    assert!(
+        backend
+            .persist_response_with_pending_approvals_if_absent(&original, &[approval("pa_old")])
+            .await
+            .expect("first insert"),
+        "new response must insert"
+    );
+    let replacement = ResponseRecord {
+        model: "new".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "new"}),
+        ..original.clone()
+    };
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(&replacement, &[approval("pa_new")])
+            .await
+            .expect("same-owner collision"),
+        "same-owner collision must not replace the existing response"
+    );
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(
+                &ResponseRecord {
+                    owner: second_owner.clone(),
+                    ..replacement
+                },
+                &[approval("pa_other")],
+            )
+            .await
+            .expect("cross-owner collision"),
+        "cross-owner collision must not replace the existing response"
+    );
+    let stored = backend
+        .get_response(&first_owner, &original.id)
+        .await
+        .expect("get original")
+        .expect("original retained");
+    assert_eq!(
+        stored.response_object.get("marker"),
+        Some(&serde_json::json!("old")),
+        "same-owner collision changed the original response"
+    );
+    assert!(
+        backend
+            .get_response(&second_owner, &original.id)
+            .await
+            .expect("get other")
+            .is_none(),
+        "cross-owner collision leaked the original response"
+    );
+    assert_eq!(
+        backend
+            .get_pending_approvals(&first_owner, &original.id, &["pa_old", "pa_new", "pa_other"])
+            .await
+            .expect("get approvals")
+            .len(),
+        1,
+        "collisions must not write replacement approvals"
     );
 }
 
