@@ -434,6 +434,8 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_stream_events"
             | "openai_tool_parse"
             | "openai_chat_completions_to_bedrock_converse"
+            | "openai_chat_completions_to_azureai_chat_completions"
+            | "openai_chat_completions_to_vertexai_gemini"
             | "responses_to_chat_completions"
             | "aws_sigv4_sign"
             | "router"
@@ -2006,13 +2008,7 @@ mod tests {
             model: Some("fixture-model".to_owned()),
             exchange: RecordedExchange {
                 request: scenario.turns[0].request.clone(),
-                response: RecordedResponse {
-                    status: 200,
-                    headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
-                    body: RecordedBody::Json {
-                        value: json!({"scenario": true}),
-                    },
-                },
+                response: chat_response("root answer", "chatcmpl-root"),
             },
         };
 
@@ -2701,7 +2697,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: openai_chat_completions_to_azureai_chat_completions\n      - filter: openai_chat_completions_to_vertexai_gemini\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

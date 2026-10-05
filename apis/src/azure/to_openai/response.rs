@@ -46,8 +46,16 @@ pub(crate) fn normalize_sse_payload(data: &[u8]) -> SsePayloadAction<'_> {
         return SsePayloadAction::ForwardOriginal(data);
     };
 
+    let annotation_only = has_filter_annotations(&value);
     let modified = strip_azure_fields_in_place(&mut value);
-    if is_filter_only_value(&value) {
+    if annotation_only && is_annotation_only_value(&value) {
+        if value.get("usage").is_some_and(|usage| !usage.is_null()) || has_retained_top_level_fields(&value) {
+            // Keep usage and metadata without exposing an annotation as a Chat choice.
+            if let Some(choices) = value.get_mut("choices") {
+                *choices = Value::Array(Vec::new());
+            }
+            return rewritten_or_original(data, &value);
+        }
         return SsePayloadAction::Drop;
     }
 
@@ -56,6 +64,18 @@ pub(crate) fn normalize_sse_payload(data: &[u8]) -> SsePayloadAction<'_> {
     } else {
         SsePayloadAction::ForwardOriginal(data)
     }
+}
+
+/// Identify frames that carried Azure choice annotations before they are stripped.
+fn has_filter_annotations(value: &Value) -> bool {
+    value.get("choices").and_then(Value::as_array).is_some_and(|choices| {
+        !choices.is_empty()
+            && choices.iter().all(|choice| {
+                choice
+                    .as_object()
+                    .is_some_and(|fields| CHOICE_STRIP.iter().any(|key| fields.contains_key(*key)))
+            })
+    })
 }
 
 /// Strip Azure-specific fields from a Chat Completions response.
@@ -126,12 +146,41 @@ fn rewritten_or_original<'a>(original: &'a [u8], value: &Value) -> SsePayloadAct
     }
 }
 
-/// Returns `true` when every choice is an Azure async-filter annotation.
+/// Returns `true` when every choice is an Azure async-filter annotation without usage.
+#[cfg(test)]
 fn is_filter_only_value(value: &Value) -> bool {
+    if value.get("usage").is_some_and(|usage| !usage.is_null()) {
+        return false;
+    }
+    is_annotation_only_value(value)
+}
+
+/// Detect choices whose only remaining fields describe an Azure annotation.
+fn is_annotation_only_value(value: &Value) -> bool {
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
         return false;
     };
-    !choices.is_empty() && choices.iter().all(|choice| !choice_has_stream_payload(choice))
+    !choices.is_empty()
+        && choices.iter().all(|choice| {
+            !choice_has_stream_payload(choice)
+                && choice.as_object().is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .all(|(key, value)| matches!(key.as_str(), "index" | "finish_reason") || value.is_null())
+                })
+        })
+}
+
+/// Preserve top-level data beyond the standard chunk envelope when dropping annotations.
+fn has_retained_top_level_fields(value: &Value) -> bool {
+    value.as_object().is_some_and(|fields| {
+        fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "id" | "object" | "created" | "model" | "system_fingerprint" | "choices" | "usage"
+            )
+        })
+    })
 }
 
 /// `true` when a choice still has Chat Completions stream content after
@@ -278,6 +327,40 @@ mod tests {
         let chunk = serde_json::json!({"id": "chatcmpl-abc", "choices": []});
         let bytes = chunk.to_string();
         assert_forward_original(bytes.as_bytes());
+    }
+
+    #[test]
+    fn non_annotation_and_usage_chunks_are_not_dropped() {
+        let without_annotation_or_usage = br#"{"choices":[{"index":0,"finish_reason":null}]}"#;
+        assert_forward_original(without_annotation_or_usage);
+
+        let without_annotation = br#"{"choices":[{"index":0,"finish_reason":null}],"usage":{"total_tokens":3}}"#;
+        assert_forward_original(without_annotation);
+
+        let with_null_logprobs =
+            br#"{"choices":[{"index":0,"finish_reason":null,"logprobs":null,"content_filter_results":{}}]}"#;
+        assert_eq!(normalize_sse_payload(with_null_logprobs), SsePayloadAction::Drop);
+
+        let with_annotation_and_usage =
+            br#"{"choices":[{"index":0,"finish_reason":null,"content_filter_results":{}}],"usage":{"total_tokens":3}}"#;
+        let action = normalize_sse_payload(with_annotation_and_usage);
+        let rewritten = rewritten_slice(&action);
+        let parsed: Value = serde_json::from_slice(rewritten).unwrap();
+        assert_eq!(parsed["choices"], serde_json::json!([]));
+        assert_eq!(parsed["usage"]["total_tokens"], 3);
+
+        let with_extension = br#"{"choices":[{"index":0,"finish_reason":null,"content_filter_results":{}}],"provider_data":{"source":"azure"}}"#;
+        let action = normalize_sse_payload(with_extension);
+        let parsed: Value = serde_json::from_slice(rewritten_slice(&action)).unwrap();
+        assert_eq!(parsed["choices"], serde_json::json!([]));
+        assert_eq!(parsed["provider_data"]["source"], "azure");
+
+        let with_service_tier =
+            br#"{"choices":[{"index":0,"finish_reason":null,"content_filter_results":{}}],"service_tier":"default"}"#;
+        let action = normalize_sse_payload(with_service_tier);
+        let parsed: Value = serde_json::from_slice(rewritten_slice(&action)).unwrap();
+        assert_eq!(parsed["choices"], serde_json::json!([]));
+        assert_eq!(parsed["service_tier"], "default");
     }
 
     // -------------------------------------------------------------------------

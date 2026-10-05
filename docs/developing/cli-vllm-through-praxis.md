@@ -369,6 +369,15 @@ claude --model "$VLLM_MODEL"
 `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` must be present in the environment of
 the Praxis process. The other variables configure Claude Code.
 
+For the translated `messages-to-openai-vllm.yaml` route, disable Anthropic
+thinking and prompt caching in Claude Code. Chat Completions cannot represent
+either feature, so Praxis rejects requests that include them:
+
+```console
+export CLAUDE_CODE_DISABLE_THINKING=1
+export DISABLE_PROMPT_CACHING=1
+```
+
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is required for a 32,768-token server. Claude
 Code does not know the served model's real window, so it sends the default
 `max_tokens` for the Anthropic model name it believes it is calling — around

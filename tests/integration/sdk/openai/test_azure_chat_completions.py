@@ -287,6 +287,90 @@ class TestAzureChatCompletionsSdk:
         path, body = _last_post()
         _assert_azure_upstream(path, body, messages=messages, extras={"stream": True})
 
+    def test_streaming_annotation_with_usage_is_preserved(self, openai_client: OpenAI) -> None:
+        content_frame = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "Hi"},
+                "finish_reason": "stop",
+            }],
+        }
+        usage_frame = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "finish_reason": None, "content_filter_results": {}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        }
+        body = (
+            "data: " + json.dumps(content_frame) + "\n\n"
+            + "data: " + json.dumps(usage_frame) + "\n\n"
+            + "data: [DONE]\n\n"
+        )
+        _STATE.script(200, "text/event-stream", body)
+
+        chunks = list(
+            openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        )
+
+        assert len(chunks) == 2
+        assert chunks[0].choices[0].delta.content == "Hi"
+        assert chunks[1].choices == []
+        assert chunks[1].usage is not None
+        assert chunks[1].usage.total_tokens == 3
+
+        _STATE.script(200, "text/event-stream", body)
+        with openai_client.chat.completions.stream(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            stream_options={"include_usage": True},
+        ) as stream:
+            list(stream)
+            completion = stream.get_final_completion()
+
+        assert completion.choices[0].message.content == "Hi"
+        assert completion.usage is not None
+        assert completion.usage.total_tokens == 3
+
+        metadata_frame = {
+            **usage_frame,
+            "choices": [{**usage_frame["choices"][0], "logprobs": None}],
+            "usage": None,
+            "provider_data": {"source": "azure"},
+            "service_tier": "default",
+        }
+        metadata_body = (
+            "data: " + json.dumps(content_frame) + "\n\n"
+            + "data: " + json.dumps(metadata_frame) + "\n\n"
+            + "data: [DONE]\n\n"
+        )
+        _STATE.script(200, "text/event-stream", metadata_body)
+        with openai_client.chat.completions.stream(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+        ) as stream:
+            events = list(stream)
+            completion = stream.get_final_completion()
+
+        assert completion.choices[0].message.content == "Hi"
+        metadata_chunk = next(
+            event.chunk
+            for event in events
+            if event.type == "chunk" and event.chunk.choices == []
+        )
+        assert metadata_chunk.service_tier == "default"
+        assert metadata_chunk.model_extra["provider_data"] == {"source": "azure"}
+
     def test_error(self, openai_client: OpenAI) -> None:
         _STATE.script(404, "application/json", json.dumps(AZURE_ERROR))
         messages = [{"role": "user", "content": "hi"}]

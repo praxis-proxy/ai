@@ -221,7 +221,9 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
     let (content, tool_calls) = extract_content_and_tool_calls(parts)?;
     let has_tool_calls = !tool_calls.is_empty();
 
-    let finish_reason = convert_finish_reason(candidate.get("finishReason").and_then(Value::as_str), has_tool_calls);
+    let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    validate_finish_reason(raw_finish_reason)?;
+    let finish_reason = convert_finish_reason(raw_finish_reason, has_tool_calls);
 
     let mut message = Map::new();
     message.insert("role".to_owned(), Value::String("assistant".to_owned()));
@@ -253,6 +255,7 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
 /// Extract text content and tool calls from Gemini response parts.
 ///
 /// - `text` parts → concatenated into a single string (or `null` if none)
+/// - signature-only parts → ignored because they have no Chat text or tool call
 /// - `functionCall` parts → converted to OpenAI `tool_calls` entries
 /// - `thoughtSignature` on a function-call part is copied onto the tool call as
 ///   `extra_content.google.thought_signature` so the client can send it back on the next turn (Gemini 3 rejects
@@ -262,6 +265,10 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
 /// `functionCall.id` when present; otherwise mint a unique id. Do not derive
 /// the id from `responseId` or the function name — those collide across rounds
 /// or parallel same-name calls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and accumulates each Gemini response part"
+)]
 fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, Vec<Value>), String> {
     let Some(parts) = parts else {
         return Ok((Value::Null, Vec::new()));
@@ -271,6 +278,19 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, 
     let mut tool_calls = Vec::new();
 
     for part in parts {
+        validate_response_part(part)?;
+        let has_text = part.get("text").is_some();
+        let has_function_call = part.get("functionCall").is_some();
+        let has_signature = part.get("thoughtSignature").is_some_and(Value::is_string);
+        if has_text && !part.get("text").is_some_and(Value::is_string) {
+            return Err("Gemini response text part must contain a string".to_owned());
+        }
+        if has_function_call && !part.get("functionCall").is_some_and(Value::is_object) {
+            return Err("Gemini response functionCall part must be an object".to_owned());
+        }
+        if !has_text && !has_function_call && !has_signature {
+            return Err("unsupported Gemini response content part".to_owned());
+        }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             text_segments.push(text);
         }
@@ -287,6 +307,26 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, 
     };
 
     Ok((content, tool_calls))
+}
+
+/// Refuse provider response fields that would be silently discarded.
+fn validate_response_part(part: &Value) -> Result<(), String> {
+    let fields = part
+        .as_object()
+        .ok_or("Gemini response content part must be an object")?;
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "text" | "functionCall" | "thought" | "thoughtSignature"))
+        || fields
+            .get("thought")
+            .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+    {
+        return Err("unsupported Gemini response content part".to_owned());
+    }
+    // A text Part or a metadata-only Part may carry a thought signature.
+    // Gemini does not require that signature on a later non-function-call
+    // turn, and Chat Completions has no corresponding text-content field.
+    Ok(())
 }
 
 /// Convert a Gemini `functionCall` part to an OpenAI `tool_calls` entry.
@@ -410,6 +450,34 @@ fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static
         // Gemini uses STOP for both normal text and function-call completions.
         _ if has_tool_calls => "tool_calls",
         _ => "stop",
+    }
+}
+
+/// Unknown provider terminal reasons must not be reported as a clean stop.
+fn validate_finish_reason(reason: Option<&str>) -> Result<(), String> {
+    if matches!(
+        reason,
+        None | Some(
+            "STOP"
+                | "MAX_TOKENS"
+                | "SAFETY"
+                | "RECITATION"
+                | "BLOCKLIST"
+                | "PROHIBITED_CONTENT"
+                | "SPII"
+                | "IMAGE_SAFETY"
+                | "LANGUAGE"
+                | "OTHER"
+                | "MODEL_ARMOR"
+                | "MALFORMED_FUNCTION_CALL"
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported Gemini finishReason `{}`",
+            reason.unwrap_or_default()
+        ))
     }
 }
 
@@ -660,6 +728,7 @@ fn build_stream_choice(
         .and_then(Value::as_array);
 
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    validate_finish_reason(finish_reason)?;
     if finish_reason.is_some() {
         state.finished_candidates.insert(candidate_index);
     }
@@ -757,6 +826,10 @@ fn reject_upstream_error_frame(obj: Option<&Map<String, Value>>) -> Result<(), S
 /// Tool-call `index` is the slot position and is set on every delta —
 /// this repo's Chat Completions stream consumer fails closed when
 /// `index` is missing and would otherwise merge parallel calls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and accumulates each streamed response part"
+)]
 fn extract_stream_content_and_tool_calls(
     parts: Option<&Vec<Value>>,
     slots: &mut Vec<ToolCallSlot>,
@@ -769,6 +842,19 @@ fn extract_stream_content_and_tool_calls(
     let mut tool_calls = Vec::new();
 
     for part in parts {
+        validate_response_part(part)?;
+        let has_text = part.get("text").is_some();
+        let has_function_call = part.get("functionCall").is_some();
+        let has_signature = part.get("thoughtSignature").is_some_and(Value::is_string);
+        if has_text && !part.get("text").is_some_and(Value::is_string) {
+            return Err("Gemini response text part must contain a string".to_owned());
+        }
+        if has_function_call && !part.get("functionCall").is_some_and(Value::is_object) {
+            return Err("Gemini response functionCall part must be an object".to_owned());
+        }
+        if !has_text && !has_function_call && !has_signature {
+            return Err("unsupported Gemini response content part".to_owned());
+        }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             text_segments.push(text);
         }
@@ -944,6 +1030,20 @@ pub(crate) fn created_timestamp() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unsupported_response_parts_fail_in_finite_and_stream_modes() {
+        for part in [
+            json!({"inlineData": {"mimeType": "image/png", "data": "AA=="}}),
+            json!({"text": "caption", "inlineData": {"mimeType": "image/png", "data": "AA=="}}),
+            json!({"text": "internal reasoning", "thought": true}),
+        ] {
+            let parts = vec![part];
+            assert!(extract_content_and_tool_calls(Some(&parts)).is_err());
+            assert!(extract_stream_content_and_tool_calls(Some(&parts), &mut Vec::new()).is_err());
+        }
+        assert!(validate_finish_reason(Some("FUTURE_REASON")).is_err());
+    }
+
     fn new_stream_state(created: u64) -> StreamTranslateState {
         let mut state = StreamTranslateState::new();
         state.created = created;
@@ -977,6 +1077,30 @@ mod tests {
         assert_eq!(parsed["usage"]["prompt_tokens"], 5);
         assert_eq!(parsed["usage"]["completion_tokens"], 2);
         assert_eq!(parsed["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn text_part_with_default_thought_and_signature_translates() {
+        let body = br#"{"candidates":[{"content":{"parts":[
+            {"text":"Hello", "thought":false},
+            {"text":" world", "thoughtSignature":"sig-text"}
+        ]},"finishReason":"STOP"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn signature_only_part_after_text_translates() {
+        let body = br#"{"candidates":[{"content":{"parts":[
+            {"text":"Hello"},
+            {"thoughtSignature":"sig-only"}
+        ]},"finishReason":"STOP"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
@@ -1455,6 +1579,40 @@ mod tests {
         assert_eq!(parsed["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(parsed["choices"][0]["delta"]["content"], "Hi");
         assert!(parsed["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn stream_text_part_with_default_thought_and_signature_translates() {
+        let mut state = new_stream_state(1_700_000_000);
+        let first = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hello", "thought":false}]}}]}"#,
+        );
+        let last = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"", "thoughtSignature":"sig-text"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(last["choices"][0]["delta"]["content"], "");
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn stream_signature_only_terminal_part_translates() {
+        let mut state = new_stream_state(1_700_000_000);
+        let first = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}"#,
+        );
+        let last = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-only"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        assert!(last["choices"][0]["delta"]["content"].is_null());
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert!(state.is_complete());
     }
 
     #[test]

@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from openai import APIError, APIStatusError, OpenAI
+from openai import APIError, APIStatusError, BadRequestError, OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -172,6 +172,13 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             return
 
         response = self._make_gemini_response(user_text, has_tool_use)
+        if "trigger text metadata" in user_text.lower():
+            response["candidates"][0]["content"]["parts"][0].update(
+                {"thought": False, "thoughtSignature": "sig-text"}
+            )
+            response["candidates"][0]["content"]["parts"].append(
+                {"thoughtSignature": "sig-only"}
+            )
         self._send_json_response(200, response)
 
     def _handle_streaming(self, request_json: dict[str, Any]) -> None:
@@ -202,6 +209,11 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             chunks = self._make_gemini_streaming_tool_chunks()
         else:
             chunks = self._make_gemini_streaming_chunks(user_text)
+            if "trigger text metadata" in user_text.lower():
+                chunks[0]["candidates"][0]["content"]["parts"][0]["thought"] = False
+                chunks[-1]["candidates"][0]["content"]["parts"].append(
+                    {"thoughtSignature": "sig-only"}
+                )
         body_lines = []
         for chunk in chunks:
             frame = f"data: {json.dumps(chunk)}\n\n"
@@ -489,6 +501,29 @@ def openai_client(vertex_proxy):
 class TestVertexGeminiChatCompletions:
     """End-to-end OpenAI SDK compatibility tests for Vertex Gemini translation."""
 
+    def test_unsupported_content_is_rejected_before_vertex(self, openai_client: OpenAI) -> None:
+        FakeVertexGeminiHandler.last_request_body = None
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/image.png",
+                                    "detail": "high",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert FakeVertexGeminiHandler.last_request_body is None
+
     def test_non_streaming_basic(self, openai_client: OpenAI) -> None:
         """Non-streaming request translates correctly and response is OpenAI-shaped."""
         response = openai_client.chat.completions.create(
@@ -527,6 +562,24 @@ class TestVertexGeminiChatCompletions:
 
         assert response.choices[0].message.content == "Hello! How can I help you today?"
         assert response.choices[0].finish_reason == "stop"
+
+    def test_text_part_metadata_in_finite_and_streamed_response(self, openai_client: OpenAI) -> None:
+        messages = [{"role": "user", "content": "Trigger text metadata"}]
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash", messages=messages
+        )
+        assert response.choices[0].message.content == (
+            "I received your message and I'm ready to assist."
+        )
+
+        with openai_client.chat.completions.create(
+            model="gemini-2.0-flash", messages=messages, stream=True
+        ) as stream:
+            chunks = list(stream)
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == (
+            response.choices[0].message.content
+        )
+        assert chunks[-1].choices[0].finish_reason == "stop"
 
     def test_streaming_basic(self, openai_client: OpenAI) -> None:
         """Streaming request produces proper OpenAI chunk stream with [DONE]."""
@@ -579,6 +632,7 @@ class TestVertexGeminiChatCompletions:
                     "function": {
                         "name": "get_weather",
                         "description": "Get weather for a location",
+                        "strict": False,
                         "parameters": {
                             "type": "object",
                             "properties": {"location": {"type": "string"}},

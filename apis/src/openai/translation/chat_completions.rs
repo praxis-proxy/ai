@@ -267,6 +267,9 @@ pub(crate) enum TranslationError {
     /// A Responses tool has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool type for Chat Completions translation: {0}")]
     UnsupportedToolType(String),
+    /// A present tools field cannot be translated unless it is an array.
+    #[error("Responses `tools` must be an array for Chat Completions translation")]
+    InvalidTools,
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
@@ -479,8 +482,15 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// on our behalf. A malformed value is therefore rejected too: anything that is
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
+#[expect(clippy::too_many_lines, reason = "sequential validation of request parameters")]
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
     validate_moderation_parameter(obj)?;
+    if obj
+        .get("tools")
+        .is_some_and(|tools| !tools.is_null() && !tools.is_array())
+    {
+        return Err(TranslationError::InvalidTools);
+    }
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -1089,7 +1099,7 @@ fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError>
 
     for tool in tools {
         let Some(tool_obj) = tool.as_object() else {
-            continue;
+            return Err(TranslationError::UnsupportedToolType("unknown".to_owned()));
         };
 
         match tool_obj.get("type").and_then(Value::as_str) {

@@ -87,6 +87,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [chat-completions-to-openai-fixture.yaml](configs/azure/chat-completions-to-openai-fixture.yaml) | Proxies Chat Completions requests to a local Azure replay backend at 127.0.0.1:3000 |
 | [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 
 ### Bedrock

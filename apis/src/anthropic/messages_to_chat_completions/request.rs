@@ -46,15 +46,12 @@ const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "moderation",
 ];
 
-/// Anthropic Messages fields dropped with a warning instead of forwarded.
+/// Anthropic Messages fields without a Chat Completions equivalent.
 ///
-/// Claude Code sends both on every request, and neither has a Chat
-/// Completions equivalent: the translated response carries no thinking
-/// blocks, so `thinking` is visibly absent and `context_management` (which
-/// only edits thinking blocks) has nothing to act on. Forwarding them would
-/// make the outcome depend on the backend, since vLLM ignores unknown fields
-/// and the OpenAI API rejects them.
-const DROPPED_FIELDS: [&str; 2] = ["thinking", "context_management"];
+/// The translated response cannot carry thinking blocks, and
+/// `context_management` can edit them. Non-null values are rejected before
+/// conversion; null values have no effect and are removed.
+const UNMAPPABLE_FIELDS: [&str; 2] = ["thinking", "context_management"];
 
 /// Every `output_config` key in the Anthropic schema, including the beta
 /// `task_budget`; the schema declares no others (`additionalProperties:
@@ -68,17 +65,19 @@ const OUTPUT_CONFIG_KEYS: [&str; 3] = ["effort", "format", "task_budget"];
 /// - mapped fields are translated to their Chat Completions equivalent;
 /// - [`UNREPRESENTABLE_FIELDS`] reject the request with an error message, because the proxy would otherwise fabricate
 ///   their effect in the translated response;
-/// - [`DROPPED_FIELDS`] are removed with a warning;
+/// - [`UNMAPPABLE_FIELDS`] reject when they carry a value;
 /// - everything else is forwarded untouched, and the backend validates it.
 ///
 /// A translated field always wins over a forwarded client key of the same
 /// name. Returns the transformed JSON bytes, or an error message.
+#[expect(clippy::too_many_lines, reason = "linear request field extraction and mapping")]
 pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
+    validate_faithful_request(&body)?;
     reject_unrepresentable_fields(&mut body)?;
-    drop_unsupported_fields(&mut body);
+    remove_null_unmappable_fields(&mut body);
 
     // Take every mapped field up front, in one place. Each becomes an owned
     // local that is moved into the helper emitting it.
@@ -111,6 +110,259 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))
 }
 
+/// Reject request data the translator would discard or change meaning.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential validation of the translated request shape"
+)]
+fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
+    for field in UNMAPPABLE_FIELDS {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!("`{field}` cannot be translated to Chat Completions"));
+        }
+    }
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::String(_) | Value::Null => {},
+            Value::Array(blocks) if blocks.iter().all(text_block_is_supported) => {},
+            _ => return Err("`system` must be a string or array of text blocks".to_owned()),
+        }
+    }
+    if body.get("stream").and_then(Value::as_bool) != Some(true)
+        && body.get("stream_options").is_some_and(|value| !value.is_null())
+    {
+        return Err("`stream_options` requires `stream: true`".to_owned());
+    }
+    if let Some(options) = body.get("stream_options").filter(|value| !value.is_null()) {
+        let options = options.as_object().ok_or("`stream_options` must be an object")?;
+        if options
+            .get("include_usage")
+            .is_some_and(|value| !value.is_boolean() && !value.is_null())
+        {
+            return Err("`stream_options.include_usage` must be a boolean".to_owned());
+        }
+    }
+    if let Some(metadata) = body.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = metadata.as_object().ok_or("`metadata` must be an object")?;
+        if metadata.keys().any(|key| key != "user_id")
+            || metadata
+                .get("user_id")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err("unsupported Anthropic `metadata` for Chat Completions translation".to_owned());
+        }
+    }
+    if let Some(messages) = body.get("messages") {
+        let messages = messages.as_array().ok_or("`messages` must be an array")?;
+        for message in messages {
+            if !has_only_keys(message, &["role", "content"]) {
+                return Err("unsupported Anthropic message field for Chat Completions translation".to_owned());
+            }
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or("message is missing a string `role`")?;
+            // Claude Code can put a text-only system message in this array.
+            // Chat Completions represents it directly; the backend owns ordering.
+            if !matches!(role, "system" | "user" | "assistant") {
+                return Err(format!("unsupported Anthropic message role `{role}`"));
+            }
+            match message.get("content") {
+                Some(Value::String(_)) => {},
+                Some(Value::Array(blocks)) => validate_content_blocks(blocks, role)?,
+                _ => return Err("message `content` must be a string or array".to_owned()),
+            }
+        }
+    }
+    if let Some(tools) = body.get("tools").filter(|tools| !tools.is_null()) {
+        let tools = tools.as_array().ok_or("`tools` must be an array")?;
+        for tool in tools {
+            let tool = tool.as_object().ok_or("tool must be an object")?;
+            let supported_type = match tool.get("type") {
+                None => true,
+                Some(Value::String(kind)) => kind == "custom",
+                _ => false,
+            };
+            if !supported_type {
+                return Err("typed Anthropic tools cannot be translated to Chat Completions".to_owned());
+            }
+            if !tool.get("name").is_some_and(Value::is_string) {
+                return Err("tool requires a string `name`".to_owned());
+            }
+            if !tool.get("input_schema").is_some_and(Value::is_object) {
+                return Err("tool requires an `input_schema` object".to_owned());
+            }
+            if tool.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type" | "name" | "description" | "input_schema" | "strict"
+                )
+            }) || tool
+                .get("description")
+                .is_some_and(|value| !value.is_string() && !value.is_null())
+                || tool
+                    .get("strict")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
+            {
+                return Err("unsupported Anthropic tool field for Chat Completions translation".to_owned());
+            }
+        }
+    }
+    if body
+        .get("output_config")
+        .is_some_and(|config| !config.is_null() && !config.is_object())
+    {
+        return Err("`output_config` must be an object".to_owned());
+    }
+    if let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) {
+        let valid = match choice {
+            Value::String(kind) => matches!(kind.as_str(), "auto" | "any" | "none"),
+            Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+                Some("auto" | "any" | "none") => choice
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "disable_parallel_tool_use")),
+                Some("tool") => {
+                    choice.get("name").is_some_and(Value::is_string)
+                        && choice
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "type" | "name" | "disable_parallel_tool_use"))
+                },
+                _ => false,
+            },
+            _ => false,
+        };
+        let valid_parallel = choice
+            .get("disable_parallel_tool_use")
+            .is_none_or(|value| value.is_boolean() || value.is_null());
+        let needs_tools = matches!(
+            choice.get("type").and_then(Value::as_str).or_else(|| choice.as_str()),
+            Some("any" | "tool")
+        );
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !valid || !valid_parallel || (needs_tools && !has_tools) {
+            return Err("unsupported Anthropic `tool_choice` for Chat Completions translation".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Validate content before lowering so the backend cannot accept a truncated request.
+#[expect(clippy::too_many_lines, reason = "one validation arm per supported content block")]
+fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") if text_block_is_supported(block) => {},
+            Some("image") if role == "user" && !has_tool_use => {
+                let source = block.get("source").ok_or("image block is missing `source`")?;
+                if !image_source_is_supported(source)
+                    || !has_only_keys(block, &["type", "source", "cache_control"])
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("image block has an unsupported `source`".to_owned());
+                }
+            },
+            Some("tool_use") if role == "assistant" => {
+                // The converter serializes any present JSON input as arguments;
+                // an absent input retains its established empty-object default.
+                if !block.get("id").is_some_and(Value::is_string)
+                    || !block.get("name").is_some_and(Value::is_string)
+                    || !has_only_keys(
+                        block,
+                        &["type", "id", "name", "input", "caller", "toolset_name", "cache_control"],
+                    )
+                    || !block.get("caller").is_none_or(direct_caller_is_supported)
+                    || !null_or_absent(block, "toolset_name")
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("tool_use block requires string `id` and `name`".to_owned());
+                }
+            },
+            Some("tool_result") if role == "user" => {
+                let text_content = match block.get("content") {
+                    None | Some(Value::String(_)) => true,
+                    Some(Value::Array(parts)) => parts.iter().all(text_block_is_supported),
+                    _ => false,
+                };
+                if !block.get("tool_use_id").is_some_and(Value::is_string)
+                    || !text_content
+                    || block.get("is_error") == Some(&Value::Bool(true))
+                    || block
+                        .get("is_error")
+                        .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                    || !has_only_keys(
+                        block,
+                        &[
+                            "type",
+                            "tool_use_id",
+                            "content",
+                            "is_error",
+                            "toolset_name",
+                            "cache_control",
+                        ],
+                    )
+                    || !null_or_absent(block, "toolset_name")
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("tool_result requires string `tool_use_id` and text `content`".to_owned());
+                }
+            },
+            Some(kind) => return Err(format!("unsupported Anthropic content block `{kind}`")),
+            None => return Err("Anthropic content block requires a string `type`".to_owned()),
+        }
+    }
+    Ok(())
+}
+
+/// Check that a JSON object contains only fields the translator understands.
+fn has_only_keys(value: &Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|fields| fields.keys().all(|key| keys.contains(&key.as_str())))
+}
+
+/// Null or empty citations carry no source information to preserve.
+fn text_block_is_supported(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block.get("text").is_some_and(Value::is_string)
+        && block
+            .get("citations")
+            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
+        && null_or_absent(block, "cache_control")
+        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
+}
+
+/// Nullable request metadata has no effect when absent or null.
+fn null_or_absent(value: &Value, key: &str) -> bool {
+    value.get(key).is_none_or(Value::is_null)
+}
+
+/// A direct caller is the only caller form this translator emits and consumes.
+fn direct_caller_is_supported(caller: &Value) -> bool {
+    caller.is_null()
+        || caller
+            .as_object()
+            .is_some_and(|fields| fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("direct"))
+}
+
+/// Check the fields used by `convert_image_source` without copying image data.
+fn image_source_is_supported(source: &Value) -> bool {
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            source.get("media_type").is_some_and(Value::is_string)
+                && source.get("data").is_some_and(Value::is_string)
+                && has_only_keys(source, &["type", "media_type", "data"])
+        },
+        Some("url") => source.get("url").is_some_and(Value::is_string) && has_only_keys(source, &["type", "url"]),
+        _ => false,
+    }
+}
+
 /// Forward every field the translation did not consume, leaving its
 /// validation to the backend. A translated key always wins over a colliding
 /// client key.
@@ -120,12 +372,10 @@ fn forward_unmapped_fields(chat: &mut Map<String, Value>, body: Map<String, Valu
     }
 }
 
-/// Remove every [`DROPPED_FIELDS`] entry, warning for each one that carried a value.
-fn drop_unsupported_fields(body: &mut Map<String, Value>) {
-    for field in DROPPED_FIELDS {
-        if body.remove(field).is_some_and(|value| !value.is_null()) {
-            warn!(field, "dropping Anthropic field with no Chat Completions equivalent");
-        }
+/// Remove null-only unmappable fields after validation treats them as absent.
+fn remove_null_unmappable_fields(body: &mut Map<String, Value>) {
+    for field in UNMAPPABLE_FIELDS {
+        body.remove(field);
     }
 }
 
@@ -971,6 +1221,129 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "enumerates semantic loss cases at one boundary")]
+    fn strict_translation_rejects_semantic_losses() {
+        for (request, field) in [
+            (json!({"thinking": {"type": "enabled"}}), "thinking"),
+            (json!({"context_management": {"edits": []}}), "context_management"),
+            (json!({"system": 42}), "system"),
+            (json!({"messages": [{"role": "user", "content": 42}]}), "content"),
+            (
+                json!({"messages": [{"role": "user", "content": [{"type": "unknown"}]}]}),
+                "unknown",
+            ),
+            (
+                json!({"messages": [{"role": "assistant", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/i.png"}},
+                    {"type": "tool_use", "id": "c1", "name": "f", "input": {}}
+                ]}]}),
+                "image",
+            ),
+            (
+                json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+                "typed",
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]}]}),
+                "text",
+            ),
+            (json!({"output_config": 42}), "output_config"),
+            (
+                json!({"stream": true, "stream_options": "include_usage"}),
+                "stream_options",
+            ),
+        ] {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(request.as_object().unwrap().clone());
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn strict_translation_accepts_generated_history_and_text_tool_results() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Hello", "citations": null, "cache_control": null},
+                    {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}, "caller": {"type": "direct"}, "toolset_name": null}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "toolset_name": null, "content": [
+                        {"type": "text", "text": "Sunny", "citations": null}
+                    ]}
+                ]}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["content"], "Hello");
+        assert_eq!(translated["messages"][0]["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(translated["messages"][1]["content"], "Sunny");
+    }
+
+    #[test]
+    fn strict_translation_accepts_empty_citations_in_history() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Hi", "citations": []}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hello", "citations": []}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [
+                    {"type": "text", "text": "Sunny", "citations": []}
+                ]}]}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["content"], "Hi");
+        assert_eq!(translated["messages"][1]["content"], "Hello");
+        assert_eq!(translated["messages"][2]["content"], "Sunny");
+    }
+
+    #[test]
+    fn strict_translation_preserves_system_message_in_history() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "Be concise"}]},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be concise"})
+        );
+        assert_eq!(translated["messages"][1], json!({"role": "user", "content": "Hi"}));
+    }
+
+    #[test]
+    fn strict_translation_treats_omitted_tool_result_content_as_empty() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1"}
+            ]}]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["role"], "tool");
+        assert_eq!(translated["messages"][0]["content"], "");
+    }
+
+    #[test]
+    fn strict_translation_rejects_nonempty_citations_and_indirect_caller() {
+        for block in [
+            json!({"type": "text", "text": "Hello", "citations": [{"url": "https://example.test"}]}),
+            json!({"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}, "caller": {"type": "server"}}),
+        ] {
+            let body = json!({"model": "m", "messages": [{"role": "assistant", "content": [block]}]});
+            assert!(transform_request(body).is_err());
+        }
+    }
+
+    #[test]
     fn basic_text_request() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#;
         let result = transform_bytes(body).unwrap();
@@ -1038,32 +1411,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_definition_with_non_string_name_falls_back_to_empty() {
+    fn tool_definition_with_non_string_name_is_rejected() {
         let body = br#"{"model":"m","tools":[{"name":42,"description":true,"input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["tools"][0]["function"]["name"], "",
-            "non-string name yields empty"
-        );
-        assert_eq!(
-            parsed["tools"][0]["function"]["description"], "",
-            "non-string description yields empty"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("string `name`"), "{error}");
     }
 
     #[test]
-    fn stream_options_dropped_when_streaming_disabled() {
+    fn stream_options_without_streaming_are_rejected() {
         let body = br#"{"model":"m","stream":false,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["stream"], false);
-        assert!(
-            parsed.get("stream_options").is_none(),
-            "stream_options is meaningless without streaming"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`stream_options` requires"), "{error}");
     }
 
     #[test]
@@ -1136,142 +1494,63 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_marked_in_tool_message_content() {
+    fn tool_result_error_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"cat: missing.txt: No such file or directory","is_error":true}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory",
-            "OpenAI-compatible tool messages should preserve Anthropic error semantics"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_image_promoted_to_followup_user_message() {
+    fn tool_result_image_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "tool", "first message is tool result");
-        assert_eq!(parsed["messages"][0]["content"], "chart", "tool text content");
-        assert_eq!(
-            parsed["messages"][1]["role"], "user",
-            "image should be promoted to user message"
-        );
-        assert_eq!(
-            parsed["messages"][1]["content"][0]["type"], "image_url",
-            "promoted image content type"
-        );
-        assert_eq!(
-            parsed["messages"][1]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
-            "promoted image URL"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn top_level_search_result_preserved_as_text_context() {
+    fn top_level_search_result_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","source":"https://docs.example.test/product","title":"Product Guide","content":[{"type":"text","text":"The default timeout is 30 seconds."},{"type":"text","text":"The maximum timeout is 120 seconds."}]},{"type":"text","text":"What is the timeout range?"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(
-            content[0]["text"],
-            "Search result: \"Product Guide\"\nSource: \"https://docs.example.test/product\"\nContent:\nThe default timeout is 30 seconds.\nThe maximum timeout is 120 seconds.",
-            "search result metadata and text should remain visible to the backend"
-        );
-        assert_eq!(
-            content[1]["text"], "What is the timeout range?",
-            "following user text should remain a separate content part"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_search_result_preserved_in_tool_message_content() {
+    fn tool_result_search_result_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://timeouts","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."}]},{"type":"text","text":"Applies to version 2."}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "tool");
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Search result: \"Timeout KB\"\nSource: \"kb://timeouts\"\nContent:\nTimeouts default to 30 seconds.\nApplies to version 2.",
-            "tool result search_result content should not be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_document_preserved_in_tool_message_content() {
+    fn tool_result_document_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"Before document."},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document fact."}]},"title":"Nested Doc"},{"type":"text","text":"After document."}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Before document.\nDocument: \"Nested Doc\"\nContent:\nNested document fact.\nAfter document.",
-            "tool result document content should be flattened in order with surrounding text"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn document_text_source_preserved_as_text_context() {
+    fn document_text_source_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"The grass is green. The sky is blue."},"title":"Color Notes","context":"trusted notes","citations":{"enabled":true}},{"type":"text","text":"What color is the grass?"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"],
-            "Document: \"Color Notes\"\nContext: \"trusted notes\"\nContent:\nThe grass is green. The sky is blue.",
-            "plain text document contents should remain visible to the backend"
-        );
-        assert_eq!(content[1]["text"], "What color is the grass?");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn document_file_source_preserved_as_reference_text() {
+    fn document_file_source_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_abc123"},"title":"Uploaded Contract"},{"type":"text","text":"Summarize the uploaded contract."}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"], "Document: \"Uploaded Contract\"\nSource: \"file:file_abc123\"",
-            "file-backed documents should remain visible as references instead of disappearing"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn document_source_variants_preserved_or_dropped_intentionally() {
+    fn document_source_variants_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Content block fact."}]},"title":"Content Doc"},{"type":"document","source":{"type":"url","url":"https://docs.example.test/file.pdf"}},{"type":"document","source":{"type":"base64","media_type":"application/pdf"}},{"type":"document","source":{"type":"unknown","data":"ignored"}}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"], "Document: \"Content Doc\"\nContent:\nContent block fact.",
-            "content document source should flatten nested text blocks"
-        );
-        assert_eq!(
-            content[1]["text"], "Document\nSource: \"https://docs.example.test/file.pdf\"",
-            "URL document source should be preserved as a quoted reference"
-        );
-        assert_eq!(
-            content[2]["text"], "Document\nSource: \"base64:application/pdf\"",
-            "base64 document source should be preserved as a quoted media reference"
-        );
-        assert_eq!(
-            content.len(),
-            3,
-            "unknown document source without metadata should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn search_result_metadata_values_are_quoted() {
+    fn search_result_metadata_is_rejected() {
         let body = json!({
             "model": "claude-opus-4-8",
             "max_tokens": 1024,
@@ -1286,18 +1565,12 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_bytes(body.as_bytes()).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Search result: \"Title\\nSource: forged\"\nSource: \"https://docs.example.test/a\\nContext: forged\"\nContent:\nReal search text.",
-            "quoted search metadata should not create forged label lines"
-        );
+        let error = transform_bytes(body.as_bytes()).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
-    fn document_metadata_values_are_quoted() {
+    fn document_metadata_is_rejected() {
         let body = json!({
             "model": "claude-opus-4-8",
             "max_tokens": 1024,
@@ -1312,26 +1585,15 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_bytes(body.as_bytes()).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Document: \"Doc\\nContext: forged\"\nContext: \"safe\\nSource: forged\"\nContent:\nReal document text.",
-            "quoted document metadata should not create forged label lines"
-        );
+        let error = transform_bytes(body.as_bytes()).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn empty_search_result_and_document_blocks_dropped() {
+    fn empty_search_result_and_document_blocks_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","content":[]},{"type":"document","source":{"type":"content","content":[]}},{"type":"document","source":{"type":"text","data":""}},{"type":"document","source":{"type":"url","url":""}},{"type":"document","source":{"type":"file","file_id":""}},{"type":"document","source":{"type":"base64","media_type":""}}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "empty metadata-only blocks should not fabricate prompt text"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
@@ -1346,7 +1608,7 @@ mod tests {
 
     #[test]
     fn tool_choice_any_mapped() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","input_schema":{"type":"object"}}],"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1363,16 +1625,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_dropped_when_all_tools_filtered() {
+    fn tool_choice_with_untranslatable_tools_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(parsed.get("tools").is_none(), "server-side tools should be filtered");
-        assert!(
-            parsed.get("tool_choice").is_none(),
-            "tool_choice without translated tools should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("typed"), "{error}");
     }
 
     #[test]
@@ -1399,7 +1655,7 @@ mod tests {
 
     #[test]
     fn tool_definition_strict_mapped() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true},{"name":"get_time","description":"Get time","input_schema":{"type":"object"},"strict":false},{"name":"get_news","description":"Get news","input_schema":{"type":"object"},"strict":"yes"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true},{"name":"get_time","description":"Get time","input_schema":{"type":"object"},"strict":false}],"messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1410,10 +1666,6 @@ mod tests {
         assert_eq!(
             parsed["tools"][1]["function"]["strict"], false,
             "Anthropic strict false should remain false"
-        );
-        assert!(
-            parsed["tools"][2]["function"].get("strict").is_none(),
-            "non-boolean strict values should be omitted"
         );
     }
 
@@ -1641,17 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn client_default_fields_are_dropped_not_forwarded() {
+    fn non_null_unmappable_fields_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        for field in ["thinking", "context_management"] {
-            assert!(
-                parsed.get(field).is_none(),
-                "`{field}` has no Chat Completions equivalent"
-            );
-        }
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
@@ -1703,18 +1948,11 @@ mod tests {
     }
 
     #[test]
-    fn hoist_system_non_string_non_array_skipped() {
+    fn non_string_system_is_rejected() {
         let body =
             br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":42,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"].as_array().unwrap().len(),
-            1,
-            "non-string/non-array system should be skipped"
-        );
-        assert_eq!(parsed["messages"][0]["role"], "user");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`system`"), "{error}");
     }
 
     #[test]
@@ -1732,52 +1970,31 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_missing_role_skipped() {
+    fn message_missing_role_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "message without role should be skipped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("role"), "{error}");
     }
 
     #[test]
-    fn convert_messages_content_not_string_or_array() {
+    fn message_non_text_content_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":42}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "user");
-        assert_eq!(
-            parsed["messages"][0]["content"], "",
-            "non-string/non-array content should become empty string"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("content"), "{error}");
     }
 
     #[test]
-    fn thinking_block_dropped() {
+    fn thinking_block_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "thinking blocks should be dropped entirely"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
-    fn unknown_block_type_dropped() {
+    fn unknown_block_type_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"custom_xyz","data":"something"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "unknown block types should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("custom_xyz"), "{error}");
     }
 
     #[test]
@@ -1790,12 +2007,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_string_unknown_maps_to_auto() {
+    fn unknown_string_tool_choice_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"foo","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["tool_choice"], "auto", "unknown string tool_choice maps to auto");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
@@ -1824,27 +2039,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_object_tool_without_name_maps_to_auto() {
+    fn tool_choice_without_name_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["tool_choice"], "auto",
-            "tool without name should fallback to auto"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
-    fn tool_choice_non_string_non_object_skipped() {
+    fn non_string_tool_choice_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":true,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed.get("tool_choice").is_none(),
-            "non-string/non-object tool_choice should be skipped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
@@ -1907,16 +2112,10 @@ mod tests {
     }
 
     #[test]
-    fn assistant_tool_calls_drop_image_parts() {
-        // The joined-string branch cannot carry an image part, so it is dropped
-        // while the surrounding text is still joined.
+    fn assistant_tool_calls_with_image_are_rejected() {
         let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"url","url":"https://example.com/i.png"}},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
-        let parsed: Value = serde_json::from_slice(&transform_bytes(body).unwrap()).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"], "onetwo",
-            "text joins across the dropped image"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("image"), "{error}");
     }
 
     #[test]
@@ -1987,15 +2186,10 @@ mod tests {
     }
 
     #[test]
-    fn only_client_tools_converted() {
+    fn server_tools_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        let tools = parsed["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2, "only untyped and custom client tools should remain");
-        assert_eq!(tools[0]["function"]["name"], "get_weather");
-        assert_eq!(tools[1]["function"]["name"], "get_time");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("typed"), "{error}");
     }
 
     #[test]

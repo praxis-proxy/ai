@@ -20,8 +20,8 @@ pub(crate) mod response;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
-    SubRequestResponseMode, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    SelectedUpstreamBodyOutcome, SubRequestResponseMode, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -91,7 +91,8 @@ pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completi
 /// not report truthfully (`service_tier`, `container`, `inference_geo`,
 /// `mcp_servers`, and Chat Completions fields such as `n` or `logprobs` whose
 /// output the translated response would discard) are rejected with a 400.
-/// `thinking` and `context_management` are dropped with a warning.
+/// Unsupported semantic content is rejected because Chat Completions cannot
+/// represent it faithfully.
 ///
 /// # YAML
 ///
@@ -320,19 +321,23 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             )));
         }
 
-        transform_buffered_response(ctx, body, transform_error);
-        Ok(FilterAction::Continue)
+        Ok(transform_buffered_response(ctx, body, transform_error))
     }
 }
 
 /// Transform a fully buffered response body in place: normalize an error round
 /// into a single Anthropic error, or rewrite a successful Chat Completions body
 /// into the Messages shape and record the mapped finish reason.
-fn transform_buffered_response(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, transform_error: bool) {
+fn transform_buffered_response(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    transform_error: bool,
+) -> FilterAction {
     if transform_error {
         let status = error_status(ctx);
         let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
         transform_error_body(body, status, request_id);
+        FilterAction::Continue
     } else {
         let request_model = ctx
             .filter_metadata
@@ -342,6 +347,12 @@ fn transform_buffered_response(ctx: &mut HttpFilterContext<'_>, body: &mut Optio
         let stop_sequences = client_stop_sequences(ctx);
         if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences) {
             ctx.set_metadata("openai.finish_reason", finish_reason);
+            FilterAction::Continue
+        } else {
+            // Reject the invalid success. If the upstream 200 headers have
+            // already been sent, the proxy aborts the response body instead
+            // of sending a new HTTP 500 error.
+            FilterAction::Reject(Rejection::status(500))
         }
     }
 }
@@ -1342,9 +1353,12 @@ mod tests {
 
         let mut body = Some(Bytes::from_static(b"not json"));
         let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("malformed upstream success must reject with an HTTP error");
+        };
         let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
 
-        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(rejection.status, 500);
         assert_eq!(parsed["type"], "error");
         assert_eq!(parsed["error"]["type"], "api_error");
         assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");

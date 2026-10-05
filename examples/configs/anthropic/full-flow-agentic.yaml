@@ -10,6 +10,8 @@
 #   * a Chat-Completions-only backend (for example a vLLM deployment serving only
 #     `/v1/chat/completions`), reached through the Anthropic <-> Chat Completions
 #     translation filters.
+# The translation path rejects Anthropic features that Chat Completions cannot
+# represent faithfully, such as thinking blocks.
 #
 # The top-level `router` classifies each request and freezes ONE logical cluster
 # for it from the model, so the inference step resolves the same backend on every

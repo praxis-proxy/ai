@@ -76,6 +76,24 @@ fn map_stop_reason(reason: &str) -> &'static str {
     }
 }
 
+/// Reject new Bedrock terminal states until they have an explicit Chat mapping.
+fn validate_stop_reason(reason: &str) -> Result<(), String> {
+    if matches!(
+        reason,
+        "end_turn"
+            | "stop_sequence"
+            | "tool_use"
+            | "max_tokens"
+            | "model_context_window_exceeded"
+            | "content_filtered"
+            | "guardrail_intervened"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported Bedrock stopReason `{reason}`"))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Non-streaming response translation
 // -----------------------------------------------------------------------------
@@ -101,10 +119,12 @@ pub(crate) fn transform_response(body: &[u8], model: &str, id: &str) -> Result<V
     let (content, tool_calls) = extract_message_content(message)?;
 
     // --- Finish reason ---
-    let finish_reason = obj
+    let stop_reason = obj
         .get("stopReason")
         .and_then(Value::as_str)
-        .map_or("stop", map_stop_reason);
+        .ok_or("missing string `stopReason`")?;
+    validate_stop_reason(stop_reason)?;
+    let finish_reason = map_stop_reason(stop_reason);
 
     // --- Usage ---
     let usage = extract_usage(obj.get("usage"));
@@ -444,6 +464,7 @@ fn translate_message_stop(
         .get("stopReason")
         .and_then(Value::as_str)
         .ok_or("messageStop payload is missing string `stopReason`")?;
+    validate_stop_reason(stop_reason)?;
     let finish_reason = map_stop_reason(stop_reason);
 
     state.finish_reason = Some(finish_reason.to_owned());
@@ -715,7 +736,6 @@ mod tests {
             ("content_filtered", "content_filter"),
             ("guardrail_intervened", "content_filter"),
             ("model_context_window_exceeded", "length"),
-            ("unknown_future_reason", "stop"),
         ] {
             let bedrock = serde_json::json!({
                 "output": {"message": {"content": [{"text": "hi"}]}},
@@ -729,6 +749,12 @@ mod tests {
                 "stopReason={bedrock_reason}"
             );
         }
+        let body = serde_json::json!({
+            "output": {"message": {"content": [{"text": "hi"}]}},
+            "stopReason": "unknown_future_reason"
+        });
+        let error = transform_response(body.to_string().as_bytes(), MODEL, ID).unwrap_err();
+        assert!(error.contains("unknown_future_reason"), "{error}");
     }
 
     #[test]
