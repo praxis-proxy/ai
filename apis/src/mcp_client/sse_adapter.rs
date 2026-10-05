@@ -234,6 +234,7 @@ struct RawSseEventWindow {
 
 impl RawSseEventWindow {
     /// Count completed frames while advancing the borrowed raw event window.
+    #[expect(clippy::too_many_lines, reason = "scans SSE line and frame boundaries in one pass")]
     fn observe(&mut self, chunk: &[u8]) -> usize {
         let mut completed = 0_usize;
         let mut line_was_buffered = self.unfinished_line_bytes != 0;
@@ -766,8 +767,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks queue, line, and later result in one stream"
+    )]
     async fn prior_queue_and_cleared_comment_line_remain_charged_before_later_result() {
-        // Ten batches leave 2,000 parsed ID-only events and a reusable
+        // Ten batches process 2,000 ID-only events and leave a reusable
         // VecDeque allocation. The fragmented comment leaves a large cleared
         // unfinished-line Vec. Both allocations still exist when the result
         // chunk reaches the byte layer.
@@ -848,7 +853,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 1_024, Arc::clone(&signal).into(), Some(1_024));
+        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 1_024, Arc::clone(&signal).into(), Some(2_048));
         assert_eq!(
             stream
                 .next()

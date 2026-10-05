@@ -92,6 +92,12 @@ fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
     reason = "one lexical pass counts numeric expansion and JSON nodes"
 )]
 pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
+    // Two wire-like owners may coexist: the transport body and SSE `data` or
+    // serde's string allocation. rmcp's untagged JSON-RPC deserializer can
+    // hold intermediate Value trees alongside the final one. With serde_json's
+    // preserve_order maps, dense arrays of small nested objects need more than
+    // 128 bytes per structural token before those intermediates are dropped.
+    const NODE_PEAK_BYTES: usize = 512;
     let mut normalized = raw.len();
     let mut nodes = 1_usize;
     let mut index = 0;
@@ -132,12 +138,6 @@ pub(super) fn json_preparse_peak_bytes(raw: &[u8]) -> Option<usize> {
         }
         index += 1;
     }
-    // Two wire-like owners may coexist: the transport body and SSE `data` or
-    // serde's string allocation. rmcp's untagged JSON-RPC deserializer can
-    // hold intermediate Value trees alongside the final one. With serde_json's
-    // preserve_order maps, dense arrays of small nested objects need more than
-    // 128 bytes per structural token before those intermediates are dropped.
-    const NODE_PEAK_BYTES: usize = 512;
     raw.len()
         .checked_mul(2)?
         .checked_add(normalized)?
@@ -2036,7 +2036,8 @@ mod tests {
             body.push_str("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n");
         }
         body.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
-        let cap = body.len() + 4_096;
+        // Leave room for one previous and one current parsed JSON-RPC event.
+        let cap = body.len() + 10_000;
         let message = parse_buffered_sse_terminal(body.as_bytes(), Some(cap), &test_signal())
             .unwrap()
             .expect("terminal response");
