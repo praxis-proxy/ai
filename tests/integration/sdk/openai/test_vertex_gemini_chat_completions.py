@@ -507,7 +507,18 @@ class TestVertexGeminiChatCompletions:
             openai_client.chat.completions.create(
                 model="gemini-2.0-flash",
                 messages=[
-                    {"role": "user", "content": [{"type": "image_url", "image_url": {}}]}
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/image.png",
+                                    "detail": "high",
+                                },
+                            }
+                        ],
+                    }
                 ],
             )
         assert exc_info.value.status_code == 400

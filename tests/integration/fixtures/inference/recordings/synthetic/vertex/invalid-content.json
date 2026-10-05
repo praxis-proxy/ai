@@ -34,7 +34,10 @@
                   "content": [
                     {
                       "type": "image_url",
-                      "image_url": {}
+                      "image_url": {
+                        "url": "https://example.com/image.png",
+                        "detail": "high"
+                      }
                     }
                   ]
                 }
@@ -53,7 +56,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "image_url part requires a supported URL",
+                "message": "image_url detail cannot be translated to Vertex Gemini",
                 "type": "invalid_request_error",
                 "param": null,
                 "code": "invalid_request_error"

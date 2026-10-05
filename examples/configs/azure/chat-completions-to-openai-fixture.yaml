@@ -1,7 +1,9 @@
 # Azure OpenAI to Chat Completions local replay fixture
 #
-# Proxies standard Chat Completions requests to an Azure OpenAI
-# deployment. The `openai_chat_completions_to_azureai_chat_completions` filter injects the
+# Proxies Chat Completions requests to a local Azure replay backend at
+# 127.0.0.1:3000.
+#
+# The `openai_chat_completions_to_azureai_chat_completions` filter injects the
 # required `api-version` query parameter, strips the `model` field
 # from the body (Azure uses the deployment name from the URL), and
 # normalizes Azure-specific response fields.

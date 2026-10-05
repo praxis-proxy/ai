@@ -348,11 +348,12 @@ filter_chains:
 
 The `anthropic_messages_to_chat_completions` filter:
 - Hoists `system` to an OpenAI system message
-- Flattens content blocks (text, image, tool_use,
-  tool_result, document, search_result)
-- Marks `tool_result.is_error` in translated tool
-  message text because Chat Completions has no
-  equivalent tool-result error flag
+- Translates text, user image, assistant `tool_use`,
+  and text-only user `tool_result` blocks; rejects
+  `document`, `search_result`, and other blocks that
+  Chat Completions cannot represent
+- Rejects `tool_result.is_error: true` because Chat
+  Completions has no equivalent tool-result error flag
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Reports a matched stop sequence as `stop_reason:
@@ -377,12 +378,12 @@ The `anthropic_messages_to_chat_completions` filter:
   `functions`, `function_call`, `web_search_options`,
   `moderation`); a `null` or the field's documented
   default (for example `n: 1`) is dropped instead
-- Drops `thinking` and `context_management` with a log
-  warning; Claude Code sends both on every request and
-  Chat Completions has no equivalent
+- Rejects non-null `thinking` and `context_management`
+  because Chat Completions has no equivalent
 - Forwards every other field untouched (for example
   `top_k`) and leaves its validation to the backend
-- Drops `thinking` content blocks with a log warning
+- Rejects `thinking` content blocks and content blocks
+  carrying non-empty citations or prompt-cache controls
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and
@@ -392,6 +393,11 @@ The `anthropic_messages_to_chat_completions` filter:
   response bodies
 - Preserves original `finish_reason` in filter
   metadata as `openai.finish_reason`
+
+If an upstream success response cannot be translated, the filter rejects it.
+This can return an HTTP 500 before response headers are sent. Once the
+upstream success headers have been sent, the proxy aborts the response body;
+the client may observe a connection error or an incomplete HTTP 200 response.
 
 Add `anthropic_messages_to_chat_completions_stream` with a `text/event-stream`
 response condition when the backend may return streaming

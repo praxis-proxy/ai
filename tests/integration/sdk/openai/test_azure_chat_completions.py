@@ -359,10 +359,17 @@ class TestAzureChatCompletionsSdk:
             model="gpt-4o",
             messages=[{"role": "user", "content": "hi"}],
         ) as stream:
-            list(stream)
+            events = list(stream)
             completion = stream.get_final_completion()
 
         assert completion.choices[0].message.content == "Hi"
+        metadata_chunk = next(
+            event.chunk
+            for event in events
+            if event.type == "chunk" and event.chunk.choices == []
+        )
+        assert metadata_chunk.service_tier == "default"
+        assert metadata_chunk.model_extra["provider_data"] == {"source": "azure"}
 
     def test_error(self, openai_client: OpenAI) -> None:
         _STATE.script(404, "application/json", json.dumps(AZURE_ERROR))

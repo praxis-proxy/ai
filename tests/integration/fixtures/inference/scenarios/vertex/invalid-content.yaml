@@ -23,7 +23,9 @@ turns:
             - role: user
               content:
                 - type: image_url
-                  image_url: {}
+                  image_url:
+                    url: https://example.com/image.png
+                    detail: high
     expect:
       client_status: 400
       client_body_kind: json
