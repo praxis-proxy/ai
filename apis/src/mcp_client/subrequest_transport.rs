@@ -1184,13 +1184,14 @@ impl McpSubrequestClient {
             // spurious 413 (see collect_capped). Exactly one of the two branches
             // cancels the body.
             if content_type.as_deref().is_some_and(is_json_content_type) {
-                if preparse_peak_limit.is_some() && !body.try_cap_chunk_bytes(self.control_response_bytes) {
+                let error_wire_cap = buffered_preparse_wire_cap(self.control_response_bytes, preparse_peak_limit);
+                if preparse_peak_limit.is_some() && !body.try_cap_chunk_bytes(error_wire_cap) {
                     body.cancel().await;
                     return Err(StreamableHttpError::UnexpectedServerResponse(
                         format!("HTTP {status}").into(),
                     ));
                 }
-                if let Some(bytes) = collect_capped(&mut body, self.control_response_bytes).await
+                if let Some(bytes) = collect_capped(&mut body, error_wire_cap, preparse_peak_limit).await
                     && json_preparse_fits(&bytes, preparse_peak_limit)
                     && let Ok(text) = std::str::from_utf8(&bytes)
                     && let Some(message) = parse_json_rpc_error(text)
@@ -1578,14 +1579,7 @@ async fn collect_body(
                     // BytesMut may replace its backing allocation when it grows.
                     // Keep the incoming chunk, old capacity, and at most twice
                     // the new logical length inside the parse allowance.
-                    let growth_peak = next_len.and_then(|next| {
-                        let live = buf.capacity().checked_add(chunk.len())?;
-                        if next > buf.capacity() {
-                            live.checked_add(next.checked_mul(2)?.max(8))
-                        } else {
-                            Some(live)
-                        }
-                    });
+                    let growth_peak = buffered_append_peak(&buf, chunk.len());
                     if growth_peak.is_none_or(|bytes| bytes > limit) {
                         signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
                         body.cancel().await;
@@ -1619,15 +1613,22 @@ async fn collect_body(
 /// Distinct from [`collect_body`] on purpose: on the error path an oversize or
 /// truncated body must NOT surface as a 413. This helper takes no signal handle —
 /// so it structurally cannot record [`TransportSignal::ResponseTooLarge`] — and
-/// returns [`None`] on overflow (`buf.len() > cap`) or a `next_chunk()` error,
+/// returns [`None`] on wire or parse-peak overflow or a `next_chunk()` error,
 /// letting the caller fall back to the true HTTP status. The body is cancelled in
 /// every case; a clean EOF within `cap` returns `Some(bytes)`.
-async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -> Option<Bytes> {
+async fn collect_capped(
+    body: &mut Box<dyn StreamingResponseBody>,
+    cap: usize,
+    preparse_peak_limit: Option<usize>,
+) -> Option<Bytes> {
     let mut buf = bytes::BytesMut::new();
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                if buf.len().checked_add(chunk.len()).is_none_or(|bytes| bytes > cap) {
+                if buf.len().checked_add(chunk.len()).is_none_or(|bytes| bytes > cap)
+                    || preparse_peak_limit
+                        .is_some_and(|limit| buffered_append_peak(&buf, chunk.len()).is_none_or(|bytes| bytes > limit))
+                {
                     body.cancel().await;
                     return None;
                 }
@@ -1642,6 +1643,18 @@ async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -
                 return None;
             },
         }
+    }
+}
+
+/// The incoming chunk and the old buffer may coexist with a replacement
+/// allocation while `BytesMut` grows. Reserve that transient before appending.
+fn buffered_append_peak(buf: &bytes::BytesMut, incoming: usize) -> Option<usize> {
+    let next = buf.len().checked_add(incoming)?;
+    let live = buf.capacity().checked_add(incoming)?;
+    if next > buf.capacity() {
+        live.checked_add(next.checked_mul(2)?.max(8))
+    } else {
+        Some(live)
     }
 }
 
@@ -3089,7 +3102,7 @@ mod tests {
     #[tokio::test]
     async fn collect_capped_returns_bytes_within_cap() {
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"err"), Bytes::from_static(b"or")]);
-        let out = collect_capped(&mut body, 1024).await;
+        let out = collect_capped(&mut body, 1024, None).await;
         assert_eq!(out.as_deref(), Some(b"error".as_ref()));
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
@@ -3103,7 +3116,7 @@ mod tests {
         // caller falls back to the HTTP status rather than a spurious 413. By
         // construction collect_capped takes no signal handle, so it cannot record one.
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]);
-        assert!(collect_capped(&mut body, 6).await.is_none());
+        assert!(collect_capped(&mut body, 6, None).await.is_none());
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "an over-cap error body cancels the body"
@@ -3113,10 +3126,20 @@ mod tests {
     #[tokio::test]
     async fn collect_capped_returns_none_on_transport_error() {
         let (mut body, cancelled) = erroring_body([Bytes::from_static(b"partial")]);
-        assert!(collect_capped(&mut body, 1024).await.is_none());
+        assert!(collect_capped(&mut body, 1024, None).await.is_none());
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "a transport error on the error path cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_capped_rejects_buffer_growth_before_error_body_copy() {
+        let (mut body, cancelled) = fake_body([Bytes::from(vec![b'x'; 65 * 1_024])]);
+        assert!(collect_capped(&mut body, 1_048_576, Some(2_048)).await.is_none());
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "an error body exceeding the parse allowance is cancelled"
         );
     }
 
@@ -3156,6 +3179,39 @@ mod tests {
         assert!(
             client.signal_handle().get().is_none(),
             "an unparseable error body must never record a 413 size signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_post_budgeted_error_withholds_large_chunk_and_keeps_http_status() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let yielded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::counting_chunks(
+            [Bytes::from(vec![b'x'; 65 * 1_024])],
+            Arc::clone(&cancelled),
+            Arc::clone(&yielded),
+        ));
+        let signal = test_signal();
+        let result = client()
+            .classify_streaming_post_response(
+                sub_response(500, Some("application/json"), b""),
+                body,
+                false,
+                1_024,
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                Some(2_048),
+                Arc::clone(&signal),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedServerResponse(message)) if message.contains("HTTP 500")
+        ));
+        assert_eq!(yielded.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            signal.get().is_none(),
+            "an error-body size breach retains its HTTP status"
         );
     }
 

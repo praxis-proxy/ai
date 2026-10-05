@@ -210,6 +210,8 @@ struct ByteState {
     raw_event: RawSseEventWindow,
     /// Conservative charge for every event the parser may queue from one chunk.
     batch_charge: Arc<AtomicUsize>,
+    /// Parsed messages rmcp may still hold after this adapter yields them.
+    yielded_charge: Arc<AtomicUsize>,
     /// `sse-stream` retains its `VecDeque<Sse>` allocation after draining it.
     queued_capacity_charge: usize,
     /// Whether the last tightened chunk cap came from parse headroom.
@@ -327,6 +329,7 @@ pub(super) fn sse_stream_from_body(
         .min(preparse_peak_limit.unwrap_or(usize::MAX));
     let parse_signal = signal.clone();
     let batch_charge = Arc::new(AtomicUsize::new(0));
+    let yielded_charge = Arc::new(AtomicUsize::new(0));
     let state = ByteState {
         body,
         emitted: 0,
@@ -334,6 +337,7 @@ pub(super) fn sse_stream_from_body(
         per_event: SseEventSizeLimiter::new(effective_per_event),
         raw_event: RawSseEventWindow::default(),
         batch_charge: Arc::clone(&batch_charge),
+        yielded_charge: Arc::clone(&yielded_charge),
         queued_capacity_charge: 0,
         parse_chunk_cap: false,
         signal,
@@ -352,6 +356,7 @@ pub(super) fn sse_stream_from_body(
                     .bytes
                     .checked_mul(2)
                     .and_then(|bytes| bytes.checked_add(st.queued_capacity_charge))
+                    .and_then(|bytes| bytes.checked_add(st.yielded_charge.load(Ordering::Relaxed)))
                     .and_then(|bytes| bytes.checked_add(line_capacity?))
                     .map_or(0, |retained| limit.saturating_sub(retained));
                 let operation_headroom = st.operation_cap.saturating_sub(st.emitted);
@@ -412,6 +417,7 @@ pub(super) fn sse_stream_from_body(
                         if raw_window
                             .and_then(|bytes| bytes.checked_mul(if saw_data { 4 } else { 3 }))
                             .and_then(|bytes| bytes.checked_add(queued_preparse_peak))
+                            .and_then(|bytes| bytes.checked_add(st.yielded_charge.load(Ordering::Relaxed)))
                             .and_then(|bytes| bytes.checked_add(parse_line_capacity?))
                             .is_none_or(|bytes| bytes > limit)
                         {
@@ -473,28 +479,36 @@ pub(super) fn sse_stream_from_body(
     SseStream::from_bytes_stream(byte_stream)
         .map(move |event| {
             let frame: Sse = event?;
-            // The raw event and parsed id/event strings can coexist.
-            let metadata_bytes = frame
-                .id
-                .as_ref()
-                .map_or(0, String::len)
-                .checked_add(frame.event.as_ref().map_or(0, String::len))
-                .and_then(|bytes| bytes.checked_mul(2));
-            let parse_fits = preparse_peak_limit.is_none_or(|limit| {
-                metadata_bytes
-                    .and_then(|bytes| bytes.checked_add(batch_charge.load(Ordering::Relaxed)))
+            if let Some(limit) = preparse_peak_limit {
+                // rmcp may queue multiple decoded notifications after they
+                // leave this stream. Their release is unobservable here, so
+                // keep a conservative charge for every yielded frame until
+                // this SSE stream ends. Include the current parser batch while
+                // rmcp materializes the next message.
+                let frame_charge = frame
+                    .id
+                    .as_ref()
+                    .map_or(0, String::len)
+                    .checked_add(frame.event.as_ref().map_or(0, String::len))
+                    .and_then(|bytes| bytes.checked_mul(2))
                     .and_then(|bytes| {
                         frame.data.as_deref().map_or(Some(bytes), |data| {
                             super::subrequest_transport::json_preparse_peak_bytes(data.as_bytes())
                                 .and_then(|peak| bytes.checked_add(peak))
                         })
-                    })
-                    .is_some_and(|bytes| bytes <= limit)
-            });
-            if !parse_fits {
-                let limit = preparse_peak_limit.unwrap_or(0);
-                parse_signal.record(TransportSignal::ResponseTooLarge { limit });
-                return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
+                    });
+                let next_yielded =
+                    frame_charge.and_then(|bytes| bytes.checked_add(yielded_charge.load(Ordering::Relaxed)));
+                if next_yielded
+                    .and_then(|bytes| bytes.checked_add(batch_charge.load(Ordering::Relaxed)))
+                    .is_none_or(|bytes| bytes > limit)
+                {
+                    parse_signal.record(TransportSignal::ResponseTooLarge { limit });
+                    return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
+                }
+                if let Some(bytes) = next_yielded {
+                    yielded_charge.store(bytes, Ordering::Relaxed);
+                }
             }
             Ok(frame)
         })
@@ -537,7 +551,11 @@ impl FakeStreamingBody {
         }
     }
 
-    fn counting_chunks<I>(chunks: I, cancelled: Arc<std::sync::atomic::AtomicBool>, count: Arc<AtomicUsize>) -> Self
+    pub(super) fn counting_chunks<I>(
+        chunks: I,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        count: Arc<AtomicUsize>,
+    ) -> Self
     where
         I: IntoIterator<Item = bytes::Bytes>,
     {
@@ -689,6 +707,34 @@ mod tests {
         assert!(matches!(
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 40_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn yielded_notifications_share_one_parse_allowance() {
+        let json = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"level\":\"info\",\"data\":\"{}\"}}}}",
+            "x".repeat(100_000)
+        );
+        let chunk = Bytes::from(format!("data: {json}\n\n"));
+        let body = Box::new(FakeStreamingBody::from_chunks(vec![chunk; 5], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            body,
+            1_000_000,
+            6_000_000,
+            1_000_000,
+            Arc::clone(&signal).into(),
+            Some(430_000),
+        );
+        assert!(stream.next().await.expect("first notification").is_ok());
+        assert!(
+            stream.next().await.expect("later notification rejected").is_err(),
+            "rmcp may still retain the first decoded notification in its worker queue"
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 430_000 })
         ));
     }
 
