@@ -3861,7 +3861,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
+source = "git+https://github.com/praxis-proxy/praxis?rev=0fd543ce9173ad92631e9940f1bde20af6fda428#0fd543ce9173ad92631e9940f1bde20af6fda428"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3882,7 +3882,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
+source = "git+https://github.com/praxis-proxy/praxis?rev=0fd543ce9173ad92631e9940f1bde20af6fda428#0fd543ce9173ad92631e9940f1bde20af6fda428"
 dependencies = [
  "bytes",
  "chrono",
@@ -3907,7 +3907,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
+source = "git+https://github.com/praxis-proxy/praxis?rev=0fd543ce9173ad92631e9940f1bde20af6fda428#0fd543ce9173ad92631e9940f1bde20af6fda428"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3940,7 +3940,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
+source = "git+https://github.com/praxis-proxy/praxis?rev=0fd543ce9173ad92631e9940f1bde20af6fda428#0fd543ce9173ad92631e9940f1bde20af6fda428"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3968,7 +3968,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.7.3"
-source = "git+https://github.com/praxis-proxy/praxis?rev=17994a9dec680a5c1e6929791e08495e4447a0e5#17994a9dec680a5c1e6929791e08495e4447a0e5"
+source = "git+https://github.com/praxis-proxy/praxis?rev=0fd543ce9173ad92631e9940f1bde20af6fda428#0fd543ce9173ad92631e9940f1bde20af6fda428"
 dependencies = [
  "arc-swap",
  "notify",

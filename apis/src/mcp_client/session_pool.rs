@@ -9,8 +9,8 @@
 //! in one execution can therefore never exchange sessions whose outbound
 //! pipeline, timeout, or forwarded-header policy differs.
 //!
-//! A session's response limit remains immutable. The pool is keyed only by
-//! identity, but checkout accepts the required limit and rejects mismatched
+//! A session's response limits remain immutable. The pool is keyed only by
+//! identity, but checkout accepts the required limits and rejects mismatched
 //! sessions for explicit background closure. This preserves the transport's
 //! fixed response bound without retaining one bucket for every per-round limit.
 //!
@@ -104,14 +104,40 @@ struct IdleTimer {
     parked: Arc<AtomicBool>,
 }
 
+/// Immutable transport limits that a pooled session must exactly match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct McpSessionLimits {
+    /// Decoded tool-result allowance.
+    pub(crate) payload_bytes: usize,
+    /// Wire allowance for initialization and other control exchanges.
+    pub(crate) control_response_bytes: usize,
+    /// Shared raw and parsed tool-response peak, when budgeted.
+    pub(crate) preparse_peak_bytes: Option<usize>,
+}
+
+impl McpSessionLimits {
+    /// Bind all limits baked into a transport at session creation.
+    pub(crate) const fn new(
+        payload_bytes: usize,
+        control_response_bytes: usize,
+        preparse_peak_bytes: Option<usize>,
+    ) -> Self {
+        Self {
+            payload_bytes,
+            control_response_bytes,
+            preparse_peak_bytes,
+        }
+    }
+}
+
 /// A live, initialized MCP session ready for another exclusive `tools/call`.
 pub(crate) struct PooledSession {
     /// Initialized rmcp client worker.
     service: RunningService<RoleClient, ()>,
     /// Replaceable per-call transport classification slot.
     signal_state: Arc<TransportSignalState>,
-    /// Immutable result limit baked into this session's transport.
-    payload_limit: usize,
+    /// Immutable response and parse limits baked into this session's transport.
+    limits: McpSessionLimits,
     /// Instant when the session most recently entered the idle pool.
     last_used: Instant,
     /// Guard that disarms the idle cancellation task when taken or closed.
@@ -124,12 +150,12 @@ impl PooledSession {
     pub(crate) fn new(
         service: RunningService<RoleClient, ()>,
         signal_state: Arc<TransportSignalState>,
-        payload_limit: usize,
+        limits: McpSessionLimits,
     ) -> Self {
         Self {
             service,
             signal_state,
-            payload_limit,
+            limits,
             last_used: Instant::now(),
             idle_timer: None,
         }
@@ -298,7 +324,7 @@ impl McpSessionPool {
 
     /// Take one compatible session and return all unusable entries separately
     /// so the caller can close them outside the synchronous mutex boundary.
-    pub(crate) fn checkout(&self, key: &McpPoolKey, payload_limit: usize) -> PoolCheckout {
+    pub(crate) fn checkout(&self, key: &McpPoolKey, limits: McpSessionLimits) -> PoolCheckout {
         let mut map = self.lock();
         let Some(stack) = map.get_mut(key) else {
             return PoolCheckout {
@@ -314,7 +340,7 @@ impl McpSessionPool {
             let idle_timer_disarmed = candidate.unpark();
             if session.is_none()
                 && idle_timer_disarmed
-                && candidate.payload_limit == payload_limit
+                && candidate.limits == limits
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
             {
@@ -337,7 +363,7 @@ impl McpSessionPool {
         if let Some(existing) = map.get_mut(&key) {
             let mut retained = Vec::with_capacity(existing.len());
             for prior in std::mem::take(existing) {
-                if prior.payload_limit == session.payload_limit {
+                if prior.limits == session.limits {
                     retained.push(prior);
                 } else {
                     rejected.push(prior);

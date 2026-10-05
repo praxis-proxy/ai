@@ -162,17 +162,13 @@ fn admit_json_preparse(
 
 /// Loose executor backstop for a streaming callout (spec §4.5, F3).
 ///
-/// praxis always arms its outer `CalloutStreamingBody` at the `max_response_bytes`
-/// passed to [`McpSubrequestClient::execute_streaming`] and rejects an overflowing
-/// chunk with an opaque `FilterError`, discarding our typed 413. If that ceiling
-/// equalled the adapter's binding cap, praxis would trip *first* and the
-/// transport's own `try_unfold` counter would never record
-/// [`TransportSignal::ResponseTooLarge`]. So the executor ceiling is loosened to
-/// twice the binding adapter cap: the adapter counter (still keyed to the exact
-/// per-message/cumulative cap) trips first for any single chunk up to the full cap
-/// size and yields HTTP 413, while the ceiling stays finite (not `usize::MAX`) so
-/// the `None`-body buffered fallback and the success-`application/json` drain
-/// (`collect_body`/`drain_body`) remain memory-bounded — at 2x the cap.
+/// praxis arms its outer `CalloutStreamingBody` at the `max_response_bytes`
+/// passed to [`McpSubrequestClient::execute_streaming`]. The executor ceiling is
+/// twice the binding adapter cap so the adapter normally enforces its exact
+/// per-message/cumulative limit first. If one chunk exceeds the outer ceiling,
+/// core returns a typed size error and the SSE adapter records the binding cap.
+/// The finite outer ceiling also bounds buffered fallback and streaming JSON
+/// drains (`collect_body`/`drain_body`) at twice the cap.
 fn streaming_executor_backstop(binding_cap: usize) -> usize {
     binding_cap.saturating_mul(2)
 }
@@ -1034,7 +1030,9 @@ impl McpSubrequestClient {
             // can never clamp the authoritative per-event bound below `wire_cap()`.
             max_sse_event_size.max(self.wire_cap()),
             signal,
-            self.control_preparse_limit(),
+            // rmcp may resume a tool POST response through GET after the SSE
+            // connection drops. Preserve the tool reply's parse allowance.
+            self.preparse_peak_limit,
         ))
     }
 
@@ -1247,7 +1245,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             &uri,
             Bytes::new(),
             headers,
-            MAX_CONTROL_RESPONSE_BYTES,
+            self.control_response_bytes,
             &signal,
         ))
         .await?;
@@ -1505,7 +1503,7 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// A `next_chunk()` error also fails closed the same way. On this armed
 /// streaming-JSON drain the body is wrapped at the loosened `2×` executor
 /// backstop specifically so that response *size* is the dominant failure mode:
-/// praxis withholds an oversize chunk as an opaque error, so mapping any
+/// praxis withholds an oversize chunk as an error, so mapping any
 /// `next_chunk()` error to `ResponseTooLarge` keeps the typed 413. Conflating a
 /// rare genuine transport error with a 413 on this path is still fail-closed and
 /// never turns an error into a success. Clean EOF (`Ok(None)`) cancels the body
@@ -1532,7 +1530,7 @@ async fn collect_body(
             },
             Err(_error) => {
                 // The armed streaming body withholds an oversize chunk at the 2x
-                // executor backstop as an opaque error; on this drain size is the
+                // executor backstop as an error; on this drain size is the
                 // dominant failure mode, so any next_chunk error fails closed as a
                 // 413. This never yields a false success and never returns the
                 // partial buffer.
@@ -1789,6 +1787,7 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
 ///
 /// Follows the SSE framing rules the transport needs: `data:` lines within an
 /// event are joined with `\n`, and a blank line terminates the event.
+#[cfg(test)]
 fn sse_data_events(text: &str) -> Vec<String> {
     let mut events = Vec::new();
     let mut data = String::new();
@@ -1819,6 +1818,10 @@ fn sse_data_events(text: &str) -> Vec<String> {
 ///
 /// Returns the first `Response`/`Error` message (the terminal answer for a
 /// request/response exchange), falling back to the last parseable message.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks each SSE event's live parse owners before allocation"
+)]
 fn parse_buffered_sse_terminal(
     body: &[u8],
     preparse_peak_limit: Option<usize>,
@@ -1828,15 +1831,66 @@ fn parse_buffered_sse_terminal(
         return Ok(None);
     };
     let mut last = None;
-    for data in sse_data_events(text) {
-        admit_json_preparse(data.as_bytes(), preparse_peak_limit, signal)?;
-        let Ok(message) = serde_json::from_str::<ServerJsonRpcMessage>(&data) else {
+    let mut last_charge = 0_usize;
+    let mut data = String::new();
+    let mut has_data = false;
+    // Parse one SSE event at a time. The bounded transport body remains live,
+    // so account for it and the prior fallback message before growing data or
+    // allocating a JSON-RPC object.
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if !has_data {
+                continue;
+            }
+            let current = std::mem::take(&mut data);
+            has_data = false;
+            let current_charge = if let Some(limit) = preparse_peak_limit {
+                let peak = json_preparse_peak_bytes(current.as_bytes());
+                if peak
+                    .and_then(|bytes| body.len().checked_add(bytes))
+                    .and_then(|bytes| bytes.checked_add(last_charge))
+                    .is_none_or(|bytes| bytes > limit)
+                {
+                    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                    return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+                }
+                peak.unwrap_or(usize::MAX)
+            } else {
+                0
+            };
+            let Ok(message) = serde_json::from_str::<ServerJsonRpcMessage>(&current) else {
+                continue;
+            };
+            if matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) {
+                return Ok(Some(message));
+            }
+            last_charge = current_charge;
+            last = Some(message);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("data:") else {
             continue;
         };
-        if matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) {
-            return Ok(Some(message));
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        let next_len = data
+            .len()
+            .checked_add(usize::from(has_data))
+            .and_then(|bytes| bytes.checked_add(rest.len()));
+        if let Some(limit) = preparse_peak_limit
+            && next_len
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add(body.len()))
+                .and_then(|bytes| bytes.checked_add(last_charge))
+                .is_none_or(|bytes| bytes > limit)
+        {
+            signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+            return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
         }
-        last = Some(message);
+        if has_data {
+            data.push('\n');
+        }
+        data.push_str(rest);
+        has_data = true;
     }
     Ok(last)
 }
@@ -1970,6 +2024,24 @@ mod tests {
             .unwrap()
             .expect("terminal response");
         assert!(matches!(message, JsonRpcMessage::Response(_)));
+    }
+
+    #[test]
+    fn buffered_sse_parses_many_events_with_one_event_copy_at_a_time() {
+        let mut body = String::new();
+        for _ in 0..256 {
+            body.push_str("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n");
+        }
+        body.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+        let cap = body.len() + 4_096;
+        let message = parse_buffered_sse_terminal(body.as_bytes(), Some(cap), &test_signal())
+            .unwrap()
+            .expect("terminal response");
+        assert!(matches!(message, JsonRpcMessage::Response(_)));
+        assert!(
+            body.len() * 2 > cap,
+            "copying every data event would exceed this allowance"
+        );
     }
 
     #[test]
@@ -2923,6 +2995,36 @@ mod tests {
         let mut stream = stream;
         let first = futures::StreamExt::next(&mut stream).await.expect("event").expect("ok");
         assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
+    }
+
+    #[tokio::test]
+    async fn get_stream_uses_tool_parse_allowance_on_reconnect() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1_024,
+            1_024,
+            Some(2_048),
+            None,
+        );
+        let numbers = vec!["1e15"; 140].join(",");
+        let wire = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"values\":[{numbers}]}}}}\n\n");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([Bytes::from(wire)], cancelled),
+        );
+        let signal = test_signal();
+        let mut stream = client
+            .classify_get_stream_response(
+                sub_response(200, Some("text/event-stream"), b""),
+                Some(body),
+                DEFAULT_MAX_SSE_EVENT_SIZE,
+                Arc::clone(&signal).into(),
+            )
+            .await
+            .unwrap();
+        assert!(futures::StreamExt::next(&mut stream).await.expect("one event").is_err());
+        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit }) if *limit == 2_048));
     }
 
     // -- F6: rmcp's max_sse_event_size backstop must never clamp below the wire cap --

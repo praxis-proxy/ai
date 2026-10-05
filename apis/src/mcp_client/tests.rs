@@ -18,6 +18,10 @@ use super::{
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn test_pool_limits() -> McpSessionLimits {
+    McpSessionLimits::new(TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, None)
+}
+
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
     validate_mcp_target(url, TEST_TIMEOUT, false).await
 }
@@ -2023,6 +2027,36 @@ async fn budgeted_minimum_result_limit_reaches_tool_after_initialize() {
     ));
 }
 
+/// rmcp may resume a failed SSE stream after an event id and return a later
+/// successful tool result. The earlier typed size signal still rejects it.
+#[tokio::test]
+async fn successful_tool_result_cannot_clear_recorded_size_failure() {
+    let (url, ct) = start_test_mcp_server().await;
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_pooled_session(&url, &callout).await;
+    let signal = session.begin_call();
+    assert!(
+        signal
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 2_048 })
+            .is_ok()
+    );
+    let result = invoke_tool(
+        &session,
+        &signal,
+        "echo",
+        serde_json::json!({"message": "recovered"}),
+        &parse_display_url(&url),
+    )
+    .await;
+    session.finish_call(&signal);
+    session.close().await;
+    ct.cancel();
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+}
+
 /// Two `tools/call`s for the same identity across consecutive rounds share one
 /// initialized session: exactly one `initialize` handshake, two `tools/call`s.
 #[tokio::test]
@@ -2219,7 +2253,7 @@ async fn reused_session_failure_evicts_without_retry() {
         "at-most-once: round 1 (ok) + round 2 reuse attempt (rejected), never a third retry"
     );
     assert!(
-        pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none(),
+        pool.checkout(&key, test_pool_limits()).session.is_none(),
         "a failed reused session must be evicted, not returned to the pool"
     );
 }
@@ -2277,7 +2311,7 @@ async fn reused_session_transparently_reinitializes_after_server_404() {
         "the stale request must be rejected before execution, leaving exactly one execution per round"
     );
 
-    let checkout = pool.checkout(&key, TEST_MAX_RESULT_BYTES);
+    let checkout = pool.checkout(&key, test_pool_limits());
     assert!(
         checkout.rejected.is_empty(),
         "the reinitialized session must remain compatible"
@@ -2427,7 +2461,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
 async fn drain_key(pool: &McpSessionPool, key: &McpPoolKey) -> usize {
     let mut count = 0;
     loop {
-        let checkout = pool.checkout(key, TEST_MAX_RESULT_BYTES);
+        let checkout = pool.checkout(key, test_pool_limits());
         close_sessions(checkout.rejected).await;
         let Some(session) = checkout.session else {
             break;
@@ -2449,14 +2483,38 @@ async fn checkout_removes_emptied_key() {
 
     let rejected = pool.checkin(key.clone(), open_pooled_session(&url, &callout).await);
     close_sessions(rejected).await;
-    let checkout = pool.checkout(&key, TEST_MAX_RESULT_BYTES);
+    let checkout = pool.checkout(&key, test_pool_limits());
     close_sessions(checkout.rejected).await;
     let session = checkout.session.expect("the single warm session must check out once");
     session.close().await;
     assert!(
-        pool.checkout(&key, TEST_MAX_RESULT_BYTES).session.is_none(),
+        pool.checkout(&key, test_pool_limits()).session.is_none(),
         "the emptied key must be removed, so a second checkout finds nothing"
     );
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn checkout_rejects_sessions_with_different_control_or_parse_limits() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let key = McpPoolKey::new(McpPoolNamespace::new(), "budget-identity".to_owned()).unwrap();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for required in [
+        McpSessionLimits::new(TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES / 2, None),
+        McpSessionLimits::new(TEST_MAX_RESULT_BYTES, MAX_CONTROL_RESPONSE_BYTES, Some(2_048)),
+    ] {
+        let rejected = pool.checkin(key.clone(), open_pooled_session(&url, &callout).await);
+        close_sessions(rejected).await;
+        let checkout = pool.checkout(&key, required);
+        assert!(
+            checkout.session.is_none(),
+            "a tighter transport policy must open a new session"
+        );
+        assert_eq!(checkout.rejected.len(), 1);
+        close_sessions(checkout.rejected).await;
+    }
     ct.cancel();
 }
 
@@ -2471,7 +2529,7 @@ async fn checkout_rejects_expired_session_before_tool_delivery() {
     close_sessions(rejected).await;
     pool.expire_all_for_test();
 
-    let checkout = pool.checkout(&key, TEST_MAX_RESULT_BYTES);
+    let checkout = pool.checkout(&key, test_pool_limits());
     assert!(
         checkout.session.is_none(),
         "an expired session must never carry a tool call"
@@ -2496,7 +2554,7 @@ async fn checkout_rejects_session_after_idle_timer_wins_race() {
     close_sessions(rejected).await;
     pool.claim_all_idle_timeouts_for_test();
 
-    let checkout = pool.checkout(&key, TEST_MAX_RESULT_BYTES);
+    let checkout = pool.checkout(&key, test_pool_limits());
     assert!(
         checkout.session.is_none(),
         "a timer-owned cancellation must never escape checkout as reusable"

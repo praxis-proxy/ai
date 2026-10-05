@@ -21,7 +21,7 @@
 use std::sync::{Arc, OnceLock};
 
 use futures::stream::{BoxStream, StreamExt as _};
-use praxis_filter::StreamingResponseBody;
+use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
 use sse_stream::{Error as SseError, Sse, SseStream};
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
@@ -228,7 +228,11 @@ pub(super) fn sse_stream_from_body(
     signal: SseSignalTarget,
     preparse_peak_limit: Option<usize>,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
-    let effective_per_event = per_event_cap.min(max_sse_event_size);
+    // SSE metadata is allocated by the parser too. Apply the parse allowance
+    // to raw event bytes before handing a chunk to SseStream.
+    let effective_per_event = per_event_cap
+        .min(max_sse_event_size)
+        .min(preparse_peak_limit.unwrap_or(usize::MAX));
     let parse_signal = signal.clone();
     let state = ByteState {
         body,
@@ -261,7 +265,16 @@ pub(super) fn sse_stream_from_body(
                     return Ok(Some((chunk, st)));
                 },
                 Ok(None) => return Ok(None),
-                Err(_error) => return Err(SseByteStreamError::Upstream),
+                Err(error) => {
+                    if error.downcast_ref::<CalloutResponseTooLarge>().is_some() {
+                        // The core backstop is deliberately wider than this
+                        // adapter's operation cap. Report the binding cap.
+                        let limit = st.operation_cap;
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                        return Err(SseByteStreamError::Ceiling { limit });
+                    }
+                    return Err(SseByteStreamError::Upstream);
+                },
             }
         }
     });
@@ -269,9 +282,24 @@ pub(super) fn sse_stream_from_body(
     SseStream::from_bytes_stream(byte_stream)
         .map(move |event| {
             let frame: Sse = event?;
-            if let Some(data) = frame.data.as_deref()
-                && !super::subrequest_transport::json_preparse_fits(data.as_bytes(), preparse_peak_limit)
-            {
+            // The raw event and parsed id/event strings can coexist.
+            let metadata_bytes = frame
+                .id
+                .as_ref()
+                .map_or(0, String::len)
+                .checked_add(frame.event.as_ref().map_or(0, String::len))
+                .and_then(|bytes| bytes.checked_mul(2));
+            let parse_fits = preparse_peak_limit.is_none_or(|limit| {
+                frame.data.as_deref().is_none_or(|data| {
+                    metadata_bytes
+                        .and_then(|bytes| {
+                            super::subrequest_transport::json_preparse_peak_bytes(data.as_bytes())
+                                .and_then(|peak| bytes.checked_add(peak))
+                        })
+                        .is_some_and(|bytes| bytes <= limit)
+                })
+            });
+            if !parse_fits {
                 let limit = preparse_peak_limit.unwrap_or(0);
                 parse_signal.record(TransportSignal::ResponseTooLarge { limit });
                 return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
@@ -288,6 +316,8 @@ pub(super) struct FakeStreamingBody {
     chunks: std::collections::VecDeque<bytes::Bytes>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     err_after: Option<usize>,
+    /// Core ceiling to return instead of a generic upstream error.
+    overflow_limit: Option<usize>,
     yielded: usize,
 }
 
@@ -301,6 +331,7 @@ impl FakeStreamingBody {
             chunks: chunks.into_iter().collect(),
             cancelled,
             err_after: None,
+            overflow_limit: None,
             yielded: 0,
         }
     }
@@ -311,6 +342,16 @@ impl FakeStreamingBody {
     {
         let mut body = Self::from_chunks(chunks, cancelled);
         body.err_after = Some(body.chunks.len());
+        body
+    }
+
+    /// Return the core's typed byte-limit error after the queued chunks.
+    pub(super) fn overflowing_after<I>(chunks: I, cancelled: Arc<std::sync::atomic::AtomicBool>, limit: usize) -> Self
+    where
+        I: IntoIterator<Item = bytes::Bytes>,
+    {
+        let mut body = Self::erroring_after(chunks, cancelled);
+        body.overflow_limit = Some(limit);
         body
     }
 
@@ -330,6 +371,9 @@ impl StreamingResponseBody for FakeStreamingBody {
         if let Some(n) = self.err_after
             && self.yielded >= n
         {
+            if let Some(limit) = self.overflow_limit {
+                return Err(Box::new(CalloutResponseTooLarge { limit }));
+            }
             return Err(praxis_filter::FilterError::from("fake upstream body error".to_owned()));
         }
         match self.chunks.pop_front() {
@@ -500,5 +544,43 @@ mod tests {
         }
         assert!(saw_err, "an upstream body error must surface");
         assert!(signal.get().is_none(), "a transport error is not a size breach");
+    }
+
+    #[tokio::test]
+    async fn core_streaming_ceiling_error_signals_binding_cap() {
+        let body = Box::new(FakeStreamingBody::overflowing_after([], cancelled_flag(), 8));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 4, 4, 4, Arc::clone(&signal).into(), None);
+        assert!(stream.next().await.expect("typed body error").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 4 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_id_metadata_obeys_parse_allowance_before_parser() {
+        let event = format!("id: {}\ndata: {{\"ok\":true}}\n\n", "x".repeat(16_384));
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(event)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 65_536, 65_536, 65_536, Arc::clone(&signal).into(), Some(2_048));
+        assert!(stream.next().await.expect("oversized id").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 2_048 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_id_and_json_peak_share_parse_allowance() {
+        let event = format!("id: {}\ndata: {{\"ok\":true}}\n\n", "x".repeat(900));
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(event)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 65_536, 65_536, 65_536, Arc::clone(&signal).into(), Some(1_024));
+        assert!(stream.next().await.expect("combined peak").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 1_024 })
+        ));
     }
 }

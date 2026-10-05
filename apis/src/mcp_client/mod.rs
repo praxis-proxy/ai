@@ -42,7 +42,7 @@ use rmcp::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
-use self::session_pool::PooledSession;
+use self::session_pool::{McpSessionLimits, PooledSession};
 pub use self::streaming_selector::McpStreamingSelectorFilter;
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
@@ -481,6 +481,7 @@ pub(crate) async fn call_tool(
 /// This does not apply a timeout; the caller bounds the handshake.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "mirrors the tool-call boundary's forwarded-header + connector context inputs"
 )]
 async fn open_tool_session(
@@ -526,7 +527,11 @@ async fn open_tool_session(
         })
     })?;
     signal_state.finish_exchange(&signal);
-    Ok(PooledSession::new(service, signal_state, max_result_bytes))
+    Ok(PooledSession::new(
+        service,
+        signal_state,
+        McpSessionLimits::new(max_result_bytes, max_control_response_bytes, preparse_peak_limit),
+    ))
 }
 
 /// Issue one `tools/call` on an already-initialized session without closing it.
@@ -550,12 +555,19 @@ async fn invoke_tool(
     if let Some(args_obj) = parsed_args {
         params = params.with_arguments(args_obj);
     }
-    Box::pin(session.service().call_tool(params)).await.map_err(|_source| {
+    let result = Box::pin(session.service().call_tool(params)).await.map_err(|_source| {
         transport_signal_error(signal, display_url).unwrap_or_else(|| McpClientError::CallTool {
             url: display_url.clone(),
             tool_name: tool_name.to_owned(),
         })
-    })
+    })?;
+    // rmcp may recover an SSE parsing failure through a resumed GET and then
+    // return a successful tool result. A recorded size or target rejection
+    // still taints this call and must evict its session.
+    if let Some(error) = transport_signal_error(signal, display_url) {
+        return Err(error);
+    }
+    Ok(result)
 }
 
 /// Call `tools/call` with an additional trusted, operator-allowlisted header
@@ -650,7 +662,10 @@ pub(crate) async fn call_tool_with_forwarded_headers_with_budget(
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
     if let Some((pool, key)) = pool {
-        let checkout = pool.checkout(key, max_result_bytes);
+        let checkout = pool.checkout(
+            key,
+            McpSessionLimits::new(max_result_bytes, max_control_response_bytes, preparse_peak_limit),
+        );
         session_pool::close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
             let signal = session.begin_call();

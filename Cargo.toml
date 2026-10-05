@@ -342,8 +342,8 @@ private_doc_tests = "allow"
 # Temporary until Praxis publishes the stream-suppression phase from
 # praxis-proxy/praxis#1349. Keep all coupled crates on the same immutable tree.
 [patch.crates-io]
-praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
-praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
-praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
-praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
-praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "0fd543ce9173ad92631e9940f1bde20af6fda428" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "0fd543ce9173ad92631e9940f1bde20af6fda428" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "0fd543ce9173ad92631e9940f1bde20af6fda428" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "0fd543ce9173ad92631e9940f1bde20af6fda428" }
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "0fd543ce9173ad92631e9940f1bde20af6fda428" }
