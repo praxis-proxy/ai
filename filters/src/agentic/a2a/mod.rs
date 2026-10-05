@@ -29,10 +29,7 @@ use bytes::Bytes;
 use praxis_ai_apis::is_event_stream_content_type;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::{
-        payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
-        value_safety::contains_control_chars,
-    },
+    builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
     parse_filter_config,
 };
 use tracing::{debug, trace};
@@ -42,6 +39,7 @@ use self::{
     envelope::{A2aEnvelope, extract_a2a_envelope},
     task_routing::{LocalTaskRouteStore, RouteSource, attempt_route_lookup},
 };
+use super::value_safety::contains_control_chars;
 
 // -----------------------------------------------------------------------------
 // A2aFilter

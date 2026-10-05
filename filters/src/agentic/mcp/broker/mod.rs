@@ -28,12 +28,9 @@ use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    builtins::http::{
-        payload_processing::json_rpc::{
-            config::JsonRpcConfig,
-            envelope::{JsonRpcEnvelope, JsonRpcIdKind, JsonRpcKind, parse_json_rpc_value},
-        },
-        value_safety::contains_control_chars,
+    builtins::http::payload_processing::json_rpc::{
+        config::JsonRpcConfig,
+        envelope::{JsonRpcEnvelope, JsonRpcIdKind, JsonRpcKind, parse_json_rpc_value},
     },
     parse_filter_config,
 };
@@ -41,6 +38,7 @@ use tracing::{debug, trace};
 
 use self::config::{CacheScope, CatalogTool, McpBrokerConfig, build_config};
 use super::protocol::ProtocolProfile;
+use crate::agentic::value_safety::contains_control_chars;
 
 // -----------------------------------------------------------------------------
 // Constants

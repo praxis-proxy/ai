@@ -9,10 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::builtins::http::value_safety::contains_control_chars;
 use serde_json::Value;
 
 use super::config::TaskRoutingConfig;
+use crate::agentic::value_safety::contains_control_chars;
 
 // -----------------------------------------------------------------------------
 // Constants

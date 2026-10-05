@@ -4,12 +4,7 @@
 //! A shared helper for body-derived data promotion.
 
 use http::HeaderName;
-use praxis_filter::{
-    FilterError,
-    builtins::http::{
-        payload_processing::config_validation::validate_header_name, value_safety::is_safe_promoted_value,
-    },
-};
+use praxis_filter::{FilterError, builtins::http::payload_processing::config_validation::validate_header_name};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -24,7 +19,8 @@ pub const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Returns `true` iff `val` is within the length limit and safe for HTTP header use.
 pub fn is_promotable_value(val: &str) -> bool {
-    val.len() <= MAX_PROMOTED_VALUE_LEN && is_safe_promoted_value(val)
+    // Match HeaderValue::from_str without allocating a header for every fact.
+    val.len() <= MAX_PROMOTED_VALUE_LEN && val.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7F))
 }
 
 /// Namespaces that classification filters may overwrite when the call
@@ -269,6 +265,25 @@ mod tests {
     #[test]
     fn rejects_newline() {
         assert!(!is_promotable_value("bad\nmodel"), "newline should be rejected");
+    }
+
+    #[test]
+    fn promotion_safety_matches_header_values() {
+        for byte in 0_u8..=127 {
+            let value = char::from(byte).to_string();
+            assert_eq!(
+                is_promotable_value(&value),
+                http::HeaderValue::from_str(&value).is_ok(),
+                "ASCII byte 0x{byte:02x} must match HTTP header parsing"
+            );
+        }
+        for value in ["café", "😀", "mixed café\ttext"] {
+            assert_eq!(
+                is_promotable_value(value),
+                http::HeaderValue::from_str(value).is_ok(),
+                "UTF-8 value {value:?} must match HTTP header parsing"
+            );
+        }
     }
 
     #[test]

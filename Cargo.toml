@@ -115,11 +115,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.2", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.2", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.2", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.2", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.2", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.3", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -338,3 +338,12 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
+
+# Temporary until Praxis publishes the stream-suppression phase from
+# praxis-proxy/praxis#1349. Keep all coupled crates on the same immutable tree.
+[patch.crates-io]
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "17994a9dec680a5c1e6929791e08495e4447a0e5" }
