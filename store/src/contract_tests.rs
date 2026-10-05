@@ -13,7 +13,7 @@ use crate::{
     traits::{ConversationItemStore, PersistedStateBackend},
     types::{
         ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord,
+        ResponseRecord, StoreError,
     },
 };
 
@@ -101,6 +101,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
+    bounded_item_rebuild_rolls_back(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
@@ -551,6 +552,59 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         remaining.messages.as_array().map(Vec::len),
         Some(1),
         "message cache rebuilt after delete"
+    );
+}
+
+/// A failed bounded rebuild must not commit the new item or change the cache.
+#[expect(clippy::too_many_lines, reason = "transactional item and cache rollback assertions")]
+async fn bounded_item_rebuild_rolls_back(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-rollback");
+    let conversation_id = "conv_bounded_rollback";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: conversation_id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, conversation_id, &[item(&o, conversation_id, "prior")])
+        .await
+        .expect("seed prior item and cache");
+    let before = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read prior cache")
+        .expect("conversation exists");
+
+    assert!(
+        matches!(
+            backend
+                .create_items_and_sync_messages_bounded(&o, conversation_id, &[item(&o, conversation_id, "new")], 1)
+                .await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "oversized rebuild must fail"
+    );
+    let listed = backend
+        .list_conversation_items(&o, conversation_id, None, 10, true)
+        .await
+        .expect("list after failed rebuild");
+    assert_eq!(listed.len(), 1, "failed append must not commit a second item");
+    assert_eq!(
+        listed.first().map(|item| item.item_id.as_str()),
+        Some("prior"),
+        "prior item must survive the rollback"
+    );
+    let after = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read cache after failed rebuild")
+        .expect("conversation survives");
+    assert_eq!(
+        after.messages, before.messages,
+        "failed append must not change the cached messages"
     );
 }
 
