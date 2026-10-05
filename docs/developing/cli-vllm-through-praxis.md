@@ -111,6 +111,16 @@ rendered plan instead of a finished one. Switching to the two flags above
 resolved it. They were verified together, so change them as a pair; if you need
 visible reasoning for other work, expect agentic clients to degrade.
 
+A nightly GPU regression guards this pairing. The
+`vllm-gpu-claude-acceptance` job drives a read-only planning turn through the
+native Anthropic path and fails if the run exhausts its turn budget instead of
+answering, or if a `<think>` delimiter reaches the user-visible text. The
+scenario is pinned in `[claude_code.launch.planning]` of
+`tests/integration/fixtures/claude-code-cli/pin.toml`; reverting either flag
+above is expected to turn it red. It is a headless approximation of the turn
+that broke, not interactive plan mode, which the CLI does not expose to
+`claude -p`.
+
 The 32,768-token window is intentional for Claude Code auto mode. Its
 client-initiated safety classifier reserves 2,112 output tokens independently
 of the main Claude Code output-token setting and includes a large client-owned
