@@ -21,7 +21,7 @@
 use std::{
     mem::size_of,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -32,20 +32,199 @@ use sse_stream::{Error as SseError, Sse, SseStream};
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
 
+/// One request-session allowance shared by every rmcp GET and POST SSE stream.
+/// Parser reservations are released with their streams; yielded frames remain
+/// charged because rmcp does not tell us when its decoded queue is drained.
+pub(super) struct SessionSseLedger {
+    /// Session-wide allowance, absent for callers without a preparse budget.
+    limit: Option<usize>,
+    /// Charges shared by concurrently polled GET and POST streams.
+    counters: Mutex<SessionSseCounters>,
+}
+
+/// Charges that must be updated together under the ledger lock.
+#[derive(Default)]
+struct SessionSseCounters {
+    /// Decoded frames handed to rmcp, whose release is not observable here.
+    yielded: usize,
+    /// Sum of all live stream parser reservations.
+    active_parser: usize,
+}
+
+impl SessionSseLedger {
+    /// Create accounting for one rmcp client session.
+    pub(super) fn new(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            counters: Mutex::new(SessionSseCounters::default()),
+        }
+    }
+
+    /// Report whether a budgeted session has yielded opaque rmcp messages.
+    pub(super) fn has_yielded(&self) -> bool {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .yielded
+            != 0
+    }
+
+    /// Give one stream its own releasable parser reservation.
+    fn stream(self: &Arc<Self>) -> Arc<StreamPermit> {
+        Arc::new(StreamPermit {
+            ledger: Arc::clone(self),
+            parser: AtomicUsize::new(0),
+        })
+    }
+
+    /// Apply the stricter of the session and operation limits.
+    fn effective_limit(&self, local_limit: usize) -> usize {
+        self.limit
+            .map_or(local_limit, |session_limit| session_limit.min(local_limit))
+    }
+}
+
+/// The two halves of one SSE adapter share this permit. No lock spans an
+/// upstream await or a parser poll; each accounting transition is atomic.
+struct StreamPermit {
+    /// Session whose counters include this stream's parser charge.
+    ledger: Arc<SessionSseLedger>,
+    /// This stream's portion of the active parser charge.
+    parser: AtomicUsize,
+}
+
+impl StreamPermit {
+    /// Replace this stream's parser reservation under the session lock.
+    fn reserve(&self, next_parser: usize, local_limit: usize) -> bool {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.parser.load(Ordering::Relaxed);
+        let Some(active_parser) = counters
+            .active_parser
+            .checked_sub(current)
+            .and_then(|other| other.checked_add(next_parser))
+        else {
+            return false;
+        };
+        if counters
+            .yielded
+            .checked_add(active_parser)
+            .is_none_or(|total| total > self.ledger.effective_limit(local_limit))
+        {
+            return false;
+        }
+        counters.active_parser = active_parser;
+        self.parser.store(next_parser, Ordering::Relaxed);
+        drop(counters);
+        true
+    }
+
+    /// Reserve the entire permitted raw chunk before awaiting the body. A
+    /// budgeted session leaves half the currently free allowance available so
+    /// an idle common GET does not consume every byte needed by a tool POST.
+    fn reserve_pull(&self, local_limit: usize, operation_headroom: usize) -> Option<usize> {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.parser.load(Ordering::Relaxed);
+        let total = counters.yielded.checked_add(counters.active_parser)?;
+        let free = self.ledger.effective_limit(local_limit).checked_sub(total)?;
+        let slice = if self.ledger.limit.is_some() {
+            free.div_ceil(2)
+        } else {
+            free
+        };
+        let cap = operation_headroom.min(slice);
+        let next = current.checked_add(cap)?;
+        counters.active_parser = counters.active_parser.checked_add(cap)?;
+        self.parser.store(next, Ordering::Relaxed);
+        drop(counters);
+        Some(cap)
+    }
+
+    /// Atomically move the parsed frame into the opaque rmcp-owned queue while
+    /// replacing this stream's peak parser reservation with its steady charge.
+    fn yield_frame(&self, frame: usize, next_parser: usize, local_limit: usize) -> bool {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.parser.load(Ordering::Relaxed);
+        let Some(active_parser) = counters
+            .active_parser
+            .checked_sub(current)
+            .and_then(|other| other.checked_add(next_parser))
+        else {
+            return false;
+        };
+        let Some(yielded) = counters.yielded.checked_add(frame) else {
+            return false;
+        };
+        if yielded
+            .checked_add(active_parser)
+            .is_none_or(|total| total > self.ledger.effective_limit(local_limit))
+        {
+            return false;
+        }
+        counters.yielded = yielded;
+        counters.active_parser = active_parser;
+        self.parser.store(next_parser, Ordering::Relaxed);
+        drop(counters);
+        true
+    }
+}
+
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        let mut counters = self
+            .ledger
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.active_parser = counters
+            .active_parser
+            .saturating_sub(self.parser.load(Ordering::Relaxed));
+    }
+}
+
 /// Destination for an SSE size classification.
 #[derive(Clone)]
 pub(super) enum SseSignalTarget {
     /// One POST response owns a fixed signal generation.
-    Fixed(Arc<OnceLock<TransportSignal>>),
+    Fixed {
+        /// First-wins signal for the POST generation.
+        signal: Arc<OnceLock<TransportSignal>>,
+        /// Shared accounting for every stream in this rmcp session.
+        ledger: Arc<SessionSseLedger>,
+    },
     /// A standalone GET stream reports only to the call active when it fails.
     Active(Arc<TransportSignalState>),
 }
 
 impl SseSignalTarget {
+    /// Bind a POST to the shared charge held by its rmcp client session.
+    pub(super) fn fixed_with_ledger(signal: Arc<OnceLock<TransportSignal>>, ledger: Arc<SessionSseLedger>) -> Self {
+        Self::Fixed { signal, ledger }
+    }
+
+    /// Keep decoded messages charged when rmcp resumes through a new stream.
+    fn ledger(&self) -> Arc<SessionSseLedger> {
+        match self {
+            Self::Fixed { ledger, .. } => Arc::clone(ledger),
+            Self::Active(state) => state.sse_ledger(),
+        }
+    }
+
     /// Record one first-wins transport classification.
     fn record(&self, classification: TransportSignal) {
         match self {
-            Self::Fixed(signal) => {
+            Self::Fixed { signal, .. } => {
                 signal.get_or_init(|| classification);
             },
             Self::Active(state) => state.record_active(classification),
@@ -55,7 +234,7 @@ impl SseSignalTarget {
 
 impl From<Arc<OnceLock<TransportSignal>>> for SseSignalTarget {
     fn from(signal: Arc<OnceLock<TransportSignal>>) -> Self {
-        Self::Fixed(signal)
+        Self::fixed_with_ledger(signal, Arc::new(SessionSseLedger::new(None)))
     }
 }
 
@@ -212,8 +391,8 @@ struct ByteState {
     batch_charge: Arc<AtomicUsize>,
     /// Upper bound for data Strings still queued inside `sse-stream`.
     queued_data_charge: Arc<AtomicUsize>,
-    /// Parsed messages rmcp may still hold after this adapter yields them.
-    yielded_charge: Arc<AtomicUsize>,
+    /// Session-wide reservation for this parser and its rmcp-owned messages.
+    permit: Arc<StreamPermit>,
     /// `sse-stream` retains its `VecDeque<Sse>` allocation after draining it.
     queued_capacity_charge: usize,
     /// Whether the last tightened chunk cap came from parse headroom.
@@ -332,7 +511,7 @@ pub(super) fn sse_stream_from_body(
     let parse_signal = signal.clone();
     let batch_charge = Arc::new(AtomicUsize::new(0));
     let queued_data_charge = Arc::new(AtomicUsize::new(0));
-    let yielded_charge = Arc::new(AtomicUsize::new(0));
+    let permit = signal.ledger().stream();
     let state = ByteState {
         body,
         emitted: 0,
@@ -341,7 +520,7 @@ pub(super) fn sse_stream_from_body(
         raw_event: RawSseEventWindow::default(),
         batch_charge: Arc::clone(&batch_charge),
         queued_data_charge: Arc::clone(&queued_data_charge),
-        yielded_charge: Arc::clone(&yielded_charge),
+        permit: Arc::clone(&permit),
         queued_capacity_charge: 0,
         parse_chunk_cap: false,
         signal,
@@ -350,6 +529,7 @@ pub(super) fn sse_stream_from_body(
     let byte_stream = futures::stream::try_unfold(state, move |mut st| async move {
         loop {
             if let Some(limit) = preparse_peak_limit {
+                let shared_limit = st.permit.ledger.effective_limit(limit);
                 // `sse-stream` drains its parsed queue before asking for the
                 // next raw chunk. Only the unfinished current event can still
                 // own a data String at this boundary.
@@ -359,26 +539,40 @@ pub(super) fn sse_stream_from_body(
                     0
                 };
                 st.queued_data_charge.store(pending_data, Ordering::Relaxed);
-                // The parser can retain a data String with up to twice its
-                // logical length, a cleared unfinished-line allocation, and
-                // the drained event queue between pulls. Do not hand it a raw
-                // chunk that cannot coexist with those prior owners.
+                // The previous parser batch and its queue capacity remain
+                // live after the last yielded event. Refresh this stream's
+                // steady charge before reserving an awaited raw chunk.
+                let steady = st.batch_charge.load(Ordering::Relaxed).checked_add(pending_data);
+                if !steady.is_some_and(|bytes| st.permit.reserve(bytes, limit)) {
+                    st.signal
+                        .record(TransportSignal::ResponseTooLarge { limit: shared_limit });
+                    st.body.cancel().await;
+                    return Err(SseByteStreamError::JsonExpansion { limit: shared_limit });
+                }
+                // Keep the existing local raw-window bound as well as the
+                // shared session allowance. The permit reserves the selected
+                // chunk maximum before the asynchronous body pull.
                 let line_capacity = st.raw_event.max_buffered_line_bytes.checked_mul(2);
                 let parse_headroom = st
                     .raw_event
                     .bytes
                     .checked_mul(2)
                     .and_then(|bytes| bytes.checked_add(st.queued_capacity_charge))
-                    .and_then(|bytes| bytes.checked_add(st.yielded_charge.load(Ordering::Relaxed)))
                     .and_then(|bytes| bytes.checked_add(line_capacity?))
                     .map_or(0, |retained| limit.saturating_sub(retained));
                 let operation_headroom = st.operation_cap.saturating_sub(st.emitted);
-                let chunk_cap = parse_headroom.min(operation_headroom);
-                st.parse_chunk_cap = parse_headroom <= operation_headroom;
-                if !st.body.try_cap_chunk_bytes(chunk_cap) {
-                    st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                let Some(chunk_cap) = st.permit.reserve_pull(limit, parse_headroom.min(operation_headroom)) else {
+                    st.signal
+                        .record(TransportSignal::ResponseTooLarge { limit: shared_limit });
                     st.body.cancel().await;
-                    return Err(SseByteStreamError::JsonExpansion { limit });
+                    return Err(SseByteStreamError::JsonExpansion { limit: shared_limit });
+                };
+                st.parse_chunk_cap = chunk_cap < operation_headroom;
+                if !st.body.try_cap_chunk_bytes(chunk_cap) {
+                    st.signal
+                        .record(TransportSignal::ResponseTooLarge { limit: shared_limit });
+                    st.body.cancel().await;
+                    return Err(SseByteStreamError::JsonExpansion { limit: shared_limit });
                 }
             }
             match st.body.next_chunk().await {
@@ -441,15 +635,15 @@ pub(super) fn sse_stream_from_body(
                         } else {
                             previous_line_capacity
                         };
-                        if raw_window
+                        let parser_peak = raw_window
                             .and_then(|bytes| bytes.checked_mul(if saw_data { 4 } else { 3 }))
                             .and_then(|bytes| bytes.checked_add(queued_preparse_peak))
-                            .and_then(|bytes| bytes.checked_add(st.yielded_charge.load(Ordering::Relaxed)))
-                            .and_then(|bytes| bytes.checked_add(parse_line_capacity?))
-                            .is_none_or(|bytes| bytes > limit)
-                        {
-                            st.signal.record(TransportSignal::ResponseTooLarge { limit });
-                            return Err(SseByteStreamError::JsonExpansion { limit });
+                            .and_then(|bytes| bytes.checked_add(parse_line_capacity?));
+                        if !parser_peak.is_some_and(|bytes| st.permit.reserve(bytes, limit)) {
+                            let shared_limit = st.permit.ledger.effective_limit(limit);
+                            st.signal
+                                .record(TransportSignal::ResponseTooLarge { limit: shared_limit });
+                            return Err(SseByteStreamError::JsonExpansion { limit: shared_limit });
                         }
                         // Keep both parser allocations charged after the raw
                         // event window resets or the queued events drain.
@@ -487,7 +681,8 @@ pub(super) fn sse_stream_from_body(
                         // remaining headroom was exhausted. Without a parse
                         // allowance, this is the cumulative core backstop.
                         let limit = if st.parse_chunk_cap {
-                            preparse_peak_limit.unwrap_or(st.operation_cap)
+                            preparse_peak_limit
+                                .map_or(st.operation_cap, |limit| st.permit.ledger.effective_limit(limit))
                         } else {
                             st.operation_cap
                         };
@@ -511,7 +706,7 @@ pub(super) fn sse_stream_from_body(
                 // rmcp may queue multiple decoded notifications after they
                 // leave this stream. Their release is unobservable here, so
                 // keep a conservative charge for every yielded frame until
-                // this SSE stream ends. Include the current parser batch while
+                // this rmcp session ends. Include the current parser batch while
                 // rmcp materializes the next message.
                 let frame_charge = frame
                     .id
@@ -525,23 +720,22 @@ pub(super) fn sse_stream_from_body(
                                 .and_then(|peak| bytes.checked_add(peak))
                         })
                     });
-                let next_yielded =
-                    frame_charge.and_then(|bytes| bytes.checked_add(yielded_charge.load(Ordering::Relaxed)));
                 let queued_after_current = frame
                     .data
                     .as_ref()
                     .map_or(Some(0), |data| data.len().checked_mul(2))
                     .map(|current| queued_data_charge.load(Ordering::Relaxed).saturating_sub(current));
-                if next_yielded
-                    .and_then(|bytes| bytes.checked_add(batch_charge.load(Ordering::Relaxed)))
-                    .and_then(|bytes| bytes.checked_add(queued_after_current?))
-                    .is_none_or(|bytes| bytes > limit)
+                let next_parser =
+                    queued_after_current.and_then(|bytes| batch_charge.load(Ordering::Relaxed).checked_add(bytes));
+                if !frame_charge
+                    .zip(next_parser)
+                    .is_some_and(|(frame, parser)| permit.yield_frame(frame, parser, limit))
                 {
-                    parse_signal.record(TransportSignal::ResponseTooLarge { limit });
-                    return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion { limit })));
-                }
-                if let Some(bytes) = next_yielded {
-                    yielded_charge.store(bytes, Ordering::Relaxed);
+                    let shared_limit = permit.ledger.effective_limit(limit);
+                    parse_signal.record(TransportSignal::ResponseTooLarge { limit: shared_limit });
+                    return Err(SseError::Body(Box::new(SseByteStreamError::JsonExpansion {
+                        limit: shared_limit,
+                    })));
                 }
                 if let Some(bytes) = queued_after_current {
                     queued_data_charge.store(bytes, Ordering::Relaxed);
@@ -568,6 +762,8 @@ pub(super) struct FakeStreamingBody {
     max_chunk_bytes: Option<usize>,
     /// Exercise fail-closed handling for other streaming body implementations.
     supports_chunk_cap: bool,
+    /// Synchronize two independent adapter pulls in a concurrency regression.
+    pull_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 #[cfg(test)]
@@ -585,6 +781,7 @@ impl FakeStreamingBody {
             yielded_count: None,
             max_chunk_bytes: None,
             supports_chunk_cap: true,
+            pull_barrier: None,
         }
     }
 
@@ -630,6 +827,11 @@ impl FakeStreamingBody {
         self.supports_chunk_cap = false;
         self
     }
+
+    fn with_pull_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        self.pull_barrier = Some(barrier);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -662,6 +864,9 @@ impl StreamingResponseBody for FakeStreamingBody {
                 {
                     self.chunks.clear();
                     return Err(Box::new(CalloutResponseTooLarge { limit }));
+                }
+                if let Some(barrier) = &self.pull_barrier {
+                    barrier.wait().await;
                 }
                 self.yielded += 1;
                 if let Some(count) = &self.yielded_count {
@@ -699,8 +904,8 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt as _;
 
-    use super::{FakeStreamingBody, sse_stream_from_body};
-    use crate::mcp_client::subrequest_transport::TransportSignal;
+    use super::{FakeStreamingBody, SessionSseLedger, SseSignalTarget, sse_stream_from_body};
+    use crate::mcp_client::subrequest_transport::{TransportSignal, TransportSignalState};
 
     fn cancelled_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
@@ -812,6 +1017,139 @@ mod tests {
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: recorded }) if *recorded == limit
         ));
+    }
+
+    #[tokio::test]
+    async fn resumed_streams_share_queued_message_charge() {
+        let event = Bytes::from(format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"message\":\"{}\"}}}}\n\n",
+            "x".repeat(100_000)
+        ));
+        let limit = 500_000;
+        let state = Arc::new(TransportSignalState::new(Some(limit)));
+        let signal = state.current();
+        let first_body = Box::new(FakeStreamingBody::from_chunks([event.clone()], cancelled_flag()));
+        let first_target = SseSignalTarget::fixed_with_ledger(Arc::clone(&signal), state.sse_ledger());
+        let mut first = sse_stream_from_body(first_body, 500_000, 500_000, 500_000, first_target, Some(limit));
+        assert!(first.next().await.expect("first message").is_ok());
+        assert!(state.has_budgeted_sse_yields());
+        drop(first);
+
+        let resumed_body = Box::new(FakeStreamingBody::from_chunks([event], cancelled_flag()));
+        let resumed_target = SseSignalTarget::Active(state);
+        let mut resumed = sse_stream_from_body(resumed_body, 500_000, 500_000, 500_000, resumed_target, Some(limit));
+        assert!(
+            resumed
+                .next()
+                .await
+                .expect("resumed message exceeds shared allowance")
+                .is_err()
+        );
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 500_000 })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(clippy::too_many_lines, reason = "sets up two independently polled SSE streams")]
+    async fn concurrent_get_and_post_share_parser_and_yield_allowance() {
+        let limit = 600_000;
+        let state = Arc::new(TransportSignalState::new(Some(limit)));
+        let signal = state.current();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let event = Bytes::from(format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"message\":\"{}\"}}}}\n\n",
+            "x".repeat(100_000)
+        ));
+        let post_body = Box::new(
+            FakeStreamingBody::from_chunks([event.clone()], cancelled_flag()).with_pull_barrier(Arc::clone(&barrier)),
+        );
+        let get_body = Box::new(FakeStreamingBody::from_chunks([event], cancelled_flag()).with_pull_barrier(barrier));
+        let mut post = sse_stream_from_body(
+            post_body,
+            limit,
+            limit,
+            limit,
+            SseSignalTarget::fixed_with_ledger(Arc::clone(&signal), state.sse_ledger()),
+            Some(limit),
+        );
+        let mut get = sse_stream_from_body(
+            get_body,
+            limit,
+            limit,
+            limit,
+            SseSignalTarget::Active(state),
+            Some(limit),
+        );
+
+        let (post_result, get_result) = tokio::join!(post.next(), get.next());
+        let admitted = [post_result, get_result]
+            .into_iter()
+            .filter(|result| result.as_ref().is_some_and(Result::is_ok))
+            .count();
+        assert_eq!(admitted, 1, "only one large frame fits alongside both live parsers");
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 600_000 })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_small_get_and_post_both_fit() {
+        let limit = 600_000;
+        let state = Arc::new(TransportSignalState::new(Some(limit)));
+        let signal = state.current();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let event =
+            Bytes::from_static(b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n");
+        let post_body = Box::new(
+            FakeStreamingBody::from_chunks([event.clone()], cancelled_flag()).with_pull_barrier(Arc::clone(&barrier)),
+        );
+        let get_body = Box::new(FakeStreamingBody::from_chunks([event], cancelled_flag()).with_pull_barrier(barrier));
+        let mut post = sse_stream_from_body(
+            post_body,
+            limit,
+            limit,
+            limit,
+            SseSignalTarget::fixed_with_ledger(Arc::clone(&signal), state.sse_ledger()),
+            Some(limit),
+        );
+        let mut get = sse_stream_from_body(
+            get_body,
+            limit,
+            limit,
+            limit,
+            SseSignalTarget::Active(state),
+            Some(limit),
+        );
+
+        let (post_result, get_result) = tokio::join!(post.next(), get.next());
+        assert!(post_result.expect("POST frame").is_ok());
+        assert!(get_result.expect("GET frame").is_ok());
+        assert!(signal.get().is_none());
+    }
+
+    #[test]
+    fn concurrent_yield_reservations_cannot_lose_a_charge() {
+        let ledger = Arc::new(SessionSseLedger::new(Some(100)));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first = ledger.stream();
+        let second = ledger.stream();
+        let (first_admitted, second_admitted) = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first.yield_frame(60, 0, 100)
+            });
+            let second = scope.spawn(move || {
+                barrier.wait();
+                second.yield_frame(60, 0, 100)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first_admitted, second_admitted, "only one sixty-byte frame fits");
+        assert!(ledger.has_yielded());
     }
 
     #[tokio::test]

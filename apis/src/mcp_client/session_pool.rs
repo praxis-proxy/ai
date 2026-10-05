@@ -182,6 +182,13 @@ impl PooledSession {
         self.service.is_closed()
     }
 
+    /// rmcp does not expose when queued SSE messages are released. Retire a
+    /// budgeted session after it yields any, instead of charging later calls
+    /// for a previous call's possibly drained messages.
+    fn has_budgeted_sse_yields(&self) -> bool {
+        self.signal_state.has_budgeted_sse_yields()
+    }
+
     /// Return whether this session has exceeded the bounded idle lifetime.
     fn is_expired_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_used) >= MAX_IDLE_AGE
@@ -343,6 +350,7 @@ impl McpSessionPool {
                 && candidate.limits == limits
                 && !candidate.is_closed()
                 && !candidate.is_expired_at(now)
+                && !candidate.has_budgeted_sse_yields()
             {
                 session = Some(candidate);
             } else {
@@ -357,6 +365,9 @@ impl McpSessionPool {
     /// Return a healthy session. Rejected and superseded sessions are returned
     /// for explicit asynchronous closure by the caller.
     pub(crate) fn checkin(&self, key: McpPoolKey, mut session: PooledSession) -> Vec<PooledSession> {
+        if session.has_budgeted_sse_yields() {
+            return vec![session];
+        }
         let mut map = self.lock();
 
         let mut rejected = Vec::new();

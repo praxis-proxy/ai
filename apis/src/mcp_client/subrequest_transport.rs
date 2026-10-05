@@ -294,14 +294,31 @@ pub(crate) enum TransportSignal {
 pub(crate) struct TransportSignalState {
     /// Signal generation assigned to the active initialization or tool call.
     active: Mutex<Option<Arc<OnceLock<TransportSignal>>>>,
+    /// rmcp may queue decoded SSE messages across resumed HTTP streams. Their
+    /// release is not observable at this boundary, so retain the charge for
+    /// the lifetime of this client session.
+    sse_ledger: Arc<crate::mcp_client::sse_adapter::SessionSseLedger>,
 }
 
 impl TransportSignalState {
     /// Create state with a pristine initialization-generation signal.
-    fn new() -> Self {
+    pub(super) fn new(preparse_peak_limit: Option<usize>) -> Self {
         Self {
             active: Mutex::new(Some(Arc::new(OnceLock::new()))),
+            sse_ledger: Arc::new(crate::mcp_client::sse_adapter::SessionSseLedger::new(
+                preparse_peak_limit,
+            )),
         }
+    }
+
+    /// Share parser and decoded-message accounting across all SSE streams.
+    pub(super) fn sse_ledger(&self) -> Arc<crate::mcp_client::sse_adapter::SessionSseLedger> {
+        Arc::clone(&self.sse_ledger)
+    }
+
+    /// A session with unobservable queued-message release must not be pooled.
+    pub(crate) fn has_budgeted_sse_yields(&self) -> bool {
+        self.sse_ledger.has_yielded()
     }
 
     /// Return the active signal, or a detached slot for idle traffic.
@@ -738,7 +755,7 @@ impl McpSubrequestClient {
             step_timeout,
             stream_cumulative_cap,
             owner,
-            signal_state: Arc::new(TransportSignalState::new()),
+            signal_state: Arc::new(TransportSignalState::new(preparse_peak_limit)),
         }
     }
 
@@ -1223,7 +1240,10 @@ impl McpSubrequestClient {
                     // rmcp's `config.max_sse_event_size` is an outer backstop only; raise it to
                     // the per-message cap so it never clamps the per-event bound below it.
                     max_sse_event_size.max(per_event_cap),
-                    Arc::clone(&signal).into(),
+                    crate::mcp_client::sse_adapter::SseSignalTarget::fixed_with_ledger(
+                        Arc::clone(&signal),
+                        self.signal_state.sse_ledger(),
+                    ),
                     preparse_peak_limit,
                 );
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
@@ -2017,7 +2037,7 @@ mod tests {
 
     #[test]
     fn reusable_session_starts_each_exchange_with_a_pristine_signal() {
-        let state = TransportSignalState::new();
+        let state = TransportSignalState::new(None);
         let prior = state.current();
         assert!(prior.set(TransportSignal::ResponseTooLarge { limit: 7 }).is_ok());
 
