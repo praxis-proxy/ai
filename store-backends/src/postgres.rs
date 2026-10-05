@@ -1655,6 +1655,21 @@ impl ConversationItemStore for PostgresResponseStore {
     reason = "transactional cache helpers sit beside their trait implementation"
 )]
 impl PostgresResponseStore {
+    /// Start an item-rebuild transaction with one snapshot for bounded reads.
+    async fn begin_items_rebuild(&self, bounded: bool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|e| self.db_err(&e))?;
+        if bounded {
+            // Raw item inserts do not lock the parent conversation. Keep the
+            // size query and subsequent fetch on one snapshot so an insert
+            // cannot make the fetched rowset larger than the preflighted one.
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+        }
+        Ok(tx)
+    }
+
     /// Insert items and rebuild the owner-scoped cache in one transaction.
     #[expect(
         clippy::too_many_lines,
@@ -1679,7 +1694,7 @@ impl PostgresResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
 
-        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        let mut tx = Box::pin(self.begin_items_rebuild(max_rebuild_bytes.is_some())).await?;
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
