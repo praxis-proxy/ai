@@ -962,4 +962,48 @@ outbound_chain:
         FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
             .expect("a resolvable outbound chain must build");
     }
+
+    /// A named outbound chain remains resolvable when the callout is nested in
+    /// an iterative router step. This exercises the production chain-aware
+    /// pipeline builder rather than the standalone filter constructor.
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression fixture includes the complete nested YAML"
+    )]
+    fn file_search_callout_binds_named_outbound_chain_inside_irr() {
+        let registry = build_ai_registry();
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\
+- filter: iterative_request_router
+  initial_step: inference
+  max_iterations: 1
+  timeout_ms: 1000
+  steps:
+    - name: inference
+      filters:
+        - filter: openai_file_search_callout
+          vector_store_url: https://8.8.8.8
+          outbound_chain: vector-store-outbound
+      on_result:
+        - default: true
+          done: true
+",
+        )
+        .expect("IRR reproduction config should parse");
+        let chain_entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\
+- filter: headers
+  request_set:
+    - name: X-Vector-Store-Client
+      value: praxis-ai-gateway
+",
+        )
+        .expect("named outbound chain should parse");
+        let chains = HashMap::from([("vector-store-outbound", chain_entries.as_slice())]);
+
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+            .expect("named outbound chain should resolve inside the IRR step");
+    }
 }

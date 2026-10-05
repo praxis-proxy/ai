@@ -43,7 +43,7 @@ use self::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
         MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
@@ -132,7 +132,6 @@ impl FileSearchCalloutFilter {
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
-        require_inline_outbound_chain(&cfg.outbound_chain)?;
         let outbound = ctx.bind_chain(&cfg.outbound_chain)?;
         let validated = build_config_with_client(&cfg, client)?;
         Ok(Self::build(validated, Arc::new(outbound)))

@@ -7141,13 +7141,7 @@ filter_chains:
               # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
-                outbound_chain:
-                  name: vector-store-outbound
-                  filters:
-                    - filter: headers
-                      request_set:
-                        - name: X-Vector-Store-Client
-                          value: praxis-ai-gateway
+                outbound_chain: vector-store-outbound
                 timeout_ms: 30000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -7183,6 +7177,13 @@ filter_chains:
                 next: inference
               - default: true
                 done: true
+
+  - name: vector-store-outbound
+    filters:
+      - filter: headers
+        request_set:
+          - name: X-Vector-Store-Client
+            value: praxis-ai-gateway
 
 insecure_options:
   allow_private_endpoints: true
@@ -7483,7 +7484,7 @@ class TestFileSearchVLLM:
         # the configured FilteredSubrequestExecutor outbound chain — not merely
         # that a file_search_call item surfaced. The recording shim in front of
         # OGX captured each forwarded request; every one must carry the marker
-        # header the inline outbound_chain injects, which only the executor path
+        # header the named outbound_chain injects, which only the executor path
         # can add.
         captured = VectorStoreWitnessHandler.captured_headers
         assert captured, (
