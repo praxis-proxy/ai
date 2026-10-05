@@ -209,7 +209,8 @@ test-inference-fixtures:
 # integration target below. When adding a PostgreSQL test, check it against
 # this list, because a missed prefix drops it silently.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored store::tests::pg_ store::tests::postgres_ $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
+		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
