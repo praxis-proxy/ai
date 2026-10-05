@@ -11,7 +11,9 @@
 /// Remaining capacity shared by all payload owners in one logical request.
 #[derive(Debug, Eq, PartialEq)]
 pub struct RetainedPayloadBudget {
+    /// Smallest configured ceiling for this logical request.
     limit: usize,
+    /// Bytes reserved by currently live payload owners.
     retained: usize,
 }
 
