@@ -126,6 +126,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.system_history
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.unrepresentable_parameters
     scopes:
       - messages_to_chat_completions

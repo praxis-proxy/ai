@@ -36,6 +36,15 @@
                   "content": [
                     {
                       "type": "text",
+                      "text": "Be concise."
+                    }
+                  ],
+                  "role": "system"
+                },
+                {
+                  "content": [
+                    {
+                      "type": "text",
                       "text": "What is 2+2? Reply with just the number.",
                       "citations": []
                     }
@@ -124,6 +133,10 @@
             "value": {
               "max_completion_tokens": 64,
               "messages": [
+                {
+                  "content": "Be concise.",
+                  "role": "system"
+                },
                 {
                   "content": "What is 2+2? Reply with just the number.",
                   "role": "user"

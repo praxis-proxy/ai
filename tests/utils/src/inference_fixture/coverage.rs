@@ -1241,6 +1241,7 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
@@ -1309,6 +1310,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
@@ -1357,7 +1359,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 59, "manifest feature inventory count");
+        assert_eq!(report.features_total, 60, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 48, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 53, "manifest recording inventory count");
         assert_eq!(
@@ -1413,7 +1415,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 59, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 60, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1474,6 +1476,10 @@ mod tests {
                 ),
                 (
                     &"messages.request.provider_parameter_passthrough".to_owned(),
+                    &vec!["messages/provider-parameter-passthrough".to_owned()]
+                ),
+                (
+                    &"messages.request.system_history".to_owned(),
                     &vec!["messages/provider-parameter-passthrough".to_owned()]
                 ),
                 (
@@ -1769,7 +1775,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[9..13] {
+        for feature in &manifest.features[9..14] {
             assert_eq!(
                 feature
                     .providers
@@ -1779,7 +1785,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[13..16] {
+        for feature in &manifest.features[14..17] {
             assert_eq!(
                 feature
                     .providers
@@ -1790,14 +1796,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[16]
+            manifest.features[17]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("synthetic", CoverageStatus::SyntheticOnly)]
         );
-        for feature in &manifest.features[17..20] {
+        for feature in &manifest.features[18..21] {
             assert_eq!(
                 feature
                     .providers
@@ -1810,7 +1816,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[20..32] {
+        for feature in &manifest.features[21..33] {
             assert_eq!(
                 feature
                     .providers
@@ -1820,7 +1826,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[32..34] {
+        for feature in &manifest.features[33..35] {
             assert_eq!(
                 feature
                     .providers
@@ -1830,7 +1836,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[34..46] {
+        for feature in &manifest.features[35..47] {
             assert_eq!(
                 feature
                     .providers
@@ -1841,14 +1847,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[46]
+            manifest.features[47]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[47..51] {
+        for feature in &manifest.features[48..52] {
             assert_eq!(
                 feature
                     .providers
@@ -1858,7 +1864,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[51..59] {
+        for feature in &manifest.features[52..60] {
             assert_eq!(
                 feature
                     .providers

@@ -349,9 +349,9 @@ fn transform_buffered_response(
             ctx.set_metadata("openai.finish_reason", finish_reason);
             FilterAction::Continue
         } else {
-            // A body-phase rejection is rendered by the proxy's registered
-            // Anthropic error formatter as HTTP 500. This prevents an invalid
-            // upstream success from being accepted as a successful Message.
+            // Reject the invalid success. If the upstream 200 headers have
+            // already been sent, the proxy aborts the response body instead
+            // of sending a new HTTP 500 error.
             FilterAction::Reject(Rejection::status(500))
         }
     }

@@ -162,7 +162,9 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
                 .get("role")
                 .and_then(Value::as_str)
                 .ok_or("message is missing a string `role`")?;
-            if !matches!(role, "user" | "assistant") {
+            // Claude Code can put a text-only system message in this array.
+            // Chat Completions represents it directly; the backend owns ordering.
+            if !matches!(role, "system" | "user" | "assistant") {
                 return Err(format!("unsupported Anthropic message role `{role}`"));
             }
             match message.get("content") {
@@ -1298,6 +1300,23 @@ mod tests {
         assert_eq!(translated["messages"][0]["content"], "Hi");
         assert_eq!(translated["messages"][1]["content"], "Hello");
         assert_eq!(translated["messages"][2]["content"], "Sunny");
+    }
+
+    #[test]
+    fn strict_translation_preserves_system_message_in_history() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "Be concise"}]},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be concise"})
+        );
+        assert_eq!(translated["messages"][1], json!({"role": "user", "content": "Hi"}));
     }
 
     #[test]

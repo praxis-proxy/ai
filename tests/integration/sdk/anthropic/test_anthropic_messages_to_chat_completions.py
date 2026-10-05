@@ -452,10 +452,10 @@ class TestResponseUsage:
 
 class TestResponseValidation:
     @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
-    def test_untranslatable_success_is_http_error(self, anthropic_client, kind):
+    def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
         RecordingBackend.untranslatable_reply_once = kind
         try:
-            with pytest.raises(APIStatusError) as excinfo:
+            with pytest.raises((APIStatusError, json.JSONDecodeError)) as excinfo:
                 anthropic_client.messages.create(
                     model=MODEL,
                     max_tokens=64,
@@ -464,9 +464,15 @@ class TestResponseValidation:
         finally:
             RecordingBackend.untranslatable_reply_once = None
 
-        assert excinfo.value.status_code == 500
-        assert excinfo.value.body["type"] == "error"
-        assert excinfo.value.body["error"]["type"] == "api_error"
+        error = excinfo.value
+        if isinstance(error, APIStatusError):
+            assert error.status_code == 500
+            assert error.body["type"] == "error"
+            assert error.body["error"]["type"] == "api_error"
+        else:
+            # A response-body rejection can abort after 200 headers have been
+            # sent. The SDK then fails to parse the empty, aborted body.
+            assert error.doc == ""
 
 
 class TestStreamingResponseValidation:

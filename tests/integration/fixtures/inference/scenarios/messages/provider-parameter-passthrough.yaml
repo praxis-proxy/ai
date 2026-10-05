@@ -1,12 +1,13 @@
 version: 1
 id: messages/provider-parameter-passthrough
-description: Unmapped Anthropic request fields reach the Chat Completions backend untouched, while metadata.user_id and output_config are mapped.
+description: Unmapped request fields reach the Chat backend untouched, while metadata.user_id, output_config, and a text-only system history message are mapped.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
 features:
   - messages.request.provider_parameter_passthrough
   - messages.request.empty_citations
+  - messages.request.system_history
 turns:
   - name: initial
     request:
@@ -37,6 +38,10 @@ turns:
                   - answer
                 additionalProperties: false
           messages:
+            - role: system
+              content:
+                - type: text
+                  text: Be concise.
             - role: user
               content:
                 - type: text

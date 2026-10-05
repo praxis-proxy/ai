@@ -101,6 +101,8 @@ three-boundary credential isolation but adds the
 `path_rewrite` that maps `POST /v1/messages` to `/v1/chat/completions`. The
 client still speaks the Anthropic wire format; Praxis rewrites both the request
 and the response, so vLLM only ever sees OpenAI Chat Completions.
+Claude Code must disable thinking and prompt caching for this translated route;
+see the [Claude Code setup](developing/cli-vllm-through-praxis.md#4-connect-claude-code).
 
 `/v1/messages/count_tokens` has no Chat Completions equivalent, so the
 `path_rewrite` is anchored to `^/v1/messages$` and leaves it unrewritten. A
