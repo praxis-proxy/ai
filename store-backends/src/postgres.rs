@@ -1655,21 +1655,6 @@ impl ConversationItemStore for PostgresResponseStore {
     reason = "transactional cache helpers sit beside their trait implementation"
 )]
 impl PostgresResponseStore {
-    /// Start an item-rebuild transaction with one snapshot for bounded reads.
-    async fn begin_items_rebuild(&self, bounded: bool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(|e| self.db_err(&e))?;
-        if bounded {
-            // Raw item inserts do not lock the parent conversation. Keep the
-            // size query and subsequent fetch on one snapshot so an insert
-            // cannot make the fetched rowset larger than the preflighted one.
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| self.db_err(&e))?;
-        }
-        Ok(tx)
-    }
-
     /// Insert items and rebuild the owner-scoped cache in one transaction.
     #[expect(
         clippy::too_many_lines,
@@ -1694,7 +1679,7 @@ impl PostgresResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
 
-        let mut tx = Box::pin(self.begin_items_rebuild(max_rebuild_bytes.is_some())).await?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
@@ -1849,20 +1834,39 @@ async fn pg_rebuild_messages(
     conversation_id: &str,
     max_rebuild_bytes: Option<usize>,
 ) -> Result<(), StoreError> {
-    if let Some(max_rebuild_bytes) = max_rebuild_bytes {
-        let size_sql = format!(
-            "SELECT COALESCE(SUM(octet_length(item_data)), 0) AS raw_bytes, COUNT(*) AS row_count \
-             FROM {items_table} \
-             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
+    let rows = if let Some(max_rebuild_bytes) = max_rebuild_bytes {
+        // A single READ COMMITTED statement gives the size aggregate and item
+        // fetch the same snapshot. Raw item inserts need not lock the parent,
+        // so separate statements could fetch rows that were absent at preflight.
+        // The lateral branch returns no item_data when the bound fails, leaving
+        // one aggregate row to report PayloadTooLarge without loading the items.
+        let bounded_sql = format!(
+            "WITH measured AS (\
+               SELECT COALESCE(SUM(octet_length(item_data)), 0) AS raw_bytes, COUNT(*) AS row_count \
+               FROM {items_table} \
+               WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4\
+             ) \
+             SELECT measured.raw_bytes, measured.row_count, selected.item_data \
+             FROM measured LEFT JOIN LATERAL (\
+               SELECT item_data, position, item_id FROM {items_table} \
+               WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
+                 AND (measured.raw_bytes::numeric * 26 + measured.row_count::numeric * 4 + 4) <= $5::text::numeric\
+             ) AS selected ON true \
+             ORDER BY selected.position ASC NULLS LAST, selected.item_id ASC NULLS LAST"
         );
-        let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
+        let sql_limit = max_rebuild_bytes.to_string();
+        let rows = sqlx::query(AssertSqlSafe(bounded_sql.as_str()))
             .bind(owner.tenant_id())
             .bind(owner.issuer())
             .bind(owner.subject())
             .bind(conversation_id)
-            .fetch_one(&mut **tx)
+            .bind(sql_limit)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
+        let size_row = rows
+            .first()
+            .ok_or_else(|| StoreError::Database("bounded rebuild returned no size row".to_owned()))?;
         let raw_bytes: i64 = size_row
             .try_get("raw_bytes")
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1872,20 +1876,22 @@ async fn pg_rebuild_messages(
         if !super::conversation_rebuild_fits(raw_bytes, row_count, max_rebuild_bytes) {
             return Err(StoreError::PayloadTooLarge);
         }
-    }
-    let select_sql = format!(
-        "SELECT item_data FROM {items_table} \
-         WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
-         ORDER BY position ASC, item_id ASC"
-    );
-    let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
-        .bind(owner.tenant_id())
-        .bind(owner.issuer())
-        .bind(owner.subject())
-        .bind(conversation_id)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))?;
+        rows
+    } else {
+        let select_sql = format!(
+            "SELECT item_data FROM {items_table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
+             ORDER BY position ASC, item_id ASC"
+        );
+        sqlx::query(AssertSqlSafe(select_sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(conversation_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?
+    };
 
     let mut messages = Vec::with_capacity(rows.len());
     for row in &rows {

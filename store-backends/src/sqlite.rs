@@ -2189,6 +2189,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compressed-row regression checks both encoded and decoded charges"
+    )]
     async fn compressed_response_read_counts_model_with_decoded_json() {
         let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
         let codec = StoreCompressionConfig {

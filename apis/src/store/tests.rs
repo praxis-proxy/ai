@@ -4853,6 +4853,43 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
     assert_eq!(messages.len(), 2, "messages cache should have 2 items");
 }
 
+#[tokio::test]
+#[ignore]
+async fn pg_bounded_message_rebuild_rejects_before_fetch_and_rolls_back() {
+    let store = make_pg_store_with_items().await;
+    let owner = crate::test_utils::test_owner("tenant_a");
+    let conversation_id = "conv_bounded_sync";
+    let conv = ConversationRecord {
+        conversation_id: conversation_id.to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let item = make_conversation_item("item_a", "tenant_a", conversation_id, 0);
+    let rejected = store
+        .create_items_and_sync_messages_bounded(&owner, conversation_id, std::slice::from_ref(&item), 1)
+        .await;
+    assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+    let items = store
+        .list_conversation_items(&owner, conversation_id, None, 10, true)
+        .await
+        .expect("list after rollback should succeed");
+    assert!(items.is_empty(), "over-budget insertion must roll back");
+
+    store
+        .create_items_and_sync_messages_bounded(&owner, conversation_id, &[item], 4096)
+        .await
+        .expect("fitting rebuild should succeed");
+    let conversation = ConversationItemStore::get_conversation(&store, &owner, conversation_id)
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    assert_eq!(conversation.messages.as_array().map(Vec::len), Some(1));
+}
+
 // -----------------------------------------------------------------------------
 // delete_item_and_sync_messages (PostgreSQL)
 // -----------------------------------------------------------------------------
