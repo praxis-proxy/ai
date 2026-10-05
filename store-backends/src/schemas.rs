@@ -194,8 +194,13 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
 }
 
 /// Add a repair pointer when legacy duplicate positions prevent index creation.
-pub(crate) fn ddl_error(statement: &str, error: impl std::fmt::Display) -> StoreError {
-    let hint = if statement.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS idx_") && statement.contains("_position ") {
+pub(crate) fn ddl_error(statement: &str, error: &sqlx::Error) -> StoreError {
+    let hint = if statement.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS idx_")
+        && statement.contains("_position ")
+        && error
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+    {
         "; see docs/store/legacy-item-position-repair.md for pre-index data repair"
     } else {
         ""
@@ -1163,18 +1168,57 @@ mod tests {
         assert_eq!(count, 2, "failed startup must not discard legacy rows");
     }
 
-    #[test]
-    fn position_index_error_points_to_legacy_repair() {
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn position_index_error_points_to_legacy_repair() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool should connect");
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TABLE items (conversation_id TEXT, position INTEGER)",
+        ))
+        .execute(&pool)
+        .await
+        .expect("table should be created");
+        sqlx::query(sqlx::AssertSqlSafe(
+            "INSERT INTO items VALUES ('conv_1', 1), ('conv_1', 1)",
+        ))
+        .execute(&pool)
+        .await
+        .expect("duplicate positions should be seeded before the index exists");
         let index = "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_position ON items(conversation_id, position)";
-        let err = ddl_error(index, "duplicate position");
+        let cause = sqlx::query(sqlx::AssertSqlSafe(index))
+            .execute(&pool)
+            .await
+            .expect_err("duplicate positions should prevent index creation");
+        let err = ddl_error(index, &cause);
         assert!(
             err.to_string().contains("docs/store/legacy-item-position-repair.md"),
             "startup error should identify the operator-run repair: {err}"
         );
-        let unrelated = ddl_error("CREATE TABLE items (...) ", "syntax error");
+
+        sqlx::query(sqlx::AssertSqlSafe("DROP TABLE items"))
+            .execute(&pool)
+            .await
+            .expect("table should be dropped");
+        let cause = sqlx::query(sqlx::AssertSqlSafe(index))
+            .execute(&pool)
+            .await
+            .expect_err("a missing table should prevent the same index statement");
+        let unrelated_index = ddl_error(index, &cause);
         assert!(
-            !unrelated.to_string().contains("legacy-item-position-repair"),
-            "unrelated SQL errors must not suggest a duplicate-position repair"
+            !unrelated_index.to_string().contains("legacy-item-position-repair"),
+            "unrelated database errors on the position index must not recommend data repair: {unrelated_index}"
+        );
+    }
+
+    #[test]
+    fn unrelated_position_index_failure_has_no_repair_hint() {
+        let index = "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_position ON items(conversation_id, position)";
+        let err = ddl_error(index, &sqlx::Error::PoolClosed);
+        assert!(
+            !err.to_string().contains("legacy-item-position-repair"),
+            "non-database errors must not suggest a duplicate-position repair: {err}"
         );
     }
 
