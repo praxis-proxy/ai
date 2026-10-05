@@ -16,8 +16,6 @@ pub(crate) mod error_response_formatter;
 pub(crate) mod include;
 mod operation;
 pub(crate) mod operation_classifier;
-#[cfg(feature = "openai-responses")]
-pub mod retained_payload_budget;
 pub(crate) mod responses;
 pub(crate) mod sse;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
