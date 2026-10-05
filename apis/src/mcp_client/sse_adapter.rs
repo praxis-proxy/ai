@@ -18,7 +18,13 @@
 //! single [`futures::stream::try_unfold`] rather than the upstream
 //! `pin_project!` wrapper.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    mem::size_of,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use futures::stream::{BoxStream, StreamExt as _};
 use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
@@ -200,8 +206,52 @@ struct ByteState {
     operation_cap: usize,
     /// Per-event size limiter.
     per_event: SseEventSizeLimiter,
+    /// Raw bytes in the unfinished SSE event, including comments and metadata.
+    raw_event: RawSseEventWindow,
+    /// Conservative charge for every event the parser may queue from one chunk.
+    batch_charge: Arc<AtomicUsize>,
     /// Out-of-band signal for recording `ResponseTooLarge`.
     signal: SseSignalTarget,
+}
+
+/// Track the borrowed raw SSE window before the parser can allocate owners.
+/// A blank line ends the current event; CRLF is one line ending.
+#[derive(Clone, Copy, Default)]
+struct RawSseEventWindow {
+    /// Raw bytes since the last blank event boundary.
+    bytes: usize,
+    /// Whether the current line has any content.
+    line_has_content: bool,
+    /// Treat a CRLF pair as one line ending across chunks.
+    previous_was_cr: bool,
+}
+
+impl RawSseEventWindow {
+    /// Count completed frames while advancing the borrowed raw event window.
+    fn observe(&mut self, chunk: &[u8]) -> usize {
+        let mut completed = 0_usize;
+        for &byte in chunk {
+            self.bytes = self.bytes.saturating_add(1);
+            if self.previous_was_cr {
+                self.previous_was_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' | b'\n' => {
+                    if !self.line_has_content {
+                        self.bytes = 0;
+                        completed = completed.saturating_add(1);
+                    }
+                    self.line_has_content = false;
+                    self.previous_was_cr = byte == b'\r';
+                },
+                _ => self.line_has_content = true,
+            }
+        }
+        completed
+    }
 }
 
 /// Adapt `body` into an rmcp SSE stream, enforcing both byte budgets.
@@ -234,18 +284,55 @@ pub(super) fn sse_stream_from_body(
         .min(max_sse_event_size)
         .min(preparse_peak_limit.unwrap_or(usize::MAX));
     let parse_signal = signal.clone();
+    let batch_charge = Arc::new(AtomicUsize::new(0));
     let state = ByteState {
         body,
         emitted: 0,
         operation_cap,
         per_event: SseEventSizeLimiter::new(effective_per_event),
+        raw_event: RawSseEventWindow::default(),
+        batch_charge: Arc::clone(&batch_charge),
         signal,
     };
 
-    let byte_stream = futures::stream::try_unfold(state, |mut st| async move {
+    let byte_stream = futures::stream::try_unfold(state, move |mut st| async move {
         loop {
             match st.body.next_chunk().await {
                 Ok(Some(chunk)) => {
+                    if let Some(limit) = preparse_peak_limit {
+                        // sse-stream may hold the raw chunk, an unfinished
+                        // line, and owned fields for every event it queues.
+                        // Include comments, which its retained-field limiter
+                        // intentionally excludes.
+                        let raw_window = st.raw_event.bytes.checked_add(chunk.len());
+                        let mut next_window = st.raw_event;
+                        let completed = next_window.observe(&chunk);
+                        let queued_nodes = if completed == 0 {
+                            Some(0)
+                        } else {
+                            completed
+                                .checked_mul(2)
+                                .map(|slots| slots.max(4))
+                                .and_then(|slots| slots.checked_mul(size_of::<Sse>()))
+                        };
+                        if raw_window
+                            .and_then(|bytes| bytes.checked_mul(3))
+                            .and_then(|bytes| bytes.checked_add(queued_nodes?))
+                            .is_none_or(|bytes| bytes > limit)
+                        {
+                            st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                            return Err(SseByteStreamError::JsonExpansion { limit });
+                        }
+                        // The parser has consumed the raw chunk before its
+                        // map callback; only one logical copy of its queued
+                        // fields and unfinished line remains alongside the
+                        // VecDeque node storage.
+                        let charge = raw_window
+                            .and_then(|bytes| bytes.checked_add(queued_nodes.unwrap_or(limit)))
+                            .unwrap_or(limit);
+                        st.batch_charge.store(charge, Ordering::Relaxed);
+                        st.raw_event = next_window;
+                    }
                     // Per-event (per-message) ceiling, before parsing.
                     if st.per_event.observe(&chunk).is_err() {
                         let limit = st.per_event.max_size;
@@ -290,14 +377,15 @@ pub(super) fn sse_stream_from_body(
                 .checked_add(frame.event.as_ref().map_or(0, String::len))
                 .and_then(|bytes| bytes.checked_mul(2));
             let parse_fits = preparse_peak_limit.is_none_or(|limit| {
-                frame.data.as_deref().is_none_or(|data| {
-                    metadata_bytes
-                        .and_then(|bytes| {
+                metadata_bytes
+                    .and_then(|bytes| bytes.checked_add(batch_charge.load(Ordering::Relaxed)))
+                    .and_then(|bytes| {
+                        frame.data.as_deref().map_or(Some(bytes), |data| {
                             super::subrequest_transport::json_preparse_peak_bytes(data.as_bytes())
                                 .and_then(|peak| bytes.checked_add(peak))
                         })
-                        .is_some_and(|bytes| bytes <= limit)
-                })
+                    })
+                    .is_some_and(|bytes| bytes <= limit)
             });
             if !parse_fits {
                 let limit = preparse_peak_limit.unwrap_or(0);
@@ -357,7 +445,7 @@ impl FakeStreamingBody {
 
     #[expect(dead_code, reason = "probe for future cancellation tests")]
     pub(super) fn cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        self.cancelled.load(Ordering::SeqCst)
     }
 }
 
@@ -390,7 +478,7 @@ impl StreamingResponseBody for FakeStreamingBody {
     }
 
     async fn cancel(&mut self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 }
 
@@ -582,5 +670,72 @@ mod tests {
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 1_024 })
         ));
+    }
+
+    #[tokio::test]
+    async fn id_only_frame_is_bounded_before_parser_allocates_it() {
+        let event = format!("id: {}\n\n", "x".repeat(900));
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(event)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 65_536, 65_536, 65_536, Arc::clone(&signal).into(), Some(1_024));
+        assert!(stream.next().await.expect("oversized id-only frame").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 1_024 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fragmented_comment_line_is_bounded_before_parser_allocates_it() {
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [
+                Bytes::from(format!(":{}", "x".repeat(300))),
+                Bytes::from("x".repeat(300)),
+            ],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 65_536, 65_536, 65_536, Arc::clone(&signal).into(), Some(1_024));
+        assert!(stream.next().await.expect("oversized unfinished comment").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 1_024 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn many_small_events_in_one_chunk_share_parse_allowance() {
+        // The raw 6 KiB batch fits a 32 KiB allowance after the 3x
+        // parser-copy reserve; 1,000 queued Sse structs do not.
+        let chunk = "id:a\n\n".repeat(1_000);
+        let body = Box::new(FakeStreamingBody::from_chunks([Bytes::from(chunk)], cancelled_flag()));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 65_536, 65_536, 65_536, Arc::clone(&signal).into(), Some(32_768));
+        assert!(stream.next().await.expect("oversized event batch").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 32_768 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_crlf_boundary_keeps_small_event_admitted() {
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"data: {}\r"), Bytes::from_static(b"\n\r\n")],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 1_024, Arc::clone(&signal).into(), Some(1_024));
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("one event")
+                .expect("admitted")
+                .data
+                .as_deref(),
+            Some("{}")
+        );
+        assert!(signal.get().is_none());
     }
 }

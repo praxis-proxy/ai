@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+use futures::StreamExt as _;
+
 use super::{
     session_pool::{MAX_IDLE_PER_KEY, MAX_TOTAL_IDLE, close_sessions},
     *,
@@ -1482,6 +1484,21 @@ fn owner_projecting_mcp_callout() -> McpCallout {
 }
 
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
+fn streaming_mcp_callout() -> McpCallout {
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_mcp_streaming_selector" => McpStreamingSelectorFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> =
+        serde_yaml::from_str("- filter: openai_mcp_streaming_selector\n").unwrap();
+    let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    McpCallout::fabricated(true)
+        .unwrap()
+        .with_pipeline_for_test(StdArc::new(pipeline))
+}
+
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 
 #[tokio::test]
@@ -2051,6 +2068,176 @@ async fn successful_tool_result_cannot_clear_recorded_size_failure() {
     session.finish_call(&signal);
     session.close().await;
     ct.cancel();
+    assert!(matches!(
+        result,
+        Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
+    ));
+}
+
+#[derive(Default)]
+struct ResumedSseTestState {
+    /// Tool request id returned only by the resumed GET.
+    tool_id: Mutex<serde_json::Value>,
+    /// Number of valid Last-Event-ID resumptions observed.
+    get_count: AtomicUsize,
+    /// Request sequence for diagnosing reconnect behavior.
+    requests: Mutex<Vec<String>>,
+}
+
+fn resumed_sse_response(
+    status: http::StatusCode,
+    content_type: &str,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .unwrap()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "models initialize, failing SSE POST, and resumed GET in one test server"
+)]
+async fn resumed_sse_handler(
+    axum::extract::State(state): axum::extract::State<StdArc<ResumedSseTestState>>,
+    method: http::Method,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if method == http::Method::GET {
+        state.requests.lock().unwrap().push(format!(
+            "GET {:?}",
+            headers.get("last-event-id").and_then(|value| value.to_str().ok())
+        ));
+        if headers.get("last-event-id").and_then(|value| value.to_str().ok()) != Some("resume-1") {
+            return resumed_sse_response(http::StatusCode::BAD_REQUEST, "text/plain", axum::body::Body::empty());
+        }
+        state.get_count.fetch_add(1, Ordering::Relaxed);
+        let id = state.tool_id.lock().unwrap().clone();
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": "recovered"}]}
+        });
+        return resumed_sse_response(
+            http::StatusCode::OK,
+            "text/event-stream",
+            axum::body::Body::from(format!("data: {reply}\n\n")),
+        );
+    }
+    if method != http::Method::POST {
+        return resumed_sse_response(
+            http::StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain",
+            axum::body::Body::empty(),
+        );
+    }
+    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    state.requests.lock().unwrap().push(
+        request
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+    );
+    let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    match request.get("method").and_then(serde_json::Value::as_str) {
+        Some("initialize") => {
+            let version = request
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("2025-06-18");
+            let reply = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "resume-test", "version": "1"}
+                }
+            });
+            resumed_sse_response(
+                http::StatusCode::OK,
+                "application/json",
+                axum::body::Body::from(reply.to_string()),
+            )
+        },
+        Some("notifications/initialized") => {
+            resumed_sse_response(http::StatusCode::ACCEPTED, "text/plain", axum::body::Body::empty())
+        },
+        Some("tools/call") => {
+            *state.tool_id.lock().unwrap() = id.clone();
+            let oversized = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"content": [{"type": "text", "text": "x".repeat(16_384)}]}
+            });
+            let later = bytes::Bytes::from(format!("data: {oversized}\n\n"));
+            let chunks = futures::stream::once(async {
+                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(b"id: resume-1\n\n"))
+            })
+            .chain(futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<bytes::Bytes, std::io::Error>(later)
+            }));
+            resumed_sse_response(
+                http::StatusCode::OK,
+                "text/event-stream",
+                axum::body::Body::from_stream(chunks),
+            )
+        },
+        _ => resumed_sse_response(http::StatusCode::BAD_REQUEST, "text/plain", axum::body::Body::empty()),
+    }
+}
+
+/// A parse breach after an event id is reconnectable in rmcp. A subsequent
+/// valid GET result cannot make the original tool call succeed.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "starts one server and checks its complete reconnect lifecycle"
+)]
+async fn resumed_get_cannot_clear_prior_sse_parse_budget_failure() {
+    let state = StdArc::new(ResumedSseTestState::default());
+    let router = axum::Router::new()
+        .route("/mcp", axum::routing::any(resumed_sse_handler))
+        .with_state(StdArc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let ct = tokio_util::sync::CancellationToken::new();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    let result = call_tool_with_forwarded_headers_with_budget(
+        None,
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({"message": "hello"}),
+        INTEGRATION_TIMEOUT,
+        1_024,
+        MAX_CONTROL_RESPONSE_BYTES,
+        Some(2_048),
+        &streaming_mcp_callout(),
+    )
+    .await;
+    ct.cancel();
+    assert!(
+        state.get_count.load(Ordering::Relaxed) > 0,
+        "rmcp must resume with Last-Event-ID: result={result:?}, requests={:?}",
+        state.requests.lock().unwrap()
+    );
     assert!(matches!(
         result,
         Err(McpClientError::ResponseTooLarge { limit: 2_048, .. })
