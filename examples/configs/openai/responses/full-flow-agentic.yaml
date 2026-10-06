@@ -682,6 +682,13 @@ filter_chains:
       # Inert on requests without context_management. Its anonymous summarization
       # callout targets the gateway's own Chat backend; a deployment points
       # inference_url at whatever summarizer it trusts.
+      #
+      # Like the IRR below, this filter owns an ordinary pre-read request-body
+      # hook that runs before the binding router publishes a decision, so it
+      # cannot carry a `bound_upstream` condition (core rejects that combination
+      # at build time). OpenAI-bound requests skip it structurally instead: the
+      # terminal direct-openai branch above stops the parent chain before it
+      # reaches this filter.
       - filter: openai_responses_compact
         allow_pre_security_callout: true
         inference_url: "http://127.0.0.1:3001/v1/chat/completions"
@@ -690,10 +697,6 @@ filter_chains:
         # model their summarization endpoint serves (tests substitute it).
         default_model: gpt-4o-mini
         timeout_ms: 60000
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway

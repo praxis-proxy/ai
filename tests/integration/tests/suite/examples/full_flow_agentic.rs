@@ -530,7 +530,11 @@ fn full_flow_native_chat_ingress_reaches_chat_backend_raw() {
     );
 
     let requests = backend.requests();
-    assert_eq!(requests.len(), 1, "native chat ingress makes exactly one backend request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "native chat ingress makes exactly one backend request"
+    );
     assert_eq!(
         requests[0].uri, "/v1/chat/completions",
         "native chat ingress must reach the Chat backend path unchanged"
@@ -584,7 +588,11 @@ fn full_flow_identity_model_rewrite_preserves_model_value() {
         ),
     );
 
-    assert_eq!(parse_status(&raw), 200, "identity-aliased request should complete: {raw}");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "identity-aliased request should complete: {raw}"
+    );
 
     let requests = backend.requests();
     assert_eq!(requests.len(), 1, "single-pass IRR should make one inference request");
