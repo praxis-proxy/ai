@@ -254,58 +254,48 @@ container with
 from the host under `--network host`). When finished, replace the `kill` in
 the cleanup section with `docker rm -f praxis-vllm`.
 
-#### The native Codex example needs a rebuilt image
+#### The native Codex example needs a writable database path
 
-The published image is built with `PRAXIS_AI_FEATURES=full`, and `full` does
-not include `store-sqlite` (it selects `store-postgres` as the store backend).
-`client-tool-compat.yaml` — the preferred native Codex example — therefore
-cannot run on the stock image; `--validate` rejects it up front:
+The image is built with `full,store-sqlite`, so `client-tool-compat.yaml` — the
+preferred native Codex example — runs on the stock image. The other three
+configurations in this section have no store filter and need no change at all.
 
-```text
-invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
-```
-
-The other three configurations in this section have no store filter and run on the
-published image unchanged. For the native Codex path, build the image locally
-with SQLite compiled in:
-
-```console
-docker build -f Containerfile \
-  --build-arg PRAXIS_AI_FEATURES=full,store-sqlite \
-  -t praxis-ai:sqlite .
-```
-
-Then give the store a writable path. The image's `/etc/praxis` working
-directory is root-owned while the process runs as `praxis`, so the example's
-relative `sqlite://responses.db?mode=rwc` cannot be created: the proxy starts,
-and the first `/v1/responses` request fails with HTTP 500 and
-`unable to open database file`. Point `database_url` at a mounted directory the
-container user can write instead:
+The one edit the store example does need is an absolute `database_url`. The
+image's `/etc/praxis` working directory is root-owned while the process runs as
+`praxis` (UID 100), so the example's relative `sqlite://responses.db?mode=rwc`
+cannot be created: the proxy starts, and the first `/v1/responses` request
+fails with HTTP 500 and `unable to open database file`. Point `database_url` at
+`/var/lib/praxis`, the writable state directory owned by the container user:
 
 ```yaml
 - filter: openai_response_store
   backend: sqlite
-  database_url: "sqlite:///data/responses.db?mode=rwc"
+  database_url: "sqlite:///var/lib/praxis/responses.db?mode=rwc"
 ```
 
 ```console
-mkdir -m 0777 -p "$PWD/praxis-responses"
 docker run -d --rm --name praxis-vllm \
   --network host \
+  -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  -v "$PWD/praxis-responses:/data:z" \
-  praxis-ai:sqlite -c /etc/praxis/praxis.yaml
+  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
 ```
 
-The permissive mode is what lets UID 100 create the database in a host
-directory owned by your user; a directory `chown`ed to UID 100 works too.
-Podman can use a named volume instead, with the `:U` suffix asking it to chown
-the volume to the container user: `-v praxis-responses:/data:U`.
+The database then lives in the container's writable layer and disappears with
+`--rm`, which is usually what a CLI test loop wants. To keep responses across
+restarts, mount a volume at `/var/lib/praxis`: `-v praxis-state:/var/lib/praxis`
+with Podman adds `:U` to chown it to the container user, and a host directory
+needs `chown 100:100` (or `-m 0777`) before the first run.
 
-The published image can also serve this example with `backend: postgres`,
+SQLite in the image landed after `v0.5.0`, so a pinned older tag still rejects
+the config at startup with
+`backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature`. Use
+`latest` or a tag newer than `v0.5.0`.
+
+The image can also serve this example with `backend: postgres`,
 `allow_private_database_url: true`, and a reachable PostgreSQL instance — see
 `examples/configs/openai/responses/response-store-postgres-mtls.yaml` — but for
-a single-developer CLI loop the locally built SQLite image is less setup.
+a single-developer CLI loop SQLite is less setup.
 
 ## 3. Connect Codex
 
