@@ -405,6 +405,16 @@ def _patched_config(listener_port: int, backend_port: int) -> str:
     text = CONFIG_PATH.read_text()
     text = text.replace("127.0.0.1:8080", f"127.0.0.1:{listener_port}")
     text = text.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    # CI GPU runners execute as root, and Praxis refuses to start as root unless
+    # the config opts in. Enable it in this throwaway test copy only; the shipped
+    # example stays strict. On a non-root host the flag is a harmless no-op.
+    if "allow_root:" not in text:
+        if "insecure_options:" in text:
+            text = text.replace(
+                "insecure_options:", "insecure_options:\n  allow_root: true", 1
+            )
+        else:
+            text += "\ninsecure_options:\n  allow_root: true\n"
     return text
 
 
