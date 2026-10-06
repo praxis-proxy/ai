@@ -385,7 +385,7 @@ def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -
                         "header": OWNER_HEADER,
                     },
                     conversations_filter,
-                    {"filter": "openai_responses_format"},
+                    {"filter": "openai_responses_request", "initialize_state": False},
                     response_store_filter,
                     {
                         "filter": "router",

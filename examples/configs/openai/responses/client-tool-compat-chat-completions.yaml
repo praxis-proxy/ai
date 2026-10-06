@@ -47,7 +47,8 @@ listeners:
 filter_chains:
   - name: client-tool-compat-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

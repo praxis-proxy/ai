@@ -17,7 +17,8 @@ listeners:
 filter_chains:
   - name: agentic-deferred-mcp-fixture
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

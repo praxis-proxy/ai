@@ -1923,7 +1923,7 @@ fn make_context_with_request_headers(
     }
     let request = Box::leak(Box::new(request));
     let mut ctx = crate::test_utils::make_filter_context(request);
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_request.stream", "false");
     if let Some(state) = state {
         ctx.extensions.insert(state);
     }

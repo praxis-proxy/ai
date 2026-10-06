@@ -10,7 +10,7 @@
 # round (#1046).
 #
 # Request order (forward):
-#   1. openai_responses_format classifies the client request.
+#   1. openai_responses_request (facts) classifies the client request.
 #   2. openai_responses_request creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
 #   4. openai_file_search_callout dispatches the owner's pending hosted
@@ -40,7 +40,8 @@ listeners:
 filter_chains:
   - name: responses-file-search-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

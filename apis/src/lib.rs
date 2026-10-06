@@ -207,7 +207,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
+            http "openai_responses_request" => crate::openai::OpenaiResponsesRequestFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,

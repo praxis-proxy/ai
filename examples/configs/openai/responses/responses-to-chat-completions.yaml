@@ -6,7 +6,7 @@
 # /v1/chat/completions.
 #
 # Request order:
-#   1. openai_responses_format classifies the client request.
+#   1. openai_responses_request (facts) classifies the client request.
 #   2. openai_responses_request performs the canonical JSON parse and
 #      creates ResponsesState for downstream enrichment and translation.
 #   3. openai_response_store initializes the shared response store.
@@ -44,7 +44,8 @@ listeners:
 filter_chains:
   - name: responses-chat-translation
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

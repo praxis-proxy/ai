@@ -149,8 +149,9 @@ reviews:
         binding.
         Once that lifecycle is implemented, review it against the issue's
         contract instead of requiring this rejection. Do not flag the
-        openai_responses_format classifier preserving background as routing
-        metadata, nor a provider-owned/direct passthrough (e.g. http-passthrough)
+        classifier-only openai_responses_request pass (initialize_state: false)
+        preserving background as routing metadata, nor a provider-owned/direct
+        passthrough (e.g. http-passthrough)
         that forwards background=true unchanged to a native OpenAI backend —
         that preservation is intentional; rejection is deliberately deferred to
         the gateway-owned stage.

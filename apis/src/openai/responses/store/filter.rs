@@ -725,7 +725,7 @@ fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a conversation.
 fn has_conversation(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+    ctx.get_metadata("openai_responses_request.has_conversation") == Some("true")
 }
 
 /// Return whether the request method is not persistable.
@@ -739,7 +739,7 @@ fn is_non_post_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is not a Responses API request.
 fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    let format = ctx.get_metadata("openai_responses_format.format");
+    let format = ctx.get_metadata("openai_responses_request.format");
     let skip = !is_responses_format(ctx);
     if skip {
         trace!(format = ?format, "skipping non-responses format");
@@ -749,12 +749,12 @@ fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is classified as a Responses API request.
 fn is_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
 }
 
 /// Return whether the request explicitly disabled persistence.
 fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
-    let skip = ctx.get_metadata("openai_responses_format.store") == Some("false");
+    let skip = ctx.get_metadata("openai_responses_request.store") == Some("false");
     if skip {
         trace!("skipping persistence (store=false)");
     }
@@ -763,7 +763,7 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream") == Some("true")
+    ctx.get_metadata("openai_responses_request.stream") == Some("true")
 }
 
 /// Return whether this is a streaming replay retrieval
@@ -798,7 +798,7 @@ fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a previous response.
 fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_previous_response_id") == Some("true")
+    ctx.get_metadata("openai_responses_request.has_previous_response_id") == Some("true")
 }
 
 /// Check whether persistence was skipped during the response phase.
@@ -1165,7 +1165,7 @@ impl ResponseStoreFilter {
     /// GETs fall through to normal retrieval, and unrelated paths continue.
     async fn handle_get_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // A replay GET returns a streaming SSE response. Force streaming
-        // response mode first: a legacy `openai_responses_format` pipeline
+        // response mode first: an `openai_responses_request` pipeline
         // classifies the GET as Responses-format with `stream=false` (the flag
         // is read from a POST body it never sees), which would otherwise select
         // the buffered override in `on_request` and make the runtime reject the

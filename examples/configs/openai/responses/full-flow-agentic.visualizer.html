@@ -1106,7 +1106,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "head-based match -\u003e openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format"
+          "note": "head-based match -\u003e openai_responses create; the Chat/unclassified body is ignored here and discriminated later by the pre-routing openai_responses_request"
         },
         "S11": {
           "state": "passthrough",
@@ -1123,12 +1123,13 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_responses_format",
-      "name": "openai_responses_format",
+      "id": "openai_responses_request_prerouting",
+      "name": "openai_responses_request (pre-routing)",
       "group": "classification",
       "order": 6,
-      "phase": "request-phase classifier; promotes internal x-praxis-* routing headers",
+      "phase": "request-phase classifier (initialize_state false); promotes internal x-praxis-* routing headers without minting state",
       "config": {
+        "initialize_state": false,
         "on_invalid": "continue",
         "headers.format": "x-praxis-ai-format",
         "headers.model": "x-praxis-ai-model",
@@ -3028,7 +3029,7 @@ const PIPELINE = {
       {
         "order": 6,
         "depth": 0,
-        "filter_type": "openai_responses_format",
+        "filter_type": "openai_responses_request",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -4239,7 +4240,7 @@ const WIRE = {
       "Connection: close"
     ],
     "resBody": "",
-    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so none of the router's /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.",
+    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by the pre-routing openai_responses_request, so none of the router's /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.",
     "provenance": [
       "examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
@@ -4288,7 +4289,7 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}",
-    "notes": "model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_request, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider's response (status:queued) is returned verbatim without gateway composition.",
+    "notes": "model gpt-5 makes the pre-routing openai_responses_request publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so the managed openai_responses_request owner, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider's response (status:queued) is returned verbatim without gateway composition.",
     "provenance": [
       {
         "tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough": "200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)"
@@ -4315,7 +4316,7 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}",
-    "notes": "model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object==\"response\" and output[0].content[0].text==\"translated\"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.",
+    "notes": "model vllm-chat makes the pre-routing openai_responses_request publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object==\"response\" and output[0].content[0].text==\"translated\"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.",
     "provenance": [
       {
         "tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding": "200, response.object==response + output text \"translated\"; backend gets one /v1/chat/completions request whose body has messages and no input)"

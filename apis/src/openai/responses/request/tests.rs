@@ -89,13 +89,13 @@ async fn a_create_request_publishes_classification_metadata() {
     // Published under the namespace downstream filters already read.
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_responses_request.format")
             .map(String::as_str),
         Some("openai_responses")
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.stream")
+            .get("openai_responses_request.stream")
             .map(String::as_str),
         Some("true")
     );
@@ -163,7 +163,7 @@ async fn a_model_only_create_is_classified_from_the_endpoint() {
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_responses_request.format")
             .map(String::as_str),
         Some("openai_responses"),
         "body heuristics find no discriminator, but the create endpoint decides"
@@ -207,7 +207,7 @@ async fn a_positively_classified_body_is_not_relabelled() {
 
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_responses_request.format")
             .map(String::as_str),
         Some("openai_chat_completions"),
         "only unknown bodies are upgraded by endpoint authority"
@@ -279,10 +279,6 @@ async fn filter_results_are_published_under_this_filter() {
         Some("stateful"),
         "the routing fact a branch condition matches on"
     );
-    assert!(
-        !ctx.filter_results.contains_key("openai_responses_format"),
-        "nothing is published under the replaced filter's name"
-    );
 }
 
 /// A passthrough chain consumes no state, so it can opt out of building it.
@@ -301,14 +297,14 @@ async fn initialize_state_false_classifies_without_building_state() {
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_responses_request.format")
             .map(String::as_str),
         Some("openai_responses"),
         "classification is still published so routing is unaffected"
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.stream")
+            .get("openai_responses_request.stream")
             .map(String::as_str),
         Some("true"),
         "promoted routing facts are still published"
@@ -342,9 +338,12 @@ async fn state_is_initialized_by_default() {
 }
 
 #[tokio::test]
-async fn bodyless_responses_operations_are_left_alone() {
+async fn bodyless_responses_operations_publish_identity_without_state() {
     // The registry declares these as carrying no body, so there is nothing to
-    // parse and nothing to publish.
+    // parse. The endpoint is still authoritative that the request is Responses,
+    // so the format fact is published for header-based routing — a fetch or
+    // delete reaches the managed store exactly as it did under the former
+    // classifier — while no response-creating state is minted.
     for (method, path) in [
         (http::Method::GET, "/v1/responses/resp_123"),
         (http::Method::DELETE, "/v1/responses/resp_123"),
@@ -363,9 +362,12 @@ async fn bodyless_responses_operations_are_left_alone() {
             ctx.extensions.get::<ResponsesState>().is_none(),
             "{method} {path} must not initialize state"
         );
-        assert!(
-            !ctx.filter_metadata.contains_key("openai_responses_format.format"),
-            "{method} {path} publishes nothing; identity comes from the request head"
+        assert_eq!(
+            ctx.filter_metadata
+                .get("openai_responses_request.format")
+                .map(String::as_str),
+            Some("openai_responses"),
+            "{method} {path} still publishes its identity so header routing can see it"
         );
     }
 }
@@ -387,7 +389,7 @@ async fn an_absent_optional_body_is_not_an_invalid_body() {
         assert!(matches!(action, FilterAction::Release), "{path} should forward");
         assert_eq!(
             ctx.filter_metadata
-                .get("openai_responses_format.format")
+                .get("openai_responses_request.format")
                 .map(String::as_str),
             Some("openai_responses"),
             "{path} still publishes its identity so header routing can see it"
@@ -449,7 +451,7 @@ async fn other_body_bearing_responses_operations_are_processed() {
         assert!(matches!(action, FilterAction::Release), "{path}");
         assert_eq!(
             ctx.filter_metadata
-                .get("openai_responses_format.format")
+                .get("openai_responses_request.format")
                 .map(String::as_str),
             Some("openai_responses"),
             "{path} should publish its classification"
@@ -576,7 +578,7 @@ async fn an_unclassifiable_body_follows_on_invalid_continue() {
         assert!(matches!(action, FilterAction::Release), "{label} body should forward");
         let published = ctx
             .filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_responses_request.format")
             .map(String::as_str);
         assert!(
             published == Some("non_json") || published == Some("invalid_json"),
@@ -709,6 +711,61 @@ async fn the_bound_upstream_phase_initializes_state_like_the_pre_read_phase() {
     );
 }
 
+/// A managed pass reuses the pre-routing parse rather than deserializing twice.
+///
+/// A two-entry chain publishes routing facts before binding and initializes
+/// state after it. The create body must be parsed exactly once across both
+/// passes, so the body bytes are corrupted between them: if the managed pass
+/// re-parsed, it would fail to classify the garbage and release without state;
+/// reusing the cached parse, it initializes state from the original request.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential two-phase setup and cross-pass assertions"
+)]
+async fn the_managed_pass_reuses_the_pre_routing_parse() {
+    let body = json!({"model": "gpt-4.1", "input": "deserialize once"});
+
+    let facts = filter(FACTS_ONLY);
+    let managed = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+
+    let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+    let facts_action = facts.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
+    assert!(matches!(facts_action, FilterAction::Release));
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_some(),
+        "the pre-routing pass must cache its parse for the managed pass"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "the pre-routing pass mints no state"
+    );
+
+    // Corrupt the body so any re-parse in the managed pass would fail.
+    let mut corrupted = Some(Bytes::from_static(b"not json {{"));
+    let outcome = managed
+        .on_bound_upstream_request_body(&mut ctx, &mut corrupted)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "the managed pass must consume the cached parse"
+    );
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("the managed pass initializes state from the cached parse");
+    assert_eq!(
+        state.request_body.pointer("/input").and_then(serde_json::Value::as_str),
+        Some("deserialize once"),
+        "state must come from the original parse, not the corrupted bytes"
+    );
+}
+
 /// A managed `background: true` create is still rejected after binding.
 #[tokio::test]
 async fn the_bound_upstream_phase_still_rejects_managed_background() {
@@ -814,7 +871,7 @@ async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() 
     assert!(matches!(action, FilterAction::Release));
 
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.has_conversation"),
+        ctx.get_metadata("openai_responses_request.has_conversation"),
         Some("true"),
         "append-back is armed by the conversation selector"
     );
@@ -824,7 +881,7 @@ async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() 
         "the canonical conversation ID must be published before the owner is captured"
     );
     assert_ne!(
-        ctx.get_metadata("openai_responses_format.background"),
+        ctx.get_metadata("openai_responses_request.background"),
         Some("true"),
         "a background create does not arm local append-back"
     );
@@ -844,8 +901,300 @@ async fn a_create_without_a_conversation_does_not_arm_append_back() {
     drop(filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap());
 
     assert_ne!(
-        ctx.get_metadata("openai_responses_format.has_conversation"),
+        ctx.get_metadata("openai_responses_request.has_conversation"),
         Some("true"),
         "no conversation selector means no local append-back"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Routing Mode
+// -----------------------------------------------------------------------------
+
+/// Drive one create body through the default filter and return its context.
+async fn run_ctx<'a>(config_yaml: &str, request: &'a Request, body: &serde_json::Value) -> HttpFilterContext<'a> {
+    let filter = filter(config_yaml);
+    let mut ctx = make_filter_context(request);
+    let mut bytes = Some(Bytes::from(serde_json::to_vec(body).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "classification releases the request"
+    );
+    ctx
+}
+
+/// Read the routing-mode filter result published under this filter.
+fn mode_result<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
+    ctx.filter_results
+        .get("openai_responses_request")
+        .and_then(|r| r.get("mode"))
+}
+
+/// Collect promoted request headers for assertion.
+fn collect_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> std::collections::HashMap<&'a str, &'a str> {
+    ctx.extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect()
+}
+
+/// Mode is a pre-routing fact, so these drive the fact publisher
+/// (`initialize_state: false`) that computes it before the router runs. The
+/// managed owner rejects provider-owned fields such as `prompt` that are also
+/// stateful markers, which would mask the mode under test.
+const FACTS_ONLY: &str = "initialize_state: false\n";
+
+/// `store=false` with no other stateful marker is the one stateless case, and
+/// it must read the same across the filter result, metadata, and header.
+#[tokio::test]
+async fn mode_is_stateless_only_when_store_false_and_no_marker() {
+    let request = create_request();
+    let ctx = run_ctx(FACTS_ONLY, &request, &json!({"input": "test", "store": false})).await;
+
+    assert_eq!(mode_result(&ctx), Some("stateless"));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.mode")
+            .map(String::as_str),
+        Some("stateless")
+    );
+    assert_eq!(collect_headers(&ctx).get("x-praxis-responses-mode"), Some(&"stateless"));
+}
+
+/// Empty `tools` is not a stateful marker.
+#[tokio::test]
+async fn mode_is_stateless_when_store_false_and_tools_empty() {
+    let request = create_request();
+    let ctx = run_ctx(
+        FACTS_ONLY,
+        &request,
+        &json!({"input": "test", "store": false, "tools": []}),
+    )
+    .await;
+
+    assert_eq!(
+        mode_result(&ctx),
+        Some("stateless"),
+        "an empty tools array must not force the stateful path"
+    );
+}
+
+/// Omitted `store` defaults to stateful, as does an explicit `store=true`.
+#[tokio::test]
+async fn mode_is_stateful_when_store_is_default_or_true() {
+    let request = create_request();
+
+    let omitted = run_ctx(FACTS_ONLY, &request, &json!({"input": "test"})).await;
+    assert_eq!(
+        mode_result(&omitted),
+        Some("stateful"),
+        "omitted store defaults to true (stateful)"
+    );
+
+    let explicit = run_ctx(FACTS_ONLY, &request, &json!({"input": "test", "store": true})).await;
+    assert_eq!(mode_result(&explicit), Some("stateful"));
+}
+
+/// Any stateful marker keeps the request stateful even with `store=false`.
+#[tokio::test]
+async fn mode_is_stateful_when_store_false_but_a_marker_is_present() {
+    let request = create_request();
+    for marker in [
+        json!({"input": "test", "store": false, "previous_response_id": "resp_1"}),
+        json!({"input": "test", "store": false, "tools": [{"type": "function"}]}),
+        json!({"input": "test", "store": false, "conversation": {"id": "conv_1"}}),
+        json!({"input": "test", "store": false, "prompt": {"id": "pmpt_123"}}),
+    ] {
+        let ctx = run_ctx(FACTS_ONLY, &request, &marker).await;
+        assert_eq!(
+            mode_result(&ctx),
+            Some("stateful"),
+            "a stateful marker overrides store=false: {marker}"
+        );
+    }
+}
+
+/// Mode belongs only to Responses traffic; a Chat Completions body on the
+/// create endpoint keeps its own identity and is left without a mode.
+#[tokio::test]
+async fn mode_is_absent_for_a_chat_completions_body() {
+    let request = create_request();
+    let ctx = run_ctx(
+        FACTS_ONLY,
+        &request,
+        &json!({"messages": [{"role": "user", "content": "Hi"}]}),
+    )
+    .await;
+
+    assert!(mode_result(&ctx).is_none(), "mode is not set for chat completions");
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.mode"),
+        "mode metadata is absent for chat completions"
+    );
+    assert!(
+        !collect_headers(&ctx).contains_key("x-praxis-responses-mode"),
+        "mode header is absent for chat completions"
+    );
+    assert!(
+        ctx.extensions
+            .get::<praxis_filter::ErrorResponseFormatterHandle>()
+            .is_some(),
+        "the OpenAI error formatter is still installed for chat completions"
+    );
+}
+
+/// A custom mode header replaces the dedicated default name.
+#[tokio::test]
+async fn mode_header_honours_a_custom_name() {
+    let request = create_request();
+    let ctx = run_ctx(
+        "initialize_state: false\nheaders:\n  mode: x-custom-mode\n",
+        &request,
+        &json!({"input": "test", "store": false}),
+    )
+    .await;
+    let headers = collect_headers(&ctx);
+
+    assert_eq!(headers.get("x-custom-mode"), Some(&"stateless"));
+    assert!(
+        !headers.contains_key("x-praxis-responses-mode"),
+        "the default mode header is not emitted when overridden"
+    );
+}
+
+/// A null mode header suppresses the header but keeps the mode metadata.
+#[tokio::test]
+async fn mode_header_null_suppresses_only_the_header() {
+    let request = create_request();
+    let ctx = run_ctx(
+        "initialize_state: false\nheaders:\n  mode: null\n",
+        &request,
+        &json!({"input": "test", "store": false}),
+    )
+    .await;
+
+    assert!(
+        !collect_headers(&ctx).contains_key("x-praxis-responses-mode"),
+        "a null mode header suppresses emission"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.mode")
+            .map(String::as_str),
+        Some("stateless"),
+        "metadata is still written when the header is disabled"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Fact Promotion
+// -----------------------------------------------------------------------------
+
+/// Every configured header carries the body fact it was derived from.
+#[tokio::test]
+async fn model_and_stream_facts_are_promoted_to_headers() {
+    let request = create_request();
+    let ctx = run_ctx(
+        "{}",
+        &request,
+        &json!({"model": "gpt-4.1", "input": "hi", "stream": true}),
+    )
+    .await;
+    let headers = collect_headers(&ctx);
+
+    assert_eq!(headers.get("x-praxis-ai-format"), Some(&"openai_responses"));
+    assert_eq!(headers.get("x-praxis-ai-model"), Some(&"gpt-4.1"));
+    assert_eq!(headers.get("x-praxis-ai-stream"), Some(&"true"));
+}
+
+/// An oversized model value is dropped from every promotion channel so it
+/// cannot smuggle an unbounded value into a header, metadata, or a result.
+#[tokio::test]
+async fn an_oversized_model_is_not_promoted() {
+    let request = create_request();
+    let oversized = "a".repeat(9000);
+    let ctx = run_ctx("{}", &request, &json!({"model": oversized, "input": "hi"})).await;
+
+    assert!(
+        !collect_headers(&ctx).contains_key("x-praxis-ai-model"),
+        "an oversized model is not promoted to a header"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.model"),
+        "an oversized model is not promoted to metadata"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_responses_request")
+            .and_then(|r| r.get("model")),
+        None,
+        "an oversized model is not promoted to a filter result"
+    );
+}
+
+/// A model value carrying control characters is not a valid header value and
+/// must not be promoted.
+#[tokio::test]
+async fn a_control_char_model_is_not_promoted() {
+    let request = create_request();
+    let ctx = run_ctx("{}", &request, &json!({"model": "bad\nmodel", "input": "hi"})).await;
+
+    assert!(
+        !collect_headers(&ctx).contains_key("x-praxis-ai-model"),
+        "a control-character model is not promoted to a header"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.model"),
+        "a control-character model is not promoted to metadata"
+    );
+}
+
+/// Facts the body omits are not invented on any channel.
+#[tokio::test]
+async fn omitted_facts_are_not_promoted() {
+    let request = create_request();
+    // `model` and `stream` omitted; only the format is known from the endpoint.
+    let ctx = run_ctx("{}", &request, &json!({"input": "hi", "store": false})).await;
+    let headers = collect_headers(&ctx);
+
+    assert_eq!(headers.get("x-praxis-ai-format"), Some(&"openai_responses"));
+    assert!(!headers.contains_key("x-praxis-ai-model"), "no model fact to promote");
+    assert!(!headers.contains_key("x-praxis-ai-stream"), "no stream fact to promote");
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.model"),
+        "no model metadata when the body omits it"
+    );
+}
+
+/// Null header names suppress every promoted header while metadata and results
+/// stay intact.
+#[tokio::test]
+async fn null_header_names_suppress_all_header_promotion() {
+    let request = create_request();
+    let ctx = run_ctx(
+        "headers:\n  format: null\n  model: null\n  stream: null\n  mode: null\n",
+        &request,
+        &json!({"model": "gpt-4.1", "input": "hi", "stream": true}),
+    )
+    .await;
+
+    assert!(
+        collect_headers(&ctx).is_empty(),
+        "every promotion header is suppressed when its name is null"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.model")
+            .map(String::as_str),
+        Some("gpt-4.1"),
+        "metadata is still published when headers are disabled"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_responses_request")
+            .and_then(|r| r.get("model")),
+        Some("gpt-4.1"),
+        "filter results are still published when headers are disabled"
     );
 }

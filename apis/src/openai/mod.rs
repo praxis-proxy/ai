@@ -49,7 +49,7 @@ pub use responses::{
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};
 pub use responses::{
-    ModelRewriteFilter, ResponsesFormatFilter, ToolParseFilter,
+    ModelRewriteFilter, ToolParseFilter,
     routes::{
         PROTOCOL_EXTENSION_OPERATION_IDS as RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS, ResponsesOperation,
         ResponsesOperationSpec, operation_specs as responses_operation_specs,

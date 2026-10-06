@@ -434,7 +434,8 @@ filter_chains:
         credentials:
           - slot: ogx_files
             source_header: x-user-ogx-key
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -694,7 +695,8 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -794,7 +796,8 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -932,7 +935,8 @@ filter_chains:
         credentials:
           - slot: ogx_files
             source_header: x-user-ogx-key
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -1059,7 +1063,8 @@ filter_chains:
 
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

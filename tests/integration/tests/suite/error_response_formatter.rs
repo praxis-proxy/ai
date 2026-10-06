@@ -168,7 +168,12 @@ fn unclassified_connection_refused_returns_generic_fallback() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// YAML config with the OpenAI responses format filter.
+/// YAML config with the OpenAI operation classifier and responses request filter.
+///
+/// `ai_operation` installs the OpenAI error formatter from the request head for
+/// every classified OpenAI operation — Chat Completions included — while
+/// `openai_responses_request` classifies Responses create bodies. Unrecognized
+/// endpoints match neither, so they fall back to RFC 9457 Problem Details.
 fn openai_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
@@ -180,7 +185,9 @@ listeners:
 filter_chains:
   - name: classify
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: router
         routes:

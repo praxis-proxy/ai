@@ -36,7 +36,8 @@ listeners:
 filter_chains:
   - name: openai
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/v1"

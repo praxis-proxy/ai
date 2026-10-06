@@ -190,7 +190,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
         "failed MCP output item should identify the server: {response_body}"
     );
     // The lifecycle snapshots echo the requested model. In the shipped pipeline
-    // the format filter promotes it to `openai_responses_format.model` metadata,
+    // the classifier promotes it to `openai_responses_request.model` metadata,
     // so this exercises the metadata branch (not the ResponsesState fallback the
     // unit tests cover).
     assert!(
@@ -1552,7 +1552,8 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: openai_responses_request
         on_invalid: reject
@@ -1613,7 +1614,8 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: openai_responses_request
         on_invalid: reject
@@ -1657,7 +1659,7 @@ insecure_options:
 /// so persistence depends entirely on the resolver *creating* the state when it
 /// writes the terminal snapshot (`get_or_insert_with`, not `get_mut`). The store
 /// still triggers streaming persistence -- its gating reads only
-/// `openai_responses_format.*` metadata, which `openai_responses_format`
+/// `openai_responses_request.*` metadata, which `openai_responses_request`
 /// (always first) supplies -- and `build_record_from_state` reads only
 /// `response_object`, so a default state carrying just that field suffices.
 fn resolve_yaml_store_no_validate_rehydrate(
@@ -1678,7 +1680,8 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: openai_tool_parse
       - filter: state_owner
@@ -1716,7 +1719,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1746,7 +1750,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1777,7 +1782,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1807,7 +1813,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1838,7 +1845,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1874,7 +1882,8 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve

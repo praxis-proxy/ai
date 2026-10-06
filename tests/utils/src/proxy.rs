@@ -534,7 +534,11 @@ pub fn start_proxy(config: &Config) -> ProxyGuard {
     let client = configured_subrequest_client(config);
     let registry = praxis_ai::build_full_registry(&client);
     let guard = spawn_proxy_server(config, &registry, &client);
-    crate::net::wait::wait_for_http(&guard.addr);
+    // TCP-only readiness: the listener pipeline is built before `server.run`,
+    // so an accepted connection means the pipeline is installed. An HTTP probe
+    // would send a `GET /` that the operation-aware classifier releases to the
+    // backend, polluting request-count assertions, so avoid issuing one.
+    crate::net::wait::wait_for_tcp(&guard.addr);
     guard.wait_for_store_ready();
     guard
 }
@@ -564,7 +568,8 @@ pub fn start_proxy_no_wait(config: &Config) -> ProxyGuard {
 pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> ProxyGuard {
     let client = configured_subrequest_client(config);
     let guard = spawn_proxy_server(config, registry, &client);
-    crate::net::wait::wait_for_http(&guard.addr);
+    // TCP-only readiness; see `start_proxy` for why no HTTP probe is issued.
+    crate::net::wait::wait_for_tcp(&guard.addr);
     guard.wait_for_store_ready();
     guard
 }

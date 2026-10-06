@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Single request-body processor for body-bearing Responses operations.
+//! Request-body fact owner for body-bearing Responses operations.
 //!
 //! Operation identity comes from the request head through the Responses
-//! registry, so the body is never inspected to decide whether this filter
-//! applies. A matched request is then deserialized exactly once, and
-//! that one parsed value produces every downstream fact: the classification
-//! metadata, the promoted headers and filter results, the proxy-owned
-//! identifiers, and [`ResponsesState`].
+//! registry — the same source `ai_operation` uses — so the body is never
+//! inspected to decide whether this filter applies. A matched request is then
+//! deserialized once, and that one parsed value produces every downstream fact:
+//! the classification metadata, the promoted routing headers and filter
+//! results, the proxy-owned identifiers, and [`ResponsesState`].
 //!
-//! Create requests with `background=true` or a non-null `prompt` are rejected,
-//! because Praxis does not implement the asynchronous Responses lifecycle or
-//! provider-owned prompt templates on gateway-managed paths.
+//! The filter runs in one of two roles, chosen by `initialize_state`:
 //!
-//! This filter owns that parse outright. The separate validation stage it
-//! replaced parsed the body a second time after `openai_responses_format` had
-//! already parsed it, so routing facts, proxy-owned defaults, and state could
-//! be derived from different parses of one request.
+//! - A pre-routing fact publisher (`initialize_state: false`) classifies the body, promotes the model, stream, store,
+//!   and stateful/stateless mode facts the router needs, and hands its parse to a later managed pass. It mints no
+//!   identifiers and enforces no managed-path policy, so provider-owned traffic the router may still bind to a direct
+//!   upstream keeps its fields intact.
+//! - The managed owner (`initialize_state: true`, the default) additionally rejects `background=true` and non-null
+//!   `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When a
+//!   pre-routing pass already parsed the body, the managed pass reuses that parse rather than deserializing the body a
+//!   second time.
 //!
-//! Metadata keeps the `openai_responses_format` namespace, because twelve
-//! downstream filters read those keys and renaming them is a separate change
-//! rather than a side effect of consolidating the parse. Filter results are
-//! published under this filter's own name, since a branch condition must name
-//! the filter it is attached to.
+//! Classification metadata is published under this filter's `openai_responses_request`
+//! namespace, which downstream filters read. Filter results are published under
+//! this filter's own name, since a branch condition must name the filter it is
+//! attached to.
 //!
 //! # YAML
 //!
@@ -50,7 +51,7 @@ use tracing::{debug, trace};
 
 use super::{
     bound_body_outcome,
-    config::{ResponsesFormatConfig, ResponsesRequestConfig, build_config},
+    config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
@@ -66,9 +67,6 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
-/// Configuration matches `openai_responses_format`, so a chain keeps the same
-/// `on_invalid` and `headers` settings wherever this filter is placed.
-///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
 /// token counts. Bodyless operations — fetch, delete, cancel, list input items,
@@ -83,7 +81,7 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// resolve the saved object. Prefer `input` over top-level `instructions`,
 /// which managed-path content-policy extraction does not screen.
 ///
-/// Promotes `openai_responses_format.*` metadata, publishes filter results
+/// Promotes `openai_responses_request.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
 /// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
@@ -106,6 +104,95 @@ impl OpenaiResponsesRequestFilter {
             config: ResponsesRequestConfig { shared, ..cfg },
         }))
     }
+
+    /// Enforce the managed-path policy and initialize state from one parse.
+    ///
+    /// Runs on the managed owner, either directly from its own parse or from the
+    /// parse a pre-routing pass cached. Provider-owned fields that gateway-managed
+    /// create requests cannot honor are rejected before any state is built.
+    fn finish_managed_request(&self, ctx: &mut HttpFilterContext<'_>, cached: CachedRequestParse) -> FilterAction {
+        let CachedRequestParse {
+            parsed,
+            classified,
+            operation,
+        } = cached;
+
+        if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
+            return action;
+        }
+        if let Some(action) = reject_conflicting_history_selectors(&parsed) {
+            return action;
+        }
+
+        if let Some(reason) = state_skip_reason(&classified, &self.config, operation) {
+            trace!(reason, "leaving Responses state uninitialized");
+            return FilterAction::Release;
+        }
+
+        let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
+        let conversation_id = resolve_conversation_id(ctx, &parsed);
+
+        enrich_context(ctx, &classified, &response_id, &conversation_id);
+        // Must follow `enrich_context`: the owner is bound to the canonical
+        // conversation ID that call publishes, and the Conversations response path
+        // reads this immutable owner when appending the completed turn.
+        #[cfg(feature = "openai-conversations")]
+        crate::openai::conversations::capture_validated_append_owner(ctx);
+        insert_responses_state(ctx, parsed, &response_id);
+
+        debug!(
+            response_id = %response_id,
+            conversation_id = %conversation_id,
+            "managed create request processed and state initialized"
+        );
+
+        FilterAction::Release
+    }
+
+    /// Parse, classify, and publish routing facts for an entry with no cached parse.
+    ///
+    /// A pre-routing fact publisher hands its parse to a later managed pass; a
+    /// managed owner with no earlier pass finishes the request from this one parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] when publishing classification facts fails.
+    fn classify_fresh_request(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        operation: ResponsesOperation,
+    ) -> Result<FilterAction, FilterError> {
+        // A body that cannot be classified follows `on_invalid` instead.
+        let (parsed, classified) = match parse_and_classify_create_body(body) {
+            Ok(pair) => pair,
+            Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
+        };
+
+        // Routing facts are published for every entry, in whichever phase it
+        // runs, so the router and downstream consumers read the same
+        // classification whether or not a managed pass follows.
+        let mode = super::compute_mode(&classified);
+        publish_classification(ctx, &classified, &self.config.shared, mode)?;
+
+        let cached = CachedRequestParse {
+            parsed,
+            classified,
+            operation,
+        };
+
+        if !self.config.initialize_state {
+            // A pre-routing fact publisher mints no identifiers and enforces no
+            // managed-path policy, so provider-owned traffic the router may still
+            // bind to a direct upstream keeps its fields intact. The parse is
+            // handed to a later managed pass rather than repeated there.
+            ctx.extensions.insert(cached);
+            return Ok(FilterAction::Release);
+        }
+
+        // A managed owner with no earlier pass does both jobs from this one parse.
+        Ok(self.finish_managed_request(ctx, cached))
+    }
 }
 
 #[async_trait]
@@ -118,8 +205,9 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         BodyAccess::ReadOnly
     }
 
-    /// Also offer the bound-upstream phase, so a chain can defer this work
-    /// until the router has selected a logical provider.
+    /// The managed owner also offers the bound-upstream phase, so a chain can
+    /// defer its policy enforcement until the router has selected a logical
+    /// provider.
     ///
     /// Declaring both hooks is what lets the operator choose with a
     /// `bound_upstream` condition: core schedules the bound-upstream hook when
@@ -127,8 +215,19 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// Deferring matters for mixed chains, where provider-owned traffic must
     /// reach its upstream with its own fields intact while gateway-managed
     /// requests are still held to the managed-path policy.
+    ///
+    /// A pure fact publisher (`initialize_state: false`) enforces no managed-path
+    /// policy, so it has nothing to defer: it offers the pre-read hook only, like
+    /// the classifier it replaces. Declaring the bound-upstream hook anyway would
+    /// make a facts-only entry a bound-upstream participant and, in a chain with
+    /// an iterative request router, promote the router to a binding publisher it
+    /// never needed to be.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        if self.config.initialize_state {
+            BodyAccess::ReadOnly
+        } else {
+            BodyAccess::None
+        }
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -137,8 +236,21 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         }
     }
 
+    /// Only the managed owner offers the response path, and only for
+    /// end-of-stream teardown of the per-request MCP sessions it mints.
+    ///
+    /// A pure fact publisher (`initialize_state: false`) mints no sessions, so it
+    /// has nothing to tear down and declines response-body access entirely. This
+    /// mirrors [`Self::bound_upstream_request_body_access`]: were a facts-only
+    /// entry to declare access, it would join the response body as a `Stream`
+    /// participant and could downgrade a co-located store filter's buffered
+    /// accumulation, breaking streamed-response persistence.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        if self.config.initialize_state {
+            BodyAccess::ReadOnly
+        } else {
+            BodyAccess::None
+        }
     }
 
     /// Streamed, because the response body is never buffered here.
@@ -162,44 +274,40 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(matched) = matched_body_bearing_operation(ctx) else {
+        let Some(matched) = matched_responses_operation(ctx) else {
             trace!(
                 method = %ctx.request.method,
                 path = ctx.request.uri.path(),
-                "not a body-bearing Responses operation"
+                "not a Responses operation"
             );
             return Ok(FilterAction::Release);
         };
 
-        // An operation whose body the specification marks optional is complete
-        // without one, so an absent body is not an invalid body and must not
+        // A bodyless operation (fetch, delete, cancel, list input items, or the
+        // WebSocket handshake), or an operation whose body the specification
+        // marks optional that arrived without one, is a valid Responses request
+        // with nothing to classify. The endpoint is authoritative, so the format
+        // fact is still promoted for header-based routing — a fetch or delete
+        // reaches the managed store exactly as it did under the former
+        // classifier — but no body-derived facts, routing mode, or state are
+        // produced, and an absent optional body is not an invalid body that must
         // reach `on_invalid`.
-        if !matched.body.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty) {
+        if !matched.body.is_present() || (!matched.body.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty)) {
             trace!(
                 path = ctx.request.uri.path(),
-                "optional request body absent, publishing operation identity only"
+                "bodyless Responses operation, publishing operation identity only"
             );
             return publish_bodyless_operation(ctx, &self.config.shared);
         }
 
-        // The one parse feeds classification, promotion, and state alike. A body
-        // that cannot be classified follows `on_invalid` instead.
-        let (parsed, classified) = match parse_and_classify_create_body(body) {
-            Ok(pair) => pair,
-            Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
-        };
-
-        if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
-            return Ok(action);
+        // A managed pass reuses the parse a pre-routing pass cached, so a managed
+        // create body is deserialized exactly once across both phases.
+        if let Some(cached) = ctx.extensions.remove::<CachedRequestParse>() {
+            return Ok(self.finish_managed_request(ctx, cached));
         }
 
-        if let Some(action) = reject_conflicting_history_selectors(&parsed) {
-            return Ok(action);
-        }
-
-        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)?;
-
-        Ok(FilterAction::Release)
+        // Otherwise parse, classify, and publish facts from this phase.
+        self.classify_fresh_request(ctx, body, matched.operation)
     }
 
     /// Same processing, deferred until a logical provider is bound.
@@ -261,51 +369,19 @@ fn reject_unsupported_managed_fields(
     })
 }
 
-/// Publish everything the one parse produced.
+/// One deserialization carried from the pre-routing pass to the managed pass.
 ///
-/// Kept out of `on_request_body` so the filter entry point stays a readable
-/// sequence of guards.
-///
-/// # Errors
-///
-/// Returns [`FilterError`] when a filter result cannot be published.
-fn publish_request_facts(
-    ctx: &mut HttpFilterContext<'_>,
-    classified: &ClassifiedRequest,
+/// Publishing routing facts requires parsing the body before the router runs,
+/// and the managed owner needs the same parse after binding. Holding the parse
+/// here, keyed in request extensions, means a managed create body is
+/// deserialized exactly once across both phases rather than re-parsed per entry.
+struct CachedRequestParse {
+    /// The parsed request body, moved into state initialization.
     parsed: serde_json::Value,
-    config: &ResponsesRequestConfig,
+    /// Its classification, derived from the same parse.
+    classified: ClassifiedRequest,
+    /// The operation the request head resolved to.
     operation: ResponsesOperation,
-) -> Result<(), FilterError> {
-    let mode = super::compute_mode(classified);
-
-    // Classification is published for every body, whatever it turned out to
-    // be, exactly as the standalone classifier did.
-    publish_classification(ctx, classified, &config.shared, mode)?;
-
-    if let Some(reason) = state_skip_reason(classified, config, operation) {
-        trace!(reason, "leaving Responses state uninitialized");
-        return Ok(());
-    }
-
-    let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
-    let conversation_id = resolve_conversation_id(ctx, &parsed);
-
-    enrich_context(ctx, classified, &response_id, &conversation_id);
-    // Must follow `enrich_context`: the owner is bound to the canonical
-    // conversation ID that call publishes, and the Conversations response path
-    // reads this immutable owner when appending the completed turn.
-    #[cfg(feature = "openai-conversations")]
-    crate::openai::conversations::capture_validated_append_owner(ctx);
-    insert_responses_state(ctx, parsed, &response_id);
-
-    debug!(
-        response_id = %response_id,
-        conversation_id = %conversation_id,
-        mode = ?mode,
-        "create request processed and state initialized"
-    );
-
-    Ok(())
 }
 
 /// A matched Responses operation and its declared request-body shape.
@@ -359,7 +435,7 @@ fn state_skip_reason(
 fn publish_classification(
     ctx: &mut HttpFilterContext<'_>,
     classified: &ClassifiedRequest,
-    config: &ResponsesFormatConfig,
+    config: &ResponsesClassificationConfig,
     mode: Option<&'static str>,
 ) -> Result<(), FilterError> {
     super::install_error_formatter(ctx, classified.format);
@@ -381,7 +457,7 @@ fn publish_classification(
 fn handle_unclassifiable(
     ctx: &mut HttpFilterContext<'_>,
     format: AiRequestFormat,
-    config: &ResponsesFormatConfig,
+    config: &ResponsesClassificationConfig,
 ) -> Result<FilterAction, FilterError> {
     if let Some(action) = super::handle_invalid_format(format, config) {
         debug!(format = format.as_str(), "rejecting unclassifiable create body");
@@ -417,25 +493,30 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
     classified
 }
 
-/// The declared request-body shape when this is a body-bearing operation.
+/// The Responses operation the request head resolves to, with its declared
+/// request-body shape.
 ///
 /// Resolved from the request head through the shared registry — the same source
-/// of truth the `ai_operation` classifier uses — so no body heuristic
-/// decides whether this filter applies, and the filter works whether or not the
+/// of truth the `ai_operation` classifier uses — so no body heuristic decides
+/// whether this filter applies, and the filter works whether or not the
 /// classifier is present in the chain.
 ///
-/// The registry already records which operations declare a request body and
-/// whether it is required, so that declaration selects what is worth parsing
-/// rather than a hand-written path list that can drift from it. Bodyless
-/// operations — fetch, delete, cancel, list input items, and the `WebSocket`
-/// handshake — yield `None` and are released untouched.
-fn matched_body_bearing_operation(ctx: &HttpFilterContext<'_>) -> Option<MatchedOperation> {
-    responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http)
-        .map(|route| MatchedOperation {
+/// Every matched Responses operation is returned, body-bearing or not: the
+/// endpoint is authoritative that the request is Responses even when there is no
+/// body to classify. Bodyless operations — fetch, delete, cancel, list input
+/// items, and the `WebSocket` handshake — still need their format fact promoted
+/// so header-based routing reaches the managed path; the caller inspects
+/// [`MatchedOperation::body`] to decide between publishing operation identity
+/// only and parsing a create body. A request that matches no Responses route
+/// (Chat Completions, Anthropic, `GET /`) yields `None` and is released
+/// untouched.
+fn matched_responses_operation(ctx: &HttpFilterContext<'_>) -> Option<MatchedOperation> {
+    responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http).map(|route| {
+        MatchedOperation {
             operation: route.spec.operation,
             body: route.spec.request_body(),
-        })
-        .filter(|matched| matched.body.is_present())
+        }
+    })
 }
 
 /// Publish the operation's identity when it carries no body to parse.
@@ -450,7 +531,7 @@ fn matched_body_bearing_operation(ctx: &HttpFilterContext<'_>) -> Option<Matched
 /// Returns [`FilterError`] when a filter result cannot be published.
 fn publish_bodyless_operation(
     ctx: &mut HttpFilterContext<'_>,
-    config: &ResponsesFormatConfig,
+    config: &ResponsesClassificationConfig,
 ) -> Result<FilterAction, FilterError> {
     let classified = empty_result(AiRequestFormat::Responses);
     publish_classification(ctx, &classified, config, None)?;

@@ -61,11 +61,11 @@ a request body.
 
 ### Metadata Propagation
 
-The format filter promotes classified facts using
-three channels:
+The `openai_responses_request` filter promotes classified
+facts using three channels:
 
 - **Filter metadata**: durable key-value pairs
-  (e.g. `openai_responses_format.model`) that
+  (e.g. `openai_responses_request.model`) that
   persist across Pingora phases. Used for
   cross-filter communication.
 - **Extra request headers**: added to the upstream
@@ -145,20 +145,18 @@ and promotes it to a configurable header (default
 `X-Model`). Enables header-based routing to
 provider-specific clusters.
 
-### `openai_responses_format`
-
-Classifies AI API request bodies and promotes format,
-model, stream, store, background, and mode to
-headers, metadata, and filter results.
-
 ### `openai_responses_request`
 
-Parses Responses API request JSON once, enriches filter metadata,
-and generates cryptographically random response and
-conversation IDs with `resp_` and `conv_` prefixes.
-Provider-owned parameter combinations pass through unchanged.
-Offers both the pre-read and bound-upstream body phases, so a
-chain can defer it until a logical provider is bound.
+Classifies AI API request bodies and promotes format,
+model, stream, store, background, and mode to headers,
+metadata, and filter results. Parses the Responses API
+request JSON once, enriches filter metadata, and generates
+cryptographically random response and conversation IDs with
+`resp_` and `conv_` prefixes. Provider-owned parameter
+combinations pass through unchanged. Offers both the pre-read
+and bound-upstream body phases, so a chain can defer it until
+a logical provider is bound, and `initialize_state: false`
+lets a pure routing chain classify without building state.
 
 ### `anthropic_messages_format`
 
@@ -187,8 +185,8 @@ Persists non-streaming Responses API responses. See
 
 - `apis/src/classifier/mod.rs`:
   pure format classifier
-- `apis/src/openai/responses/mod.rs`:
-  `ResponsesFormatFilter`
+- `apis/src/openai/responses/request/mod.rs`:
+  `OpenaiResponsesRequestFilter`
 - `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
 - `filters/src/prompt_enrich/`:

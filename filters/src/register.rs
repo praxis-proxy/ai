@@ -323,10 +323,6 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
 fn register_openai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
         http "openai_responses_model_rewrite" => praxis_ai_apis::openai::ModelRewriteFilter::from_config
     );
     praxis_filter::register_filters!(
@@ -689,7 +685,6 @@ mod tests {
             "state_owner",
             "project_state_owner_headers",
             "callout_credentials",
-            "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
             "ai_operation",

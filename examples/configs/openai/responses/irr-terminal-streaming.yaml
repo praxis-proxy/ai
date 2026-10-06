@@ -8,7 +8,7 @@
 # there is no operator opt-in. Streaming is not a Praxis IRR YAML transport
 # mode.
 #
-# `openai_responses_format` publishes descriptive client intent. The final
+# `openai_responses_request` publishes descriptive client intent. The final
 # outbound serializer, `openai_responses_proxy`, independently keeps the
 # provider-visible `"stream": true` field aligned with Praxis's typed
 # `SubRequestResponseMode::Streaming` selection.

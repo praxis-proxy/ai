@@ -347,7 +347,7 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 ///
 /// The `iterative_request_router` runner moves request extensions into each
 /// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
-/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
+/// filters (e.g. `openai_responses_request`) is not visible here. `ResponsesState`
 /// is created pre-IRR and travels through extensions, so fall back to it for
 /// format and stream detection — mirroring how `responses_to_chat_completions`
 /// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
@@ -371,10 +371,10 @@ fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
         .unwrap_or(false);
     let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && (typed_streaming
-            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+            || ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
             || has_responses_state);
     let is_streaming =
-        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        typed_streaming || ctx.get_metadata("openai_responses_request.stream") == Some("true") || body_stream;
     let inside_irr = ctx.extensions.get::<IterationState>().is_some();
     arm_decision(is_responses && is_streaming, inside_irr)
 }

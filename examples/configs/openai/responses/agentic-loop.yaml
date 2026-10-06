@@ -30,7 +30,7 @@
 #   Filters listed first in the YAML run last in the response phase.
 #
 # Pipeline ordering (pre-IRR, runs once):
-#   1. openai_responses_format — classifies body, promotes metadata
+#   1. openai_responses_request (facts) — classifies body, promotes metadata
 #   2. openai_responses_request — validates parameters, generates IDs
 #   3. openai_response_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
@@ -153,7 +153,8 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

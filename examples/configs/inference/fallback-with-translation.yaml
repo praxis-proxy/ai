@@ -12,42 +12,44 @@
 #
 #   - ResponsesState (extension, set by openai_responses_request)
 #     survives step transitions.
-#   - openai_responses_format.format (metadata) does not.
+#   - openai_responses_request.format (metadata) does not.
 #
 # Because responses_to_chat_completions reads both metadata and
-# extensions, each step must re-run openai_responses_format and
-# openai_responses_request to repopulate its metadata. Without
-# them the translation filter returns 500: "request pipeline state
-# is unavailable".
+# extensions, each step must re-run openai_responses_request to
+# repopulate its metadata. Without it the translation filter returns
+# 500: "request pipeline state is unavailable".
 #
 # Filter ordering within each step:
 #
-#   1. openai_responses_format         classify, set metadata
-#   2. openai_responses_model_rewrite  rewrite model (optional)
-#   3. openai_responses_request       parse body, set metadata + extension
-#   4. responses_to_chat_completions   translate body using both
-#   5. path_rewrite                    /v1/responses -> /v1/chat/completions
-#   6. router                          select cluster
-#   7. credential_injection            inject per-cluster credentials
-#   8. load_balancer                   select endpoint
+#   1. openai_responses_request (facts) classify body, set metadata,
+#                                        cache the parse
+#   2. openai_responses_request (owner)  reuse the parse, set metadata
+#                                        + ResponsesState extension
+#   3. responses_to_chat_completions     translate body using both
+#   4. path_rewrite                      /v1/responses -> /v1/chat/completions
+#   5. router                            select cluster
+#   6. credential_injection              inject per-cluster credentials
+#   7. load_balancer                     select endpoint
+#
+# The two openai_responses_request entries share one deserialization:
+# the first (initialize_state: false) publishes classification facts and
+# caches its parse; the second (the managed owner) reuses that parse.
 #
 # Key ordering constraints:
-#   - 1 before 2: model rewrite reads openai_responses_format.stream
-#   - 2 before 3: validate parses after rewrite, so ResponsesState
-#     carries the effective model
-#   - 3 before 4: translation reads responses.response_id metadata
-#     and ResponsesState extension, both set by validate
-#   - 6 before 7: credential injection matches on ctx.cluster,
+#   - 1 before 2: the owner reuses the facts pass's cached parse
+#   - 2 before 3: translation reads responses.response_id metadata
+#     and ResponsesState extension, both set by the owner
+#   - 5 before 6: credential injection matches on ctx.cluster,
 #     which the router sets
 #
 # Pre-IRR filters:
-#   openai_responses_format rejects non-Responses requests early.
-#   openai_responses_request rejects malformed bodies before the
-#   IRR allocates sub-request resources.
+#   The facts openai_responses_request classifies the request; the owner
+#   openai_responses_request rejects malformed bodies before the IRR
+#   allocates sub-request resources.
 #
 # Adapting for real providers:
-#   - Add openai_responses_model_rewrite between format and validate
-#     in the fallback step to map model names across providers.
+#   - Add openai_responses_model_rewrite between the facts and owner
+#     passes in the fallback step to map model names across providers.
 #   - Use env_var instead of value in credential_injection to read
 #     API keys from the environment at startup.
 #   - Add a headers filter (request_set Host) before load_balancer
@@ -67,7 +69,8 @@ listeners:
 filter_chains:
   - name: inference-failover
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
@@ -87,7 +90,8 @@ filter_chains:
         steps:
           - name: primary
             filters:
-              - filter: openai_responses_format
+              - filter: openai_responses_request
+                initialize_state: false
               - filter: openai_responses_request
                 on_invalid: reject
                 headers:
@@ -129,7 +133,8 @@ filter_chains:
 
           - name: fallback
             filters:
-              - filter: openai_responses_format
+              - filter: openai_responses_request
+                initialize_state: false
               - filter: openai_responses_request
                 on_invalid: reject
                 headers:
