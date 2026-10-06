@@ -33,10 +33,16 @@ def pytest_configure(config):
         "sdk_version(version): test targeted at a specific SDK version lane (e.g. 2.x, 3.x)",
     )
 
+    # This directory is itself named `openai`, so when the real SDK is absent
+    # `import openai` resolves to it as an implicit namespace package rather
+    # than failing. Such a module has no `__version__`, so read it defensively:
+    # suites that declare no `openai` dependency, such as the OpenResponses
+    # conformance runner, must land in the `unknown` lane instead of raising
+    # AttributeError out of `pytest_configure`.
     try:
         import openai
 
-        installed_version = openai.__version__
+        installed_version = getattr(openai, "__version__", "not-installed")
     except ImportError:
         installed_version = "not-installed"
 
