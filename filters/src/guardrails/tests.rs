@@ -5,6 +5,8 @@ use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
     filter::AiGuardrailsFilter,
 };
+#[cfg(feature = "openai-responses")]
+use super::{filter::record_local_tool_verdict, providers::GuardResult};
 
 // =============================================================================
 // Test helpers
@@ -533,6 +535,36 @@ async fn on_request_body_modified_records_redaction_without_changing_body() {
     assert_eq!(body, Some(original));
 }
 
+#[cfg(feature = "openai-responses")]
+#[test]
+fn local_tool_modified_verdict_fails_closed() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = record_local_tool_verdict(
+        &mut ctx,
+        GuardResult::Redact {
+            modified_text: "masked result".to_owned(),
+            reason: "pii".to_owned(),
+        },
+    )
+    .unwrap();
+
+    let rejection = as_rejection(action);
+    assert_eq!(rejection.status, 502, "modified tool results must fail closed");
+    let rejection_body = rejection.body.unwrap();
+    let body_text = String::from_utf8_lossy(&rejection_body);
+    assert!(
+        body_text.contains("sanitized content cannot be safely applied"),
+        "the rejection should explain why modified content is not forwarded: {body_text}"
+    );
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
+        Some("redacted"),
+        "the tool-result phase should retain the provider verdict even when failing closed"
+    );
+}
+
 #[tokio::test]
 async fn on_request_body_unknown_status_fails_closed() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
@@ -782,6 +814,7 @@ fn phase_config_default() {
     let phase = PhaseConfig::default();
     assert!(phase.request, "default request should be true");
     assert!(!phase.response, "default response should be false");
+    assert!(!phase.tool_results, "default tool_results should be false");
 }
 
 #[test]
@@ -790,11 +823,13 @@ fn phase_config_custom_values() {
         "
 request: false
 response: true
+tool_results: true
 ",
     )
     .unwrap();
     assert!(!parsed.request, "request should be false");
     assert!(parsed.response, "response should be true");
+    assert!(parsed.tool_results, "tool_results should be true");
 }
 
 #[test]
@@ -802,6 +837,7 @@ fn phase_config_omitted_uses_defaults() {
     let parsed: PhaseConfig = serde_yaml::from_str("{}").unwrap();
     assert!(parsed.request, "omitted request should default to true");
     assert!(!parsed.response, "omitted response should default to false");
+    assert!(!parsed.tool_results, "omitted tool_results should default to false");
 }
 
 #[test]

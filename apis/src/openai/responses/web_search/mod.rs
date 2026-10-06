@@ -871,8 +871,10 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// place, never duplicated.
 fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        let result_start = state.messages.len();
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
+        state.mark_local_tool_results_from(result_start);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into

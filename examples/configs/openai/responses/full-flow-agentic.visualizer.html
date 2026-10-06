@@ -2479,10 +2479,84 @@ const PIPELINE = {
       }
     },
     {
+      "id": "ai_guardrails",
+      "name": "ai_guardrails",
+      "group": "irr-step",
+      "order": 25,
+      "phase": "IRR step request-body EOS; checks only newly produced local Responses tool results; records blocked/provider-failure verdicts for openai_agentic_loop; no response phase",
+      "config": {
+        "provider.type": "nemo",
+        "provider.endpoint": "http://127.0.0.1:3003/v1/checks",
+        "provider.guardrails.config_ids": [
+          "your-config"
+        ],
+        "provider.timeout_ms": 5000,
+        "provider.max_message_checks": 32,
+        "phase.request": false,
+        "phase.response": false,
+        "phase.tool_results": true
+      },
+      "promotes": "checks the new MCP, web-search, or file-search result suffix before it can be sent to the model on the next IRR round; a block or check failure is finalized by openai_agentic_loop",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S5": {
+          "state": "active",
+          "note": "checks the file-search result before model re-entry"
+        },
+        "S6": {
+          "state": "active",
+          "note": "checks the MCP result before model re-entry"
+        },
+        "S7": {
+          "state": "active",
+          "note": "checks the web-search result before model re-entry"
+        },
+        "S8": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        }
+      }
+    },
+    {
       "id": "openai_agentic_loop",
       "name": "openai_agentic_loop",
       "group": "irr-step",
-      "order": 25,
+      "order": 26,
       "phase": "IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)",
       "config": {
         "max_infer_iters": 7
@@ -2547,7 +2621,7 @@ const PIPELINE = {
       "id": "irr_headers",
       "name": "headers (IRR step)",
       "group": "irr-step",
-      "order": 26,
+      "order": 27,
       "phase": "IRR step request-phase; sets outbound header",
       "config": {
         "request_set": [
@@ -2617,7 +2691,7 @@ const PIPELINE = {
       "id": "irr_load_balancer",
       "name": "load_balancer (IRR step)",
       "group": "irr-step",
-      "order": 27,
+      "order": 28,
       "phase": "IRR step request-phase; selects the endpoint for the router-bound cluster (cluster_source:bound_upstream) and publishes its typed application_protocol BEFORE the protocol-adaptive body builders",
       "config": {
         "cluster_source": "bound_upstream",
@@ -2700,7 +2774,7 @@ const PIPELINE = {
       "id": "openai_responses_proxy",
       "name": "openai_responses_proxy",
       "group": "irr-step",
-      "order": 28,
+      "order": 29,
       "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Responses (selected_upstream.application_protocol=openai_responses); response-phase handles buffered/streamed",
       "config": {
         "conditions": [
@@ -2767,7 +2841,7 @@ const PIPELINE = {
       "id": "responses_to_chat_completions",
       "name": "responses_to_chat_completions",
       "group": "irr-step",
-      "order": 29,
+      "order": 30,
       "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Chat Completions; request-phase translates Responses-\u003eChat, response-phase (reverse) translates Chat-\u003eResponses",
       "config": {
         "max_rewritten_body_bytes": 33554432,
@@ -2838,7 +2912,7 @@ const PIPELINE = {
       "id": "path_rewrite",
       "name": "path_rewrite",
       "group": "irr-step",
-      "order": 30,
+      "order": 31,
       "phase": "IRR step request-phase; rewrites the outbound path to /v1/chat/completions when the selected upstream speaks Chat Completions",
       "config": {
         "replace.pattern": "^/v1/responses/?$",
@@ -3447,7 +3521,7 @@ const PIPELINE = {
       {
         "order": 25,
         "depth": 1,
-        "filter_type": "openai_agentic_loop",
+        "filter_type": "ai_guardrails",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3456,7 +3530,7 @@ const PIPELINE = {
       {
         "order": 26,
         "depth": 1,
-        "filter_type": "headers",
+        "filter_type": "openai_agentic_loop",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3465,7 +3539,7 @@ const PIPELINE = {
       {
         "order": 27,
         "depth": 1,
-        "filter_type": "load_balancer",
+        "filter_type": "headers",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3473,6 +3547,15 @@ const PIPELINE = {
       },
       {
         "order": 28,
+        "depth": 1,
+        "filter_type": "load_balancer",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 29,
         "depth": 1,
         "filter_type": "openai_responses_proxy",
         "name": null,
@@ -3489,7 +3572,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 29,
+        "order": 30,
         "depth": 1,
         "filter_type": "responses_to_chat_completions",
         "name": null,
@@ -3506,7 +3589,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 30,
+        "order": 31,
         "depth": 1,
         "filter_type": "path_rewrite",
         "name": null,
@@ -3740,6 +3823,13 @@ const PIPELINE = {
       "credential": "user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts"
     },
     {
+      "name": "NeMo Guardrails",
+      "endpoint": "http://127.0.0.1:3003/v1/checks",
+      "usedBy": [
+        "ai_guardrails (local tool-result checks inside the IRR)"
+      ]
+    },
+    {
       "name": "Brave Search",
       "endpoint": "provider:brave (external Brave API)",
       "usedBy": [
@@ -3810,31 +3900,34 @@ const SCEN_META = {
     "services": []
   },
   "S5": {
-    "narr": "\u003cb\u003eFile search loop.\u003c/b\u003e The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.",
+    "narr": "\u003cb\u003eFile search loop.\u003c/b\u003e The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.",
     "clusters": [
       "inference-backend",
       "vector-stores-backend"
     ],
     "services": [
-      "Vector store"
+      "Vector store",
+      "NeMo Guardrails"
     ]
   },
   "S6": {
-    "narr": "\u003cb\u003eMCP loop.\u003c/b\u003e openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.",
+    "narr": "\u003cb\u003eMCP loop.\u003c/b\u003e openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.",
     "clusters": [
       "inference-backend"
     ],
     "services": [
-      "MCP server"
+      "MCP server",
+      "NeMo Guardrails"
     ]
   },
   "S7": {
-    "narr": "\u003cb\u003eWeb search loop.\u003c/b\u003e The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.",
+    "narr": "\u003cb\u003eWeb search loop.\u003c/b\u003e The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.",
     "clusters": [
       "inference-backend"
     ],
     "services": [
-      "Brave Search"
+      "Brave Search",
+      "NeMo Guardrails"
     ]
   },
   "S8": {

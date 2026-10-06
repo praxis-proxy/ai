@@ -320,6 +320,11 @@ impl HttpFilter for AgenticLoopFilter {
             return convert_dispatch_failure(ctx, state, &failure);
         }
 
+        // Every request-body filter in this IRR step has now run. Clear the
+        // shared suffix boundary only here, after all configured tool-result
+        // guardrails had an opportunity to inspect it.
+        state.pending_local_tool_guardrail_start = None;
+
         if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
             return finish_deferred_local_response(ctx, state);
         }

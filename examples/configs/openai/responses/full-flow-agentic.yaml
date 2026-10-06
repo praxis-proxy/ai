@@ -11,6 +11,8 @@
 # request trace is continued through every nested web-search, OGX, and MCP
 # callout with a fresh span ID per hop.
 #
+# Start NeMo Guardrails 0.24.0+ on 127.0.0.1:3003 for local tool-result checks.
+#
 # The request is classified once, then a top-level router freezes one logical
 # cluster plus its application_provider/application_protocol metadata. That
 # binding drives two mutually exclusive paths:
@@ -139,7 +141,8 @@
 # protocol-adaptive translation):
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
-#       → openai_file_search_callout → openai_agentic_loop
+#       → openai_file_search_callout → ai_guardrails
+#       → openai_agentic_loop
 #       → headers → load_balancer(cluster_source=bound_upstream)
 #       → openai_responses_proxy         (when selected upstream = Responses)
 #       → responses_to_chat_completions  (when selected upstream = Chat)
@@ -161,6 +164,8 @@
 #   loop owner's assigned calls at request-body EOS on the next iteration,
 #   reconciling results in place inside ResponsesState.accumulated_output.
 #   Each is inert unless the model emits the matching hosted tool call.
+#   ai_guardrails follows all dispatchers and checks only their newly produced
+#   local result suffix before openai_agentic_loop may allow model re-entry.
 #
 # Transition rules (evaluated after each step's response-body):
 #   openai_agentic_loop.action = "loop" → next: inference
@@ -714,6 +719,22 @@ filter_chains:
                 max_total_response_bytes: 67108864
                 max_state_bytes: 136314880
                 on_failure: closed
+              # Check newly produced MCP, web-search, and file-search results
+              # before the loop owner can send them to the model on re-entry.
+              # Keep request and response phases off here; this gate screens
+              # only the newly produced tool-result suffix in the IRR step.
+              - filter: ai_guardrails
+                provider:
+                  type: nemo
+                  endpoint: "http://127.0.0.1:3003/v1/checks"
+                  guardrails:
+                    config_ids: ["your-config"]
+                  timeout_ms: 5000
+                  max_message_checks: 32
+                phase:
+                  request: false
+                  response: false
+                  tool_results: true
               # Sole loop owner: parses each model response, records the
               # hosted-tool assignments for the dispatchers, and publishes the
               # single continuation signal (action=loop|done). max_infer_iters

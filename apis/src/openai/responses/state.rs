@@ -488,6 +488,16 @@ pub(crate) struct ResponsesState {
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
 
+    /// Start of the newly appended local tool-result suffix that still needs
+    /// guardrail evaluation before another inference request may be built.
+    ///
+    /// Dispatchers set this to the pre-append `messages` length. The guardrail
+    /// handoff drains the marker exactly once and extracts only
+    /// `function_call_output` items from that suffix, so prior conversation
+    /// history is never rescanned. An index keeps the handoff payload-free: the
+    /// canonical result remains owned only by [`Self::messages`].
+    pub pending_local_tool_guardrail_start: Option<usize>,
+
     /// Number of leading messages already persisted by a provider-owned
     /// conversation. Internal continuations send only the remaining delta.
     pub provider_history_len: usize,
@@ -916,6 +926,7 @@ impl Default for ResponsesState {
             client_tool_lowering: HashMap::new(),
             client_tool_echo: None,
             messages: Vec::new(),
+            pending_local_tool_guardrail_start: None,
             provider_history_len: 0,
             provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
@@ -1012,6 +1023,17 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
+    /// Mark a suffix containing newly appended local tool results.
+    ///
+    /// Multiple dispatchers run before the guardrail filter, so retain the
+    /// earliest start and evaluate their combined suffix once.
+    pub(crate) fn mark_local_tool_results_from(&mut self, start: usize) {
+        self.pending_local_tool_guardrail_start = Some(
+            self.pending_local_tool_guardrail_start
+                .map_or(start, |current| current.min(start)),
+        );
     }
 
     /// Borrow the public output owned by [`Self::response_object`].

@@ -1595,3 +1595,85 @@ fn resolve_spec_schema_ref<'a>(spec: &'a serde_json::Value, schema: &'a serde_js
     spec.pointer(pointer)
         .unwrap_or_else(|| panic!("missing schema ref {ref_path}"))
 }
+
+#[cfg(feature = "openai-responses")]
+#[test]
+fn local_tool_guardrail_handoff_is_shared_by_each_configured_policy() {
+    let mut extensions = RequestExtensions::default();
+    let mut state = state::ResponsesState {
+        messages: vec![
+            serde_json::json!({"role":"user", "content":"old input"}),
+            serde_json::json!({"type":"function_call", "call_id":"call_1", "name":"lookup"}),
+            serde_json::json!({"type":"function_call_output", "call_id":"call_1", "output":"untrusted result"}),
+            serde_json::json!({"type":"reasoning", "summary":[]}),
+        ],
+        ..state::ResponsesState::default()
+    };
+    state.mark_local_tool_results_from(1);
+    extensions.insert(state);
+
+    assert_eq!(
+        local_tool_guardrail_messages(&extensions, 1024).unwrap(),
+        vec![serde_json::json!({"role":"user", "content":"untrusted result"})]
+    );
+    assert_eq!(
+        local_tool_guardrail_messages(&extensions, 1024).unwrap(),
+        vec![serde_json::json!({"role":"user", "content":"untrusted result"})],
+        "a second guardrail policy must receive the same local-result suffix"
+    );
+    assert_eq!(
+        extensions
+            .get::<state::ResponsesState>()
+            .unwrap()
+            .pending_local_tool_guardrail_start,
+        Some(1),
+        "only the loop owner clears the marker after the whole filter chain"
+    );
+}
+
+#[cfg(feature = "openai-responses")]
+#[test]
+fn local_tool_guardrail_handoff_rejects_oversized_result_before_copying() {
+    let mut extensions = RequestExtensions::default();
+    let mut state = state::ResponsesState {
+        messages: vec![serde_json::json!({
+            "type":"function_call_output",
+            "call_id":"call_1",
+            "output":"untrusted result"
+        })],
+        ..state::ResponsesState::default()
+    };
+    state.mark_local_tool_results_from(0);
+    extensions.insert(state);
+
+    let error = local_tool_guardrail_messages(&extensions, 8)
+        .expect_err("the result must be bounded before the async callout copy");
+    assert!(
+        error.to_string().contains("guardrail evaluation limit"),
+        "oversized local tool results must be rejected before copying into the NeMo callout payload: {error}"
+    );
+}
+
+#[cfg(feature = "openai-responses")]
+#[test]
+fn local_tool_guardrail_failure_stays_with_responses_state() {
+    let mut extensions = RequestExtensions::default();
+    extensions.insert(state::ResponsesState::default());
+
+    assert!(
+        record_local_tool_guardrail_failure(
+            &mut extensions,
+            403,
+            "content_blocked",
+            "blocked local result".to_owned(),
+        ),
+        "the Responses state must accept the guardrail failure for the loop owner to enforce"
+    );
+    let failure = extensions
+        .get::<state::ResponsesState>()
+        .and_then(|state| state.dispatch_failure.as_ref())
+        .expect("the loop owner should receive the terminal failure");
+    assert_eq!(failure.status, 403);
+    assert_eq!(failure.code, "content_blocked");
+    assert_eq!(failure.message, "blocked local result");
+}

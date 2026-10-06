@@ -252,7 +252,9 @@ impl FileSearchCalloutFilter {
         // replayed here. Bridges are next-round-only and never persisted (see
         // `MAX_TOTAL_MODEL_CONTEXT_BYTES`).
         for bridge in bridges {
+            let result_start = state.messages.len();
             state.messages.extend(bridge);
+            state.mark_local_tool_results_from(result_start);
         }
         Ok(())
     }
