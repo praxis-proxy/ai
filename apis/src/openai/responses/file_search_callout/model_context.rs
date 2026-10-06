@@ -93,6 +93,10 @@ struct ModelContextBuilder {
     max_rendered_json_bytes: usize,
     /// Rendered per-chunk annotations.
     rendered: String,
+    /// Reused storage for one annotation.
+    annotation: String,
+    /// Width reserved for the default wrapper's chunk count.
+    default_count_width: usize,
     /// Compact-JSON string-content bytes used by rendered annotations.
     rendered_json_bytes: usize,
     /// Whether any content exceeded a formatting bound.
@@ -101,9 +105,9 @@ struct ModelContextBuilder {
 
 impl ModelContextBuilder {
     /// Create a builder after reserving escaped outer-template bytes.
-    fn new(max_bytes: usize, query: &str, template: &str) -> Self {
+    fn new(max_bytes: usize, query: &str, template: &str, max_chunk_count: usize) -> Self {
         let max_json_bytes = max_bytes.min(MAX_MODEL_CONTEXT_BYTES);
-        let max_chunk_count = MAX_FORMATTED_CHUNKS.to_string();
+        let max_chunk_count = max_chunk_count.min(MAX_FORMATTED_CHUNKS).to_string();
         let wrapper = render_template_bounded(
             template,
             &[("query", query), ("num_chunks", &max_chunk_count), ("results", "")],
@@ -111,17 +115,25 @@ impl ModelContextBuilder {
         );
         let result_placeholders = count_template_placeholders(template, "results");
         let wrapper_json_bytes = wrapper.as_deref().and_then(json_string_content_bytes);
+        let wrapper_fits = wrapper_json_bytes.is_some_and(|bytes| bytes <= max_json_bytes);
         let max_rendered_json_bytes = wrapper_json_bytes
             .and_then(|bytes| max_json_bytes.checked_sub(bytes))
             .map_or(0, |bytes| bytes / result_placeholders.max(1));
+        let default_wrapper = template == CONTEXT_TEMPLATE && wrapper_fits;
         Self {
             chunk_count: 0,
-            exhausted: wrapper_json_bytes.is_none() || result_placeholders == 0,
+            exhausted: !wrapper_fits || result_placeholders == 0,
             max_json_bytes,
             max_rendered_json_bytes,
-            rendered: String::new(),
+            rendered: if default_wrapper {
+                wrapper.unwrap_or_default()
+            } else {
+                String::new()
+            },
+            annotation: String::new(),
+            default_count_width: if default_wrapper { max_chunk_count.len() } else { 0 },
             rendered_json_bytes: 0,
-            truncated: wrapper_json_bytes.is_none() || result_placeholders == 0,
+            truncated: !wrapper_fits || result_placeholders == 0,
         }
     }
 
@@ -138,34 +150,52 @@ impl ModelContextBuilder {
     }
 
     /// Append one result chunk when both formatting budgets permit it.
+    #[expect(clippy::too_many_lines, reason = "check encoded limits before appending a chunk")]
     fn append_chunk(&mut self, result: &SearchResult, content: &str, template: &str) -> bool {
         if self.exhausted || self.chunk_count >= MAX_FORMATTED_CHUNKS {
             return self.exhaust();
         }
         let next_index = self.chunk_count.saturating_add(1);
         let remaining_bytes = self.max_rendered_json_bytes.saturating_sub(self.rendered_json_bytes);
-        let Some(annotation) = render_annotation_bounded(result, content, next_index, template, remaining_bytes) else {
+        self.annotation.clear();
+        if render_annotation_bounded_into(
+            &mut self.annotation,
+            result,
+            content,
+            next_index,
+            template,
+            remaining_bytes,
+        )
+        .is_none()
+        {
             return self.exhaust();
-        };
-        let Some(annotation_json_bytes) = json_string_content_bytes(&annotation) else {
-            return self.exhaust();
-        };
-        let Some(next_json_bytes) = self.rendered_json_bytes.checked_add(annotation_json_bytes) else {
+        }
+        let Some(next_json_bytes) = json_string_content_bytes(&self.annotation)
+            .and_then(|annotation_bytes| self.rendered_json_bytes.checked_add(annotation_bytes))
+        else {
             return self.exhaust();
         };
         if next_json_bytes > self.max_rendered_json_bytes {
             return self.exhaust();
         }
-        let rendered_file = !annotation.is_empty();
-        self.rendered.push_str(&annotation);
+        let rendered_file = !self.annotation.is_empty();
+        self.rendered.push_str(&self.annotation);
         self.rendered_json_bytes = next_json_bytes;
         self.chunk_count = next_index;
         rendered_file
     }
 
     /// Apply the outer context template and report whether it overflowed.
-    fn finish(self, query: &str, template: &str) -> (String, bool) {
+    fn finish(mut self, query: &str, template: &str) -> (String, bool) {
         let chunk_count = self.chunk_count.to_string();
+        if self.default_count_width > 0 {
+            // The reserved count is at least as wide as the final count. Keep
+            // annotations in this buffer instead of copying the full context.
+            let start = "file_search found ".len();
+            self.rendered
+                .replace_range(start..start + self.default_count_width, &chunk_count);
+            return (self.rendered, self.truncated);
+        }
         let rendered = render_template_bounded(
             template,
             &[
@@ -230,21 +260,32 @@ fn next_template_placeholder(template: &str) -> Option<TemplatePlaceholder<'_>> 
 /// Render a template without allowing replacement values to exceed `max_bytes`.
 fn render_template_bounded(template: &str, variables: &[(&str, &str)], max_bytes: usize) -> Option<String> {
     let mut rendered = String::with_capacity(template.len().min(max_bytes));
+    render_template_bounded_into(&mut rendered, template, variables, max_bytes)?;
+    Some(rendered)
+}
+
+/// Reuse the caller's buffer while rendering one bounded template.
+fn render_template_bounded_into(
+    rendered: &mut String,
+    template: &str,
+    variables: &[(&str, &str)],
+    max_bytes: usize,
+) -> Option<()> {
     let mut remaining = template;
     while let Some(placeholder) = next_template_placeholder(remaining) {
-        push_bounded(&mut rendered, placeholder.prefix, max_bytes)?;
+        push_bounded(rendered, placeholder.prefix, max_bytes)?;
         if let Some(value) = variables
             .iter()
             .find_map(|(variable, value)| (*variable == placeholder.name).then_some(*value))
         {
-            push_bounded(&mut rendered, value, max_bytes)?;
+            push_bounded(rendered, value, max_bytes)?;
         } else {
-            push_bounded(&mut rendered, placeholder.raw, max_bytes)?;
+            push_bounded(rendered, placeholder.raw, max_bytes)?;
         }
         remaining = placeholder.rest;
     }
-    push_bounded(&mut rendered, remaining, max_bytes)?;
-    Some(rendered)
+    push_bounded(rendered, remaining, max_bytes)?;
+    Some(())
 }
 
 /// Append one string when it fits the remaining byte budget.
@@ -274,7 +315,16 @@ pub(super) fn format_search_results(
 ) -> FormattedSearchResults {
     let mut citation_files = HashMap::new();
     let mut public_results = Vec::with_capacity(results.len());
-    let mut context = ModelContextBuilder::new(limits.max_model_context_bytes, query, templates.context);
+    let max_chunk_count = results
+        .iter()
+        .fold(0_usize, |total, result| total.saturating_add(result.content.len()))
+        .min(MAX_FORMATTED_CHUNKS);
+    let mut context = ModelContextBuilder::new(
+        limits.max_model_context_bytes,
+        query,
+        templates.context,
+        max_chunk_count,
+    );
     let emits_citation_marker = templates.annotation.contains("<|{file_id}|>");
 
     for result in results {
@@ -371,6 +421,7 @@ fn format_result(
 }
 
 /// Render one annotation without exceeding its remaining context budget.
+#[cfg(test)]
 fn render_annotation_bounded(
     result: &SearchResult,
     content: &str,
@@ -378,9 +429,25 @@ fn render_annotation_bounded(
     template: &str,
     max_bytes: usize,
 ) -> Option<String> {
+    let mut rendered = String::new();
+    render_annotation_bounded_into(&mut rendered, result, content, index, template, max_bytes)?;
+    Some(rendered)
+}
+
+/// Render one annotation into reusable storage.
+#[expect(clippy::too_many_arguments, reason = "borrowed template fields and reused storage")]
+fn render_annotation_bounded_into(
+    rendered: &mut String,
+    result: &SearchResult,
+    content: &str,
+    index: usize,
+    template: &str,
+    max_bytes: usize,
+) -> Option<()> {
     let index = index.to_string();
     let score = result.score.to_string();
-    render_template_bounded(
+    render_template_bounded_into(
+        rendered,
         template,
         &[
             ("index", &index),
@@ -413,6 +480,94 @@ pub(super) fn is_valid_filename(filename: &str) -> bool {
 mod tests {
     use super::*;
     use crate::openai::responses::file_search_callout::client::{ContentChunk, ContentChunkType};
+
+    /// Fixed pre-change path: one owned annotation per chunk and a final full
+    /// context copy into the wrapper.
+    fn previous_default_context(result: &SearchResult) -> String {
+        let mut rendered = String::new();
+        for (index, chunk) in result.content.iter().enumerate() {
+            let annotation = render_annotation_bounded(
+                result,
+                &chunk.text,
+                index + 1,
+                ANNOTATION_TEMPLATE,
+                MAX_MODEL_CONTEXT_BYTES,
+            )
+            .unwrap();
+            rendered.push_str(&annotation);
+        }
+        render_template_bounded(
+            CONTEXT_TEMPLATE,
+            &[
+                ("query", "allocation fixture"),
+                ("num_chunks", &result.content.len().to_string()),
+                ("results", &rendered),
+            ],
+            MAX_MODEL_CONTEXT_BYTES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare complete context output and allocation baseline"
+    )]
+    fn high_cardinality_context_reuses_chunk_storage() {
+        let result = SearchResult {
+            attributes: None,
+            content: (0..2_048)
+                .map(|_| ContentChunk {
+                    _chunk_type: ContentChunkType::Text,
+                    text: "x".repeat(256),
+                })
+                .collect(),
+            file_id: "file-allocation".to_owned(),
+            filename: "allocation.txt".to_owned(),
+            score: 0.75,
+        };
+        let optimized_context = || {
+            let mut builder = ModelContextBuilder::new(
+                MAX_MODEL_CONTEXT_BYTES,
+                "allocation fixture",
+                CONTEXT_TEMPLATE,
+                result.content.len(),
+            );
+            for chunk in &result.content {
+                assert!(builder.append_chunk(&result, &chunk.text, ANNOTATION_TEMPLATE));
+            }
+            builder.finish("allocation fixture", CONTEXT_TEMPLATE).0
+        };
+        assert_eq!(optimized_context(), previous_default_context(&result));
+        let optimized = allocation_counter::measure(|| {
+            std::hint::black_box(optimized_context());
+        });
+        let baseline = allocation_counter::measure(|| {
+            std::hint::black_box(previous_default_context(&result));
+        });
+        eprintln!("hosted file context allocations: optimized={optimized:?}, baseline={baseline:?}");
+        assert!(optimized.count_total < baseline.count_total);
+        assert!(optimized.bytes_max < baseline.bytes_max);
+    }
+
+    #[test]
+    fn default_wrapper_accepts_exact_escaped_boundary() {
+        let query = "\n".repeat(64);
+        let wrapper = render_template(
+            CONTEXT_TEMPLATE,
+            &[("query", &query), ("num_chunks", "0"), ("results", "")],
+        );
+        let escaped_bytes = json_string_content_bytes(&wrapper).unwrap();
+        assert!(wrapper.len() < escaped_bytes);
+        let exact =
+            ModelContextBuilder::new(escaped_bytes, &query, CONTEXT_TEMPLATE, 0).finish(&query, CONTEXT_TEMPLATE);
+        assert_eq!(exact, (wrapper, false));
+        let below =
+            ModelContextBuilder::new(escaped_bytes - 1, &query, CONTEXT_TEMPLATE, 0).finish(&query, CONTEXT_TEMPLATE);
+        assert!(below.1);
+        assert!(below.0.is_empty());
+    }
 
     #[test]
     fn template_values_are_not_reinterpreted_as_placeholders() {

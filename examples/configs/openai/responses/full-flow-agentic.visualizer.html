@@ -1549,81 +1549,10 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_conversations",
-      "name": "openai_conversations",
-      "group": "conversations",
-      "order": 12,
-      "phase": "request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming); gated unless bound_upstream.application_provider=openai",
-      "config": {
-        "backend": "sqlite",
-        "database_url": "sqlite://responses.db?mode=rwc",
-        "conversations_table": "openai_conversations",
-        "items_table": "openai_conversation_items",
-        "conditions": [
-          "unless bound_upstream.application_provider: openai"
-        ]
-      },
-      "promotes": "sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation",
-      "scenarios": {
-        "S1": {
-          "state": "passthrough",
-          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
-        },
-        "S2": {
-          "state": "passthrough",
-          "note": "no conversation field; note append-back is non-streaming only"
-        },
-        "S3": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S4": {
-          "state": "passthrough",
-          "note": "prev_response_id path, not a conversation field"
-        },
-        "S5": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S6": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S7": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S8": {
-          "state": "passthrough",
-          "note": "GET retrieve, not a conversations op"
-        },
-        "S9": {
-          "state": "skipped",
-          "note": "direct-services terminal branch ran first"
-        },
-        "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
-        },
-        "S11": {
-          "state": "skipped",
-          "note": "direct-services terminal branch ran first"
-        },
-        "S12": {
-          "state": "skipped",
-          "note": "direct-openai terminal branch ran first"
-        },
-        "S13": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        }
-      }
-    },
-    {
       "id": "openai_response_store",
       "name": "openai_response_store",
       "group": "store",
-      "order": 13,
+      "order": 12,
       "phase": "request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai",
       "config": {
         "backend": "sqlite",
@@ -1687,6 +1616,77 @@ const PIPELINE = {
         "S13": {
           "state": "inert",
           "note": "backend registered but store:false -\u003e no persistence"
+        }
+      }
+    },
+    {
+      "id": "openai_conversations",
+      "name": "openai_conversations",
+      "group": "conversations",
+      "order": 13,
+      "phase": "request-phase (CRUD + has_conversation); response-phase appends items before Store on completed JSON or SSE; gated unless bound_upstream.application_provider=openai",
+      "config": {
+        "backend": "sqlite",
+        "database_url": "sqlite://responses.db?mode=rwc",
+        "conversations_table": "openai_conversations",
+        "items_table": "openai_conversation_items",
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
+      },
+      "promotes": "sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation",
+      "scenarios": {
+        "S1": {
+          "state": "passthrough",
+          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
+        },
+        "S2": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S3": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S4": {
+          "state": "passthrough",
+          "note": "prev_response_id path, not a conversation field"
+        },
+        "S5": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S6": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S7": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S8": {
+          "state": "passthrough",
+          "note": "GET retrieve, not a conversations op"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "router route-miss before this filter"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "passthrough",
+          "note": "no conversation field"
         }
       }
     },
@@ -3217,7 +3217,7 @@ const PIPELINE = {
       {
         "order": 12,
         "depth": 0,
-        "filter_type": "openai_conversations",
+        "filter_type": "openai_response_store",
         "name": null,
         "irr_step": null,
         "conditions": [
@@ -3241,7 +3241,7 @@ const PIPELINE = {
       {
         "order": 13,
         "depth": 0,
-        "filter_type": "openai_response_store",
+        "filter_type": "openai_conversations",
         "name": null,
         "irr_step": null,
         "conditions": [

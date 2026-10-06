@@ -75,7 +75,87 @@ pub(crate) mod stream_events;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
-pub use agentic_loop::AgenticLoopFilter;
+pub use agentic_loop::{AgenticBudgetPolicy, AgenticLoopFilter};
+
+/// Preflight a budgeted Responses body before the first JSON parser allocates.
+/// The same listener policy applies to every reachable loop instance.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    if !(is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        || (ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"))
+    {
+        return None;
+    }
+    let admitted =
+        agentic_loop::budget::input_charge(bytes).is_some_and(|charge| charge <= policy.max_retained_bytes());
+    (!admitted).then(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request body exceeds openai_agentic_loop.max_retained_bytes",
+        ))
+    })
+}
+
+/// Initialize request-wide accounting for a classified Responses create.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn plain_agentic_budget(
+    ctx: &HttpFilterContext<'_>,
+    parsed: &serde_json::Value,
+    bytes: &[u8],
+) -> Result<Option<agentic_loop::budget::SimpleBudget>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "a budgeted Responses request must be a JSON object",
+        )));
+    };
+    let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
+    let will_store = object.get("store") != Some(&serde_json::Value::Bool(false));
+    let budget = agentic_loop::budget::SimpleBudget::new_with_store(policy.max_retained_bytes(), charge, will_store);
+    budget.map(Some).ok_or_else(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request body exceeds openai_agentic_loop.max_retained_bytes",
+        ))
+    })
+}
+
+/// Recognize requests whose file resolver can skip a second JSON projection.
+#[cfg(feature = "openai-file-resolve-filter")]
+fn text_only_input(input: Option<&serde_json::Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    match input {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => items.iter().all(|item| {
+            let Some(message) = item.as_object() else {
+                return false;
+            };
+            if message.get("type").is_some_and(|kind| kind != "message") {
+                return false;
+            }
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => true,
+                Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) == Some("input_text")
+                        && part.get("text").is_some_and(serde_json::Value::is_string)
+                }),
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -368,6 +448,11 @@ impl HttpFilter for ResponsesFormatFilter {
             Some(b) => b.as_ref(),
             None => &[],
         };
+
+        #[cfg(feature = "openai-responses")]
+        if let Some(action) = initial_agentic_budget_rejection(ctx, bytes) {
+            return Ok(action);
+        }
 
         let (classified, websocket_handshake) = classify_request(ctx, bytes);
 

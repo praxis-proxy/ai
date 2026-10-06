@@ -783,6 +783,28 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     }
 }
 
+#[tokio::test]
+async fn budgeted_compaction_filter_rejects_oversized_body_before_store_or_callout() {
+    let filter = make_filter("closed");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let mut body = Some(Bytes::from(json!({"model":"test","input":"x".repeat(200)}).to_string()));
+    let original = body.clone();
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 413, "budgeted compaction must reject before callout");
+            let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+            assert!(text.contains("max_retained_bytes"), "{text}");
+        },
+        _ => panic!("budgeted compaction must reject before callout"),
+    }
+    assert_eq!(body, original, "rejection must leave the request body unchanged");
+}
+
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
@@ -898,6 +920,37 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
 }
 
+#[tokio::test]
+async fn reactive_compaction_rejects_source_expansion_before_callout_even_when_fail_open() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.messages = vec![json!({"role": "user", "content": "old context".repeat(40)})];
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.simple_budget = SimpleBudget::new(4_096, 100);
+
+    let result = filter.check_and_summarize(&mut state).await;
+    let Err(FilterAction::Reject(rejection)) = result else {
+        panic!("source expansion must fail before the callout");
+    };
+    assert_eq!(rejection.status, 413);
+    let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(text.contains("max_retained_bytes"), "{text}");
+}
+
+#[test]
+fn reactive_compaction_callout_cap_uses_remaining_request_budget() {
+    let mut budget = SimpleBudget::new(65_536, 100).unwrap();
+    assert!(budget.reserve_additional_input(30_000));
+    let cap = compaction_response_limit(Some(budget)).unwrap();
+    assert!(cap > 0 && cap < MAX_SUMMARIZATION_RESPONSE_BYTES);
+    assert!(cap * COMPACTION_RESPONSE_MULTIPLIER <= budget.remaining_bytes().unwrap());
+    assert!(compaction_response_limit(None).unwrap() == MAX_SUMMARIZATION_RESPONSE_BYTES);
+}
+
 // =============================================================================
 // direct input should_compact
 // =============================================================================
@@ -1007,19 +1060,22 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
         .unwrap();
     let registry = ResponseStoreRegistry::new();
     registry.register(&std::sync::Arc::from("default"), backend).unwrap();
-    let request = parse_compact_request_body(&Some(Bytes::from_static(
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","previous_response_id":"resp_private"}"#,
     )))
     .unwrap();
 
     let wrong_store = registry.get_scoped("default", &other).unwrap();
-    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &request).await else {
+    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &mut request, &mut None).await
+    else {
         panic!("wrong-owner compaction must fail before its callout");
     };
     assert_eq!(rejection.status, 404);
 
     let owner_store = registry.get_scoped("default", &owner).unwrap();
-    let messages = collect_compact_messages(&owner_store, &request).await.unwrap();
+    let messages = collect_compact_messages(&owner_store, &mut request, &mut None)
+        .await
+        .unwrap();
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 

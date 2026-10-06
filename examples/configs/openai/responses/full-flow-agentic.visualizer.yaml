@@ -564,59 +564,6 @@ pipeline:
       S13:
         state: passthrough
         note: no tools; has_tools=false
-  - id: openai_conversations
-    name: openai_conversations
-    group: conversations
-    filter_type: openai_conversations
-    phase: request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming); gated unless bound_upstream.application_provider=openai
-    config:
-      backend: sqlite
-      database_url: sqlite://responses.db?mode=rwc
-      conversations_table: openai_conversations
-      items_table: openai_conversation_items
-      conditions:
-      - 'unless bound_upstream.application_provider: openai'
-    promotes: sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation
-    scenarios:
-      S1:
-        state: passthrough
-        note: no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create
-      S2:
-        state: passthrough
-        note: no conversation field; note append-back is non-streaming only
-      S3:
-        state: passthrough
-        note: no conversation field
-      S4:
-        state: passthrough
-        note: prev_response_id path, not a conversation field
-      S5:
-        state: passthrough
-        note: no conversation field
-      S6:
-        state: passthrough
-        note: no conversation field
-      S7:
-        state: passthrough
-        note: no conversation field
-      S8:
-        state: passthrough
-        note: GET retrieve, not a conversations op
-      S9:
-        state: skipped
-        note: direct-services terminal branch ran first
-      S10:
-        state: skipped
-        note: router route-miss before this filter
-      S11:
-        state: skipped
-        note: direct-services terminal branch ran first
-      S12:
-        state: skipped
-        note: direct-openai terminal branch ran first
-      S13:
-        state: passthrough
-        note: no conversation field
   - id: openai_response_store
     name: openai_response_store
     group: store
@@ -670,6 +617,59 @@ pipeline:
       S13:
         state: inert
         note: backend registered but store:false -> no persistence
+  - id: openai_conversations
+    name: openai_conversations
+    group: conversations
+    filter_type: openai_conversations
+    phase: request-phase (CRUD + has_conversation); response-phase appends items before Store on completed JSON or SSE; gated unless bound_upstream.application_provider=openai
+    config:
+      backend: sqlite
+      database_url: sqlite://responses.db?mode=rwc
+      conversations_table: openai_conversations
+      items_table: openai_conversation_items
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation
+    scenarios:
+      S1:
+        state: passthrough
+        note: no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create
+      S2:
+        state: passthrough
+        note: no conversation field
+      S3:
+        state: passthrough
+        note: no conversation field
+      S4:
+        state: passthrough
+        note: prev_response_id path, not a conversation field
+      S5:
+        state: passthrough
+        note: no conversation field
+      S6:
+        state: passthrough
+        note: no conversation field
+      S7:
+        state: passthrough
+        note: no conversation field
+      S8:
+        state: passthrough
+        note: GET retrieve, not a conversations op
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: no conversation field
   - id: openai_responses_rehydrate
     name: openai_responses_rehydrate
     group: context

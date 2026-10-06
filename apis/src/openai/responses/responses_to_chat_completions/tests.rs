@@ -6,7 +6,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::StatusCode;
 use praxis_core::time::FixedTimeSource;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, SelectedUpstreamBodyOutcome, SubRequestResponseMode};
+use praxis_filter::{
+    BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, SelectedUpstreamBodyOutcome,
+    SubRequestResponseMode,
+};
 use serde_json::json;
 
 use super::{
@@ -14,9 +17,296 @@ use super::{
     ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
 };
 use crate::openai::{
-    responses::state::ResponsesState,
+    responses::{
+        agentic_loop::{AgenticBudgetPolicy, budget::SimpleBudget},
+        state::ResponsesState,
+    },
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
+
+#[tokio::test]
+async fn budgeted_buffered_text_translates_with_shared_request_reservation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","store":false}"#));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(outbound["messages"][0]["content"], "hello");
+    assert_eq!(outbound["model"], "m");
+}
+
+#[tokio::test]
+async fn budgeted_chat_preserves_high_cardinality_forwarded_parameters() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let extra = (0..100)
+        .map(|index| (format!("key_{index}"), json!({})))
+        .collect::<serde_json::Map<_, _>>();
+    let value = json!({"model":"m","input":"hello","store":false,"extra_body":extra});
+    let wire = serde_json::to_vec(&value).unwrap();
+    let charge = crate::openai::responses::agentic_loop::budget::input_charge(&wire).unwrap();
+    let mut state = ResponsesState::from_request_body(value);
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(2_097_152, charge, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from(wire));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(outbound["extra_body"].as_object().unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn budgeted_chat_request_overflow_rejects_before_dispatch() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
+    context.extensions.insert(state);
+    let original = Bytes::from_static(br#"{"model":"m","input":"hello","store":false}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
+        panic!("translation must reject when its own request tree cannot be reserved");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+    assert!(context.get_metadata(ARMED_KEY).is_none());
+}
+
+#[test]
+fn budgeted_chat_response_overflow_rejects_before_json_parse() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, "success");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from(vec![b'x'; 5_000]));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("response must reject before parsing a body that exceeds its budget");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(body.is_none());
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
+    for headers_committed in [false, true] {
+        let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut context = crate::test_utils::make_filter_context(&request);
+        context.current_filter_id = Some(0);
+        context.set_metadata(ARMED_KEY, "true");
+        context.set_metadata("openai_responses_format.stream", "true");
+        context.set_metadata("responses.response_id", "resp_stream_budget");
+        context.set_metadata(CREATED_AT_KEY, "1700000000");
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "m",
+            "input": "hello",
+            "stream": true,
+            "store": false
+        }));
+        state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
+        context.extensions.insert(state);
+        let response = Box::leak(Box::new(crate::test_utils::make_response()));
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        context.response_header = Some(response);
+        assert!(matches!(
+            filter.on_response(&mut context).await.unwrap(),
+            FilterAction::Continue
+        ));
+        context.response_header = None;
+        if headers_committed {
+            context.extensions.insert(ClientResponseHeadersCommitted);
+        }
+        let mut first_byte = Some(Bytes::from_static(b":"));
+        assert!(matches!(
+            filter.on_response_body(&mut context, &mut first_byte, false).unwrap(),
+            FilterAction::Continue
+        ));
+        let mut first_comment_end = Some(Bytes::from_static(b" ping\n\n"));
+        assert!(matches!(
+            filter
+                .on_response_body(&mut context, &mut first_comment_end, false)
+                .unwrap(),
+            FilterAction::Continue
+        ));
+        let frame = b"data: {\"id\":\"chatcmpl_budget\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}";
+        let mut split_line = Some(Bytes::copy_from_slice(frame));
+        assert!(matches!(
+            filter.on_response_body(&mut context, &mut split_line, false).unwrap(),
+            FilterAction::Continue
+        ));
+        let mut frame_end = Some(Bytes::from_static(b"\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut context, &mut frame_end, false).unwrap(),
+            FilterAction::Continue
+        ));
+        // Comments produce no semantic output. Their transient framing charge
+        // must be released rather than accumulating as if 200 frames survived.
+        for _ in 0..200 {
+            let mut keepalive = Some(Bytes::from_static(b": ping\n\n"));
+            assert!(matches!(
+                filter.on_response_body(&mut context, &mut keepalive, false).unwrap(),
+                FilterAction::Continue
+            ));
+        }
+        let mut body = Some(Bytes::from(vec![b'x'; 256 * 1024]));
+
+        let action = filter.on_response_body(&mut context, &mut body, false).unwrap();
+
+        assert!(body.is_none(), "the provider frame must not reach the client");
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(
+            context.get_metadata("responses.stream_error_code"),
+            Some("server_error")
+        );
+        assert_eq!(
+            context.get_metadata("responses.stream_error_message"),
+            Some(super::CHAT_RESPONSE_OVERFLOW)
+        );
+        assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+        assert_eq!(
+            context.filter_results["openai_agentic_loop"].get("action"),
+            Some("done")
+        );
+        let mut later = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+        assert!(matches!(
+            filter.on_response_body(&mut context, &mut later, true).unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(later.is_none(), "the failed stream must suppress later callbacks");
+    }
+}
+
+#[tokio::test]
+async fn budgeted_chat_stream_closes_after_many_small_deltas() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("responses.response_id", "resp_many_deltas");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hello", "stream": true, "store": false
+    }));
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    context.extensions.insert(state);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+
+    // A completed comment leaves spare parser capacity. A tiny next frame
+    // should not reserve 32 times that empty capacity again.
+    let mut comment = Some(Bytes::from(format!(":{}\n\n", "x".repeat(12_000))));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut comment, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let mut keepalive = Some(Bytes::from_static(b": ping\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut keepalive, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(context.get_metadata("responses.stream_error_code"), None);
+
+    let frame = format!(
+        "data: {{\"id\":\"chatcmpl_many\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+        "x".repeat(100)
+    );
+    for _ in 0..100 {
+        let mut body = Some(Bytes::copy_from_slice(frame.as_bytes()));
+        assert!(matches!(
+            filter.on_response_body(&mut context, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        assert_ne!(context.get_metadata("responses.skip_persist"), Some("true"));
+    }
+    let mut finish = Some(Bytes::from_static(
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    ));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut finish, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let mut done = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut context, &mut done, false).unwrap(),
+        FilterAction::Continue
+    ));
+    let translated = String::from_utf8(done.unwrap().to_vec()).unwrap();
+    assert!(translated.contains("event: response.completed\n"), "{translated}");
+    assert_eq!(context.get_metadata("responses.stream_error_code"), None);
+}
+
+#[tokio::test]
+async fn budgeted_finite_chat_buffer_uses_listener_cap() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 1048576").unwrap()).unwrap(),
+    );
+    context.response_header = Some(Box::leak(Box::new(crate::test_utils::make_response())));
+
+    let action = filter.on_response(&mut context).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(
+        context.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(131_072)
+        }
+    ));
+}
 
 #[test]
 fn default_config_parses() {
@@ -1918,6 +2208,7 @@ async fn successful_sse_chunks_translate_to_responses_events() {
         "tool_choice": "auto"
     }));
     state.original_tool_choice = Some(json!({"type": "web_search"}));
+    state.simple_budget = SimpleBudget::new_with_store(8_388_608, 2_000, false);
     context.extensions.insert(state);
     let mut request_body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,

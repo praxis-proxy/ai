@@ -2333,6 +2333,73 @@ async fn pool_drain_explicitly_closes_idle_server_session() {
 }
 
 #[tokio::test]
+async fn budgeted_session_close_waits_for_delayed_delete_after_deadline() {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+    let delete_completed = StdArc::new(AtomicUsize::new(0));
+    let completion = StdArc::clone(&delete_completed);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let completion = StdArc::clone(&completion);
+                async move {
+                    if request.method() == http::Method::DELETE {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let response = next.run(request).await;
+                        completion.store(1, Ordering::SeqCst);
+                        response
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    let limits = McpBudgetedCallLimits {
+        wire_limit: 4_096,
+        parse_charge_limit: 262_144,
+    };
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_tool_session(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        Some(limits),
+        &callout,
+        &parse_display_url(&url),
+    )
+    .await
+    .unwrap();
+    close_fresh_session(session, tokio::time::Instant::now(), Some(limits)).await;
+    assert_eq!(
+        delete_completed.load(Ordering::SeqCst),
+        1,
+        "the request cannot settle its callout reservation while rmcp still holds the transport"
+    );
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
     let (url, ct, methods) = start_method_recording_mcp_server().await;
     let pool = McpSessionPool::new();
@@ -2382,6 +2449,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         None,
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        None,
         callout,
         &parse_display_url(url),
     )
@@ -2808,6 +2876,34 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
     assert!(
         matches!(err, McpClientError::ListingTooLarge { .. }),
         "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_listing_rejects_at_request_specific_cumulative_cap() {
+    let (url, ct) = start_multi_page_list_mcp_server(1_024, 3).await;
+    let limits = McpBudgetedCallLimits {
+        wire_limit: 1_024 * 1_024,
+        parse_charge_limit: 1_024 * 1_024,
+    };
+    let result = list_tools_with_forwarded_headers_budgeted(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+        Some((limits, 2 * 1_024)),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(
+        matches!(result, Err(McpClientError::ListingTooLarge { .. })),
+        "a request cap below the ordinary 4 MiB limit must stop pagination: {result:?}"
     );
 }
 

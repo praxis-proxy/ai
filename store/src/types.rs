@@ -242,6 +242,9 @@ pub enum StoreError {
 
     /// Store not initialized or unavailable.
     Unavailable(String),
+
+    /// A bounded read would materialize more payload than its caller permits.
+    PayloadTooLarge,
 }
 
 impl fmt::Display for StoreError {
@@ -252,6 +255,7 @@ impl fmt::Display for StoreError {
             Self::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
             Self::Unavailable(msg) => write!(f, "store unavailable: {msg}"),
+            Self::PayloadTooLarge => write!(f, "stored payload exceeds request limit"),
         }
     }
 }

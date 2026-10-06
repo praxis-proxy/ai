@@ -354,6 +354,12 @@ pub(super) struct StreamConverter {
     tool_calls: Vec<ToolCallState>,
     /// Total accumulated semantic bytes.
     accumulated_bytes: usize,
+    /// Portion of the shared request ledger held for live converter state.
+    pub(super) budget_retained_charge: usize,
+    /// Emitted bytes remain charged until the next callback reaches downstream.
+    pub(super) budget_output_handoff_charge: usize,
+    /// Portion of the up-front snapshot reserve allotted to emitted SSE bytes.
+    pub(super) budget_output_allowance: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
 }
@@ -383,8 +389,57 @@ impl StreamConverter {
             message: None,
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
+            budget_retained_charge: 0,
+            budget_output_handoff_charge: 0,
+            budget_output_allowance: 0,
             frames_processed: 0,
         }
+    }
+
+    /// Conservative live charge after the transient source-chunk reserve can
+    /// be released. The raw frame can outlive this callback; decoded text,
+    /// arguments, logprobs, and metadata can appear in later terminal output.
+    pub(super) fn budget_live_charge(&self) -> Option<usize> {
+        let value_bytes = self
+            .service_tier
+            .iter()
+            .chain(self.usage.iter())
+            .try_fold(0_usize, |bytes, value| {
+                bytes.checked_add(serialized_json_len(value).ok()?)
+            })?;
+        let identity_bytes = self
+            .chat_id
+            .iter()
+            .chain(self.model.iter())
+            .chain(self.finish_reason.iter())
+            .try_fold(0_usize, |bytes, value| bytes.checked_add(value.len()))?;
+        self.framing
+            .retained_capacity_bytes()
+            .checked_mul(8)?
+            .checked_add(self.accumulated_bytes.checked_mul(16)?)?
+            .checked_add(value_bytes.checked_mul(16)?)?
+            .checked_add(identity_bytes.checked_mul(16)?)?
+            .checked_add(self.tool_calls.len().checked_mul(1_024)?)?
+            .checked_add(usize::from(self.message.is_some()).checked_mul(1_024)?)
+    }
+
+    /// A tiny callback can complete a much larger buffered frame, copying it
+    /// into SSE data, decoded semantic state, and translated output at once.
+    pub(super) fn budget_framing_growth_charge(&self) -> Option<usize> {
+        self.framing.buffered_bytes().checked_mul(32)
+    }
+
+    /// A completed frame can close the entire response, repeating retained
+    /// text, logprobs, and arguments in item-done and terminal SSE snapshots.
+    /// Reserve this projection before parsing the frame, then release whatever
+    /// was not retained at the end of the callback.
+    pub(super) fn budget_closeout_growth_charge(&self) -> Option<usize> {
+        if matches!(self.phase, Phase::EmittedTerminal | Phase::Failed) {
+            return Some(0);
+        }
+        self.accumulated_bytes
+            .checked_mul(24)?
+            .checked_add(self.tool_calls.len().checked_mul(2_048)?)
     }
 
     /// Feed one response body chunk, returning any completed Responses SSE bytes.

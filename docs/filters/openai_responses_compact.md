@@ -17,6 +17,8 @@ Compaction applies in two scenarios:
 
 Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` - there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
 
+On listeners with `openai_agentic_loop.max_retained_bytes`, explicit compact uses a bounded Store read and caps the summarization response before it is buffered. Source expansion and persistence are charged to one request-wide budget. An overflow returns 413 before the next payload owner is created.
+
 Praxis runs `StreamBuffer` body hooks before header-phase request filters. This filter therefore requires `allow_pre_security_callout: true` and should only be used behind an outer authentication and authorization boundary.
 
 ## Configuration

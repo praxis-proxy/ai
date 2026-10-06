@@ -21,7 +21,7 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
+    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
     start_proxy,
 };
 
@@ -48,7 +48,7 @@ fn single_pass_completes_through_irr() {
     let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"Hello"}"#;
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(
@@ -65,6 +65,546 @@ fn single_pass_completes_through_irr() {
         model_body.get("parallel_tool_calls").is_none(),
         "an omitted parallel_tool_calls field must remain omitted"
     );
+}
+
+#[test]
+fn retained_budget_allows_model_alias_before_validation() {
+    let response = r#"{"id":"resp_model_alias","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_model_rewrite(free_port(), model.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"client-alias","input":"Hello","store":false}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "budgeted alias request failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["model"], "gpt-4.1");
+}
+
+#[test]
+fn retained_budget_preserves_provider_owned_fields() {
+    let response = r#"{"id":"resp_provider_fields","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Hello",
+        "store":false,
+        "include":["reasoning.encrypted_content"],
+        "background":false,
+        "prompt":null,
+        "context_management":[{"type":"compaction","compact_threshold":1000}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "budgeted provider fields failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    for field in ["include", "background", "prompt", "context_management"] {
+        assert_eq!(outbound[field], request[field], "{field} must survive the proxy");
+    }
+}
+
+#[test]
+fn retained_budget_preserves_responses_with_chat_prompt_enrichment_filter() {
+    let response = r#"{"id":"resp_prompt_enrich","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let original = std::fs::read_to_string(example_config_path("openai/responses/agentic-loop.yaml"))
+        .expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "      - filter: openai_responses_format",
+        "      - filter: prompt_enrich\n        on_invalid: continue\n        prepend:\n          - role: system\n            content: Be helpful.\n\n      - filter: openai_responses_format",
+        1,
+    );
+    assert_ne!(yaml, original, "insert the chat prompt filter before Responses parsing");
+    let yaml = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", model.port())]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic config");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","store":false}"#),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "chat prompt filter should leave Responses input intact: {raw}"
+    );
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(sent["input"], "Hello");
+    assert!(
+        sent.get("messages").is_none(),
+        "chat-only enrichment does not change Responses input"
+    );
+}
+
+#[test]
+fn retained_budget_preserves_text_message_array() {
+    let response = r#"{"id":"resp_text_array","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let input = serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]);
+    let body = serde_json::json!({"model":"gpt-4.1","input":input,"store":false});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body.to_string()));
+    assert_eq!(parse_status(&raw), 200, "text message array failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["input"], input);
+}
+
+#[test]
+fn retained_budget_preserves_single_message_object_and_empty_input() {
+    let response = r#"{"id":"resp_input_shape","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned()), (200, response.to_owned())])
+        .start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let message = serde_json::json!({"type":"message","role":"user","content":"Hello"});
+    let requests = [
+        serde_json::json!({"model":"gpt-4.1","input":message,"store":false}),
+        serde_json::json!({"model":"gpt-4.1","store":false}),
+    ];
+
+    for request in &requests {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "in-budget request shape failed: {raw}");
+    }
+
+    let sent = model.requests();
+    assert_eq!(sent.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&sent[0].body).expect("first provider request JSON");
+    let second: serde_json::Value = serde_json::from_str(&sent[1].body).expect("second provider request JSON");
+    assert_eq!(first["input"], requests[0]["input"]);
+    assert!(second.get("input").is_none(), "omitted input must remain omitted");
+}
+
+#[test]
+fn retained_budget_persists_default_store_plain_response() {
+    let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_plain_store");
+    let config = load_approval_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&created),
+        200,
+        "default Store create must succeed: {created}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = body["id"].as_str().expect("created response id");
+
+    let (status, retrieved) = http_get(proxy.addr(), &format!("/v1/responses/{id}"), None);
+    assert_eq!(status, 200, "budgeted response must be stored: {retrieved}");
+    assert_eq!(model.requests().len(), 1, "retrieve must not run inference");
+}
+
+#[test]
+fn retained_budget_restores_previous_plain_response() {
+    let first = r#"{"id":"resp_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_restore_previous");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let first_raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&first_raw), 200, "first response: {first_raw}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    let first_id = created["id"].as_str().expect("created response id");
+    let next_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Next turn",
+        "store": false,
+        "previous_response_id": first_id,
+    });
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next_body.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "bounded restore: {next_raw}");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "one inference per turn");
+    let second_sent: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "backend must receive previous input/output and new turn: {second_sent}"
+    );
+    assert!(
+        second_sent.get("previous_response_id").is_none(),
+        "locally rehydrated history must not also ask the backend to restore it"
+    );
+}
+
+#[test]
+fn retained_budget_explicit_compact_persists_and_restores_summary() {
+    let first = r#"{"id":"resp_before_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_before_compact","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let summary = r#"{"id":"chatcmpl-summary","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary marker"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}}"#;
+    let follow_up = r#"{"id":"resp_after_compact","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first.to_owned()),
+        (200, summary.to_owned()),
+        (200, follow_up.to_owned()),
+    ])
+    .start_with_shutdown();
+    let db = TempSqlite::new("budgeted_explicit_compact");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_before_compact","input":"More context"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&compacted), 200, "budgeted compact: {compacted}");
+    let compacted_body: serde_json::Value = serde_json::from_str(&parse_body(&compacted)).unwrap();
+    assert_eq!(
+        compacted_body["object"], "response.compaction",
+        "explicit response shape"
+    );
+    let compact_id = compacted_body["id"].as_str().expect("compaction response id");
+    let (status, stored) = http_get(proxy.addr(), &format!("/v1/responses/{compact_id}"), None);
+    assert_eq!(status, 200, "compaction must persist: {stored}");
+
+    let next =
+        serde_json::json!({"model":"gpt-4.1","input":"Next turn","previous_response_id":compact_id,"store":false});
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "restore compacted history: {next_raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "create, compact callout, and follow-up inference");
+    let outbound: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    assert!(
+        outbound["input"].to_string().contains("Summary marker"),
+        "follow-up must replay the compacted summary: {outbound}"
+    );
+}
+
+#[test]
+fn retained_budget_explicit_compact_rejects_oversized_stored_history_before_callout() {
+    let first = r#"{"id":"resp_large_for_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_large","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let db = TempSqlite::new("budgeted_explicit_compact_overflow");
+    let model = StatefulCapturingBackend::new(vec![(200, first.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    drop(proxy);
+    drop(model);
+
+    let callout = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), callout.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_large_for_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&compacted),
+        413,
+        "stored history must exceed the small budget: {compacted}"
+    );
+    assert!(
+        callout.requests().is_empty(),
+        "Store overflow must stop before summarization"
+    );
+}
+
+#[test]
+fn retained_budget_appends_plain_conversation_and_restores_next_turn() {
+    let first = r#"{"id":"resp_conv_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_conv_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_conversation_append");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = created["id"].as_str().expect("conversation ID");
+    assert!(
+        id.starts_with("conv_"),
+        "local Conversations create must return an ID: {created}"
+    );
+    for input in ["First turn", "Second turn"] {
+        let request = serde_json::json!({"model":"gpt-4.1","input":input,"store":false,"conversation":id});
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "conversation turn: {raw}");
+    }
+
+    let requests = model.requests();
+    let inference: Vec<_> = requests.iter().filter(|request| !request.body.is_empty()).collect();
+    assert_eq!(
+        inference.len(),
+        2,
+        "model requests: {:?}",
+        requests.iter().map(|request| &request.body).collect::<Vec<_>>()
+    );
+    let second_sent: serde_json::Value = serde_json::from_str(&inference[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "second inference must replay appended first turn: {second_sent}"
+    );
+    let (status, items) = http_get(proxy.addr(), &format!("/v1/conversations/{id}/items"), None);
+    assert_eq!(status, 200, "list appended items: {items}");
+    let listed: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(4));
+}
+
+#[test]
+fn budgeted_conversation_append_overflow_does_not_store_success() {
+    let response = r#"{"id":"resp_conv_append_overflow","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+
+    // Admission and the model output fit. The retained input copy needed for
+    // append-back alone exceeds the remaining request budget.
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_ne!(parse_status(&raw), 200, "append overflow cannot report success: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "inference must have completed before append admission"
+    );
+
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_conv_append_overflow", None);
+    assert_eq!(status, 404, "a failed append cannot leave a successful Store record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
+fn budgeted_stream_conversation_append_overflow_emits_error_without_success_or_store() {
+    let response_id = "resp_stream_conv_append_overflow";
+    let events = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": response_id, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0,
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{"type":"message","id":"msg_stream_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}],
+                },
+                "sequence_number": 1,
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) =
+        start_streaming_model_with_pacing(vec![events], Some(Duration::from_millis(50)));
+    let db = TempSqlite::new("budgeted_stream_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model_port, 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "stream": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "stream headers and prefix should already be committed: {raw}"
+    );
+    assert!(
+        body.contains("event: response.created"),
+        "the client should receive the streamed prefix: {body}"
+    );
+    assert_eq!(
+        body.matches("event: error").count(),
+        1,
+        "append overflow needs one terminal SSE error: {body}"
+    );
+    assert!(
+        !body.contains("event: response.completed"),
+        "success must be withheld: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "error streams have no success sentinel: {body}"
+    );
+    let frames = parse_sse_frames(&body);
+    let error = sole_event(&frames, "error");
+    assert_eq!(error.data["code"], "invalid_request_error");
+    assert_eq!(error.data["sequence_number"], 1);
+    assert!(
+        error.data["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conversation append"))
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    model_thread.join().expect("model should finish streaming");
+
+    let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 404, "the failed stream cannot leave a Store success record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_budget_store_overflow_skips_persistence() {
+    let response = serde_json::json!({
+        "id": "resp_store_overflow",
+        "object": "response",
+        "created_at": 1_760_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type":"message","content":[{"type":"output_text","text":"x".repeat(200)}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_store_overflow");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "over-budget Store output must fail before persistence: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "overflow must stop after the first inference"
+    );
+
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("Store database should open");
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("Store table should be queryable");
+    assert_eq!(persisted, 0, "an over-budget response must not be stored");
+    pool.close().await;
+}
+
+#[test]
+fn retained_budget_rejects_oversized_initial_input_before_inference() {
+    let model = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 4_096);
+    let proxy = start_proxy(&config);
+
+    // This stays below the listener's 128-byte raw cap so the Responses
+    // admission guard, rather than core's generic transport 413, rejects it.
+    let request_body = r#"{"model":"gpt-4.1","input":"Hi","store":false,"temperature":0,"seed":1}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
+
+    assert_eq!(parse_status(&raw), 413);
+    assert!(!parse_body(&raw).is_empty(), "empty 413 response: {raw:?}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_retained_bytes")),
+        "413 must identify the retained-payload budget: {body}"
+    );
+    assert!(model.requests().is_empty(), "rejected input must not reach inference");
+}
+
+#[test]
+fn retained_budget_rejects_oversized_buffered_output_without_dispatch() {
+    let response = serde_json::json!({
+        "id": "resp_provider",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "x".repeat(200)}],
+        }],
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 8_192);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi","store":false}"#),
+    );
+
+    assert_eq!(parse_status(&raw), 502);
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(model.requests().len(), 1, "overflow must stop after one inference");
 }
 
 #[test]
@@ -316,7 +856,7 @@ fn round_trip_captures_tool_and_model_requests() {
     );
     let raw = http_send(proxy.addr(), &request);
 
-    assert_eq!(parse_status(&raw), 200, "round-trip should return 200");
+    assert_eq!(parse_status(&raw), 200, "round-trip should return 200: {raw}");
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
     assert_eq!(
@@ -2219,16 +2759,15 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         "model backend should receive exactly three requests"
     );
 
-    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
-    // they share one initialized session. The server therefore sees a single
-    // dispatch handshake covering both tools/call rounds; the only other
-    // initialize/tools/list pair comes from tool discovery
-    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
-    // would re-handshake, yielding initialize == 3.
+    // This example enables max_retained_bytes. Each budgeted tools/call uses a
+    // fresh transport so an older pooled session cannot carry a larger wire or
+    // parser ceiling into the next round. Discovery and both dispatch rounds
+    // therefore initialize separately; unbudgeted pooling is covered by the
+    // mcp_client session-pool tests.
     assert_eq!(
         mcp.method_count("initialize"),
-        2,
-        "one discovery handshake + one reused dispatch handshake across both rounds"
+        3,
+        "one discovery handshake and one bounded dispatch handshake per tool round"
     );
     assert_eq!(
         mcp.method_count("tools/list"),
@@ -5698,6 +6237,10 @@ type StreamingModel = (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>);
 
 /// Start a two-turn model backend that emits each SSE event as a chunk.
 fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
+    start_streaming_model_with_pacing(responses, None)
+}
+
+fn start_streaming_model_with_pacing(responses: Vec<Vec<String>>, pacing: Option<Duration>) -> StreamingModel {
     let listener = TcpListener::bind("127.0.0.1:0").expect("streaming model should bind");
     let port = listener
         .local_addr()
@@ -5724,6 +6267,9 @@ fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
             for event in response {
                 write!(stream, "{:x}\r\n{event}\r\n", event.len()).expect("streaming model should write event chunk");
                 stream.flush().expect("streaming model should flush event chunk");
+                if let Some(delay) = pacing {
+                    thread::sleep(delay);
+                }
             }
             stream
                 .write_all(b"0\r\n\r\n")
@@ -7423,6 +7969,62 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
 }
 
+fn load_agentic_config_with_model_rewrite(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "      - filter: openai_responses_validate",
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"client-alias\": \"gpt-4.1\"\n\n      - filter: openai_responses_validate",
+        1,
+    );
+    assert_ne!(yaml, original, "expected model rewrite before validation");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config with model rewrite")
+}
+
+fn load_agentic_config_with_budget(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(yaml, original, "expected the example's retained-payload limit");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config")
+}
+
+fn load_agentic_config_with_budget_and_store(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let with_budget = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(with_budget, original, "expected the example's retained-payload limit");
+    let with_store = with_budget.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(
+        &with_store,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port)]),
+    );
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config with Store")
+}
+
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
@@ -7530,7 +8132,18 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
+    // This variant delegates conversation history to the model backend. The
+    // local Conversations filter cannot append to that backend-owned ID.
+    let yaml = yaml.replacen(
+        "      - filter: openai_conversations\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        conversations_table: openai_conversations\n        items_table: openai_conversation_items\n\n",
+        "",
+        1,
+    );
     let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
+    assert!(
+        !yaml.contains("      - filter: openai_conversations\n"),
+        "native conversation history must not append into the local store"
+    );
     assert!(
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"

@@ -78,6 +78,16 @@ impl Framing {
     pub(super) fn has_incomplete_frame(&self) -> bool {
         self.parser.has_incomplete_frame()
     }
+
+    /// Bytes still owned by an incomplete frame after a callback.
+    pub(super) fn retained_capacity_bytes(&self) -> usize {
+        self.parser.retained_capacity_bytes()
+    }
+
+    /// Bytes in an unfinished frame that can expand when the next chunk lands.
+    pub(super) fn buffered_bytes(&self) -> usize {
+        self.parser.buffered_bytes()
+    }
 }
 
 /// Translate a parser error into a framing error the state machine understands.

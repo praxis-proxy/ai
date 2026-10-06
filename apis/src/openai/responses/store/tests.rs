@@ -322,6 +322,38 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_create_caps_store_response_buffer() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&config).unwrap());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(512) });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_store_requires_request_budget_before_input_capture() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions
+        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let original = Bytes::from_static(br#"{"input":"hello"}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
+    assert_eq!(body, Some(original), "misconfigured Store must not copy input");
+}
+
 // -----------------------------------------------------------------------------
 // on_request Bypass
 // -----------------------------------------------------------------------------

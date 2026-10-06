@@ -122,6 +122,10 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates and initializes one Responses create body"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -130,6 +134,19 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
     ) -> Result<FilterAction, FilterError> {
         if let Some(action) = early_validation_action(ctx, end_of_stream) {
             return Ok(action);
+        }
+
+        let raw = body.as_deref().unwrap_or_default();
+        if let Some(action) = super::initial_agentic_budget_rejection(ctx, raw) {
+            return Ok(action);
+        }
+        // Explicit compact parses under its own ledger. Keeping this
+        // validator's request-body state would add uncharged input copies.
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Release);
         }
 
         let parsed = match parse_request_body(body) {
@@ -142,6 +159,14 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = super::reject_prompt_template(&parsed) {
             return Ok(action);
         }
+        let budget = if super::is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+            match super::plain_agentic_budget(ctx, &parsed, raw) {
+                Ok(budget) => budget,
+                Err(action) => return Ok(action),
+            }
+        } else {
+            None
+        };
 
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
         let conversation_id = resolve_conversation_id(ctx, &parsed);
@@ -149,7 +174,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         enrich_context(ctx, &response_id, &conversation_id);
         #[cfg(feature = "openai-conversations")]
         crate::openai::conversations::capture_validated_append_owner(ctx);
-        insert_responses_state(ctx, parsed, &response_id);
+        insert_responses_state(ctx, parsed, &response_id, budget);
 
         debug!(
             response_id = %response_id,
@@ -221,9 +246,15 @@ fn early_validation_action(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> 
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
+) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    state.simple_budget = budget;
     ctx.extensions.insert(state);
 }
 
@@ -734,6 +765,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budgeted_compact_does_not_retain_validator_input_state() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Release), "compact owns its body parser");
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "validator must not retain an extra compact input tree"
+        );
+    }
+
+    #[tokio::test]
     async fn not_end_of_stream_continues() {
         let filter = OpenaiResponsesValidateFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -871,6 +920,25 @@ mod tests {
             matches!(action, FilterAction::Reject(_)),
             "POST /input_tokens without body should be rejected, not released"
         );
+    }
+
+    #[tokio::test]
+    async fn budgeted_listener_preserves_input_tokens_request() {
+        let filter = make_filter();
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses/input_tokens",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.extensions
+            .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Release));
+        assert!(ctx.extensions.get::<ResponsesState>().is_some());
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_none());
     }
 
     // -------------------------------------------------------------------------

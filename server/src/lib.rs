@@ -18,6 +18,8 @@ pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 pub use pipelines::validate_pipelines_with_store_wiring;
+#[cfg(feature = "openai-responses")]
+pub use pipelines::{agentic_request_body_cap, prepare_agentic_budget_entries};
 pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{

@@ -144,11 +144,19 @@ impl SseFrameParser {
     }
 
     /// Return the number of bytes currently retained by the parser.
-    fn buffered_bytes(&self) -> usize {
+    pub(crate) fn buffered_bytes(&self) -> usize {
         self.line_buf
             .len()
             .saturating_add(self.data_buf.len())
             .saturating_add(self.event_type.as_ref().map_or(0, String::len))
+    }
+
+    /// Allocated backing storage retained across stream callbacks.
+    pub(crate) fn retained_capacity_bytes(&self) -> usize {
+        self.line_buf
+            .capacity()
+            .saturating_add(self.data_buf.capacity())
+            .saturating_add(self.event_type.as_ref().map_or(0, String::capacity))
     }
 
     /// Check whether the current retained byte count exceeds the buffer limit.
@@ -295,6 +303,10 @@ pub(crate) enum SseParseError {
         limit: usize,
     },
 
+    /// Request-wide retained payload cannot admit the next SSE chunk before
+    /// frame assembly or event parsing.
+    RetainedPayloadLimitExceeded,
+
     /// A lowered client tool could not be restored to its canonical typed item
     /// on the streaming Responses path (#1159): malformed arguments envelope,
     /// missing completion artifact, out-of-order lifecycle, or a lossy retype.
@@ -357,6 +369,12 @@ impl fmt::Display for SseParseError {
                 f,
                 "SSE accumulation limit exceeded: {dimension} {value} exceeds {limit} limit"
             ),
+            Self::RetainedPayloadLimitExceeded => {
+                write!(
+                    f,
+                    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes"
+                )
+            },
             Self::ClientToolRestore { key, reason } => {
                 write!(f, "client tool restoration failed for {key}: {reason}")
             },

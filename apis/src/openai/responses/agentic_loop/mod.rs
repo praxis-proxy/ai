@@ -110,6 +110,7 @@
 //! `openai_responses_validate` for every Responses API create
 //! request.
 
+pub(crate) mod budget;
 mod config;
 
 #[cfg(test)]
@@ -130,22 +131,123 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, Rejection,
-    SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    IterationState, PipelineExtension, Rejection, RequestExtensions, SubRequestResponseMode, TrustedHeaderMutation,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
 
 use self::config::{AgenticLoopConfig, build_config};
+
+/// The smallest loop budget reachable by a listener, installed before any
+/// request filter runs. The serving pipeline derives it from its nested IRR
+/// steps, so validation and rehydration use the same limit as the loop.
+#[derive(Clone, Copy)]
+pub struct AgenticBudgetPolicy {
+    /// Effective byte ceiling for every reachable loop on this listener.
+    max_retained_bytes: usize,
+}
+
+impl AgenticBudgetPolicy {
+    /// Read the validated limit from one `openai_agentic_loop` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] for an invalid loop configuration.
+    pub fn from_config(config: &serde_yaml::Value) -> Result<Self, FilterError> {
+        let cfg = if config.is_null() {
+            AgenticLoopConfig::default()
+        } else {
+            parse_filter_config("openai_agentic_loop", config)?
+        };
+        let cfg = build_config(cfg)?;
+        Ok(Self {
+            max_retained_bytes: cfg.max_retained_bytes.get(),
+        })
+    }
+
+    /// The effective request-wide byte limit.
+    #[must_use]
+    pub const fn max_retained_bytes(self) -> usize {
+        self.max_retained_bytes
+    }
+
+    /// Largest raw create body admitted before the request JSON is parsed.
+    #[must_use]
+    pub const fn max_request_body_bytes(self) -> usize {
+        self.max_retained_bytes / budget::INPUT_WIRE_MULTIPLIER
+    }
+
+    /// Conservatively charge a JSON body before parsing it in another filter.
+    #[must_use]
+    pub fn input_charge(bytes: &[u8]) -> Option<usize> {
+        budget::input_charge(bytes)
+    }
+
+    /// Check a filter's temporary parse and added values against live headroom.
+    #[must_use]
+    pub fn has_body_headroom(self, ctx: &HttpFilterContext<'_>, bytes: &[u8], extra_charge: usize) -> bool {
+        let Some(charge) = Self::input_charge(bytes).and_then(|charge| charge.checked_add(extra_charge)) else {
+            return false;
+        };
+        match ctx.extensions.get::<ResponsesState>() {
+            Some(state) => state
+                .simple_budget
+                .is_some_and(|budget| budget.remaining_bytes().is_some_and(|remaining| charge <= remaining)),
+            None => charge <= self.max_retained_bytes,
+        }
+    }
+
+    /// Reserve a filter's rewritten body when Responses state already exists.
+    /// Before state creation the request filter rechecks the resulting body.
+    pub fn reserve_body_projection(self, ctx: &mut HttpFilterContext<'_>, bytes: &[u8], extra_charge: usize) -> bool {
+        let Some(charge) = Self::input_charge(bytes).and_then(|charge| charge.checked_add(extra_charge)) else {
+            return false;
+        };
+        match ctx.extensions.get_mut::<ResponsesState>() {
+            Some(state) => state
+                .simple_budget
+                .as_mut()
+                .is_some_and(|budget| budget.reserve_additional_input(charge)),
+            None => charge <= self.max_retained_bytes,
+        }
+    }
+
+    /// Largest buffered inference response admitted by the core router.
+    #[must_use]
+    pub const fn max_irr_response_bytes(self) -> usize {
+        self.max_retained_bytes / budget::IRR_RESPONSE_DIVISOR
+    }
+
+    /// Lower this policy to another reachable loop's configured limit.
+    #[must_use]
+    pub const fn min(self, other: Self) -> Self {
+        Self {
+            max_retained_bytes: if self.max_retained_bytes < other.max_retained_bytes {
+                self.max_retained_bytes
+            } else {
+                other.max_retained_bytes
+            },
+        }
+    }
+}
+
+impl PipelineExtension for AgenticBudgetPolicy {
+    fn prepare(&self, extensions: &mut RequestExtensions) {
+        extensions.insert(*self);
+    }
+}
 use super::{
     arm_agentic_stream_guard, enforce_agentic_stream_guard,
     error::responses_error_rejection,
     file_search_callout::{
-        ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
-        is_pending_file_search_call, translate_function_calls_to_file_search,
+        ensure_public_output_item_ids_in_response, has_file_search_tool, is_pending_file_search_call,
+        translate_function_calls_to_file_search,
     },
+    is_responses_create,
     state::{
-        DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
+        DispatchFailure, FileSearchAssignment, McpApprovalState, OutputAssignment, ResponsesState, SynthesisKind,
         current_round_file_search_admissions, tool_search_discovery_is_within_budget,
     },
     stream_events::{encode_local_completion, encode_local_error},
@@ -296,40 +398,17 @@ impl HttpFilter for AgenticLoopFilter {
         _body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
+        if end_of_stream {
+            handle_agentic_request_body(ctx, &self.config)
+        } else {
+            Ok(FilterAction::Continue)
         }
-
-        let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        // A locally-detected security-context failure (missing/invalid per-user callout
-        // credential) is converted here FIRST, so a security terminal preempts a generic
-        // dispatch terminal for the same round.
-        if let Some(failure) = state.security_failure.take() {
-            return convert_dispatch_failure(ctx, state, &failure);
-        }
-
-        // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
-        // records a shared terminal outcome instead of committing a second terminal
-        // response. The sole loop owner converts it here — before preparing another
-        // inference request — into a buffered JSON rejection (pre-commitment) or a
-        // logical-stream SSE error (post-commitment). See issue #1046.
-        if let Some(failure) = state.dispatch_failure.take() {
-            return convert_dispatch_failure(ctx, state, &failure);
-        }
-
-        if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
-            return finish_deferred_local_response(ctx, state);
-        }
-
-        prepare_iteration(ctx, &mut state);
-        trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
-        ctx.extensions.insert(state);
-        Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the loop admits output before its sole parse and transition decision"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -340,9 +419,37 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // Multiple loop instances can contribute one policy to a step. Only
+        // one of them may parse and accumulate the provider response.
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.simple_budget.is_some())
+            && let Some(iteration) = ctx.extensions.get::<IterationState>().map(IterationState::iteration)
+        {
+            let marker = iteration.to_string();
+            if ctx.get_metadata("responses.agentic_response_processed_iteration") == Some(marker.as_str()) {
+                return Ok(FilterAction::Continue);
+            }
+            ctx.set_metadata("responses.agentic_response_processed_iteration", marker);
+        }
+
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+
+        if ctx.subrequest_response_mode() != SubRequestResponseMode::Streaming
+            && let Some(budget) = state.simple_budget.as_mut()
+            && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes))
+        {
+            ctx.set_metadata("responses.skip_persist", "true");
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+            )));
+        }
 
         if let Some(bytes) = body.as_ref() {
             extract_tool_calls_from_body(bytes, &mut state);
@@ -369,6 +476,92 @@ impl HttpFilter for AgenticLoopFilter {
     }
 }
 
+/// Process the request-side loop transition outside the async hook's future.
+///
+/// # Errors
+///
+/// Returns a filter error if a terminal outcome cannot be converted.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the loop orders request admission and terminal dispatch outcomes"
+)]
+fn handle_agentic_request_body(
+    ctx: &mut HttpFilterContext<'_>,
+    config: &AgenticLoopConfig,
+) -> Result<FilterAction, FilterError> {
+    // The compact filter returns locally before IRR. Reaching the loop on
+    // this path means no compact owner accounted for its Store/callout work.
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+    {
+        return Ok(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "compaction requires openai_responses_compact before openai_agentic_loop",
+        )));
+    }
+
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_none_or(|state| state.simple_budget.is_none())
+    {
+        return Ok(FilterAction::Reject(responses_error_rejection(
+            500,
+            "server_error",
+            "agentic retained-payload policy was not attached to this Responses create request",
+        )));
+    }
+
+    let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
+        return Ok(FilterAction::Continue);
+    };
+
+    if let Some(budget) = state.simple_budget.as_mut()
+        && !budget.lower_limit(config.max_retained_bytes.get())
+    {
+        let status = if state.iteration == 0 { 413 } else { 502 };
+        let failure = DispatchFailure {
+            status,
+            code: if status == 413 {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            },
+            message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+        };
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    // A locally-detected security-context failure (missing/invalid per-user callout
+    // credential) is converted here FIRST, so a security terminal preempts a generic
+    // dispatch terminal for the same round.
+    if let Some(failure) = state.security_failure.take() {
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
+    // records a shared terminal outcome instead of committing a second terminal
+    // response. The sole loop owner converts it here — before preparing another
+    // inference request — into a buffered JSON rejection (pre-commitment) or a
+    // logical-stream SSE error (post-commitment). See issue #1046.
+    if let Some(failure) = state.dispatch_failure.take() {
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
+        return finish_deferred_local_response(ctx, state);
+    }
+
+    prepare_iteration(ctx, &mut state);
+    trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
+    ctx.extensions.insert(state);
+    Ok(FilterAction::Continue)
+}
+
 /// Apply dispatcher-specific response validation before the sole loop decision.
 #[cfg_attr(
     not(feature = "openai-mcp-tools"),
@@ -379,7 +572,7 @@ impl HttpFilter for AgenticLoopFilter {
 )]
 fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     if let Some(max_calls) = configured_web_max_calls(ctx)
-        && state.web_search_calls.len() > max_calls
+        && state.selected_web_search_calls().len() > max_calls
     {
         return Err(DispatchFailure {
             status: 502,
@@ -469,17 +662,13 @@ fn convert_dispatch_failure(
 ) -> Result<FilterAction, FilterError> {
     // The loop terminates here; drop this round's dispatch bookkeeping.
     clear_round_dispatch_state(&mut state);
-    let streaming = request_is_streaming(&state);
-    if streaming {
-        // No `deferred_stream_done` here: a terminal SSE `error` frame is the stream
-        // terminator and is never followed by a `[DONE]` sentinel (see
-        // `encode_local_error`). Only skip persistence of the failed round.
-        ctx.set_metadata("responses.skip_persist", "true");
-    }
+    let streaming = request_is_streaming(&state) && ctx.extensions.get::<ClientResponseHeadersCommitted>().is_some();
+    ctx.set_metadata("responses.skip_persist", "true");
     ctx.extensions.insert(state);
     set_action(ctx, ACTION_DONE)?;
 
     if streaming {
+        // An error frame terminates the committed stream without [DONE].
         let body = encode_local_error(ctx, failure.code, &failure.message);
         let mut response = Rejection::status(200)
             .with_header("content-type", "text/event-stream")
@@ -544,6 +733,8 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
     if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state);
         state.tool_calls.clear();
+        #[cfg(feature = "openai-mcp-tools")]
+        state.approved_tool_calls.clear();
         state.tool_search_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -566,6 +757,8 @@ fn end_stream_with_error(
     message: &str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    #[cfg(feature = "openai-mcp-tools")]
+    state.approved_tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
@@ -698,7 +891,9 @@ fn request_is_streaming(state: &ResponsesState) -> bool {
 /// resolves to no dispatcher, so a round carrying only client calls must
 /// terminate as `done` rather than loop uselessly to the `max_infer_iters` cap.
 fn has_dispatchable_calls(state: &ResponsesState) -> bool {
-    !state.web_search_calls.is_empty() || !state.file_search_assignments.is_empty() || has_dispatchable_mcp_work(state)
+    !state.selected_web_search_calls().is_empty()
+        || !state.file_search_assignments.is_empty()
+        || has_dispatchable_mcp_work(state)
 }
 
 /// Whether deferred MCP discovery is pending or a recorded call resolves to a
@@ -708,12 +903,12 @@ fn has_dispatchable_mcp_work(state: &ResponsesState) -> bool {
     if has_pending_deferred_discovery(state) {
         return true;
     }
-    if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+    if state.selected_tool_calls().is_empty() || state.mcp_tool_map.is_empty() {
         return false;
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     state
-        .tool_calls
+        .selected_tool_calls()
         .iter()
         .any(|call| classify_mcp(call, &tool_index) != McpDisposition::NotMcp)
 }
@@ -779,31 +974,45 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
     }
-    let queued_ids: Vec<String> = state
-        .tool_search_calls
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
+    let round_start = state.current_round_output_start.unwrap_or(0);
+    let mut pending = std::collections::HashMap::<String, usize>::new();
+    for assignment in &state.tool_search_calls {
+        if assignment
+            .resolve(&state.accumulated_output, round_start, "tool_search_call")
+            .is_none()
+        {
+            continue;
         }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
-        };
-        if matches && let Some(obj) = item.as_object_mut() {
+        if let Some(item) = state.accumulated_output.get_mut(assignment.output_index)
+            && let Some(obj) = item.as_object_mut()
+        {
             obj.insert("status".to_owned(), json!("incomplete"));
+            *pending.entry(assignment.item_id.clone()).or_default() += 1;
         }
-    };
-    for item in &mut state.accumulated_output {
-        mark(item);
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
-    }
+    mark_persisted_tool_searches_incomplete(&mut state.persisted_messages, &mut pending);
     state.tool_search_calls.clear();
+}
+
+/// Match the most recent persisted occurrence of each current-round search ID.
+fn mark_persisted_tool_searches_incomplete(
+    messages: &mut [Value],
+    pending: &mut std::collections::HashMap<String, usize>,
+) {
+    for item in messages.iter_mut().rev() {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(count) = pending.get_mut(id) else {
+            continue;
+        };
+        if *count > 0 && item.get("type").and_then(Value::as_str) == Some("tool_search_call") {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("status".to_owned(), json!("incomplete"));
+            }
+            *count -= 1;
+        }
+    }
 }
 
 /// Remove representation metadata after replacing a buffered response body.
@@ -868,7 +1077,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     // so the public response never ships an item without an id (issue #955). Runs
     // after normalization so translated file-search calls are seen as such.
     ensure_public_output_item_ids_in_response(&mut response);
-    collect_output_items(&response, state, &private_indices);
+    collect_output_items(&mut response, state, &private_indices);
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
@@ -881,7 +1090,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
 /// without sending the latter back to inference as an unresolved call, so fail
 /// before any external side effect.
 fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
-    let has_server = !state.web_search_calls.is_empty()
+    let has_server = !state.selected_web_search_calls().is_empty()
         || !state.file_search_assignments.is_empty()
         || has_hosted_queued_tool_search(state);
     // Scan this round's items in `accumulated_output` rather than
@@ -898,7 +1107,7 @@ fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
         .unwrap_or_default()
         .iter()
         .any(super::state::is_client_executed_tool_call);
-    if state.tool_calls.is_empty() {
+    if state.selected_tool_calls().is_empty() {
         return has_server && has_client;
     }
     if state.mcp_tool_map.is_empty() {
@@ -916,7 +1125,7 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let mut has_server = false;
     let mut has_client = false;
-    for call in &state.tool_calls {
+    for call in state.selected_tool_calls() {
         let is_mcp = call
             .get("name")
             .and_then(Value::as_str)
@@ -930,7 +1139,7 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
 /// Without MCP tool support every function call is client-owned.
 #[cfg(not(feature = "openai-mcp-tools"))]
 fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
-    (false, !state.tool_calls.is_empty())
+    (false, !state.selected_tool_calls().is_empty())
 }
 
 /// Distribute output items from a parsed response into the accumulator and state vectors.
@@ -943,18 +1152,20 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     clippy::too_many_lines,
     reason = "linear per-item classification of one response's output"
 )]
-fn collect_output_items(response: &Value, state: &mut ResponsesState, private_indices: &[usize]) {
-    let Some(Value::Array(output)) = response.get("output") else {
+fn collect_output_items(response: &mut Value, state: &mut ResponsesState, private_indices: &[usize]) {
+    let Some(Value::Array(output)) = response.get_mut("output") else {
         return;
     };
+    let output = std::mem::take(output);
     state.current_round_output_start = Some(state.accumulated_output.len());
     let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
-    for (round_index, item) in output.iter().enumerate() {
+    for (round_index, item) in output.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
-        state.accumulated_output.push(item.clone());
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call") if is_dispatchable_function_call(item) => {
-                state.tool_calls.push(item.clone());
+            Some("function_call") if is_dispatchable_function_call(&item) => {
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_calls.push(assignment);
+                }
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
@@ -972,7 +1183,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
-                        std::slice::from_ref(item),
+                        std::slice::from_ref(&item),
                     ));
             },
             Some("web_search_call") => {
@@ -981,17 +1192,21 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // openai_web_search dispatch consumes `web_search_calls` and
                 // appends a backend-valid function_call/function_call_output
                 // bridge for the next inference step.
-                state.web_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.web_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
             },
-            Some("tool_search_call") if is_hosted_completed_tool_search(item) => {
+            Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Only a completed hosted search may trigger deferred
                 // `tools/list`. Client-executed searches return to the caller
                 // without listing or another inference round.
-                state.tool_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
             },
-            Some("tool_search_call") if is_completed_output_item(item) => {
+            Some("tool_search_call") if is_completed_output_item(&item) => {
                 state.persisted_messages.push(item.clone());
             },
             Some("file_search_call") => {
@@ -1002,7 +1217,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
                 state.persisted_messages.push(item.clone());
-                if is_pending_file_search_call(item) {
+                if is_pending_file_search_call(&item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
                         SynthesisKind::Private
                     } else {
@@ -1013,6 +1228,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             },
             _ => {},
         }
+        state.accumulated_output.push(item);
     }
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
@@ -1047,6 +1263,13 @@ fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usiz
         .into_iter()
         .map(|(output_index, synthesis)| FileSearchAssignment {
             output_index,
+            item_id: state
+                .accumulated_output
+                .get(output_index)
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             synthesis,
         })
         .collect::<Vec<_>>();
@@ -1095,17 +1318,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     } else {
         Vec::new()
     };
-    // `openai_stream_events` built `tool_calls` from the raw streamed round
-    // before normalization, so any private `function_call(name=file_search)` is
-    // still present there as a client-looking call. It is now a
-    // `file_search_call` in `response_object`/`accumulated_output`, so drop it
-    // from `tool_calls` to mirror the buffered path, where `collect_output_items`
-    // builds `tool_calls` from the already-normalized response. Otherwise
-    // `has_mixed_function_call_ownership` misreads a pure file-search round (no
-    // MCP tool map, a recorded assignment) as mixed client/server ownership.
-    if !private_indices.is_empty() {
-        state.tool_calls.retain(|call| !is_file_search_function_call(call));
-    }
+    // The stream accumulator owns the response tree until this round is
+    // complete. Build dispatch selections only after normalization and move.
+    state.tool_calls.clear();
     // Stamp stable synthetic IDs on any id-less streamed items before draining the
     // round into the accumulator (issue #955), mirroring the buffered path.
     ensure_public_output_item_ids_in_response(&mut state.response_object);
@@ -1118,7 +1333,17 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     for (round_index, item) in round.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "reasoning") => {
+            Some("function_call") => {
+                if is_dispatchable_function_call(&item)
+                    && let Some(assignment) = OutputAssignment::new(absolute_index, &item)
+                {
+                    state.tool_calls.push(assignment);
+                }
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state.accumulated_output.push(item);
+            },
+            Some("reasoning") => {
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);
@@ -1142,7 +1367,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // enter `messages`. The openai_web_search dispatch consumes
                 // `web_search_calls` and appends a backend-valid
                 // function_call/function_call_output bridge for the next round.
-                state.web_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.web_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);
             },
@@ -1175,7 +1402,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // `tool_search_call` is not a valid OpenResponses input item, so
                 // it must not enter `messages`. `openai_mcp_dispatch` consumes
                 // `tool_search_calls` to list deferred connectors.
-                state.tool_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_search_calls.push(assignment);
+                }
                 state.accumulated_output.push(item.clone());
                 state.persisted_messages.push(item);
             },
@@ -1228,6 +1457,8 @@ fn is_responses_api_output(response: &Value) -> bool {
 /// Drop this round's dispatcher queues so a terminal outcome cannot re-dispatch.
 fn clear_round_dispatch_state(state: &mut ResponsesState) {
     state.tool_calls.clear();
+    #[cfg(feature = "openai-mcp-tools")]
+    state.approved_tool_calls.clear();
     state.web_search_calls.clear();
     state.tool_search_calls.clear();
     state.file_search_assignments.clear();
@@ -1235,10 +1466,7 @@ fn clear_round_dispatch_state(state: &mut ResponsesState) {
 
 /// Whether a hosted `tool_search_call` is queued for deferred connector listing.
 fn has_hosted_queued_tool_search(state: &ResponsesState) -> bool {
-    state
-        .tool_search_calls
-        .iter()
-        .any(|item| !super::state::is_client_executed_tool_call(item))
+    !state.selected_tool_search_calls().is_empty()
 }
 
 // -----------------------------------------------------------------------------

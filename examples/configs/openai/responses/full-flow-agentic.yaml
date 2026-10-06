@@ -506,16 +506,6 @@ filter_chains:
               bound_upstream:
                 application_provider: openai
 
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
-
       - filter: openai_response_store
         backend: sqlite
         # In-memory:
@@ -524,6 +514,18 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+
+      # Response hooks run in reverse: append the conversation turn before
+      # Store can persist a successful response from the same exchange.
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
         conditions:
           - unless:
               bound_upstream:

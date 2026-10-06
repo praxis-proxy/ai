@@ -223,6 +223,195 @@ fn reject_rewritten_body_too_large_returns_413() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn budgeted_file_resolve_rejects_before_file_callout() {
+    let config = serde_yaml::from_str(
+        "files_api_url: http://127.0.0.1:9\nallow_pre_security_callout: true\non_missing: continue\ntimeout_ms: 100",
+    )
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&config).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw = br#"{"model":"test","input":[{"type":"input_file","file_id":"file-1"}]}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
+async fn budgeted_file_resolution_preserves_in_budget_request_and_history() {
+    let files_api_url = start_files_api_stub();
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({
+        "model": "test",
+        "store": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(8_388_608, 128, false).unwrap());
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let part = &rewritten["input"][0]["content"][0];
+    assert_eq!(part["file_data"], "aGlzdG9yeQ==");
+    assert_eq!(part["filename"], "history.txt");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+    assert_eq!(state.persisted_messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_plain_text_skips_file_resolution_without_changing_body() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"hello"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "plain text needs no file resolution"
+    );
+    assert_eq!(body, Some(raw), "file resolver must leave the admitted body untouched");
+}
+
+#[tokio::test]
+async fn budgeted_text_message_array_skips_file_resolution() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":[{"role":"user","content":[{"type":"input_text","text":"Hello"}]}]});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 32_000, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+}
+
+#[tokio::test]
+async fn budgeted_plain_text_needs_no_second_json_reserve() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"a".repeat(8192),"store":false});
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let ingress_charge = super::super::agentic_loop::budget::input_charge(&raw).unwrap();
+    let mut state = ResponsesState::from_request_body(request);
+    state.simple_budget = Some(
+        super::super::agentic_loop::budget::SimpleBudget::new_with_store(1_048_576, ingress_charge, false).unwrap(),
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn budgeted_restored_plain_history_skips_file_resolution() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.history_rehydrated = true;
+    state.messages.insert(0, json!({"role":"user","content":"first"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role":"user","content":"first"}));
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+}
+
+#[tokio::test]
+async fn budgeted_restored_file_with_exhausted_budget_rejects_before_callout() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.history_rehydrated = true;
+    state.persisted_messages.insert(
+        0,
+        json!({"role":"user","content":[{"type":"input_file","file_url":"https://example.com/file"}]}),
+    );
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(4_096, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body, Some(raw));
+}
+
+#[tokio::test]
 async fn skips_non_responses_request() {
     let filter = make_filter();
     let req = Box::leak(Box::new(crate::test_utils::make_request(

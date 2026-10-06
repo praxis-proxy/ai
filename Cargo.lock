@@ -1914,8 +1914,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3883,8 +3881,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be9a64d340db0f296e91b71aedebeb2b612d9c227879c0406b05ac211030b2d0"
+source = "git+https://github.com/praxis-proxy/praxis?rev=41032be38037f6468d8d3935e7c44ee480974069#41032be38037f6468d8d3935e7c44ee480974069"
 dependencies = [
  "bytes",
  "chrono",
@@ -3909,8 +3906,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47953af135b13051fb858fc8a47ef1f85c195a842d878d094e062004fd8644d8"
+source = "git+https://github.com/praxis-proxy/praxis?rev=41032be38037f6468d8d3935e7c44ee480974069#41032be38037f6468d8d3935e7c44ee480974069"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3943,8 +3939,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddf2ff46c78f58f444459394b470b5b25c7bd4ba76ff82c2b9d6ae211207cf82"
+source = "git+https://github.com/praxis-proxy/praxis?rev=41032be38037f6468d8d3935e7c44ee480974069#41032be38037f6468d8d3935e7c44ee480974069"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3972,8 +3967,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b79d96e17d8d3c65da4c42cfe5ce8f9f7b1380940cd080f728234af6a1c4158e"
+source = "git+https://github.com/praxis-proxy/praxis?rev=41032be38037f6468d8d3935e7c44ee480974069#41032be38037f6468d8d3935e7c44ee480974069"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4147,7 +4141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -4168,7 +4162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4446,7 +4440,7 @@ dependencies = [
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.10.3",

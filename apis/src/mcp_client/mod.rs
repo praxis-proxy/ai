@@ -83,6 +83,17 @@ pub(crate) struct McpConnectorContext<'a> {
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
 pub(super) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
+/// Per-call ceilings reserved by the Responses request-wide budget before a
+/// budgeted MCP side effect. Budgeted calls use fresh sessions so an older
+/// pooled transport cannot retain a less restrictive response ceiling.
+#[derive(Clone, Copy)]
+pub(crate) struct McpBudgetedCallLimits {
+    /// Maximum raw bytes in one JSON-RPC response or SSE operation.
+    pub wire_limit: usize,
+    /// Maximum lexical wire and JSON structure charge before rmcp parses it.
+    pub parse_charge_limit: usize,
+}
+
 // -----------------------------------------------------------------------------
 // McpDisplayUrl
 // -----------------------------------------------------------------------------
@@ -350,7 +361,10 @@ pub(crate) async fn list_tools(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers extend the existing API"
 )]
-#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "keeps the unbudgeted MCP listing entry point available")
+)]
 pub(crate) async fn list_tools_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -362,6 +376,37 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     max_tools: usize,
     callout: &McpCallout,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
+    list_tools_with_forwarded_headers_budgeted(
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        timeout,
+        max_tools,
+        callout,
+        None,
+    )
+    .await
+}
+
+/// Resolve an MCP listing with the request's reserved wire, parser, and
+/// cumulative decoded-listing ceilings. `None` preserves the legacy limits.
+#[expect(clippy::too_many_arguments, reason = "MCP callout parameters plus request budget")]
+#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
+pub(crate) async fn list_tools_with_forwarded_headers_budgeted(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    timeout: Duration,
+    max_tools: usize,
+    callout: &McpCallout,
+    budget: Option<(McpBudgetedCallLimits, usize)>,
+) -> Result<Vec<serde_json::Value>, McpClientError> {
     // No upfront SSRF classifier: the subrequest transport validates the
     // dial target during the callout via `prepare_url_target`, so this path
     // resolves DNS exactly once. `initialize` and `tools/list` are
@@ -371,11 +416,12 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     // evaluated. Across pagination the decoded listing is additionally
     // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
     let display_url = parse_display_url(server_url);
-    let mcp_client = subrequest_transport::McpSubrequestClient::control(
-        callout.clone(),
-        timeout,
-        connector_context.map(|context| context.owner.clone()),
-    );
+    let owner = connector_context.map(|context| context.owner.clone());
+    let mcp_client = if let Some((limits, _)) = budget {
+        subrequest_transport::McpSubrequestClient::control_with_budget(callout.clone(), timeout, owner, limits)
+    } else {
+        subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout, owner)
+    };
     // Take the signal handle before the client is moved into the rmcp
     // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
     // recorded during the exchange (which rmcp otherwise discards) can be
@@ -401,7 +447,10 @@ pub(crate) async fn list_tools_with_forwarded_headers(
             })
         })?;
         let client = running.insert(client);
-        let tools = Box::pin(paginate_tools(client, max_tools, &display_url))
+        let listing_limit = budget.map_or(MAX_LISTING_RESPONSE_BYTES, |(_, limit)| {
+            limit.min(MAX_LISTING_RESPONSE_BYTES)
+        });
+        let tools = Box::pin(paginate_tools(client, max_tools, listing_limit, &display_url))
             .await
             .map_err(|err| transport_signal_error(&signal, &display_url).unwrap_or(err))?;
         tools_to_json(tools)
@@ -487,13 +536,15 @@ async fn open_tool_session(
     connector_context: Option<&McpConnectorContext<'_>>,
     timeout: Duration,
     max_result_bytes: usize,
+    budgeted_limits: Option<McpBudgetedCallLimits>,
     callout: &McpCallout,
     display_url: &McpDisplayUrl,
 ) -> Result<PooledSession, McpClientError> {
-    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(
+    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool_with_budget(
         callout.clone(),
         timeout,
         max_result_bytes,
+        budgeted_limits,
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
@@ -571,14 +622,6 @@ async fn invoke_tool(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers and optional pooling extend the existing API"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
-)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
-)]
 pub(crate) async fn call_tool_with_forwarded_headers(
     pool: Option<(&McpSessionPool, &McpPoolKey)>,
     server_url: &str,
@@ -593,6 +636,89 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     max_result_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_limits(
+        pool,
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        callout,
+        None,
+    )
+    .await
+}
+
+/// Execute a budgeted call with transport limits reserved by the Responses
+/// owner. The fresh session keeps a pooled transport's older, larger ceilings
+/// from bypassing this request's limit.
+#[expect(clippy::too_many_arguments, reason = "mirrors the unbudgeted MCP call boundary")]
+pub(crate) async fn call_tool_with_forwarded_headers_budgeted(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    callout: &McpCallout,
+    limits: McpBudgetedCallLimits,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_limits(
+        None,
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        callout,
+        Some(limits),
+    )
+    .await
+}
+
+/// Execute the common pooled or fresh MCP session path with optional budgeted
+/// transport bounds. Only unbudgeted callers can reuse the session pool.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared budgeted and unbudgeted MCP call boundary"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "session reuse and fresh session cleanup share one boundary"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "rmcp service setup and cleanup remain in one async owner"
+)]
+async fn call_tool_with_limits(
+    pool: Option<(&McpSessionPool, &McpPoolKey)>,
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    callout: &McpCallout,
+    budgeted_limits: Option<McpBudgetedCallLimits>,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
     let deadline = tokio::time::Instant::now() + timeout;
     // 1. Reuse a warm session for this exact identity, if one exists. A reused session only ever existed after a prior
@@ -600,7 +726,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     //    those sessions are explicitly closed in the background so their DELETE cannot consume this call's delivery
     //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
     //    an idle GET-stream failure cannot poison this call.
-    if let Some((pool, key)) = pool {
+    if let Some((pool, key)) = pool.filter(|_| budgeted_limits.is_none()) {
         let checkout = pool.checkout(key, max_result_bytes);
         session_pool::close_sessions_in_background(checkout.rejected);
         if let Some(session) = checkout.session {
@@ -648,6 +774,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             connector_context,
             timeout,
             max_result_bytes,
+            budgeted_limits,
             callout,
             &display_url,
         )
@@ -665,19 +792,19 @@ pub(crate) async fn call_tool_with_forwarded_headers(
 
     match outcome {
         Ok(Ok(result)) => {
-            match (pool, session.take()) {
+            match (pool.filter(|_| budgeted_limits.is_none()), session.take()) {
                 (Some((pool, key)), Some(session)) => {
                     let rejected = pool.checkin(key.clone(), session);
                     session_pool::close_sessions_in_background(rejected);
                 },
-                (None, Some(session)) => session.close_before(deadline).await,
+                (None, Some(session)) => close_fresh_session(session, deadline, budgeted_limits).await,
                 (_, None) => {},
             }
             Ok(result)
         },
         Ok(Err(err)) => {
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_fresh_session(session, deadline, budgeted_limits).await;
             }
             Err(err)
         },
@@ -686,7 +813,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             // oversized/SSRF exchange surfaced only when the deadline fired still
             // maps to its typed error.
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_fresh_session(session, deadline, budgeted_limits).await;
             }
             Err(call_signal.map_or_else(
                 || McpClientError::Timeout {
@@ -696,6 +823,21 @@ pub(crate) async fn call_tool_with_forwarded_headers(
                 |signal| classify_deadline(&signal, &display_url, timeout),
             ))
         },
+    }
+}
+
+/// A budgeted result can release its callout reservation only after rmcp's
+/// worker has stopped retaining the transport and any DELETE response. Normal
+/// unbudgeted calls keep their existing bounded close behavior.
+async fn close_fresh_session(
+    session: PooledSession,
+    deadline: tokio::time::Instant,
+    budgeted_limits: Option<McpBudgetedCallLimits>,
+) {
+    if budgeted_limits.is_some() {
+        session.close_budgeted().await;
+    } else {
+        session.close_before(deadline).await;
     }
 }
 
@@ -713,6 +855,7 @@ const MAX_PAGES: usize = 100;
 async fn paginate_tools(
     client: &Peer<RoleClient>,
     max_tools: usize,
+    max_listing_bytes: usize,
     url: &McpDisplayUrl,
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
     let mut all_tools = Vec::new();
@@ -723,7 +866,7 @@ async fn paginate_tools(
         let page = Box::pin(client.list_tools(Some(params)))
             .await
             .map_err(|_source| McpClientError::ListTools { url: url.clone() })?;
-        accumulate_listing_bytes(&mut total_bytes, &page.tools, url)?;
+        accumulate_listing_bytes(&mut total_bytes, &page.tools, max_listing_bytes, url)?;
         all_tools.extend(page.tools);
         if all_tools.len() > max_tools {
             return Err(McpClientError::TooManyTools {
@@ -988,14 +1131,15 @@ fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
 fn accumulate_listing_bytes(
     total_bytes: &mut usize,
     tools: &[rmcp::model::Tool],
+    max_listing_bytes: usize,
     url: &McpDisplayUrl,
 ) -> Result<(), McpClientError> {
     *total_bytes = total_bytes.saturating_add(measure_tools_json_bytes(tools));
-    if *total_bytes > MAX_LISTING_RESPONSE_BYTES {
+    if *total_bytes > max_listing_bytes {
         return Err(McpClientError::ListingTooLarge {
             url: url.clone(),
             bytes: *total_bytes,
-            max: MAX_LISTING_RESPONSE_BYTES,
+            max: max_listing_bytes,
         });
     }
     Ok(())

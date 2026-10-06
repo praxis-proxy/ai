@@ -81,6 +81,13 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// inference round and are not persisted into rehydration history.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
+/// Wire, decoder, decoded result, and formatting owners can overlap during
+/// one fan-out. Reserve a separate allowance for every simultaneously live
+/// response and leave capacity for final public and model-facing projections.
+const RETAINED_SEARCH_WIRE_FACTOR: usize = 16;
+/// Extra typed decoder and parser scratch for every concurrent response.
+const RETAINED_SEARCH_DECODER_HEADROOM: usize = 65_536;
+
 /// Dispatches the loop owner's pending file-search assignments against a vector
 /// store API compatible backend.
 ///
@@ -169,11 +176,21 @@ impl FileSearchCalloutFilter {
     /// On a size overflow it records a shared [`DispatchFailure`] the loop owner
     /// converts into the terminal wire form; the dispatcher never rejects itself.
     #[expect(clippy::too_many_lines, reason = "sequential result formatting and state commit")]
-    fn apply_batch(state: &mut ResponsesState, plan: &SearchPlan, batch: &SearchBatch) -> Result<(), DispatchFailure> {
+    fn apply_batch(
+        state: &mut ResponsesState,
+        plan: &SearchPlan,
+        batch: &SearchBatch,
+        model_limit: usize,
+    ) -> Result<usize, DispatchFailure> {
         let failed_calls: HashSet<usize> = batch.failures.iter().map(|failure| failure.call_index).collect();
         let expose_results = state.include.iter().any(|value| value == "file_search_call.results");
         let mut bridges = Vec::with_capacity(plan.calls.len());
-        let mut remaining_model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES;
+        let mut remaining_model_bytes = model_limit;
+        let mut retained_charge = plan
+            .calls
+            .len()
+            .checked_mul(1_024)
+            .ok_or_else(file_search_budget_failure)?;
         let response_identity_hash = state
             .response_object
             .get("id")
@@ -204,6 +221,21 @@ impl FileSearchCalloutFilter {
                 templates: &MODEL_CONTEXT_TEMPLATES,
             }
             .format(results, expose_results);
+            let public_bytes = bounded_json_size(&public_results, usize::MAX)
+                .ok()
+                .flatten()
+                .ok_or_else(file_search_budget_failure)?;
+            let citation_bytes = citation_files.iter().try_fold(0_usize, |total, (file_id, filename)| {
+                total
+                    .checked_add(file_id.len())?
+                    .checked_add(filename.len())?
+                    .checked_add(256)
+            });
+            retained_charge = retained_charge
+                .checked_add(public_bytes.checked_mul(8).ok_or_else(file_search_budget_failure)?)
+                .and_then(|total| total.checked_add(serialized_bytes.checked_mul(8)?))
+                .and_then(|total| total.checked_add(citation_bytes?.checked_mul(8)?))
+                .ok_or_else(file_search_budget_failure)?;
             remaining_model_bytes = remaining_model_bytes.saturating_sub(serialized_bytes);
 
             let complete = !call.queries.is_empty()
@@ -254,7 +286,7 @@ impl FileSearchCalloutFilter {
         for bridge in bridges {
             state.messages.extend(bridge);
         }
-        Ok(())
+        Ok(retained_charge)
     }
 
     /// Execute the bounded fan-out for a completed plan.
@@ -267,6 +299,7 @@ impl FileSearchCalloutFilter {
         plan: &SearchPlan,
         request_headers: &HeaderMap,
         transport: &CalloutTransport<'_>,
+        retained_limit: usize,
     ) -> SearchBatch {
         if let Some(message) = plan.planning_error {
             return SearchBatch::with_failures(
@@ -297,7 +330,7 @@ impl FileSearchCalloutFilter {
             SearchBatch::new(plan.calls.len())
         } else {
             self.client
-                .search(&specs, plan.calls.len(), request_headers, transport)
+                .search_with_retained_limit(&specs, plan.calls.len(), request_headers, transport, retained_limit)
                 .await
         };
         batch.failures.extend(planning_failures);
@@ -369,6 +402,16 @@ impl FileSearchCalloutFilter {
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+            && assignments.iter().any(|assignment| assignment.resolve(state).is_none())
+        {
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "openai_file_search_callout: stale file-search assignment".to_owned(),
+            });
+            return Ok(FilterAction::Continue);
+        }
         let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
             Ok(identity) => identity,
             Err(CalloutContextMissing::Credential { slot }) => {
@@ -379,6 +422,13 @@ impl FileSearchCalloutFilter {
             return Ok(FilterAction::Continue);
         };
         let plan = build_search_plan(state, &assignments);
+        let Some(retained_limit) = file_search_body_limit(state, plan.spec_coordinates.len()) else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Continue);
+        };
         let hdrs = callout_request_headers(ctx);
         // Capture the downstream client attributes forwarded into every filtered
         // sub-request, then bind the request-scoped transport to the prebuilt
@@ -395,7 +445,14 @@ impl FileSearchCalloutFilter {
             downstream,
             identity: &identity,
         };
-        let batch = self.execute_plan(&plan, &hdrs, &transport).await;
+        let batch = self.execute_plan(&plan, &hdrs, &transport, retained_limit).await;
+        if batch.retained_limit_exceeded {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Continue);
+        }
         if let Some(failure) = self.dispatch_failure(&batch) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.dispatch_failure = Some(failure);
@@ -406,11 +463,37 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        let Some((peak_charge, model_limit)) = file_search_format_reservation(state, &plan, &batch) else {
+            state.dispatch_failure = Some(file_search_budget_failure());
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Continue);
+        };
+        if let Some(budget) = state.simple_budget.as_mut()
+            && !budget.reserve_additional_input(peak_charge)
+        {
+            state.dispatch_failure = Some(file_search_budget_failure());
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Continue);
+        }
         // Terminalize any assignments the per-continuation server cap dropped
         // from the plan, then reconcile the executed calls in place.
         terminalize_unplanned_pending_calls(state, &assignments, &plan);
-        if let Err(failure) = Self::apply_batch(state, &plan, &batch) {
-            state.dispatch_failure = Some(failure);
+        let retained_charge = match Self::apply_batch(state, &plan, &batch, model_limit) {
+            Ok(charge) => charge,
+            Err(failure) => {
+                state.dispatch_failure = Some(failure);
+                ctx.set_metadata("responses.skip_persist", "true");
+                return Ok(FilterAction::Continue);
+            },
+        };
+        drop(batch);
+        drop(plan);
+        drop(assignments);
+        if let Some(budget) = state.simple_budget.as_mut()
+            && !budget.settle_additional_input(peak_charge, retained_charge)
+        {
+            state.dispatch_failure = Some(file_search_budget_failure());
+            ctx.set_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         }
         if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
@@ -695,15 +778,33 @@ fn continuation_state_fits(
         &state.messages,
         &state.persisted_messages,
         &state.previous_tools,
-        &state.tool_calls,
         &state.tools,
-        &state.web_search_calls,
     ] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
             return false;
         };
         used = used.saturating_add(size);
     }
+    #[cfg(feature = "openai-mcp-tools")]
+    {
+        let Some(size) = bounded_json_size(&state.approved_tool_calls, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    used = used.saturating_add(
+        state
+            .tool_calls
+            .iter()
+            .chain(&state.web_search_calls)
+            .chain(&state.tool_search_calls)
+            .fold(0_usize, |bytes, assignment| {
+                bytes.saturating_add(assignment.item_id.len())
+            }),
+    );
     for value in [
         state.context_management.as_ref(),
         state.conversation.as_ref(),
@@ -783,6 +884,62 @@ fn continuation_state_dispatch_failure() -> DispatchFailure {
         status: 413,
         code: "invalid_request_error",
         message: "openai_file_search_callout: continuation state exceeds max_state_bytes".to_owned(),
+    }
+}
+
+/// Bound the whole fan-out before the first provider call. Each concurrently
+/// decoded response has 64 KiB of parser and typed-result headroom beyond its
+/// wire body; the wire factor leaves room for the public and model projections.
+fn file_search_body_limit(state: &ResponsesState, spec_count: usize) -> Option<usize> {
+    let Some(budget) = state.simple_budget else {
+        return Some(usize::MAX);
+    };
+    if spec_count == 0 {
+        return Some(usize::MAX);
+    }
+    let decoder_headroom = spec_count.checked_mul(RETAINED_SEARCH_DECODER_HEADROOM)?;
+    let available = budget
+        .remaining_bytes()?
+        .checked_sub(decoder_headroom)?
+        .checked_sub(4_096)?;
+    let body_limit = available / RETAINED_SEARCH_WIRE_FACTOR;
+    (body_limit > 0).then_some(body_limit)
+}
+
+/// Admit typed rows, public result materialization, citation metadata, and
+/// overlapping model-context String/JSON/bridge owners before formatting.
+fn file_search_format_reservation(
+    state: &ResponsesState,
+    plan: &SearchPlan,
+    batch: &SearchBatch,
+) -> Option<(usize, usize)> {
+    let Some(budget) = state.simple_budget else {
+        return Some((0, MAX_TOTAL_MODEL_CONTEXT_BYTES));
+    };
+    let typed = batch.retained_bytes()?;
+    let queries = plan.calls.iter().try_fold(0_usize, |total, call| {
+        call.queries
+            .iter()
+            .try_fold(total, |total, query| total.checked_add(query.len()))
+    })?;
+    let non_model = typed
+        .checked_mul(16)?
+        .checked_add(queries.checked_mul(16)?)?
+        .checked_add(plan.calls.len().checked_mul(16_384)?)?;
+    let remaining = budget.remaining_bytes()?.checked_sub(non_model)?;
+    let model_limit = MAX_TOTAL_MODEL_CONTEXT_BYTES.min(remaining / 8);
+    let peak = non_model.checked_add(model_limit.checked_mul(8)?)?;
+    Some((peak, model_limit))
+}
+
+/// A request-wide budget failure after model inference is a terminal 502,
+/// regardless of the file-search filter's provider failure policy.
+fn file_search_budget_failure() -> DispatchFailure {
+    DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file search"
+            .to_owned(),
     }
 }
 
@@ -1003,7 +1160,7 @@ fn pending_calls_from_assignments(
     let mut calls = Vec::new();
     for assignment in assignments.iter().take(MAX_PENDING_CALLS) {
         let output_index = assignment.output_index;
-        let Some(item) = state.accumulated_output.get(output_index) else {
+        let Some(item) = assignment.resolve(state) else {
             continue;
         };
         let Some(query_values) = item.get("queries").and_then(Value::as_array) else {
@@ -1307,6 +1464,9 @@ fn terminalize_unplanned_pending_calls(
     for assignment in assignments {
         let output_index = assignment.output_index;
         if plan.calls.iter().any(|call| call.output_index == output_index) {
+            continue;
+        }
+        if assignment.resolve(state).is_none() {
             continue;
         }
         if let Some(object) = state

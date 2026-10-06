@@ -30,9 +30,28 @@ use super::{
 use crate::{
     CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
-    openai::responses::state::{FileSearchAssignment, SynthesisKind},
+    openai::responses::{
+        agentic_loop::budget::SimpleBudget,
+        state::{FileSearchAssignment, SynthesisKind},
+    },
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
+
+#[test]
+fn retained_file_fanout_cap_has_exact_preflight_boundary() {
+    let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+    let decoder_headroom = 2 * RETAINED_SEARCH_DECODER_HEADROOM + 4_096;
+    let remaining = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(remaining - decoder_headroom - RETAINED_SEARCH_WIRE_FACTOR));
+    let mut state = ResponsesState {
+        simple_budget: Some(budget),
+        ..Default::default()
+    };
+    assert_eq!(file_search_body_limit(&state, 2), Some(1));
+    assert!(state.simple_budget.as_mut().unwrap().reserve_additional_input(1));
+    assert_eq!(file_search_body_limit(&state, 2), None);
+    assert_eq!(file_search_body_limit(&ResponsesState::default(), 2), Some(usize::MAX));
+}
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -597,6 +616,40 @@ async fn local_calls_keep_public_ids() {
     let generated_id = state.accumulated_output[0]["id"].as_str().unwrap();
     assert!(generated_id.starts_with("fs_"));
     assert_eq!(state.accumulated_output[1]["id"], long_id);
+}
+
+#[tokio::test]
+async fn stale_file_search_assignment_cannot_dispatch_or_rewrite_another_item() {
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));
+    let filter = make_filter(server.port, "");
+
+    for stale in ["id", "type", "round", "index", "status"] {
+        let mut state = one_pending_state(&["vs-a"]);
+        match stale {
+            "id" => state.accumulated_output[0]["id"] = json!("fs-replaced"),
+            "type" => state.accumulated_output[0]["type"] = json!("web_search_call"),
+            "round" => state.current_round_output_start = Some(1),
+            "index" => state.file_search_assignments[0].output_index = 99,
+            "status" => state.accumulated_output[0]["status"] = json!("completed"),
+            _ => unreachable!(),
+        }
+        let output_before = state.accumulated_output.clone();
+        let mut ctx = make_context(Some(state));
+
+        assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert_eq!(state.accumulated_output, output_before, "stale {stale} selection");
+        assert!(state.messages.is_empty(), "stale {stale} selection");
+        assert_eq!(
+            state.dispatch_failure.as_ref().map(|failure| failure.status),
+            Some(502),
+            "stale {stale} selection must fail closed"
+        );
+    }
+    assert!(
+        server.requests().is_empty(),
+        "stale selections cannot reach a vector store"
+    );
 }
 
 #[tokio::test]
@@ -1394,6 +1447,76 @@ async fn searches_multiple_stores_concurrently() {
 }
 
 #[tokio::test]
+async fn budgeted_file_fanout_keeps_all_small_results_eligible() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut state = one_pending_state(&["vs-a", "vs-b"]);
+    state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(server.requests().len(), 2);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.dispatch_failure.is_none());
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn exhausted_file_response_allowance_stops_before_paid_fanout() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "on_failure: open\n");
+    let mut state = one_pending_state(&["vs-a"]);
+    let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+    let remaining = budget.remaining_bytes().unwrap();
+    let response_allowance = RETAINED_SEARCH_DECODER_HEADROOM + 4_096 + RETAINED_SEARCH_WIRE_FACTOR * 10;
+    assert!(budget.reserve_additional_input(remaining - response_allowance));
+    state.simple_budget = Some(budget);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        server.requests().is_empty(),
+        "no vector-store request should be dispatched"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
+    let server = MockServer::json(200, &json!({"data": [], "padding": "x".repeat(500_000)}));
+    let filter = make_filter(server.port, "on_failure: open\n");
+    let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
+        .map(|index| format!("vs-{index}"))
+        .collect();
+    let store_refs: Vec<&str> = store_ids.iter().map(String::as_str).collect();
+    let mut state = one_pending_state(&store_refs);
+    state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
+    let pending = state.accumulated_output[0].clone();
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(state.accumulated_output[0], pending);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let requests = server.requests();
+    assert!(
+        !requests.is_empty(),
+        "the first bounded batch should reach the provider"
+    );
+    assert!(
+        requests.len() <= MAX_CONCURRENT_SEARCHES,
+        "retained-budget exhaustion must stop scheduling later batches"
+    );
+    assert!(
+        requests.iter().all(|request| !request.contains("/vs-8/search")),
+        "the next vector store must not run after budget exhaustion"
+    );
+}
+
+#[tokio::test]
 async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
     let server = MockServer::routes([
         (
@@ -1982,13 +2105,20 @@ fn state_with(store_ids: &[&str], output_items: Vec<Value>) -> ResponsesState {
 /// `FileSearchAssignment` for every pending `file_search_call`, mirroring the
 /// owner's `collect_output_items`.
 fn register_assignments(state: &mut ResponsesState, output_items: Vec<Value>) {
-    for item in output_items {
+    for mut item in output_items {
         let output_index = state.accumulated_output.len();
         let pending = is_pending_file_search_call(&item);
+        if pending && item.get("id").and_then(Value::as_str).is_none() {
+            item.as_object_mut()
+                .expect("file-search item")
+                .insert("id".to_owned(), json!(format!("fs_test_{output_index}")));
+        }
+        let item_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
         state.accumulated_output.push(item);
         if pending {
             state.file_search_assignments.push(FileSearchAssignment {
                 output_index,
+                item_id: item_id.expect("pending file-search item id"),
                 synthesis: SynthesisKind::Native,
             });
         }

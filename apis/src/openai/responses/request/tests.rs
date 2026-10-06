@@ -34,6 +34,176 @@ fn create_request() -> Request {
     make_request(http::Method::POST, "/v1/responses")
 }
 
+#[tokio::test]
+async fn budgeted_plain_create_initializes_shared_charge() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let policy = super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap();
+    ctx.extensions.insert(policy);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","store":false}"#,
+    ));
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_some());
+}
+
+#[tokio::test]
+async fn budgeted_create_accepts_default_store_with_shared_charge() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "default Store must remain available for plain creates"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_some());
+}
+
+#[tokio::test]
+async fn budgeted_create_preserves_provider_owned_parameters() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let original = json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "store": false,
+        "reasoning": {"effort": "medium"},
+        "metadata": {"caller": "test"},
+        "temperature": "backend validates this"
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "provider parameters must reach the backend"
+    );
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().request_body, original);
+}
+
+#[tokio::test]
+async fn budgeted_fused_request_leaves_compaction_body_to_handler() {
+    let filter = default_filter();
+    let req = make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "fused classifier must leave compact parsing to its budgeted owner"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "fused classifier must not retain a second compact input tree"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_create_rejects_large_body_before_parse() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(Bytes::from(
+        format!(r#"{{"input":"{}","store":false}}"#, "a".repeat(200)).into_bytes(),
+    ));
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
+async fn budgeted_create_admits_stream_tools_and_typed_input() {
+    let request = create_request();
+    let filter = default_filter();
+    for body in [
+        json!({"model":"gpt-4.1","input":"hello","store":false,"stream":true}),
+        json!({"model":"gpt-4.1","input":"hello","store":false,"tools":[{"type":"web_search_preview"}],"tool_choice":"auto"}),
+        json!({"model":"gpt-4.1","input":[{"type":"function_call_output","call_id":"call_1","output":"done"}],"store":false}),
+        json!({"model":"gpt-4.1","input":[{"type":"mcp_approval_response","approval_request_id":"approval_1","approve":true}],"store":false}),
+        json!({"model":"gpt-4.1","input":[{"type":"message","role":"user","content":[{"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}]}],"store":false}),
+        json!({"model":"gpt-4.1","input":"next","previous_response_id":"resp_1","context_management":[{"type":"compaction","compact_threshold":1000}]}),
+    ] {
+        let mut ctx = make_filter_context(&request);
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+        let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Release), "{body}");
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert_eq!(state.request_body, body);
+        assert!(state.simple_budget.is_some());
+    }
+}
+
+#[tokio::test]
+async fn budgeted_create_keeps_context_management_for_bounded_compaction() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let context = json!([{"type":"compaction","compact_threshold":1000}]);
+    let mut bytes = Some(Bytes::from(
+        serde_json::to_vec(&json!({"input":"hello","store":false,"context_management":context})).unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut bytes, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.context_management, Some(context));
+    assert!(state.simple_budget.is_some());
+}
+
+#[tokio::test]
+async fn budgeted_create_keeps_history_selector_for_bounded_restore() {
+    let request = create_request();
+    for body in [json!({"input":"hello","store":false,"previous_response_id":"resp_old"})] {
+        let mut ctx = make_filter_context(&request);
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+        let action = default_filter()
+            .on_request_body(&mut ctx, &mut bytes, true)
+            .await
+            .unwrap();
+        assert!(matches!(action, FilterAction::Release), "{body}");
+        assert!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.simple_budget)
+                .is_some(),
+            "request-wide budget must survive through bounded restore"
+        );
+    }
+}
+
 /// Drive one body through the filter and return the action.
 async fn run(filter: &dyn HttpFilter, request: &Request, body: &serde_json::Value) -> FilterAction {
     let mut ctx = make_filter_context(request);

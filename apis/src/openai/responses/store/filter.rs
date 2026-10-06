@@ -716,6 +716,28 @@ fn request_will_persist_response(ctx: &HttpFilterContext<'_>) -> bool {
         && !is_store_disabled(ctx)
 }
 
+/// Bound the Store's buffered response before it owns another payload copy.
+fn response_buffer_limit(ctx: &HttpFilterContext<'_>) -> usize {
+    if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+        return MAX_JSON_BODY_BYTES;
+    }
+    ctx.extensions
+        .get::<super::super::AgenticBudgetPolicy>()
+        .map_or(MAX_JSON_BODY_BYTES, |policy| {
+            MAX_JSON_BODY_BYTES.min(policy.max_irr_response_bytes())
+        })
+}
+
+/// The request validator must attach the shared budget before Store copies input.
+fn missing_create_budget(ctx: &HttpFilterContext<'_>) -> bool {
+    is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.extensions.get::<super::super::AgenticBudgetPolicy>().is_some()
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_none_or(|state| state.simple_budget.is_none())
+}
+
 /// Check whether rehydrate needs the store before the request phase.
 fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.request.method == http::Method::POST
@@ -1012,8 +1034,9 @@ impl HttpFilter for ResponseStoreFilter {
         }
 
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
+            let max_bytes = response_buffer_limit(ctx);
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(MAX_JSON_BODY_BYTES),
+                max_bytes: Some(max_bytes),
             });
         }
 
@@ -1049,6 +1072,13 @@ impl HttpFilter for ResponseStoreFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
+        }
+        if missing_create_budget(ctx) {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                500,
+                "server_error",
+                "agentic retained-payload policy was not attached before Store input capture",
+            )));
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);

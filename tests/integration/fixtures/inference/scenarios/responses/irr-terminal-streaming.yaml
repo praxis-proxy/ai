@@ -1,6 +1,6 @@
 version: 1
 id: responses/irr-terminal-streaming
-description: A native Responses SSE exchange remains streaming through a terminal iterative request router step.
+description: A native Responses SSE exchange remains streaming through a terminal iterative request router step, preserving the canonical final message, usage, and done sentinel.
 protocol: openai_responses
 example_config: openai/responses/irr-terminal-streaming.yaml
 upstream_authority: 127.0.0.1:3001
@@ -28,8 +28,9 @@ turns:
       upstream_body_kind: json
       # openai_stream_events composes the terminal IRR round into one logical
       # Responses stream, re-encoding each frame as a named SSE event. The
-      # controlled upstream import stays data-only; replay still compares the
-      # complete normalized upstream and client exchanges byte-for-byte.
+      # controlled upstream import stays data-only; replay compares the full
+      # normalized wire, including the final message ID, content, usage, and
+      # [DONE] sentinel, byte-for-byte.
       client_sse_events:
         - response.created
         - response.output_text.delta

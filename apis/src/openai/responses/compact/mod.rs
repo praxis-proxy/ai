@@ -43,7 +43,7 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, io, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -57,6 +57,10 @@ use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{SimpleBudget, input_charge},
+    },
     error::responses_error_rejection,
     is_explicit_compact_request,
     state::{ResponsesState, mark_local_compaction_item},
@@ -64,7 +68,7 @@ use super::{
 use crate::{
     callout_policy::OnFailure,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry},
+    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -74,6 +78,23 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Account for tokenization, rendered text, callout JSON, and the replacement
+/// history while the original decoded history remains live.
+const COMPACTION_SOURCE_MULTIPLIER: usize = 128;
+
+/// A buffered callout can contain one JSON node per byte. Reserve space for
+/// its transport, parsed tree, summary, base64 item, and history copies before
+/// allowing the subrequest to read that many bytes.
+const COMPACTION_RESPONSE_MULTIPLIER: usize = 320;
+
+/// Store decoding can expand each raw JSON byte into a map or Vec node. This
+/// allowance also covers the decoded record and subsequent history copies.
+const COMPACTION_STORE_MULTIPLIER: usize = 512;
+
+/// Reserve response-object assembly, Store serialization, and the returned
+/// body before creating another owned projection of the compaction result.
+const COMPACTION_PERSIST_MULTIPLIER: usize = 512;
 
 /// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
 const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
@@ -132,6 +153,11 @@ struct Summarization {
 /// Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because
 /// `state.input == state.messages` - there is no separable "current turn" to preserve after summarization.
 /// Requests without rehydrated history are released without compaction.
+///
+/// On listeners with `openai_agentic_loop.max_retained_bytes`, explicit compact
+/// uses a bounded Store read and caps the summarization response before it is
+/// buffered. Source expansion and persistence are charged to one request-wide
+/// budget. An overflow returns 413 before the next payload owner is created.
 ///
 /// Praxis runs `StreamBuffer` body hooks before header-phase request
 /// filters. This filter therefore requires
@@ -204,9 +230,13 @@ impl CompactFilter {
     }
 
     /// Run the summarization callout and return the summary text.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one callout needs preflight, bounded read, and post-read charge"
+    )]
     async fn execute_compaction(
         &self,
-        state: &ResponsesState,
+        state: &mut ResponsesState,
         params: &CompactionParams,
         conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
@@ -214,15 +244,34 @@ impl CompactFilter {
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
+        let response_limit = compaction_response_limit(state.simple_budget)?;
         let result = subrequest::execute_url(
             &self.client,
             &self.config.inference_url,
             request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            response_limit,
             timeout,
             self.config.address_policy,
         )
         .await;
+        if let Some(budget) = state.simple_budget.as_mut() {
+            match &result {
+                Ok(response) => {
+                    let charge = input_charge(&response.body)
+                        .and_then(|charge| response.body.len().checked_mul(16)?.checked_add(charge))
+                        .ok_or_else(reject_compaction_budget)?;
+                    if !budget.reserve_additional_input(charge) {
+                        return Err(reject_compaction_budget());
+                    }
+                },
+                Err(subrequest::SubRequestError::ResponseTooLarge { .. })
+                    if response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES =>
+                {
+                    return Err(reject_compaction_budget());
+                },
+                _ => {},
+            }
+        }
         Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
     }
 
@@ -254,19 +303,32 @@ impl CompactFilter {
         &self,
         req: &ExplicitCompactRequest,
         messages: &[Value],
+        budget: &mut Option<SimpleBudget>,
     ) -> Result<Option<Summarization>, FilterAction> {
         let conversation_text = build_conversation_text(messages);
         let request = build_summarization_request(&conversation_text, req.instructions.as_deref(), &req.model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
+        let response_limit = compaction_response_limit(*budget)?;
         let result = subrequest::execute_url(
             &self.client,
             &self.config.inference_url,
             request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            response_limit,
             timeout,
             self.config.address_policy,
         )
         .await;
+        if let Some(budget) = budget.as_mut() {
+            match &result {
+                Ok(response) => reserve_compact_bytes(budget, response.body.len(), COMPACTION_RESPONSE_MULTIPLIER)?,
+                Err(subrequest::SubRequestError::ResponseTooLarge { .. })
+                    if response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES =>
+                {
+                    return Err(reject_compaction_budget());
+                },
+                _ => {},
+            }
+        }
         self.handle_subrequest_result(result)
     }
 
@@ -298,7 +360,26 @@ impl CompactFilter {
     }
 
     /// Check the threshold and run summarization if it is exceeded.
-    async fn check_and_summarize(&self, state: &ResponsesState) -> Result<Option<String>, FilterAction> {
+    async fn check_and_summarize(&self, state: &mut ResponsesState) -> Result<Option<String>, FilterAction> {
+        let config = extract_compaction_config(&state.context_management)
+            .map_err(|message| reject_compact(400, "invalid_request_error", &message))?;
+        let Some(config) = config else {
+            return Ok(None);
+        };
+        if previous_usage_total(state).is_some_and(|total| !exceeds_threshold(total, &config)) {
+            return Ok(None);
+        }
+        if let Some(budget) = state.simple_budget.as_mut() {
+            let bytes = count_json_bytes(&state.messages)
+                .and_then(|history| count_json_bytes(&state.request_body)?.checked_add(history))
+                .ok_or_else(reject_compaction_budget)?;
+            let charge = bytes
+                .checked_mul(COMPACTION_SOURCE_MULTIPLIER)
+                .ok_or_else(reject_compaction_budget)?;
+            if !budget.reserve_additional_input(charge) {
+                return Err(reject_compaction_budget());
+            }
+        }
         let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
             Ok(Some(pair)) => pair,
             Ok(None) => return Ok(None),
@@ -331,9 +412,13 @@ impl CompactFilter {
         ctx: &HttpFilterContext<'_>,
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterAction> {
-        let req = parse_compact_request_body(body)?;
+        let mut budget = explicit_compact_budget(ctx, body)?;
+        let mut req = parse_compact_request_body(body)?;
         let (store, owner) = resolve_store_and_owner(ctx)?;
-        let messages = collect_compact_messages(&store, &req).await?;
+        let messages = collect_compact_messages(&store, &mut req, &mut budget).await?;
+        if let Some(budget) = budget.as_mut() {
+            reserve_compact_json(budget, &messages, COMPACTION_SOURCE_MULTIPLIER)?;
+        }
         let writer = CompactionWriter {
             filter: self,
             ctx,
@@ -342,12 +427,15 @@ impl CompactFilter {
             req: &req,
             messages: &messages,
         };
-        let response_object = if let Some(summary) = self.summarize_messages(&req, &messages).await? {
-            writer.persist_compacted(&summary).await?
-        } else {
-            warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
-            writer.persist_uncompacted().await?
-        };
+        // The callout future carries a buffered response. Keep it off the
+        // request filter's stack while the source messages remain live.
+        let response_object =
+            if let Some(summary) = Box::pin(self.summarize_messages(&req, &messages, &mut budget)).await? {
+                writer.persist_compacted(&summary, &mut budget).await?
+            } else {
+                warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
+                writer.persist_uncompacted(&mut budget).await?
+            };
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
@@ -355,6 +443,88 @@ impl CompactFilter {
                 .with_body(Bytes::from(body_bytes)),
         ))
     }
+}
+
+/// Start a request-wide ledger before explicit compact parses its JSON body.
+fn explicit_compact_budget(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+) -> Result<Option<SimpleBudget>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let bytes = body.as_deref().unwrap_or_default();
+    let charge = input_charge(bytes).ok_or_else(reject_compaction_budget)?;
+    SimpleBudget::new_for_local_response(policy.max_retained_bytes(), charge)
+        .map(Some)
+        .ok_or_else(reject_compaction_budget)
+}
+
+/// Charge already owned JSON before copying it into another independent owner.
+fn reserve_compact_json<T: serde::Serialize>(
+    budget: &mut SimpleBudget,
+    value: &T,
+    multiplier: usize,
+) -> Result<(), FilterAction> {
+    let bytes = count_json_bytes(value).ok_or_else(reject_compaction_budget)?;
+    reserve_compact_bytes(budget, bytes, multiplier)
+}
+
+/// Apply a checked worst-case multiplier to an independently owned payload.
+fn reserve_compact_bytes(budget: &mut SimpleBudget, bytes: usize, multiplier: usize) -> Result<(), FilterAction> {
+    let charge = bytes.checked_mul(multiplier).ok_or_else(reject_compaction_budget)?;
+    if budget.reserve_additional_input(charge) {
+        Ok(())
+    } else {
+        Err(reject_compaction_budget())
+    }
+}
+
+/// Determine a transport cap before the callout can buffer a response. The
+/// later charge uses its actual JSON shape, while this worst-case allowance
+/// ensures even an unusually dense JSON tree fits before parsing begins.
+fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, FilterAction> {
+    let Some(budget) = budget else {
+        return Ok(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    };
+    let bytes = budget.remaining_bytes().unwrap_or(0) / COMPACTION_RESPONSE_MULTIPLIER;
+    if bytes == 0 {
+        return Err(reject_compaction_budget());
+    }
+    Ok(bytes.min(MAX_SUMMARIZATION_RESPONSE_BYTES))
+}
+
+/// Count already parsed JSON without building another serialized payload.
+fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+/// Counts encoded JSON bytes without retaining the serialized payload.
+struct JsonByteCounter(usize);
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Budget failures always terminate the request, including fail-open callouts.
+fn reject_compaction_budget() -> FilterAction {
+    reject_compact(
+        413,
+        "invalid_request_error",
+        "compaction exceeds openai_agentic_loop.max_retained_bytes",
+    )
 }
 
 #[async_trait]
@@ -377,6 +547,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reactive and explicit admission share the body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -398,10 +572,18 @@ impl HttpFilter for CompactFilter {
         if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let budgeted = ctx.extensions.get::<AgenticBudgetPolicy>().is_some();
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
+        if budgeted && state.simple_budget.is_none() {
+            return Ok(reject_compact(
+                500,
+                "server_error",
+                "retained-payload budget state is missing",
+            ));
+        }
         let summary = match self.check_and_summarize(state).await {
             Ok(Some(summary)) => summary,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
@@ -567,7 +749,7 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         .as_ref()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "request body is empty"))?;
-    let parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
+    let mut parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
         debug!(error = %e, "compact request body parse failed");
         reject_compact(400, "invalid_request_error", "invalid JSON body")
     })?;
@@ -577,7 +759,7 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         .filter(|s| !s.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "missing required field: model"))?
         .to_owned();
-    let input = parse_compact_input(parsed.get("input"));
+    let input = parse_compact_input(parsed.get_mut("input").map(Value::take));
     let previous_response_id = parsed
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -605,12 +787,10 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
 ///
 /// A bare string is coerced into a single `user` message, matching the
 /// contract where a string is equivalent to a text user input.
-fn parse_compact_input(input: Option<&Value>) -> Vec<Value> {
+fn parse_compact_input(input: Option<Value>) -> Vec<Value> {
     match input {
-        Some(Value::String(s)) if !s.is_empty() => {
-            vec![serde_json::json!({"role": "user", "content": s})]
-        },
-        Some(Value::Array(arr)) => arr.clone(),
+        Some(Value::String(s)) if !s.is_empty() => vec![serde_json::json!({"role": "user", "content": s})],
+        Some(Value::Array(arr)) => arr,
         _ => Vec::new(),
     }
 }
@@ -634,14 +814,15 @@ fn resolve_store_and_owner(
 /// first and the inline `input` items are appended after.
 async fn collect_compact_messages(
     store: &OwnerScopedResponseStore,
-    req: &ExplicitCompactRequest,
+    req: &mut ExplicitCompactRequest,
+    budget: &mut Option<SimpleBudget>,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
     if let Some(prev) = req.previous_response_id.as_deref() {
-        let record = fetch_response(store, prev).await?;
+        let record = fetch_response(store, prev, budget).await?;
         messages.extend(stored_message_array(record.messages));
     }
-    messages.extend(req.input.iter().cloned());
+    messages.append(&mut req.input);
     if messages.is_empty() {
         return Err(reject_compact(400, "invalid_request_error", "no messages to compact"));
     }
@@ -649,10 +830,39 @@ async fn collect_compact_messages(
 }
 
 /// Fetch a stored response by id.
-async fn fetch_response(store: &OwnerScopedResponseStore, response_id: &str) -> Result<ResponseRecord, FilterAction> {
-    match store.get_response(response_id).await {
-        Ok(Some(r)) => Ok(r),
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded Store lookup and post-read charge form one admission step"
+)]
+async fn fetch_response(
+    store: &OwnerScopedResponseStore,
+    response_id: &str,
+    budget: &mut Option<SimpleBudget>,
+) -> Result<ResponseRecord, FilterAction> {
+    let result = match budget {
+        Some(budget) => {
+            let remaining = budget.remaining_bytes().unwrap_or(0);
+            store
+                .get_response_bounded(response_id, remaining / COMPACTION_STORE_MULTIPLIER)
+                .await
+        },
+        None => store.get_response(response_id).await,
+    };
+    match result {
+        Ok(Some(r)) => {
+            if let Some(budget) = budget.as_mut() {
+                let bytes = count_json_bytes(&r.response_object)
+                    .and_then(|size| size.checked_add(count_json_bytes(&r.input)?))
+                    .and_then(|size| size.checked_add(count_json_bytes(&r.messages)?))
+                    .and_then(|size| size.checked_add(r.model.len()))
+                    .and_then(|size| size.checked_add(r.id.len()))
+                    .ok_or_else(reject_compaction_budget)?;
+                reserve_compact_bytes(budget, bytes, COMPACTION_STORE_MULTIPLIER)?;
+            }
+            Ok(r)
+        },
         Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
+        Err(StoreError::PayloadTooLarge) if budget.is_some() => Err(reject_compaction_budget()),
         Err(e) => {
             warn!(error = %e, "failed to fetch response for compact");
             Err(reject_compact(500, "server_error", "failed to fetch response"))
@@ -689,12 +899,25 @@ impl CompactionWriter<'_> {
     /// Persist the compaction result for a successful summarization. The
     /// response `output` and the persisted history are the same single
     /// compaction item.
-    async fn persist_compacted(&self, summary: &Summarization) -> Result<Value, FilterAction> {
+    async fn persist_compacted(
+        &self,
+        summary: &Summarization,
+        budget: &mut Option<SimpleBudget>,
+    ) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            let size = summary
+                .content
+                .len()
+                .checked_add(self.filter.config.summary_prefix.len())
+                .and_then(|size| size.checked_add(1_024))
+                .ok_or_else(reject_compaction_budget)?;
+            reserve_compact_bytes(budget, size, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let compaction_id = format!("compact_{}", self.ctx.id_generator.generate(self.ctx.time_source));
         let item = build_compaction_item(&compaction_id, &summary.content, &self.filter.config.summary_prefix);
         let stored_item = mark_local_compaction_item(&item);
         let usage = build_compaction_usage(self.messages, Some(summary), &self.filter.config.tiktoken_encoding);
-        self.persist_response(Value::Array(vec![item]), Value::Array(vec![stored_item]), usage)
+        self.persist_response(Value::Array(vec![item]), Value::Array(vec![stored_item]), usage, budget)
             .await
     }
 
@@ -707,22 +930,44 @@ impl CompactionWriter<'_> {
     /// violate the Responses output schema (items require `type`/`id`/`status`).
     /// The intact conversation is still persisted as the record's history so a
     /// follow-up request referencing this response id rehydrates it in full.
-    async fn persist_uncompacted(&self) -> Result<Value, FilterAction> {
+    async fn persist_uncompacted(&self, budget: &mut Option<SimpleBudget>) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            reserve_compact_json(budget, &self.messages, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let usage = build_compaction_usage(self.messages, None, &self.filter.config.tiktoken_encoding);
-        self.persist_response(Value::Array(Vec::new()), Value::Array(self.messages.to_vec()), usage)
-            .await
+        self.persist_response(
+            Value::Array(Vec::new()),
+            Value::Array(self.messages.to_vec()),
+            usage,
+            budget,
+        )
+        .await
     }
 
     /// Assemble the `response.compaction` object, persist the record, and return
     /// the object. `output` is the API-facing output array; `stored_messages` is
     /// the history persisted for rehydration continuity (the two differ on
     /// fail-open).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response assembly and Store persistence share one reserved projection"
+    )]
     async fn persist_response(
         &self,
         output: Value,
         stored_messages: Value,
         usage: Value,
+        budget: &mut Option<SimpleBudget>,
     ) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            let bytes = count_json_bytes(&output)
+                .and_then(|size| size.checked_add(count_json_bytes(&stored_messages)?))
+                .and_then(|size| size.checked_add(count_json_bytes(&usage)?))
+                .and_then(|size| size.checked_add(self.req.model.len()))
+                .and_then(|size| size.checked_add(1_024))
+                .ok_or_else(reject_compaction_budget)?;
+            reserve_compact_bytes(budget, bytes, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let resp_id = format!("resp_{}", self.ctx.id_generator.generate(self.ctx.time_source));
         let created_at = i64::try_from(self.ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
         let response_object = serde_json::json!({

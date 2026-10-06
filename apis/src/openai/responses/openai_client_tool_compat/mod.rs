@@ -157,7 +157,9 @@ use tracing::debug;
 
 use self::config::{ClientToolCompatConfig, build_config};
 use super::{
+    agentic_loop::{AgenticBudgetPolicy, budget::output_charge},
     body_limits::reject_rewritten_body_too_large,
+    bounded_json_size,
     error::responses_error_rejection,
     state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
 };
@@ -188,6 +190,22 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// Maximum number of `environment.skills` entries a local `shell` tool may
 /// declare (`LocalEnvironmentParam.skills` `maxItems: 200`).
 const MAX_LOCAL_SKILLS: usize = 200;
+
+/// New declaration, reverse-map, echo, and outbound owners created by lowering.
+const LOWERING_SOURCE_MULTIPLIER: usize = 32;
+/// Fixed structural capacity for each independently lowered tool or history item.
+const LOWERING_ITEM_RESERVE: usize = 2_048;
+/// Parsed tool schemas can have many nodes relative to their wire size.
+const LOWERING_NODE_RESERVE: usize = 8_192;
+/// Nested tool arguments can contain another JSON tree inside an outer string.
+const EMBEDDED_JSON_NODE_RESERVE: usize = 8_192;
+/// Namespace and member names can be repeated in every restored output item.
+const RESTORATION_NAME_MULTIPLIER: usize = 8;
+/// Request-phase retained-payload rejection before rich-tool lowering allocates.
+const LOWERING_BUDGET_MESSAGE: &str = "client tool request lowering exceeded openai_agentic_loop.max_retained_bytes";
+/// Response-phase retained-payload rejection before buffered restore parses JSON.
+const RESTORATION_BUDGET_MESSAGE: &str =
+    "client tool response restoration exceeded openai_agentic_loop.max_retained_bytes";
 
 /// Length of the `___{hash:016x}` suffix appended to a shortened namespace name.
 /// The triple-underscore marker domain-separates the hashed shape from every
@@ -473,9 +491,15 @@ impl ClientToolCompatFilter {
     /// `restore_response` enforces, failing closed rather than buffering an
     /// unbounded un-restored body.
     fn arm_restoration(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_rewritten_body_bytes),
-        });
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+            ctx.response_body_mode = BodyMode::StreamBuffer {
+                max_bytes: Some(self.max_rewritten_body_bytes.min(policy.max_irr_response_bytes())),
+            };
+        } else {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(self.max_rewritten_body_bytes),
+            });
+        }
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
     }
 }
@@ -530,6 +554,13 @@ impl HttpFilter for ClientToolCompatFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if !reserve_client_tool_lowering(state) {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                413,
+                "invalid_request_error",
+                LOWERING_BUDGET_MESSAGE,
+            )));
+        }
         if let Err(action) = self.lower_request(state, streaming, stream_restoration_armed) {
             return Ok(action);
         }
@@ -556,9 +587,18 @@ impl HttpFilter for ClientToolCompatFilter {
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if !reserve_client_tool_restoration(state, bytes) {
+            *body = None;
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                RESTORATION_BUDGET_MESSAGE,
+            )));
+        }
         match self.restore_response(state, bytes) {
             Ok(Some(serialized)) => {
                 serialized.commit(body, self.name(), "body");
@@ -573,6 +613,192 @@ impl HttpFilter for ClientToolCompatFilter {
 // -----------------------------------------------------------------------------
 // Request lowering
 // -----------------------------------------------------------------------------
+
+/// Reserve the declarations, typed history, reverse map, and canonical echo
+/// before lowering creates any independently owned copy. The JSON counter
+/// writes no payload and fails closed if a source exceeds the absolute cap.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checked request-owner sum is one preflight transaction"
+)]
+fn reserve_client_tool_lowering(state: &mut ResponsesState) -> bool {
+    if state.simple_budget.is_none() {
+        return true;
+    }
+    let canonical_tools = state.client_tool_echo.as_ref().map_or_else(
+        || state.request_body.get("tools").and_then(Value::as_array),
+        |echo| Some(&echo.tools),
+    );
+    let has_rich = request_has_rich_client_tool(state);
+    let has_typed_history = state.messages.iter().any(is_typed_client_tool_history);
+    if !has_rich && !has_typed_history {
+        return true;
+    }
+    let charge = (|| {
+        let tools = canonical_tools.map(Vec::as_slice).unwrap_or_default();
+        let mut total = 0_usize;
+        for tool in tools {
+            total = total
+                .checked_add(retained_value_charge(tool)?)?
+                .checked_add(LOWERING_ITEM_RESERVE)?
+                .checked_add(namespace_fanout_charge(tool)?)?;
+        }
+        for item in &state.messages {
+            if is_typed_client_tool_history(item) {
+                total = total
+                    .checked_add(retained_value_charge(item)?)?
+                    .checked_add(LOWERING_ITEM_RESERVE)?;
+                if item.get("type").and_then(Value::as_str) == Some("tool_search_output") {
+                    for tool in item.get("tools").and_then(Value::as_array).into_iter().flatten() {
+                        total = total.checked_add(namespace_fanout_charge(tool)?)?;
+                    }
+                }
+            }
+        }
+        if let Some(choice) = state.request_body.get("tool_choice") {
+            total = total.checked_add(retained_value_charge(choice)?)?;
+        }
+        Some(total)
+    })();
+    charge.is_some_and(|charge| {
+        state
+            .simple_budget
+            .as_mut()
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// Bound copies of one already parsed source without serializing it into a buffer.
+fn retained_value_charge(value: &Value) -> Option<usize> {
+    let bytes = bounded_json_size(value, praxis_filter::body::MAX_JSON_BODY_BYTES)
+        .ok()
+        .flatten()?;
+    bytes
+        .checked_mul(LOWERING_SOURCE_MULTIPLIER)?
+        .checked_add(value_node_count(value)?.checked_mul(LOWERING_NODE_RESERVE)?)
+}
+
+/// Count parsed JSON nodes and map keys without allocating an intermediate tree.
+fn value_node_count(value: &Value) -> Option<usize> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .try_fold(1_usize, |count, item| count.checked_add(value_node_count(item)?)),
+        Value::Object(fields) => fields.iter().try_fold(1_usize, |count, (_, item)| {
+            count.checked_add(1)?.checked_add(value_node_count(item)?)
+        }),
+        _ => Some(1),
+    }
+}
+
+/// A namespace header is copied into each flattened member declaration.
+fn namespace_fanout_charge(tool: &Value) -> Option<usize> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return Some(0);
+    }
+    let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+    let header = bounded_json_size(
+        &(tool.get("name"), tool.get("description")),
+        praxis_filter::body::MAX_JSON_BODY_BYTES,
+    )
+    .ok()
+    .flatten()?;
+    header.checked_mul(members)?.checked_mul(LOWERING_SOURCE_MULTIPLIER)
+}
+
+/// Identify history entries that may create new owned lowered payloads.
+fn is_typed_client_tool_history(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "custom_tool_call"
+                | "custom_tool_call_output"
+                | "shell_call"
+                | "shell_call_output"
+                | "tool_search_call"
+                | "tool_search_output"
+                | "function_call"
+        )
+    )
+}
+
+/// Buffering is already capped at the listener before this callback. Reserve
+/// parsing and restored output copies before parsing the complete body.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checked response-owner sum is one preflight transaction"
+)]
+fn reserve_client_tool_restoration(state: &mut ResponsesState, bytes: &[u8]) -> bool {
+    let Some(echo) = state.client_tool_echo.as_ref() else {
+        return true;
+    };
+    if state.simple_budget.is_none() {
+        return true;
+    }
+    let charge = (|| {
+        let echo_bytes = bounded_json_size(&echo.tools, praxis_filter::body::MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()?
+            .checked_add(
+                bounded_json_size(&echo.tool_choice, praxis_filter::body::MAX_JSON_BODY_BYTES)
+                    .ok()
+                    .flatten()?,
+            )?;
+        let longest_name = state
+            .client_tool_lowering
+            .values()
+            .try_fold(0_usize, |longest, lowered| {
+                bounded_json_size(
+                    &(&lowered.original_name, &lowered.namespace),
+                    praxis_filter::body::MAX_JSON_BODY_BYTES,
+                )
+                .ok()
+                .flatten()
+                .map(|name_size| longest.max(name_size))
+            })?;
+        let object_count = bytes.iter().filter(|&&byte| byte == b'{').count();
+        output_charge(bytes)?
+            .checked_add(embedded_json_syntax_count(bytes)?.checked_mul(EMBEDDED_JSON_NODE_RESERVE)?)?
+            .checked_add(
+                object_count
+                    .checked_mul(longest_name)?
+                    .checked_mul(RESTORATION_NAME_MULTIPLIER)?,
+            )?
+            .checked_add(echo_bytes.checked_mul(8)?)?
+            .checked_add(4_096)
+    })();
+    charge.is_some_and(|charge| {
+        state
+            .simple_budget
+            .as_mut()
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// Count punctuation inside outer JSON strings without allocating or decoding.
+/// Escapes count too, since a `\u` sequence can hide JSON syntax in `arguments`.
+fn embedded_json_syntax_count(bytes: &[u8]) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0_usize;
+    for &byte in bytes {
+        if !in_string {
+            if byte == b'"' {
+                in_string = true;
+            }
+        } else if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            count = count.checked_add(1)?;
+            escaped = true;
+        } else if byte == b'"' {
+            in_string = false;
+        } else if matches!(byte, b'{' | b'[' | b',' | b':') {
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
+}
 
 /// Restore an owned `tools` array back into the request body verbatim.
 fn restore_tools(state: &mut ResponsesState, tools: Vec<Value>) {

@@ -38,8 +38,12 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{input_charge, output_charge},
+    },
     body_limits::rewritten_body_too_large_rejection,
-    enforce_agentic_stream_guard,
+    bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -71,6 +75,33 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
+
+/// Conservative allowance for the owned Chat request tree and its serialized body.
+const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
+/// Map, message, and serializer capacity needed even for a short text input.
+const CHAT_REQUEST_FIXED_RESERVE: usize = 4_096;
+/// Request-phase admission error before any translated body is built.
+const CHAT_REQUEST_OVERFLOW: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat request translation";
+/// Response-phase admission error before a buffered Chat body is parsed.
+const CHAT_RESPONSE_OVERFLOW: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat response translation";
+/// Reserve client-owned request fields cloned into opening and terminal snapshots.
+const CHAT_STREAM_ECHO_MULTIPLIER: usize = 16;
+/// Part of that reserve covers encoded opening and terminal snapshots in flight.
+const CHAT_STREAM_OUTPUT_ECHO_MULTIPLIER: usize = 4;
+/// Fixed share of the error reserve available for one encoded SSE callback.
+const CHAT_STREAM_OUTPUT_BASE_ALLOWANCE: usize = 8_192;
+/// Capacity for the one bounded error terminal if a stream exhausts its ledger.
+const CHAT_STREAM_ERROR_RESERVE: usize = 16_384;
+/// Vec growth on a one-byte partial frame can exceed the wire multiplier.
+const CHAT_STREAM_MIN_TRANSIENT_CHARGE: usize = 256;
+/// Marker that stops processing provider callbacks after an aggregate overflow.
+const CHAT_STREAM_BUDGET_FAILED: &str = "responses_to_chat_completions.budget_failed";
+
+/// Final emitted bytes stay charged through downstream response filters and
+/// can be released if another Chat inference round starts on this request.
+struct ChatStreamOutputHandoff(usize);
 
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
@@ -186,12 +217,18 @@ impl ResponsesToChatCompletionsFilter {
     /// Build and size-check the owned Chat Completions request body.
     fn translated_request_bytes(
         &self,
-        ctx: &HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+        if !reserve_chat_request_source(ctx) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        if !reserve_chat_request_wire(ctx, &translated) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -258,6 +295,10 @@ impl ResponsesToChatCompletionsFilter {
         clippy::unnecessary_wraps,
         reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response setup keeps validation, budget admission, and converter installation in order"
+    )]
     fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let streaming_requested = request_is_streaming(ctx);
         let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
@@ -275,6 +316,14 @@ impl ResponsesToChatCompletionsFilter {
         }
         let Some((response_id, created_at)) = stream_identity(ctx) else {
             return Ok(FilterAction::Reject(missing_pipeline_state()));
+        };
+        let Some(output_allowance) = reserve_chat_stream_snapshots(ctx) else {
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                CHAT_RESPONSE_OVERFLOW,
+            )));
         };
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
@@ -297,11 +346,9 @@ impl ResponsesToChatCompletionsFilter {
         // opt-out as always memory-safe.
         ctx.response_body_mode = BodyMode::Stream;
         prepare_transformed_stream_headers(ctx);
-        ctx.insert_filter_state(StreamConverter::new(
-            response_id,
-            created_at,
-            self.config.stream_limits(),
-        ));
+        let mut converter = StreamConverter::new(response_id, created_at, self.config.stream_limits());
+        converter.budget_output_allowance = output_allowance;
+        ctx.insert_filter_state(converter);
         Ok(FilterAction::Continue)
     }
 
@@ -311,13 +358,52 @@ impl ResponsesToChatCompletionsFilter {
     /// partial provider framing is never forwarded. Recoverable translation
     /// failures surface as a `response.failed` event from the converter, so only
     /// internal serialization failures propagate as [`FilterError`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one callback reserves, converts, settles, and publishes a single stream chunk"
+    )]
     fn transform_stream_response(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.get_metadata(CHAT_STREAM_BUDGET_FAILED) == Some("true") {
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
+        };
+        // The converter owns incomplete Chat SSE framing before it produces a
+        // Responses event for the downstream accumulator to charge. Reserve the
+        // source chunk first, including JSON-node and semantic-state headroom.
+        let budgeted = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.simple_budget.is_some());
+        if budgeted && !release_chat_stream_output_handoff(ctx, &mut converter) {
+            return Ok(chat_stream_budget_error(ctx, body));
+        }
+        let transient_charge = if budgeted {
+            let charge = body
+                .as_deref()
+                .map_or(Some(0), |bytes| {
+                    input_charge(bytes)?
+                        .max(CHAT_STREAM_MIN_TRANSIENT_CHARGE)
+                        .checked_add(converter.budget_framing_growth_charge()?)
+                })
+                .and_then(|source| source.checked_add(converter.budget_closeout_growth_charge()?));
+            let admitted = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| charge.is_some_and(|charge| budget.reserve_additional_input(charge)));
+            if !admitted {
+                return Ok(chat_stream_budget_error(ctx, body));
+            }
+            charge.unwrap_or(0)
+        } else {
+            0
         };
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -344,6 +430,57 @@ impl ResponsesToChatCompletionsFilter {
             out.extend_from_slice(&events);
         }
 
+        if budgeted {
+            let Some(mut reserved) = converter.budget_retained_charge.checked_add(transient_charge) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            let Some(live) = (if end_of_stream {
+                Some(0)
+            } else {
+                converter.budget_live_charge()
+            }) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            // The initial echo reserve already includes a bounded output
+            // projection. Keep any excess charged across the downstream handoff.
+            let output_charge = if out.is_empty() {
+                0
+            } else {
+                out.capacity().saturating_sub(converter.budget_output_allowance)
+            };
+            let Some(retained) = live.checked_add(output_charge) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            // The projection was reserved before conversion. Actual Vec
+            // capacity can be higher; charge any remainder before handing the
+            // translated body to downstream filters.
+            let additional = retained.saturating_sub(reserved);
+            if additional != 0 {
+                let admitted = ctx
+                    .extensions
+                    .get_mut::<ResponsesState>()
+                    .and_then(|state| state.simple_budget.as_mut())
+                    .is_some_and(|budget| budget.reserve_additional_input(additional));
+                if !admitted {
+                    return Ok(chat_stream_budget_error(ctx, body));
+                }
+                reserved = retained;
+            }
+            let settled = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| budget.settle_additional_input(reserved, retained));
+            if !settled {
+                return Ok(chat_stream_budget_error(ctx, body));
+            }
+            converter.budget_retained_charge = retained;
+            converter.budget_output_handoff_charge = output_charge;
+            if end_of_stream && output_charge != 0 {
+                ctx.extensions.insert(ChatStreamOutputHandoff(output_charge));
+            }
+        }
+
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
@@ -352,7 +489,175 @@ impl ResponsesToChatCompletionsFilter {
     }
 }
 
+/// Reserve the request fields cloned into the opening pair and terminal
+/// snapshots before the first Chat callback can create either resource.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic reservation keeps snapshot measurement and ledger admission together"
+)]
+fn reserve_chat_stream_snapshots(ctx: &mut HttpFilterContext<'_>) -> Option<usize> {
+    if let Some(handoff) = ctx.extensions.remove::<ChatStreamOutputHandoff>()
+        && !ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.settle_additional_input(handoff.0, 0))
+    {
+        return None;
+    }
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return ctx.extensions.get::<AgenticBudgetPolicy>().is_none().then_some(0);
+    };
+    if state.simple_budget.is_none() {
+        return ctx.extensions.get::<AgenticBudgetPolicy>().is_none().then_some(0);
+    }
+    let charges = (|| {
+        let request = bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()?;
+        let tools = bounded_json_size(&state.tools, MAX_JSON_BODY_BYTES).ok().flatten()?;
+        let choice = bounded_json_size(
+            state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice),
+            MAX_JSON_BODY_BYTES,
+        )
+        .ok()
+        .flatten()?;
+        let source = request.checked_add(tools)?.checked_add(choice)?;
+        let reserve = source
+            .checked_mul(CHAT_STREAM_ECHO_MULTIPLIER)?
+            .checked_add(CHAT_STREAM_ERROR_RESERVE)?;
+        let output_allowance = source
+            .checked_mul(CHAT_STREAM_OUTPUT_ECHO_MULTIPLIER)?
+            .checked_add(CHAT_STREAM_OUTPUT_BASE_ALLOWANCE)?;
+        Some((reserve, output_allowance))
+    })();
+    let (charge, output_allowance) = charges?;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+        .and_then(|budget| budget.reserve_additional_input(charge).then_some(output_allowance))
+}
+
+/// The previous translated chunk has passed the downstream filters before
+/// this callback begins, so its handoff charge can leave this owner's ledger.
+fn release_chat_stream_output_handoff(ctx: &mut HttpFilterContext<'_>, converter: &mut StreamConverter) -> bool {
+    let charge = converter.budget_output_handoff_charge;
+    let Some(retained) = converter.budget_retained_charge.checked_sub(charge) else {
+        return false;
+    };
+    if charge != 0
+        && !ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.settle_additional_input(charge, 0))
+    {
+        return false;
+    }
+    converter.budget_retained_charge = retained;
+    converter.budget_output_handoff_charge = 0;
+    true
+}
+
+/// The streaming body runs inside IRR, which discards response-body rejections.
+/// Publish a sticky error and let the downstream stream owner emit it at EOS.
+fn chat_stream_budget_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
+    *body = None;
+    ctx.set_metadata(CHAT_STREAM_BUDGET_FAILED, "true");
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
+    ctx.set_metadata("responses.skip_persist", "true");
+    super::fs_arm_stream_stop(ctx);
+    FilterAction::Continue
+}
+
+/// Reserve the independently owned Chat tree before request translation builds it.
+/// The source consists of the canonical request plus enriched conversation turns;
+/// the fixed allowance covers the new map and message wrappers for a short input.
+fn reserve_chat_request_source(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        (|| {
+            bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+                .ok()
+                .flatten()?
+                .checked_add(bounded_json_size(&state.messages, MAX_JSON_BODY_BYTES).ok().flatten()?)?
+                .checked_mul(CHAT_REQUEST_SOURCE_MULTIPLIER)?
+                .checked_add(CHAT_REQUEST_FIXED_RESERVE)
+        })()
+    };
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// The translated tree is still live when its outbound wire Vec is allocated.
+fn reserve_chat_request_wire(ctx: &mut HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
+    if ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_none_or(|state| state.simple_budget.is_none())
+    {
+        return true;
+    }
+    let charge = bounded_json_size(translated, MAX_JSON_BODY_BYTES)
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.checked_mul(2));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// Reject a Chat request whose additional translation owners cannot be reserved.
+fn chat_request_budget_rejection() -> SelectedUpstreamBodyOutcome {
+    SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        CHAT_REQUEST_OVERFLOW,
+    ))
+}
+
+/// Reserve a parsed Chat tree and the derived Responses tree before JSON parse.
+/// The loop subsequently charges the translated Responses wire independently.
+fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) -> bool {
+    let echo_charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()
+            .and_then(|bytes| bytes.checked_mul(4))
+    };
+    let charge = echo_charge.and_then(|echo| output_charge(body)?.checked_add(echo));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the adapter owns request transport selection and finite and streaming response translation"
+)]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
         "responses_to_chat_completions"
@@ -422,11 +727,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
-        // Buffer the finite response up to the absolute ceiling; the
-        // pipeline's body_limits decides the real raw cap.
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        });
+        // Cap core's raw response buffer before the body callback can preflight
+        // the Chat parse tree and translated Responses resource.
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+            ctx.response_body_mode = BodyMode::StreamBuffer {
+                max_bytes: Some(policy.max_irr_response_bytes().min(MAX_JSON_BODY_BYTES)),
+            };
+        } else {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
+        }
         prepare_transformed_response_headers(ctx);
 
         Ok(FilterAction::Continue)
@@ -446,6 +757,15 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
+                    if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
+                        *body = None;
+                        ctx.set_metadata("responses.skip_persist", "true");
+                        return Ok(FilterAction::Reject(responses_error_rejection(
+                            502,
+                            "server_error",
+                            CHAT_RESPONSE_OVERFLOW,
+                        )));
+                    }
                     self.transform_finite_response(ctx, body)?;
                 }
                 Ok(FilterAction::Continue)
@@ -462,7 +782,6 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         if let Some(outcome) = request_disposition(ctx) {
             return Ok(outcome);
         }
-
         let serialized = match self.translated_request_bytes(ctx)? {
             Ok(bytes) => bytes,
             Err(outcome) => return Ok(outcome),

@@ -13,6 +13,16 @@
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
 #
+# The retained-payload guardrail accepts buffered text, file, and image inputs
+# with or without Store persistence, finite Responses-to-Chat translation,
+# bounded previous_response_id or conversation restore, and conversation
+# append-back, and explicit POST /v1/responses/compact with bounded Store and
+# summarization callouts. File resolution and document extraction reserve their
+# expanded content when those filters are configured in the request path.
+# Tool requests remain gated until their dispatch accounting lands.
+# in this draft PR. The tool examples below document the intended pipeline but
+# currently return a Responses-formatted 400 before inference or dispatch.
+#
 # Configured `connector_id` values can be combined with `defer_loading: true`
 # and a `tool_search` tool so discovery waits for a later `tool_search_call`.
 # Connector IDs are pipeline-local; they are never forwarded to the
@@ -58,12 +68,15 @@
 #
 # Config knobs:
 #   max_infer_iters: application-level iteration cap (default 10)
+#   max_retained_bytes: request-wide retained-payload cap (default 64 MiB;
+#                       valid range 4 KiB through 256 MiB). The smallest
+#                       reachable loop cap applies to the listener.
 #   max_iterations:  infrastructure-level safety cap on IRR. It must be
 #                    at least max_infer_iters + 1 (initial inference plus
 #                    the allowed MCP-backed inference continuations).
 #
 # Streaming:
-#   With stream=true, each inference round is streamed through the same
+#   Each streaming inference round is composed through the same
 #   downstream Responses SSE lifecycle. Intermediate response lifecycle
 #   events are normalized by openai_stream_events while MCP and web-search
 #   transitions resume inference after each upstream stream completes.
@@ -72,7 +85,7 @@
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#     -d '{"model":"gpt-4.1","input":"Hello","store":false}'
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -153,20 +166,28 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_operation
+
       - filter: openai_responses_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
+        conditions:
+          - unless:
+              path_prefix: "/v1/conversations"
 
+      # If client model aliases are needed, place
+      # openai_responses_model_rewrite here, before validation. Its parsed
+      # body and replacement model are charged to max_retained_bytes.
       - filter: openai_responses_validate
 
       - filter: openai_tool_parse
-
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite
@@ -174,7 +195,21 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
 
+      # Response hooks run in reverse: append the conversation turn before
+      # Store can persist a successful response from the same exchange.
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
       - filter: openai_responses_rehydrate
+
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        default_model: gpt-4.1
 
       - filter: openai_mcp_tool_resolve
         connectors:
@@ -184,6 +219,8 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        # Bound core's buffered response before AI response filters run.
+        max_response_bytes: 8388608
         max_stream_response_bytes: 67108864
         # The IRR's 30s default is too short for production model streams.
         # Allow six minutes total for time-to-first-byte and logical streaming
@@ -285,6 +322,7 @@ filter_chains:
                   - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+                max_retained_bytes: 67108864
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy

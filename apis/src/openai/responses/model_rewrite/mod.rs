@@ -58,6 +58,11 @@ use praxis_filter::{
 use tracing::{debug, trace, warn};
 
 use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
+#[cfg(feature = "openai-responses")]
+use super::agentic_loop::{
+    AgenticBudgetPolicy,
+    budget::{SimpleBudget, input_charge},
+};
 use super::error::responses_error_rejection;
 use crate::{
     classifier::{is_chat_completions_create, is_responses_create},
@@ -70,6 +75,11 @@ use crate::{
 // -----------------------------------------------------------------------------
 
 /// Rewrites the `model` field in Responses and Chat Completions request bodies.
+///
+/// With `openai_agentic_loop`, place this filter before
+/// `openai_responses_validate`. The rewrite reserves its parsed input and
+/// configured model expansion against the request's retained-payload limit
+/// before either allocation.
 ///
 /// # YAML
 ///
@@ -130,6 +140,10 @@ impl ModelRewriteFilter {
     }
 
     /// Parse, rewrite, and re-serialize the request body.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the rewrite preflights the raw and replacement owners before both allocations"
+    )]
     fn rewrite_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -137,6 +151,21 @@ impl ModelRewriteFilter {
     ) -> Result<FilterAction, FilterError> {
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
+        };
+
+        #[cfg(feature = "openai-responses")]
+        let budgeted_raw_charge = if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        {
+            let Some(charge) = input_charge(raw) else {
+                return Ok(model_rewrite_budget_rejection());
+            };
+            if !reserve_model_rewrite_charge(ctx, charge) {
+                return Ok(model_rewrite_budget_rejection());
+            }
+            Some(charge)
+        } else {
+            None
         };
 
         let mut value: serde_json::Value = match serde_json::from_slice(raw) {
@@ -148,6 +177,21 @@ impl ModelRewriteFilter {
             return Ok(invalid_body_action(self.on_invalid));
         };
 
+        #[cfg(feature = "openai-responses")]
+        if let Some(raw_charge) = budgeted_raw_charge {
+            let target_len = match obj.get("model") {
+                Some(serde_json::Value::String(model)) => resolve_alias(&self.model_aliases, model).map(str::len),
+                Some(serde_json::Value::Null) | None => self.default_model.as_ref().map(String::len),
+                Some(_) => None,
+            };
+            if let Some(target_len) = target_len {
+                let extra = target_len.checked_mul(16).and_then(|bytes| bytes.checked_add(4_096));
+                if !extra.is_some_and(|extra| reserve_model_rewrite_target(ctx, raw_charge, extra)) {
+                    return Ok(model_rewrite_budget_rejection());
+                }
+            }
+        }
+
         let result = apply_rewrite(obj, &self.model_aliases, self.default_model.as_deref());
         promote_facts(ctx, &result, &self.headers);
 
@@ -157,6 +201,56 @@ impl ModelRewriteFilter {
 
         serialize_and_update(body, &value, &result, self.name())
     }
+}
+
+/// Bound the parsed rewrite input before its first JSON allocation. A loop
+/// continuation can have prior output live, so it reserves against that state.
+#[cfg(feature = "openai-responses")]
+fn reserve_model_rewrite_charge(ctx: &mut HttpFilterContext<'_>, charge: usize) -> bool {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return true;
+    };
+    let limit = policy.max_retained_bytes();
+    if let Some(budget) = ctx
+        .extensions
+        .get_mut::<super::state::ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+    {
+        budget.reserve_additional_input(charge)
+    } else {
+        SimpleBudget::new_with_store(limit, charge, false).is_some()
+    }
+}
+
+/// Reserve the model's new string, metadata copies, and outbound JSON before
+/// inserting a configured alias or default into the parsed request tree.
+#[cfg(feature = "openai-responses")]
+fn reserve_model_rewrite_target(ctx: &mut HttpFilterContext<'_>, raw_charge: usize, extra: usize) -> bool {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return true;
+    };
+    let limit = policy.max_retained_bytes();
+    if let Some(budget) = ctx
+        .extensions
+        .get_mut::<super::state::ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+    {
+        budget.reserve_additional_input(extra)
+    } else {
+        raw_charge
+            .checked_add(extra)
+            .is_some_and(|charge| SimpleBudget::new_with_store(limit, charge, false).is_some())
+    }
+}
+
+/// Return the request-side retained-payload overflow response.
+#[cfg(feature = "openai-responses")]
+fn model_rewrite_budget_rejection() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "model rewrite exceeds openai_agentic_loop.max_retained_bytes",
+    ))
 }
 
 #[async_trait]

@@ -5,6 +5,7 @@
 
 use std::{
     fmt, io,
+    mem::size_of,
     net::SocketAddr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -373,6 +374,10 @@ pub(crate) struct SearchBatch {
     /// Ranked, bounded results for each file-search call.
     pub results_by_call: Vec<Vec<SearchResult>>,
 
+    /// The request-wide retained allowance, rather than a configured per-tool
+    /// ceiling, stopped body collection or further fan-out.
+    pub retained_limit_exceeded: bool,
+
     /// Process-wide response admission retained while decoded payloads live.
     response_admission: Option<Arc<ResponseAdmission>>,
 }
@@ -383,6 +388,7 @@ impl SearchBatch {
         Self {
             failures: Vec::new(),
             results_by_call: (0..call_count).map(|_| Vec::new()).collect(),
+            retained_limit_exceeded: false,
             response_admission: None,
         }
     }
@@ -400,6 +406,34 @@ impl SearchBatch {
         for results in &mut self.results_by_call {
             results.sort_by(|left, right| right.score.total_cmp(&left.score));
         }
+    }
+
+    /// Count the typed result owners still live while public and model forms
+    /// are constructed. Attribute trees use a conservative JSON-node factor.
+    pub(super) fn retained_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .results_by_call
+            .capacity()
+            .checked_mul(size_of::<Vec<SearchResult>>())?;
+        for results in &self.results_by_call {
+            bytes = bytes.checked_add(results.capacity().checked_mul(size_of::<SearchResult>())?)?;
+            for result in results {
+                bytes = bytes
+                    .checked_add(result.file_id.capacity())?
+                    .checked_add(result.filename.capacity())?
+                    .checked_add(result.content.capacity().checked_mul(size_of::<ContentChunk>())?)?;
+                for chunk in &result.content {
+                    bytes = bytes.checked_add(chunk.text.capacity())?;
+                }
+                if let Some(attributes) = &result.attributes {
+                    let json = crate::openai::responses::bounded_json_size(attributes, usize::MAX)
+                        .ok()
+                        .flatten()?;
+                    bytes = bytes.checked_add(json.checked_mul(8)?)?;
+                }
+            }
+        }
+        Some(bytes)
     }
 }
 
@@ -434,7 +468,7 @@ pub(crate) struct FileSearchClientConfig {
 ///
 /// A [`FileSearchCalloutFilter`](super::FileSearchCalloutFilter) builds one of
 /// these from its bound outbound pipeline and the live request context, then
-/// hands it to [`FileSearchClient::search`] so the whole fan-out routes through
+/// hands it to [`FileSearchClient::search_with_retained_limit`] so the whole fan-out routes through
 /// the same filtered sub-request transport.
 pub(crate) struct CalloutTransport<'a> {
     /// Prebuilt outbound filter chain every vector-store sub-request runs through.
@@ -489,19 +523,46 @@ impl FileSearchClient {
         }
     }
 
-    /// Search multiple vector stores with bounded concurrency and aggregation.
+    /// Search multiple vector stores with bounded concurrency, aggregation,
+    /// and a request-wide cap on all response bodies.
+    /// The cap is applied by the executor before buffering or typed decoding.
     #[expect(
         clippy::too_many_lines,
-        reason = "deadline, budget, and failure policy share one scheduling loop"
+        reason = "deadline, fan-out, and failure policy share one loop"
     )]
-    pub async fn search(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the shared callout transport and request limit are independent execution inputs"
+    )]
+    pub async fn search_with_retained_limit(
         &self,
         specs: &[SearchSpec<'_>],
         call_count: usize,
         request_headers: &HeaderMap,
         transport: &CalloutTransport<'_>,
+        retained_limit: usize,
     ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
+        let total_limit = self.max_total_response_bytes.min(retained_limit);
+        let aggregate_is_request_limited = total_limit < self.max_total_response_bytes;
+        // Keep every scheduled spec eligible for one bounded response. The
+        // existing per-tool scheduler reserves a complete response slot before
+        // starting each concurrency chunk.
+        let response_limit = if aggregate_is_request_limited {
+            self.max_response_bytes.min(total_limit / specs.len().max(1))
+        } else {
+            self.max_response_bytes
+        };
+        let response_is_request_limited = response_limit < self.max_response_bytes;
+        if specs.is_empty() {
+            return batch;
+        }
+        // Even the smallest valid result body (`{"data":[]}`) cannot fit below
+        // this limit, so fail before starting any paid fan-out.
+        if response_limit == 0 || (response_is_request_limited && response_limit < br#"{"data":[]}"#.len()) {
+            batch.retained_limit_exceeded = aggregate_is_request_limited || response_limit == 0;
+            return batch;
+        }
         let mut consumed_response_bytes = 0_usize;
         let mut deadline_recorded = false;
         let mut next_spec = 0_usize;
@@ -523,12 +584,18 @@ impl FileSearchClient {
             self.subrequest_client.clone(),
             transport.downstream.clone(),
             0,
-            self.max_response_bytes,
+            response_limit,
             execution_timeout,
         );
         let outbound_headers = self.build_outbound_headers(request_headers);
         let admission = match self
-            .acquire_execution_admission(specs.len(), execution_started, execution_timeout)
+            .acquire_execution_admission(
+                specs.len(),
+                execution_started,
+                execution_timeout,
+                response_limit,
+                total_limit,
+            )
             .await
         {
             Ok(admission) => admission,
@@ -546,10 +613,16 @@ impl FileSearchClient {
                 break;
             }
 
-            let chunk_len = self.reserved_chunk_len(consumed_response_bytes, specs.len() - next_spec);
+            let chunk_len = Self::reserved_chunk_len(
+                consumed_response_bytes,
+                specs.len() - next_spec,
+                response_limit,
+                total_limit,
+            );
             if chunk_len == 0 {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
-                    append_budget_failures(&mut batch.failures, remaining_specs, self.max_total_response_bytes);
+                    append_budget_failures(&mut batch.failures, remaining_specs, total_limit);
+                    batch.retained_limit_exceeded |= aggregate_is_request_limited;
                 }
                 break;
             }
@@ -576,10 +649,23 @@ impl FileSearchClient {
                 &mut consumed_response_bytes,
                 chunk,
                 chunk_results,
-                self.max_total_response_bytes,
+                total_limit,
+                aggregate_is_request_limited,
             );
+            if aggregate_is_request_limited || response_is_request_limited {
+                batch.retained_limit_exceeded |= batch.failures.iter().any(|failure| {
+                    matches!(&failure.error, FileSearchError::ResponseTooLarge { limit, .. }
+                        if (aggregate_is_request_limited && *limit == total_limit)
+                            || (response_is_request_limited && *limit == response_limit))
+                });
+            }
 
             next_spec = next_spec.saturating_add(chunk_len);
+            // A request-wide retained limit is terminal regardless of the
+            // provider's fail-open policy. Do not start another paid batch.
+            if batch.retained_limit_exceeded {
+                break;
+            }
             if execution_started.elapsed() >= execution_timeout {
                 append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
                 deadline_recorded = true;
@@ -645,14 +731,19 @@ impl FileSearchClient {
     }
 
     /// Reserve the execution's aggregate response budget before fan-out.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "deadline and both response caps govern one fan-out reservation"
+    )]
     async fn acquire_execution_admission(
         &self,
         spec_count: usize,
         execution_started: Instant,
         execution_timeout: Duration,
+        response_limit: usize,
+        total_limit: usize,
     ) -> Result<Arc<ResponseAdmission>, &'static str> {
-        let aggregate_units =
-            response_admission_units(self.max_response_bytes, self.max_total_response_bytes, spec_count)?;
+        let aggregate_units = response_admission_units(response_limit, total_limit, spec_count)?;
         let remaining = execution_timeout
             .checked_sub(execution_started.elapsed())
             .filter(|remaining| !remaining.is_zero())
@@ -879,9 +970,14 @@ impl FileSearchClient {
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
-    fn reserved_chunk_len(&self, consumed_bytes: usize, remaining_specs: usize) -> usize {
-        let remaining_bytes = self.max_total_response_bytes.saturating_sub(consumed_bytes);
-        (remaining_bytes / self.max_response_bytes)
+    fn reserved_chunk_len(
+        consumed_bytes: usize,
+        remaining_specs: usize,
+        response_limit: usize,
+        total_limit: usize,
+    ) -> usize {
+        let remaining_bytes = total_limit.saturating_sub(consumed_bytes);
+        (remaining_bytes / response_limit)
             .min(MAX_CONCURRENT_SEARCHES)
             .min(remaining_specs)
     }
@@ -2032,16 +2128,21 @@ fn fixup_file_id(result: &mut SearchResult) {
 }
 
 /// Merge one bounded concurrency chunk into the aggregate batch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "aggregate bytes and request limit must be applied to every concurrent result"
+)]
 fn merge_chunk_results(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
     specs: &[SearchSpec<'_>],
     results: Vec<Result<SearchResponse, FileSearchError>>,
     total_limit: usize,
+    request_limited: bool,
 ) -> bool {
     let mut failed = false;
     for (spec, result) in specs.iter().zip(results) {
-        let result = merge_search_result(batch, consumed_bytes, spec, result, total_limit);
+        let result = merge_search_result(batch, consumed_bytes, spec, result, total_limit, request_limited);
         if let Err(error) = result {
             failed = true;
             batch.failures.push(SearchFailure {
@@ -2054,12 +2155,17 @@ fn merge_chunk_results(
 }
 
 /// Account for and retain only the top results from one response.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "aggregate bytes and request limit must be applied before retaining a result"
+)]
 fn merge_search_result(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
     spec: &SearchSpec<'_>,
     response: Result<SearchResponse, FileSearchError>,
     total_limit: usize,
+    request_limited: bool,
 ) -> Result<(), FileSearchError> {
     let body_bytes = match &response {
         Ok(response) => response.body_bytes,
@@ -2068,10 +2174,13 @@ fn merge_search_result(
         // charges nothing against the aggregate budget, like a callout failure.
         Err(FileSearchError::Callout { .. } | FileSearchError::ResponseTooLarge { .. }) => 0,
     };
-    let total = consumed_bytes
+    let Some(total) = consumed_bytes
         .checked_add(body_bytes)
         .filter(|total| *total <= total_limit)
-        .ok_or_else(|| aggregate_limit_error(spec.store_id, total_limit))?;
+    else {
+        batch.retained_limit_exceeded |= request_limited;
+        return Err(aggregate_limit_error(spec.store_id, total_limit));
+    };
     *consumed_bytes = total;
 
     let SearchResponse { body_bytes: _, data } = response?;
@@ -2188,9 +2297,9 @@ mod tests {
 
     use super::{
         FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
-        RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchResult, SearchSpec, VectorStoreSearchRequest,
-        append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results, parse_response_body,
-        response_admission_units,
+        RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchResponse, SearchResult, SearchSpec,
+        VectorStoreSearchRequest, append_unprocessed_deadline_failures, deserialize_search_results,
+        merge_search_result, merge_top_results, parse_response_body, response_admission_units,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
@@ -2218,6 +2327,30 @@ mod tests {
             query: "query",
             ranking_options: None,
             store_id,
+        }
+    }
+
+    #[test]
+    fn aggregate_overflow_distinguishes_request_budget_from_tool_ceiling() {
+        let spec = search_spec(0, "vs-test");
+        for request_limited in [false, true] {
+            let mut batch = SearchBatch::new(1);
+            let mut consumed = 0;
+            let result = merge_search_result(
+                &mut batch,
+                &mut consumed,
+                &spec,
+                Ok(SearchResponse {
+                    body_bytes: 11,
+                    data: Vec::new(),
+                }),
+                10,
+                request_limited,
+            );
+            assert!(result.is_err());
+            assert_eq!(batch.retained_limit_exceeded, request_limited);
+            assert_eq!(consumed, 0);
+            drop(batch);
         }
     }
 
@@ -2554,6 +2687,38 @@ mod tests {
             allocations.bytes_max <= (body.len() + RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES) as u64,
             "peak live decoder allocation must fit the charged decoded allowance: {allocations:?}"
         );
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
+    fn high_cardinality_decode_avoids_full_result_tree_allocation() {
+        const RESULT_COUNT: usize = 10_000;
+        let mut body = Vec::with_capacity(MINIMAL_RESULT.len() * RESULT_COUNT + RESULT_COUNT + 10);
+        body.extend_from_slice(br#"{"data":["#);
+        for index in 0..RESULT_COUNT {
+            if index != 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(MINIMAL_RESULT);
+        }
+        body.extend_from_slice(b"]}");
+
+        let optimized = allocation_counter::measure(|| {
+            let decoded = decode(&body, 50).expect("bounded decoder accepts fixture");
+            assert_eq!(decoded.len(), 50);
+            std::hint::black_box(decoded);
+        });
+        let baseline = allocation_counter::measure(|| {
+            let parsed: Value = serde_json::from_slice(&body).expect("full JSON tree accepts fixture");
+            assert_eq!(
+                parsed.get("data").and_then(Value::as_array).map(Vec::len),
+                Some(RESULT_COUNT)
+            );
+            std::hint::black_box(parsed);
+        });
+        eprintln!("hosted file decode allocation fixture: optimized={optimized:?}, baseline={baseline:?}");
+        assert!(optimized.count_total < baseline.count_total);
+        assert!(optimized.bytes_max < baseline.bytes_max);
     }
 
     #[test]

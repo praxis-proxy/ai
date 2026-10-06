@@ -3,7 +3,7 @@
 
 //! Adapt a praxis streaming response body into an rmcp SSE stream.
 //!
-//! [`sse_stream_from_body`] wraps a [`StreamingResponseBody`] as the
+//! [`sse_stream_from_body_with_budget`] wraps a [`StreamingResponseBody`] as the
 //! `BoxStream<Result<Sse, SseError>>` rmcp's `StreamableHttpPostResponse::Sse`
 //! and `get_stream` expect. Two independent byte budgets are enforced at the
 //! raw byte layer, *before* SSE parsing:
@@ -21,12 +21,14 @@
 use std::sync::{Arc, OnceLock};
 
 use futures::stream::{BoxStream, StreamExt as _};
-use praxis_filter::StreamingResponseBody;
+use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
 use sse_stream::{Error as SseError, Sse, SseStream};
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
+use crate::openai::responses::agentic_loop::budget::output_charge;
 
 /// Destination for an SSE size classification.
+#[derive(Clone)]
 pub(super) enum SseSignalTarget {
     /// One POST response owns a fixed signal generation.
     Fixed(Arc<OnceLock<TransportSignal>>),
@@ -205,10 +207,7 @@ struct ByteState {
 /// cap is `min(per_event_cap, max_sse_event_size)`). A breach of either budget
 /// records `signal` (first wins) and terminates the stream.
 #[allow(clippy::allow_attributes, dead_code, reason = "wired by selector filter in task 4")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "two-budget byte-layer adapter is inherently sequential"
-)]
+#[cfg(test)]
 pub(super) fn sse_stream_from_body(
     body: Box<dyn StreamingResponseBody>,
     per_event_cap: usize,
@@ -216,7 +215,29 @@ pub(super) fn sse_stream_from_body(
     max_sse_event_size: usize,
     signal: SseSignalTarget,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
+    sse_stream_from_body_with_budget(body, per_event_cap, operation_cap, max_sse_event_size, signal, None)
+}
+
+/// Apply a structural preparse ceiling to every completed MCP SSE event.
+/// The byte-layer limits still run before the SSE parser allocates a frame.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "adds one optional parse bound to the SSE adapter"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-budget byte-layer adapter is inherently sequential"
+)]
+pub(super) fn sse_stream_from_body_with_budget(
+    body: Box<dyn StreamingResponseBody>,
+    per_event_cap: usize,
+    operation_cap: usize,
+    max_sse_event_size: usize,
+    signal: SseSignalTarget,
+    parse_charge_limit: Option<usize>,
+) -> BoxStream<'static, Result<Sse, SseError>> {
     let effective_per_event = per_event_cap.min(max_sse_event_size);
+    let parse_signal = signal.clone();
     let state = ByteState {
         body,
         emitted: 0,
@@ -229,18 +250,24 @@ pub(super) fn sse_stream_from_body(
         loop {
             match st.body.next_chunk().await {
                 Ok(Some(chunk)) => {
+                    // Reject before scanning the chunk for SSE lines. A single
+                    // network chunk may contain several valid small events, so
+                    // only the cumulative ceiling applies to its raw length.
+                    let Some(total) = st
+                        .emitted
+                        .checked_add(chunk.len())
+                        .filter(|total| *total <= st.operation_cap)
+                    else {
+                        let limit = st.operation_cap;
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                        return Err(SseByteStreamError::Ceiling { limit });
+                    };
+                    st.emitted = total;
                     // Per-event (per-message) ceiling, before parsing.
                     if st.per_event.observe(&chunk).is_err() {
                         let limit = st.per_event.max_size;
                         st.signal.record(TransportSignal::ResponseTooLarge { limit });
                         return Err(SseByteStreamError::EventTooLarge { max_size: limit });
-                    }
-                    // Cumulative operation-stream ceiling.
-                    st.emitted = st.emitted.saturating_add(chunk.len());
-                    if st.emitted > st.operation_cap {
-                        let limit = st.operation_cap;
-                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
-                        return Err(SseByteStreamError::Ceiling { limit });
                     }
                     if chunk.is_empty() {
                         continue; // keep pulling; never yield an empty frame
@@ -248,12 +275,30 @@ pub(super) fn sse_stream_from_body(
                     return Ok(Some((chunk, st)));
                 },
                 Ok(None) => return Ok(None),
-                Err(_error) => return Err(SseByteStreamError::Upstream),
+                Err(error) => {
+                    if let Some(overflow) = error.downcast_ref::<CalloutResponseTooLarge>() {
+                        let limit = overflow.limit;
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                        return Err(SseByteStreamError::Ceiling { limit });
+                    }
+                    return Err(SseByteStreamError::Upstream);
+                },
             }
         }
     });
 
-    SseStream::from_bytes_stream(byte_stream).boxed()
+    SseStream::from_bytes_stream(byte_stream)
+        .map(move |event| {
+            if let (Some(limit), Ok(value)) = (parse_charge_limit, &event)
+                && let Some(data) = &value.data
+                && output_charge(data.as_bytes()).is_none_or(|charge| charge > limit)
+            {
+                parse_signal.record(TransportSignal::ResponseTooLarge { limit });
+                return Err(SseError::Body(Box::new(SseByteStreamError::Ceiling { limit })));
+            }
+            event
+        })
+        .boxed()
 }
 
 /// Test double for [`StreamingResponseBody`] that yields queued chunks and
@@ -342,6 +387,21 @@ mod tests {
     use super::{FakeStreamingBody, sse_stream_from_body};
     use crate::mcp_client::subrequest_transport::TransportSignal;
 
+    struct OversizedCalloutStream;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::StreamingResponseBody for OversizedCalloutStream {
+        async fn next_chunk(&mut self) -> Result<Option<Bytes>, praxis_filter::FilterError> {
+            Err(Box::new(praxis_filter::CalloutResponseTooLarge { limit: 4 }))
+        }
+
+        async fn suppress(&mut self) -> Result<(), praxis_filter::FilterError> {
+            Ok(())
+        }
+
+        async fn cancel(&mut self) {}
+    }
+
     fn cancelled_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
     }
@@ -384,6 +444,22 @@ mod tests {
             matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 4 })),
             "cumulative breach records a 413 signal at the operation cap"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_hits_cumulative_cap_before_event_scan() {
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"data: aaaaaaaaaaaaa\n\n")],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 8, 12, 16 * 1024 * 1024, Arc::clone(&signal).into());
+
+        assert!(stream.next().await.expect("stream error").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 12 })
+        ));
     }
 
     #[tokio::test]
@@ -449,5 +525,23 @@ mod tests {
         }
         assert!(saw_err, "an upstream body error must surface");
         assert!(signal.get().is_none(), "a transport error is not a size breach");
+    }
+
+    #[tokio::test]
+    async fn core_stream_ceiling_error_records_size_signal() {
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            Box::new(OversizedCalloutStream),
+            4,
+            4,
+            16 * 1024 * 1024,
+            Arc::clone(&signal).into(),
+        );
+
+        assert!(stream.next().await.expect("stream error").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 4 })
+        ));
     }
 }

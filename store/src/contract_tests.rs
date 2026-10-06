@@ -13,7 +13,7 @@ use crate::{
     traits::{ConversationItemStore, PersistedStateBackend},
     types::{
         ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord,
+        ResponseRecord, StoreError,
     },
 };
 
@@ -97,9 +97,12 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     approvals_consume_all_or_nothing(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
     persist_pairs_response_and_approvals(backend).await;
+    insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
+    bounded_item_rebuild_rolls_back(backend).await;
+    bounded_rebuild_rechecks_intervening_append(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
@@ -376,6 +379,85 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
     );
 }
 
+/// A rollback candidate must never replace a preexisting response or its
+/// approvals, including when a provider reuses an ID for the same owner.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks same-owner and cross-owner collisions with approvals"
+)]
+async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateBackend) {
+    let first_owner = owner("insert-first");
+    let second_owner = owner("insert-second");
+    let original = ResponseRecord {
+        id: "resp_insert_once".to_owned(),
+        owner: first_owner.clone(),
+        created_at: 1,
+        model: "old".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "old"}),
+        input: serde_json::json!([]),
+        messages: serde_json::json!([]),
+    };
+    assert!(
+        backend
+            .persist_response_with_pending_approvals_if_absent(&original, &[approval("pa_old")])
+            .await
+            .expect("first insert"),
+        "new response must insert"
+    );
+    let replacement = ResponseRecord {
+        model: "new".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "new"}),
+        ..original.clone()
+    };
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(&replacement, &[approval("pa_new")])
+            .await
+            .expect("same-owner collision"),
+        "same-owner collision must not replace the existing response"
+    );
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(
+                &ResponseRecord {
+                    owner: second_owner.clone(),
+                    ..replacement
+                },
+                &[approval("pa_other")],
+            )
+            .await
+            .expect("cross-owner collision"),
+        "cross-owner collision must not replace the existing response"
+    );
+    let stored = backend
+        .get_response(&first_owner, &original.id)
+        .await
+        .expect("get original")
+        .expect("original retained");
+    assert_eq!(
+        stored.response_object.get("marker"),
+        Some(&serde_json::json!("old")),
+        "same-owner collision changed the original response"
+    );
+    assert!(
+        backend
+            .get_response(&second_owner, &original.id)
+            .await
+            .expect("get other")
+            .is_none(),
+        "cross-owner collision leaked the original response"
+    );
+    assert_eq!(
+        backend
+            .get_pending_approvals(&first_owner, &original.id, &["pa_old", "pa_new", "pa_other"])
+            .await
+            .expect("get approvals")
+            .len(),
+        1,
+        "collisions must not write replacement approvals"
+    );
+}
+
 /// `compare_and_swap_conversation_messages` guards a stale write.
 async fn conversation_messages_cas(backend: &dyn PersistedStateBackend) {
     let o = owner("cas");
@@ -471,6 +553,117 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         remaining.messages.as_array().map(Vec::len),
         Some(1),
         "message cache rebuilt after delete"
+    );
+}
+
+/// A failed bounded rebuild must not commit the new item or change the cache.
+#[expect(clippy::too_many_lines, reason = "transactional item and cache rollback assertions")]
+async fn bounded_item_rebuild_rolls_back(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-rollback");
+    let conversation_id = "conv_bounded_rollback";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: conversation_id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, conversation_id, &[item(&o, conversation_id, "prior")])
+        .await
+        .expect("seed prior item and cache");
+    let before = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read prior cache")
+        .expect("conversation exists");
+
+    assert!(
+        matches!(
+            backend
+                .create_items_and_sync_messages_bounded(&o, conversation_id, &[item(&o, conversation_id, "new")], 1)
+                .await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "oversized rebuild must fail"
+    );
+    let listed = backend
+        .list_conversation_items(&o, conversation_id, None, 10, true)
+        .await
+        .expect("list after failed rebuild");
+    assert_eq!(listed.len(), 1, "failed append must not commit a second item");
+    assert_eq!(
+        listed.first().map(|item| item.item_id.as_str()),
+        Some("prior"),
+        "prior item must survive the rollback"
+    );
+    let after = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read cache after failed rebuild")
+        .expect("conversation survives");
+    assert_eq!(
+        after.messages, before.messages,
+        "failed append must not change the cached messages"
+    );
+}
+
+/// A request's earlier bounded restore cannot authorize a later cache rebuild:
+/// another writer may grow the conversation between those two operations.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restore, intervening write, and rollback assertions form one scenario"
+)]
+async fn bounded_rebuild_rechecks_intervening_append(backend: &dyn PersistedStateBackend) {
+    let o = owner("intervening-append");
+    let id = "conv_intervening_append";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, id, &[item(&o, id, "prior")])
+        .await
+        .expect("seed prior item");
+    let snapshot = backend
+        .get_conversation_bounded(&o, id, 65_536)
+        .await
+        .expect("bounded restore")
+        .expect("conversation exists");
+    assert_eq!(
+        snapshot.messages.as_array().map(Vec::len),
+        Some(1),
+        "restore sees the first item"
+    );
+
+    let mut concurrent = item(&o, id, "concurrent");
+    concurrent.item_data = serde_json::json!({"id":"concurrent", "content":"x".repeat(10_000)});
+    backend
+        .create_items_and_sync_messages(&o, id, &[concurrent])
+        .await
+        .expect("another writer appends after restore");
+    let rejected = backend
+        .create_items_and_sync_messages_bounded(&o, id, &[item(&o, id, "candidate")], 65_536)
+        .await;
+    assert!(
+        matches!(rejected, Err(StoreError::PayloadTooLarge)),
+        "intervening item must exceed the bound"
+    );
+    let listed = backend
+        .list_conversation_items(&o, id, None, 10, true)
+        .await
+        .expect("list items");
+    assert_eq!(listed.len(), 2, "failed candidate append must roll back");
+    assert!(
+        listed.iter().all(|record| record.item_id != "candidate"),
+        "candidate must roll back"
     );
 }
 

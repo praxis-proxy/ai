@@ -25,7 +25,9 @@ use super::{
 use crate::{
     openai::{
         operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter, classify},
-        responses::{DEFAULT_TENANT_ID, state::ResponsesState},
+        responses::{
+            AgenticBudgetPolicy, DEFAULT_TENANT_ID, agentic_loop::budget::SimpleBudget, state::ResponsesState,
+        },
     },
     operation::{ApplicationProtocol, Transport},
     store::{
@@ -3955,6 +3957,77 @@ async fn on_response_body_skips_invalid_json() {
     let mut body = Some(Bytes::from_static(b"{not-json"));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_append_rejects_before_item_copy_when_headroom_is_exhausted() {
+    let (filter, store) = harness();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"input":"hello"}));
+    state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
+    ctx.extensions.insert(state);
+    set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let response_bytes =
+        br#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}"#;
+    let mut body = Some(Bytes::from_static(response_bytes));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(
+        body.as_deref(),
+        Some(response_bytes.as_slice()),
+        "overflow must leave the response body untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_incomplete_response_skips_append_reservation() {
+    let (filter, store) = harness();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"input":"x".repeat(3_000)}));
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 100_000, false);
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+    set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(br#"{"status":"incomplete","output":[]}"#));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "incomplete response needs no append"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        before,
+        "skipped append must not consume request headroom"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

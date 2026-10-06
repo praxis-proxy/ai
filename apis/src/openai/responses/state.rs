@@ -11,6 +11,7 @@
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
     time::Duration,
@@ -72,14 +73,66 @@ pub(crate) enum SynthesisKind {
 /// bridging model context — so the complete output item is never cloned into a
 /// second owner (avoids the payload duplication the "keep `Vec<Value>`" interface
 /// would incur; the recommended "store output indices" boundary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileSearchAssignment {
     /// Absolute index into [`ResponsesState::accumulated_output`] of the
     /// `file_search_call` item the dispatcher must execute and reconcile.
     pub output_index: usize,
+    /// Public ID used to reject a replaced or stale indexed item.
+    pub item_id: String,
     /// Whether the item was normalized from a private `function_call` this round
     /// (`Private`, opening suppressed) or streamed natively (`Native`).
     pub synthesis: SynthesisKind,
+}
+
+impl FileSearchAssignment {
+    /// Resolve only a still-pending item in the current round with the same public ID.
+    pub(crate) fn resolve<'a>(&self, state: &'a ResponsesState) -> Option<&'a serde_json::Value> {
+        let round_start = state.current_round_output_start.unwrap_or(0);
+        if self.output_index < round_start {
+            return None;
+        }
+        let item = state.accumulated_output.get(self.output_index)?;
+        (item.get("type")?.as_str()? == "file_search_call"
+            && item.get("id")?.as_str()? == self.item_id
+            && is_pending_file_search_call(item))
+        .then_some(item)
+    }
+}
+
+/// A round-local dispatcher selection into the canonical public output.
+/// The ID and type checks reject a stale index if a later rewrite replaces its
+/// slot; the round check prevents redispatch after another inference step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutputAssignment {
+    /// Absolute position in the canonical public output.
+    pub output_index: usize,
+    /// Public item ID, used to reject a rewritten or displaced index.
+    pub item_id: String,
+}
+
+impl OutputAssignment {
+    /// Select a canonical output item without copying its payload.
+    pub(crate) fn new(output_index: usize, item: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            output_index,
+            item_id: item.get("id")?.as_str()?.to_owned(),
+        })
+    }
+
+    /// Resolve a current-round item only when its index, ID, and type still match.
+    pub(crate) fn resolve<'a>(
+        &self,
+        output: &'a [serde_json::Value],
+        round_start: usize,
+        expected_type: &str,
+    ) -> Option<&'a serde_json::Value> {
+        if self.output_index < round_start {
+            return None;
+        }
+        let item = output.get(self.output_index)?;
+        (item.get("id")?.as_str()? == self.item_id && item.get("type")?.as_str()? == expected_type).then_some(item)
+    }
 }
 
 /// A terminal failure a request-phase dispatcher recorded in shared state.
@@ -308,6 +361,25 @@ pub(crate) enum McpApprovalState {
     ExecuteUngatedThenReturn,
 }
 
+/// Peak transport and result capacity reserved for one MCP execution batch.
+/// The reservation is settled to the retained result charge after dispatch.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct McpExecutionBudget {
+    /// Number of MCP calls admitted together.
+    pub call_count: usize,
+    /// Retained result limit passed to the dispatcher.
+    pub result_limit: usize,
+    /// Raw response ceiling applied before the MCP JSON parser.
+    pub wire_limit: usize,
+    /// Structural and wire charge allowed for one MCP response parse.
+    pub parse_charge_limit: usize,
+    /// Total peak capacity reserved in the request-wide ledger.
+    pub reserved: usize,
+    /// Argument parser capacity that is released with this batch.
+    pub transient_argument_charge: usize,
+}
+
 /// Request-scoped state shared across Responses API filters.
 ///
 /// Created by `openai_responses_validate` for every Responses API
@@ -328,6 +400,9 @@ pub(crate) enum McpApprovalState {
               not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
+    /// Conservative request-wide charge for the first plain Responses path.
+    /// Set only when a listener has an agentic retained-payload policy.
+    pub(crate) simple_budget: Option<super::agentic_loop::budget::SimpleBudget>,
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
 
@@ -464,6 +539,11 @@ pub(crate) struct ResponsesState {
 
     /// Lifecycle state for an MCP batch that must return after execution.
     pub mcp_approval_state: McpApprovalState,
+
+    /// Capacity already reserved before a durable approval batch was consumed.
+    /// Request-side execution reuses it rather than charging twice.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) mcp_execution_budget: Option<McpExecutionBudget>,
 
     /// Whether a local dispatcher exhausted the response-wide tool budget.
     ///
@@ -608,14 +688,19 @@ pub(crate) struct ResponsesState {
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
-    pub tool_calls: Vec<serde_json::Value>,
+    pub tool_calls: Vec<OutputAssignment>,
+
+    /// Approved calls resumed from Store have no item in this round's provider
+    /// output, so they keep an independent owner until MCP dispatch completes.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub approved_tool_calls: Vec<serde_json::Value>,
 
     /// `tool_search_call` items from the current inference response.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// `openai_mcp_dispatch` consumes these to load deferred connector
     /// tools before the next inference round.
-    pub tool_search_calls: Vec<serde_json::Value>,
+    pub tool_search_calls: Vec<OutputAssignment>,
 
     /// Web search calls from the current inference response only.
     ///
@@ -623,7 +708,7 @@ pub(crate) struct ResponsesState {
     /// Stored separately from `tool_calls` because `web_search_call`
     /// items have a different shape (`action.query` instead of
     /// `name`/`arguments`) and are dispatched by a different filter.
-    pub web_search_calls: Vec<serde_json::Value>,
+    pub web_search_calls: Vec<OutputAssignment>,
 
     /// Cumulative web searches dispatched to the provider across all
     /// agentic-loop iterations.
@@ -690,6 +775,11 @@ pub(crate) struct ResponsesState {
     /// (e.g. a model `web_search_call` placeholder later completed under the
     /// same id, or gaining `action.sources` after local execution).
     pub emitted_output_items: HashMap<String, EmittedItem>,
+
+    /// Last local SSE synthesis snapshot admitted for each absolute output index.
+    /// Rechecking the same pending item at chunk and round finalization must not
+    /// charge it twice; a changed item gets a fresh reservation before re-emission.
+    pub stream_synthesis_reserved: HashMap<usize, u64>,
 
     /// Item ids of local tool calls a dispatch filter actually executed this
     /// request (execution provenance), keyed by the output item's `id`.
@@ -893,6 +983,7 @@ impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
+            simple_budget: None,
             citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
@@ -910,6 +1001,8 @@ impl Default for ResponsesState {
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_execution_budget: None,
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
@@ -935,6 +1028,8 @@ impl Default for ResponsesState {
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            #[cfg(feature = "openai-mcp-tools")]
+            approved_tool_calls: Vec::new(),
             tool_search_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,
@@ -945,6 +1040,7 @@ impl Default for ResponsesState {
             accumulated_output: Vec::new(),
             stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
+            stream_synthesis_reserved: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
             pending_local_tool_synthesis: Vec::new(),
             provider_streamed_terminal_ids: BTreeSet::new(),
@@ -955,6 +1051,113 @@ impl Default for ResponsesState {
 }
 
 impl ResponsesState {
+    /// Borrow current-round canonical output selected by a dispatcher queue.
+    fn selected_output<'a>(
+        &'a self,
+        assignments: &'a [OutputAssignment],
+        expected_type: &'static str,
+    ) -> impl Iterator<Item = &'a serde_json::Value> {
+        let round_start = self.current_round_output_start.unwrap_or(0);
+        assignments
+            .iter()
+            .filter_map(move |assignment| assignment.resolve(&self.accumulated_output, round_start, expected_type))
+    }
+
+    /// Borrow function calls selected for dispatch, including resumed approvals.
+    pub(crate) fn selected_tool_calls(&self) -> Vec<&serde_json::Value> {
+        #[cfg(feature = "openai-mcp-tools")]
+        let mut selected: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
+        #[cfg(not(feature = "openai-mcp-tools"))]
+        let selected: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
+        #[cfg(feature = "openai-mcp-tools")]
+        selected.extend(self.approved_tool_calls.iter());
+        selected
+    }
+
+    /// Borrow hosted tool-search calls selected in the current round.
+    pub(crate) fn selected_tool_search_calls(&self) -> Vec<&serde_json::Value> {
+        self.selected_output(&self.tool_search_calls, "tool_search_call")
+            .collect()
+    }
+
+    /// Borrow web-search calls selected in the current round.
+    pub(crate) fn selected_web_search_calls(&self) -> Vec<&serde_json::Value> {
+        self.selected_output(&self.web_search_calls, "web_search_call")
+            .collect()
+    }
+
+    /// Borrow web-search calls with their absolute canonical output positions.
+    pub(crate) fn selected_web_search_outputs(&self) -> Vec<(usize, &serde_json::Value)> {
+        let round_start = self.current_round_output_start.unwrap_or(0);
+        self.web_search_calls
+            .iter()
+            .filter_map(|assignment| {
+                assignment
+                    .resolve(&self.accumulated_output, round_start, "web_search_call")
+                    .map(|item| (assignment.output_index, item))
+            })
+            .collect()
+    }
+
+    /// Install an owned output item and its compact selection in unit fixtures.
+    #[cfg(test)]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::too_many_lines,
+        reason = "test fixture builder reconciles explicit and pre-existing output items"
+    )]
+    pub(crate) fn select_test_output(&mut self, kind: &str, items: Vec<serde_json::Value>) {
+        for mut item in items {
+            let existing_index = self.accumulated_output.iter().position(|existing| existing == &item);
+            if item.get("type").and_then(serde_json::Value::as_str).is_none() {
+                item.as_object_mut()
+                    .expect("test output item")
+                    .insert("type".to_owned(), serde_json::Value::String(kind.to_owned()));
+                if let Some(index) = existing_index {
+                    self.accumulated_output[index]
+                        .as_object_mut()
+                        .expect("test output item")
+                        .insert("type".to_owned(), serde_json::Value::String(kind.to_owned()));
+                }
+            }
+            if item.get("id").and_then(serde_json::Value::as_str).is_none() {
+                let id = format!(
+                    "test_output_{}",
+                    existing_index.unwrap_or(self.accumulated_output.len())
+                );
+                item.as_object_mut()
+                    .expect("test output item")
+                    .insert("id".to_owned(), serde_json::Value::String(id.clone()));
+                if let Some(index) = existing_index {
+                    self.accumulated_output[index]
+                        .as_object_mut()
+                        .expect("test output item")
+                        .insert("id".to_owned(), serde_json::Value::String(id));
+                }
+            }
+            let output_index = existing_index
+                .or_else(|| self.accumulated_output.iter().position(|existing| existing == &item))
+                .unwrap_or_else(|| {
+                    let index = self.accumulated_output.len();
+                    self.accumulated_output.push(item.clone());
+                    index
+                });
+            self.current_round_output_start = Some(
+                self.current_round_output_start
+                    .map_or(output_index, |start| start.min(output_index)),
+            );
+            let assignment = OutputAssignment::new(output_index, &item).expect("test output id");
+            match kind {
+                "function_call" => self.tool_calls.push(assignment),
+                "web_search_call" => self.web_search_calls.push(assignment),
+                "tool_search_call" => self.tool_search_calls.push(assignment),
+                _ => panic!("unknown test output selection {kind}"),
+            }
+        }
+    }
+
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
@@ -1107,6 +1310,10 @@ impl ResponsesState {
     /// Returns a [`FilterAction::Reject`] carrying an HTTP 502 error envelope on
     /// citation-annotation failure, JSON size overflow, or serialization
     /// failure, closing the prior fail-open serialization gap.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "terminal output ownership and citation admission share one finalization transaction"
+    )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
         if !self.response_object.is_object() {
             return Ok(());
@@ -1120,6 +1327,24 @@ impl ResponsesState {
             }
             if !self.usage.is_null() {
                 obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Some(budget) = self.simple_budget.as_mut() {
+            let staging = super::file_search_callout::citations::annotation_staging_bytes(
+                self.response_object
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(&[][..], Vec::as_slice),
+                &self.citation_files,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to preflight final response citations");
+                finalize_rejection("failed to preflight final response citations")
+            })?;
+            if !budget.reserve_additional_input(staging) {
+                return Err(finalize_rejection(
+                    "retained payload exceeded during citation annotation",
+                ));
             }
         }
         annotate_response(&mut self.response_object, &self.citation_files).map_err(|error| {
@@ -1167,11 +1392,13 @@ fn finalize_rejection(message: &str) -> FilterAction {
 /// displace an earlier built-in call (or vice versa). MCP calls are exempt from
 /// this budget (see [`is_builtin_tool_call`]), so they never appear as budget
 /// consumers even when interleaved with the target calls in model output order.
-pub(crate) fn current_round_tool_call_admissions(
+pub(crate) fn current_round_tool_call_admissions<T: Borrow<serde_json::Value>>(
     state: &ResponsesState,
-    target_calls: &[serde_json::Value],
+    target_calls: &[T],
 ) -> Vec<bool> {
-    current_round_tool_call_admissions_by(state, target_calls.len(), |index| target_calls.get(index))
+    current_round_tool_call_admissions_by(state, target_calls.len(), |index| {
+        target_calls.get(index).map(Borrow::borrow)
+    })
 }
 
 /// Return budget admission decisions for file-search assignments in model order.
@@ -1213,10 +1440,12 @@ pub(crate) fn current_round_file_search_admissions(
             remaining = remaining.saturating_sub(1);
         }
         let absolute_index = round_start.saturating_add(offset);
-        if assignments
-            .get(assignment_index)
-            .is_some_and(|assignment| assignment.output_index == absolute_index)
-        {
+        if assignments.get(assignment_index).is_some_and(|assignment| {
+            assignment.output_index == absolute_index
+                && item.get("type").and_then(serde_json::Value::as_str) == Some("file_search_call")
+                && item.get("id").and_then(serde_json::Value::as_str) == Some(assignment.item_id.as_str())
+                && is_pending_file_search_call(item)
+        }) {
             admissions.push(admitted);
             assignment_index = assignment_index.saturating_add(1);
         }
@@ -1264,6 +1493,10 @@ fn current_round_tool_call_admissions_by<'a>(
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
+    let selected = state.selected_tool_search_calls();
+    if selected.is_empty() {
+        return false;
+    }
     let Some(max) = state.max_tool_calls else {
         return true;
     };
@@ -1273,8 +1506,9 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
     if remaining == 0 {
         return false;
     }
-    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
-    admissions.is_empty() || admissions.into_iter().any(|admitted| admitted)
+    current_round_tool_call_admissions(state, &selected)
+        .into_iter()
+        .any(|admitted| admitted)
 }
 
 /// Normalize the `input` field into a message array.
@@ -1658,6 +1892,7 @@ mod tests {
         let web = json!({"type":"web_search_call", "id":"ws_second", "status":"in_progress"});
         let assignment = FileSearchAssignment {
             output_index: 0,
+            item_id: "fs_first".to_owned(),
             synthesis: SynthesisKind::Native,
         };
         let state = ResponsesState {
@@ -1705,21 +1940,21 @@ mod tests {
     #[test]
     fn tool_search_discovery_rejects_exhausted_budget() {
         let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-        let exhausted = ResponsesState {
+        let mut exhausted = ResponsesState {
             max_tool_calls: Some(0),
-            tool_search_calls: vec![search.clone()],
             ..ResponsesState::default()
         };
+        exhausted.select_test_output("tool_search_call", vec![search.clone()]);
         assert!(
             !tool_search_discovery_is_within_budget(&exhausted),
             "a zero remaining budget must not admit deferred tools/list"
         );
 
-        let admitted = ResponsesState {
+        let mut admitted = ResponsesState {
             max_tool_calls: Some(1),
-            tool_search_calls: vec![search],
             ..ResponsesState::default()
         };
+        admitted.select_test_output("tool_search_call", vec![search]);
         assert!(
             tool_search_discovery_is_within_budget(&admitted),
             "the first admitted hosted search may still list deferred connectors"
@@ -1730,13 +1965,13 @@ mod tests {
     fn tool_search_discovery_follows_current_round_admission_order() {
         let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
         let web = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
-        let displaced = ResponsesState {
+        let mut displaced = ResponsesState {
             max_tool_calls: Some(1),
             accumulated_output: vec![web.clone(), search.clone()],
             response_object: json!({"output": [web, search.clone()]}),
-            tool_search_calls: vec![search],
             ..ResponsesState::default()
         };
+        displaced.select_test_output("tool_search_call", vec![search]);
         assert!(
             !tool_search_discovery_is_within_budget(&displaced),
             "an earlier current-round built-in call consumes the shared cap first"
@@ -1934,14 +2169,17 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "drain fixture compares both indexed assignments")]
     fn drain_file_search_assignments_moves_and_empties() {
         let mut state = ResponsesState::default();
         state.file_search_assignments.push(FileSearchAssignment {
             output_index: 2,
+            item_id: "fs_2".to_owned(),
             synthesis: SynthesisKind::Private,
         });
         state.file_search_assignments.push(FileSearchAssignment {
             output_index: 5,
+            item_id: "fs_5".to_owned(),
             synthesis: SynthesisKind::Native,
         });
         let drained = state.drain_file_search_assignments();
@@ -1950,10 +2188,12 @@ mod tests {
             vec![
                 FileSearchAssignment {
                     output_index: 2,
+                    item_id: "fs_2".to_owned(),
                     synthesis: SynthesisKind::Private,
                 },
                 FileSearchAssignment {
                     output_index: 5,
+                    item_id: "fs_5".to_owned(),
                     synthesis: SynthesisKind::Native,
                 },
             ]
@@ -2156,6 +2396,40 @@ mod tests {
         };
         assert_eq!(rejection.status, 502, "annotation failure returns a server error");
         assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn final_citation_staging_obeys_exact_retained_budget_boundary() {
+        use crate::openai::responses::agentic_loop::budget::SimpleBudget;
+
+        let output = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "source <|file-known|>"}]
+        })];
+        let citation_files = HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
+        let staging = crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(
+            &output,
+            &citation_files,
+        )
+        .expect("valid marker has a bounded staging charge");
+        assert!(staging > 0);
+        for (extra, succeeds) in [(0, true), (1, false)] {
+            let mut budget = SimpleBudget::new(1_048_576, 0).expect("test budget admits request");
+            let remaining = budget.remaining_bytes().expect("budget has headroom");
+            assert!(budget.reserve_additional_input(remaining - staging + extra));
+            let mut state = ResponsesState {
+                response_object: json!({"object": "response", "output": []}),
+                accumulated_output: output.clone(),
+                citation_files: citation_files.clone(),
+                simple_budget: Some(budget),
+                ..ResponsesState::default()
+            };
+            let mut body = None;
+            let result = state.finalize_response_body(&mut body);
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(body.is_some(), succeeds);
+        }
     }
 
     #[test]

@@ -87,8 +87,9 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    AgenticBudgetPolicy, agentic_loop::budget::output_charge, body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome, error::responses_error_rejection, openai_responses_proxy::serialized_outbound_body_len,
+    state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -356,6 +357,10 @@ impl HttpFilter for FileResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "budget preflight and file resolution share one body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -380,6 +385,21 @@ impl HttpFilter for FileResolveFilter {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
         };
+
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
+            if budgeted_plain_input_without_references(ctx) {
+                return Ok(FilterAction::Continue);
+            }
+            let charge = output_charge(raw);
+            let admitted = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| charge.is_some_and(|charge| budget.reserve_additional_input(charge)));
+            if !admitted {
+                return Ok(reject_retained_file_budget());
+            }
+        }
 
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
@@ -428,6 +448,44 @@ impl HttpFilter for FileResolveFilter {
     }
 }
 
+/// A text input and file-free retained history need no second parse or rewrite.
+fn budgeted_plain_input_without_references(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+        state.simple_budget.is_some()
+            && super::text_only_input(state.request_body.get("input"))
+            && state.messages.iter().all(|item| !history_needs_file_resolution(item))
+            && state
+                .persisted_messages
+                .iter()
+                .all(|item| !history_needs_file_resolution(item))
+    })
+}
+
+/// Detect file-bearing history without allocating another JSON projection.
+fn history_needs_file_resolution(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(history_needs_file_resolution),
+        serde_json::Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some("input_file")
+            ) || (fields.get("type").and_then(serde_json::Value::as_str) == Some("input_image")
+                && (fields.contains_key("file_id") || fields.contains_key("file_url")))
+                || fields.values().any(history_needs_file_resolution)
+        },
+        _ => false,
+    }
+}
+
+/// Reject before parsing or dispatch when file ownership would exceed the request budget.
+fn reject_retained_file_budget() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "file resolution exceeded openai_agentic_loop.max_retained_bytes",
+    ))
+}
+
 /// Run resolution and rewrite the body if any references were resolved.
 ///
 /// Takes ownership of the parsed body so the resolved value can be moved
@@ -461,19 +519,26 @@ async fn resolve_and_rewrite(
     let mut budget = filter
         .client
         .resolution_budget(identity.and_then(|identity| build_outbound_execution(filter, ctx, identity)));
+    budget.set_simple_budget(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.simple_budget),
+    );
     // Body pre-read mutations have not reached `ctx.request` yet. Materialize
     // their effective view once so every Files API call observes trusted
     // removals and projections while `ctx` is subsequently mutated.
     let request_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
     let count = match resolve_current_input(filter, &request_headers, &mut parsed, &mut budget).await {
         Ok(count) => count,
+        Err(ResolveError::RetainedBudget) => return Ok(reject_retained_file_budget()),
         Err(e) => return Ok(reject_resolve_error(&e)),
     };
     if count == 0 {
         trace!("no file_id references found");
         if let Err(e) = update_state(filter, ctx, &request_headers, None, &mut budget).await {
-            return Ok(reject_resolve_error(&e));
+            return Ok(reject_file_resolution_error(&e));
         }
+        sync_simple_budget(ctx, &budget);
         if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
             return Ok(rejection);
         }
@@ -485,13 +550,30 @@ async fn resolve_and_rewrite(
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, &request_headers, Some(parsed), &mut budget).await {
-        return Ok(reject_resolve_error(&e));
+        return Ok(reject_file_resolution_error(&e));
     }
+    sync_simple_budget(ctx, &budget);
     if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
         return Ok(rejection);
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// Publish file owner reservations before downstream filters resume.
+fn sync_simple_budget(ctx: &mut HttpFilterContext<'_>, budget: &ResolutionBudget) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.simple_budget = budget.simple_budget();
+    }
+}
+
+/// Budget exhaustion is terminal even when missing file policy is permissive.
+fn reject_file_resolution_error(error: &ResolveError) -> FilterAction {
+    if matches!(error, ResolveError::RetainedBudget) {
+        reject_retained_file_budget()
+    } else {
+        reject_resolve_error(error)
+    }
 }
 
 /// Snapshot the downstream request context and build the outbound
@@ -525,11 +607,7 @@ fn build_outbound_execution(
 /// agentic and ordinary Responses pipelines without relying on a later loop owner.
 fn reject_missing_callout_context(slot: &str) -> FilterAction {
     let message = format!("file resolution requires the '{slot}' per-user credential, which was not provided");
-    FilterAction::Reject(super::error::responses_error_rejection(
-        401,
-        MISSING_CALLOUT_CONTEXT,
-        &message,
-    ))
+    FilterAction::Reject(responses_error_rejection(401, MISSING_CALLOUT_CONTEXT, &message))
 }
 
 /// Enforce the resolver's body limit against the exact request shape
@@ -779,6 +857,7 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
         ResolveError::TooLarge { reference, limit } => too_large_error_response(reference, *limit),
+        ResolveError::RetainedBudget => (413, "file resolution exceeded retained payload budget".to_owned()),
         ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
         ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
