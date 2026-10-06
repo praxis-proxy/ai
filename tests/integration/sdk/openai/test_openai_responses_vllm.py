@@ -8510,7 +8510,18 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requests += 1
-        if self.headers.get("x-tenant-id") is not None:
+        # The credential-free resolver downloads client-supplied file_url targets
+        # with an EMPTY header map. Reject if the re-projected owner identity
+        # (x-tenant-id/x-user-id) OR any credential (the ogx_files Authorization
+        # or the raw x-user-ogx-key secret) leaks onto this request, so a
+        # regression that routes file_url through the credentialed outbound chain
+        # fails here instead of silently serving content.
+        leaked = [
+            name
+            for name in ("x-tenant-id", "x-user-id", "authorization", "x-user-ogx-key")
+            if self.headers.get(name) is not None
+        ]
+        if leaked:
             self.send_response(403)
             self.end_headers()
             return
