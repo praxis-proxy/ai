@@ -21,8 +21,9 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path, free_port, http_send,
-    json_post, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
+    Backend, CapturedRequest, StatefulCapturingBackend, StatefulCapturingGuard, TempSqlite, build_pipeline,
+    example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
+    start_proxy, start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -61,6 +62,22 @@ fn load_client_tool_compat_config_without_stream_owner(
     praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config without stream owner")
 }
 
+/// The backend requests that are inference rounds, dropping the harness probe.
+///
+/// `start_proxy` waits for the listener by sending `GET /`, and the chain's
+/// catch-all route forwards every path it does not otherwise handle to the
+/// inference backend. That probe is therefore visible to the mock alongside the
+/// rounds under test, the same way `azure_translation` skips Pingora's
+/// health-check probe. It consumes no scripted response: the mock answers
+/// probes itself.
+fn inference_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
+    model
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // Pipeline build
 // -----------------------------------------------------------------------------
@@ -70,6 +87,40 @@ fn example_config_builds_pipeline() {
     let db = TempSqlite::new("client_tool_compat_build");
     let config = load_client_tool_compat_config(free_port(), 19951, db.url());
     let _pipeline = build_pipeline(&config);
+}
+
+// -----------------------------------------------------------------------------
+// Bodyless traffic a coding client also sends
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bodyless_models_probe_reaches_the_backend() {
+    // `GET /v1/models` carries no body. The chain leads with
+    // `openai_responses_request`, which resolves the operation from the
+    // request head, so a path it does not recognize is released rather than
+    // rejected for carrying no JSON. A body-only classifier under
+    // `on_invalid: reject` would answer 400 "request body is not JSON" here.
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_models_probe");
+    let config = load_client_tool_compat_config(proxy_port, backend.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "bodyless model-discovery probe should return 200: {raw}"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "/v1/models",
+        "model-discovery path must reach the backend unchanged"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -118,7 +169,7 @@ fn custom_tool_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a lowered private `function`, never a
     // `custom` tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round for a single client tool call");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -203,7 +254,7 @@ fn shell_tool_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a private `function` named `shell`, never a
     // rich `shell`/`local_shell` tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -310,7 +361,7 @@ fn namespace_tool_round_trip_lowers_and_restores() {
     assert_eq!(parse_status(&raw), 200, "namespace round trip should return 200: {raw}");
 
     // Request phase: the backend saw a flat private function name.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -411,7 +462,7 @@ fn namespace_custom_member_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a flat private function name and no rich
     // custom or namespace tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -502,7 +553,7 @@ fn tool_search_round_trip_lowers_and_restores() {
     );
 
     // Request phase: the backend saw a private `function` named `tool_search`.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -634,7 +685,7 @@ fn discovered_tool_round_trip_becomes_callable() {
 
     // Request phase of turn 2: the backend must see the discovered `apply_patch`
     // tool declared as a private function so it can call it.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 2, "two inference rounds");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[1].body).expect("turn 2 backend body is JSON");
@@ -721,7 +772,7 @@ fn all_client_tool_types_lower_to_functions() {
         "mixed rich-tool request should return 200: {raw}"
     );
 
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -794,7 +845,7 @@ fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
         "the rejection names the missing streaming owner: {body}"
     );
     assert!(
-        model.requests().is_empty(),
+        inference_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
@@ -844,7 +895,7 @@ fn local_shell_declaration_fails_closed_before_upstream() {
         "the rejection names the unsupported tool: {body}"
     );
     assert!(
-        model.requests().is_empty(),
+        inference_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
@@ -899,7 +950,7 @@ fn native_function_tool_passes_through_unchanged() {
     assert_eq!(parse_status(&raw), 200, "native passthrough should return 200: {raw}");
 
     // The backend saw the plain function tool untouched.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");

@@ -41,8 +41,9 @@ use nix::{
     unistd::Pid,
 };
 use praxis_test_utils::{
-    CapturedHttpRequest, HttpBackendEvent, HttpServerAction, example_config_path, free_port, patch_yaml, start_proxy,
-    start_scripted_http_backend, start_scripted_http_backend_turns,
+    CapturedHttpRequest, HttpBackendEvent, HttpServerAction, example_config_path, free_port, http_send, parse_body,
+    parse_status, patch_yaml, start_proxy, start_scripted_http_backend, start_scripted_http_backend_turns,
+    start_uri_echo_backend,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -440,19 +441,46 @@ async fn translated_chat_sse_reaches_client_before_upstream_finishes() {
     let _proxy = start_proxy(&config);
 
     let client = tokio::spawn(read_first_translated_delta(proxy_port));
-    let request = tokio::time::timeout(Duration::from_secs(5), backend.next_event())
-        .await
-        .expect("provider should receive translated request")
-        .expect("backend event channel should remain open");
-    let HttpBackendEvent::Request(request) = request else {
-        panic!("provider should receive a normal HTTP request, got {request:?}");
-    };
+    let request = next_translated_request(&mut backend).await;
     assert_eq!(request.path, "/v1/chat/completions");
 
     tokio::time::timeout(Duration::from_secs(2), client)
         .await
         .expect("client should receive a translated delta before the delayed terminal Chat chunk")
         .expect("client reader task should finish");
+}
+
+/// Prove a bodyless probe survives the translated chain.
+///
+/// `GET /v1/models` carries no body, and an empty body classifies as non-JSON.
+/// The example scopes `openai_responses_format` to `POST /v1/responses`, so the
+/// probe must route through to the provider rather than being rejected with
+/// 400 "request body is not JSON" before it reaches the router.
+#[test]
+fn translated_chain_passes_bodyless_models_probe() {
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/codex-http-chat-translation.yaml"))
+        .expect("Codex translated-provider example should exist");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "bodyless model-discovery probe should return 200: {raw}"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "/v1/models",
+        "model-discovery path must reach the provider unchanged"
+    );
 }
 
 /// Prove the front-door observer records an Upgrade before forwarding it.
@@ -1315,6 +1343,33 @@ env_key = "PRAXIS_TEST_API_KEY"
     output
 }
 
+/// Whether an observed event is the `start_proxy` readiness probe.
+///
+/// `start_proxy` waits for the listener by sending `GET /`, and the translated
+/// chain routes every unmatched path to the selected provider, so the scripted
+/// backend reports that probe as an unexpected request before any translated
+/// traffic arrives. It is harness noise, not client behavior under test.
+fn is_readiness_probe(event: &HttpBackendEvent) -> bool {
+    matches!(event, HttpBackendEvent::UnexpectedRequest { method, path } if method == "GET" && path == "/")
+}
+
+/// The next provider-facing request, skipping the readiness probe.
+async fn next_translated_request(backend: &mut praxis_test_utils::HttpBackendGuard) -> CapturedHttpRequest {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), backend.next_event())
+            .await
+            .expect("provider should receive translated request")
+            .expect("backend event channel should remain open");
+        if is_readiness_probe(&event) {
+            continue;
+        }
+        let HttpBackendEvent::Request(request) = event else {
+            panic!("provider should receive a normal HTTP request, got {event:?}");
+        };
+        return request;
+    }
+}
+
 /// Collect and validate provider-facing requests from the translated workflow.
 async fn observe_translated_chat_requests(
     backend: &mut praxis_test_utils::HttpBackendGuard,
@@ -1325,6 +1380,9 @@ async fn observe_translated_chat_requests(
             .await
             .expect("translated provider request should arrive within ten seconds")
             .expect("backend observation channel should remain open");
+        if is_readiness_probe(&event) {
+            continue;
+        }
         match event {
             HttpBackendEvent::Request(request) => {
                 assert_eq!(request.method, "POST", "translated provider method should be POST");

@@ -29,14 +29,16 @@ listeners:
 filter_chains:
   - name: client-tool-compat
     filters:
-      - filter: openai_responses_format
+      # Recognizes the operation from the request head, so bodyless and
+      # non-Responses traffic a coding client also sends — GET /v1/models,
+      # health probes — is released untouched instead of being rejected for
+      # carrying no JSON body.
+      - filter: openai_responses_request
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
-
-      - filter: openai_responses_validate
 
       # Persisted Responses/Conversations state is scoped to an immutable owner.
       # This single-tenant demo installs a fixed owner directly (no auth gateway
