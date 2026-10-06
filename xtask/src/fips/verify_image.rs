@@ -22,7 +22,6 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
-    thread,
     time::Duration,
 };
 
@@ -204,12 +203,16 @@ fn pull_under_policy(work: &Path, image: &str) -> Result<(), String> {
             println!("fips-verify-image: ok: Red Hat signature verified for {image}");
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if attempt == PULL_ATTEMPTS || !transient_registry_failure(&stderr) {
             return Err(pull_failure_message(image, &stderr));
         }
         eprintln!("fips-verify-image: registry copy failed on attempt {attempt}/{PULL_ATTEMPTS} ({stderr}); retrying");
-        thread::sleep(PULL_RETRY_DELAY);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a synchronous command-line tool with no async runtime"
+        )]
+        std::thread::sleep(PULL_RETRY_DELAY);
         attempt += 1;
     }
 }
@@ -220,10 +223,6 @@ fn pull_under_policy(work: &Path, image: &str) -> Result<(), String> {
 /// A signature error wins even when the text also mentions EOF, so a bad
 /// signature is never retried.
 fn transient_registry_failure(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    if signature_rejection(&lower) {
-        return false;
-    }
     const MARKERS: &[&str] = &[
         "unexpected eof",
         "connection reset",
@@ -236,13 +235,17 @@ fn transient_registry_failure(stderr: &str) -> bool {
         "client.timeout",
         "while reconnecting",
     ];
+    let lower = stderr.to_ascii_lowercase();
+    if signature_rejection(&lower) {
+        return false;
+    }
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 /// Whether podman refused the image for a signature or policy reason.
 fn signature_rejection(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
     const MARKERS: &[&str] = &["signature", "signedby", "gpg", "key expired", "policy"];
+    let lower = stderr.to_ascii_lowercase();
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
