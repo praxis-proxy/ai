@@ -375,27 +375,25 @@ impl SearchClient {
 
     /// Whether the configured provider can faithfully forward the given `country`.
     ///
-    /// Brave constrains the value by its channel: the country rides in the
-    /// `X-Loc-Country` request header, so a value that is not a valid header value
-    /// (e.g. one containing a control character like a newline) cannot be
-    /// represented; this mirrors [`build_brave_request`]'s `HeaderValue::from_str`
-    /// exactly, so the two never disagree. You.com carries the country in a JSON
-    /// body typed as an ISO 3166-1 alpha-2 enum, so a value that is not a
-    /// well-formed alpha-2 code (two ASCII letters) cannot be a valid member and is
-    /// rejected here. You.com's accepted subset is not publicly enumerated, so a
+    /// Both Brave and You.com type `country` as an ISO 3166-1 alpha-2 enum — Brave
+    /// in its `X-Loc-Country` request header, You.com in a JSON body — so a value
+    /// that is not a well-formed alpha-2 code (two ASCII letters) cannot be a valid
+    /// member and is rejected here. A well-formed alpha-2 code is always
+    /// header-encodable, so this is strictly tighter than [`build_brave_request`]'s
+    /// `HeaderValue::from_str` and the builder never sees a value it cannot send.
+    /// Neither provider's accepted subset is publicly enumerated, so a
     /// well-formed-but-unsupported code is still forwarded and surfaces as a
-    /// provider error rather than being validated away. Either way the preflight
-    /// rejects an unrepresentable value rather than letting dispatch silently drop
-    /// it and search without the caller's location (issue #1548). Tavily reports
-    /// `country` unsupported before this is consulted, so it never constrains the
-    /// value.
+    /// provider error rather than being validated away against a guessed list.
+    /// Either way the preflight rejects an unrepresentable value rather than letting
+    /// dispatch silently drop it and search without the caller's location (issue
+    /// #1548). Tavily reports `country` unsupported before this is consulted, so it
+    /// never constrains the value.
     ///
     /// [`build_brave_request`]: SearchClient::build_brave_request
     #[cfg(feature = "openai-responses")]
     pub(crate) fn country_is_representable(&self, country: &str) -> bool {
         match self.provider {
-            SearchProvider::Brave => http::HeaderValue::from_str(country).is_ok(),
-            SearchProvider::You => is_iso_3166_alpha2(country),
+            SearchProvider::Brave | SearchProvider::You => is_iso_3166_alpha2(country),
             SearchProvider::Tavily => true,
         }
     }
@@ -1371,18 +1369,28 @@ mod tests {
 
     #[cfg(feature = "openai-responses")]
     #[test]
-    fn brave_rejects_a_country_it_cannot_encode_as_a_header() {
-        // Brave carries the country in the `X-Loc-Country` header; a value with a
-        // control character cannot be encoded and would otherwise be silently
-        // dropped at dispatch, so it must be reported as unrepresentable here.
+    fn brave_represents_only_well_formed_alpha2_countries() {
+        // Brave carries the country in the `X-Loc-Country` header, typed as an ISO
+        // 3166-1 alpha-2 enum. A well-formed two-letter code is representable; any
+        // other value (control character, wrong length, non-letters) is rejected at
+        // preflight rather than forwarded as an out-of-contract header value that
+        // Brave may reject or ignore (issue #1548).
         let brave = test_client_for(SearchProvider::Brave);
         assert!(
             brave.country_is_representable("FR"),
-            "a plain ISO code is representable"
+            "a plain alpha-2 code is representable"
         );
         assert!(
             !brave.country_is_representable("FR\n"),
-            "a country with a control character cannot be a header value"
+            "a control character is not alpha-2"
+        );
+        assert!(
+            !brave.country_is_representable("not-a-country"),
+            "a non-code string is not alpha-2"
+        );
+        assert!(
+            !brave.country_is_representable("USA"),
+            "a three-letter code is not alpha-2"
         );
     }
 
