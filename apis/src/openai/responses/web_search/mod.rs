@@ -361,12 +361,38 @@ impl WebSearchFilter {
     /// `country` a provider cannot map from an ISO code — this rejects the request
     /// explicitly so a location-sensitive search never runs with location
     /// semantics the caller did not actually get.
+    ///
+    /// A request may declare more than one web-search tool (e.g. `web_search`
+    /// alongside `web_search_preview`), so every declared tool's `user_location` is
+    /// inspected: an unsupported field on any of them is rejected. Because dispatch
+    /// forwards a single country, tools that declare *different* countries are also
+    /// rejected — honoring only the first would silently drop the others.
     fn preflight_location_support(&self, state: &ResponsesState) -> Result<(), Rejection> {
-        let Some(user_location) = web_search_user_location_from_state(state) else {
-            return Ok(());
-        };
-        self.reject_unsupported_location_fields(user_location)?;
-        self.reject_unrepresentable_country(state)
+        let mut countries: Vec<&str> = Vec::new();
+        for user_location in web_search_user_locations_from_state(state) {
+            self.reject_unsupported_location_fields(user_location)?;
+            if let Some(country) = user_location
+                .get("country")
+                .and_then(Value::as_str)
+                .filter(|country| !country.is_empty())
+                && !countries.contains(&country)
+            {
+                countries.push(country);
+            }
+        }
+        if countries.len() > 1 {
+            return Err(responses_error_rejection_with_code(
+                400,
+                "invalid_request_error",
+                "invalid_value",
+                "web-search tools declare conflicting user_location.country values; \
+                 dispatch forwards a single country, so declare the same country on every tool.",
+            ));
+        }
+        if let Some(country) = countries.first() {
+            self.reject_unrepresentable_country(country)?;
+        }
+        Ok(())
     }
 
     /// Reject `user_location` fields the configured provider cannot honor at all
@@ -391,13 +417,11 @@ impl WebSearchFilter {
     }
 
     /// Reject a supported `country` the provider cannot represent in its forwarding
-    /// channel (e.g. Brave's `X-Loc-Country` header rejects control characters),
-    /// rather than letting the dispatcher silently drop it and search without the
-    /// caller's location (issue #1548).
-    fn reject_unrepresentable_country(&self, state: &ResponsesState) -> Result<(), Rejection> {
-        let Some(country) = web_search_country_from_state(state) else {
-            return Ok(());
-        };
+    /// channel (e.g. Brave's `X-Loc-Country` header rejects control characters, and
+    /// You.com's JSON enum requires a well-formed ISO alpha-2 code), rather than
+    /// letting the dispatcher silently drop it and search without the caller's
+    /// location (issue #1548).
+    fn reject_unrepresentable_country(&self, country: &str) -> Result<(), Rejection> {
         if self.search_client.country_is_representable(country) {
             return Ok(());
         }
@@ -995,6 +1019,22 @@ fn web_search_user_location_from_state(state: &ResponsesState) -> Option<&Value>
         } else {
             None
         }
+    })
+}
+
+/// Every web-search tool's `user_location` object from request state, in
+/// declaration order.
+///
+/// A request may declare more than one web-search tool, so the round-0 preflight
+/// inspects them all rather than only the first — an unsupported field or a
+/// conflicting country on a later tool must not slip past
+/// [`web_search_user_location_from_state`]'s first-match lookup.
+fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
+    state.tools.iter().filter_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        is_web_search_tool_type(tool_type)
+            .then(|| tool.get("user_location"))
+            .flatten()
     })
 }
 

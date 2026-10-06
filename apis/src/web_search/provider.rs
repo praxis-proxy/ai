@@ -235,6 +235,18 @@ fn credential_authority(url: &str) -> Result<String, FilterError> {
     Ok(authority)
 }
 
+/// Whether `country` is a well-formed ISO 3166-1 alpha-2 code: exactly two ASCII
+/// letters. This is the format OpenAI's `user_location.country` and the providers
+/// that honor it (You.com's JSON enum) document; it is a syntactic check, not a
+/// lookup against any provider's accepted subset.
+///
+/// Only the OpenAI Responses preflight (via [`SearchClient::country_is_representable`])
+/// consumes this, so it is compiled out of the lean build where that module is absent.
+#[cfg(feature = "openai-responses")]
+fn is_iso_3166_alpha2(country: &str) -> bool {
+    country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
@@ -363,21 +375,28 @@ impl SearchClient {
 
     /// Whether the configured provider can faithfully forward the given `country`.
     ///
-    /// Only Brave constrains the *value*: the country rides in the `X-Loc-Country`
-    /// request header, so a value that is not a valid header value (e.g. one
-    /// containing a control character like a newline) cannot be represented. The
-    /// preflight rejects such a value rather than letting [`build_brave_request`]
-    /// silently drop it at dispatch (issue #1548). This mirrors that builder's
-    /// `HeaderValue::from_str` exactly, so the two never disagree. You.com carries
-    /// the country in a JSON body and Tavily reports it unsupported before this is
-    /// consulted, so neither constrains the value.
+    /// Brave constrains the value by its channel: the country rides in the
+    /// `X-Loc-Country` request header, so a value that is not a valid header value
+    /// (e.g. one containing a control character like a newline) cannot be
+    /// represented; this mirrors [`build_brave_request`]'s `HeaderValue::from_str`
+    /// exactly, so the two never disagree. You.com carries the country in a JSON
+    /// body typed as an ISO 3166-1 alpha-2 enum, so a value that is not a
+    /// well-formed alpha-2 code (two ASCII letters) cannot be a valid member and is
+    /// rejected here. You.com's accepted subset is not publicly enumerated, so a
+    /// well-formed-but-unsupported code is still forwarded and surfaces as a
+    /// provider error rather than being validated away. Either way the preflight
+    /// rejects an unrepresentable value rather than letting dispatch silently drop
+    /// it and search without the caller's location (issue #1548). Tavily reports
+    /// `country` unsupported before this is consulted, so it never constrains the
+    /// value.
     ///
     /// [`build_brave_request`]: SearchClient::build_brave_request
     #[cfg(feature = "openai-responses")]
     pub(crate) fn country_is_representable(&self, country: &str) -> bool {
         match self.provider {
             SearchProvider::Brave => http::HeaderValue::from_str(country).is_ok(),
-            SearchProvider::You | SearchProvider::Tavily => true,
+            SearchProvider::You => is_iso_3166_alpha2(country),
+            SearchProvider::Tavily => true,
         }
     }
 
@@ -1369,12 +1388,23 @@ mod tests {
 
     #[cfg(feature = "openai-responses")]
     #[test]
-    fn you_represents_any_country_in_its_json_body() {
-        // You.com carries the country in a JSON body, which has no header-style
-        // encoding constraint, so even an odd value is representable (never dropped).
+    fn you_represents_only_well_formed_alpha2_countries() {
+        // You.com carries the country in a JSON body typed as an ISO 3166-1 alpha-2
+        // enum, so a well-formed two-letter code is representable but a malformed
+        // value (control character, wrong length, non-letters) is rejected at
+        // preflight rather than forwarded for the provider to 400 on (issue #1548).
         let you = test_client_for(SearchProvider::You);
-        assert!(you.country_is_representable("FR"));
-        assert!(you.country_is_representable("FR\n"));
+        assert!(
+            you.country_is_representable("FR"),
+            "a plain alpha-2 code is representable"
+        );
+        assert!(
+            !you.country_is_representable("FR\n"),
+            "a control character is not alpha-2"
+        );
+        assert!(!you.country_is_representable("France"), "a full name is not alpha-2");
+        assert!(!you.country_is_representable("fr-FR"), "a locale tag is not alpha-2");
+        assert!(!you.country_is_representable("1"), "a single digit is not alpha-2");
     }
 
     #[test]

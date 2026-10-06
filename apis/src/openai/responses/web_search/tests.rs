@@ -2195,6 +2195,99 @@ async fn preflight_rejects_a_country_the_provider_cannot_represent() {
     );
 }
 
+#[tokio::test]
+async fn preflight_inspects_every_declared_web_search_tool() {
+    // A request may declare more than one web-search tool. The first carries no
+    // location, but a second (`web_search_preview`) carries an unsupported `city`.
+    // The preflight must inspect every tool rather than only the first, or the
+    // unsupported field slips past (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "city": "Paris"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an unsupported field on a later web-search tool must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_web_search_tools_with_conflicting_countries() {
+    // Dispatch forwards a single country, so two web-search tools that declare
+    // different countries cannot both be honored. Honoring only the first would
+    // silently drop the other, so the request is rejected (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "DE"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("conflicting countries must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert!(body["error"]["message"].as_str().unwrap().contains("conflicting"));
+}
+
+#[tokio::test]
+async fn preflight_allows_web_search_tools_repeating_the_same_country() {
+    // Two web-search tools naming the *same* country agree with the single country
+    // dispatch forwards, so the request passes the preflight and continues.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "matching countries across tools must pass preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_a_malformed_country_for_you_com() {
+    // You.com carries the country in a JSON alpha-2 enum. A malformed value passes
+    // the field-support check but is not a well-formed alpha-2 code, so it must be
+    // rejected here rather than forwarded for You.com to 400 on (issue #1548).
+    let yaml = make_filter_yaml("you", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "France"})),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a malformed You.com country must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert!(body["error"]["message"].as_str().unwrap().contains("country"));
+}
+
 /// A declared `tool_search` with the given `execution`, plus a web-search tool
 /// carrying an unsupported `city`, so the preflight decision turns only on whether the
 /// `tool_search` declaration is server-executed.
