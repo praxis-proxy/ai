@@ -364,15 +364,41 @@ def _find_binary() -> str:
     )
 
 
-def _wait_for_port(port: int, timeout: float = 10.0) -> None:
+# A loaded GPU runner can be slow to cold-start the full debug binary, so the
+# default startup budget is generous and overridable from CI.
+PROXY_START_TIMEOUT = float(os.environ.get("PRAXIS_TEST_PROXY_START_TIMEOUT", "30"))
+
+
+def _proxy_log_tail(log_path: str | None, limit: int = 4000) -> str:
+    if not log_path:
+        return "(no proxy output captured)"
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return "(no proxy output captured)"
+    return text[-limit:] if text else "(proxy produced no output)"
+
+
+def _wait_for_port(
+    port: int, proc: subprocess.Popen, log_path: str | None, timeout: float
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        exit_code = proc.poll()
+        if exit_code is not None:
+            raise RuntimeError(
+                f"praxis-ai exited with code {exit_code} before binding port "
+                f"{port}; output:\n{_proxy_log_tail(log_path)}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.1)
-    raise TimeoutError(f"port {port} did not accept connections within {timeout}s")
+    raise TimeoutError(
+        f"port {port} did not accept connections within {timeout}s; "
+        f"praxis-ai output:\n{_proxy_log_tail(log_path)}"
+    )
 
 
 def _patched_config(listener_port: int, backend_port: int) -> str:
@@ -382,35 +408,69 @@ def _patched_config(listener_port: int, backend_port: int) -> str:
     return text
 
 
+def _stop_proc(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _unlink(*paths: str | None) -> None:
+    for path in paths:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 @pytest.fixture(scope="session")
 def praxis_proxy() -> Any:
     backend_port = _free_port()
-    listener_port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    fd, config_path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as handle:
-        handle.write(_patched_config(listener_port, backend_port))
-
-    proc = subprocess.Popen(
-        [_find_binary(), "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    binary = _find_binary()
+    proc: subprocess.Popen | None = None
+    config_path: str | None = None
+    log_path: str | None = None
+    errors: list[str] = []
     try:
-        _wait_for_port(listener_port)
+        # Retry a few times: _free_port() races with other processes on a busy
+        # runner, and a lost race makes praxis-ai exit with "address in use".
+        for attempt in range(3):
+            listener_port = _free_port()
+            fd, config_path = tempfile.mkstemp(suffix=".yaml")
+            with os.fdopen(fd, "w") as handle:
+                handle.write(_patched_config(listener_port, backend_port))
+            log_fd, log_path = tempfile.mkstemp(suffix=".log")
+            with os.fdopen(log_fd, "wb") as log_file:
+                proc = subprocess.Popen(
+                    [binary, "-c", config_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            try:
+                _wait_for_port(listener_port, proc, log_path, PROXY_START_TIMEOUT)
+                break
+            except (TimeoutError, RuntimeError) as exc:
+                errors.append(f"attempt {attempt + 1}: {exc}")
+                _stop_proc(proc)
+                proc = None
+                _unlink(config_path, log_path)
+                config_path = log_path = None
+        else:
+            raise RuntimeError("praxis-ai did not start:\n" + "\n".join(errors))
         yield listener_port
     finally:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _stop_proc(proc)
         server.shutdown()
-        os.unlink(config_path)
+        _unlink(config_path, log_path)
 
 
 @pytest.fixture
