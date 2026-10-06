@@ -4651,6 +4651,183 @@ class TestResponsesToChatCompletionsVLLM:
             f"message; got: {output_types}"
         )
 
+    def test_web_search_unsupported_user_location_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """Unsupported ``user_location`` fields fail closed, never silently dropped (#1548).
+
+        The Brave-backed provider accepts only an ISO ``country``; a ``city`` it
+        cannot honor must be rejected with a 400 at round 0, before any inference
+        round or provider callout. The canonical web-search state preserves the
+        full ``user_location``, so dropping unsupported fields would change
+        location-sensitive search semantics without telling the caller. No
+        ``@requires_vllm_compat`` marker: the preflight short-circuits before the
+        model, so this contract holds in both live and simulator modes.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "unsupported user_location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        # The request is rejected before the provider is ever contacted.
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_allowed_tools_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool excluded by ``allowed_tools`` but reachable via another
+        continuation tool is still preflighted (#1548).
+
+        ``allowed_tools`` names only ``file_search``, so web search is not callable
+        on round 0. But a file-search continuation resets ``tool_choice`` to
+        ``"auto"`` while retaining the declared web-search tool, making it reachable
+        on a later round — after the round-0 preflight would normally be skipped.
+        The preflight must therefore reject the unsupported ``city`` up front rather
+        than let it be silently dropped once web search runs. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "file_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_unrepresentable_country_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A supported ``country`` the provider cannot encode fails closed (#1548).
+
+        Brave carries the country in the ``X-Loc-Country`` request header. A value
+        with a control character passes the field-support check but cannot be
+        encoded as a header, so it would be silently dropped at dispatch. The
+        preflight rejects it with a 400 ``invalid_value`` instead, before any
+        provider callout. No ``@requires_vllm_compat`` marker: the rejection is at
+        round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "country": "FR\n"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "an unrepresentable country must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "invalid_value"
+        assert "country" in error.body["message"], (
+            f"rejection must name the offending field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_server_tool_search_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool reachable via a server-executed ``tool_search``
+        continuation is still preflighted (#1548).
+
+        ``tools`` declares a server-executed ``tool_search`` (hosted MCP connector
+        discovery); ``allowed_tools`` names it with a bare ``{"type":"tool_search"}``
+        selector that carries no ``execution``. The declaration is authoritative: that
+        hosted discovery continuation resets ``tool_choice`` to ``"auto"`` while
+        retaining the declared web-search tool, making it reachable on a later round —
+        after the round-0 preflight would normally be skipped. The preflight must
+        therefore reject the unsupported ``city`` up front. A client-executed
+        ``tool_search`` (the default) returns to the API client instead and never
+        makes web search reachable; that negative case is covered by the Rust unit
+        tests, which assert ``Continue`` without a model round. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    },
+                    {"type": "tool_search", "execution": "server"},
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "tool_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Agentic Loop Fixtures
