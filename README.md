@@ -13,38 +13,34 @@ backends and applies policy.
 
 ## What can it do?
 
-- **Route by what a request contains.** Classify OpenAI Responses, Chat
-  Completions, and Anthropic Messages traffic; select backends by API format,
-  model, or MCP tool name. See the
-  [unified gateway](examples/configs/anthropic/unified-gateway.yaml) and
-  [intelligent routing](examples/configs/intelligent-route-all-capabilities.yaml)
-  examples.
-- **Proxy or translate provider APIs.** Forward native provider traffic or
-  serve Anthropic Messages and OpenAI Responses clients from Chat
-  Completions-compatible backends, including streaming responses. See the
-  [Anthropic](examples/configs/anthropic/messages-to-openai.yaml)
-  and [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)
-  examples.
-- **Code harness support.** Run Codex through OpenAI Responses and Claude Code
-  through Anthropic Messages. The
-  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows both
-  clients reaching native vLLM endpoints or Chat Completions through translation.
-- **Manage OpenAI response state.** Persist and rehydrate Responses history,
-  serve Conversations endpoints locally, and use PostgreSQL or SQLite for
-  storage. See the [response store guide](docs/architecture/response-store.md)
-  and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
-- **Connect tools and agents.** Run Responses tool loops with MCP, web search,
-  and file search; route stateless MCP calls and A2A task follow-ups. See the
-  [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
-  [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
-  [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
-- **Apply policy and measure usage.** Inject upstream credentials, enrich
-  prompts, call external guardrails, expose token usage, and report metering
-  data. See the [feature overview](docs/features.md) for details.
-- **Extend the pipeline** with custom Rust filters built on Praxis's
-  `HttpFilter` interface.
+- **Route by request content** — classify OpenAI Responses, Chat Completions,
+  and Anthropic Messages traffic; select backends by API format, model, or MCP
+  tool name
+  ([unified gateway](examples/configs/anthropic/unified-gateway.yaml),
+  [intelligent routing](examples/configs/intelligent-route-all-capabilities.yaml)).
+- **Proxy or translate provider APIs** — forward native traffic or serve
+  Anthropic Messages and OpenAI Responses clients from Chat Completions
+  backends, streaming included
+  ([Anthropic](examples/configs/anthropic/messages-to-openai.yaml),
+  [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)).
+- **Support code harnesses** — run Codex through Responses and Claude Code
+  through Messages, reaching native vLLM or Chat Completions via translation
+  ([coding client guide](docs/developing/cli-vllm-through-praxis.md)).
+- **Manage OpenAI response state** — persist and rehydrate Responses history
+  and serve Conversations locally, backed by PostgreSQL or SQLite
+  ([response store guide](docs/architecture/response-store.md),
+  [Conversations example](examples/configs/openai/conversations/conversations.yaml)).
+- **Connect tools and agents** — run Responses tool loops with MCP, web and
+  file search; route stateless MCP calls and A2A follow-ups
+  ([agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
+  [MCP broker](examples/configs/mcp-stateless-broker.yaml),
+  [A2A routing](examples/configs/a2a-task-routing.yaml)).
+- **Apply policy and measure usage** — inject credentials, enrich prompts, call
+  guardrails, and report token usage ([feature overview](docs/features.md)).
+- **Extend the pipeline** with custom Rust filters on Praxis's `HttpFilter`
+  interface.
 
-See the [complete feature overview](docs/features.md) and
+See the [feature overview](docs/features.md) and
 [filter reference](docs/filters/README.md) for the full list.
 
 ## Architecture
@@ -57,11 +53,10 @@ transforms, and routes traffic through one policy-driven gateway.
 ### Praxis AI and Praxis
 
 [Praxis][praxis-proxy/praxis] supplies the proxy runtime, listeners, TLS, load
-balancing, and filter framework. Praxis AI packages the AI-specific filters
-and server on top of it. Keeping them in separate repositories lets the AI
-integrations evolve independently while Praxis remains useful for general
-proxy workloads. See our [conventions] for the project structure and
-development practices.
+balancing, and filter framework; Praxis AI packages the AI-specific filters and
+server on top of it. Separate repositories let the AI integrations evolve
+independently while Praxis stays useful for general proxy workloads. See our
+[conventions] for project structure and development practices.
 
 [praxis-proxy/praxis]:https://github.com/praxis-proxy/praxis
 [conventions]:https://github.com/praxis-proxy/conventions
@@ -75,10 +70,9 @@ make release
 ./target/release/praxis-ai
 ```
 
-`make release` builds the `full` feature set. A plain
-`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
-leaves out the stateful OpenAI filter groups and their dependencies; see
-[Cargo features](docs/features.md#cargo-features).
+`make release` builds the `full` feature set; `cargo build -p praxis-ai-proxy`
+builds the smaller `standard` set without the stateful OpenAI filter groups (see
+[Cargo features](docs/features.md#cargo-features)).
 
 Then check that it is running:
 
@@ -114,19 +108,18 @@ rate limiting, health checks, and other core proxy features, visit the
 > behavior may change before `v1.0.0`. See the [security policy]
 > for the supported release line.
 
-Released container images are available from
-[`ghcr.io/praxis-proxy/ai`][container images]. Source builds and local
-development instructions are in the [development guide].
+Released container images are published to
+[`ghcr.io/praxis-proxy/ai`][container images] and can be pulled with Docker or
+Podman:
 
 ```console
 docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
-Podman can pull the same OCI image. See the [quickstart] for a source build
-and the [release documentation] for image contents and tagging. A FIPS 140-3
-build for Red Hat Enterprise Linux hosts is published under the same tags
-with a `-fips` suffix (for example `latest-fips`); see
-[FIPS 140-3](docs/fips.md).
+See the [release documentation] for image contents and tagging, and the
+[development guide] for source builds. A FIPS 140-3 build for Red Hat
+Enterprise Linux is published under the same tags with a `-fips` suffix (for
+example `latest-fips`); see [FIPS 140-3](docs/fips.md).
 
 ## Contributing
 
@@ -136,7 +129,8 @@ filters and protocol support. Before opening a pull request, please read the
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
-[proposal process](https://github.com/praxis-proxy/enhancements) so we can shape the idea together.
+[proposal process](https://github.com/praxis-proxy/enhancements) so we can shape
+the idea together.
 
 [Open an issue][issues] · [Request a feature][feature request] ·
 [Open a pull request][pull requests]
@@ -146,7 +140,6 @@ For larger changes, open a [feature request] and follow the
 [container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
 [development guide]: docs/developing/getting-started.md
 [feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
-[quickstart]: docs/quickstart.md
 [release documentation]: docs/release.md
 [security policy]: .github/SECURITY.md
 
