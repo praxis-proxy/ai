@@ -56,6 +56,8 @@ mod sync_inference_readme;
 #[cfg(feature = "dev")]
 mod sync_responses_readme;
 #[cfg(feature = "dev")]
+mod translation_matrix;
+#[cfg(feature = "dev")]
 mod visualize_config;
 
 use clap::{Parser, Subcommand};
@@ -178,6 +180,11 @@ enum Command {
     #[cfg(feature = "dev")]
     RecordInference(inference_fixtures::RecordArgs),
 
+    /// Validate the translation support matrix manifest and regenerate or
+    /// verify the rendered matrix document.
+    #[cfg(feature = "dev")]
+    TranslationMatrix(translation_matrix::Args),
+
     /// Generate the pipeline-overview table in
     /// `apis/src/openai/responses/README.md`.
     #[cfg(feature = "dev")]
@@ -226,6 +233,7 @@ fn run_dev(command: Command) {
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
         Command::OpenresponsesCoverage(args) => openresponses_coverage::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
+        Command::TranslationMatrix(args) => translation_matrix::run(&args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
         Command::SyncFlowVisualizers(args) => flow_visualizer::run(&args),
         Command::VisualizeConfig(args) => visualize_config::run(&args),

@@ -24,32 +24,33 @@ version: 1
 # Preconditions that hold for every surface below.
 # ---------------------------------------------------------------------------
 preconditions:
-  clean_rejection_is_opt_in:
+  - id: clean-rejection-is-opt-in
     summary: >-
       Praxis emits a provider-shaped error only when one of three filters ran
       and matched. With none installed the proxy emits RFC 9457
       application/problem+json, not the client's dialect.
-    installers:
-      - openai_operation            # apis/src/openai/operation_classifier/mod.rs:172-182
-      - openai_responses_format     # apis/src/openai/responses/mod.rs:409-421
-      - anthropic_messages_format   # apis/src/anthropic/messages_format/mod.rs:181-195
-    default_without_installer: rfc-9457-problem-json
     evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/fail_to_proxy.rs:264-283
-    shipped_coverage: 63 of 99 examples/configs/*.yaml install none of the three.
+    detail:
+      - "Installers: openai_operation (apis/src/openai/operation_classifier/mod.rs:172-182),
+         openai_responses_format (apis/src/openai/responses/mod.rs:409-421),
+         anthropic_messages_format (apis/src/anthropic/messages_format/mod.rs:181-195)."
+      - "63 of 99 configs under examples/configs install none of the three."
 
-  on_invalid_defaults_to_continue:
+  - id: on-invalid-defaults-to-continue
     summary: >-
       Malformed or unrecognized bodies are forwarded to the backend and lose
       the error formatter. 13 of the 20 examples that set on_invalid choose
       continue.
     evidence: apis/src/openai/responses/config.rs:117-118
+    detail: []
 
-  no_deny_unknown_fields_on_the_wire:
+  - id: no-deny-unknown-fields-on-the-wire
     summary: >-
       No request body is deserialized into a typed struct on any surface.
       Unknown fields are governed only by hand-written allowlists, where those
       exist. Absence of an allowlist means silent acceptance.
     evidence: apis/src/openai/translation/chat_completions.rs:176-216
+    detail: []
 
 # ---------------------------------------------------------------------------
 # Shared feature vocabulary. Every surface answers the same rows, so the
@@ -170,6 +171,7 @@ surfaces:
 
   # -------------------------------------------------------------------------
   - id: anthropic-messages-to-chat-completions
+    short: "Anthropic -> CC"
     client_api: Anthropic Messages
     backend_api: OpenAI Chat Completions
     filters:
@@ -314,6 +316,7 @@ surfaces:
 
   # -------------------------------------------------------------------------
   - id: responses-to-chat-completions
+    short: "Responses -> CC"
     client_api: OpenAI Responses
     backend_api: OpenAI Chat Completions
     filters: [responses_to_chat_completions]
@@ -449,6 +452,7 @@ surfaces:
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-vertexai-gemini
+    short: "CC -> Gemini"
     client_api: OpenAI Chat Completions
     backend_api: Vertex AI Gemini
     filters: [openai_chat_completions_to_vertexai_gemini]
@@ -576,6 +580,7 @@ surfaces:
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-azureai
+    short: "CC -> Azure"
     client_api: OpenAI Chat Completions
     backend_api: Azure AI Chat Completions
     filters: [openai_chat_completions_to_azureai_chat_completions]
@@ -646,6 +651,7 @@ surfaces:
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-bedrock-converse
+    short: "CC -> Bedrock"
     client_api: OpenAI Chat Completions
     backend_api: AWS Bedrock Converse
     filters: [openai_chat_completions_to_bedrock_converse]
@@ -789,7 +795,7 @@ cross_surface_gaps:
     blocker: TODO-ISSUE systematic handling of reasoning and cache tokens across translators
 
   - id: oversized-body-bare-413
-    affects: all
+    affects: [anthropic-messages-to-chat-completions, responses-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-azureai, chat-completions-to-bedrock-converse]
     summary: >-
       An oversized body produces Rejection::status(413) with no headers and no
       body, then short-circuits fail_to_proxy before any formatter runs. This
