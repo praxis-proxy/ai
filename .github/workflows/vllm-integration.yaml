@@ -1742,6 +1742,23 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/qualification-responses-pytest.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run OpenAI Agents SDK live Responses loop (GPU)
+        id: qualification_agents_sdk
+        # The Agents SDK test owns its listener and a forwarding recorder that
+        # relays to live vLLM; it needs only the proxy build and a ready model,
+        # not OGX or PostgreSQL.
+        if: ${{ always() && !cancelled() && steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' }}
+        env:
+          VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_AI_BIN: target/debug/praxis-ai
+        run: |
+          set +e
+          uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s \
+            2>&1 | tee "$RUNNER_TEMP/qualification-agents-sdk.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Run credentialed live Tavily web search (SDK 2.x)
         if: ${{ always() && !cancelled() && steps.qualification_ogx_ready.outcome == 'success' }}
         env:
@@ -1816,6 +1833,7 @@ jobs:
             ${{ runner.temp }}/qualification-responses-pytest.log
             ${{ runner.temp }}/qualification-credentialed-sdk2-pytest.log
             ${{ runner.temp }}/qualification-credentialed-pytest.log
+            ${{ runner.temp }}/qualification-agents-sdk.log
             ${{ runner.temp }}/qualification-vllm.log
             ${{ runner.temp }}/qualification-postgres.log
             ${{ runner.temp }}/qualification-ogx.log

@@ -20,19 +20,33 @@ This is NOT OpenAI Agents API support. The test must never call `/v1/agents/*`
 or Chat Completions; a scripted Responses backend sits behind Praxis and the
 router only publishes `/v1/responses`, so any other path fails loudly.
 
-Determinism: the backend is scripted, so the model "decides" to call the tool
-regardless of inference probability. Two model rounds are hard-scripted:
+Determinism (default): the backend is scripted, so the model "decides" to call
+the tool regardless of inference probability. Two model rounds are hard-scripted:
   1. first Response emits a `function_call` for `get_weather`;
   2. the Agents SDK executes the local Python tool exactly once;
   3. the continuation request carries the matching `function_call_output`;
   4. the backend returns a final message with a unique marker.
 
-The test uses no credentials, no external network, no retries, and no xfail.
-Agents SDK tracing is disabled so the runner cannot export traces to OpenAI.
+The default mode uses no credentials, no external network, no retries, and no
+xfail. Agents SDK tracing is disabled so the runner cannot export traces to
+OpenAI.
+
+Live mode (GPU suite): set `VLLM_TEST_BACKEND=live` to run the identical loop
+against a real vLLM serving `/v1/responses` (`VLLM_MODEL` names the served
+model, `PRAXIS_TEST_VLLM_BASE_URL` points at it). The local recorder stays on
+the wire and forwards to vLLM, so the "only `/v1/responses` crossed Praxis" and
+`function_call_output` assertions still hold; the tool call is forced via
+`tool_choice="required"` so a real model's probability cannot flake the loop.
 
 Usage:
+    # Deterministic (scripted backend), the required CI gate:
     cargo build -p praxis-ai-proxy
     uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
+
+    # Live vLLM (GPU suite):
+    VLLM_TEST_BACKEND=live VLLM_MODEL=Qwen/Qwen3-8B \
+      PRAXIS_TEST_VLLM_BASE_URL=http://127.0.0.1:8000 \
+      uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
 """
 
 from __future__ import annotations
@@ -47,6 +61,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,6 +78,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-praxis-agents-sdk-not-needed")
 
 from agents import (  # noqa: E402  (import after env setup is intentional)
     Agent,
+    ModelSettings,
     OpenAIResponsesModel,
     Runner,
     function_tool,
@@ -87,6 +104,19 @@ EXPECTED_CITY = "Boston"
 TOOL_OUTPUT_MARKER = "WEATHER-TOOL-RESULT::b4e1f6a2"
 FINAL_OUTPUT_MARKER = "AGENTS-SDK-LOOP-OK::7f3c9a2e5d"
 CALL_ID = "call_praxis_weather_1"
+
+# Live mode (GPU suite): instead of the scripted backend, the recorder forwards
+# every request to a real vLLM serving /v1/responses, so an actual model decides
+# to call the tool. Selected by VLLM_TEST_BACKEND=live; VLLM_MODEL names the
+# served model and PRAXIS_TEST_VLLM_BASE_URL points at the running vLLM. The
+# recorder stays in the path so the "only /v1/responses crossed Praxis" and
+# function_call_output assertions still hold against the real backend.
+LIVE = os.environ.get("VLLM_TEST_BACKEND") == "live"
+VLLM_BASE_URL = os.environ.get("PRAXIS_TEST_VLLM_BASE_URL", "http://127.0.0.1:8000")
+# In live mode the served model name must match vLLM's --served-model-name.
+ACTIVE_MODEL = os.environ.get("VLLM_MODEL", MODEL) if LIVE else MODEL
+# A real model load + generation is far slower than the scripted backend.
+REQUEST_TIMEOUT = 300.0 if LIVE else 10.0
 
 # Record every invocation of the local tool so the test can assert it ran
 # exactly once with the expected arguments.
@@ -222,6 +252,52 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: Any) -> None:  # silence access logs
         pass
 
+    def _relay(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _forward(self, raw: bytes) -> None:
+        """Live mode: forward the request to the real vLLM and relay its reply.
+
+        The recorder stays on the wire (Praxis -> recorder -> vLLM) so the
+        request-inspection assertions hold against a real backend.
+        """
+        url = VLLM_BASE_URL.rstrip("/") + self.path
+        req = urllib.request.Request(url, data=raw, method="POST")
+        req.add_header(
+            "Content-Type", self.headers.get("Content-Type", "application/json")
+        )
+        auth = self.headers.get("Authorization")
+        if auth:
+            req.add_header("Authorization", auth)
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                body = resp.read()
+                self._relay(
+                    resp.status,
+                    body,
+                    resp.headers.get("Content-Type", "application/json"),
+                )
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            self._relay(
+                exc.code, body, exc.headers.get("Content-Type", "application/json")
+            )
+        except (urllib.error.URLError, OSError) as exc:
+            # A transport failure talking to live vLLM (refused, reset, read
+            # timeout) would otherwise escape do_POST, drop the socket, and
+            # surface as an opaque proxy 5xx. Relay a legible 504 so the cause
+            # lands in the GPU step's tee'd log instead.
+            body = json.dumps(
+                {"error": {"message": f"recorder->vLLM forward failed: {exc}"}}
+            ).encode()
+            self._relay(504, body, "application/json")
+
     def do_GET(self) -> None:
         self.send_response(200)
         self.send_header("Content-Length", "0")
@@ -236,6 +312,10 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             parsed = {"__unparsed__": raw.decode("utf-8", "replace")}
         _STATE.record(self.path, parsed)
+
+        if LIVE:
+            self._forward(raw)
+            return
 
         scripted = _STATE.take()
         if scripted is None:
@@ -339,10 +419,10 @@ def agents_model(praxis_proxy: int) -> OpenAIResponsesModel:
         api_key="sk-praxis-agents-sdk-not-needed",
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         max_retries=0,
-        timeout=10.0,
+        timeout=REQUEST_TIMEOUT,
     )
     # Explicit Responses provider: the runner must speak /v1/responses only.
-    return OpenAIResponsesModel(model=MODEL, openai_client=client)
+    return OpenAIResponsesModel(model=ACTIVE_MODEL, openai_client=client)
 
 
 @pytest.fixture(autouse=True)
@@ -367,31 +447,49 @@ class TestAgentsSdkResponsesLoop:
     def test_function_tool_loop_over_responses(
         self, agents_model: OpenAIResponsesModel
     ) -> None:
-        _STATE.script(_function_call_response())
-        _STATE.script(_final_message_response())
+        model_kwargs: dict[str, Any] = {}
+        if LIVE:
+            # Force the real model to call the tool so the loop is deterministic;
+            # reset_tool_choice (Agent default True) flips tool_choice back to
+            # "auto" after the call, so the continuation round is free-form and
+            # cannot loop forever.
+            model_kwargs["model_settings"] = ModelSettings(
+                tool_choice="required", max_tokens=512
+            )
+        else:
+            # The scripted backend drives both rounds; no live model is involved.
+            _STATE.script(_function_call_response())
+            _STATE.script(_final_message_response())
 
         agent = Agent(
             name="weather-agent",
             instructions="Use the get_weather tool to answer weather questions.",
             tools=[get_weather],
             model=agents_model,
+            **model_kwargs,
         )
 
-        result = Runner.run_sync(agent, "What is the weather in Boston?")
+        prompt = "What is the weather in Boston?"
+        if LIVE:
+            # Qwen3 serves a reasoning parser; skip thinking for a fast, stable run.
+            prompt += " Use the get_weather tool. /no_think"
 
-        # The SDK returned the scripted final message as its final output.
-        assert result.final_output == FINAL_OUTPUT_MARKER
+        result = Runner.run_sync(agent, prompt)
 
-        # Exactly two model rounds occurred, both to /v1/responses — never
+        # The loop produced a final textual answer.
+        assert isinstance(result.final_output, str) and result.final_output, result
+
+        # Every model round crossed Praxis as POST /v1/responses — never
         # /v1/agents/* and never Chat Completions.
         paths = [path for path, _ in _STATE.requests]
-        assert len(paths) == 2, f"expected exactly two model rounds, got {paths}"
+        assert paths, "no requests reached the backend"
         assert all(p == "/v1/responses" for p in paths), paths
         assert not any("/v1/agents" in p for p in paths), paths
         assert not any("/v1/chat/completions" in p for p in paths), paths
 
-        # The local tool executed exactly once with the expected arguments.
-        assert TOOL_CALLS == [{"city": EXPECTED_CITY}], TOOL_CALLS
+        # The local tool executed with the expected city.
+        assert TOOL_CALLS, "get_weather was never called"
+        assert all("boston" in c["city"].lower() for c in TOOL_CALLS), TOOL_CALLS
 
         # Round 1: the declared function schema crossed Praxis correctly.
         _, round1 = _STATE.requests[0]
@@ -405,14 +503,39 @@ class TestAgentsSdkResponsesLoop:
         assert params["properties"]["city"]["type"] == "string", params
         assert "city" in params["required"], params
 
-        # Round 2: the tool output crossed Praxis as the matching
-        # function_call_output in the continuation request.
-        _, round2 = _STATE.requests[1]
-        assert isinstance(round2.get("input"), list), round2
-        fco = _find_item(round2["input"], "function_call_output")
-        assert fco["call_id"] == CALL_ID, fco
-        expected_output = f"{TOOL_OUTPUT_MARKER}::{EXPECTED_CITY}"
-        assert fco["output"] == expected_output, fco
+        # Continuation round: the tool output crossed Praxis as the matching
+        # function_call_output. Its payload is the exact value the local tool
+        # returned, and its call_id links back to the model's function_call.
+        continuation = next(
+            (
+                body
+                for _, body in _STATE.requests
+                if isinstance(body.get("input"), list)
+                and any(
+                    isinstance(item, dict)
+                    and item.get("type") == "function_call_output"
+                    for item in body["input"]
+                )
+            ),
+            None,
+        )
+        assert continuation is not None, _STATE.requests
+        fco = _find_item(continuation["input"], "function_call_output")
+        assert fco["call_id"], fco
+        called_city = TOOL_CALLS[0]["city"]
+        assert fco["output"] == f"{TOOL_OUTPUT_MARKER}::{called_city}", fco
+
+        if LIVE:
+            # A real model drives the rounds: at least the initial request plus
+            # one continuation carrying the tool output.
+            assert len(paths) >= 2, paths
+        else:
+            # Scripted backend: exactly two rounds, the pinned call id, and the
+            # unique final marker returned verbatim.
+            assert len(paths) == 2, f"expected exactly two model rounds, got {paths}"
+            assert TOOL_CALLS == [{"city": EXPECTED_CITY}], TOOL_CALLS
+            assert fco["call_id"] == CALL_ID, fco
+            assert result.final_output == FINAL_OUTPUT_MARKER
 
     def test_pinned_versions_recorded(self) -> None:
         agents_version = importlib.metadata.version("openai-agents")
