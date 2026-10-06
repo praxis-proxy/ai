@@ -69,6 +69,28 @@ VLLM_MODEL=praxis-test-model VLLM_TEST_BACKEND=simulator uv run --with "openai>=
 
 You can also pass `--sdk-version=2.x` or `--sdk-version=3.x` to enforce version verification during pytest startup.
 
+### OpenAI Agents SDK Responses Compatibility
+
+The OpenAI Agents SDK function-calling loop is verified through the Responses
+API; the OpenAI Agents API is not implemented. `test_openai_agents_sdk.py` runs
+the SDK runner (`Runner`) through a deterministic, client-owned function-tool
+loop against a local Praxis listener: the scripted Responses backend emits a
+`function_call`, the SDK executes a local Python tool exactly once, the
+continuation request carries the matching `function_call_output`, and the final
+message returns a unique marker. The test asserts only `POST /v1/responses` is
+called — never `/v1/agents/*` or Chat Completions.
+
+The test owns its compatible `openai` dependency, so it runs once (not per
+storage backend or OpenAI SDK lane) and pins `openai-agents` via its PEP 723
+header:
+
+```console
+uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
+```
+
+It requires no credentials, external network, inference probability, retry, or
+`xfail`, and `-s` prints the pinned Agents SDK and OpenAI SDK versions.
+
 ### FIPS Build and Compliance Check
 
 Praxis AI targets FIPS 140-3 on Red Hat Enterprise Linux by performing all
