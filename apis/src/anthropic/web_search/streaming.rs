@@ -362,12 +362,24 @@ struct RoundState {
     suppressed_web_search: Option<usize>,
     /// Stop reason captured from this round's `message_delta`.
     stop_reason: Option<String>,
+    /// Matched stop sequence captured from this round's `message_delta`.
+    stop_sequence: Option<String>,
+    /// Container metadata captured from this round's `message_delta`.
+    container: Option<Value>,
+    /// Stop details captured from this round's `message_delta`.
+    stop_details: Option<Value>,
     /// Output tokens captured from this round's `message_delta`.
     round_output_tokens: u64,
     /// Input tokens captured from this round's `message_start` / `message_delta`.
     round_input_tokens: Option<u64>,
     /// Cache-read input tokens captured from this round's usage.
     round_cache_read: Option<u64>,
+    /// Cache-creation input tokens captured from this round's usage.
+    round_cache_creation: Option<u64>,
+    /// Output-token details captured from this round's usage.
+    round_output_tokens_details: Option<Value>,
+    /// Server-tool usage captured from this round's usage.
+    round_server_tool_use: Option<Value>,
     /// Cumulative bytes of streamed text/tool-input fragments this round.
     ///
     /// Bounds attacker-controlled fragment growth before the round message is
@@ -424,6 +436,12 @@ pub(super) struct LogicalStream {
     input_tokens_total: Option<u64>,
     /// Aggregated cache-read input tokens across rounds, `None` until reported.
     cache_read_total: Option<u64>,
+    /// Aggregated cache-creation input tokens across rounds.
+    cache_creation_total: Option<u64>,
+    /// Aggregated output-token details across rounds.
+    output_tokens_details_total: Option<Value>,
+    /// Aggregated server-tool usage across rounds.
+    server_tool_use_total: Option<Value>,
     /// Reconstructed managed-round message bytes retained for IRR re-entry.
     ///
     /// A streamed round leaves the IRR buffered response body empty, so re-entry
@@ -447,6 +465,9 @@ impl LogicalStream {
             output_tokens_total: 0,
             input_tokens_total: None,
             cache_read_total: None,
+            cache_creation_total: None,
+            output_tokens_details_total: None,
+            server_tool_use_total: None,
             reconstructed: None,
             failed: false,
             round: RoundState::default(),
@@ -585,6 +606,15 @@ impl LogicalStream {
         if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.round.round_cache_read = Some(cache_read);
         }
+        if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+            self.round.round_cache_creation = Some(cache_creation);
+        }
+        if let Some(output_tokens_details) = usage.get("output_tokens_details") {
+            self.round.round_output_tokens_details = Some(output_tokens_details.clone());
+        }
+        if let Some(server_tool_use) = usage.get("server_tool_use") {
+            self.round.round_server_tool_use = Some(server_tool_use.clone());
+        }
     }
 
     /// Assign a client output index to a content block and forward its start.
@@ -666,12 +696,19 @@ impl LogicalStream {
 
     /// Capture the round's stop reason and output-token count; do not forward.
     fn on_message_delta(&mut self, data: &Value) {
-        if let Some(stop_reason) = data
-            .get("delta")
-            .and_then(|delta| delta.get("stop_reason"))
-            .and_then(Value::as_str)
-        {
-            self.round.stop_reason = Some(stop_reason.to_owned());
+        if let Some(delta) = data.get("delta") {
+            if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                self.round.stop_reason = Some(stop_reason.to_owned());
+            }
+            if let Some(stop_sequence) = delta.get("stop_sequence") {
+                self.round.stop_sequence = stop_sequence.as_str().map(ToOwned::to_owned);
+            }
+            if let Some(container) = delta.get("container") {
+                self.round.container = Some(container.clone());
+            }
+            if let Some(stop_details) = delta.get("stop_details") {
+                self.round.stop_details = Some(stop_details.clone());
+            }
         }
         if let Some(usage) = data.get("usage") {
             if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
@@ -879,6 +916,14 @@ impl LogicalStream {
         if let Some(cache_read) = self.round.round_cache_read {
             self.cache_read_total = Some(self.cache_read_total.unwrap_or(0).saturating_add(cache_read));
         }
+        if let Some(cache_creation) = self.round.round_cache_creation {
+            self.cache_creation_total = Some(self.cache_creation_total.unwrap_or(0).saturating_add(cache_creation));
+        }
+        aggregate_usage_value(
+            &mut self.output_tokens_details_total,
+            self.round.round_output_tokens_details.take(),
+        );
+        aggregate_usage_value(&mut self.server_tool_use_total, self.round.round_server_tool_use.take());
     }
 
     /// Build the terminal `message_delta` and `message_stop` frames.
@@ -888,11 +933,14 @@ impl LogicalStream {
     /// identical to the non-streaming translator, and usage is aggregated across
     /// every IRR round rather than reporting only the final round's output.
     fn build_terminal(&self, stop_reason: &str) -> Vec<u8> {
-        let usage = super::super::wire::MessageDeltaUsage::new(
-            self.output_tokens_total,
-            self.input_tokens_total,
-            self.cache_read_total,
-        );
+        let usage = super::super::wire::MessageDeltaUsage {
+            cache_creation_input_tokens: self.cache_creation_total,
+            cache_read_input_tokens: self.cache_read_total,
+            input_tokens: self.input_tokens_total,
+            output_tokens: self.output_tokens_total,
+            output_tokens_details: self.output_tokens_details_total.clone(),
+            server_tool_use: self.server_tool_use_total.clone(),
+        };
         let mut out = Vec::new();
         emit_event(
             &mut out,
@@ -900,16 +948,42 @@ impl LogicalStream {
             &json!({
                 "type": "message_delta",
                 "delta": {
-                    "container": null,
-                    "stop_details": null,
+                    "container": self.round.container.clone().unwrap_or(Value::Null),
+                    "stop_details": self.round.stop_details.clone().unwrap_or(Value::Null),
                     "stop_reason": stop_reason,
-                    "stop_sequence": null
+                    "stop_sequence": self.round.stop_sequence
                 },
                 "usage": usage
             }),
         );
         emit_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
         out
+    }
+}
+
+/// Aggregate a usage object whose fields are cumulative counters.
+fn aggregate_usage_value(total: &mut Option<Value>, incoming: Option<Value>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    if incoming.is_null() {
+        return;
+    }
+    let Value::Object(incoming_object) = incoming else {
+        *total = Some(incoming);
+        return;
+    };
+    let Some(Value::Object(total_object)) = total.as_mut() else {
+        *total = Some(Value::Object(incoming_object));
+        return;
+    };
+    for (key, value) in incoming_object {
+        let Some(incoming_number) = value.as_u64() else {
+            total_object.insert(key, value);
+            continue;
+        };
+        let current_number = total_object.get(&key).and_then(Value::as_u64).unwrap_or(0);
+        total_object.insert(key, Value::from(current_number.saturating_add(incoming_number)));
     }
 }
 
@@ -1139,6 +1213,11 @@ mod tests {
                 "usage": {"output_tokens": output_tokens}
             }),
         )
+    }
+
+    /// A terminal `message_delta` carrying metadata and usage counters.
+    fn message_delta_with_metadata(data: &Value) -> Vec<u8> {
+        sse("message_delta", data)
     }
 
     /// A `message_stop` frame.
@@ -2211,12 +2290,31 @@ mod tests {
     }
 
     #[test]
-    fn terminal_message_delta_matches_schema_and_aggregates_usage() {
+    #[expect(clippy::too_many_lines, reason = "focused metadata preservation regression coverage")]
+    fn terminal_message_delta_preserves_metadata_and_aggregates_usage() {
         let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
         // Round 0: a managed WebSearch call; usage input=10, cache_read=2.
         text_output(&mut stream, &message_start_with_usage("msg_1", 10, 2), false);
         text_output(&mut stream, &web_search_block(0, "toolu_1", "rust proxy"), false);
-        text_output(&mut stream, &message_delta("tool_use", 5), false);
+        text_output(
+            &mut stream,
+            &message_delta_with_metadata(&json!({
+                "type": "message_delta",
+                "delta": {
+                    "container": null,
+                    "stop_details": null,
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "cache_creation_input_tokens": 4,
+                    "output_tokens": 5,
+                    "output_tokens_details": {"thinking_tokens": 2},
+                    "server_tool_use": {"web_search_requests": 1}
+                }
+            })),
+            false,
+        );
         text_output(&mut stream, &message_stop(), false);
         assert!(matches!(stream.finish_round().unwrap().action, RoundAction::Loop));
 
@@ -2224,27 +2322,64 @@ mod tests {
         stream.begin_round();
         text_output(&mut stream, &message_start_with_usage("msg_2", 8, 3), false);
         text_output(&mut stream, &text_block(0, "Answer"), false);
-        text_output(&mut stream, &message_delta("end_turn", 9), false);
+        text_output(
+            &mut stream,
+            &message_delta_with_metadata(&json!({
+                "type": "message_delta",
+                "delta": {
+                    "container": {"id": "container_1", "expires_at": "2026-10-06T00:00:00Z"},
+                    "stop_details": {"type": "refusal", "category": "general_harms", "explanation": "policy"},
+                    "stop_reason": "stop_sequence",
+                    "stop_sequence": "STOP"
+                },
+                "usage": {
+                    "cache_creation_input_tokens": 6,
+                    "output_tokens": 9,
+                    "output_tokens_details": {"thinking_tokens": 7},
+                    "server_tool_use": {"web_search_requests": 2}
+                }
+            })),
+            false,
+        );
         text_output(&mut stream, &message_stop(), false);
         let terminal = stream.finish_round().unwrap().terminal;
 
         let event = parse_event(&terminal, "message_delta");
         assert_eq!(
             event["delta"]["container"],
-            Value::Null,
-            "schema-complete delta.container"
+            json!({"id": "container_1", "expires_at": "2026-10-06T00:00:00Z"}),
+            "terminal container metadata is preserved"
         );
         assert_eq!(
             event["delta"]["stop_details"],
-            Value::Null,
-            "schema-complete delta.stop_details"
+            json!({"type": "refusal", "category": "general_harms", "explanation": "policy"}),
+            "terminal stop details are preserved"
         );
-        assert_eq!(event["delta"]["stop_reason"], "end_turn", "final stop reason carried");
+        assert_eq!(
+            event["delta"]["stop_reason"], "stop_sequence",
+            "final stop reason carried"
+        );
+        assert_eq!(
+            event["delta"]["stop_sequence"], "STOP",
+            "matched stop sequence is preserved"
+        );
         assert_eq!(event["usage"]["output_tokens"], 14, "output tokens aggregate 5 + 9");
         assert_eq!(event["usage"]["input_tokens"], 18, "input tokens aggregate 10 + 8");
         assert_eq!(
             event["usage"]["cache_read_input_tokens"], 5,
             "cache-read tokens aggregate 2 + 3"
+        );
+        assert_eq!(
+            event["usage"]["cache_creation_input_tokens"], 10,
+            "cache-creation tokens aggregate 4 + 6"
+        );
+        assert_eq!(
+            event["usage"]["output_tokens_details"]["thinking_tokens"], 9,
+            "output-token details aggregate 2 + 7"
+        );
+        assert_eq!(
+            event["usage"]["server_tool_use"]["web_search_requests"], 3,
+            "server-tool usage aggregates 1 + 2"
         );
     }
 

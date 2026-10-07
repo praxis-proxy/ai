@@ -1150,7 +1150,7 @@ struct PendingListToolsFailure {
     /// synthesized failure snapshot. Captured here -- rather than read from
     /// `ResponsesState` in the header phase -- so the caller's real options are
     /// echoed even in a pipeline without
-    /// `openai_responses_validate`/`openai_responses_rehydrate` (which never
+    /// `openai_responses_request`/`openai_responses_rehydrate` (which never
     /// builds that state), and so a large `instructions`/`metadata` cannot be
     /// amplified across the snapshots. `None` when the body is unparseable,
     /// carries no echoable field, or the whitelisted subset exceeds
@@ -1307,7 +1307,7 @@ fn build_list_tools_failure_response(
     // or streamed failure reports the same configuration a real Responses object
     // would. Sourcing them from the captured descriptor -- rather than
     // `ResponsesState.request_body` -- keeps fidelity correct even in a pipeline
-    // without `openai_responses_validate`/`openai_responses_rehydrate` (which
+    // without `openai_responses_request`/`openai_responses_rehydrate` (which
     // never builds that state), and bounds the size so a large
     // `instructions`/`metadata` is not amplified across the snapshots. `None` (no
     // echoable field, or over the cap) falls back to API defaults.
@@ -1445,7 +1445,7 @@ fn build_list_tools_failure_response(
     //   * In `agentic-loop.yaml`, `openai_stream_events` is nested in the iterative_request_router that follows this
     //     filter, so it never runs.
     //   * A pipeline with `openai_response_store` + this filter but without
-    //     `openai_responses_validate`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
+    //     `openai_responses_request`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
     //     persists purely from `response_object` (the store reads only that field, not `request_body`).
     // `get_or_insert_with` therefore both creates the state when absent and
     // writes the snapshot, making persistence independent of pipeline ordering

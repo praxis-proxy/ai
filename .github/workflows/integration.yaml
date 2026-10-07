@@ -122,7 +122,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-schema-cargo
 
@@ -144,7 +144,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-inference-cargo
 
@@ -169,7 +169,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-integration-cargo
 
@@ -186,7 +186,7 @@ jobs:
         run: make test-integration
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Build Praxis for SDK tests
         run: cargo build -p praxis-ai-proxy
@@ -254,7 +254,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-environment-cargo
       - name: Environment tests
@@ -280,7 +280,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: azure-sdk-cargo
 
@@ -295,6 +295,47 @@ jobs:
 
       - name: Run Azure OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
+
+  # ----------------------------------------------------------------------------
+  # OpenAI Agents SDK function-tool loop over Responses (local scripted backend)
+  #
+  # One required job, not a per-storage/per-SDK-lane matrix: the Agents SDK owns
+  # its own compatible `openai` dependency (pinned via PEP 723 in the test), and
+  # storage backend is not what this test measures. It proves the SDK-managed
+  # model -> tool -> model loop crosses Praxis's /v1/responses deterministically
+  # with no credentials, network, or inference probability.
+  # ----------------------------------------------------------------------------
+
+  agents-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: agents-sdk-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Run OpenAI Agents SDK Responses compatibility test
+        run: uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
 
   # Anthropic Python SDK vs Chat Completions translation (local fake backend)
   # ----------------------------------------------------------------------------
@@ -314,7 +355,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: anthropic-sdk-cargo
 
@@ -355,7 +396,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: codex-http-cargo
 
@@ -465,7 +506,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: vertex-gemini-sdk-cargo
 
@@ -503,7 +544,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: codex-websocket-cargo
 

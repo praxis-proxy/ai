@@ -23,7 +23,10 @@ translated path for a backend that only exposes OpenAI Chat Completions.
 In GitHub Actions, open **vLLM Dev Endpoint**, choose **Run workflow**, and keep
 the defaults for Qwen3-8B. The workflow provisions a temporary GPU, publishes a
 Cloudflare URL in the run summary, and tears everything down at the requested
-deadline or when the run is cancelled.
+deadline or when the run is cancelled. Its defaults already serve Qwen3-8B with
+`--reasoning-parser qwen3` and thinking off, which is what the coding clients
+below expect; change the `reasoning_parser` and `enable_thinking` inputs only
+for a different model or when you specifically want visible reasoning.
 
 Record the two summary values:
 
@@ -48,7 +51,8 @@ vllm serve Qwen/Qwen3-8B \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager \
   --api-key "$VLLM_API_KEY"
@@ -74,7 +78,8 @@ docker run --rm --name vllm \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager
 ```
@@ -86,6 +91,35 @@ run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
+
+### Reasoning flags matter for Claude Code
+
+The two reasoning-related flags above are deliberate for this setup and are the
+main difference from the flags CI serves:
+
+- `--reasoning-parser qwen3` matches the served model family. The parser name
+  selects how vLLM splits a `<think>` block out of the completion into
+  `reasoning_content`; a parser written for a different family can leave that
+  text in the assistant message instead.
+- `--default-chat-template-kwargs '{"enable_thinking":false}'` turns Qwen3's
+  thinking off at the chat-template level, so the model does not emit a
+  `<think>` block for the agentic turns Claude Code drives in the first place.
+
+Serving Qwen3-8B with `--reasoning-parser deepseek_r1` and thinking left on
+made Claude Code's plan mode loop endlessly, emitting reasoning text into the
+rendered plan instead of a finished one. Switching to the two flags above
+resolved it. They were verified together, so change them as a pair; if you need
+visible reasoning for other work, expect agentic clients to degrade.
+
+A nightly GPU regression guards this pairing. The
+`vllm-gpu-claude-acceptance` job drives a read-only planning turn through the
+native Anthropic path and fails if the run exhausts its turn budget instead of
+answering, or if a `<think>` delimiter reaches the user-visible text. The
+scenario is pinned in `[claude_code.launch.planning]` of
+`tests/integration/fixtures/claude-code-cli/pin.toml`; reverting either flag
+above is expected to turn it red. It is a headless approximation of the turn
+that broke, not interactive plan mode, which the CLI does not expose to
+`claude -p`.
 
 The 32,768-token window is intentional for Claude Code auto mode. Its
 client-initiated safety classifier reserves 2,112 output tokens independently
@@ -489,16 +523,16 @@ kill "$PRAXIS_PID"
   turns into a 400 before routing. Both Codex examples in section 2 lead with
   the head-driven `openai_responses_request` instead, which releases any
   operation it does not recognize without reading a body. A config derived from
-  an older copy needs the same swap: replace the
-  `openai_responses_format`/`openai_responses_validate` pair with
-  `openai_responses_request`, keeping the same `on_invalid` and `headers`.
+  an older copy needs the same swap: drop the leading `openai_responses_format`
+  and let `openai_responses_request` carry the `on_invalid` and `headers` that
+  classifier used to carry.
   Do not reach for `on_invalid: continue` instead: it clears the probe but also
   forwards genuinely malformed Responses bodies to vLLM rather than rejecting
   them at the gateway.
 - RFC 9457 `application/problem+json` where an OpenAI client expects
   `{"error": {...}}`: `openai_responses_request` resolves Responses operations
   only, so it does not own the protocol decision for the Chat Completions and
-  other OpenAI traffic a coding client also sends. Put `openai_operation` ahead
+  other OpenAI traffic a coding client also sends. Put `ai_operation` ahead
   of it, as both Codex examples do; it classifies from the request head and
   installs the OpenAI error formatter for every OpenAI protocol.
 - `400` with `maximum context length is 32768 tokens` and a requested output
@@ -514,6 +548,14 @@ kill "$PRAXIS_PID"
   `--strict-mcp-config` to drop globally configured MCP servers, disable
   unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
+- Claude Code never finishes a turn — plan mode keeps looping, or reasoning
+  text appears in the answer or the rendered plan: the server is emitting
+  thinking that the client is not meant to see. Serve Qwen3 with
+  `--reasoning-parser qwen3` and
+  `--default-chat-template-kwargs '{"enable_thinking":false}'` as shown in
+  section 1, and restart vLLM; the reasoning parser is a server flag, so
+  nothing on the Praxis or client side changes it. On the on-demand endpoint,
+  check the `reasoning_parser` and `enable_thinking` inputs of the run.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Connection refused on 8080 from another machine, while vLLM on 8000 answers:

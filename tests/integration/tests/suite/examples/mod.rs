@@ -41,6 +41,7 @@ mod identity_header_guard;
 mod inference_fallback;
 mod intelligent_route_hardening;
 mod intelligent_route_management_skip;
+mod intelligent_route_projected_credentials;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
@@ -82,7 +83,7 @@ mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
-mod openai_responses_validate;
+mod openai_responses_request;
 // The state-ownership example selects the SQLite store backend.
 #[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;

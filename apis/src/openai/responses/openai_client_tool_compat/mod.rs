@@ -1572,7 +1572,7 @@ impl Lowering {
             .filter(|parameters| parameters.is_object())
             .cloned()
             .unwrap_or_else(default_tool_search_parameters);
-        lowered.push(tool_search_lowered_function(&description, &parameters));
+        lowered.push(tool_search_lowered_function(&description, parameters));
         self.register(
             TOOL_SEARCH_NAME.to_owned(),
             LoweredClientTool {
@@ -1987,14 +1987,14 @@ fn shell_lowered_function(description: &str) -> Value {
 }
 
 /// Build the fixed private `function` a client-executed `tool_search` lowers to.
-fn tool_search_lowered_function(description: &str, parameters: &Value) -> Value {
-    json!({
-        "type": "function",
-        "name": TOOL_SEARCH_NAME,
-        "description": description,
-        "parameters": parameters,
-        "strict": false,
-    })
+fn tool_search_lowered_function(description: &str, parameters: Value) -> Value {
+    let mut out = Map::with_capacity(5);
+    out.insert("type".to_owned(), json!("function"));
+    out.insert("name".to_owned(), json!(TOOL_SEARCH_NAME));
+    out.insert("description".to_owned(), json!(description));
+    out.insert("parameters".to_owned(), parameters);
+    out.insert("strict".to_owned(), json!(false));
+    Value::Object(out)
 }
 
 /// Lower a `tool_choice` value, translating client-owned selectors in place.
@@ -2590,16 +2590,16 @@ pub(crate) fn restore_shell_call(item: &Value) -> Result<Value, ()> {
         .ok_or(())?;
     let status = restore_call_status(item)?;
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-    let mut out = json!({
-        "type": "shell_call",
-        "id": shell_public_item_id(id),
-        "call_id": call_id,
-        "action": action,
-        // A local shell_call carries its environment so the client-executed
-        // classifier recognizes it and mixed-ownership rounds fail closed.
-        "environment": {"type": "local"},
-        "status": status,
-    });
+    let mut fields = Map::with_capacity(7);
+    fields.insert("type".to_owned(), json!("shell_call"));
+    fields.insert("id".to_owned(), json!(shell_public_item_id(id)));
+    fields.insert("call_id".to_owned(), json!(call_id));
+    fields.insert("action".to_owned(), action);
+    // A local shell_call carries its environment so the client-executed
+    // classifier recognizes it and mixed-ownership rounds fail closed.
+    fields.insert("environment".to_owned(), json!({"type": "local"}));
+    fields.insert("status".to_owned(), json!(status));
+    let mut out = Value::Object(fields);
     carry_caller(&mut out, item);
     Ok(out)
 }
@@ -2621,14 +2621,14 @@ pub(crate) fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
     let status = restore_call_status(item)?;
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let arguments: Value = serde_json::from_str(arguments).ok().ok_or(())?;
-    Ok(json!({
-        "type": "tool_search_call",
-        "id": tool_search_public_item_id(id),
-        "call_id": call_id,
-        "execution": "client",
-        "arguments": arguments,
-        "status": status,
-    }))
+    let mut out = Map::with_capacity(6);
+    out.insert("type".to_owned(), json!("tool_search_call"));
+    out.insert("id".to_owned(), json!(tool_search_public_item_id(id)));
+    out.insert("call_id".to_owned(), json!(call_id));
+    out.insert("execution".to_owned(), json!("client"));
+    out.insert("arguments".to_owned(), arguments);
+    out.insert("status".to_owned(), json!(status));
+    Ok(Value::Object(out))
 }
 
 /// Map a backend `function_call` `status` to a schema-valid `FunctionCallStatus`

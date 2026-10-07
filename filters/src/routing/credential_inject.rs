@@ -70,17 +70,40 @@
 //!     env_var: OTHER_API_TOKEN    # token from environment variable
 //! ```
 //!
+//! A consumer may start before any route has a credential:
+//!
+//! ```yaml
+//! filter: credential_inject
+//! credentials: []
+//! projected_credential_mount_base: /run/secrets/projected-credentials
+//! ```
+//!
 //! The `name`/`namespace`/`key` triple uniquely identifies a Kubernetes
 //! Secret entry and must match what the configuration producer wrote into the
-//! routing overlay candidate.
+//! routing overlay candidate. Configured `file:` entries use their explicit
+//! path unchanged. With `projected_credential_mount_base`, a later overlay
+//! reference not present in the startup table is resolved under
+//! `{root}/{namespace}/{name}/{key}` on demand. Including the namespace keeps
+//! same-name Secrets in different namespaces distinct. An absent, unsafe, or
+//! invalid projected file rejects the request with HTTP 503; the filter never
+//! passes a selected credential-bearing route through without injection.
+//! Projected `apikey` references use `x-api-key`; a different provider header
+//! requires a configured credential entry. Projected values are cached for at
+//! most 250 ms so high-traffic routes do not read the Secret on every request.
+//! A rotated or revoked token may therefore still be injected during that
+//! interval. Overlay digest and scope validation do not authenticate the
+//! publisher: use this mode only with a trusted overlay publisher and mount
+//! only Secrets this gateway is authorized to use. The projection must be
+//! read-only to untrusted processes; concurrent symlink rewriting is outside
+//! the path-containment guarantee.
 
 use std::{
     collections::HashMap,
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError, mpsc},
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -117,6 +140,9 @@ const MAX_TOKEN_READ_BYTES: u64 = 16 * 1024 + 1;
 /// Default injection header for the `apikey` strategy.
 const DEFAULT_APIKEY_HEADER: &str = "x-api-key";
 
+/// Bounds request-path file reads while still observing projected Secret updates.
+const PROJECTED_CACHE_TTL: Duration = Duration::from_millis(250);
+
 // -----------------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------------
@@ -125,8 +151,27 @@ const DEFAULT_APIKEY_HEADER: &str = "x-api-key";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialInjectConfig {
-    /// Credential entries, keyed by secretRef (name/namespace/key).
+    /// Credential entries, keyed by secretRef (name/namespace/key). May be
+    /// empty only when `projected_credential_mount_base` is configured.
+    #[serde(default)]
     credentials: Vec<CredentialEntryConfig>,
+
+    /// Optional root containing projected Secret directories. When configured,
+    /// a credential reference selected from a live routing overlay may be
+    /// resolved from `{root}/{namespace}/{secret-name}/{secret-key}` even when
+    /// it was not present in the startup credential table. Including the
+    /// namespace keeps same-name Secrets distinct. Projected `apikey` entries
+    /// use `x-api-key`; providers requiring another header need a configured
+    /// credential entry. This lets a no-route startup safely accept later
+    /// credential-bearing overlay revisions: an absent or unmounted file
+    /// rejects the request with 503 after the 250 ms cache refresh interval.
+    /// A rotated or revoked token may be used until that interval expires.
+    /// Overlay digest and scope validation do not authenticate the publisher:
+    /// use only a trusted publisher and mount only Secrets this gateway is
+    /// authorized to inject. The root must be read-only to untrusted processes;
+    /// concurrent symlink rewriting is outside the containment guarantee.
+    #[serde(default)]
+    projected_credential_mount_base: Option<PathBuf>,
 }
 
 /// A single configured credential entry.
@@ -203,7 +248,6 @@ struct CredentialRef {
 }
 
 /// Resolved credential ready for request-time injection.
-#[derive(Clone)]
 struct ResolvedCredential {
     /// Strategy this credential injects under, cross-checked against the
     /// strategy declared by the overlay candidate.
@@ -234,6 +278,85 @@ struct CredentialSnapshot {
 struct ConfiguredCredential {
     /// Current complete snapshot.
     snapshot: Arc<ArcSwap<CredentialSnapshot>>,
+}
+
+/// One projected reference's last validated value, refreshed on demand.
+struct ProjectedCacheEntry {
+    /// Short-lived state protected independently of filesystem refreshes.
+    state: Mutex<ProjectedCacheState>,
+    /// Wakes requests waiting for a per-reference refresh.
+    refreshed: tokio::sync::Notify,
+}
+
+/// Cached value and single-flight refresh state for one reference.
+struct ProjectedCacheState {
+    /// Time of the last filesystem refresh.
+    loaded_at: Option<Instant>,
+    /// Last validated value, or no value after a failed refresh.
+    credential: Option<Arc<ResolvedCredential>>,
+    /// True while one request is refreshing the projected file.
+    refreshing: bool,
+}
+
+/// Releases waiters if the refreshing request is cancelled.
+struct ProjectedRefreshGuard {
+    /// Entry whose refresh state this guard owns.
+    entry: Arc<ProjectedCacheEntry>,
+    /// Whether the refresh published a cache result.
+    completed: bool,
+}
+
+impl ProjectedRefreshGuard {
+    /// Publish a refresh result and wake concurrent requests.
+    fn complete(mut self, result: &Result<Arc<ResolvedCredential>, FilterError>) {
+        let mut state = self.entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.loaded_at = Some(Instant::now());
+        state.credential = result.as_ref().ok().cloned();
+        state.refreshing = false;
+        self.completed = true;
+        drop(state);
+        self.entry.refreshed.notify_waiters();
+    }
+}
+
+impl Drop for ProjectedRefreshGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut state = self.entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.refreshing = false;
+            drop(state);
+            self.entry.refreshed.notify_waiters();
+        }
+    }
+}
+
+/// Secret identity and injection strategy used for dynamic cache lookup.
+type ProjectedCacheKey = (CredentialRef, &'static str);
+/// Shared per-reference lock and cached value.
+type ProjectedCacheEntryRef = Arc<ProjectedCacheEntry>;
+/// Cache entries paired with their last-use timestamps.
+type ProjectedCacheEntries = HashMap<ProjectedCacheKey, (ProjectedCacheEntryRef, Instant)>;
+/// Bounded set of per-reference cache entries and their last use times.
+type ProjectedCache = Mutex<ProjectedCacheEntries>;
+
+/// Evict least-recently-used entries that have no active callers. A caller
+/// holds an `Arc` while it waits for or performs a per-reference refresh, so
+/// removing only entries with a single strong reference keeps that refresh
+/// discoverable to every concurrent request.
+fn trim_projected_cache(entries: &mut ProjectedCacheEntries, target_len: usize) {
+    while entries.len() > target_len {
+        let oldest_idle = entries
+            .iter()
+            .filter(|(_, (entry, _))| Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, (_, last_used))| *last_used)
+            .map(|(key, _)| key.clone());
+        let Some(oldest_idle) = oldest_idle else {
+            // All entries are in use. Let the cache exceed its target briefly;
+            // callers trim it again after their refreshes release their Arcs.
+            break;
+        };
+        entries.remove(&oldest_idle);
+    }
 }
 
 /// File-backed credential and its reference identity.
@@ -293,6 +416,13 @@ impl Drop for CredentialReloadHandle {
 pub struct CredentialInjectFilter {
     /// Credential reference → resolved injectable credential.
     credentials: HashMap<CredentialRef, ConfiguredCredential>,
+    /// Headers that may carry caller-supplied credentials for any configured entry.
+    credential_headers: Vec<HeaderName>,
+    /// Optional root for fail-closed, request-time resolution of projected
+    /// credentials introduced by a later overlay revision.
+    projected_credential_mount_base: Option<PathBuf>,
+    /// Bounded cache of dynamically selected projected references.
+    projected_cache: ProjectedCache,
     /// Bounded watcher lifetime for file-backed credentials.
     _reload_handle: Option<CredentialReloadHandle>,
 }
@@ -308,7 +438,7 @@ impl CredentialInjectFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if:
-    /// - `credentials` is empty
+    /// - `credentials` is empty and no projected mount base is configured
     /// - any entry has more than one token source (`value`, `env_var`, `file`) or none
     /// - any `env_var` is not set in the environment
     /// - any `file` does not exist, is unreadable, or is empty
@@ -322,11 +452,20 @@ impl CredentialInjectFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: CredentialInjectConfig = parse_filter_config("credential_inject", config)?;
 
-        if cfg.credentials.is_empty() || cfg.credentials.len() > MAX_CREDENTIALS {
-            return Err(format!("credential_inject: credentials must contain 1-{MAX_CREDENTIALS} entries").into());
+        if cfg.credentials.len() > MAX_CREDENTIALS {
+            return Err(
+                format!("credential_inject: credentials must contain at most {MAX_CREDENTIALS} entries").into(),
+            );
+        }
+        if cfg.credentials.is_empty() && cfg.projected_credential_mount_base.is_none() {
+            return Err("credential_inject: empty credentials requires projected_credential_mount_base".into());
+        }
+        if let Some(base) = &cfg.projected_credential_mount_base {
+            validate_projected_mount_base(base)?;
         }
 
         let mut credentials = HashMap::with_capacity(cfg.credentials.len());
+        let mut credential_headers = vec![AUTHORIZATION, HeaderName::from_static("x-api-key")];
 
         let mut watched = Vec::new();
         for entry in &cfg.credentials {
@@ -334,6 +473,9 @@ impl CredentialInjectFilter {
             validate_credential_ref(entry)?;
             let strategy = strategy_label(&entry.strategy);
             let header_name = resolve_header_name(entry)?;
+            if !credential_headers.contains(&header_name) {
+                credential_headers.push(header_name.clone());
+            }
             let cred_ref = CredentialRef {
                 name: entry.name.clone(),
                 namespace: entry.namespace.clone(),
@@ -342,7 +484,7 @@ impl CredentialInjectFilter {
             let resolved = match (&entry.value, &entry.env_var, &entry.file) {
                 (None, None, Some(path)) => {
                     validate_bounded("file", path, MAX_SOURCE_LEN)?;
-                    resolve_file_credential(path, &cred_ref, strategy, &header_name)?
+                    resolve_file_credential(Path::new(path), &cred_ref, strategy, &header_name)?
                 },
                 _ => resolve_credential(entry, strategy, &header_name)?,
             };
@@ -376,8 +518,92 @@ impl CredentialInjectFilter {
 
         Ok(Box::new(Self {
             credentials,
+            credential_headers,
+            projected_credential_mount_base: cfg.projected_credential_mount_base,
+            projected_cache: Mutex::new(HashMap::new()),
             _reload_handle: reload_handle,
         }))
+    }
+
+    /// Reuse a validated value between bounded refreshes. A per-reference
+    /// refresh state prevents concurrent requests from stampeding the filesystem.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bounded cache admission and refresh share one per-reference operation"
+    )]
+    async fn cached_projected_credential(
+        &self,
+        base: &Path,
+        selected: &SelectedCredential,
+    ) -> Result<Arc<ResolvedCredential>, FilterError> {
+        let key = (selected.reference.clone(), selected.strategy);
+        let entry = {
+            let mut entries = self.projected_cache.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            if let Some((entry, last_used)) = entries.get_mut(&key) {
+                *last_used = now;
+                Arc::clone(entry)
+            } else {
+                trim_projected_cache(&mut entries, MAX_CREDENTIALS.saturating_sub(1));
+                let entry = Arc::new(ProjectedCacheEntry {
+                    state: Mutex::new(ProjectedCacheState {
+                        loaded_at: None,
+                        credential: None,
+                        refreshing: false,
+                    }),
+                    refreshed: tokio::sync::Notify::new(),
+                });
+                entries.insert(key, (Arc::clone(&entry), now));
+                entry
+            }
+        };
+        let result = loop {
+            enum CacheAction {
+                Hit(Option<Arc<ResolvedCredential>>),
+                Wait,
+                Refresh,
+            }
+            let notified = entry.refreshed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let action = {
+                let mut cached = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if cached
+                    .loaded_at
+                    .is_some_and(|loaded| loaded.elapsed() < PROJECTED_CACHE_TTL)
+                {
+                    CacheAction::Hit(cached.credential.clone())
+                } else if cached.refreshing {
+                    CacheAction::Wait
+                } else {
+                    cached.refreshing = true;
+                    CacheAction::Refresh
+                }
+            };
+            match action {
+                CacheAction::Hit(credential) => {
+                    break credential.ok_or_else(|| "credential_inject: projected credential unavailable".into());
+                },
+                CacheAction::Wait => {
+                    notified.await;
+                    continue;
+                },
+                CacheAction::Refresh => {},
+            }
+            let refresh = ProjectedRefreshGuard {
+                entry: Arc::clone(&entry),
+                completed: false,
+            };
+            let result = resolve_projected_credential(base.to_path_buf(), selected.clone())
+                .await
+                .map(Arc::new);
+            refresh.complete(&result);
+            break result;
+        };
+        drop(entry);
+        let mut entries = self.projected_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        trim_projected_cache(&mut entries, MAX_CREDENTIALS);
+        result
     }
 }
 
@@ -400,7 +626,31 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let Some(configured) = self.credentials.get(&selected.reference) else {
+        let configured_snapshot = self
+            .credentials
+            .get(&selected.reference)
+            .map(|configured| configured.snapshot.load_full());
+        let projected_credential;
+        let cred = if let Some(snapshot) = configured_snapshot.as_ref() {
+            // Configured entries retain the existing atomically refreshed
+            // snapshot path. A configured-but-invalid entry must not fall
+            // through to a second source.
+            let Some(credential) = snapshot.credential.as_ref() else {
+                return Ok(FilterAction::Reject(Rejection::status(503)));
+            };
+            credential
+        } else if let Some(base) = &self.projected_credential_mount_base {
+            // Candidate references are part of the validated, scoped routing
+            // overlay. Resolve newly introduced references only below the
+            // configured mount root; missing/invalid files fail closed.
+            projected_credential = if let Ok(credential) = self.cached_projected_credential(base, &selected).await {
+                credential
+            } else {
+                tracing::debug!("credential_inject: projected credential unavailable; failing closed");
+                return Ok(FilterAction::Reject(Rejection::status(503)));
+            };
+            projected_credential.as_ref()
+        } else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
                 name = %selected.reference.name,
@@ -411,17 +661,9 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        // Request handling only looks up and atomically loads an immutable
-        // snapshot. Filesystem I/O, validation, and publication happen in the
-        // bounded watcher thread after projected-volume events.
-        let snapshot = configured.snapshot.load_full();
-        let Some(cred) = snapshot.credential.as_ref() else {
-            return Ok(FilterAction::Reject(Rejection::status(503)));
-        };
-
         // The overlay candidate and the configured entry must agree on how this
-        // secret is injected. A producer/config disagreement fails closed
-        // rather than sending a bearer token where an apikey header is expected.
+        // secret is injected. Static-table entries are cross-checked; dynamic
+        // projected entries use the already validated overlay strategy.
         if cred.strategy != selected.strategy {
             tracing::debug!(
                 name = %selected.reference.name,
@@ -443,11 +685,10 @@ impl HttpFilter for CredentialInjectFilter {
         let header_value = HeaderValue::from_str(cred.header_value.as_str()).map_err(|e| -> FilterError {
             format!("credential_inject: invalid resolved credential header: {e}").into()
         })?;
-        // Strip every credential-bearing header the caller could smuggle:
-        // the standard pair plus this entry's configured injection header.
-        ctx.request_headers_to_remove.push(AUTHORIZATION);
-        ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
-        ctx.request_headers_to_remove.push(cred.header_name.clone());
+        // A projected route can select a different credential than the startup table.
+        for header in &self.credential_headers {
+            ctx.request_headers_to_remove.push(header.clone());
+        }
         ctx.request_headers_to_set
             .push((cred.header_name.clone(), header_value));
 
@@ -460,6 +701,7 @@ impl HttpFilter for CredentialInjectFilter {
 // -----------------------------------------------------------------------------
 
 /// Credential reference selected by the routing filter, with its strategy.
+#[derive(Clone)]
 struct SelectedCredential {
     /// Strategy declared by the selected route candidate.
     strategy: &'static str,
@@ -635,7 +877,7 @@ fn resolve_credential(
 
 /// Resolve a credential from one projected Secret file.
 fn resolve_file_credential(
-    path: &str,
+    path: &Path,
     reference: &CredentialRef,
     strategy: &'static str,
     header_name: &HeaderName,
@@ -656,13 +898,99 @@ fn resolve_file_credential(
     })
 }
 
+/// Validate the trusted root used for overlay-selected projected credentials.
+fn validate_projected_mount_base(base: &Path) -> Result<(), FilterError> {
+    if !base.is_absolute()
+        || base == Path::new("/")
+        || base.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(
+            "credential_inject: projected_credential_mount_base must be a non-root absolute path without dot segments"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Build the projected file path for a reference carried by the validated
+/// routing overlay. Every locator field becomes one distinct path component.
+fn projected_credential_path(base: &Path, reference: &CredentialRef) -> Result<PathBuf, FilterError> {
+    for (field, value) in [
+        ("name", reference.name.as_str()),
+        ("namespace", reference.namespace.as_str()),
+        ("key", reference.key.as_str()),
+    ] {
+        validate_bounded(field, value, MAX_REFERENCE_LEN)?;
+    }
+    for (field, component) in [
+        ("namespace", reference.namespace.as_str()),
+        ("name", reference.name.as_str()),
+        ("key", reference.key.as_str()),
+    ] {
+        if component == "."
+            || component == ".."
+            || component
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '\0'))
+            || Path::new(component).components().count() != 1
+        {
+            return Err(format!("credential_inject: projected credential {field} is not a safe path component").into());
+        }
+    }
+    Ok(base
+        .join(&reference.namespace)
+        .join(&reference.name)
+        .join(&reference.key))
+}
+
+/// Resolve a credential introduced by an accepted overlay from the configured
+/// Secret projection root. File I/O runs on Tokio's blocking pool and uses the
+/// same bounded validation and zeroization path as configured file entries.
+async fn resolve_projected_credential(
+    base: PathBuf,
+    selected: SelectedCredential,
+) -> Result<ResolvedCredential, FilterError> {
+    let path = projected_credential_path(&base, &selected.reference)?;
+    let reference = selected.reference;
+    let strategy = selected.strategy;
+    let header_name = if strategy == STRATEGY_BEARER_TOKEN {
+        AUTHORIZATION
+    } else {
+        HeaderName::from_static(DEFAULT_APIKEY_HEADER)
+    };
+    tokio::task::spawn_blocking(move || {
+        let resolved_root = std::fs::canonicalize(&base).map_err(|error| -> FilterError {
+            format!("credential_inject: projected root unavailable: {error}").into()
+        })?;
+        let resolved_path = std::fs::canonicalize(&path).map_err(|error| -> FilterError {
+            format!("credential_inject: projected credential unavailable: {error}").into()
+        })?;
+        if !resolved_path.starts_with(&resolved_root) {
+            return Err("credential_inject: projected credential resolves outside configured root".into());
+        }
+        resolve_file_credential(&resolved_path, &reference, strategy, &header_name)
+    })
+    .await
+    .map_err(|error| -> FilterError {
+        format!("credential_inject: projected credential read task failed: {error}").into()
+    })?
+}
+
 /// Read one projected credential using the same bounded validation path for
 /// startup and reload. The credential value is never included in diagnostics.
-fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizing<String>, FilterError> {
-    let file = File::open(Path::new(path)).map_err(|error| {
+fn read_projected_token(path: &Path, reference: &CredentialRef) -> Result<Zeroizing<String>, FilterError> {
+    let file = File::open(path).map_err(|error| {
         format!(
-            "credential_inject: cannot read file '{path}' for '{}/{}/{}': {error}",
-            reference.name, reference.namespace, reference.key
+            "credential_inject: cannot read file '{}' for '{}/{}/{}': {error}",
+            path.display(),
+            reference.name,
+            reference.namespace,
+            reference.key
         )
     })?;
     let mut content = Zeroizing::new(String::new());
@@ -685,12 +1013,7 @@ fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizi
 /// Publish the current file state, failing closed when it cannot be read or
 /// validated.
 fn reload_credential(item: &WatchedCredential) {
-    let credential = match resolve_file_credential(
-        item.path.to_string_lossy().as_ref(),
-        &item.reference,
-        item.strategy,
-        &item.header_name,
-    ) {
+    let credential = match resolve_file_credential(&item.path, &item.reference, item.strategy, &item.header_name) {
         Ok(credential) => Some(credential),
         Err(error) => {
             tracing::warn!(
@@ -783,12 +1106,7 @@ fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<Credentia
             // complete startup snapshot.
             let mut initial = Vec::with_capacity(watched.len());
             for item in &watched {
-                match resolve_file_credential(
-                    item.path.to_string_lossy().as_ref(),
-                    &item.reference,
-                    item.strategy,
-                    &item.header_name,
-                ) {
+                match resolve_file_credential(&item.path, &item.reference, item.strategy, &item.header_name) {
                     Ok(credential) => initial.push((Arc::clone(&item.snapshot), credential)),
                     Err(error) => {
                         drop(ready_tx.send(Err(format!("failed authoritative credential read: {error}"))));
@@ -858,7 +1176,7 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
                 namespace: entry.namespace.clone(),
                 key: entry.key.clone(),
             };
-            read_projected_token(path, &reference)
+            read_projected_token(Path::new(path), &reference)
         },
         (None, None, None) => Err(format!(
             "credential_inject: '{}/{}/{}' must have exactly one of 'value', 'env_var', or 'file'",
@@ -909,9 +1227,22 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn empty_credentials_rejected() {
+    fn empty_credentials_require_projected_mount_base() {
         let err = parse_err("credentials: []");
-        assert!(err.to_string().contains("must contain"), "{err}");
+        assert!(err.to_string().contains("projected_credential_mount_base"), "{err}");
+    }
+
+    #[test]
+    fn empty_credentials_with_projected_mount_base_is_a_valid_fail_closed_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        assert!(
+            parse(&yaml).is_ok(),
+            "dynamic projected mode should permit an empty startup table"
+        );
     }
 
     #[test]
@@ -1090,6 +1421,329 @@ mod tests {
             ctx.request_headers_to_set.is_empty(),
             "no Authorization injected without credential"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_startup_table_injects_credential_from_later_overlay_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("test-ns").join("provider-secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("token"), "projected-token\n").unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer caller-token"));
+        req.headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "provider-secret", "test-ns", "token");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(ctx.request_headers_to_remove.contains(&AUTHORIZATION));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key"))
+        );
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+        assert_eq!(ctx.request_headers_to_set[0].1, "projected-token");
+    }
+
+    #[tokio::test]
+    async fn projected_credentials_with_same_name_and_key_are_namespace_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        for (namespace, token) in [("namespace-a", "token-from-a"), ("namespace-b", "token-from-b")] {
+            let secret_dir = dir.path().join(namespace).join("shared-secret");
+            std::fs::create_dir_all(&secret_dir).unwrap();
+            std::fs::write(secret_dir.join("token"), token).unwrap();
+        }
+
+        // This legacy-layout file would alias both namespace references if the
+        // resolver ignored namespace. Neither selected Secret may read it.
+        let legacy_dir = dir.path().join("shared-secret");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("token"), "wrong-legacy-token").unwrap();
+
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+
+        for (namespace, expected_token) in [("namespace-a", "token-from-a"), ("namespace-b", "token-from-b")] {
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            set_credential_metadata(&mut ctx, "apikey", "shared-secret", namespace, "token");
+
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            assert_eq!(ctx.request_headers_to_set.len(), 1);
+            assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+            assert_eq!(ctx.request_headers_to_set[0].1, expected_token);
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rotation, warm cache, and removal form one credential lifecycle"
+    )]
+    async fn projected_cache_refreshes_after_atomic_secret_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("test-ns").join("provider-secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let token_path = secret_dir.join("token");
+        std::fs::write(&token_path, "token-a").unwrap();
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let inject = || async {
+            let mut ctx = crate::test_utils::make_filter_context(&request);
+            set_credential_metadata(&mut ctx, "apikey", "provider-secret", "test-ns", "token");
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            (action, ctx.request_headers_to_set)
+        };
+
+        let (first, headers) = inject().await;
+        assert!(matches!(first, FilterAction::Continue));
+        assert_eq!(headers[0].1, "token-a");
+        std::fs::write(secret_dir.join("next-token"), "token-b").unwrap();
+        std::fs::rename(secret_dir.join("next-token"), &token_path).unwrap();
+        let (_, cached_headers) = inject().await;
+        assert_eq!(cached_headers[0].1, "token-a", "warm requests reuse the bounded cache");
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (rotated, headers) = inject().await;
+        assert!(matches!(rotated, FilterAction::Continue));
+        assert_eq!(headers[0].1, "token-b");
+
+        std::fs::remove_file(&token_path).unwrap();
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (missing, headers) = inject().await;
+        assert!(matches!(missing, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "missing, invalid, and recovered files form one cache lifecycle"
+    )]
+    async fn projected_cache_recovers_after_missing_and_invalid_files_become_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("test-ns").join("provider-secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let token_path = secret_dir.join("token");
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let inject = || async {
+            let mut ctx = crate::test_utils::make_filter_context(&request);
+            set_credential_metadata(&mut ctx, "apikey", "provider-secret", "test-ns", "token");
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            (action, ctx.request_headers_to_set)
+        };
+
+        let (missing, headers) = inject().await;
+        assert!(matches!(missing, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+
+        std::fs::write(&token_path, " \n").unwrap();
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (invalid, headers) = inject().await;
+        assert!(matches!(invalid, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+
+        std::fs::write(&token_path, "recovered-token").unwrap();
+        let (cached_failure, headers) = inject().await;
+        assert!(matches!(cached_failure, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (recovered, headers) = inject().await;
+        assert!(matches!(recovered, FilterAction::Continue));
+        assert_eq!(headers[0].1, "recovered-token");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn projected_secret_symlinks_must_resolve_within_the_mount_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("provider-secret")).unwrap();
+        std::fs::write(outside.join("provider-secret/token"), "outside-token").unwrap();
+        symlink(&outside, root.join("test-ns")).unwrap();
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            root.display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "bearer_token", "provider-secret", "test-ns", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 503));
+
+        let inside = root.join("inside-ns/provider-secret");
+        std::fs::create_dir_all(inside.join("..version")).unwrap();
+        std::fs::write(inside.join("..version/token"), "inside-token").unwrap();
+        symlink("..version", inside.join("..data")).unwrap();
+        symlink("..data/token", inside.join("token")).unwrap();
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "bearer_token", "provider-secret", "inside-ns", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.request_headers_to_set[0].1, "Bearer inside-token");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn projected_secret_reads_preserve_non_utf8_canonical_paths() {
+        use std::{
+            ffi::OsStr,
+            os::unix::{ffi::OsStrExt as _, fs::symlink},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let projected_dir = root.join("test-ns/provider-secret");
+        std::fs::create_dir_all(&projected_dir).unwrap();
+        let target = root.join(OsStr::from_bytes(b"target-\xff"));
+        std::fs::write(&target, "inside-token").unwrap();
+        symlink(&target, projected_dir.join("token")).unwrap();
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            root.display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "bearer_token", "provider-secret", "test-ns", "token");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.request_headers_to_set[0].1, "Bearer inside-token");
+    }
+
+    #[tokio::test]
+    async fn configured_custom_apikey_header_takes_precedence_over_projected_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configured-token");
+        std::fs::write(&path, "provider-token").unwrap();
+        let filter = parse(&format!(
+            "credentials:\n  - name: secret\n    namespace: test-ns\n    key: token\n    strategy: apikey\n    header: x-provider-key\n    file: '{}'\nprojected_credential_mount_base: '{}'\n",
+            path.display(),
+            dir.path().display()
+        ))
+        .unwrap();
+        let mut request = crate::test_utils::make_request(Method::POST, "/chat");
+        request
+            .headers
+            .insert("x-provider-key", HeaderValue::from_static("caller-token"));
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "apikey", "secret", "test-ns", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-provider-key"))
+        );
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-provider-key");
+        assert_eq!(ctx.request_headers_to_set[0].1, "provider-token");
+    }
+
+    #[tokio::test]
+    async fn projected_credential_strips_other_configured_injection_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let projected_dir = dir.path().join("test-ns/projected-secret");
+        std::fs::create_dir_all(&projected_dir).unwrap();
+        std::fs::write(projected_dir.join("token"), "projected-token").unwrap();
+        let filter = parse(&format!(
+            "credentials:\n  - name: configured-secret\n    namespace: test-ns\n    key: token\n    strategy: apikey\n    header: x-provider-key\n    value: configured-token\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let mut request = crate::test_utils::make_request(Method::POST, "/chat");
+        request
+            .headers
+            .insert("x-provider-key", HeaderValue::from_static("caller-token"));
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "apikey", "projected-secret", "test-ns", "token");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-provider-key")),
+            "a projected route must strip headers used by other configured credentials"
+        );
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+        assert_eq!(ctx.request_headers_to_set[0].1, "projected-token");
+    }
+
+    #[test]
+    fn projected_path_includes_namespace_and_rejects_namespace_traversal() {
+        let base = Path::new("/run/secrets/projected-credentials");
+        let reference = CredentialRef {
+            name: "shared-secret".to_owned(),
+            namespace: "tenant-a".to_owned(),
+            key: "token".to_owned(),
+        };
+        assert_eq!(
+            projected_credential_path(base, &reference).unwrap(),
+            Path::new("/run/secrets/projected-credentials/tenant-a/shared-secret/token")
+        );
+
+        for namespace in ["../other", "tenant/a", "tenant\\a"] {
+            let unsafe_reference = CredentialRef {
+                namespace: namespace.to_owned(),
+                ..reference.clone()
+            };
+            assert!(
+                projected_credential_path(base, &unsafe_reference).is_err(),
+                "unsafe namespace path component {namespace:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_startup_table_rejects_missing_or_unsafe_overlay_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        for name in ["missing-secret", "../outside"] {
+            let req = crate::test_utils::make_request(Method::POST, "/chat");
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            set_credential_metadata(&mut ctx, "bearer_token", name, "test-ns", "token");
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            assert!(
+                matches!(action, FilterAction::Reject(rejection) if rejection.status == 503),
+                "missing or unsafe projected ref {name} must fail closed"
+            );
+            assert!(ctx.request_headers_to_set.is_empty());
+        }
+
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "bearer_token", "valid-name", "../outside", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(ctx.request_headers_to_set.is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -1430,7 +2084,7 @@ mod tests {
             path.display()
         );
         let filter = parse(&yaml).unwrap();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         drop(filter);
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -1734,6 +2388,92 @@ mod tests {
     // Test Utilities
     // -------------------------------------------------------------------------
 
+    #[test]
+    fn projected_cache_eviction_preserves_entries_with_active_callers() {
+        let mut entries = HashMap::new();
+        let active_key = (credential_reference("active"), STRATEGY_BEARER_TOKEN);
+        let idle_key = (credential_reference("idle"), STRATEGY_BEARER_TOKEN);
+        let new_entry = || {
+            Arc::new(ProjectedCacheEntry {
+                state: Mutex::new(ProjectedCacheState {
+                    loaded_at: None,
+                    credential: None,
+                    refreshing: false,
+                }),
+                refreshed: tokio::sync::Notify::new(),
+            })
+        };
+        let active_entry = new_entry();
+        let active_caller = Arc::clone(&active_entry);
+        entries.insert(active_key.clone(), (active_entry, Instant::now()));
+        entries.insert(idle_key.clone(), (new_entry(), Instant::now()));
+
+        trim_projected_cache(&mut entries, 1);
+        assert!(
+            entries.contains_key(&active_key),
+            "active per-key state must remain discoverable"
+        );
+        assert!(
+            !entries.contains_key(&idle_key),
+            "idle entries remain evictable at capacity"
+        );
+
+        drop(active_caller);
+        trim_projected_cache(&mut entries, 0);
+        assert!(entries.is_empty(), "released entries can be trimmed back to capacity");
+    }
+
+    #[tokio::test]
+    async fn projected_cache_warm_hit_shares_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("ns").join("shared");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("k"), "token").unwrap();
+        let filter = CredentialInjectFilter {
+            credentials: HashMap::new(),
+            credential_headers: vec![AUTHORIZATION, HeaderName::from_static("x-api-key")],
+            projected_credential_mount_base: Some(dir.path().to_path_buf()),
+            projected_cache: Mutex::new(HashMap::new()),
+            _reload_handle: None,
+        };
+        let selected = SelectedCredential {
+            strategy: STRATEGY_BEARER_TOKEN,
+            reference: credential_reference("shared"),
+        };
+
+        let first = filter.cached_projected_credential(dir.path(), &selected).await.unwrap();
+        let second = filter.cached_projected_credential(dir.path(), &selected).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "warm hits must share the token-bearing credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_projected_refresh_wakes_waiters() {
+        let entry = Arc::new(ProjectedCacheEntry {
+            state: Mutex::new(ProjectedCacheState {
+                loaded_at: None,
+                credential: None,
+                refreshing: true,
+            }),
+            refreshed: tokio::sync::Notify::new(),
+        });
+        let refresh = ProjectedRefreshGuard {
+            entry: Arc::clone(&entry),
+            completed: false,
+        };
+        let notified = entry.refreshed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(refresh);
+        notified.await;
+        assert!(
+            !entry.state.lock().unwrap_or_else(PoisonError::into_inner).refreshing,
+            "cancelled refresh must release per-reference single-flight state"
+        );
+    }
+
     fn credential_reference(name: &str) -> CredentialRef {
         CredentialRef {
             name: name.to_owned(),
@@ -1745,15 +2485,7 @@ mod tests {
     fn initial_snapshot(path: &Path, name: &str) -> Arc<ArcSwap<CredentialSnapshot>> {
         let reference = credential_reference(name);
         Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
-            credential: Some(
-                resolve_file_credential(
-                    path.to_string_lossy().as_ref(),
-                    &reference,
-                    STRATEGY_BEARER_TOKEN,
-                    &AUTHORIZATION,
-                )
-                .unwrap(),
-            ),
+            credential: Some(resolve_file_credential(path, &reference, STRATEGY_BEARER_TOKEN, &AUTHORIZATION).unwrap()),
         }))
     }
 

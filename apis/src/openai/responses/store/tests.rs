@@ -402,7 +402,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));

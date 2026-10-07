@@ -7,7 +7,7 @@
 #
 # Request order:
 #   1. openai_responses_format classifies the client request.
-#   2. openai_responses_validate performs the canonical JSON parse and
+#   2. openai_responses_request performs the canonical JSON parse and
 #      creates ResponsesState for downstream enrichment and translation.
 #   3. openai_response_store initializes the shared response store.
 #   4. openai_responses_rehydrate resolves previous_response_id into the
@@ -51,7 +51,13 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: state_owner
         mode: single_tenant

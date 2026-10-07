@@ -204,10 +204,10 @@ pipeline:
       S13:
         state: active
         note: projects before the managed chat-completions round
-  - id: openai_operation
-    name: openai_operation
+  - id: ai_operation
+    name: ai_operation
     group: classification
-    filter_type: openai_operation
+    filter_type: ai_operation
     phase: request-phase classification; no response phase
     config: {}
     promotes: classifies the request head (method + path + transport) against the registered OpenAI operation registries (Conversations, Chat Completions, Responses); on a match publishes the typed operation into request extensions, sets x-praxis-ai-application-protocol + x-praxis-ai-operation, and records application_protocol/operation_id filter results consumed by on_result branches and openai_conversations; on no match strips those headers and continues. Must precede openai_conversations.
@@ -466,10 +466,10 @@ pipeline:
       S13:
         state: inert
         note: bound provider=vllm (managed), not direct; branch not taken
-  - id: openai_responses_validate
-    name: openai_responses_validate
+  - id: openai_responses_request
+    name: openai_responses_request
     group: classification
-    filter_type: openai_responses_validate
+    filter_type: openai_responses_request
     phase: request-phase; JSON syntax + ID generation + managed-provider background/prompt policy; gated unless bound_upstream.application_provider=openai
     config:
       conditions:
@@ -1256,6 +1256,62 @@ pipeline:
       S13:
         state: inert
         note: no file_search_call emitted
+  - id: ai_guardrails
+    name: ai_guardrails
+    group: irr-step
+    filter_type: ai_guardrails
+    phase: IRR step request-body EOS; checks only newly produced local Responses tool results; records blocked/provider-failure verdicts for openai_agentic_loop; no response phase
+    config:
+      provider.type: nemo
+      provider.endpoint: http://127.0.0.1:3003/v1/checks
+      provider.guardrails.config_ids:
+      - your-config
+      provider.timeout_ms: 5000
+      provider.max_message_checks: 32
+      phase.request: false
+      phase.response: false
+      phase.tool_results: true
+    promotes: checks the new MCP, web-search, or file-search result suffix before it can be sent to the model on the next IRR round; a block or check failure is finalized by openai_agentic_loop
+    scenarios:
+      S1:
+        state: inert
+        note: no local tool result produced
+      S2:
+        state: inert
+        note: no local tool result produced
+      S3:
+        state: inert
+        note: no local tool result produced
+      S4:
+        state: inert
+        note: no local tool result produced
+      S5:
+        state: active
+        note: checks the file-search result before model re-entry
+      S6:
+        state: active
+        note: checks the MCP result before model re-entry
+      S7:
+        state: active
+        note: checks the web-search result before model re-entry
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: no local tool result produced
   - id: openai_agentic_loop
     name: openai_agentic_loop
     group: irr-step
@@ -1696,6 +1752,10 @@ pipeline:
     - openai_file_search_callout (vector_store_url)
     - vector-stores-backend cluster (/v1/vector_stores direct-services branch)
     credential: user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts
+  - name: NeMo Guardrails
+    endpoint: http://127.0.0.1:3003/v1/checks
+    usedBy:
+    - ai_guardrails (local tool-result checks inside the IRR)
   - name: Brave Search
     endpoint: provider:brave (external Brave API)
     usedBy:
@@ -1750,24 +1810,27 @@ scen_meta:
     - inference-backend
     services: []
   S5:
-    narr: <b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.
+    narr: <b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.
     clusters:
     - inference-backend
     - vector-stores-backend
     services:
     - Vector store
+    - NeMo Guardrails
   S6:
-    narr: <b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.
+    narr: <b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.
     clusters:
     - inference-backend
     services:
     - MCP server
+    - NeMo Guardrails
   S7:
-    narr: <b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.
+    narr: <b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.
     clusters:
     - inference-backend
     services:
     - Brave Search
+    - NeMo Guardrails
   S8:
     narr: <b>GET retrieve.</b> openai_response_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
     clusters: []
@@ -2111,7 +2174,7 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}"
-    notes: 'model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_validate, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider''s response (status:queued) is returned verbatim without gateway composition.'
+    notes: 'model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_request, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider''s response (status:queued) is returned verbatim without gateway composition.'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough: 200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:413-439 (full_flow_managed_provider_rejects_background_before_forwarding: the managed path rejects background:true with 400, contrasting the direct passthrough)
@@ -2130,7 +2193,7 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}"
-    notes: 'model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_validate ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
+    notes: 'model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding: 200, response.object==response + output text "translated"; backend gets one /v1/chat/completions request whose body has messages and no input)
     - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'

@@ -488,7 +488,7 @@ fn translated_chain_passes_bodyless_models_probe() {
 ///
 /// `openai_responses_request` resolves Responses operations only, so it does
 /// not speak for the non-Responses traffic this chain's catch-all route also
-/// forwards. `openai_operation` does, and it is what installs the OpenAI error
+/// forwards. `ai_operation` does, and it is what installs the OpenAI error
 /// formatter for a proxy-generated failure on that path; the body classifier
 /// this chain used to run covered it. Nothing else here derives that fact, so
 /// removing the filter silently drops it.
@@ -505,7 +505,7 @@ fn translated_chain_owns_the_openai_protocol_decision() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
 
     assert!(
-        build_pipeline(&config).contains_filter("openai_operation"),
+        build_pipeline(&config).contains_filter("ai_operation"),
         "the chain must classify OpenAI operations from the request head so \
          non-Responses traffic keeps the OpenAI error shape"
     );

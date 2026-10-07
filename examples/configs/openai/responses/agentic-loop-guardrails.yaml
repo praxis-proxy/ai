@@ -1,0 +1,108 @@
+# Responses Agentic Loop with NeMo Tool-Result Guardrails
+#
+# Screens each newly produced local tool result before it can enter the next
+# inference request. The guardrail belongs inside the IRR step, after every
+# request-phase dispatcher and before openai_agentic_loop. Filters outside the
+# IRR run only on the original client request and cannot protect continuations.
+#
+# This focused example uses MCP dispatch. The same ai_guardrails placement also
+# covers results appended by openai_web_search and openai_file_search_callout
+# when those dispatchers are added before it.
+#
+# NeMo's /v1/checks endpoint evaluates Chat-style user messages. Praxis converts
+# only the newly appended canonical function_call_output values to that check
+# shape; it does not rescan earlier conversation history or reinterpret the raw
+# IRR request body.
+#
+# Start a Responses-compatible model backend on 127.0.0.1:3001 and NeMo
+# Guardrails 0.24.0+ on 127.0.0.1:3002 before starting this config.
+
+listeners:
+  - name: guarded-agentic-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [guarded-agentic-pipeline]
+
+filter_chains:
+  - name: guarded-agentic-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_tool_parse
+
+      # Resolves request-supplied MCP server_url tools before the first model
+      # round. Production deployments should prefer configured connector_id
+      # destinations and appropriate outbound policy.
+      - filter: openai_mcp_tool_resolve
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        timeout_ms: 360000
+        step_timeout_ms: 300000
+        max_response_bytes: 67108864
+        max_stream_response_bytes: 67108864
+        steps:
+          - name: inference
+            filters:
+              # Required for one logical SSE lifecycle across model rounds and
+              # for delivering a post-commit guardrail failure as an SSE error.
+              - filter: openai_stream_events
+
+              # Executes MCP assignments from the preceding model response.
+              - filter: openai_mcp_dispatch
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+
+              # Must remain after all local dispatchers and before the loop
+              # owner. request:false makes the first IRR round inert: general
+              # Responses request-format coverage is tracked separately in
+              # ai#1043. tool_results:true evaluates only new local results.
+              - filter: ai_guardrails
+                provider:
+                  type: nemo
+                  endpoint: "http://127.0.0.1:3002/v1/checks"
+                  guardrails:
+                    config_ids: ["your-config"]
+                  timeout_ms: 5000
+                  max_message_checks: 32
+                phase:
+                  request: false
+                  response: false
+                  tool_results: true
+
+              # Sole continuation and terminal-response owner. It consumes a
+              # guardrail failure before openai_responses_proxy can issue the
+              # next model request.
+              - filter: openai_agentic_loop
+                max_infer_iters: 10
+
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: inference-backend
+              - filter: load_balancer
+                clusters:
+                  - name: inference-backend
+                    endpoints: ["127.0.0.1:3001"]
+                    read_timeout_ms: 300000
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true
+  # This local example calls loopback MCP and NeMo services. Keep disabled in
+  # production unless private upstreams are an intentional trust boundary.
+  allow_private_upstreams: true

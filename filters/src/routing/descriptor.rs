@@ -258,15 +258,26 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// # Errors
 ///
 /// Returns [`FilterError`] if:
-/// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
+/// - the static or legacy candidate list is empty or exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
 /// - duplicate (kind, name, site, cluster) tuples exist
-#[expect(
-    clippy::too_many_lines,
-    reason = "single validation loop, splitting hurts readability"
-)]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
-    if raw.is_empty() {
+    validate_candidates_with_empty(raw, false)
+}
+
+/// Validate candidates from the versioned routing-overlay contract, where an
+/// empty list is an authoritative no-route revision.
+pub(crate) fn validate_overlay_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, true)
+}
+
+/// Apply the shared candidate invariants with an explicit empty-list policy.
+#[expect(clippy::too_many_lines, reason = "candidate validation is one cohesive pass")]
+fn validate_candidates_with_empty(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
         return Err("routing: candidates list must not be empty".into());
     }
     if raw.len() > MAX_CANDIDATES {

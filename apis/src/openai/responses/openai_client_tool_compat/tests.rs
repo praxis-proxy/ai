@@ -1558,6 +1558,102 @@ fn tool_search_call_with_malformed_arguments_fails_closed() {
     assert_eq!(reject_parts(&action).0, 502);
 }
 
+// -----------------------------------------------------------------------------
+// Allocation evidence
+// -----------------------------------------------------------------------------
+
+#[test]
+fn tool_search_lowered_function_moves_large_parameters() {
+    let parameters = json!({
+        "properties": {"query": {"type": "string", "description": "x".repeat(8192)}}
+    });
+    let clone_info = allocation_counter::measure(|| {
+        std::hint::black_box(parameters.clone());
+    });
+    let move_info = allocation_counter::measure(|| {
+        std::hint::black_box(tool_search_lowered_function("Search tools", parameters));
+    });
+
+    assert!(
+        clone_info.bytes_total >= 8192,
+        "the deep-copy baseline must copy the large schema: {clone_info:?}"
+    );
+    assert!(
+        move_info.bytes_total < clone_info.bytes_total,
+        "lowering must move the owned schema: move={move_info:?} clone={clone_info:?}"
+    );
+}
+
+#[test]
+fn restore_shell_call_moves_large_parsed_action() {
+    let arguments = serde_json::to_string(&json!({"commands": ["x".repeat(8192)]})).unwrap();
+    let item = json!({
+        "type": "function_call",
+        "id": "fc_shell",
+        "call_id": "call_shell",
+        "name": "shell",
+        "arguments": arguments,
+        "status": "completed",
+    });
+    let restored = restore_shell_call(&item).expect("shell call restores");
+    assert_eq!(
+        restored["action"]["commands"][0].as_str().expect("large command").len(),
+        8192,
+        "the large action must remain structurally equivalent"
+    );
+
+    let parse_info = allocation_counter::measure(|| {
+        std::hint::black_box(parse_shell_action(&arguments).expect("action parses"));
+    });
+    let restore_info = allocation_counter::measure(|| {
+        std::hint::black_box(restore_shell_call(&item).expect("shell call restores"));
+    });
+    assert!(
+        parse_info.bytes_total >= 8192,
+        "the parse baseline must allocate the large command: {parse_info:?}"
+    );
+    assert!(
+        restore_info.bytes_total.saturating_sub(parse_info.bytes_total) < 8192,
+        "restoration must move the parsed action instead of copying it: \
+         restore={restore_info:?} parse={parse_info:?}"
+    );
+}
+
+#[test]
+fn restore_tool_search_call_moves_large_parsed_arguments() {
+    let arguments = serde_json::to_string(&json!({"query": "x".repeat(8192)})).unwrap();
+    let item = json!({
+        "type": "function_call",
+        "id": "fc_search",
+        "call_id": "call_search",
+        "name": "tool_search",
+        "arguments": arguments,
+        "status": "completed",
+    });
+    let restored = restore_tool_search_call(&item).expect("tool search restores");
+    assert_eq!(
+        restored["arguments"]["query"].as_str().expect("large query").len(),
+        8192,
+        "the large arguments must remain structurally equivalent"
+    );
+
+    let parse_info = allocation_counter::measure(|| {
+        std::hint::black_box(serde_json::from_str::<Value>(&arguments).expect("arguments parse"));
+    });
+    let restore_info = allocation_counter::measure(|| {
+        std::hint::black_box(restore_tool_search_call(&item).expect("tool search restores"));
+    });
+    assert!(
+        parse_info.bytes_total >= 8192,
+        "the parse baseline must allocate the large query: {parse_info:?}"
+    );
+    assert!(
+        restore_info.bytes_total.saturating_sub(parse_info.bytes_total) < 8192,
+        "restoration must move parsed arguments instead of copying them: \
+         restore={restore_info:?} parse={parse_info:?}"
+    );
+}
+
 #[test]
 fn unrelated_function_calls_are_left_untouched() {
     let state = state_with_custom_lowered();

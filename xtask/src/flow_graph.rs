@@ -402,10 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_one_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
-        assert_eq!(nodes.len(), 30, "19 main + 11 IRR-step filters");
+        assert_eq!(nodes.len(), 31, "19 main + 12 IRR-step filters");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -422,10 +422,15 @@ mod tests {
         assert_eq!(nodes[19].irr_step.as_deref(), Some("inference"));
         assert_eq!(nodes[19].filter_type, "project_state_owner_headers");
         assert_eq!(
-            nodes[27].filter_type, "openai_responses_proxy",
+            nodes[24].filter_type, "ai_guardrails",
+            "guardrails precede the loop owner"
+        );
+        assert_eq!(nodes[25].filter_type, "openai_agentic_loop");
+        assert_eq!(
+            nodes[28].filter_type, "openai_responses_proxy",
             "proxy after the step load balancer"
         );
-        assert_eq!(nodes[29].filter_type, "path_rewrite", "last step filter");
+        assert_eq!(nodes[30].filter_type, "path_rewrite", "last step filter");
     }
 
     #[test]

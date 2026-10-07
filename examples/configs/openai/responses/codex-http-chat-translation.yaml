@@ -34,7 +34,7 @@ filter_chains:
       # non-Responses traffic too, and this is what keeps a proxy-generated
       # failure on that path in the OpenAI error shape rather than RFC 9457
       # problem details.
-      - filter: openai_operation
+      - filter: ai_operation
 
       # Recognizes the operation from the request head, so bodyless requests a
       # coding client also sends — GET /v1/models, health probes — are released

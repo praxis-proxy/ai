@@ -22,7 +22,13 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: responses_to_chat_completions
         max_rewritten_body_bytes: 67108864

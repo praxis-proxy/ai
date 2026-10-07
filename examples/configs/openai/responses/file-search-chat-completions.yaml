@@ -11,7 +11,7 @@
 #
 # Request order (forward):
 #   1. openai_responses_format classifies the client request.
-#   2. openai_responses_validate creates canonical ResponsesState.
+#   2. openai_responses_request creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
 #   4. openai_file_search_callout dispatches the owner's pending hosted
 #      search assignments at request-body EOS on IRR re-entry.
@@ -47,7 +47,13 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: iterative_request_router
         initial_step: inference

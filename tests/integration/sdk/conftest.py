@@ -125,7 +125,7 @@ filter_chains:
   # operation classifier, which resolves the protocol from the request head.
   - name: classify_from_head
     filters:
-      - filter: openai_operation
+      - filter: ai_operation
       - filter: router
         routes:
           - path_prefix: "/"

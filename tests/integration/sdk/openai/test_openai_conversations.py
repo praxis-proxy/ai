@@ -152,7 +152,7 @@ def _write_config(
         },
     ]
     if include_operation_classifier:
-        filters.append({"filter": "openai_operation"})
+        filters.append({"filter": "ai_operation"})
     filters.append(_conversations_filter(f"sdk_{port}", db_path))
 
     config = {
@@ -194,7 +194,7 @@ def _write_tenant_config(port: int, db_path: str) -> str:
                 "name": "tenant-conversations-pipeline",
                 "filters": [
                     {"filter": "test_tenant_identity"},
-                    {"filter": "openai_operation"},
+                    {"filter": "ai_operation"},
                     conversations_filter,
                 ],
             }
@@ -250,6 +250,89 @@ class _ChunkedResponsesBackend(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, _format, *_args):
         return
+
+
+class _RecordingResponsesBackend(http.server.BaseHTTPRequestHandler):
+    """Return a Responses object and record the request the proxy forwarded."""
+
+    protocol_version = "HTTP/1.1"
+    forwarded: list[dict] = []
+    response_body = json.dumps(
+        {
+            "id": "resp_passthrough",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(content_length)
+        type(self).forwarded.append(
+            {"path": self.path, "body": json.loads(raw) if raw else None}
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.response_body)))
+        self.end_headers()
+        self.wfile.write(self.response_body)
+        self.wfile.flush()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def _write_passthrough_config(port: int, backend_port: int) -> str:
+    """Write a chain that classifies and routes but initializes no state."""
+    config = {
+        "listeners": [
+            {
+                "name": "passthrough",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["passthrough-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "passthrough-pipeline",
+                "filters": [
+                    {
+                        "filter": "openai_responses_request",
+                        "on_invalid": "continue",
+                        "initialize_state": False,
+                    },
+                    {
+                        "filter": "router",
+                        "routes": [{"path_prefix": "/", "cluster": "backend"}],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
 
 
 def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
@@ -466,6 +549,42 @@ def openai_client(praxis_proxy):
 
 
 @pytest.fixture
+def passthrough_client():
+    """Start a stateless passthrough proxy and a recording backend."""
+    _RecordingResponsesBackend.forwarded = []
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _RecordingResponsesBackend
+    )
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    config_path = _write_passthrough_config(port, backend.server_address[1])
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_proxy(port, proc)
+        yield OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        backend.shutdown()
+        os.unlink(config_path)
+
+
+@pytest.fixture
 def chunked_response_client():
     """Start a composed response-store/Conversations proxy and chunked backend."""
     backend = http.server.ThreadingHTTPServer(
@@ -658,6 +777,28 @@ class TestOpenAIConversations:
         assert conversation.metadata["topic"] == "demo"
         assert isinstance(conversation.created_at, int)
         assert conversation.created_at > 0
+
+    def test_passthrough_chain_forwards_create_without_initializing_state(
+        self, passthrough_client
+    ):
+        """A chain with initialize_state disabled still classifies and routes.
+
+        The request reaches the backend unchanged and its response reaches the
+        client, so disabling state costs nothing a passthrough chain uses.
+        """
+        response = passthrough_client.responses.create(
+            model="gpt-4.1",
+            input="Hello",
+        )
+
+        assert response.id == "resp_passthrough", "the backend response must reach the client unaltered"
+        assert response.status == "completed", "the passthrough chain must not rewrite the response status"
+
+        forwarded = _RecordingResponsesBackend.forwarded
+        assert len(forwarded) == 1, "exactly one request should reach the backend"
+        assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
+        assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
+        assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
 
     def test_chunked_response_is_retrievable_with_composed_filters(
         self, chunked_response_client

@@ -145,7 +145,7 @@ fn bodyless_models_probe_reaches_the_backend() {
 ///
 /// `openai_responses_request` resolves Responses operations only, so it does
 /// not speak for the `POST /v1/chat/completions` a coding client also sends
-/// through this chain's catch-all route. `openai_operation` does, and it is
+/// through this chain's catch-all route. `ai_operation` does, and it is
 /// what installs the OpenAI error formatter for a proxy-generated failure on
 /// that path; the previous body classifier used to cover it. Nothing else in
 /// the chain derives that fact, so removing the filter silently drops it.
@@ -161,7 +161,7 @@ fn the_chain_owns_the_openai_protocol_decision() {
     let pipeline = build_pipeline(&config);
 
     assert!(
-        pipeline.contains_filter("openai_operation"),
+        pipeline.contains_filter("ai_operation"),
         "the chain must classify OpenAI operations from the request head so \
          non-Responses traffic keeps the OpenAI error shape"
     );

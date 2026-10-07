@@ -1554,7 +1554,13 @@ filter_chains:
         tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
@@ -1609,7 +1615,13 @@ filter_chains:
         tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
@@ -1640,7 +1652,7 @@ insecure_options:
 }
 
 /// Minimal store pipeline with `openai_response_store` + `openai_mcp_tool_resolve`
-/// but WITHOUT `openai_responses_validate`/`openai_responses_rehydrate` (and no
+/// but WITHOUT `openai_responses_request`/`openai_responses_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
 /// writes the terminal snapshot (`get_or_insert_with`, not `get_mut`). The store

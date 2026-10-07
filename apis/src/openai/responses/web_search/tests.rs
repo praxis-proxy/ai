@@ -927,6 +927,16 @@ async fn on_request_body_appends_backend_valid_continuation() {
         .iter()
         .find(|m| m.get("type").and_then(Value::as_str) == Some("function_call_output"))
         .expect("continuation should include a function_call_output");
+    let bridge_start = state
+        .messages
+        .iter()
+        .position(|m| m.get("type").and_then(Value::as_str) == Some("function_call"))
+        .expect("continuation should include a function_call");
+    assert_eq!(
+        state.pending_local_tool_guardrail_start,
+        Some(bridge_start),
+        "the new search bridge should be marked from its function_call"
+    );
     assert_eq!(output["call_id"], call_id, "output must reference the call");
     let text = output["output"].as_str().expect("output should be a string");
     assert!(
