@@ -17,6 +17,8 @@ Requests with `background=true` are rejected because Praxis does not implement t
 
 Routing mode for supported Responses API requests: `stateful` when the request contains `previous_response_id`, non-empty `tools`, `store=true` (default when omitted), `conversation`, or `prompt.id`; `stateless` when `store=false` with no other stateful markers.
 
+`prompt.id` refers to OpenAI's deprecated reusable prompt object, retired with `v1/prompts` on 2026-11-30; new clients should send prompt content through `input`/`instructions` instead of a saved prompt reference.
+
 Use with branch chains to route stateful and stateless requests to different clusters.
 
 ## Configuration

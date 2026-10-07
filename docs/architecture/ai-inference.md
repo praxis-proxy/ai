@@ -96,6 +96,13 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
+`has_prompt_id` detects OpenAI's deprecated reusable prompt
+object (`prompt: { id, version, variables }`). OpenAI retires
+reusable prompts and `v1/prompts` on 2026-11-30; clients
+should move the saved prompt's content into `input`/`instructions`
+rather than rely on a gateway to resolve it. Praxis keeps
+recognizing the shape for routing while OpenAI still supports it.
+
 Requests with `background: true` are rejected before mode
 classification because Praxis does not implement the
 asynchronous Responses lifecycle.
