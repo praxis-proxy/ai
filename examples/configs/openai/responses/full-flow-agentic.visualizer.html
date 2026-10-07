@@ -825,7 +825,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "establishes TraceContext before the route-miss"
+          "note": "establishes TraceContext for the single inference round"
         },
         "S11": {
           "state": "active",
@@ -893,7 +893,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "owner mapped before route-miss"
+          "note": "maps x-auth-* ingress into owner context (no auth verification)"
         },
         "S11": {
           "state": "active",
@@ -977,7 +977,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "strips all provider-key headers and sets the assertion before the route-miss"
+          "note": "strips all x-user-* provider keys defensively (slots empty if absent); also strips client x-mcp-authorized and sets the verified assertion, consumed only by MCP filters"
         },
         "S11": {
           "state": "active",
@@ -1043,7 +1043,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "projects before route-miss"
+          "note": "projects x-tenant-id/x-user-id, strips raw ingress"
         },
         "S11": {
           "state": "active",
@@ -1106,7 +1106,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "head-based match -\u003e openai_responses create; the Chat/unclassified body is ignored here and discriminated later by the pre-routing openai_responses_request"
+          "note": "head-based match -\u003e openai_responses create; operation identity is authoritative, so the Chat/Anthropic/unclassified body shape does not change the operation (#1602)"
         },
         "S11": {
           "state": "passthrough",
@@ -1176,7 +1176,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "classifies as chat/anthropic/unclassified -\u003e not openai_responses, on_invalid:continue avoids early reject"
+          "note": "classify_matched_operation forces format=openai_responses for the matched create body regardless of its Chat/Anthropic shape; promotes format + model=gpt-4, stream=false"
         },
         "S11": {
           "state": "passthrough",
@@ -1251,7 +1251,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "no route matches (format is not openai_responses, no upgrade header) -\u003e route-miss (bare 404)"
+          "note": "model gpt-4 misses the gpt-5/vllm-chat model routes and falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format openai_responses) -\u003e inference-backend (managed native)"
         },
         "S11": {
           "state": "active",
@@ -1324,8 +1324,8 @@ const PIPELINE = {
           "note": "WS bound responses-websocket-backend (direct), not openai; branch not taken"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss already returned 404"
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
         },
         "S11": {
           "state": "inert",
@@ -1398,8 +1398,8 @@ const PIPELINE = {
           "note": "bound responses-websocket-backend (direct) -\u003e takes the direct-services terminal branch; forwards the WS upgrade to 3001"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss already returned 404"
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
         },
         "S11": {
           "state": "active",
@@ -1465,8 +1465,8 @@ const PIPELINE = {
           "note": "WS took the direct-services terminal branch before the body filters"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before the body filters"
+          "state": "active",
+          "note": "managed owner builds ResponsesState and generates the response id from the one parse; the Chat-shaped body is carried as the Responses create body"
         },
         "S11": {
           "state": "skipped",
@@ -1532,8 +1532,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no tools; has_tools=false"
         },
         "S11": {
           "state": "skipped",
@@ -1603,8 +1603,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
         },
         "S11": {
           "state": "skipped",
@@ -1674,8 +1674,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "active",
+          "note": "persists buffered response on reverse path (store default true)"
         },
         "S11": {
           "state": "skipped",
@@ -1741,8 +1741,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no previous_response_id/conversation"
         },
         "S11": {
           "state": "skipped",
@@ -1814,8 +1814,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "inert",
+          "note": "no file_id refs; callout does not fire"
         },
         "S11": {
           "state": "skipped",
@@ -1883,8 +1883,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "inert",
+          "note": "no input_file parts to convert"
         },
         "S11": {
           "state": "skipped",
@@ -1962,8 +1962,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no MCP tool entries"
         },
         "S11": {
           "state": "skipped",
@@ -2032,8 +2032,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before this filter"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S11": {
           "state": "skipped",
@@ -2115,8 +2115,8 @@ const PIPELINE = {
           "note": "WS handshake took the direct-services terminal branch"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before the IRR"
+          "state": "active",
+          "note": "enters IRR; one inference round; agentic_loop action=done"
         },
         "S11": {
           "state": "skipped",
@@ -2181,8 +2181,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "re-projects owner headers each round"
         },
         "S11": {
           "state": "skipped",
@@ -2248,8 +2248,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "one-round logical stream; still composes and populates response_object"
         },
         "S11": {
           "state": "skipped",
@@ -2316,8 +2316,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no web_search_call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2390,8 +2390,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no MCP call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2462,8 +2462,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no file_search_call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2536,8 +2536,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no local tool result produced"
         },
         "S11": {
           "state": "skipped",
@@ -2601,8 +2601,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "parses single round; action=done (no tools)"
         },
         "S11": {
           "state": "skipped",
@@ -2671,8 +2671,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "sets Content-Type"
         },
         "S11": {
           "state": "skipped",
@@ -2754,8 +2754,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S11": {
           "state": "skipped",
@@ -2821,8 +2821,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "rebuilds body; buffered (stream:false)"
         },
         "S11": {
           "state": "skipped",
@@ -2892,8 +2892,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
         },
         "S11": {
           "state": "skipped",
@@ -2961,8 +2961,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
         },
         "S11": {
           "state": "skipped",
@@ -3712,8 +3712,8 @@ const PIPELINE = {
       "id": "S10",
       "label": "Non-Responses body on /v1/responses",
       "request": "POST /v1/responses with Chat Completions / Anthropic / unclassified body",
-      "entersIRR": false,
-      "loopRounds": 0
+      "entersIRR": true,
+      "loopRounds": 1
     },
     {
       "id": "S11",
@@ -3956,8 +3956,10 @@ const SCEN_META = {
     "services": []
   },
   "S10": {
-    "narr": "\u003cb\u003eNon-Responses body.\u003c/b\u003e A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, so no router route matches — a route-miss returns a bare 404 before any body filter runs.",
-    "clusters": [],
+    "narr": "\u003cb\u003eChat/Anthropic body on /v1/responses.\u003c/b\u003e Operation identity is authoritative over body shape (#1602): ai_operation matches the POST /v1/responses head and openai_responses_request forces format=openai_responses, so a Chat/Anthropic/unclassified body routes by model through the Responses catch-all to the managed inference-backend and runs one IRR round, returning 200 - superseding the pre-#1602 route-miss 404.",
+    "clusters": [
+      "inference-backend"
+    ],
     "services": []
   },
   "S11": {
@@ -4245,17 +4247,17 @@ const WIRE = {
       "x-auth-tenant: integration-tenant",
       "x-auth-user: integration-user"
     ],
-    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
+    "reqBody": "{\n  \"model\": \"gpt-4\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
     "resStatus": "200 OK",
     "resKind": "json",
     "resHeaders": [
       "Content-Type: application/json"
     ],
-    "resBody": "{\n  \"id\": \"resp_chat_shaped_body\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"model\": \"gpt-4.1\",\n  \"status\": \"completed\",\n  \"output\": []\n}",
-    "notes": "Operation identity is authoritative over body shape (#1602). ai_operation matches the request head POST /v1/responses -\u003e createResponse (application_protocol=openai_responses), and openai_responses_request's classify_matched_operation then forces format=openai_responses for the matched create body regardless of its {model,messages} Chat shape, promoting x-praxis-ai-format:openai_responses and x-praxis-ai-model:gpt-4.1. The model-specific /v1/responses routes do not match (gpt-5 and vllm-chat require their x-praxis-ai-model), so the body falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend). That cluster is not application_provider=openai, so the direct-OpenAI branch is skipped and the managed path handles the request, reaching the inference backend which returns a Response object -\u003e 200. This supersedes the pre-#1602 behavior, where a Chat/Anthropic-shaped body demoted the format fact and missed every format-constrained route, yielding a bare 404. The resBody mirrors the minimal completed Response the integration test's capturing backend returns (output shape is produced by the real inference backend).",
+    "resBody": "{\n  \"id\": \"resp_chat_body\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"model\": \"gpt-4\",\n  \"status\": \"completed\",\n  \"output\": []\n}",
+    "notes": "Operation identity is authoritative over body shape (#1602). ai_operation matches the request head POST /v1/responses -\u003e createResponse (application_protocol=openai_responses), and openai_responses_request's classify_matched_operation then forces format=openai_responses for the matched create body regardless of its {model,messages} Chat shape, promoting x-praxis-ai-format:openai_responses and x-praxis-ai-model:gpt-4. The model-specific /v1/responses routes do not match (gpt-5 and vllm-chat require their x-praxis-ai-model), so the body falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend). That cluster is not application_provider=openai, so the direct-OpenAI branch is skipped and the managed path handles the request, reaching the inference backend which returns a Response object -\u003e 200. This supersedes the pre-#1602 behavior, where a Chat/Anthropic-shaped body demoted the format fact and missed every format-constrained route, yielding a bare 404. The resBody mirrors the minimal completed Response the integration test's capturing backend returns (output shape is produced by the real inference backend).",
     "provenance": [
       "apis/src/openai/responses/request/mod.rs:550-552 (classify_matched_operation forces classified.format = AiRequestFormat::Responses for a matched Responses create body, so body shape never demotes the format fact)",
-      "examples/configs/openai/responses/full-flow-agentic.yaml:427-430 (router Responses catch-all: path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend, reached once the gpt-5/vllm-chat model routes miss)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:432-435 (router Responses catch-all: path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend, reached once the gpt-5/vllm-chat model routes miss)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-532 (full_flow_chat_completions_body_on_responses_path_is_treated_as_responses asserts 200 and the backend receives the request once)",
       {
         "tests/integration/tests/suite/examples/full_flow_agentic.rs:534-577 (full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses": "same Responses routing for an Anthropic-shaped body)"

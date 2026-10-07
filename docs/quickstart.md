@@ -36,6 +36,8 @@ listeners:
 filter_chains:
   - name: openai
     filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
       - filter: router
