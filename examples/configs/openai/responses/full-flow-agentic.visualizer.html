@@ -4246,21 +4246,20 @@ const WIRE = {
       "x-auth-user: integration-user"
     ],
     "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
-    "resStatus": "404 Not Found",
-    "resKind": "none",
+    "resStatus": "200 OK",
+    "resKind": "json",
     "resHeaders": [
-      "Connection: close"
+      "Content-Type: application/json"
     ],
-    "resBody": "",
-    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by the pre-routing openai_responses_request, so none of the router's /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.",
+    "resBody": "{\n  \"id\": \"resp_chat_shaped_body\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"model\": \"gpt-4.1\",\n  \"status\": \"completed\",\n  \"output\": []\n}",
+    "notes": "Operation identity is authoritative over body shape (#1602). ai_operation matches the request head POST /v1/responses -\u003e createResponse (application_protocol=openai_responses), and openai_responses_request's classify_matched_operation then forces format=openai_responses for the matched create body regardless of its {model,messages} Chat shape, promoting x-praxis-ai-format:openai_responses and x-praxis-ai-model:gpt-4.1. The model-specific /v1/responses routes do not match (gpt-5 and vllm-chat require their x-praxis-ai-model), so the body falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend). That cluster is not application_provider=openai, so the direct-OpenAI branch is skipped and the managed path handles the request, reaching the inference backend which returns a Response object -\u003e 200. This supersedes the pre-#1602 behavior, where a Chat/Anthropic-shaped body demoted the format fact and missed every format-constrained route, yielding a bare 404. The resBody mirrors the minimal completed Response the integration test's capturing backend returns (output shape is produced by the real inference backend).",
     "provenance": [
-      "examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
+      "apis/src/openai/responses/request/mod.rs:550-552 (classify_matched_operation forces classified.format = AiRequestFormat::Responses for a matched Responses create body, so body shape never demotes the format fact)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:427-430 (router Responses catch-all: path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend, reached once the gpt-5/vllm-chat model routes miss)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-532 (full_flow_chat_completions_body_on_responses_path_is_treated_as_responses asserts 200 and the backend receives the request once)",
       {
-        "tests/integration/tests/suite/examples/full_flow_agentic.rs:521-560 (full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend": "same route-miss for an Anthropic body)"
-      },
-      "~/.cargo/registry/.../praxis-proxy-filter-0.7.1/src/builtins/http/traffic_management/router/mod.rs (route-miss =\u003e Rejection::status(404), body:None) [praxis core dep]",
-      "~/.cargo/registry/.../praxis-proxy-protocol-0.7.1/src/http/pingora/convert.rs (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:534-577 (full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses": "same Responses routing for an Anthropic-shaped body)"
+      }
     ]
   },
   "S11": {
