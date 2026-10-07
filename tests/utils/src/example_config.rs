@@ -140,7 +140,17 @@ pub fn example_config_path(filename: &str) -> String {
 /// let result = praxis_test_utils::patch_yaml(yaml, 9999, &HashMap::new());
 /// assert_eq!(result, "address: \"127.0.0.1:9999\"");
 /// ```
+///
+/// # Panics
+///
+/// Panics if `port_map` contains an empty address, which would match at every
+/// position without consuming any input.
 pub fn patch_yaml(yaml: &str, listener_port: u16, port_map: &HashMap<&str, u16>) -> String {
+    assert!(
+        port_map.keys().all(|address| !address.is_empty()),
+        "port_map addresses must not be empty"
+    );
+
     // Longest needle first so a shorter address that prefixes another cannot
     // claim the match; `port_map` wins ties, since it is caller-supplied.
     let mut rules: Vec<(&str, u16)> = port_map.iter().map(|(address, port)| (*address, *port)).collect();
@@ -246,6 +256,14 @@ mod tests {
         let yaml = "upstream: \"10.0.0.1:443\"";
         let result = patch_yaml(yaml, 8080, &HashMap::new());
         assert_eq!(result, yaml, "unmatched addresses should stay unchanged");
+    }
+
+    /// An empty address matches everywhere without consuming input, so the
+    /// scan would append replacements forever; reject it up front.
+    #[test]
+    #[should_panic(expected = "port_map addresses must not be empty")]
+    fn patch_yaml_rejects_an_empty_address() {
+        patch_yaml("address: \"0.0.0.0:8080\"", 8080, &HashMap::from([("", 5555_u16)]));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use std::{
     collections::HashSet,
     net::TcpListener,
+    ops::Range,
     sync::{
         LazyLock, Mutex, PoisonError,
         atomic::{AtomicU16, Ordering},
@@ -16,12 +17,26 @@ use std::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Number of ports in the reserved band below the OS ephemeral range.
+/// Number of ports the reserved band takes when the OS range allows it.
 ///
 /// Ports are never returned to the band, so this bounds how many a single
 /// test binary can allocate over its whole run. The integration suite uses
 /// roughly a third of it.
-const BAND_WIDTH: u16 = 8192;
+const PREFERRED_BAND_WIDTH: u16 = 8192;
+
+/// Smallest band worth reserving.
+///
+/// A narrower band would wrap around and exhaust itself part-way through a
+/// test binary, so below this width [`bind_unique_port`] falls back to the OS
+/// instead.
+const MIN_BAND_WIDTH: u16 = 1024;
+
+/// Lowest port the reserved band may use.
+///
+/// Above every port an example config binds or dials — the highest is Ollama's
+/// `11434` — so an allocated port can never equal an address that a test
+/// rewrites by substring.
+const BAND_FLOOR: u16 = 12000;
 
 /// Ephemeral floor assumed when the OS range cannot be read.
 ///
@@ -54,12 +69,13 @@ const ALIAS_CEILING: u16 = 30000;
 /// candidate that proved unusable is not retried.
 static ALLOCATED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// First port of the reserved band.
+/// The reserved band, or `None` when the OS ephemeral range reaches too low
+/// to leave one.
 ///
-/// Ports are handed out from `[BAND_START, BAND_START + BAND_WIDTH)`, which
-/// sits entirely below the OS ephemeral range (and below [`ALIAS_CEILING`]).
-/// A listener bound to port `0` therefore cannot be assigned a port that this
-/// allocator also hands out: the two pools are disjoint by construction.
+/// Ports are handed out from this half-open range, which sits entirely below
+/// the OS ephemeral range (and below [`ALIAS_CEILING`]). A listener bound to
+/// port `0` therefore cannot be assigned a port that this allocator also
+/// hands out: the two pools are disjoint by construction.
 ///
 /// This matters because test servers bind `127.0.0.1:0` directly, without
 /// consulting [`ALLOCATED_PORTS`]. Drawing proxy ports from the ephemeral
@@ -68,25 +84,36 @@ static ALLOCATED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::
 /// before the proxy bound. The proxy's bind then failed on its own thread
 /// while the readiness probe was satisfied by the squatting server, so the
 /// test ran its whole scenario against an unrelated backend.
-static BAND_START: LazyLock<u16> = LazyLock::new(|| band_end() - BAND_WIDTH);
+static BAND: LazyLock<Option<Range<u16>>> = LazyLock::new(|| select_band(ephemeral_floor()));
 
 /// Rotating offset into the reserved band.
 ///
 /// Seeded per process so that concurrently running test binaries start at
 /// different points in the band instead of contending over its first ports.
+/// Taken modulo the band width at each use, since the width is not known
+/// until the band is selected.
 static CURSOR: LazyLock<AtomicU16> = LazyLock::new(|| AtomicU16::new(seed_offset()));
 
 // -----------------------------------------------------------------------------
 // Band Selection
 // -----------------------------------------------------------------------------
 
-/// One past the last port of the reserved band.
+/// The reserved band for a given OS ephemeral floor.
 ///
-/// Below the OS ephemeral range so that a bind to port `0` cannot collide,
-/// and below [`ALIAS_CEILING`] so that substring address patching cannot
-/// corrupt an allocated port.
-fn band_end() -> u16 {
-    ephemeral_floor().min(ALIAS_CEILING)
+/// The band ends below that floor so that a bind to port `0` cannot collide,
+/// below [`ALIAS_CEILING`] so that substring address patching cannot corrupt
+/// an allocated port, and starts at or above [`BAND_FLOOR`] so that it holds
+/// no port an example config uses.
+///
+/// A low floor is honored rather than overridden: substituting a default
+/// would place the band inside the OS range and recreate the collision the
+/// band exists to prevent. When those bounds leave less than
+/// [`MIN_BAND_WIDTH`] ports, there is no band to reserve and this returns
+/// `None`.
+fn select_band(ephemeral_floor: u16) -> Option<Range<u16>> {
+    let end = ephemeral_floor.min(ALIAS_CEILING);
+    let width = PREFERRED_BAND_WIDTH.min(end.checked_sub(BAND_FLOOR)?);
+    (width >= MIN_BAND_WIDTH).then(|| (end - width)..end)
 }
 
 /// Lowest port the OS assigns when asked to bind port `0`.
@@ -101,20 +128,18 @@ fn ephemeral_floor() -> u16 {
         .split_whitespace()
         .next()
         .and_then(|low| low.parse::<u16>().ok())
-        // A floor at or below the band width leaves no room beneath it.
-        .filter(|low| *low > BAND_WIDTH)
         .unwrap_or(DEFAULT_EPHEMERAL_FLOOR)
 }
 
 /// A per-process starting offset into the reserved band.
 fn seed_offset() -> u16 {
-    let pid = u16::try_from(std::process::id() % u32::from(BAND_WIDTH)).unwrap_or(0);
+    let pid = u16::try_from(std::process::id() % u32::from(u16::MAX)).unwrap_or(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| {
-            u16::try_from(since.subsec_nanos() % u32::from(BAND_WIDTH)).unwrap_or(0)
+            u16::try_from(since.subsec_nanos() % u32::from(u16::MAX)).unwrap_or(0)
         });
-    (pid ^ nanos) % BAND_WIDTH
+    pid ^ nanos
 }
 
 // -----------------------------------------------------------------------------
@@ -124,21 +149,24 @@ fn seed_offset() -> u16 {
 /// Bind a port from the reserved band that no other caller in this
 /// process has claimed, registering it before the bind is attempted.
 ///
+/// Falls back to an OS-assigned port when the ephemeral range leaves no room
+/// for a band; see [`bind_ephemeral_port`].
+///
 /// # Panics
 ///
 /// Panics if no port in the band can be bound.
 pub fn bind_unique_port() -> (TcpListener, u16) {
-    for _ in 0..BAND_WIDTH {
-        let offset = CURSOR.fetch_add(1, Ordering::Relaxed) % BAND_WIDTH;
-        let port = *BAND_START + offset;
+    let Some(band) = BAND.as_ref() else {
+        return bind_ephemeral_port();
+    };
+    let width = band.end - band.start;
+
+    for _ in 0..width {
+        let port = band.start + CURSOR.fetch_add(1, Ordering::Relaxed) % width;
 
         // Claim the port before binding so a bind failure (a service outside
         // this process holds it) retires the candidate instead of spinning.
-        if !ALLOCATED_PORTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(port)
-        {
+        if !claim(port) {
             continue;
         }
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
@@ -147,9 +175,42 @@ pub fn bind_unique_port() -> (TcpListener, u16) {
     }
     panic!(
         "failed to bind a port in the reserved band {}..{}",
-        *BAND_START,
-        *BAND_START + BAND_WIDTH
+        band.start, band.end
     );
+}
+
+/// Bind an OS-assigned port that no other caller in this process has claimed.
+///
+/// The degraded path, taken only when the OS ephemeral range reaches below
+/// [`BAND_FLOOR`] and so leaves no disjoint band. Nothing keeps a server that
+/// binds `127.0.0.1:0` out of this range, so the cross-talk the band prevents
+/// remains possible here; it is still better than carving a band out of the
+/// ephemeral range, which would make that collision systematic.
+///
+/// # Panics
+///
+/// Panics if no unclaimed ephemeral port can be bound.
+fn bind_ephemeral_port() -> (TcpListener, u16) {
+    for _ in 0..64 {
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            continue;
+        };
+        let Ok(port) = listener.local_addr().map(|address| address.port()) else {
+            continue;
+        };
+        if claim(port) {
+            return (listener, port);
+        }
+    }
+    panic!("failed to bind an unclaimed ephemeral port");
+}
+
+/// Record `port` as claimed by this process, reporting whether it was new.
+fn claim(port: u16) -> bool {
+    ALLOCATED_PORTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(port)
 }
 
 /// A held port that keeps its [`TcpListener`] open until dropped or released.
@@ -189,7 +250,8 @@ impl std::fmt::Display for PortGuard {
 ///
 /// The returned port is unbound, so the caller races anything that binds an
 /// explicit port. It does not race a listener bound to port `0`, because the
-/// band sits below the OS ephemeral range.
+/// band sits below the OS ephemeral range — unless that range reaches so low
+/// that no band exists and [`bind_ephemeral_port`] supplies the port.
 pub fn free_port() -> u16 {
     let (_listener, port) = bind_unique_port();
     port
@@ -236,6 +298,11 @@ mod tests {
 
     #[test]
     fn allocated_ports_sit_below_the_ephemeral_range() {
+        let Some(band) = BAND.as_ref() else {
+            // This host's ephemeral range leaves no band; the fallback path
+            // deliberately allocates from inside it.
+            return;
+        };
         let floor = ephemeral_floor();
         for _ in 0..64 {
             let port = free_port();
@@ -244,14 +311,52 @@ mod tests {
                 "port {port} must sit below the ephemeral floor {floor} so that a \
                  bind to port 0 can never be assigned it"
             );
-            assert!(port >= *BAND_START, "port {port} must sit inside the reserved band");
+            assert!(band.contains(&port), "port {port} must sit inside the reserved band");
         }
     }
 
-    /// No port in the band may begin with a port that example configs use, or
-    /// the substring address patching in individual tests would rewrite it.
+    /// Whatever the OS range, the band must stay out of it. A floor the band
+    /// cannot fit under yields no band at all rather than one placed inside
+    /// the ephemeral range.
+    #[test]
+    fn no_ephemeral_floor_yields_a_band_that_reaches_into_the_os_range() {
+        for floor in 0..=u16::MAX {
+            let Some(band) = select_band(floor) else {
+                continue;
+            };
+            assert!(
+                band.end <= floor,
+                "band {band:?} selected for ephemeral floor {floor} reaches into the OS \
+                 range, so a bind to port 0 could be assigned an allocated port"
+            );
+            assert!(
+                band.start >= BAND_FLOOR && band.end <= ALIAS_CEILING,
+                "band {band:?} selected for ephemeral floor {floor} escapes {BAND_FLOOR}..{ALIAS_CEILING}"
+            );
+        }
+    }
+
+    /// The regression this guards: a floor below the band width used to be
+    /// discarded in favor of [`DEFAULT_EPHEMERAL_FLOOR`], which put the band
+    /// at `21808..30000` — squarely inside an ephemeral range starting at
+    /// `8000`.
+    #[test]
+    fn a_low_ephemeral_floor_is_honored_rather_than_replaced_by_the_default() {
+        assert_eq!(
+            select_band(8000),
+            None,
+            "a floor of 8000 leaves no room below it, so no band may be reserved"
+        );
+    }
+
+    /// No port in the band may be, or begin with, a port that example configs
+    /// use, or the substring address patching in individual tests would
+    /// rewrite it.
     #[test]
     fn no_band_port_aliases_an_example_config_port() {
+        let Some(band) = BAND.as_ref() else {
+            return;
+        };
         let example_ports = example_config_ports();
         assert!(
             example_ports.contains(&3001),
@@ -259,18 +364,22 @@ mod tests {
         );
 
         for example in example_ports {
+            assert!(
+                !band.contains(&example),
+                "band {band:?} contains the example-config port {example} itself; a test \
+                 patching \"127.0.0.1:{example}\" by substring would rewrite an unrelated \
+                 address bound to it"
+            );
             for suffix in 0..10_u32 {
                 let Ok(alias) = u16::try_from(u32::from(example) * 10 + suffix) else {
                     // Extends past the port range, so it can never be allocated.
                     continue;
                 };
                 assert!(
-                    alias < *BAND_START || alias >= band_end(),
-                    "band {}..{} contains {alias}, which begins with the example-config \
+                    !band.contains(&alias),
+                    "band {band:?} contains {alias}, which begins with the example-config \
                      port {example}; a test patching \"127.0.0.1:{example}\" by substring \
-                     would corrupt an address bound to {alias}",
-                    *BAND_START,
-                    band_end()
+                     would corrupt an address bound to {alias}"
                 );
             }
         }
@@ -324,6 +433,12 @@ mod tests {
 
     #[test]
     fn a_released_port_is_not_reassigned_to_an_ephemeral_bind() {
+        if BAND.is_none() {
+            // No band on this host, so the fallback hands out ephemeral ports
+            // by design and this property cannot hold.
+            return;
+        }
+
         // The regression: `free_port` closes its probe listener, so the port is
         // unbound when it is returned. A server that binds port 0 must still be
         // unable to receive it.
