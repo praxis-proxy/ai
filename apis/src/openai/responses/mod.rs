@@ -391,7 +391,9 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 ///
 /// `prompt.id` refers to OpenAI's deprecated reusable prompt object, retired
 /// with `v1/prompts` on 2026-11-30; new clients should send prompt content
-/// through `input`/`instructions` instead of a saved prompt reference.
+/// through `input` instead of a saved prompt reference. Prefer `input` over
+/// top-level `instructions`, which managed-path content-policy extraction does
+/// not screen.
 ///
 /// Use with branch chains to route stateful and stateless requests to
 /// different clusters.

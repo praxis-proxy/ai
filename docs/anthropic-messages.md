@@ -433,7 +433,7 @@ Body classification precedence:
 1. `input` or object-valued `prompt` → OpenAI Responses
    (an object-valued `prompt` is OpenAI's deprecated reusable
    prompt object, retired with `v1/prompts` on 2026-11-30; new
-   clients should send prompt content via `input`/`instructions`)
+   clients should send prompt content via `input`)
 2. `messages` + `max_tokens` + Anthropic structural
    signals → Anthropic Messages
 3. `messages` alone → OpenAI Chat Completions
