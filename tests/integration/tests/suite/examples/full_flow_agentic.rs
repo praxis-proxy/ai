@@ -875,6 +875,24 @@ fn full_flow_local_stream_completion_updates_conversation() {
     );
     assert_eq!(items[0]["content"][0]["text"], "search the weather");
     assert_eq!(items[1]["type"], "web_search_call");
+
+    // The guardrail phase must actually screen the failed web-search result
+    // before it re-enters the model; a test that never asserts the NeMo call
+    // would still pass if that phase were removed.
+    let nemo_requests = nemo.requests();
+    assert_eq!(
+        nemo_requests.len(),
+        1,
+        "NeMo must screen the failed web-search result exactly once",
+    );
+    let screened = &nemo_requests[0];
+    assert_eq!(screened.method, "POST", "guardrail callout must POST to NeMo");
+    assert_eq!(screened.uri, "/v1/checks", "guardrail callout must target /v1/checks");
+    assert!(
+        screened.body.contains("max_tool_calls was exhausted"),
+        "NeMo request must carry the failed web-search result: {}",
+        screened.body,
+    );
 }
 
 /// A chunked non-streaming Responses body must remain buffered until the

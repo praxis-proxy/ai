@@ -752,9 +752,16 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
 class NemoGuardrailsHandler(BaseHTTPRequestHandler):
     """Passing NeMo `/v1/checks` mock used by the full-flow SDK tests."""
 
-    request_count = 0
+    #: Total `/v1/checks` requests served across all instances since the last reset.
+    request_count: ClassVar[int] = 0
     requests: ClassVar[list[dict[str, Any]]] = []
-    lock = threading.Lock()
+    lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def reset(cls):
+        with cls.lock:
+            cls.requests.clear()
+            cls.request_count = 0
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -4920,8 +4927,7 @@ def search_server():
 @pytest.fixture(scope="session")
 def nemo_guardrails_server():
     """Start a deterministic passing NeMo mock for guarded SDK tool tests."""
-    NemoGuardrailsHandler.request_count = 0
-    NemoGuardrailsHandler.requests = []
+    NemoGuardrailsHandler.reset()
     port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", port), NemoGuardrailsHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
