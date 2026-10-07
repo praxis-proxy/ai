@@ -141,19 +141,24 @@ fn bodyless_models_probe_reaches_the_backend() {
 // Protocol ownership on the catch-all route
 // -----------------------------------------------------------------------------
 
-/// The chain keeps a head-driven owner for the OpenAI protocol decision.
+/// The chain classifies OpenAI operations from the request head.
 ///
-/// `openai_responses_request` resolves Responses operations only, so it does
-/// not speak for the `POST /v1/chat/completions` a coding client also sends
-/// through this chain's catch-all route. `ai_operation` does, and it is
-/// what installs the OpenAI error formatter for a proxy-generated failure on
-/// that path; the previous body classifier used to cover it. Nothing else in
-/// the chain derives that fact, so removing the filter silently drops it.
+/// `openai_responses_request` resolves Responses operations only, so the
+/// `POST /v1/chat/completions` a coding client also sends through this
+/// chain's catch-all route leaves it with no operation identity at all.
+/// `ai_operation` resolves one for every OpenAI operation, from the head
+/// alone, which is what the body classifier this chain used to lead with
+/// could only do after reading a body.
 ///
-/// Pinned at the pipeline rather than on the wire: every route here runs
-/// inside the `iterative_request_router` step, which answers an upstream
-/// transport failure with its own 502 and never reaches the `fail_to_proxy`
-/// path that consults the formatter.
+/// Pinned at the pipeline rather than on the wire, because the facts that
+/// ownership produces are internal: the published application protocol and
+/// operation ID, and the protocol-shaped error formatter keyed off them.
+/// Nothing on this chain's own routes exercises the formatter either — every
+/// route runs inside the `iterative_request_router` step, which answers an
+/// upstream transport failure with its own 502 rather than through the
+/// `fail_to_proxy` path that consults it. So the assertion is on chain
+/// composition: nothing else here classifies non-Responses OpenAI traffic,
+/// and removing the filter silently drops that.
 #[test]
 fn the_chain_owns_the_openai_protocol_decision() {
     let db = TempSqlite::new("client_tool_compat_protocol_owner");
@@ -162,8 +167,9 @@ fn the_chain_owns_the_openai_protocol_decision() {
 
     assert!(
         pipeline.contains_filter("ai_operation"),
-        "the chain must classify OpenAI operations from the request head so \
-         non-Responses traffic keeps the OpenAI error shape"
+        "the chain must keep a request-head operation classifier so the \
+         non-Responses traffic it forwards still resolves to an OpenAI \
+         protocol"
     );
 }
 

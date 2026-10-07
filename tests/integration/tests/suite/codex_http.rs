@@ -484,19 +484,23 @@ fn translated_chain_passes_bodyless_models_probe() {
     );
 }
 
-/// The translated chain keeps a head-driven owner for the protocol decision.
+/// The translated chain classifies OpenAI operations from the request head.
 ///
-/// `openai_responses_request` resolves Responses operations only, so it does
-/// not speak for the non-Responses traffic this chain's catch-all route also
-/// forwards. `ai_operation` does, and it is what installs the OpenAI error
-/// formatter for a proxy-generated failure on that path; the body classifier
-/// this chain used to run covered it. Nothing else here derives that fact, so
-/// removing the filter silently drops it.
+/// `openai_responses_request` resolves Responses operations only, so the
+/// non-Responses traffic this chain's catch-all route also forwards leaves it
+/// with no operation identity at all. `ai_operation` resolves one for every
+/// OpenAI operation, from the head alone, which is what the body classifier
+/// this chain used to lead with could only do after reading a body.
 ///
-/// Pinned at the pipeline rather than on the wire: every route here runs
-/// inside the `iterative_request_router` step, which answers an upstream
-/// transport failure with its own 502 and never reaches the `fail_to_proxy`
-/// path that consults the formatter.
+/// Pinned at the pipeline rather than on the wire, because the facts that
+/// ownership produces are internal: the published application protocol and
+/// operation ID, and the protocol-shaped error formatter keyed off them.
+/// Nothing on this chain's own routes exercises the formatter either — every
+/// route runs inside the `iterative_request_router` step, which answers an
+/// upstream transport failure with its own 502 rather than through the
+/// `fail_to_proxy` path that consults it. So the assertion is on chain
+/// composition: nothing else here classifies non-Responses OpenAI traffic,
+/// and removing the filter silently drops that.
 #[test]
 fn translated_chain_owns_the_openai_protocol_decision() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/codex-http-chat-translation.yaml"))
@@ -506,8 +510,9 @@ fn translated_chain_owns_the_openai_protocol_decision() {
 
     assert!(
         build_pipeline(&config).contains_filter("ai_operation"),
-        "the chain must classify OpenAI operations from the request head so \
-         non-Responses traffic keeps the OpenAI error shape"
+        "the chain must keep a request-head operation classifier so the \
+         non-Responses traffic it forwards still resolves to an OpenAI \
+         protocol"
     );
 }
 

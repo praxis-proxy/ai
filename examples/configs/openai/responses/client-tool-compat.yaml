@@ -29,11 +29,13 @@ listeners:
 filter_chains:
   - name: client-tool-compat
     filters:
-      # Owns the protocol decision for every OpenAI operation this chain can
-      # see, from the request head alone. A coding client also sends Chat
-      # Completions through the catch-all route below, and this is what keeps
-      # a proxy-generated failure on that path in the OpenAI error shape
-      # rather than RFC 9457 problem details.
+      # Resolves the operation and its application protocol from the request
+      # head, for every OpenAI operation this chain can see. A coding client
+      # also sends Chat Completions through the catch-all route below, which
+      # openai_responses_request does not speak for, so this is the chain's
+      # single owner of the protocol decision — taken before any body is read,
+      # and published as x-praxis-ai-application-protocol,
+      # x-praxis-ai-operation, metadata, and filter results.
       - filter: ai_operation
 
       # Recognizes the operation from the request head, so bodyless and
