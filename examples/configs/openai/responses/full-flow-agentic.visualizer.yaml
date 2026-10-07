@@ -968,15 +968,13 @@ pipeline:
     name: openai_responses_compact
     group: context
     filter_type: openai_responses_compact
-    phase: request-phase pre-security summarization callout; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; gated unless bound_upstream.application_provider=openai
+    phase: request-phase pre-security summarization callout; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; owns an ordinary pre-read request-body hook so it cannot carry a bound_upstream condition (core rejects that combination); OpenAI-bound requests skip it structurally via the direct-openai terminal branch
     config:
       inference_url: http://127.0.0.1:3001/v1/chat/completions
       allow_private_inference_url: true
       allow_pre_security_callout: true
       default_model: gpt-4o-mini
       timeout_ms: 60000
-      conditions:
-      - 'unless bound_upstream.application_provider: openai'
     promotes: summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management
     scenarios:
       S1:
@@ -1014,7 +1012,7 @@ pipeline:
         note: direct-services terminal branch; never reached
       S12:
         state: skipped
-        note: application_provider=openai gate plus the direct-openai terminal branch; never reached
+        note: direct-openai terminal branch stops the parent chain before this filter; never reached
       S13:
         state: passthrough
         note: managed chat create without context_management; the summarizer is inert
