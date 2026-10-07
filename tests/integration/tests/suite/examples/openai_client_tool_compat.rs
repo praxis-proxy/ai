@@ -521,7 +521,7 @@ fn codex_mcp_namespace_group_round_trips_through_the_hashed_wire_name() {
     );
 
     // Request phase: the backend saw the hashed flat private function name.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
