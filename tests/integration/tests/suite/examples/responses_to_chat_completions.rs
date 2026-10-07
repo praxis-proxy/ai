@@ -140,7 +140,8 @@ fn responses_validator_rejects_prompt_template_before_chat_upstream() {
         "managed prompt must use the invalid-request error type"
     );
     assert_eq!(
-        response["error"]["message"], "prompt templates are supported only for OpenAI-owned upstreams",
+        response["error"]["message"],
+        "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
         "the canonical validator must own managed-provider prompt policy"
     );
     assert!(

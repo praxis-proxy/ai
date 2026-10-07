@@ -81,7 +81,7 @@ fn mode_branch_rejects_prompt_before_upstream() {
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(
         response["error"]["message"],
-        "prompt templates are supported only for OpenAI-owned upstreams"
+        "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
     );
 }
 

@@ -604,7 +604,7 @@ fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
         FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "prompt templates are supported only for OpenAI-owned upstreams",
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
         ))
     })
 }
