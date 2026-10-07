@@ -12,14 +12,16 @@
 # responses. Non-streaming and non-success responses pass through
 # without measurement.
 #
-# A classifying filter (openai_responses_request, anthropic_messages_format, or
-# anthropic_messages_to_chat_completions) must run upstream to set model metadata in the request
-# path. Without one, all TTFT samples are labeled "unknown".
+# A classifying filter (openai_responses_request, openai_chat_completions_format,
+# anthropic_messages_format, or anthropic_messages_to_chat_completions) must run
+# upstream to set model metadata in the request path. Without one, all TTFT
+# samples are labeled "unknown".
 #
-# openai_responses_request classifies only Responses operations, so native Chat
-# Completions requests (POST /v1/chat/completions) carry no model fact and are
-# labeled "unknown". This example measures Responses traffic (see the curl above);
-# Anthropic and translated-to-Chat traffic are labeled by their own classifiers.
+# This example classifies both Responses and native Chat Completions traffic:
+# ai_operation publishes the typed operation head, openai_responses_request reads
+# the model from Responses create bodies, and openai_chat_completions_format reads
+# it from native POST /v1/chat/completions bodies. Anthropic and translated-to-Chat
+# traffic are labeled by their own classifiers.
 
 listeners:
   - name: default
@@ -30,11 +32,15 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      # Publishes the typed operation consumed by openai_responses_request.
+      # Publishes the typed operation head consumed by the body classifiers below.
       - filter: ai_operation
 
+      # Labels Responses create traffic with the model from the request body.
       - filter: openai_responses_request
         initialize_state: false
+
+      # Labels native POST /v1/chat/completions traffic with its request model.
+      - filter: openai_chat_completions_format
 
       - filter: router
         routes:

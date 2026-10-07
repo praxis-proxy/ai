@@ -50,6 +50,35 @@ fn example_config_time_to_first_token_sse_passthrough() {
 }
 
 #[test]
+fn example_config_time_to_first_token_chat_completions_passthrough() {
+    // A native POST /v1/chat/completions request flows through the
+    // openai_chat_completions_format producer (which buffers the body to read the
+    // model) and must still forward the streamed response unchanged.
+    let backend = Backend::fixed(SSE_BODY)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "time-to-first-token.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "native chat completions should return 200");
+    assert_eq!(parse_body(&raw), SSE_BODY, "SSE body should pass through unchanged");
+}
+
+#[test]
 fn example_config_time_to_first_token_json_passthrough() {
     let backend = Backend::fixed(JSON_BODY)
         .header("content-type", "application/json")

@@ -41,6 +41,7 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`openai_agentic_loop`](openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
+| [`openai_chat_completions_format`](openai_chat_completions_format.md) | Classifies native Chat Completions create requests and promotes the model fact to durable metadata and filter results. |
 | [`openai_client_tool_compat`](openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |

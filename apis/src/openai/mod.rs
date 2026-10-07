@@ -24,8 +24,11 @@ pub(crate) mod sse;
 )]
 pub(crate) mod translation;
 
-pub use chat_completions::routes::{
-    ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
+pub use chat_completions::{
+    format::OpenaiChatCompletionsFormatFilter,
+    routes::{
+        ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
+    },
 };
 pub use conversations::{
     ConversationOperation, ConversationOperationSpec, operation_specs as conversations_operation_specs,
