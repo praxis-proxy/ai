@@ -52,7 +52,7 @@ fn example_config_time_to_first_token_sse_passthrough() {
 #[test]
 fn example_config_time_to_first_token_chat_completions_passthrough() {
     // A native POST /v1/chat/completions request flows through the
-    // openai_chat_completions_format producer (which buffers the body to read the
+    // openai_chat_completions_request producer (which buffers the body to read the
     // model) and must still forward the streamed response unchanged.
     let backend = Backend::fixed(SSE_BODY)
         .header("content-type", "text/event-stream")

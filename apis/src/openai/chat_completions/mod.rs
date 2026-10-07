@@ -3,5 +3,5 @@
 
 //! OpenAI Chat Completions API family.
 
-pub(crate) mod format;
+pub(crate) mod request;
 pub(crate) mod routes;

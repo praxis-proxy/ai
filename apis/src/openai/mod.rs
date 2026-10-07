@@ -25,7 +25,7 @@ pub(crate) mod sse;
 pub(crate) mod translation;
 
 pub use chat_completions::{
-    format::OpenaiChatCompletionsFormatFilter,
+    request::OpenaiChatCompletionsRequestFilter,
     routes::{
         ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
     },

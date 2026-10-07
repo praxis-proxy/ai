@@ -336,7 +336,7 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_chat_completions_format" => praxis_ai_apis::openai::OpenaiChatCompletionsFormatFilter::from_config
+        http "openai_chat_completions_request" => praxis_ai_apis::openai::OpenaiChatCompletionsRequestFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -691,7 +691,7 @@ mod tests {
             "callout_credentials",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
-            "openai_chat_completions_format",
+            "openai_chat_completions_request",
             "ai_operation",
             "a2a",
             "intelligent_route",

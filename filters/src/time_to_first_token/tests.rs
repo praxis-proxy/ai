@@ -235,7 +235,7 @@ fn resolve_model_chat_completions() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("openai_chat_completions_format.model", "gpt-4");
+    ctx.set_metadata("openai_chat_completions_request.model", "gpt-4");
     assert_eq!(resolve_model(&ctx), "gpt-4");
 }
 
@@ -245,7 +245,7 @@ fn resolve_model_prefers_responses_over_chat_completions() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("openai_responses_request.model", "gpt-4o");
-    ctx.set_metadata("openai_chat_completions_format.model", "gpt-4");
+    ctx.set_metadata("openai_chat_completions_request.model", "gpt-4");
     assert_eq!(resolve_model(&ctx), "gpt-4o");
 }
 

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Chat Completions request format classifier filter.
+//! Chat Completions request-body fact filter.
 //!
 //! Publishes the model fact for native `POST /v1/chat/completions` requests so a
 //! downstream consumer such as `time_to_first_token` can label metrics by model.
 //!
 //! Request-head identity comes from `ai_operation`'s typed [`AiOperationMatch`]:
 //! this filter consumes it and acts only on the body-bearing `createChatCompletion`
-//! operation, then reads the model from the buffered body. It mirrors the Responses
-//! and Anthropic Messages format producers for the Chat Completions endpoint, so
-//! the model each classifier promotes stays consistent across API families.
+//! operation, then reads the model from the buffered body. The request head
+//! remains authoritative for protocol identity; this filter only publishes
+//! body facts for downstream consumers.
 //!
 //! The filter is transparent: a body that fails to classify simply yields no model
 //! fact — it never rejects the request — so native Chat traffic forwards unchanged.
@@ -40,7 +40,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use self::config::{ChatCompletionsFormatConfig, FILTER_NAME, build_config};
+use self::config::{ChatCompletionsRequestConfig, FILTER_NAME, build_config};
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body},
     openai::chat_completions::routes as chat_completions_routes,
@@ -49,48 +49,48 @@ use crate::{
 };
 
 // -----------------------------------------------------------------------------
-// OpenaiChatCompletionsFormatFilter
+// OpenaiChatCompletionsRequestFilter
 // -----------------------------------------------------------------------------
 
-/// Classifies native Chat Completions create requests and promotes the model
-/// fact to durable metadata and filter results.
+/// Publishes body facts for native Chat Completions create requests to durable
+/// metadata and filter results.
 ///
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_chat_completions_format
+/// filter: openai_chat_completions_request
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_chat_completions_format
+/// filter: openai_chat_completions_request
 /// max_body_bytes: 1048576
 /// ```
-pub struct OpenaiChatCompletionsFormatFilter {
+pub struct OpenaiChatCompletionsRequestFilter {
     /// Parsed and validated configuration.
-    config: ChatCompletionsFormatConfig,
+    config: ChatCompletionsRequestConfig,
 }
 
-impl OpenaiChatCompletionsFormatFilter {
+impl OpenaiChatCompletionsRequestFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ChatCompletionsFormatConfig = parse_filter_config(FILTER_NAME, config)?;
+        let cfg: ChatCompletionsRequestConfig = parse_filter_config(FILTER_NAME, config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiChatCompletionsFormatFilter {
+impl HttpFilter for OpenaiChatCompletionsRequestFilter {
     fn name(&self) -> &'static str {
         // A string literal (not the `FILTER_NAME` const) so the filter-doc
         // generator's source scanner can extract the registered name.
-        "openai_chat_completions_format"
+        "openai_chat_completions_request"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -169,19 +169,19 @@ fn is_create_chat_completion(ctx: &HttpFilterContext<'_>) -> bool {
 /// proved the operation; only the model and stream flag are read from the body.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     ctx.set_metadata(
-        "openai_chat_completions_format.format",
+        "openai_chat_completions_request.format",
         AiRequestFormat::ChatCompletions.as_str(),
     );
 
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("openai_chat_completions_format.model", model.clone());
+        ctx.set_metadata("openai_chat_completions_request.model", model.clone());
     }
 
     if let Some(stream) = classified.stream {
         ctx.set_metadata(
-            "openai_chat_completions_format.stream",
+            "openai_chat_completions_request.stream",
             if stream { "true" } else { "false" },
         );
     }
@@ -189,7 +189,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
 
 /// Promote classification facts to filter results for branch conditions.
 fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) -> Result<(), FilterError> {
-    let results = ctx.filter_results.entry("openai_chat_completions_format").or_default();
+    let results = ctx.filter_results.entry("openai_chat_completions_request").or_default();
 
     results.set("format", AiRequestFormat::ChatCompletions.as_str())?;
 

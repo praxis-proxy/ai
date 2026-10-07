@@ -53,8 +53,8 @@ const META_ACTIVE: &str = "time_to_first_token.active";
 /// response.
 ///
 /// The histogram's `model` label is read from metadata set by an upstream
-/// classifying filter: `openai_responses_request` (Responses create bodies),
-/// `openai_chat_completions_format` (native `POST /v1/chat/completions` bodies),
+/// request fact filter: `openai_responses_request` (Responses create bodies),
+/// `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies),
 /// `anthropic_messages_format`, or `anthropic_messages_to_chat_completions`
 /// (Anthropic, including Anthropic-to-Chat translation). If none runs before this
 /// filter, all TTFT samples are labeled `unknown`.
@@ -141,18 +141,18 @@ impl HttpFilter for TimeToFirstTokenFilter {
     }
 }
 
-/// Resolve the model label from classifier metadata with fallback.
+/// Resolve the model label from request metadata with fallback.
 ///
-/// Reads the model a Responses, native Chat Completions, or Anthropic classifier
-/// promoted on the request path. When no classifier ran, the label falls back to
-/// `unknown`.
+/// Reads the model a Responses, native Chat Completions, or Anthropic filter
+/// promoted on the request path. When no filter published a model, the label
+/// falls back to `unknown`.
 ///
 /// Values containing control characters or exceeding the promotion length
 /// cap are treated as unsafe and replaced with `"unknown"` to prevent
 /// malformed Prometheus labels or cardinality pressure.
 fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
     ctx.get_metadata("openai_responses_request.model")
-        .or_else(|| ctx.get_metadata("openai_chat_completions_format.model"))
+        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_format.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
         .filter(|v| is_promotable_value(v))

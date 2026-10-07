@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_chat_completions_format` filter.
+//! Unit tests for the `openai_chat_completions_request` filter.
 
 use bytes::Bytes;
 use http::Method;
@@ -21,7 +21,7 @@ fn default_config_parses() {
     let filter = make_filter("{}");
     assert_eq!(
         filter.name(),
-        "openai_chat_completions_format",
+        "openai_chat_completions_request",
         "filter name should match"
     );
 }
@@ -29,14 +29,14 @@ fn default_config_parses() {
 #[test]
 fn full_config_parses() {
     let filter = make_filter("max_body_bytes: 65536");
-    assert_eq!(filter.name(), "openai_chat_completions_format");
+    assert_eq!(filter.name(), "openai_chat_completions_request");
 }
 
 #[test]
 fn zero_max_body_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 0").unwrap();
     assert!(
-        OpenaiChatCompletionsFormatFilter::from_config(&yaml).is_err(),
+        OpenaiChatCompletionsRequestFilter::from_config(&yaml).is_err(),
         "zero max_body_bytes should be rejected"
     );
 }
@@ -45,7 +45,7 @@ fn zero_max_body_bytes_rejected() {
 fn unknown_fields_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("bogus: true").unwrap();
     assert!(
-        OpenaiChatCompletionsFormatFilter::from_config(&yaml).is_err(),
+        OpenaiChatCompletionsRequestFilter::from_config(&yaml).is_err(),
         "unknown fields should be rejected"
     );
 }
@@ -84,21 +84,21 @@ async fn create_request_publishes_model_fact() {
 
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_chat_completions_format.format")
+            .get("openai_chat_completions_request.format")
             .map(String::as_str),
         Some("openai_chat_completions"),
         "format fact comes from the authoritative head"
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_chat_completions_format.model")
+            .get("openai_chat_completions_request.model")
             .map(String::as_str),
         Some("gpt-4"),
         "model fact comes from the buffered body"
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_chat_completions_format.stream")
+            .get("openai_chat_completions_request.stream")
             .map(String::as_str),
         Some("true"),
         "stream flag comes from the buffered body"
@@ -106,7 +106,7 @@ async fn create_request_publishes_model_fact() {
 
     let results = ctx
         .filter_results
-        .get("openai_chat_completions_format")
+        .get("openai_chat_completions_request")
         .expect("filter results present");
     assert_eq!(results.get("format"), Some("openai_chat_completions"));
     assert_eq!(results.get("model"), Some("gpt-4"));
@@ -125,12 +125,13 @@ async fn create_request_without_model_publishes_format_only() {
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_chat_completions_format.format")
+            .get("openai_chat_completions_request.format")
             .map(String::as_str),
         Some("openai_chat_completions"),
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_chat_completions_format.model"),
+        !ctx.filter_metadata
+            .contains_key("openai_chat_completions_request.model"),
         "no model field means no model fact"
     );
 }
@@ -147,11 +148,11 @@ async fn list_operation_publishes_no_fact() {
     assert!(matches!(action, FilterAction::Release));
     assert!(
         !ctx.filter_metadata
-            .contains_key("openai_chat_completions_format.format"),
+            .contains_key("openai_chat_completions_request.format"),
         "non-create operations produce no model fact"
     );
     assert!(
-        !ctx.filter_results.contains_key("openai_chat_completions_format"),
+        !ctx.filter_results.contains_key("openai_chat_completions_request"),
         "non-create operations write no filter results"
     );
 }
@@ -165,7 +166,7 @@ async fn responses_create_is_not_a_chat_completion() {
     assert!(matches!(action, FilterAction::Release));
     assert!(
         !ctx.filter_metadata
-            .contains_key("openai_chat_completions_format.format"),
+            .contains_key("openai_chat_completions_request.format"),
         "a Responses create request must not get a Chat Completions fact"
     );
 }
@@ -186,7 +187,7 @@ async fn missing_operation_match_publishes_no_fact() {
     assert!(matches!(action, FilterAction::Release));
     assert!(
         !ctx.filter_metadata
-            .contains_key("openai_chat_completions_format.format"),
+            .contains_key("openai_chat_completions_request.format"),
         "without an operation match the producer stays silent"
     );
 }
@@ -212,7 +213,7 @@ async fn partial_body_before_eos_continues() {
     );
     assert!(
         !ctx.filter_metadata
-            .contains_key("openai_chat_completions_format.format"),
+            .contains_key("openai_chat_completions_request.format"),
         "no fact should be produced before EOS"
     );
 }
@@ -228,12 +229,13 @@ async fn oversized_model_not_promoted() {
     let (ctx, _) = run_filter(Method::POST, "/v1/chat/completions", &body).await;
 
     assert!(
-        !ctx.filter_metadata.contains_key("openai_chat_completions_format.model"),
+        !ctx.filter_metadata
+            .contains_key("openai_chat_completions_request.model"),
         "oversized model must not be promoted to metadata"
     );
     let results = ctx
         .filter_results
-        .get("openai_chat_completions_format")
+        .get("openai_chat_completions_request")
         .expect("filter results present");
     assert!(results.get("model").is_none(), "oversized model must not be in results");
 }
@@ -248,7 +250,8 @@ async fn control_char_model_not_promoted() {
     .await;
 
     assert!(
-        !ctx.filter_metadata.contains_key("openai_chat_completions_format.model"),
+        !ctx.filter_metadata
+            .contains_key("openai_chat_completions_request.model"),
         "a model with control characters must not be promoted"
     );
 }
@@ -284,5 +287,5 @@ async fn run_filter(method: Method, path: &str, body_str: &str) -> (HttpFilterCo
 /// Build a filter from a YAML snippet.
 fn make_filter(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
-    OpenaiChatCompletionsFormatFilter::from_config(&yaml).unwrap()
+    OpenaiChatCompletionsRequestFilter::from_config(&yaml).unwrap()
 }
