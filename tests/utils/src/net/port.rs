@@ -189,7 +189,7 @@ impl std::fmt::Display for PortGuard {
 ///
 /// The returned port is unbound, so the caller races anything that binds an
 /// explicit port. It does not race a listener bound to port `0`, because the
-/// band sits below the OS ephemeral range (see [`BAND_START`]).
+/// band sits below the OS ephemeral range.
 pub fn free_port() -> u16 {
     let (_listener, port) = bind_unique_port();
     port
