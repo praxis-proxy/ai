@@ -193,9 +193,10 @@ async fn a_model_only_background_create_is_still_rejected() {
     );
 }
 
-/// A body positively identified as another format keeps that identity.
+/// The matched operation is authoritative over body shape: a Chat-Completions-
+/// shaped body on `POST /v1/responses` is still a Responses request.
 #[tokio::test]
-async fn a_positively_classified_body_is_not_relabelled() {
+async fn a_matched_operation_overrides_body_shape() {
     let filter = default_filter();
     let request = create_request();
     let mut ctx = make_filter_context(&request);
@@ -209,17 +210,16 @@ async fn a_positively_classified_body_is_not_relabelled() {
         ctx.filter_metadata
             .get("openai_responses_request.format")
             .map(String::as_str),
-        Some("openai_chat_completions"),
-        "only unknown bodies are upgraded by endpoint authority"
+        Some("openai_responses"),
+        "the endpoint identity is authoritative; JSON shape cannot override it"
     );
     assert!(
-        ctx.extensions.get::<ResponsesState>().is_none(),
-        "another protocol's body must not gain Responses state, or state-driven \
-         filters would pick up traffic the validation stage used to release"
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "a create on the Responses endpoint builds state regardless of body shape"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("responses.response_id"),
-        "no proxy-owned Responses identifiers for another protocol's body"
+        ctx.filter_metadata.contains_key("responses.response_id"),
+        "a Responses create mints its proxy-owned identifier"
     );
 }
 
@@ -316,6 +316,57 @@ async fn initialize_state_false_classifies_without_building_state() {
     assert!(
         !ctx.filter_metadata.contains_key("responses.response_id"),
         "no identifier is generated when the chain opted out"
+    );
+}
+
+/// A facts publisher retains no parse unless the chain opts in. Without a
+/// managed owner to consume it, a cached parse would sit in request extensions
+/// alongside the original body for the whole forward — a request-sized copy
+/// nothing reads.
+#[tokio::test]
+async fn a_facts_publisher_retains_no_parse_by_default() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "routing facts are still published without the opt-in"
+    );
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "no parse is retained when cache_parse_for_owner is off"
+    );
+}
+
+/// The opt-in makes the facts publisher cache its parse for a managed owner.
+#[tokio::test]
+async fn cache_parse_for_owner_retains_the_parse() {
+    let filter = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_some(),
+        "the opt-in hands the parse to a later managed pass"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "a facts publisher still mints no state even when it caches"
     );
 }
 
@@ -726,7 +777,9 @@ async fn the_bound_upstream_phase_initializes_state_like_the_pre_read_phase() {
 async fn the_managed_pass_reuses_the_pre_routing_parse() {
     let body = json!({"model": "gpt-4.1", "input": "deserialize once"});
 
-    let facts = filter(FACTS_ONLY);
+    // The pre-routing publisher opts in to the handoff, so its one parse carries
+    // to the managed pass rather than being dropped and re-parsed after binding.
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
     let managed = default_filter();
     let request = create_request();
     let mut ctx = make_filter_context(&request);
@@ -1015,10 +1068,11 @@ async fn mode_is_stateful_when_store_false_but_a_marker_is_present() {
     }
 }
 
-/// Mode belongs only to Responses traffic; a Chat Completions body on the
-/// create endpoint keeps its own identity and is left without a mode.
+/// Mode is a Responses fact, and the matched operation is authoritative: a
+/// Chat-Completions-shaped body on the create endpoint is classified Responses,
+/// so it still receives a mode.
 #[tokio::test]
-async fn mode_is_absent_for_a_chat_completions_body() {
+async fn mode_is_present_for_any_body_on_the_responses_endpoint() {
     let request = create_request();
     let ctx = run_ctx(
         FACTS_ONLY,
@@ -1027,20 +1081,28 @@ async fn mode_is_absent_for_a_chat_completions_body() {
     )
     .await;
 
-    assert!(mode_result(&ctx).is_none(), "mode is not set for chat completions");
-    assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_request.mode"),
-        "mode metadata is absent for chat completions"
+    assert_eq!(
+        mode_result(&ctx),
+        Some("stateful"),
+        "endpoint authority makes this a Responses request, which defaults to stateful"
     );
-    assert!(
-        !collect_headers(&ctx).contains_key("x-praxis-responses-mode"),
-        "mode header is absent for chat completions"
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.mode")
+            .map(String::as_str),
+        Some("stateful"),
+        "mode metadata is published for the Responses operation"
+    );
+    assert_eq!(
+        collect_headers(&ctx).get("x-praxis-responses-mode"),
+        Some(&"stateful"),
+        "the mode routing header is promoted"
     );
     assert!(
         ctx.extensions
             .get::<praxis_filter::ErrorResponseFormatterHandle>()
             .is_some(),
-        "the OpenAI error formatter is still installed for chat completions"
+        "the OpenAI error formatter is installed for the Responses operation"
     );
 }
 

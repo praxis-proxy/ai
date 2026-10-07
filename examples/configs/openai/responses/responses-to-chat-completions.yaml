@@ -46,6 +46,7 @@ filter_chains:
     filters:
       - filter: openai_responses_request
         initialize_state: false
+        cache_parse_for_owner: true
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

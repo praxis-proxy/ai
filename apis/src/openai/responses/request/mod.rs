@@ -12,14 +12,14 @@
 //!
 //! The filter runs in one of two roles, chosen by `initialize_state`:
 //!
-//! - A pre-routing fact publisher (`initialize_state: false`) classifies the body, promotes the model, stream, store,
-//!   and stateful/stateless mode facts the router needs, and hands its parse to a later managed pass. It mints no
-//!   identifiers and enforces no managed-path policy, so provider-owned traffic the router may still bind to a direct
-//!   upstream keeps its fields intact.
+//! - A pre-routing fact publisher (`initialize_state: false`) classifies the body and promotes the model, stream,
+//!   store, and stateful/stateless mode facts the router needs. It mints no identifiers and enforces no managed-path
+//!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. When the
+//!   chain also sets `cache_parse_for_owner`, it hands its one parse to a later managed pass; otherwise it retains
+//!   nothing once the facts are promoted.
 //! - The managed owner (`initialize_state: true`, the default) additionally rejects `background=true` and non-null
 //!   `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When a
-//!   pre-routing pass already parsed the body, the managed pass reuses that parse rather than deserializing the body a
-//!   second time.
+//!   pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
 //!
 //! Classification metadata is published under this filter's `openai_responses_request`
 //! namespace, which downstream filters read. Filter results are published under
@@ -184,9 +184,16 @@ impl OpenaiResponsesRequestFilter {
         if !self.config.initialize_state {
             // A pre-routing fact publisher mints no identifiers and enforces no
             // managed-path policy, so provider-owned traffic the router may still
-            // bind to a direct upstream keeps its fields intact. The parse is
-            // handed to a later managed pass rather than repeated there.
-            ctx.extensions.insert(cached);
+            // bind to a direct upstream keeps its fields intact.
+            //
+            // Its parse is handed to a later managed pass only when the chain
+            // opts in: a facts-only chain with no managed owner would otherwise
+            // retain this request-sized parse alongside the original body for the
+            // whole forward, a copy nothing consumes. When opted out the parse is
+            // dropped here and the managed owner, if any, re-parses after binding.
+            if self.config.cache_parse_for_owner {
+                ctx.extensions.insert(cached);
+            }
             return Ok(FilterAction::Release);
         }
 
@@ -372,9 +379,11 @@ fn reject_unsupported_managed_fields(
 /// One deserialization carried from the pre-routing pass to the managed pass.
 ///
 /// Publishing routing facts requires parsing the body before the router runs,
-/// and the managed owner needs the same parse after binding. Holding the parse
-/// here, keyed in request extensions, means a managed create body is
-/// deserialized exactly once across both phases rather than re-parsed per entry.
+/// and the managed owner needs the same parse after binding. When the pre-routing
+/// publisher opts in with `cache_parse_for_owner`, holding the parse here, keyed
+/// in request extensions, means a managed create body is deserialized exactly
+/// once across both phases rather than re-parsed per entry. Without the opt-in no
+/// entry caches, so this value is simply never inserted.
 struct CachedRequestParse {
     /// The parsed request body, moved into state initialization.
     parsed: serde_json::Value,
@@ -475,21 +484,24 @@ fn handle_unclassifiable(
     Ok(FilterAction::Release)
 }
 
-/// Classify a body that the request head already identified as Responses.
+/// Classify a body on an operation the request head already identified as Responses.
 ///
-/// The matched operation is authoritative over body heuristics. A valid create
-/// body may omit every discriminator those heuristics look for —
-/// `{"model":"gpt-5"}` is a legitimate create request — and would otherwise be
-/// published as `unknown`, which makes downstream Responses filters skip it and
-/// lets `background: true` past a rejection that keys off the published format.
+/// The matched operation is authoritative over body heuristics, so the format is
+/// `openai_responses` regardless of the body's shape. A valid create body may
+/// omit every discriminator the heuristics look for — `{"model":"gpt-5"}` is a
+/// legitimate create request — and a body whose keys resemble Chat Completions or
+/// Anthropic Messages is still a Responses request on `POST /v1/responses`.
+/// Publishing the body-derived format instead would let one request's JSON shape
+/// override the operation identity: the router would miss the Responses cluster,
+/// downstream Responses filters would skip the request, and `background: true`
+/// would slip past a rejection that keys off the published format.
 ///
-/// Only unknown classifications are upgraded, so a body positively identified
-/// as another format keeps that identity and its own handling.
+/// The remaining facts — model, stream, store, and the stateful markers — are
+/// still read from the body, since routing and state depend on them; only the
+/// protocol identity is fixed by the endpoint.
 fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
     let mut classified = classify_object(obj);
-    if classified.format == AiRequestFormat::UnknownJson {
-        classified.format = AiRequestFormat::Responses;
-    }
+    classified.format = AiRequestFormat::Responses;
     classified
 }
 
@@ -500,6 +512,17 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// of truth the `ai_operation` classifier uses — so no body heuristic decides
 /// whether this filter applies, and the filter works whether or not the
 /// classifier is present in the chain.
+///
+/// This re-matches the route rather than consuming the typed `AiOperationMatch`
+/// that `ai_operation` publishes, and that is deliberate on the current core.
+/// This filter reads the body with `BodyMode::StreamBuffer`, and praxis runs the
+/// buffered body pre-read before `ai_operation`'s request hook, so the match is
+/// not yet in `ctx.extensions` when this body hook runs. praxis-filter exposes no
+/// request-head phase this filter could hook instead. Both resolve the route from
+/// the same registry against the same method and path, so the two always agree;
+/// consuming the published match here waits on praxis-proxy/praxis#1142, which
+/// adds the early request-head phase. Matching on method and path alone keeps the
+/// operation identity authoritative over body shape either way.
 ///
 /// Every matched Responses operation is returned, body-bearing or not: the
 /// endpoint is authoritative that the request is Responses even when there is no

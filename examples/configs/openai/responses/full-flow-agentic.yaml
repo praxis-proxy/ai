@@ -374,6 +374,7 @@ filter_chains:
       # provider-owned traffic the router binds direct keeps its fields intact.
       - filter: openai_responses_request
         initialize_state: false
+        cache_parse_for_owner: true
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

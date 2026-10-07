@@ -147,15 +147,34 @@ pub(crate) struct ResponsesRequestConfig {
     /// provider-owned `background`/`prompt` and conflicting history selectors.
     ///
     /// A pre-routing fact publisher sets this to `false`: it classifies the
-    /// body, promotes the routing facts, and caches the parse for a later
-    /// managed entry, but mints no identifiers, resolves no conversation, and
-    /// enforces no managed-path policy — so provider-owned traffic that the
-    /// router may still bind to a direct upstream keeps its fields intact.
+    /// body, promotes the routing facts, and — when [`Self::cache_parse_for_owner`]
+    /// is also set — hands its parse to a later managed entry, but mints no
+    /// identifiers, resolves no conversation, and enforces no managed-path
+    /// policy — so provider-owned traffic that the router may still bind to a
+    /// direct upstream keeps its fields intact.
     ///
     /// Classification metadata, headers, and filter results are published
     /// either way, so routing is unaffected.
     #[serde(default = "default_initialize_state")]
     pub initialize_state: bool,
+
+    /// Whether a pre-routing fact publisher retains its single parse for a later
+    /// managed owner.
+    ///
+    /// Off by default, so a facts publisher drops its parse once the routing
+    /// facts are promoted and retains nothing request-sized while the original
+    /// body is forwarded. A facts-only chain with no managed owner — a pure
+    /// routing gateway, say — keeps this default and leaks no parse.
+    ///
+    /// Set this to `true` on a pre-routing fact publisher (`initialize_state:
+    /// false`) that is followed by the managed owner (`initialize_state: true`)
+    /// in the same chain: the publisher then caches its parse in request
+    /// extensions and the owner reuses it after binding, so a managed create
+    /// body is deserialized exactly once across both phases rather than parsed
+    /// again. It has no effect on a managed owner, which consumes its own parse
+    /// directly and never publishes one for another entry.
+    #[serde(default)]
+    pub cache_parse_for_owner: bool,
 }
 
 /// The filter owns the managed-path lifecycle unless a chain opts out.
@@ -223,6 +242,27 @@ mod tests {
         let cfg: ResponsesClassificationConfig = serde_yaml::from_str("{}").unwrap();
 
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
+    }
+
+    #[test]
+    fn cache_parse_for_owner_defaults_off() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(
+            !cfg.cache_parse_for_owner,
+            "a facts publisher must retain no parse unless a chain opts in"
+        );
+        assert!(cfg.initialize_state, "the managed owner default is unchanged");
+    }
+
+    #[test]
+    fn cache_parse_for_owner_opt_in_parses() {
+        let cfg: ResponsesRequestConfig =
+            serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\n").unwrap();
+        assert!(!cfg.initialize_state);
+        assert!(
+            cfg.cache_parse_for_owner,
+            "a pre-routing publisher can opt in to the deserialize-once handoff"
+        );
     }
 
     #[test]
