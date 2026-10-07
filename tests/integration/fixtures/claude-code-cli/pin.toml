@@ -161,6 +161,48 @@ flags = [
   "--max-turns", "8",
 ]
 
+# Compaction scenario. Keep in sync with COMPACTION_LAUNCH_FLAGS,
+# CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS, COMPACTION_BALLAST_CHAPTERS, and
+# COMPACTION_BALLAST_BYTES in claude_code_vllm.rs.
+#
+# SCOPE: proves the PINNED client's OWN auto-compaction, not Praxis's. The test
+# deliberately LOWERS the client's context window below the real backend window
+# (unlike the coding scenario, which aligns them to avoid compaction) so that
+# reading the enumerated ballast files one per turn grows accepted context past
+# the threshold mid-task. Claude Code then emits a
+# `compact_boundary(trigger="auto")` stream-json event — the definite,
+# client-emitted signal — summarizes through ANTHROPIC_BASE_URL, and issues a
+# further tool call that lands an Edit using the pre-compaction marker. The
+# acceptance job's enforced egress isolation makes Praxis the client's only
+# route, so every post-compaction request necessarily traversed the proxy.
+#
+# max_context_tokens here is INTENTIONALLY below vllm.context_length and is set
+# per-run via CLAUDE_CODE_MAX_CONTEXT_TOKENS; it does not relax the primary
+# [claude_code.launch] window the pins job validates against the backend.
+[claude_code.launch.compaction]
+exposed_tools = ["Read", "Edit", "Bash"]
+permission_mode = "acceptEdits"
+allowed_tools = ["Read", "Edit", "Bash"]
+# Lowered client window that forces the client to auto-compact mid-task. Must be
+# > 0 and < vllm.context_length (the pins job asserts both). Pinned Claude Code
+# 2.1.267 reserves 2,048 output + 13,000 compaction tokens, so the usable
+# auto-compaction threshold is `max_context_tokens - 15048` (~14,952 here). A
+# single ballast read must stay well under that headroom or one post-compaction
+# read re-crosses the threshold and the client's rapid-refill breaker aborts.
+max_context_tokens = 30000
+# Ballast seeded into the workspace and read one file per turn to grow context.
+# Total (~17.6k tokens) exceeds the ~14,952 threshold so compaction fires
+# mid-task; each chapter (~1.1k tokens) is far below the post-compaction headroom.
+ballast_chapters = 16
+ballast_bytes = 4500
+flags = [
+  "--tools", "Read,Edit,Bash",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "32",
+]
+
 [vllm]
 # Container image pinned by digest for Claude Code acceptance
 # (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full

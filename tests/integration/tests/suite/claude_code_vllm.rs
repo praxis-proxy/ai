@@ -147,6 +147,46 @@ const CLAUDE_CODE_MAX_OUTPUT_TOKENS: &str = "2048";
 /// reject them before inference.
 const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 
+/// Context window advertised to the pinned client for the compaction scenario.
+///
+/// Set under the backend's 32K generation window so that context grown across
+/// accepted turns crosses the client's own auto-compaction threshold (Claude
+/// Code compacts as usage approaches its context window) long before vLLM would
+/// reject an oversized request. The coding task still fits because
+/// [`CLAUDE_CODE_MAX_OUTPUT_TOKENS`] bounds each turn's output.
+///
+/// CRITICAL headroom constraint: pinned Claude Code 2.1.267 reserves 2,048
+/// output tokens and 13,000 compaction tokens, so its effective auto-compaction
+/// threshold is `window - 15048`. A single ballast Read must be comfortably
+/// SMALLER than that headroom, otherwise one post-compaction read immediately
+/// re-crosses the threshold and the client's rapid-refill breaker aborts the
+/// run. At 30,000 the usable headroom is ~14,952 tokens, dwarfing a single
+/// ballast chapter (~1.1k tokens), while total ballast still exceeds the
+/// threshold so compaction fires mid-task.
+///
+/// Tunable: a single GPU-job pass may be needed to land compaction mid-task
+/// against live Qwen3-8B. Keep it under the backend window, above the 15,048
+/// reserve, and paired with [`COMPACTION_BALLAST_CHAPTERS`]/[`COMPACTION_BALLAST_BYTES`].
+const CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS: &str = "30000";
+
+/// Number of ballast chapters seeded to grow context across accepted turns until
+/// the pinned client crosses its lowered auto-compaction threshold mid-task.
+///
+/// Sized so total ballast (~17.6k tokens) exceeds the ~14,952-token usable
+/// threshold, forcing compaction after roughly two-thirds of the reads with
+/// several reads still remaining for the post-compaction turns to exercise.
+const COMPACTION_BALLAST_CHAPTERS: usize = 16;
+
+/// Approximate bytes per ballast chapter (~1.1k tokens of natural-language text),
+/// kept well under the ~14,952-token post-compaction headroom so no single read
+/// re-crosses the threshold and trips the client's rapid-refill breaker.
+const COMPACTION_BALLAST_BYTES: usize = 4_500;
+
+/// Hard timeout for the multi-turn compaction run. The run reads many ballast
+/// chapters one per turn before the task's edit/verify/summary turns, so it
+/// needs more wall-clock than the single-shot coding task's [`CHILD_TIMEOUT`].
+const COMPACTION_CHILD_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Claude Code switch between its server-side and client-initiated auto-mode
 /// classifier paths.
 const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
@@ -383,6 +423,58 @@ const LAUNCH_FLAGS: &[&str] = &[
     "8",
 ];
 
+/// The compaction coding prompt: establish the marker, grow context by reading
+/// ballast one file per turn until the client auto-compacts, then finish the task.
+///
+/// The source token is read FIRST (step 1), so it is part of the pre-compaction
+/// history the client must carry across its own summarization. Steps 3-5 run
+/// AFTER compaction has fired mid-ballast, so completing them proves the
+/// compacted session continued through Praxis and still used the early marker
+/// correctly. The ballast filenames are enumerated by the caller.
+const COMPACTION_PROMPT_PREFIX: &str = "Use tools immediately; do not explain before calling them. \
+     (1) Read `source/value.txt` exactly once and remember its exact text; you will need it at the end. \
+     Then IMMEDIATELY delete the whole source directory by running exactly `rm -rf source` with the Bash \
+     tool. After that, the source is gone forever: never read `source/value.txt` again and never inspect \
+     the `source/` directory again, for any reason — rely only on what you remembered. Do not copy, \
+     move, or write the source text into any other file or scratch note; keep it only in memory. \
+     (2) Read every one of these ballast files ONE AT A TIME, a separate Read call per file, in the \
+     listed order, to build up the project context — do not stop early and do not read more than one \
+     per step: ";
+
+/// The task steps appended after the enumerated ballast list in [`COMPACTION_PROMPT_PREFIX`].
+const COMPACTION_PROMPT_SUFFIX: &str = ". \
+     (3) After reading ALL ballast files, Edit `result/value.txt`: replace the exact text `PLACEHOLDER` \
+     with the source text from step 1 converted to UPPERCASE, with no surrounding whitespace. Do not use \
+     the source text as the Edit old_string. \
+     (4) You MUST use the Bash tool to run exactly `./verify.sh` and wait for `verify: OK`. Do not give a \
+     final answer before that command succeeds. \
+     (5) Only then give a concise final summary. /no_think";
+
+/// Pinned launch flags for the compaction scenario.
+///
+/// Same exposed tools as [`LAUNCH_FLAGS`] but a higher turn budget: the run reads
+/// one ballast chapter per turn before the edit/verify/summary turns, so the 8-turn
+/// coding budget would exhaust before the task (and before compaction) completes.
+///
+/// `--no-session-persistence` is REQUIRED for the retention proof: by default
+/// Claude Code writes the full conversation (including the pre-compaction history)
+/// to a session JSONL on disk, which a post-compaction turn could read back to
+/// recover the marker it dropped to compaction — a recovery path whose file name
+/// (`~/.claude/...`) references neither `source` nor `value.txt`, so the source
+/// guards would not catch it. Disabling persistence removes that transcript so the
+/// only surviving copy of the marker is what the client retained in context.
+const COMPACTION_LAUNCH_FLAGS: &[&str] = &[
+    "--tools",
+    "Read,Edit,Bash",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--max-turns",
+    "32",
+];
+
 /// The read-only planning prompt for the issue #1418 regression.
 ///
 /// Issue #1418 reported Claude Code's interactive plan mode looping endlessly
@@ -478,21 +570,28 @@ const WEB_SEARCH_LAUNCH_FLAGS: &[&str] = &[
 /// the request exposes and the subset of those that are preapproved. Keeping
 /// them in one value means a scenario cannot be launched with another's tools.
 #[derive(Clone, Copy)]
-struct Turn {
-    /// The `-p` prompt text.
-    prompt: &'static str,
+struct Turn<'a> {
+    /// The `-p` prompt text. Borrowed so a scenario can pass a dynamically built
+    /// prompt (e.g. the compaction run's enumerated ballast list).
+    prompt: &'a str,
     /// Pinned flags, including the exposed built-in tools.
     launch_flags: &'static [&'static str],
     /// Permission mode and the preapproved subset of the exposed tools.
     permission_scenario: PermissionScenario,
+    /// Value for `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, the client's compaction window.
+    max_context_tokens: &'static str,
+    /// Hard wall-clock bound for this turn's child process.
+    timeout: Duration,
 }
 
-impl Turn {
+impl Turn<'static> {
     /// The read-only planning turn of the issue #1418 regression.
     const PLANNING: Self = Self {
         prompt: PLANNING_PROMPT,
         launch_flags: PLANNING_LAUNCH_FLAGS,
         permission_scenario: PermissionScenario::ReadOnlyPlanning,
+        max_context_tokens: CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+        timeout: CHILD_TIMEOUT,
     };
     /// The server-side web-search turn (real Tavily through the managed loop).
     const WEB_SEARCH: Self = Self {
@@ -507,6 +606,23 @@ impl Turn {
             prompt: PROMPT,
             launch_flags: LAUNCH_FLAGS,
             permission_scenario,
+            max_context_tokens: CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+            timeout: CHILD_TIMEOUT,
+        }
+    }
+}
+
+impl<'a> Turn<'a> {
+    /// The compaction coding task, driven with a lowered context window and a
+    /// higher turn budget so growing context forces the client's own
+    /// auto-compaction mid-task.
+    const fn compaction(prompt: &'a str) -> Self {
+        Self {
+            prompt,
+            launch_flags: COMPACTION_LAUNCH_FLAGS,
+            permission_scenario: PermissionScenario::AcceptEdits,
+            max_context_tokens: CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS,
+            timeout: COMPACTION_CHILD_TIMEOUT,
         }
     }
 }
@@ -651,6 +767,28 @@ enum Expectation {
     /// default, so the degradation signal must be observable (see
     /// [`assert_degradation_signaled`]).
     DegradedTranslation,
+}
+
+/// Prove a pinned Claude Code session crosses its own context limit mid-task,
+/// auto-compacts on its own, and still completes the task through Praxis against
+/// live vLLM.
+///
+/// Runs on the native Anthropic Messages path (`Claude Code -> Praxis
+/// /v1/messages -> vLLM /v1/messages`): compaction is a client-behavior property,
+/// so one path suffices, and the native path is where the client's own
+/// summarization call and post-compaction turns traverse Praxis most directly.
+/// The client's context window is lowered to
+/// [`CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS`] and context is grown by reading
+/// ballast one file per turn until the client's own auto-compaction fires,
+/// observed from its stream-json `compact_boundary` event. Nothing calls an SDK
+/// compact endpoint, injects a canned summary, or enables a Praxis compaction
+/// filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_claude_code_compaction_crosses_context_window_on_native_vllm() {
+    let Some(live) = LiveConfig::from_env() else {
+        return;
+    };
+    run_compaction_flow(&live, native_vllm_config).await;
 }
 
 /// Drives the pinned client end to end through a Praxis config built by
@@ -804,6 +942,40 @@ async fn run_web_search_flow(live: &LiveConfig, tavily_key: &str) {
         panic!("{reason}\nstdout:\n{stdout}");
     }
     assert_child_completed(&output, "web-search turn");
+}
+
+/// Drives the coding task with a lowered context window and ballast reads so the
+/// client crosses its own compaction threshold mid-task, then asserts it
+/// auto-compacted and completed the task across the boundary through Praxis.
+async fn run_compaction_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16) -> Config) {
+    assert_pinned_version(&live.claude_bin).await;
+    live.require_egress_isolation_if_demanded();
+
+    let proxy = start_isolated_proxy(live, build_config);
+    let proxy_base_url = format!("http://{}", proxy.addr());
+
+    let workspace = Workspace::create();
+    let ballast = workspace.seed_ballast(COMPACTION_BALLAST_CHAPTERS, COMPACTION_BALLAST_BYTES);
+    let prompt = format!(
+        "{COMPACTION_PROMPT_PREFIX}{list}{COMPACTION_PROMPT_SUFFIX}",
+        list = ballast.join(", "),
+    );
+
+    let started = SystemTime::now();
+    let output = launch_claude_code(
+        live,
+        &proxy_base_url,
+        workspace.project.path(),
+        Turn::compaction(&prompt),
+    )
+    .await;
+    assert_child_completed(&output, "compaction task");
+
+    // The compaction signal and the post-compaction Praxis traversal are proven
+    // from the client's own stream-json trace; the end-state check proves the
+    // marker was used correctly across the boundary.
+    workspace.assert_compaction_task_trace(&String::from_utf8_lossy(&output.stdout));
+    workspace.assert_task_completed(started);
 }
 
 /// Starts Praxis for one live run, proving the client cannot bypass it.
@@ -1152,7 +1324,12 @@ impl Workspace {
         let seed = unique_seed();
         let source_token = format!("praxis-native-{seed}");
         let expected_value = source_token.to_ascii_uppercase();
-        let nonce = format!("verified-{seed}");
+        // The verifier nonce MUST be independent of `seed`: `verify.sh` embeds it
+        // in plaintext, so a nonce derived from `seed` would let the client read
+        // `verify.sh` after compaction, recover `seed`, and reconstruct the marker
+        // without ever retaining it. A fresh random token shares nothing with the
+        // marker, whose only on-disk trace is the preimage-resistant expected.hash.
+        let nonce = format!("verified-{}", random_token());
 
         let project = tempfile::tempdir().expect("temporary project directory should be created");
         let marker_dir = tempfile::tempdir().expect("temporary marker directory should be created");
@@ -1164,6 +1341,16 @@ impl Workspace {
             .expect("source value should be written");
         // Deliberately wrong so an unchanged file cannot pass verification.
         std::fs::write(root.join("result/value.txt"), "PLACEHOLDER\n").expect("result value should be written");
+
+        // Precompute the expected digest with the SAME whitespace-stripping
+        // pipeline verify.sh uses, so the expected VALUE never appears on disk —
+        // only its sha256 does. The client cannot recover the marker by reading
+        // expected.hash or the script.
+        std::fs::write(
+            root.join("expected.hash"),
+            format!("{}\n", sha256_without_whitespace(&expected_value)),
+        )
+        .expect("expected hash should be written");
 
         let marker_path = marker_dir.path().join("verified.marker");
         write_verify_script(&root.join("verify.sh"), &marker_path, &nonce);
@@ -1180,6 +1367,43 @@ impl Workspace {
     /// The absolute path of the harness-owned verification marker.
     fn marker_path(&self) -> PathBuf {
         self.marker_dir.path().join("verified.marker")
+    }
+
+    /// Seed `count` uniquely-filled ballast chapters under `ballast/` of roughly
+    /// `approx_bytes` each and return their project-relative paths in order.
+    ///
+    /// Reading these one per turn grows the client's accumulated context until it
+    /// crosses the lowered [`CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS`] window. The
+    /// filler never contains the source token or the derived value, so the run's
+    /// marker is established only by the early `source/value.txt` Read, not leaked
+    /// into ballast.
+    fn seed_ballast(&self, count: usize, approx_bytes: usize) -> Vec<String> {
+        const WORDS: &[&str] = &[
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo",
+            "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor",
+            "whiskey", "xray", "yankee", "zulu", "summit", "harbor", "meridian", "quartz", "lantern", "cobalt",
+        ];
+        let root = self.project.path().join("ballast");
+        std::fs::create_dir(&root).expect("ballast directory should be created");
+        let mut names = Vec::with_capacity(count);
+        for index in 1..=count {
+            let name = format!("ballast/chapter_{index:02}.txt");
+            let mut body = format!("# ballast chapter {index}\n");
+            let mut counter = index;
+            while body.len() < approx_bytes {
+                body.push_str(WORDS[counter % WORDS.len()]);
+                counter += 1;
+                if counter % 12 == 0 {
+                    body.push('\n');
+                } else {
+                    body.push(' ');
+                }
+            }
+            body.push('\n');
+            std::fs::write(self.project.path().join(&name), body).expect("ballast chapter should be written");
+            names.push(name);
+        }
+        names
     }
 
     /// Assert the derived file is exact and the marker proves verification ran.
@@ -1275,6 +1499,178 @@ impl Workspace {
         assert!(
             trace.final_summary.is_some(),
             "Claude Code must emit a non-empty final summary in its stream-json output",
+        );
+    }
+
+    /// Assert the client crossed its context limit, auto-compacted on its own,
+    /// and still completed the task correctly across the compaction boundary.
+    ///
+    /// The definite compaction signal is the client's own stream-json
+    /// `compact_boundary` event with `trigger == "auto"` — not an inferred token
+    /// count, nor an SDK compact call, nor a Praxis compaction filter. The marker
+    /// (`source_token`) is read BEFORE the boundary, so it is part of the history
+    /// the client had to summarize; the Edit and verification run AFTER it. Under
+    /// the acceptance job's enforced egress isolation the client's only network
+    /// route is Praxis, so the tool call the model requests in a post-compaction
+    /// turn — and the final answer it produces from that tool's result — are
+    /// requests that necessarily traversed Praxis after compaction.
+    fn assert_compaction_task_trace(&self, stdout: &str) {
+        let trace = ToolTrace::parse(stdout);
+
+        let compaction = trace.auto_compaction().unwrap_or_else(|| {
+            panic!(
+                "Claude Code must emit a compact_boundary with trigger=auto, proving the client \
+                 compacted on its own after context grew past its lowered window; compaction \
+                 triggers observed: {:?}\nstdout:\n{stdout}",
+                trace.compaction_triggers(),
+            )
+        });
+
+        // The marker was established before compaction: the first Read of the
+        // source must precede the boundary so it is part of the history the
+        // client had to carry across its own summarization.
+        let read = trace.find_tool_use("Read", "source/value.txt").unwrap_or_else(|| {
+            panic!(
+                "client must Read source/value.txt; tool calls observed: {:?}\nstdout:\n{stdout}",
+                trace.tool_use_names(),
+            )
+        });
+        assert!(
+            read.seq < compaction.seq,
+            "the source marker must be read before compaction fires; read seq {} vs compaction seq {}\nstdout:\n{stdout}",
+            read.seq,
+            compaction.seq,
+        );
+        let read_result = trace
+            .result_for(&read.id)
+            .unwrap_or_else(|| panic!("the Read of source/value.txt must produce a tool_result"));
+        assert!(
+            read_result.text.contains(&self.source_token),
+            "the Read tool_result must carry the per-run source token {} delivered back through Praxis; got: {}",
+            self.source_token,
+            read_result.text,
+        );
+
+        // Retention proof, part 1: the source is physically removed before
+        // compaction. Step 1 reads it once and deletes the whole directory, so
+        // after the boundary there is nothing on disk to reread — `cd source &&
+        // cat value.txt` and every other recovery path simply fails.
+        let source_delete = trace.source_deletion().unwrap_or_else(|| {
+            panic!(
+                "client must delete the source directory (rm -rf source) in step 1 so the marker cannot be \
+                 recovered after compaction; Bash commands observed: {:?}\nstdout:\n{stdout}",
+                trace.bash_commands(),
+            )
+        });
+        assert!(
+            source_delete.seq < compaction.seq,
+            "the source must be deleted before compaction fires; delete seq {} vs compaction seq {}\nstdout:\n{stdout}",
+            source_delete.seq,
+            compaction.seq,
+        );
+        assert!(
+            !self.project.path().join("source").exists(),
+            "the source directory must be gone after the run so the marker could not be reread post-compaction"
+        );
+
+        // Retention proof, part 2: the marker must not be stashed on disk before
+        // compaction. Writing EITHER the uppercase derived value (most directly
+        // `result/value.txt` itself) OR the lowercase source token to any file
+        // pre-compaction would survive the boundary and let the client read it back
+        // afterward, so a successful post-compaction Edit would prove disk recovery,
+        // not in-context retention. Scan both forms: the lowercase token only
+        // legitimately appears in the pre-compaction source Read *result* (not a
+        // tool-use input), and the uppercase value only legitimately appears
+        // post-compaction, in the Edit.
+        for stash in [self.source_token.as_str(), self.expected_value.as_str()] {
+            if let Some(prewrite) = trace.value_written_before(stash, compaction.seq) {
+                panic!(
+                    "the marker {} must not be written to disk before compaction (seq {}); a \
+                     pre-compaction write is a scratchpad the client could read back to fake retention; \
+                     offending {} call at seq {}: {}\nstdout:\n{stdout}",
+                    stash, compaction.seq, prewrite.name, prewrite.seq, prewrite.input,
+                );
+            }
+        }
+
+        // Retention proof, part 2b: close the path-only copy channel. A command
+        // like `cp source/value.txt notes.txt` preserves the marker in a second
+        // file without ever embedding its text, so the value scans above miss it.
+        // Rejecting any source-referencing call that is not the sanctioned Read or
+        // the `rm` deletion catches the copy itself, before the stash exists.
+        if let Some(copy) = trace.illicit_source_access() {
+            panic!(
+                "the source marker must only be read (via the Read tool) and then deleted; copying it \
+                 elsewhere (e.g. `cp source/value.txt notes.txt`) preserves it on disk for a \
+                 post-compaction reread; offending {} call at seq {}: {}\nstdout:\n{stdout}",
+                copy.name, copy.seq, copy.input,
+            );
+        }
+
+        // Retention proof, part 3: defense in depth. Even if the delete were
+        // skipped, reject any post-compaction tool call that reaches for the
+        // source marker (the directory, `source/value.txt`, or the bare
+        // `value.txt` by any path other than the task's own result file).
+        if let Some(reread) = trace.source_reference_after(compaction.seq) {
+            panic!(
+                "source/ must not be accessed again after compaction (seq {}); a reread could launder a \
+                 marker lost to compaction; offending {} call at seq {}: {}\nstdout:\n{stdout}",
+                compaction.seq, reread.name, reread.seq, reread.input,
+            );
+        }
+
+        // A tool call the model requested in a post-compaction turn: under
+        // enforced egress isolation this request could only have reached the
+        // model through Praxis, so it proves a post-compaction request traversed
+        // the proxy.
+        let post = trace.first_tool_use_after(compaction.seq).unwrap_or_else(|| {
+            panic!(
+                "a tool call must follow compaction, proving a post-compaction request traversed \
+                 Praxis; tool calls observed: {:?}\nstdout:\n{stdout}",
+                trace.tool_use_names(),
+            )
+        });
+        assert!(
+            post.seq > compaction.seq,
+            "the post-compaction tool call must come after the boundary; got seq {} vs {}",
+            post.seq,
+            compaction.seq,
+        );
+
+        // The marker is used correctly after compaction: a SUCCESSFUL Edit writes
+        // the uppercase transform after the boundary, and verification runs AFTER
+        // that Edit. Requiring the Edit's own tool_result to report success — and
+        // the verify to follow it — rejects a trace that carries a correct file
+        // and verifier marker from before compaction and then fails the Edit.
+        let edit = trace
+            .successful_post_compaction_edit("result/value.txt", &self.expected_value, compaction.seq)
+            .unwrap_or_else(|| {
+                panic!(
+                    "client must apply a SUCCESSFUL Edit writing the uppercase value {} into \
+                     result/value.txt after compaction (seq {}); tool calls observed: {:?}\nstdout:\n{stdout}",
+                    self.expected_value,
+                    compaction.seq,
+                    trace.tool_use_names(),
+                )
+            });
+
+        let (verify_use, _) = trace.successful_verify_bash().unwrap_or_else(|| {
+            panic!(
+                "client must successfully run verify.sh after compaction; Bash commands observed: {:?}\nstdout:\n{stdout}",
+                trace.bash_commands(),
+            )
+        });
+        assert!(
+            verify_use.seq > edit.seq,
+            "verification must run AFTER the successful post-compaction Edit so it checks that write; \
+             verify seq {} vs edit seq {}\nstdout:\n{stdout}",
+            verify_use.seq,
+            edit.seq,
+        );
+
+        assert!(
+            trace.final_summary.is_some(),
+            "Claude Code must emit a non-empty final summary after compaction\nstdout:\n{stdout}",
         );
     }
 }
@@ -1440,14 +1836,45 @@ impl PlanningWorkspace {
 }
 
 /// Writes an executable `verify.sh` embedding the marker path and nonce literally.
+/// Returns the sha256 of `value` with all whitespace stripped, computed with the
+/// SAME shell pipeline `verify.sh` uses so the digests match exactly. The value
+/// is passed via the environment, never interpolated into the shell command.
+fn sha256_without_whitespace(value: &str) -> String {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf '%s' \"$VALUE\" | tr -d '[:space:]' | {}",
+            super::harness::SHA256_DIGEST_SH
+        ))
+        .env("VALUE", value)
+        .output()
+        .expect("sha256 pipeline should run");
+    assert!(
+        output.status.success(),
+        "sha256 of the expected value should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(!hash.is_empty(), "sha256 should produce a non-empty digest");
+    hash
+}
+
+/// Writes a hash-based `verify.sh`.
+///
+/// The script compares a sha256 of `result/value.txt` (whitespace-stripped)
+/// against the precomputed `expected.hash` — it NEVER reads `source/value.txt`
+/// and never prints the expected value. So `cat verify.sh`, `sh -x ./verify.sh`,
+/// or any other inspection of the script or its trace cannot leak the marker
+/// back into the client's context after compaction.
 fn write_verify_script(path: &Path, marker_path: &Path, nonce: &str) {
     let marker = marker_path.display();
+    let digest = super::harness::SHA256_DIGEST_SH;
     let script = format!(
         "#!/bin/sh\n\
          set -eu\n\
-         want=$(tr '[:lower:]' '[:upper:]' < source/value.txt)\n\
-         got=$(cat result/value.txt)\n\
-         if [ \"$want\" = \"$got\" ]; then\n\
+         actual=$(tr -d '[:space:]' < result/value.txt | {digest})\n\
+         expected=$(tr -d '[:space:]' < expected.hash)\n\
+         if [ \"$actual\" = \"$expected\" ]; then\n\
          \tprintf '%s' '{nonce}' > '{marker}'\n\
          \techo 'verify: OK'\n\
          else\n\
@@ -1493,7 +1920,7 @@ async fn launch_claude_code(
     live: &LiveConfig,
     proxy_base_url: &str,
     project_dir: &Path,
-    turn: Turn,
+    turn: Turn<'_>,
 ) -> CapturedChildOutput {
     let config_dir = tempfile::tempdir().expect("temporary CLAUDE_CONFIG_DIR should be created");
     let home_dir = tempfile::tempdir().expect("temporary HOME should be created");
@@ -1530,7 +1957,7 @@ async fn launch_claude_code(
         .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &live.model)
         .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &live.model)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", CLAUDE_CODE_MAX_OUTPUT_TOKENS)
-        .env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+        .env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", turn.max_context_tokens)
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_TELEMETRY", "1")
@@ -1543,7 +1970,7 @@ async fn launch_claude_code(
     configure_isolated_process_group(&mut command);
 
     let child = command.spawn().expect("pinned Claude Code should start");
-    capture_child_output(child, CHILD_TIMEOUT).await
+    capture_child_output(child, turn.timeout).await
 }
 
 /// Builds the base command, wrapping in a network namespace launcher if requested.
@@ -1679,6 +2106,20 @@ struct ToolUse {
     name: String,
     /// The tool input object (schema), e.g. `{ "file_path": "..." }`.
     input: Value,
+    /// Zero-based index of the stream-json line this block appeared on, used to
+    /// order tool calls against the [`CompactBoundary`] in the same stream.
+    seq: usize,
+}
+
+/// One `compact_boundary` system event the client emitted when it compacted.
+struct CompactBoundary {
+    /// `auto` when the client compacted on its own as context approached its
+    /// window; `manual` for a user-invoked `/compact`.
+    trigger: String,
+    /// Tokens the client reported in context just before compacting, if present.
+    pre_tokens: Option<u64>,
+    /// Zero-based index of the stream-json line this event appeared on.
+    seq: usize,
 }
 
 /// One `tool_result` block returned to the client for a prior `tool_use`.
@@ -1697,6 +2138,8 @@ struct ToolResult {
 struct ToolTrace {
     tool_uses: Vec<ToolUse>,
     tool_results: Vec<ToolResult>,
+    /// Every `compact_boundary` system event, in stream order.
+    compact_boundaries: Vec<CompactBoundary>,
     /// Every user-visible `text` block the assistant emitted. Reasoning the
     /// backend failed to split into its own channel lands here.
     assistant_texts: Vec<String>,
@@ -1717,13 +2160,14 @@ impl ToolTrace {
     fn parse(stdout: &str) -> Self {
         let mut tool_uses = Vec::new();
         let mut tool_results = Vec::new();
+        let mut compact_boundaries = Vec::new();
         let mut assistant_texts = Vec::new();
         let mut final_summary = None;
         let mut result_subtype = None;
         let mut result_is_error = false;
         let mut num_turns = None;
 
-        for line in stdout.lines() {
+        for (seq, line) in stdout.lines().enumerate() {
             let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
                 continue;
             };
@@ -1740,6 +2184,7 @@ impl ToolTrace {
                                         id: id.to_owned(),
                                         name: name.to_owned(),
                                         input: block.get("input").cloned().unwrap_or(Value::Null),
+                                        seq,
                                     });
                                 }
                             },
@@ -1751,6 +2196,17 @@ impl ToolTrace {
                             _ => {},
                         }
                     }
+                },
+                Some("system") if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
+                    compact_boundaries.push(CompactBoundary {
+                        trigger: value
+                            .pointer("/compact_metadata/trigger")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        pre_tokens: value.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64),
+                        seq,
+                    });
                 },
                 Some("user") => {
                     for block in message_content(&value) {
@@ -1786,6 +2242,7 @@ impl ToolTrace {
         Self {
             tool_uses,
             tool_results,
+            compact_boundaries,
             assistant_texts,
             final_summary,
             result_subtype,
@@ -1814,6 +2271,44 @@ impl ToolTrace {
             .collect()
     }
 
+    /// Finds a post-`seq` `Edit` of a file ending in `suffix` that writes
+    /// `expected_value` AND whose correlated `tool_result` reports success. A
+    /// failed Edit — even one leaving a coincidentally correct file — is rejected,
+    /// and retries are tolerated because any successful attempt satisfies it.
+    fn successful_post_compaction_edit(&self, suffix: &str, expected_value: &str, seq: usize) -> Option<&ToolUse> {
+        self.tool_uses.iter().find(|tool_use| {
+            tool_use.name == "Edit"
+                && tool_use.seq > seq
+                && tool_use
+                    .input
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.ends_with(suffix))
+                && tool_use
+                    .input
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .is_some_and(|new_string| new_string.contains(expected_value))
+                && self.result_for(&tool_use.id).is_some_and(|result| !result.is_error)
+        })
+    }
+
+    /// Any tool call BEFORE `seq` that writes `value` to disk — an `Edit`/`Write`
+    /// carrying it or a `Bash` command mentioning it (`echo UPPER > result/...`).
+    ///
+    /// The marker legitimately enters the trace only as the lowercase `source_token`
+    /// in the pre-compaction source Read result; the uppercase derived value should
+    /// appear nowhere until the post-compaction Edit. If the client writes the
+    /// derived value to any file before compaction, that file becomes a disk
+    /// scratchpad it can read back afterward (e.g. pre-writing `result/value.txt`),
+    /// faking retention. Scanning the serialized tool input catches every write
+    /// surface uniformly.
+    fn value_written_before(&self, value: &str, seq: usize) -> Option<&ToolUse> {
+        self.tool_uses
+            .iter()
+            .find(|tool_use| tool_use.seq < seq && tool_use.input.to_string().contains(value))
+    }
+
     /// Finds the first `tool_use` for `name` whose `file_path` ends with `suffix`.
     fn find_tool_use(&self, name: &str, suffix: &str) -> Option<&ToolUse> {
         self.tool_uses.iter().find(|tool_use| {
@@ -1834,13 +2329,16 @@ impl ToolTrace {
     }
 
     /// Finds the Bash invocation whose correlated result proves verification
-    /// succeeded. The client may first inspect or chmod `verify.sh`; selecting
-    /// the first command that merely mentions the path would mistake that setup
-    /// call for the required execution.
+    /// succeeded. The client may first inspect (`cat ./verify.sh`) or chmod the
+    /// script; those merely *mention* the path and their output can echo the
+    /// script's own `verify: OK` string, so selecting on the substring would
+    /// mistake an inspection for the required run and — if it precedes the Edit —
+    /// false-reject a valid trace on the ordering check. Only an actual execution
+    /// counts.
     fn successful_verify_bash(&self) -> Option<(&ToolUse, &ToolResult)> {
         self.tool_uses.iter().find_map(|tool_use| {
             let command = tool_use.input.get("command").and_then(Value::as_str)?;
-            if tool_use.name != "Bash" || !command.contains("verify.sh") {
+            if tool_use.name != "Bash" || !is_verifier_execution(command) {
                 return None;
             }
             let result = self.result_for(&tool_use.id)?;
@@ -1860,6 +2358,172 @@ impl ToolTrace {
     /// The observed tool-use names, for assertion failure messages.
     fn tool_use_names(&self) -> Vec<&str> {
         self.tool_uses.iter().map(|tool_use| tool_use.name.as_str()).collect()
+    }
+
+    /// The first client-initiated (`trigger == "auto"`) compaction boundary, if any.
+    ///
+    /// A `manual` boundary would be a user-invoked `/compact`, not the client's
+    /// own threshold-driven compaction, so it does not satisfy the acceptance.
+    fn auto_compaction(&self) -> Option<&CompactBoundary> {
+        self.compact_boundaries
+            .iter()
+            .find(|boundary| boundary.trigger == "auto")
+    }
+
+    /// Every compaction trigger observed, in stream order, for failure messages.
+    fn compaction_triggers(&self) -> Vec<&str> {
+        self.compact_boundaries
+            .iter()
+            .map(|boundary| boundary.trigger.as_str())
+            .collect()
+    }
+
+    /// The first `tool_use` emitted strictly after the given stream position.
+    fn first_tool_use_after(&self, seq: usize) -> Option<&ToolUse> {
+        self.tool_uses.iter().find(|tool_use| tool_use.seq > seq)
+    }
+
+    /// The `Bash` call that removes the source directory (`rm ... source`), if any.
+    /// Step 1 runs `rm -rf source` so the marker cannot be reread after compaction.
+    fn source_deletion(&self) -> Option<&ToolUse> {
+        self.tool_uses.iter().find(|tool_use| {
+            tool_use.name == "Bash"
+                && tool_use
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| command.contains("rm") && command.contains("source"))
+        })
+    }
+
+    /// Any tool call outside the sanctioned task flow that could stash the `source/`
+    /// marker on disk for a post-compaction reread.
+    ///
+    /// Bash is a strict ALLOWLIST: the ONLY permitted shell commands are the
+    /// sanctioned `rm -rf source` deletion and the marker-free `verify.sh`
+    /// invocation (see [`is_sanctioned_bash`]). EVERY other Bash command is flagged
+    /// — not only a literal `cp source/value.txt notes.txt` or a Python
+    /// `shutil.copyfile`, but also a glob that never names the source literally
+    /// (`cp s*/v* notes.txt`). A `contains("source")` check cannot see a
+    /// shell-expanded path and no blocklist can enumerate every copy spelling, so
+    /// only a positive allowlist is sound.
+    ///
+    /// For Edit/Write, writing TO a source path is never part of the task; writing
+    /// the marker VALUE to a scratch file is caught by the prewrite value scan, and
+    /// the sanctioned Read merely loads the marker into context.
+    fn illicit_source_access(&self) -> Option<&ToolUse> {
+        self.tool_uses.iter().find(|tool_use| match tool_use.name.as_str() {
+            // Writing TO a source path is never part of the task.
+            "Edit" | "Write" => tool_use
+                .input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .is_some_and(references_source_marker),
+            // Allowlist: only the sanctioned deletion and verifier invocation.
+            "Bash" => tool_use
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| !is_sanctioned_bash(command)),
+            // Everything else — including the sanctioned `Read`, which loads the
+            // marker into context and cannot write a file — is allowed.
+            _ => false,
+        })
+    }
+
+    /// Any tool call after `seq` that reaches for the one-time `source/` marker —
+    /// a file tool whose `file_path` or a `Bash` command references the source
+    /// directory or the marker file. A trace that drops the marker to compaction,
+    /// rereads it, then edits the result must be rejected to prove retention.
+    fn source_reference_after(&self, seq: usize) -> Option<&ToolUse> {
+        self.tool_uses.iter().find(|tool_use| {
+            if tool_use.seq <= seq {
+                return false;
+            }
+            let field = match tool_use.name.as_str() {
+                "Read" | "Edit" | "Write" => tool_use.input.get("file_path").and_then(Value::as_str),
+                "Bash" => tool_use.input.get("command").and_then(Value::as_str),
+                _ => None,
+            };
+            field.is_some_and(references_source_marker)
+        })
+    }
+}
+
+/// Whether a tool argument reaches for the one-time `source/` marker: the
+/// `source` directory itself (catching `source/value.txt`, `cd source && cat
+/// value.txt`, `./source/...`) or the marker file `value.txt` by any path other
+/// than the task's own `result/value.txt`. Broader than a literal `source/` match
+/// so `cd source` and bare-`value.txt` recovery attempts cannot evade it.
+fn references_source_marker(argument: &str) -> bool {
+    argument.contains("source") || (argument.contains("value.txt") && !argument.contains("result"))
+}
+
+/// Whether a Bash command is one the compaction task is allowed to run: the
+/// sanctioned one-time marker deletion or a marker-free `verify.sh` invocation.
+/// Every other command is illicit — the allowlist (not a blocklist of copy
+/// spellings) is what closes glob copies (`cp s*/v* notes`), Python copies, and
+/// redirects at once, since none of those match a permitted shape.
+fn is_sanctioned_bash(command: &str) -> bool {
+    // A sanctioned deletion or verifier command needs no shell metacharacter, so
+    // reject any — each is a channel to copy the marker while still looking like a
+    // delete/verify. Notably `rm -rf source -f$(cat<source/value.txt>notes.txt)`:
+    // the `-f$(...)` token begins with `-`, so the deletion tokenizer below would
+    // skip it as a flag, but the `$(...)` copies the marker out of the source dir
+    // before the delete lands. Substitution, redirection, chaining, piping, and
+    // globbing are all barred here, up front.
+    if command.contains(['$', '`', '<', '>', '|', '&', ';', '(', ')', '*', '?', '{', '}', '\n']) {
+        return false;
+    }
+    is_sanctioned_source_deletion(command) || is_sanctioned_verifier_command(command)
+}
+
+/// Whether a Bash command is an actual EXECUTION of the verifier script (not an
+/// inspection such as `cat ./verify.sh`, nor a `chmod`). Matched by exact token
+/// shape: `./verify.sh`, or `sh`/`bash` followed by the script path.
+fn is_verifier_execution(command: &str) -> bool {
+    match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["./verify.sh"] => true,
+        ["sh" | "bash", script] => *script == "./verify.sh" || *script == "verify.sh",
+        _ => false,
+    }
+}
+
+/// Whether a Bash command is EXACTLY the sanctioned one-time marker deletion:
+/// `rm` of the `source` directory (with optional flags such as `-rf`, and the
+/// target spelled `source`, `source/`, or `./source`) and nothing else — no second
+/// operand such as a bundled `&& cp ...`.
+fn is_sanctioned_source_deletion(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    if tokens.next() != Some("rm") {
+        return false;
+    }
+    let mut saw_target = false;
+    for token in tokens {
+        if token.starts_with('-') {
+            continue; // flags like -r, -f, -rf
+        }
+        let target = token.strip_prefix("./").unwrap_or(token);
+        let target = target.strip_suffix('/').unwrap_or(target);
+        if saw_target || target != "source" {
+            return false; // a second operand (e.g. `&& cp ...`) or a non-source target
+        }
+        saw_target = true;
+    }
+    saw_target
+}
+
+/// Whether a Bash command is a sanctioned operation on the marker-free `verify.sh`
+/// (hash-based, with a marker-independent nonce), matched by EXACT token shape so a
+/// glob or redirect that smuggles the marker into/through the script path cannot
+/// pass as "a verify command". Permitted: run it (`./verify.sh`, `sh ./verify.sh`),
+/// make it executable (`chmod +x ./verify.sh`), or inspect it (`cat ./verify.sh`).
+fn is_sanctioned_verifier_command(command: &str) -> bool {
+    const SCRIPT: &[&str] = &["./verify.sh", "verify.sh"];
+    let is_script = |token: &&str| SCRIPT.contains(token);
+    match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [script] | ["sh" | "bash" | "cat", script] | ["chmod", "+x", script] => is_script(script),
+        _ => false,
     }
 }
 
@@ -2274,4 +2938,322 @@ fn web_search_config_patches_the_example_into_a_valid_config() {
     // Building the config must not panic: replace_once asserts each anchor and
     // Config::from_yaml asserts the patched YAML parses.
     let _config = web_search_config(&live, 18080, 19090, "tvly-test-key");
+}
+
+#[test]
+fn tool_trace_records_auto_compaction_boundary_and_orders_tool_calls_around_it() {
+    // The marker is read before the boundary and the edit follows it: the exact
+    // ordering the compaction acceptance asserts.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"source/value.txt"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r1","content":"praxis-native-0000000001"}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"result/value.txt","new_string":"PRAXIS-NATIVE-0000000001"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}"#;
+
+    let trace = ToolTrace::parse(stdout);
+    let compaction = trace
+        .auto_compaction()
+        .expect("an auto compact_boundary should be parsed");
+    assert_eq!(compaction.pre_tokens, Some(15000));
+
+    let read = trace
+        .find_tool_use("Read", "source/value.txt")
+        .expect("the source read should be parsed");
+    assert!(read.seq < compaction.seq, "the marker read precedes compaction");
+
+    let post = trace
+        .first_tool_use_after(compaction.seq)
+        .expect("a tool use should follow compaction");
+    assert_eq!(post.name, "Edit");
+    assert!(post.seq > compaction.seq);
+}
+
+#[test]
+fn tool_trace_detects_source_reread_after_compaction() {
+    // A trace that rereads the source (via Read or Bash) after the boundary must
+    // be caught: that is the reread path that could launder a lost marker.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"source/value.txt"}}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cat source/value.txt"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}"#;
+
+    let trace = ToolTrace::parse(stdout);
+    let compaction = trace.auto_compaction().expect("auto compaction should be parsed");
+    let reread = trace
+        .source_reference_after(compaction.seq)
+        .expect("a post-compaction Bash read of source/ should be flagged");
+    assert_eq!(reread.name, "Bash");
+    assert!(reread.seq > compaction.seq);
+}
+
+#[test]
+fn tool_trace_allows_single_source_read_before_compaction() {
+    // The legitimate trace reads the source once before compaction and never
+    // touches source/ afterward; result/ edits must not be mistaken for a reread.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"source/value.txt"}}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"result/value.txt","new_string":"PRAXIS-NATIVE-0000000001"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}"#;
+
+    let trace = ToolTrace::parse(stdout);
+    let compaction = trace.auto_compaction().expect("auto compaction should be parsed");
+    assert!(
+        trace.source_reference_after(compaction.seq).is_none(),
+        "a result/ edit after compaction is not a source reread"
+    );
+}
+
+#[test]
+fn tool_trace_detects_source_recovery_evasions_after_compaction() {
+    // `cd source && cat value.txt` and a bare `cat value.txt` both try to recover
+    // the marker without the literal `source/` path; the broadened check rejects
+    // them while leaving the legitimate `result/value.txt` edit alone.
+    for command in ["cd source && cat value.txt", "cat value.txt"] {
+        let stdout = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"r1","name":"Read","input":{{"file_path":"source/value.txt"}}}}]}}}}
+{{"type":"system","subtype":"compact_boundary","compact_metadata":{{"trigger":"auto","pre_tokens":15000}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{"command":"{command}"}}}}]}}}}
+{{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}}"#
+        );
+        let trace = ToolTrace::parse(&stdout);
+        let compaction = trace.auto_compaction().expect("auto compaction should be parsed");
+        assert!(
+            trace.source_reference_after(compaction.seq).is_some(),
+            "post-compaction `{command}` must be flagged as a source-recovery attempt"
+        );
+    }
+}
+
+#[test]
+fn tool_trace_detects_marker_prewritten_to_disk_before_compaction() {
+    // Writing the derived marker to a file before compaction is a scratchpad the
+    // client could read back afterward, so it must be flagged. A post-compaction
+    // write (the legitimate Edit) and an unrelated pre-compaction write must not.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"notes.txt","content":"PRAXIS-NATIVE-42"}}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"result/value.txt","new_string":"PRAXIS-NATIVE-42"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}"#;
+    let trace = ToolTrace::parse(stdout);
+    let compaction = trace.auto_compaction().expect("auto compaction should be parsed");
+    let prewrite = trace
+        .value_written_before("PRAXIS-NATIVE-42", compaction.seq)
+        .expect("the pre-compaction write of the marker must be flagged");
+    assert_eq!(prewrite.id, "w1");
+    // The post-compaction Edit alone (no pre-write) is clean.
+    let clean = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"result/value.txt","new_string":"PRAXIS-NATIVE-42"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done"}"#;
+    let clean_trace = ToolTrace::parse(clean);
+    let clean_compaction = clean_trace.auto_compaction().expect("auto compaction should be parsed");
+    assert!(
+        clean_trace
+            .value_written_before("PRAXIS-NATIVE-42", clean_compaction.seq)
+            .is_none(),
+        "a marker written only after compaction must not be flagged as a pre-write"
+    );
+}
+
+#[test]
+fn tool_trace_detects_source_deletion() {
+    // Step 1's `rm -rf source` is recognized so the harness can require it ran
+    // before compaction.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"rm -rf source"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"done"}"#;
+    let trace = ToolTrace::parse(stdout);
+    let delete = trace
+        .source_deletion()
+        .expect("the rm -rf source command should be recognized");
+    assert_eq!(delete.name, "Bash");
+}
+
+#[test]
+fn tool_trace_detects_source_copied_to_scratch_file() {
+    // A copy of the marker to a second file preserves it on disk for a
+    // post-compaction reread without embedding the token text, so the value scans
+    // miss it. Both a Bash `cp`/`cat >` and a file-tool write of a source path
+    // must be flagged, while the sanctioned Read and `rm -rf source` must not.
+    for command in [
+        "cp source/value.txt notes.txt",
+        "cat source/value.txt > notes.txt",
+        "cd source && cp value.txt ../notes.txt",
+        // The copy bundled with the deletion must not slip through on the `rm`.
+        "cp source/value.txt notes.txt && rm -rf source",
+        // A Python copy matches no copy builtin, but the allowlist flags it since
+        // it is not the sanctioned `rm -rf source`.
+        "python3 -c 'import shutil; shutil.copyfile(source/value.txt, notes.txt)'",
+        // A glob never names the source literally, so a `contains(\"source\")` check
+        // would miss it; the positive allowlist still flags it.
+        "cp s*/v* notes.txt",
+    ] {
+        let stdout = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"r1","name":"Read","input":{{"file_path":"source/value.txt"}}}}]}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"c1","name":"Bash","input":{{"command":"{command}"}}}}]}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{"command":"rm -rf source"}}}}]}}}}
+{{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done"}}"#
+        );
+        let trace = ToolTrace::parse(&stdout);
+        let copy = trace
+            .illicit_source_access()
+            .unwrap_or_else(|| panic!("`{command}` must be flagged as an illicit source copy"));
+        assert_eq!(copy.id, "c1", "the copy command, not the Read or rm, must be flagged");
+    }
+}
+
+#[test]
+fn tool_trace_allows_sanctioned_source_read_and_deletion() {
+    // The one Read of the marker and the `rm -rf source` deletion are the only
+    // sanctioned source operations and must never be flagged as illicit.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"source/value.txt"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"rm -rf source"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"result/value.txt","new_string":"PRAXIS-NATIVE-42"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done"}"#;
+    let trace = ToolTrace::parse(stdout);
+    assert!(
+        trace.illicit_source_access().is_none(),
+        "the sanctioned Read, rm -rf source, and result edit must not be flagged"
+    );
+}
+
+#[test]
+fn tool_trace_detects_source_token_prewritten_to_disk() {
+    // The lowercase source token stashed to a scratch file before compaction is a
+    // recoverable copy just like the uppercase value, so scanning for the token
+    // text must flag it.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"notes.txt","content":"praxis-native-42"}}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":15000}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"done"}"#;
+    let trace = ToolTrace::parse(stdout);
+    let compaction = trace.auto_compaction().expect("auto compaction should be parsed");
+    let prewrite = trace
+        .value_written_before("praxis-native-42", compaction.seq)
+        .expect("the pre-compaction write of the lowercase token must be flagged");
+    assert_eq!(prewrite.id, "w1");
+}
+
+#[test]
+fn tool_trace_ignores_manual_compaction_boundary() {
+    // A user-invoked `/compact` is not the client's own threshold-driven
+    // auto-compaction and must not satisfy the acceptance signal.
+    let stdout = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":100}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"done"}"#;
+
+    let trace = ToolTrace::parse(stdout);
+    assert!(
+        trace.auto_compaction().is_none(),
+        "a manual compaction is not the client's own auto-compaction"
+    );
+    assert_eq!(trace.compaction_triggers(), ["manual"]);
+}
+
+#[test]
+fn compaction_launch_disables_session_persistence() {
+    // The on-disk session transcript is a marker-recovery side channel the source
+    // guards cannot see (its path references neither `source` nor `value.txt`), so
+    // the compaction run must disable it.
+    assert!(
+        COMPACTION_LAUNCH_FLAGS.contains(&"--no-session-persistence"),
+        "the compaction run must disable the on-disk session transcript so a post-compaction turn cannot read back the dropped marker"
+    );
+}
+
+#[test]
+fn sanctioned_source_deletion_admits_only_rm_of_source() {
+    // The one allowed source-referencing Bash command: `rm` of the source dir.
+    assert!(is_sanctioned_source_deletion("rm -rf source"));
+    assert!(is_sanctioned_source_deletion("rm -rf source/"));
+    assert!(is_sanctioned_source_deletion("rm -rf ./source"));
+    assert!(is_sanctioned_source_deletion("rm -r -f source"));
+    // Anything that also copies, redirects, or targets another path is not.
+    assert!(!is_sanctioned_source_deletion(
+        "cp source/value.txt notes.txt && rm -rf source"
+    ));
+    assert!(!is_sanctioned_source_deletion(
+        "rm -rf source && cp source/value.txt notes.txt"
+    ));
+    assert!(!is_sanctioned_source_deletion(
+        "python3 -c 'import shutil; shutil.copyfile(source, s)'"
+    ));
+    assert!(!is_sanctioned_source_deletion("cat source/value.txt > notes.txt"));
+    assert!(!is_sanctioned_source_deletion("rm -rf other"));
+}
+
+#[test]
+fn sanctioned_bash_allows_only_deletion_and_verifier() {
+    // The verifier is marker-free, so running, chmod-ing, or inspecting it is fine.
+    for allowed in [
+        "rm -rf source",
+        "./verify.sh",
+        "verify.sh",
+        "sh ./verify.sh",
+        "bash ./verify.sh",
+        "chmod +x ./verify.sh",
+        "cat ./verify.sh",
+    ] {
+        assert!(is_sanctioned_bash(allowed), "`{allowed}` should be allowed");
+    }
+    // Everything else is illicit — including a glob that never names the source
+    // literally, a Python copy, a redirect, or an unrelated command.
+    for denied in [
+        "cp s*/v* notes.txt",
+        "cp source/value.txt notes.txt",
+        "python3 -c 'import shutil; shutil.copyfile(source/value.txt, notes.txt)'",
+        "cat source/value.txt > notes.txt",
+        "cat notes.txt",
+        "ls -la",
+        // A glob or redirect smuggled through the verify.sh path is not a verify op.
+        "cp s*/v* verify.sh",
+        "cat source/value.txt > verify.sh",
+    ] {
+        assert!(!is_sanctioned_bash(denied), "`{denied}` should be flagged");
+    }
+}
+
+#[test]
+fn sanctioned_bash_rejects_substitution_hidden_in_rm_flags() {
+    // `rm -rf source -f$(cat<source/value.txt>notes.txt)` copies the marker into
+    // notes.txt via command substitution and input/output redirection before the
+    // delete; the deletion tokenizer skips `-f$(...)` as a flag, so the shell-meta
+    // guard in `is_sanctioned_bash` is what rejects it.
+    assert!(!is_sanctioned_bash("rm -rf source -f$(cat<source/value.txt>notes.txt)"));
+    assert!(!is_sanctioned_bash("rm -rf source; cp source/value.txt notes.txt"));
+    assert!(!is_sanctioned_bash("rm -rf source && cp source/value.txt notes.txt"));
+    assert!(!is_sanctioned_bash("rm -rf `cp source/value.txt notes.txt`source"));
+    // The bare, metacharacter-free deletion and verifier commands still pass.
+    assert!(is_sanctioned_bash("rm -rf source"));
+    assert!(is_sanctioned_bash("./verify.sh"));
+    assert!(is_sanctioned_bash("cat ./verify.sh"));
+}
+
+#[test]
+fn verifier_execution_excludes_inspection_and_setup() {
+    // Only an actual run of the script counts as execution.
+    assert!(is_verifier_execution("./verify.sh"));
+    assert!(is_verifier_execution("sh ./verify.sh"));
+    assert!(is_verifier_execution("bash verify.sh"));
+    // Inspection and setup are not executions, even though they name the script and
+    // an inspection's stdout can echo the script's own `verify: OK` literal.
+    assert!(!is_verifier_execution("cat ./verify.sh"));
+    assert!(!is_verifier_execution("chmod +x ./verify.sh"));
+    assert!(!is_verifier_execution("verify.sh"));
+}
+
+#[test]
+fn successful_verify_bash_ignores_pre_edit_inspection_of_the_script() {
+    // The script prints `verify: OK` on success, so its source contains that
+    // literal. A `cat ./verify.sh` inspection before the real run must NOT be
+    // selected as the verification, or an ordering check keyed on its position
+    // would reject a valid run that executes the verifier afterward.
+    let stdout = r##"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"peek","name":"Bash","input":{"command":"cat ./verify.sh"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"peek","content":"#!/bin/sh\necho 'verify: OK'"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"run","name":"Bash","input":{"command":"./verify.sh"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"run","content":"verify: OK"}]}}
+{"type":"result","result":"Task complete"}"##;
+
+    let trace = ToolTrace::parse(stdout);
+    let (tool_use, result) = trace
+        .successful_verify_bash()
+        .expect("the executed verify call should be selected, not the inspection");
+
+    assert_eq!(tool_use.id, "run");
+    assert_eq!(result.text, "verify: OK");
 }
