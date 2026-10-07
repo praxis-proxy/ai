@@ -15,14 +15,15 @@ and how the tooling works is in [FIPS Tooling](developing/fips.md).
 
 ## The FIPS build
 
-The published image (`make release`, `make container`) enables every
-non-experimental filter (`full`). The FIPS build turns off what is known not
-to be FIPS compliant yet, so nobody has to know which features to pick:
+The standard build enables every non-experimental filter (`full`); the image
+(`make container`) adds the SQLite store backend on top of it. The FIPS build
+turns off what is known not to be FIPS compliant yet, so nobody has to know
+which features to pick:
 
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` | `openai-responses`, `aws-sigv4-filter` |
+| Cargo features | `full` (`full,store-sqlite` in the image) | `openai-responses`, `aws-sigv4-filter` |
 | Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |

@@ -38,7 +38,8 @@ pub(super) struct CompactFilterConfig {
     /// E.g., `"http://localhost:11434/v1/chat/completions"`
     pub inference_url: String,
 
-    /// Allow the inference target to resolve to non-public addresses.
+    /// Allow the inference target to resolve to non-public addresses. Cloud
+    /// metadata, unspecified, and multicast addresses remain blocked.
     #[serde(default)]
     pub allow_private_inference_url: bool,
 

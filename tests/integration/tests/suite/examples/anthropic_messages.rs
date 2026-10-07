@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, Recording, free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown,
-    start_capturing_backend, start_header_echo_backend, start_proxy,
+    Backend, Recording, free_port, http_send, json_post, json_post_with_header, parse_body, parse_status,
+    start_backend_with_shutdown, start_capturing_backend, start_header_echo_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -203,24 +203,21 @@ fn anthropic_messages_to_chat_completions_returns_api_error_for_malformed_tool_a
         "messages": [{"role": "user", "content": "Use the weather tool."}]
     });
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request.to_string(), "x-request-id: req_malformed_tool"),
+    );
     let client_body: serde_json::Value =
         serde_json::from_str(&parse_body(&raw)).expect("error envelope should be JSON");
 
-    assert_eq!(parse_status(&raw), 200, "upstream status should be preserved");
+    assert_eq!(parse_status(&raw), 500, "invalid upstream success must fail");
     assert_eq!(
         client_body["type"], "error",
         "malformed tool arguments must yield an error envelope"
     );
     assert_eq!(client_body["error"]["type"], "api_error");
-    assert_eq!(
-        client_body["error"]["message"],
-        "upstream response could not be transformed"
-    );
-    assert!(
-        client_body["request_id"].is_null(),
-        "absent upstream request-id must yield a null request_id"
-    );
+    assert_eq!(client_body["error"]["message"], "Internal proxy error");
+    assert_eq!(client_body["request_id"], "req_malformed_tool");
     assert!(
         client_body.get("choices").is_none() && client_body.get("content").is_none(),
         "translation failure must not fabricate a tool_use or pass through the raw upstream body"
@@ -246,12 +243,16 @@ fn anthropic_messages_to_chat_completions_replaces_malformed_success_body() {
         "messages": [{"role": "user", "content": "Hello"}],
     });
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request_body.to_string()));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request_body.to_string(), "x-request-id: req_malformed"),
+    );
     let parsed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("fallback response should be JSON");
 
     assert_eq!(parsed["type"], "error");
     assert_eq!(parsed["error"]["type"], "api_error");
-    assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");
+    assert_eq!(parse_status(&raw), 500);
+    assert_eq!(parsed["error"]["message"], "Internal proxy error");
     assert_eq!(parsed["request_id"], "req_malformed");
 }
 
@@ -501,6 +502,113 @@ fn unified_gateway_routes_malformed_chat_completions_without_reading_the_body() 
         parse_body(&raw),
         "openai-backend",
         "Chat Completions identity must not depend on body heuristics"
+    );
+}
+
+#[test]
+fn unified_gateway_routes_malformed_anthropic_messages_without_reading_the_body() {
+    let anthropic_guard = start_backend_with_shutdown("anthropic-backend");
+    let openai_guard = start_backend_with_shutdown("openai-backend");
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/unified-gateway.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", anthropic_guard.port()),
+            ("127.0.0.1:3002", openai_guard.port()),
+            ("127.0.0.1:3003", responses_guard.port()),
+            ("127.0.0.1:3004", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\
+         not json",
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "malformed Anthropic body should still be forwarded"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "anthropic-backend",
+        "Anthropic Messages identity comes from the request head, not a body heuristic"
+    );
+}
+
+/// A Chat Completions-shaped body on an Anthropic path still routes by head.
+///
+/// The body would classify as another protocol, so this separates operation
+/// identity from body-format classification rather than merely showing that a
+/// valid Anthropic body works.
+#[test]
+fn unified_gateway_routes_a_chat_shaped_body_on_an_anthropic_path_by_head() {
+    let anthropic_guard = start_backend_with_shutdown("anthropic-backend");
+    let openai_guard = start_backend_with_shutdown("openai-backend");
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/unified-gateway.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", anthropic_guard.port()),
+            ("127.0.0.1:3002", openai_guard.port()),
+            ("127.0.0.1:3003", responses_guard.port()),
+            ("127.0.0.1:3004", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let chat_shaped = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", chat_shaped));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "anthropic-backend",
+        "the path decides the protocol; a Chat-shaped body must not redirect it"
+    );
+}
+
+/// Registered Messages subpaths classify as `anthropic_messages` too.
+#[test]
+fn unified_gateway_routes_message_batches_to_the_anthropic_backend() {
+    let anthropic_guard = start_backend_with_shutdown("anthropic-backend");
+    let openai_guard = start_backend_with_shutdown("openai-backend");
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/unified-gateway.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", anthropic_guard.port()),
+            ("127.0.0.1:3002", openai_guard.port()),
+            ("127.0.0.1:3003", responses_guard.port()),
+            ("127.0.0.1:3004", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/messages/batches/msgbatch_abc123 HTTP/1.1\r\nHost: localhost\r\n\
+         Connection: close\r\n\r\n",
+    );
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "anthropic-backend",
+        "a registered Messages subpath belongs to the same protocol"
     );
 }
 

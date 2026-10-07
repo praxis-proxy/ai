@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_responses_validate` for every Responses API create
+//! `openai_responses_request` for every Responses API create
 //! request.
 
 mod config;
@@ -319,6 +319,11 @@ impl HttpFilter for AgenticLoopFilter {
         if let Some(failure) = state.dispatch_failure.take() {
             return convert_dispatch_failure(ctx, state, &failure);
         }
+
+        // Every request-body filter in this IRR step has now run. Clear the
+        // shared suffix boundary only here, after all configured tool-result
+        // guardrails had an opportunity to inspect it.
+        state.pending_local_tool_guardrail_start = None;
 
         if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
             return finish_deferred_local_response(ctx, state);
@@ -629,8 +634,10 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
 /// the legacy grouped queues for this pass, so replayed credentials must join
 /// that log as well as remaining available to the normal request phase.
 fn queue_continuation_header(ctx: &mut HttpFilterContext<'_>, name: http::HeaderName, value: HeaderValue) {
-    ctx.request_headers_to_set.push((name.clone(), value.clone()));
-    if !ctx.pre_read_mutations.is_empty() {
+    if ctx.pre_read_mutations.is_empty() {
+        ctx.request_headers_to_set.push((name, value));
+    } else {
+        ctx.request_headers_to_set.push((name.clone(), value.clone()));
         ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, value));
     }
 }

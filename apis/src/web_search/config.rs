@@ -562,7 +562,7 @@ mod tests {
         for url in [
             "http://127.0.0.1:9999",
             "http://localhost:9999",
-            "http://169.254.169.254",
+            "http://169.254.1.1",
             "http://internal.search.example:8080",
         ] {
             let mut cfg = base_config();

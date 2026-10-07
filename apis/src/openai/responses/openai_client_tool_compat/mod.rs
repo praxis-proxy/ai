@@ -21,9 +21,10 @@
 //! - `custom` → a `function` whose single string `input` parameter carries the freeform payload; the model-visible
 //!   description preserves the declared contract.
 //! - `namespace` members (both `function` and `custom`) → flat `function` tools named
-//!   `agentic_ns__{namespace}__{member}` (hashed when longer than 64 chars); a `custom` member keeps the single string
-//!   `input` contract, and the namespace's required model-visible description is folded into every member so the group
-//!   context survives flattening.
+//!   `agentic_ns__{namespace}__{member}` (hashed when longer than 64 chars, or when a component embeds the `__`
+//!   delimiter and the verbatim name would re-split ambiguously — Codex names an MCP namespace `mcp__{server}`); a
+//!   `custom` member keeps the single string `input` contract, and the namespace's required model-visible description
+//!   is folded into every member so the group context survives flattening.
 //! - local `shell` → a `shell` `function` tool whose description folds in any declared `environment.skills` (name,
 //!   description, path) so the model still sees the available local skills.
 //! - client-executed `tool_search` → a fixed `tool_search` `function` tool.
@@ -176,10 +177,11 @@ const TOOL_SEARCH_NAME: &str = "tool_search";
 /// Prefix applied to a flattened Codex namespace member function name.
 const NAMESPACE_MEMBER_PREFIX: &str = "agentic_ns__";
 
-/// Separator [`namespace_member_name`] reserves to delimit the prefix, namespace,
-/// and member components of a flattened wire name. A namespace or member name that
-/// embeds it — or abuts it with a leading/trailing `_` — fails closed so the
-/// flattening stays injective (see [`reject_reserved_namespace_delimiter`]).
+/// Separator [`namespace_member_name`] uses to delimit the prefix, namespace, and
+/// member components of a flattened wire name. A namespace or member name that
+/// embeds it — or abuts it with a leading/trailing `_` — makes the verbatim
+/// flattening ambiguous, so such a pair takes the hashed branch instead (see
+/// [`verbatim_flattening_is_injective`]).
 const NAMESPACE_NAME_DELIMITER: &str = "__";
 
 /// Maximum length of a lowered, model-visible function name (OpenAI schema).
@@ -189,9 +191,9 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// declare (`LocalEnvironmentParam.skills` `maxItems: 200`).
 const MAX_LOCAL_SKILLS: usize = 200;
 
-/// Length of the `___{hash:016x}` suffix appended to a shortened namespace name.
-/// The triple-underscore marker domain-separates the hashed shape from every
-/// verbatim wire name (see [`namespace_member_name`]): `3 + 16 = 19`.
+/// Length of the `___{hash:016x}` suffix appended to a shortened or ambiguous
+/// namespace name. The triple-underscore marker domain-separates the hashed shape
+/// from every verbatim wire name (see [`namespace_member_name`]): `3 + 16 = 19`.
 const HASHED_NAMESPACE_MEMBER_SUFFIX_LEN: usize = 19;
 
 /// FNV-1a offset basis, matching the upstream stable name hash.
@@ -1482,19 +1484,16 @@ impl Lowering {
     /// for any name that was never withheld.
     ///
     /// Matching a reload by wire name alone is sound only because wire names are
-    /// unique per logical tool. Two reservations guarantee that. Across the
-    /// top-level/namespace boundary, a synthesized namespace member name always
-    /// carries the reserved [`NAMESPACE_MEMBER_PREFIX`], and
-    /// [`reject_reserved_top_level_name`] fails closed on any top-level
-    /// `function`/`custom` that usurps it. Within the namespace flattening,
-    /// [`reject_reserved_namespace_delimiter`] fails closed on a namespace or member
-    /// name embedding the `__` delimiter or abutting it with a leading/trailing `_`,
-    /// keeping the verbatim [`namespace_member_name`] form injective, and its
-    /// hash-truncation branch is domain-separated with a `___` marker so a hashed
-    /// name can never equal a verbatim one — together, two distinct members can never
-    /// flatten to one wire name. Without these reservations a genuinely distinct
-    /// deferred tool and a discovered tool could share a wire name, and this reclaim
-    /// would credit one against the other.
+    /// unique per logical tool. Across the top-level/namespace boundary that holds
+    /// by reservation: a synthesized namespace member name always carries the
+    /// reserved [`NAMESPACE_MEMBER_PREFIX`], and [`reject_reserved_top_level_name`]
+    /// fails closed on any top-level `function`/`custom` that usurps it. Within the
+    /// namespace flattening it holds by construction: [`namespace_member_name`] emits
+    /// the verbatim form only for a pair that re-splits unambiguously and otherwise
+    /// hashes an injective encoding of the pair, with a `___` marker keeping the two
+    /// branches byte-disjoint — so two distinct members can never flatten to one wire
+    /// name. Without that, a genuinely distinct deferred tool and a discovered tool
+    /// could share a wire name and this reclaim would credit one against the other.
     fn reclaim_withheld(&mut self, source: LoweringSource, name: &str) {
         if source == LoweringSource::Discovery && self.withheld.remove(name) {
             self.withheld_count = self.withheld_count.saturating_sub(1);
@@ -1572,7 +1571,7 @@ impl Lowering {
             .filter(|parameters| parameters.is_object())
             .cloned()
             .unwrap_or_else(default_tool_search_parameters);
-        lowered.push(tool_search_lowered_function(&description, &parameters));
+        lowered.push(tool_search_lowered_function(&description, parameters));
         self.register(
             TOOL_SEARCH_NAME.to_owned(),
             LoweredClientTool {
@@ -1598,18 +1597,6 @@ impl Lowering {
     ) -> Result<(), FilterAction> {
         let (namespace, members) = namespace_header(tool)?;
         for member in members {
-            // A member name embedding the reserved `__` delimiter would make its
-            // flattened wire name ambiguous with a distinct namespace/member pair;
-            // fail closed before it is withheld or lowered so the flattening stays
-            // injective on the deferred path too (see the callable-collision guard in
-            // `claim_lowered`). Members without a name are rejected in the helpers.
-            if let Some(member_name) = member
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-            {
-                reject_reserved_namespace_delimiter("member", member_name)?;
-            }
             if source == LoweringSource::Declaration && is_deferred_declaration(member) {
                 // A member's outbound wire name is its flattened `namespace/member`
                 // name, so a forced namespaced selector for it fails closed as
@@ -1749,7 +1736,6 @@ fn namespace_header(tool: &Value) -> Result<(NamespaceContext<'_>, &[Value]), Fi
     let Some(name) = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) else {
         return Err(reject_bad_request("namespace tool requires a non-empty name"));
     };
-    reject_reserved_namespace_delimiter("group", name)?;
     let Some(description) = tool
         .get("description")
         .and_then(Value::as_str)
@@ -1987,14 +1973,14 @@ fn shell_lowered_function(description: &str) -> Value {
 }
 
 /// Build the fixed private `function` a client-executed `tool_search` lowers to.
-fn tool_search_lowered_function(description: &str, parameters: &Value) -> Value {
-    json!({
-        "type": "function",
-        "name": TOOL_SEARCH_NAME,
-        "description": description,
-        "parameters": parameters,
-        "strict": false,
-    })
+fn tool_search_lowered_function(description: &str, parameters: Value) -> Value {
+    let mut out = Map::with_capacity(5);
+    out.insert("type".to_owned(), json!("function"));
+    out.insert("name".to_owned(), json!(TOOL_SEARCH_NAME));
+    out.insert("description".to_owned(), json!(description));
+    out.insert("parameters".to_owned(), parameters);
+    out.insert("strict".to_owned(), json!(false));
+    Value::Object(out)
 }
 
 /// Lower a `tool_choice` value, translating client-owned selectors in place.
@@ -2590,16 +2576,16 @@ pub(crate) fn restore_shell_call(item: &Value) -> Result<Value, ()> {
         .ok_or(())?;
     let status = restore_call_status(item)?;
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-    let mut out = json!({
-        "type": "shell_call",
-        "id": shell_public_item_id(id),
-        "call_id": call_id,
-        "action": action,
-        // A local shell_call carries its environment so the client-executed
-        // classifier recognizes it and mixed-ownership rounds fail closed.
-        "environment": {"type": "local"},
-        "status": status,
-    });
+    let mut fields = Map::with_capacity(7);
+    fields.insert("type".to_owned(), json!("shell_call"));
+    fields.insert("id".to_owned(), json!(shell_public_item_id(id)));
+    fields.insert("call_id".to_owned(), json!(call_id));
+    fields.insert("action".to_owned(), action);
+    // A local shell_call carries its environment so the client-executed
+    // classifier recognizes it and mixed-ownership rounds fail closed.
+    fields.insert("environment".to_owned(), json!({"type": "local"}));
+    fields.insert("status".to_owned(), json!(status));
+    let mut out = Value::Object(fields);
     carry_caller(&mut out, item);
     Ok(out)
 }
@@ -2621,14 +2607,14 @@ pub(crate) fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
     let status = restore_call_status(item)?;
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let arguments: Value = serde_json::from_str(arguments).ok().ok_or(())?;
-    Ok(json!({
-        "type": "tool_search_call",
-        "id": tool_search_public_item_id(id),
-        "call_id": call_id,
-        "execution": "client",
-        "arguments": arguments,
-        "status": status,
-    }))
+    let mut out = Map::with_capacity(6);
+    out.insert("type".to_owned(), json!("tool_search_call"));
+    out.insert("id".to_owned(), json!(tool_search_public_item_id(id)));
+    out.insert("call_id".to_owned(), json!(call_id));
+    out.insert("execution".to_owned(), json!("client"));
+    out.insert("arguments".to_owned(), arguments);
+    out.insert("status".to_owned(), json!(status));
+    Ok(Value::Object(out))
 }
 
 /// Map a backend `function_call` `status` to a schema-valid `FunctionCallStatus`
@@ -2687,28 +2673,65 @@ fn is_valid_function_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Return whether the verbatim `agentic_ns__{namespace}__{member}` flattening of
+/// this pair re-splits into exactly one `(namespace, member)` pair.
+///
+/// The verbatim form is injective only while neither component contains the
+/// [`NAMESPACE_NAME_DELIMITER`] nor abuts it with a leading or trailing `_`. Either
+/// shape admits an alternative split of the same wire name for two *distinct*
+/// pairs:
+/// - embedded `__`: namespace `a` member `b__c` and namespace `a__b` member `c` both flatten to `agentic_ns__a__b__c`;
+/// - boundary `_`: namespace `a` member `_b` and namespace `a_` member `b` both flatten to `agentic_ns__a___b` (the
+///   boundary `_` merges with the separator into `___`, which re-splits).
+///
+/// A pair that fails this test is flattened through the hashed branch of
+/// [`namespace_member_name`] rather than rejected. The delimiter is routine in real
+/// client traffic — Codex names an MCP tool namespace `mcp__{server}` and its
+/// members `mcp__{server}__{tool}` — so reserving it would reject every Codex
+/// session that attaches an MCP server.
+fn verbatim_flattening_is_injective(namespace: &str, member: &str) -> bool {
+    [namespace, member].into_iter().all(|component| {
+        !component.contains(NAMESPACE_NAME_DELIMITER) && !component.starts_with('_') && !component.ends_with('_')
+    })
+}
+
+/// Hash a `(namespace, member)` pair for the hashed branch of
+/// [`namespace_member_name`].
+///
+/// The namespace is length-prefixed so the hashed *input* is injective over
+/// distinct pairs. Hashing the flattened `full_name` instead would inherit the very
+/// ambiguity this branch exists to resolve: namespace `a` member `b__c` and
+/// namespace `a__b` member `c` share a `full_name`, so they would share both the
+/// hash and the readable prefix derived from it and collapse onto one wire name.
+fn namespace_pair_hash(namespace: &str, member: &str) -> u64 {
+    stable_name_hash(&format!("{}:{namespace}:{member}", namespace.len()))
+}
+
 /// Flatten a Codex namespace member to its model-visible function name.
 ///
 /// This must be injective across *distinct* `(namespace, member)` pairs: the
 /// reverse restoration map, the `tool_choice` rewriter, and the withheld-budget
 /// reclaim ([`Lowering::reclaim_withheld`]) all key by the returned wire name, so
 /// two distinct members flattening to one name would restore to the wrong item,
-/// redirect a forced selector, or miscount the `max_client_tools` cap. The
-/// verbatim form is kept injective by [`reject_reserved_namespace_delimiter`]. The
-/// hash-truncation branch is domain-separated with a `___` marker: a verbatim
-/// `agentic_ns__{namespace}__{member}` can never contain three consecutive
-/// underscores (the prefix ends in `__`, and the delimiter guard forbids a
-/// component from embedding `__` or abutting the separator with a leading/trailing
-/// `_`, so every junction is `__` + non-`_`), so a hashed name — which always
-/// contains `___` — is byte-disjoint from every verbatim name. Without the marker
-/// a verbatim member name set to the forward FNV hex of a longer member's full
-/// name collides with that member's hashed wire name (no hash search required).
+/// redirect a forced selector, or miscount the `max_client_tools` cap.
+///
+/// The readable verbatim form is used only when it both fits
+/// [`MAX_FUNCTION_NAME_LEN`] and re-splits unambiguously
+/// ([`verbatim_flattening_is_injective`]); every other pair takes the hashed
+/// branch, whose [`namespace_pair_hash`] input is injective by construction. The
+/// two branches are kept byte-disjoint by the `___` marker: a *verbatim* wire can
+/// never contain three consecutive underscores (the prefix ends in `__`, and the
+/// branch condition admits only components that neither embed `__` nor abut the
+/// separator with a boundary `_`, so every junction is `__` + non-`_`), while a
+/// hashed wire always does. Without the marker a verbatim member name set to the
+/// forward FNV hex of a longer member's full name collides with that member's
+/// hashed wire name (no hash search required).
 fn namespace_member_name(namespace: &str, member: &str) -> String {
     let full_name = format!("{NAMESPACE_MEMBER_PREFIX}{namespace}__{member}");
-    if full_name.chars().count() <= MAX_FUNCTION_NAME_LEN {
+    if full_name.chars().count() <= MAX_FUNCTION_NAME_LEN && verbatim_flattening_is_injective(namespace, member) {
         return full_name;
     }
-    let hash = stable_name_hash(&full_name);
+    let hash = namespace_pair_hash(namespace, member);
     let readable_len = MAX_FUNCTION_NAME_LEN - HASHED_NAMESPACE_MEMBER_SUFFIX_LEN;
     let readable_prefix: String = full_name.chars().take(readable_len).collect();
     format!("{readable_prefix}___{hash:016x}")
@@ -2761,45 +2784,6 @@ fn reject_reserved_hosted_tool_name(tool: &Value) -> Result<(), FilterAction> {
     {
         return Err(reject_bad_request(&format!(
             "client tool '{name}' collides with the reserved hosted tool name '{name}'"
-        )));
-    }
-    Ok(())
-}
-
-/// Fail closed on a `namespace` group name or member name that embeds — or abuts —
-/// the `__` delimiter [`namespace_member_name`] reserves to separate the prefix,
-/// namespace, and member components of a flattened wire name.
-///
-/// The flattening `agentic_ns__{namespace}__{member}` is injective only while a
-/// component neither contains `__` nor places a single `_` against the `__`
-/// separator. Both cases create an alternative split of the same wire name for two
-/// *distinct* `(namespace, member)` pairs:
-/// - embedded `__`: namespace `a` member `b__c` and namespace `a__b` member `c` both flatten to `agentic_ns__a__b__c`;
-/// - boundary `_`: namespace `a` member `_b` and namespace `a_` member `b` both flatten to `agentic_ns__a___b` (the
-///   boundary `_` merges with the separator into `___`, which re-splits).
-///
-/// [`Lowering::claim_lowered`] already fails closed on such a collision between two
-/// callable members, but a *deferred* member is withheld (never claimed), so a later
-/// distinct member colliding with it would slip past that guard and let
-/// [`Lowering::reclaim_withheld`] credit one member's withheld budget to the other,
-/// miscounting two logical tools as one under `max_client_tools` (and forcing a
-/// namespaced `tool_choice` for one member onto the other via the shared wire name).
-/// Rejecting both an embedded `__` and a leading or trailing `_` keeps the flattening
-/// injective on the deferred path too, so wire-name matching stays sound. The leading-
-/// `_`-on-a-group and trailing-`_`-on-a-member cases cannot merge with the separator,
-/// but are rejected as well so the rule stays symmetric and robust to future format
-/// changes. `kind` labels the offending component (`group` or `member`).
-///
-/// This guard only makes the *verbatim* flattening injective; the hash-truncation
-/// branch of [`namespace_member_name`] (taken for names over
-/// [`MAX_FUNCTION_NAME_LEN`]) is kept disjoint from every verbatim name by its own
-/// `___` domain-separator marker, since these guarded names never yield a verbatim
-/// wire containing three consecutive underscores.
-fn reject_reserved_namespace_delimiter(kind: &str, name: &str) -> Result<(), FilterAction> {
-    if name.contains(NAMESPACE_NAME_DELIMITER) || name.starts_with('_') || name.ends_with('_') {
-        return Err(reject_bad_request(&format!(
-            "namespace {kind} name '{name}' may not contain the reserved '{NAMESPACE_NAME_DELIMITER}' \
-             delimiter or begin or end with '_'"
         )));
     }
     Ok(())

@@ -144,9 +144,9 @@ reviews:
       instructions: |
         While https://github.com/praxis-proxy/ai/issues/32 remains open and
         the asynchronous Responses lifecycle is unavailable locally, the
-        gateway-owned path (openai_responses_validate,
-        openai_responses_request) must return an OpenAI 400 for create
-        requests with background: true after logical provider binding.
+        gateway-owned path (openai_responses_request) must return an OpenAI
+        400 for create requests with background: true after logical provider
+        binding.
         Once that lifecycle is implemented, review it against the issue's
         contract instead of requiring this rejection. Do not flag the
         openai_responses_format classifier preserving background as routing

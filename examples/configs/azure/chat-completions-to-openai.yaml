@@ -31,6 +31,9 @@ filter_chains:
 
       - filter: openai_chat_completions_to_azureai_chat_completions
         api_version: "2024-10-21"
+        conditions:
+          - when:
+              path: "/v1/chat/completions"
 
       - filter: router
         routes:

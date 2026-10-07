@@ -31,6 +31,7 @@ const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
+/// provider: "openai"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
 /// identity_metadata_namespace: "identity"
@@ -45,7 +46,8 @@ pub(super) struct ExternalMeteringConfig {
 
     /// Allow the metering endpoint to resolve to non-public addresses
     /// (loopback, private, link-local). Defaults to `false`, so callouts
-    /// are rejected before connecting unless the operator opts in.
+    /// are rejected before connecting unless the operator opts in. Cloud
+    /// metadata, unspecified, and multicast addresses remain blocked.
     #[serde(default)]
     pub allow_private_endpoint: bool,
 
@@ -60,6 +62,10 @@ pub(super) struct ExternalMeteringConfig {
     /// `CloudEvents` `source` field value.
     #[serde(default = "default_source")]
     pub source: String,
+
+    /// Static provider name attributed to emitted `CloudEvents`.
+    #[serde(default)]
+    pub provider: Option<String>,
 
     /// When `true` (default), requests proceed if the metering service
     /// is unavailable. When `false`, requests are rejected with 503.

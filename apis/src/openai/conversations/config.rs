@@ -156,8 +156,9 @@ pub(crate) struct ConversationsConfig {
     ///
     /// By default, DNS names, localhost, loopback, private,
     /// link-local, cloud metadata, unspecified, and Unix socket
-    /// targets are rejected. This opt-in is intended for local
-    /// development and tests.
+    /// targets are rejected. This opt-in is intended for local development
+    /// and tests; cloud metadata, unspecified, and multicast addresses remain
+    /// blocked when it is enabled.
     #[serde(default)]
     pub allow_private_database_url: bool,
 

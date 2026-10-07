@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "scenario_id": "responses/client-tool-compat-mcp-namespace",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-compat-model",
+    "source_id": "responses/client-tool-compat-mcp-namespace"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_read_file_0003": "call_recorded_0002",
+      "resp_compat_mcp_ns_0001": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "mcp-namespace-lower-restore",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Read the hosts file.",
+              "model": "synthetic-compat-model",
+              "store": false,
+              "stream": false,
+              "tools": [
+                {
+                  "description": "Codex MCP tools.",
+                  "name": "mcp__codex_tui",
+                  "tools": [
+                    {
+                      "description": "Read a file from the workspace.",
+                      "name": "read_file",
+                      "parameters": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "path": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "path"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "function"
+                    }
+                  ],
+                  "type": "namespace"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "created_at": 0,
+              "id": "resp_recorded_0001",
+              "model": "synthetic-compat-model",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"path\":\"/etc/hosts\"}",
+                  "call_id": "call_recorded_0002",
+                  "id": "fc_read_file_0002",
+                  "name": "read_file",
+                  "namespace": "mcp__codex_tui",
+                  "status": "completed",
+                  "type": "function_call"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "status": "completed",
+              "tool_choice": "auto",
+              "tools": [
+                {
+                  "description": "Codex MCP tools.",
+                  "name": "mcp__codex_tui",
+                  "tools": [
+                    {
+                      "description": "Read a file from the workspace.",
+                      "name": "read_file",
+                      "parameters": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "path": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "path"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "function"
+                    }
+                  ],
+                  "type": "namespace"
+                }
+              ],
+              "usage": {
+                "input_tokens": 31,
+                "input_tokens_details": {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "output_tokens": 14,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 45
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": "Read the hosts file.",
+                  "role": "user",
+                  "type": "message"
+                }
+              ],
+              "model": "synthetic-compat-model",
+              "store": false,
+              "stream": false,
+              "tools": [
+                {
+                  "description": "Belongs to the `mcp__codex_tui` tool namespace: Codex MCP tools.\n\nRead a file from the workspace.",
+                  "name": "agentic_ns__mcp__codex_tui__read_file___68857b231df97733",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "created_at": 0,
+              "id": "resp_recorded_0001",
+              "model": "synthetic-compat-model",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"path\":\"/etc/hosts\"}",
+                  "call_id": "call_recorded_0002",
+                  "id": "fc_read_file_0002",
+                  "name": "agentic_ns__mcp__codex_tui__read_file___68857b231df97733",
+                  "status": "completed",
+                  "type": "function_call"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "status": "completed",
+              "tool_choice": "auto",
+              "tools": [
+                {
+                  "description": "Belongs to the `mcp__codex_tui` tool namespace: Codex MCP tools.\n\nRead a file from the workspace.",
+                  "name": "agentic_ns__mcp__codex_tui__read_file___68857b231df97733",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
+                }
+              ],
+              "usage": {
+                "input_tokens": 31,
+                "input_tokens_details": {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "output_tokens": 14,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 45
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

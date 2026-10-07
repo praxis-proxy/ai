@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Anthropic protocol filters.
+//! Anthropic protocol filters and the Messages operation registry.
 
 pub(crate) mod error_response_formatter;
 mod messages_format;
 pub(crate) mod messages_to_chat_completions;
 mod messages_to_chat_completions_stream;
 mod protocol;
+pub mod routes;
 mod validate;
 mod web_search;
 mod wire;

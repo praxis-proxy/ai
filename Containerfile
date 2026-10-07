@@ -7,8 +7,13 @@
 FROM rust:1.98-alpine3.24 AS builder
 
 # Cargo features for the published binary. `full` keeps every non-experimental
-# filter; the crate default (`standard`) leaves the heavier OpenAI groups out.
-ARG PRAXIS_AI_FEATURES=full
+# filter; the proxy crate defaults to `full` while the library crates default
+# to the smaller `standard` feature set.
+# `store-sqlite` is added on top of `full` (which selects only the PostgreSQL
+# backend) so the image can also serve the SQLite-backed example configs without
+# a local rebuild. SQLx compiles SQLite into the binary through
+# `libsqlite3-sys/bundled`, so this adds no runtime package to stage 2.
+ARG PRAXIS_AI_FEATURES=full,store-sqlite
 
 # praxis-ai performs all of its cryptography in the system OpenSSL and links it
 # dynamically, so the musl target must not produce a static executable (the
@@ -119,10 +124,17 @@ LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
 #   ca-certificates: TLS certificate validation
 #   libcrypto3, libssl3: the system OpenSSL the binary links dynamically
 #   libgcc: the unwinder (libgcc_s) a dynamically linked musl binary needs
+# /etc/praxis stays root-owned: it holds the mounted configuration and the
+# proxy has no reason to write there. /var/lib/praxis is the writable state
+# directory for backends that keep local files, such as the SQLite response
+# store, so those configs work without a host directory prepared for UID 100.
+# It is deliberately not a VOLUME; declaring one would leave an anonymous
+# volume behind on every run.
 RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc \
     && addgroup -S praxis \
     && adduser -S -G praxis -h /nonexistent -s /sbin/nologin praxis \
-    && mkdir -p /etc/praxis
+    && mkdir -p /etc/praxis /var/lib/praxis \
+    && chown praxis:praxis /var/lib/praxis
 
 # Apache-2.0 (section 4) requires object-form recipients to receive the License
 # and the applicable NOTICE attributions. Ship them with the image. The root

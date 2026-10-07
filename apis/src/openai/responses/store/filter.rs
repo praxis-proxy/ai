@@ -64,18 +64,17 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
-    InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, validate_config},
-    list_input_items,
 };
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
-    service::responses::ResponsesService,
+    service::responses::{InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, build_record, list_input_items},
     state_owner::{StateOwner, require_state_owner},
     store::{
-        EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStoreRegistry, StoreError,
+        EventLogStatus, OwnerScopedResponseStore, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
+        ResponseStoreRegistry, StoreError,
     },
 };
 
@@ -174,12 +173,12 @@ impl ResponseStoreFilter {
         owner: &StateOwner,
         id: &str,
     ) -> Result<FilterAction, FilterError> {
-        let Some(service) = resolve_service(ctx, owner) else {
+        let Some(store) = resolve_store(ctx, owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
-        let deleted = service
-            .delete(id)
+        let deleted = store
+            .delete_response(id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
@@ -227,13 +226,13 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&persist.service, &record, &pending_approvals)?;
+        persist_response_blocking(&persist.store, &record, &pending_approvals)?;
         // Flush the replay event log only after the record is durable, so the
         // parent-exists gate is satisfied, and before releasing the terminal
         // frame, so a client never observes completion for a response whose
         // replay log did not persist.
         flush_event_log_blocking(
-            &persist.service,
+            &persist.store,
             &record,
             persist.captured_events,
             persist.events_over_budget,
@@ -261,7 +260,7 @@ impl ResponseStoreFilter {
         // A non-streaming response captures no SSE events, so the event log is
         // always empty here; only the buffered record is persisted.
         let PersistContext {
-            service,
+            store,
             owner,
             request_input,
             ..
@@ -274,7 +273,7 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&service, &record, &pending_approvals)?;
+        persist_response_blocking(&store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 
@@ -413,24 +412,23 @@ struct ReplayEventHead<'a> {
     ty: Option<Cow<'a, str>>,
 }
 
-/// Resolve the owner-scoped Responses service from the per-request registry.
+/// Resolve the owner-scoped Responses store from the per-request registry.
 ///
 /// The store is provisioned into the registry on the serving runtime; the filter
-/// takes an owner-bound handle at request time and wraps it in the service.
+/// takes an owner-bound handle at request time.
 /// `None` when no registry is installed or the store is not provisioned.
-fn resolve_service(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<ResponsesService> {
+fn resolve_store(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<OwnerScopedResponseStore> {
     ctx.extensions
         .get::<ResponseStoreRegistry>()
         .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, owner))
-        .map(ResponsesService::new)
 }
 
 /// Request-scoped persistence context captured before inference: the
-/// owner-scoped service, the immutable owner, the original request input, the
+/// owner-scoped store, the immutable owner, the original request input, the
 /// captured replay events, and whether capture went over budget.
 struct PersistContext {
-    /// Owner-scoped Responses service used to persist the record and event log.
-    service: ResponsesService,
+    /// Owner-scoped Responses store used to persist the record and event log.
+    store: OwnerScopedResponseStore,
     /// Immutable owner the response and its events belong to.
     owner: StateOwner,
     /// Original request input, persisted alongside the response.
@@ -451,9 +449,9 @@ fn take_persist_context(ctx: &mut HttpFilterContext<'_>) -> Result<PersistContex
     let owner = capture
         .owner
         .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
-    let service = resolve_service(ctx, &owner).ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    let store = resolve_store(ctx, &owner).ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
     Ok(PersistContext {
-        service,
+        store,
         owner,
         request_input: capture.input,
         captured_events: capture.events,
@@ -471,7 +469,7 @@ fn build_streaming_record(
     let state = ctx.extensions.get::<ResponsesState>()?;
     let response_object = state.response_object.clone();
     let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
-    ResponsesService::build_record(response_object, owner, request_input, state_messages)
+    build_record(response_object, owner, request_input, state_messages)
 }
 
 /// Build the buffered record from the decoded response body and the captured
@@ -487,7 +485,7 @@ fn build_buffered_record(
         .get::<ResponsesState>()
         .map(|state| state.persisted_messages.clone());
     let json = decode_response_body(bytes)?;
-    ResponsesService::build_record(json, owner, request_input, state_messages)
+    build_record(json, owner, request_input, state_messages)
 }
 
 /// Decode a buffered response body, logging and skipping on invalid JSON.
@@ -655,7 +653,7 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 /// store filter that is absent, request-conditioned out, or ordered after
 /// dispatch.
 ///
-/// It is written from `on_request_body` because `openai_responses_validate`
+/// It is written from `on_request_body` because `openai_responses_request`
 /// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
 /// the same body phase, so `ResponsesState` is not yet present during
 /// `on_request`.
@@ -876,7 +874,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
-    service: &ResponsesService,
+    store: &OwnerScopedResponseStore,
     record: &ResponseRecord,
     pending_approvals: &[PendingApprovalRecord],
 ) -> Result<(), FilterError> {
@@ -888,8 +886,14 @@ fn persist_response_blocking(
     );
 
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on(async { service.persist(record, pending_approvals).await }))
-        .map_err(|e| -> FilterError { Box::new(e) })
+    tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            store
+                .persist_response_with_pending_approvals(record, pending_approvals)
+                .await
+        })
+    })
+    .map_err(|e| -> FilterError { Box::new(e) })
 }
 
 /// Flush the captured replay event log synchronously, right after the response
@@ -902,7 +906,7 @@ fn persist_response_blocking(
 /// stays retrievable as JSON but is not replayable, which the terminal-event
 /// gate on the GET replay path enforces.
 fn flush_event_log_blocking(
-    service: &ResponsesService,
+    store: &OwnerScopedResponseStore,
     record: &ResponseRecord,
     events: Vec<CapturedEvent>,
     over_budget: bool,
@@ -936,7 +940,7 @@ fn flush_event_log_blocking(
 
     debug!(id = %record.id, events = records.len(), "persisting replay event log");
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on(async { service.append_events(&record.id, &records).await }))
+    tokio::task::block_in_place(|| handle.block_on(async { store.append_events(&record.id, &records).await }))
         .map_err(|e| -> FilterError { Box::new(e) })
 }
 
@@ -1216,21 +1220,21 @@ impl ResponseStoreFilter {
             Err(action) => return action,
         };
 
-        let Some(service) = resolve_service(ctx, owner) else {
+        let Some(store) = resolve_store(ctx, owner) else {
             return FilterAction::Reject(reject_store_error());
         };
 
         if parsed.stream {
-            serve_replay(service, id, parsed.starting_after).await
+            serve_replay(store, id, parsed.starting_after).await
         } else {
-            Self::serve_stored_json(&service, id).await
+            Self::serve_stored_json(&store, id).await
         }
     }
 
     /// Serve the stored response object as JSON, unchanged.
-    async fn serve_stored_json(service: &ResponsesService, id: &str) -> FilterAction {
+    async fn serve_stored_json(store: &OwnerScopedResponseStore, id: &str) -> FilterAction {
         debug!(response_id = id, "retrieving stored response");
-        match service.get(id).await {
+        match store.get_response(id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -1254,12 +1258,12 @@ impl ResponseStoreFilter {
     /// [`FilterAction`] rejection on store or not-found errors.
     async fn load_record(&self, ctx: &HttpFilterContext<'_>, id: &str) -> Result<ResponseRecord, FilterAction> {
         let owner = require_state_owner(ctx)?;
-        let Some(service) = resolve_service(ctx, owner) else {
+        let Some(store) = resolve_store(ctx, owner) else {
             return Err(FilterAction::Reject(reject_store_error()));
         };
         debug!(response_id = id, "retrieving input items");
 
-        match service.get(id).await {
+        match store.get_response(id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");
@@ -1588,11 +1592,11 @@ fn reject_store_error() -> Rejection {
 /// On success returns a [`FilterAction::StreamingTerminalResponse`] (200,
 /// `text/event-stream`, `no-store`) whose body pages the log from the store; the
 /// whole log is never held in memory.
-async fn serve_replay(service: ResponsesService, id: &str, starting_after: Option<u64>) -> FilterAction {
-    if let Err(action) = ensure_response_exists(&service, id).await {
+async fn serve_replay(store: OwnerScopedResponseStore, id: &str, starting_after: Option<u64>) -> FilterAction {
+    if let Err(action) = ensure_response_exists(&store, id).await {
         return action;
     }
-    let terminal_sequence = match ensure_replayable_log(&service, id).await {
+    let terminal_sequence = match ensure_replayable_log(&store, id).await {
         Ok(sequence) => sequence,
         Err(action) => return action,
     };
@@ -1609,15 +1613,15 @@ async fn serve_replay(service: ResponsesService, id: &str, starting_after: Optio
     headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
 
     debug!(response_id = id, "serving SSE replay");
-    let body = ReplayStreamBody::new(service, id.to_owned(), starting_after, terminal_sequence);
+    let body = ReplayStreamBody::new(store, id.to_owned(), starting_after, terminal_sequence);
     FilterAction::StreamingTerminalResponse(Box::new(
         StreamingTerminalResponse::new(200, Box::new(body)).with_headers(headers),
     ))
 }
 
 /// Require the response to exist for this owner; 404 when missing, 500 on error.
-async fn ensure_response_exists(service: &ResponsesService, id: &str) -> Result<(), FilterAction> {
-    match service.get(id).await {
+async fn ensure_response_exists(store: &OwnerScopedResponseStore, id: &str) -> Result<(), FilterAction> {
+    match store.get_response(id).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
             debug!(response_id = id, "replay: response not found");
@@ -1638,8 +1642,8 @@ async fn ensure_response_exists(service: &ResponsesService, id: &str) -> Result<
 /// with exactly one terminal event, so this equals the log's maximum sequence and
 /// bounds the replay: pages beyond it are a legitimate empty tail, while an empty
 /// page short of it means rows were removed mid-replay.
-async fn ensure_replayable_log(service: &ResponsesService, id: &str) -> Result<u64, FilterAction> {
-    match service.event_log_status(id).await {
+async fn ensure_replayable_log(store: &OwnerScopedResponseStore, id: &str) -> Result<u64, FilterAction> {
+    match store.event_log_status(id).await {
         Ok(EventLogStatus::Replayable { max_sequence }) => Ok(max_sequence),
         Ok(EventLogStatus::Absent | EventLogStatus::Incomplete { .. }) => {
             debug!(response_id = id, "replay: no replayable event log");
@@ -1655,12 +1659,12 @@ async fn ensure_replayable_log(service: &ResponsesService, id: &str) -> Result<u
 /// Pull-based body that replays a stored response's SSE event log.
 ///
 /// Each [`StreamingResponseBody::next_chunk`] fetches one page of rows with
-/// [`ResponsesService::list_events_after`], re-encodes them to the canonical wire
+/// [`OwnerScopedResponseStore::list_events_after`], re-encodes them to the canonical wire
 /// SSE form, and returns them as one chunk. It stops after the terminal event, so
 /// at most one page ([`REPLAY_PAGE_LIMIT`] rows) is held in memory at a time.
 struct ReplayStreamBody {
-    /// Owner-scoped service the body pages events through.
-    service: ResponsesService,
+    /// Owner-scoped store the body pages events through.
+    store: OwnerScopedResponseStore,
     /// Response whose log is being replayed.
     response_id: String,
     /// Cursor: the next page starts after this sequence number.
@@ -1673,16 +1677,16 @@ struct ReplayStreamBody {
 }
 
 impl ReplayStreamBody {
-    /// Bind a replay body to an owner-scoped service, starting cursor, and the
+    /// Bind a replay body to an owner-scoped store, starting cursor, and the
     /// terminal boundary established when the log was confirmed replayable.
     fn new(
-        service: ResponsesService,
+        store: OwnerScopedResponseStore,
         response_id: String,
         starting_after: Option<u64>,
         terminal_sequence: u64,
     ) -> Self {
         Self {
-            service,
+            store,
             response_id,
             cursor: starting_after,
             terminal_sequence,
@@ -1699,7 +1703,7 @@ impl StreamingResponseBody for ReplayStreamBody {
         }
 
         let events = self
-            .service
+            .store
             .list_events_after(&self.response_id, self.cursor, REPLAY_PAGE_LIMIT)
             .await
             .map_err(|e| -> FilterError { Box::new(e) })?;

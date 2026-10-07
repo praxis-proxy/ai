@@ -1042,8 +1042,14 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "background"
       # Classification preserves provider-owned fields. The managed-path
-      # validator owns rejection of unsupported background execution.
-      - filter: openai_responses_validate
+      # request filter owns rejection of unsupported background execution.
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: router
         routes:
           - path_prefix: "/"

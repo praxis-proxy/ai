@@ -27,10 +27,10 @@ use serde::Deserialize;
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
 /// static header-value matchers, per-rule algorithm choice, configurable
-/// estimation strategies (M3, see [`EstimationConfig`]), and M4
-/// token-type weights (`default_weights` / per-rule `weights`). CEL
-/// matchers and soft-limit tiers are still out of scope (see the module
-/// doc comment) -- upstream itself defers those.
+/// estimation strategies (M3, see [`EstimationConfig`]), M4
+/// token-type weights (`default_weights` / per-rule `weights`), graduated
+/// soft-limit tiers (S1), and per-rule soft over-quota enforcement
+/// (`ai#1241`). CEL matchers remain deferred (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -44,9 +44,14 @@ use serde::Deserialize;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
-/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before
-///   a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
+///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
+///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
 ///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///
+/// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
+/// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
+/// also use `budget_exhausted`. Admitted reservations use `reserved`.
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
@@ -763,6 +768,66 @@ pub(super) struct RuleConfig {
     /// the algorithm's `capacity`.
     #[serde(default)]
     pub tiers: Option<Vec<TierConfig>>,
+
+    /// What happens when the algorithm denies a reservation because the
+    /// token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`]
+    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation.
+    #[serde(default)]
+    pub enforcement: EnforcementMode,
+
+    /// Request-header annotation applied when [`enforcement`](Self::enforcement)
+    /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
+    /// for budget exhaustion. Required for `soft` (at least one static header
+    /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
+    #[serde(default)]
+    pub over_quota: Option<OverQuotaConfig>,
+}
+
+/// Per-rule action when the admission algorithm denies a reservation.
+///
+/// Distinct from graduated S1 `tiers` (which annotate admitted traffic
+/// below capacity): this chooses hard 429 vs soft annotate when the
+/// request is *over* the algorithm's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EnforcementMode {
+    /// Reject with 429 and token-denominated rate-limit response headers.
+    #[default]
+    Hard,
+    /// Forward the request and annotate it for downstream handling (`ai#1241`).
+    Soft,
+}
+
+/// Annotation surface for soft over-quota forwarding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OverQuotaConfig {
+    /// Static headers set on the upstream request when over quota.
+    /// Required to be non-empty unless `include_remaining` or
+    /// `include_used` is true.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// When true, also set the remaining-quota header from the backend
+    /// snapshot at denial time (tokens still available in the window /
+    /// bucket — often `0` when the estimate no longer fits).
+    #[serde(default)]
+    pub include_remaining: bool,
+
+    /// When true, also set a used-quota header as `limit - remaining`
+    /// from the same denial-time backend snapshot.
+    #[serde(default)]
+    pub include_used: bool,
+
+    /// Header name for remaining tokens when `include_remaining` is true.
+    /// Defaults to `X-RateLimit-Remaining-Tokens`.
+    #[serde(default)]
+    pub remaining_header: Option<String>,
+
+    /// Header name for used tokens when `include_used` is true.
+    /// Defaults to `X-Token-Quota-Used`.
+    #[serde(default)]
+    pub used_header: Option<String>,
 }
 
 /// One graduated enforcement tier (proposal S1).

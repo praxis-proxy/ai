@@ -4,12 +4,7 @@
 //! A shared helper for body-derived data promotion.
 
 use http::HeaderName;
-use praxis_filter::{
-    FilterError,
-    builtins::http::{
-        payload_processing::config_validation::validate_header_name, value_safety::is_safe_promoted_value,
-    },
-};
+use praxis_filter::{FilterError, builtins::http::payload_processing::config_validation::validate_header_name};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -17,6 +12,23 @@ use praxis_filter::{
 
 /// Longest value that may be promoted to a header, metadata key, or filter result.
 pub const MAX_PROMOTED_VALUE_LEN: usize = 256;
+
+// -----------------------------------------------------------------------------
+// Header Value Safety
+// -----------------------------------------------------------------------------
+
+/// Returns `true` if `s` is safe to promote to an HTTP header value.
+///
+/// Byte-scan equivalent of `HeaderValue::from_str(s).is_ok()`: HTAB, SP,
+/// visible ASCII, and obs-text pass; other control bytes and DEL fail.
+pub fn is_safe_promoted_value(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7F))
+}
+
+/// Returns `true` if `s` is unsafe to promote to headers or metadata.
+pub fn contains_control_chars(s: &str) -> bool {
+    !is_safe_promoted_value(s)
+}
 
 // -----------------------------------------------------------------------------
 // is_promotable_value
@@ -245,6 +257,38 @@ fn reject_unsafe_promotion_target(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_scan_matches_header_value_parse_for_every_byte() {
+        for byte in 0_u8..=255 {
+            let Ok(s) = std::str::from_utf8(std::slice::from_ref(&byte)) else {
+                continue;
+            };
+            assert_eq!(
+                is_safe_promoted_value(s),
+                http::HeaderValue::from_str(s).is_ok(),
+                "byte 0x{byte:02x} must classify exactly like HeaderValue::from_str"
+            );
+        }
+        for s in ["caf\u{e9}", "\u{1F600}", "mixed caf\u{e9}\ttab", "nul\u{0}"] {
+            assert_eq!(
+                is_safe_promoted_value(s),
+                http::HeaderValue::from_str(s).is_ok(),
+                "multi-byte sample {s:?} must classify exactly like HeaderValue::from_str"
+            );
+        }
+    }
+
+    #[test]
+    fn control_chars_is_the_negation() {
+        for s in ["", "gpt-4.1", "tab\there", "cr\r", "del\u{7f}", "nul\u{0}"] {
+            assert_eq!(
+                contains_control_chars(s),
+                !is_safe_promoted_value(s),
+                "{s:?} must be unsafe exactly when it is not safe"
+            );
+        }
+    }
 
     #[test]
     fn accepts_normal_model() {

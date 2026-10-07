@@ -6,7 +6,8 @@ surfaces. The current scope is Conversations only.
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json` as a **review reference only**. It is
 read by the automated PR review prompt (`.github/prompts/automated-review.md`)
-when a change touches Anthropic surfaces. It is not consumed by
+when a change touches Anthropic surfaces, and the Anthropic Messages operation
+registry is transcribed from it by hand. It is not consumed by
 `cargo xtask openai-conformance`, and there is no `oasdiff`, capability, or CI
 gate for Anthropic. See [Anthropic Messages Reference Spec](#anthropic-messages-reference-spec).
 
@@ -318,6 +319,16 @@ platform or console surfaces (agents, deployments, environments, memory stores,
 organizations, sessions, tunnels, vaults, skills, user profiles) are always out
 of scope — Praxis does not implement them, so their absence in Praxis is never
 a finding.
+
+### Relationship to the Anthropic Messages operation registry
+
+The Anthropic Messages operation registry in `apis/src/anthropic/routes.rs`
+transcribes its methods, paths, operation IDs, and request-body shapes from this
+pinned document, covering the non-beta `/v1/messages` surface named above. The
+transcription is not machine-checked: nothing compares the registry against the
+spec at build or CI time, so the registry makes no specification-conformance
+claim and a refresh of the pinned document will not flag a registry that has
+fallen behind. Wiring that gate is tracked separately.
 
 ### Refresh
 

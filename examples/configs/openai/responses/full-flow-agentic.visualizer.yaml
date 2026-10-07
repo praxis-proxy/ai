@@ -1,0 +1,2721 @@
+pipeline:
+  filters:
+  - id: trace_context
+    name: trace_context
+    group: trace
+    filter_type: trace_context
+    phase: request-phase; establishes typed correlation BEFORE the IRR snapshots request extensions; no response phase
+    config: {}
+    promotes: establishes a typed TraceContext extension carried across every IRR iteration; child callouts retain this request/trace identity while Praxis core assigns a fresh span ID to each outbound hop
+    scenarios:
+      S1:
+        state: active
+        note: establishes TraceContext for the single inference round
+      S2:
+        state: active
+        note: establishes TraceContext for the streaming round
+      S3:
+        state: active
+        note: establishes TraceContext (independent of the store flag)
+      S4:
+        state: active
+        note: establishes TraceContext for the multi-turn request
+      S5:
+        state: active
+        note: TraceContext propagates into the file_search vector-store callout (fresh span per hop)
+      S6:
+        state: active
+        note: TraceContext propagates into every MCP resolve/dispatch hop (fresh span each)
+      S7:
+        state: active
+        note: TraceContext propagates into the Brave web_search callout (fresh span per hop)
+      S8:
+        state: active
+        note: establishes TraceContext before the store answers the GET retrieve
+      S9:
+        state: active
+        note: establishes TraceContext on the WS handshake before the direct-services branch
+      S10:
+        state: active
+        note: establishes TraceContext before the route-miss
+      S11:
+        state: active
+        note: establishes TraceContext before the dedicated-service direct-services branch
+      S12:
+        state: active
+        note: establishes TraceContext before the direct-openai passthrough forward
+      S13:
+        state: active
+        note: establishes TraceContext for the managed chat-completions round
+  - id: state_owner
+    name: state_owner
+    group: identity
+    filter_type: state_owner
+    phase: request-phase header mapping only; no response phase
+    config:
+      mode: trusted_headers
+      tenant.header: x-auth-tenant
+      issuer.static: urn:example:gateway
+      subject.header: x-auth-user
+    promotes: normalized StateOwner extension (tenant/issuer/subject) carried across IRR iterations
+    scenarios:
+      S1:
+        state: active
+        note: maps x-auth-* ingress into owner context (no auth verification)
+      S2:
+        state: active
+        note: same owner mapping for streaming create
+      S3:
+        state: active
+        note: owner mapped even though store:false
+      S4:
+        state: active
+        note: owner mapped for multi-turn create
+      S5:
+        state: active
+        note: owner mapped; forwarded to file_search callout
+      S6:
+        state: active
+        note: owner mapped; forwarded to MCP connector
+      S7:
+        state: active
+        note: owner underpins per-user brave_search slot selection
+      S8:
+        state: active
+        note: runs before store answers the GET retrieve
+      S9:
+        state: active
+        note: owner mapped on WS handshake before the direct-services branch
+      S10:
+        state: active
+        note: owner mapped before route-miss
+      S11:
+        state: active
+        note: owner mapped before the dedicated-service direct-services branch
+      S12:
+        state: active
+        note: owner mapped before the direct-openai forward
+      S13:
+        state: active
+        note: owner mapped for the managed chat-completions round
+  - id: callout_credentials
+    name: callout_credentials
+    group: identity
+    filter_type: callout_credentials
+    phase: 'request-phase security filter; captures typed credential slots AND the trusted-boundary MCP authorization assertion (unified in #1341); does not authenticate provenance and never parses the assertion'
+    config:
+      credentials:
+      - slot: brave_search
+        source_header: x-user-brave-key
+      - slot: ogx_files
+        source_header: x-user-ogx-key
+      - slot: mcp_gateway
+        source_header: x-user-mcp-key
+      assertions:
+      - slot: mcp_gateway
+        source_header: x-mcp-authorized
+    promotes: 'the single establishing filter for scoped secrets: captures per-user brave_search / ogx_files / mcp_gateway credential slots (from x-user-brave-key / x-user-ogx-key / x-user-mcp-key) and STRIPS those raw x-user-* ingress headers; unified in #1341 it ALSO captures the mcp_gateway authorization assertion — unconditionally deleting any client-supplied x-mcp-authorized then setting the verified, short-lived assertion. Each dispatcher selects only its slot; the assertion is forwarded unchanged ONLY to configured connector_id targets (the MCP Gateway makes the authorization decision). Formerly a separate callout_authorization filter.'
+    scenarios:
+      S1:
+        state: active
+        note: strips all x-user-* provider keys defensively (slots empty if absent); also strips client x-mcp-authorized and sets the verified assertion, consumed only by MCP filters
+      S2:
+        state: active
+        note: strips all provider-key headers and strips + sets the MCP assertion; slots/assertion unused this scenario
+      S3:
+        state: active
+        note: strips all provider-key headers and strips + sets the assertion; unused this scenario
+      S4:
+        state: active
+        note: strips all provider-key headers and strips + sets the assertion; unused this scenario
+      S5:
+        state: active
+        note: captures the ogx_files key later injected on the file_search callout; strips + sets the assertion (file_search does not consume it)
+      S6:
+        state: active
+        note: captures the mcp_gateway key AND the mcp_gateway authorization assertion (x-mcp-authorized); both consumed by openai_mcp_tool_resolve + openai_mcp_dispatch
+      S7:
+        state: active
+        note: captures the brave_search key required by openai_web_search; strips + sets the assertion (web_search does not consume it)
+      S8:
+        state: active
+        note: strips all provider-key headers and client x-mcp-authorized on GET before the store answers
+      S9:
+        state: active
+        note: strips all provider-key headers and sets the assertion on the WS handshake
+      S10:
+        state: active
+        note: strips all provider-key headers and sets the assertion before the route-miss
+      S11:
+        state: active
+        note: strips all provider-key headers and sets the assertion before the dedicated-service direct-services branch
+      S12:
+        state: active
+        note: strips all provider-key headers and sets the assertion before the direct-openai forward (unused this scenario)
+      S13:
+        state: active
+        note: strips all provider-key headers and sets the assertion for the managed round (unused this scenario)
+  - id: project_state_owner_headers_preirr
+    name: project_state_owner_headers
+    group: identity
+    filter_type: project_state_owner_headers
+    phase: request-phase header projection; no response phase
+    config:
+      tenant_header: x-tenant-id
+      subject_header: x-user-id
+    promotes: projects owner as x-tenant-id/x-user-id for OGX and allowlisted callouts; strips raw x-auth-* ingress
+    scenarios:
+      S1:
+        state: active
+        note: projects x-tenant-id/x-user-id, strips raw ingress
+      S2:
+        state: active
+        note: same projection for streaming
+      S3:
+        state: active
+        note: projection regardless of store flag
+      S4:
+        state: active
+        note: projection for multi-turn
+      S5:
+        state: active
+        note: projected ids forwarded to file_search callout
+      S6:
+        state: active
+        note: projected ids forwarded to MCP connector
+      S7:
+        state: active
+        note: projection precedes web_search
+      S8:
+        state: active
+        note: projects before store answers GET
+      S9:
+        state: active
+        note: projects before the WS direct-services branch
+      S10:
+        state: active
+        note: projects before route-miss
+      S11:
+        state: active
+        note: projects before the dedicated-service direct-services branch
+      S12:
+        state: active
+        note: projects before the direct-openai forward
+      S13:
+        state: active
+        note: projects before the managed chat-completions round
+  - id: ai_operation
+    name: ai_operation
+    group: classification
+    filter_type: ai_operation
+    phase: request-phase classification; no response phase
+    config: {}
+    promotes: classifies the request head (method + path + transport) against the registered OpenAI operation registries (Conversations, Chat Completions, Responses); on a match publishes the typed operation into request extensions, sets x-praxis-ai-application-protocol + x-praxis-ai-operation, and records application_protocol/operation_id filter results consumed by on_result branches and openai_conversations; on no match strips those headers and continues. Must precede openai_conversations.
+    scenarios:
+      S1:
+        state: active
+        note: POST /v1/responses -> application_protocol openai_responses (create)
+      S2:
+        state: active
+        note: streaming create, same head -> openai_responses
+      S3:
+        state: active
+        note: store:false create, same head -> openai_responses
+      S4:
+        state: active
+        note: previous_response_id create (POST /v1/responses) -> openai_responses
+      S5:
+        state: active
+        note: file_search create -> openai_responses
+      S6:
+        state: active
+        note: MCP create -> openai_responses
+      S7:
+        state: active
+        note: web_search create -> openai_responses
+      S8:
+        state: active
+        note: GET /v1/responses/{id} -> openai_responses (retrieve)
+      S9:
+        state: active
+        note: 'GET /v1/responses + Upgrade: websocket -> openai_responses (WebSocket handshake)'
+      S10:
+        state: active
+        note: head-based match -> openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format
+      S11:
+        state: passthrough
+        note: /v1/prompts|/v1/embeddings|/v1/files|/v1/vector_stores are not in any operation registry; strips routing headers
+      S12:
+        state: active
+        note: POST /v1/responses -> openai_responses (create); gpt-5 head is classified here, provider chosen at the router
+      S13:
+        state: active
+        note: POST /v1/responses -> openai_responses (create); vllm-chat head is classified here, provider chosen at the router
+  - id: openai_responses_format
+    name: openai_responses_format
+    group: classification
+    filter_type: openai_responses_format
+    phase: request-phase classifier; promotes internal x-praxis-* routing headers
+    config:
+      on_invalid: continue
+      headers.format: x-praxis-ai-format
+      headers.model: x-praxis-ai-model
+      headers.stream: x-praxis-ai-stream
+      headers.mode: x-praxis-responses-mode
+    promotes: x-praxis-ai-format, x-praxis-ai-model, x-praxis-ai-stream, x-praxis-responses-mode; the model header is overwritten from the parsed body so clients cannot spoof the router's model policy
+    scenarios:
+      S1:
+        state: active
+        note: classifies openai_responses; sets format/model/mode, stream=false
+      S2:
+        state: active
+        note: classifies openai_responses; promotes x-praxis-ai-stream=true
+      S3:
+        state: active
+        note: classifies openai_responses (store flag not classification input)
+      S4:
+        state: active
+        note: classifies openai_responses create
+      S5:
+        state: active
+        note: classifies openai_responses (tools present)
+      S6:
+        state: active
+        note: classifies openai_responses (mcp tools)
+      S7:
+        state: active
+        note: classifies openai_responses
+      S8:
+        state: active
+        note: classifies GET as non-create; header drives later gating
+      S9:
+        state: active
+        note: classifies GET/WS as non-create (no openai_responses create marker)
+      S10:
+        state: active
+        note: classifies as chat/anthropic/unclassified -> not openai_responses, on_invalid:continue avoids early reject
+      S11:
+        state: passthrough
+        note: path not /v1/responses; no Responses classification
+      S12:
+        state: active
+        note: classifies openai_responses; model gpt-5 drives the direct-openai (application_provider=openai) route
+      S13:
+        state: active
+        note: classifies openai_responses; model vllm-chat drives the chat-completions (managed) route
+  - id: router
+    name: router
+    group: routing
+    filter_type: router
+    phase: request-phase binding router; freezes ONE logical cluster plus its application_provider/application_protocol as bound_upstream metadata; exactly one top-level router per binding pipeline
+    config:
+      routes:
+      - 'path_prefix /v1/prompts -> prompts-api'
+      - 'path_prefix /v1/embeddings -> embeddings-api'
+      - 'path_prefix /v1/files -> files-api'
+      - 'path_prefix /v1/conversations -> inference-backend'
+      - 'path /v1/responses + upgrade:websocket -> responses-websocket-backend'
+      - 'path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:gpt-5 -> openai-responses-backend'
+      - 'path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend'
+      - 'path_prefix /v1/responses + x-praxis-ai-format:openai_responses -> inference-backend'
+      - 'path_prefix /v1/vector_stores -> vector-stores-backend'
+    promotes: binds exactly one logical cluster per request and freezes its application_provider/application_protocol as bound_upstream metadata read by the two terminal branches and the IRR-step load balancer; the classifier-owned x-praxis-ai-model header cannot be spoofed; model gpt-5 -> openai-responses-backend (provider openai), vllm-chat -> chat-completions-backend (managed), any other Responses model -> inference-backend (managed native); a request matching no route is a route-miss (bare 404)
+    scenarios:
+      S1:
+        state: active
+        note: binds inference-backend (managed native Responses) via the /v1/responses format route
+      S2:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S3:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S4:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S5:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S6:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S7:
+        state: active
+        note: binds inference-backend via the /v1/responses format route
+      S8:
+        state: active
+        note: binds inference-backend via the /v1/responses prefix route so the GET retrieve reaches the local store
+      S9:
+        state: active
+        note: 'binds responses-websocket-backend (application_provider=direct) via the /v1/responses upgrade:websocket route'
+      S10:
+        state: active
+        note: no route matches (format is not openai_responses, no upgrade header) -> route-miss (bare 404)
+      S11:
+        state: active
+        note: binds a dedicated-service cluster by path_prefix (application_provider=direct)
+      S12:
+        state: active
+        note: binds openai-responses-backend (application_provider=openai) via the gpt-5 route
+      S13:
+        state: active
+        note: binds chat-completions-backend (managed vllm) via the vllm-chat route
+  - id: direct_openai_branch
+    name: headers (direct-openai branch)
+    group: routing
+    filter_type: headers
+    phase: request-phase branch carrier; when bound_upstream.application_provider=openai it takes the direct-openai terminal branch and rejoins at terminal; header set is a no-op anchor only
+    config:
+      conditions:
+      - 'when bound_upstream.application_provider: openai'
+      branch_chains:
+      - name: direct-openai
+        rejoin: terminal
+        chain: direct-openai-dispatch (load_balancer cluster_source:bound_upstream -> openai-responses-backend 127.0.0.1:3001)
+    promotes: terminal branch for the direct-OpenAI path; when the router bound a cluster whose application_provider is openai, forwards the ORIGINAL Responses request unchanged to the OpenAI-compatible provider and stops the parent chain, so the managed body filters and the IRR never run
+    scenarios:
+      S1:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S2:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S3:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S4:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S5:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S6:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S7:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S8:
+        state: inert
+        note: GET bound inference-backend (managed); branch not taken
+      S9:
+        state: inert
+        note: WS bound responses-websocket-backend (direct), not openai; branch not taken
+      S10:
+        state: skipped
+        note: router route-miss already returned 404
+      S11:
+        state: inert
+        note: dedicated-service bound provider=direct, not openai; branch not taken
+      S12:
+        state: active
+        note: bound provider=openai -> takes the direct-openai terminal branch; forwards the original request to openai-responses-backend 3001 and stops the chain (no managed body work, no IRR)
+      S13:
+        state: inert
+        note: bound provider=vllm (managed), not openai; branch not taken, chain continues to the managed body filters
+  - id: direct_services_branch
+    name: headers (direct-services branch)
+    group: routing
+    filter_type: headers
+    phase: request-phase branch carrier; when bound_upstream.application_provider=direct it takes the direct-services terminal branch and rejoins at terminal
+    config:
+      conditions:
+      - 'when bound_upstream.application_provider: direct'
+      branch_chains:
+      - name: direct-services
+        rejoin: terminal
+        chain: direct-services-dispatch (load_balancer cluster_source:bound_upstream -> prompts-api 9998 / embeddings-api 9997 / files-api 9999 / responses-websocket-backend 3001 / vector-stores-backend 3002)
+    promotes: terminal branch for dedicated services; when the router bound a cluster whose application_provider is direct (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, and the /v1/responses WebSocket upgrade), forwards straight upstream and rejoins terminal so the IRR never runs
+    scenarios:
+      S1:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S2:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S3:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S4:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S5:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S6:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S7:
+        state: inert
+        note: bound provider is managed native; branch condition unmet, chain continues
+      S8:
+        state: inert
+        note: GET bound inference-backend (managed); branch not taken (store answers later)
+      S9:
+        state: active
+        note: bound responses-websocket-backend (direct) -> takes the direct-services terminal branch; forwards the WS upgrade to 3001
+      S10:
+        state: skipped
+        note: router route-miss already returned 404
+      S11:
+        state: active
+        note: bound dedicated-service cluster (direct) -> takes the direct-services terminal branch; forwards to the path_prefix backend
+      S12:
+        state: skipped
+        note: direct-openai branch already rejoined terminal at the prior filter
+      S13:
+        state: inert
+        note: bound provider=vllm (managed), not direct; branch not taken
+  - id: openai_responses_request
+    name: openai_responses_request
+    group: classification
+    filter_type: openai_responses_request
+    phase: request-phase; JSON syntax + ID generation + managed-provider background/prompt policy; gated unless bound_upstream.application_provider=openai
+    config:
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: validates JSON syntax; generates response and conversation IDs; writes responses.* metadata (provider-owned param combos pass through); suppressed on the direct-openai path
+    scenarios:
+      S1:
+        state: active
+        note: validates syntax, generates response id
+      S2:
+        state: active
+        note: validates + generates ids for streaming create
+      S3:
+        state: active
+        note: validates; ids generated even if not persisted
+      S4:
+        state: active
+        note: validates multi-turn create
+      S5:
+        state: active
+        note: validates create with file_search tools
+      S6:
+        state: active
+        note: validates create with mcp tools
+      S7:
+        state: active
+        note: validates create
+      S8:
+        state: passthrough
+        note: GET has no body to validate
+      S9:
+        state: skipped
+        note: WS took the direct-services terminal branch before the body filters
+      S10:
+        state: skipped
+        note: router route-miss (404) before the body filters
+      S11:
+        state: skipped
+        note: dedicated services took the direct-services terminal branch before the body filters
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran before the body filters
+      S13:
+        state: active
+        note: validates the managed vllm-chat create; generates ids
+  - id: openai_tool_parse
+    name: openai_tool_parse
+    group: classification
+    filter_type: openai_tool_parse
+    phase: request-phase; parses tools/tool_choice, does NOT mutate body; gated unless bound_upstream.application_provider=openai
+    config:
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: has_tools, has_web_search, tool_choice, function_count (summary facts to metadata/results)
+    scenarios:
+      S1:
+        state: passthrough
+        note: no tools; has_tools=false
+      S2:
+        state: passthrough
+        note: no tools
+      S3:
+        state: passthrough
+        note: no tools
+      S4:
+        state: passthrough
+        note: no tools
+      S5:
+        state: active
+        note: parses file_search tool; has_tools=true
+      S6:
+        state: active
+        note: parses mcp tool; has_tools=true
+      S7:
+        state: active
+        note: parses tools; may set has_web_search
+      S8:
+        state: passthrough
+        note: GET retrieve
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: no tools; has_tools=false
+  - id: openai_conversations
+    name: openai_conversations
+    group: conversations
+    filter_type: openai_conversations
+    phase: request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming); gated unless bound_upstream.application_provider=openai
+    config:
+      backend: sqlite
+      database_url: sqlite://responses.db?mode=rwc
+      conversations_table: openai_conversations
+      items_table: openai_conversation_items
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation
+    scenarios:
+      S1:
+        state: passthrough
+        note: no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create
+      S2:
+        state: passthrough
+        note: no conversation field; note append-back is non-streaming only
+      S3:
+        state: passthrough
+        note: no conversation field
+      S4:
+        state: passthrough
+        note: prev_response_id path, not a conversation field
+      S5:
+        state: passthrough
+        note: no conversation field
+      S6:
+        state: passthrough
+        note: no conversation field
+      S7:
+        state: passthrough
+        note: no conversation field
+      S8:
+        state: passthrough
+        note: GET retrieve, not a conversations op
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: no conversation field
+  - id: openai_response_store
+    name: openai_response_store
+    group: store
+    filter_type: openai_response_store
+    phase: request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai
+    config:
+      backend: sqlite
+      database_url: sqlite://responses.db?mode=rwc
+      responses_table: openai_responses
+      conversations_table: openai_conversations
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: registers store backend for rehydrate/compact; persists ResponsesState.response_object on response path; answers GET /v1/responses/{id} pre-IRR
+    scenarios:
+      S1:
+        state: active
+        note: persists buffered response on reverse path (store default true)
+      S2:
+        state: active
+        note: persists response_object populated by openai_stream_events inside IRR
+      S3:
+        state: inert
+        note: backend registered but store:false -> no persistence
+      S4:
+        state: active
+        note: persists; rehydrate also reads prior response from this store
+      S5:
+        state: active
+        note: persists final composed response after file_search loop
+      S6:
+        state: active
+        note: persists final response after MCP loop
+      S7:
+        state: active
+        note: persists final response after web_search loop
+      S8:
+        state: active
+        note: SERVES GET as terminal response pre-IRR and short-circuits pipeline
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: inert
+        note: backend registered but store:false -> no persistence
+  - id: openai_responses_rehydrate
+    name: openai_responses_rehydrate
+    group: context
+    filter_type: openai_responses_rehydrate
+    phase: request-phase; loads and prepends prior history; gated unless bound_upstream.application_provider=openai
+    config:
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: loads context from previous_response_id or conversation, prepends message history; previous_response_id takes precedence when both present
+    scenarios:
+      S1:
+        state: passthrough
+        note: no previous_response_id/conversation
+      S2:
+        state: passthrough
+        note: no prior context markers
+      S3:
+        state: passthrough
+        note: no prior context markers
+      S4:
+        state: active
+        note: loads stored prior response via previous_response_id and prepends it
+      S5:
+        state: passthrough
+        note: no prior context markers
+      S6:
+        state: passthrough
+        note: no prior context markers
+      S7:
+        state: passthrough
+        note: no prior context markers
+      S8:
+        state: skipped
+        note: store short-circuited GET before this filter
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: no previous_response_id/conversation
+  - id: openai_file_resolve
+    name: openai_file_resolve
+    group: context
+    filter_type: openai_file_resolve
+    phase: request-phase pre-security callout; fires only when file_id refs present; gated unless bound_upstream.application_provider=openai
+    config:
+      files_api_url: http://127.0.0.1:9999
+      user_credential: ogx_files
+      allow_pre_security_callout: true
+      outbound_chain: files-api-outbound (project_state_owner_headers x-tenant-id/x-user-id)
+      on_missing: reject
+      timeout_ms: 10000
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: 'resolves file_id refs in current input + rehydrated history via Files API; rebuilds body with file_data/image_url (on_missing: reject); injects the caller-scoped ogx_files credential on file_id callouts (file_url downloads use the separate credential-free resolver)'
+    scenarios:
+      S1:
+        state: inert
+        note: no file_id refs; callout does not fire
+      S2:
+        state: inert
+        note: no file_id refs
+      S3:
+        state: inert
+        note: no file_id refs
+      S4:
+        state: inert
+        note: no file_id refs in prepended history
+      S5:
+        state: inert
+        note: file_search uses vector stores, not file_id input refs
+      S6:
+        state: inert
+        note: no file_id refs
+      S7:
+        state: inert
+        note: no file_id refs
+      S8:
+        state: skipped
+        note: store short-circuited GET
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: inert
+        note: no file_id refs; callout does not fire
+  - id: openai_doc_extract
+    name: openai_doc_extract
+    group: context
+    filter_type: openai_doc_extract
+    phase: request-phase; converts input_file parts, on_unsupported continue; gated unless bound_upstream.application_provider=openai
+    config:
+      allow_pre_security_callout: true
+      on_unsupported: continue
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: converts input_file content parts to input_text (base64 decode + UTF-8 validate) for backends lacking native input_file; unsupported formats left unchanged
+    scenarios:
+      S1:
+        state: inert
+        note: no input_file parts to convert
+      S2:
+        state: inert
+        note: no input_file parts
+      S3:
+        state: inert
+        note: no input_file parts
+      S4:
+        state: inert
+        note: no input_file parts
+      S5:
+        state: inert
+        note: no input_file parts
+      S6:
+        state: inert
+        note: no input_file parts
+      S7:
+        state: inert
+        note: no input_file parts
+      S8:
+        state: skipped
+        note: store short-circuited GET
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: inert
+        note: no input_file parts to convert
+  - id: openai_mcp_tool_resolve
+    name: openai_mcp_tool_resolve
+    group: context
+    filter_type: openai_mcp_tool_resolve
+    phase: request-phase; resolves MCP tools/list from operator connectors; gated unless bound_upstream.application_provider=openai
+    config:
+      user_credential: mcp_gateway
+      authorization_assertion: mcp_gateway
+      forward_headers:
+      - x-tenant-id
+      - x-user-id
+      connectors:
+      - id: trusted-mcp
+        server_url: http://127.0.0.1:8001/mcp
+      conditions:
+      - 'unless bound_upstream.application_provider: openai'
+    promotes: calls tools/list on each upstream MCP server; writes mcp_tool_map to ResponsesState; forwards the caller-scoped mcp_gateway credential + opaque authorization assertion and identity headers ONLY to configured connector_id targets, never an arbitrary client server_url
+    scenarios:
+      S1:
+        state: passthrough
+        note: no MCP tool entries
+      S2:
+        state: passthrough
+        note: no MCP tool entries
+      S3:
+        state: passthrough
+        note: no MCP tool entries
+      S4:
+        state: passthrough
+        note: no MCP tool entries
+      S5:
+        state: passthrough
+        note: file_search tool, not MCP
+      S6:
+        state: active
+        note: resolves tools/list from connector trusted-mcp with mcp_gateway credential + authorization assertion; writes mcp_tool_map
+      S7:
+        state: passthrough
+        note: no MCP tool entries
+      S8:
+        state: skipped
+        note: store short-circuited GET
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: no MCP tool entries
+  - id: static_response
+    name: static_response (unsupported subpath 404)
+    group: routing
+    filter_type: static_response
+    phase: request-phase terminal guard; returns 404 for a managed Responses request on an unsupported /v1/responses subpath
+    config:
+      status: 404
+      body: '{"error":{"message":"unsupported managed Responses operation","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}'
+      conditions:
+      - 'when path_prefix: /v1/responses'
+      - 'unless path: /v1/responses'
+    promotes: fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_response_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai
+    scenarios:
+      S1:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S2:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S3:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S4:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S5:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S6:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S7:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+      S8:
+        state: skipped
+        note: openai_response_store already served the GET retrieve
+      S9:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S10:
+        state: skipped
+        note: router route-miss (404) before this filter
+      S11:
+        state: skipped
+        note: direct-services terminal branch ran first
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: inert
+        note: path is exactly /v1/responses (create); the unless gate excludes it
+  - id: iterative_request_router
+    name: iterative_request_router
+    group: irr
+    filter_type: iterative_request_router
+    phase: terminal filter; owns agentic model-tool-model loop; transitions on openai_agentic_loop action
+    config:
+      initial_step: inference
+      max_iterations: 8
+      timeout_ms: 360000
+      step_timeout_ms: 300000
+      max_response_bytes: 67108864
+      max_stream_response_bytes: 67108864
+      max_state_bytes: 136314880
+      on_result:
+      - filter: openai_agentic_loop
+        key: action
+        value: loop
+        next: inference
+      - default: true
+        done: true
+    promotes: runs gateway-owned openai_responses create requests through the inference step loop; OpenAI-bound traffic already left via the direct-openai terminal branch, so IRR is reached only by managed providers; the inference step consumes the frozen logical binding directly (no second routing decision)
+    scenarios:
+      S1:
+        state: active
+        note: enters IRR; one inference round; agentic_loop action=done
+      S2:
+        state: active
+        note: enters IRR; one round; streaming lifecycle composed
+      S3:
+        state: active
+        note: enters IRR; routed but not persisted
+      S4:
+        state: active
+        note: enters IRR with rehydrated history
+      S5:
+        state: active
+        note: enters IRR; loops for file_search rounds then done
+      S6:
+        state: active
+        note: enters IRR; loops for MCP rounds then done
+      S7:
+        state: active
+        note: enters IRR; loops for web_search rounds then done
+      S8:
+        state: skipped
+        note: store short-circuited GET before IRR
+      S9:
+        state: skipped
+        note: WS handshake took the direct-services terminal branch
+      S10:
+        state: skipped
+        note: router route-miss (404) before the IRR
+      S11:
+        state: skipped
+        note: dedicated services took the direct-services terminal branch
+      S12:
+        state: skipped
+        note: direct-openai terminal branch bypassed the IRR
+      S13:
+        state: active
+        note: enters IRR; one round; the bound chat-completions upstream drives protocol translation
+  - id: irr_project_state_owner_headers
+    name: project_state_owner_headers (IRR step)
+    group: irr-step
+    filter_type: project_state_owner_headers
+    phase: IRR inference step, request-phase; re-projection inside destination-owned subrequest
+    config:
+      tenant_header: x-tenant-id
+      subject_header: x-user-id
+    promotes: re-projects x-tenant-id/x-user-id inside subrequest; strips still-uncommitted raw ingress identity headers
+    scenarios:
+      S1:
+        state: active
+        note: re-projects owner headers each round
+      S2:
+        state: active
+        note: re-projects for streaming subrequest
+      S3:
+        state: active
+        note: re-projects owner headers
+      S4:
+        state: active
+        note: re-projects owner headers
+      S5:
+        state: active
+        note: re-projects; ids forwarded to file_search callout
+      S6:
+        state: active
+        note: re-projects; ids forwarded to MCP dispatch
+      S7:
+        state: active
+        note: re-projects; owner underpins web_search slot
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: re-projects owner headers for the managed chat-completions round
+  - id: openai_stream_events
+    name: openai_stream_events
+    group: irr-step
+    filter_type: openai_stream_events
+    phase: IRR step; request-phase pass + response-phase composes one logical Responses lifecycle across rounds
+    config:
+      max_buffer_bytes: 67108864
+      max_events: 200000
+      timeout_secs: 600
+    promotes: composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store
+    scenarios:
+      S1:
+        state: active
+        note: one-round logical stream; still composes and populates response_object
+      S2:
+        state: active
+        note: composes streaming lifecycle; populates response_object for store persistence
+      S3:
+        state: active
+        note: composes lifecycle (object not persisted due to store:false)
+      S4:
+        state: active
+        note: composes lifecycle for multi-turn
+      S5:
+        state: active
+        note: composes across file_search rounds; withholds terminal until done
+      S6:
+        state: active
+        note: composes across MCP rounds
+      S7:
+        state: active
+        note: composes across web_search rounds
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: composes the chat-translated lifecycle; populates response_object
+  - id: openai_web_search
+    name: openai_web_search
+    group: irr-step
+    filter_type: openai_web_search
+    phase: IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call
+    config:
+      provider: brave
+      api_key: ${WEB_SEARCH_API_KEY}
+      user_credential: brave_search
+      max_calls_per_round: 32
+    promotes: executes web_search_call assignments prepared by the loop owner; fails closed if per-user brave_search slot missing
+    scenarios:
+      S1:
+        state: inert
+        note: no web_search_call emitted
+      S2:
+        state: inert
+        note: no web_search_call emitted
+      S3:
+        state: inert
+        note: no web_search_call emitted
+      S4:
+        state: inert
+        note: no web_search_call emitted
+      S5:
+        state: inert
+        note: file_search, not web_search
+      S6:
+        state: inert
+        note: MCP, not web_search
+      S7:
+        state: active
+        note: executes web_search_call via Brave using per-user brave_search slot; fails closed if slot missing
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: no web_search_call emitted
+  - id: openai_mcp_dispatch
+    name: openai_mcp_dispatch
+    group: irr-step
+    filter_type: openai_mcp_dispatch
+    phase: IRR step request-phase dispatcher; no response phase; inert until model emits MCP tool call
+    config:
+      user_credential: mcp_gateway
+      authorization_assertion: mcp_gateway
+      forward_headers:
+      - x-tenant-id
+      - x-user-id
+      max_calls_per_round: 32
+      max_parallel_calls: 8
+      max_result_bytes: 1048576
+      max_total_result_bytes: 8388608
+    promotes: executes MCP calls prepared/classified by the loop owner; forwards the caller-scoped mcp_gateway credential + authorization assertion on each connector call; reconciles results into ResponsesState
+    scenarios:
+      S1:
+        state: inert
+        note: no MCP call emitted
+      S2:
+        state: inert
+        note: no MCP call emitted
+      S3:
+        state: inert
+        note: no MCP call emitted
+      S4:
+        state: inert
+        note: no MCP call emitted
+      S5:
+        state: inert
+        note: file_search, not MCP
+      S6:
+        state: active
+        note: executes MCP calls via 127.0.0.1:8001/mcp with mcp_gateway credential + assertion (max 8 parallel, byte-capped)
+      S7:
+        state: inert
+        note: web_search, not MCP
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: no MCP call emitted
+  - id: openai_file_search_callout
+    name: openai_file_search_callout
+    group: irr-step
+    filter_type: openai_file_search_callout
+    phase: IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call
+    config:
+      vector_store_url: http://127.0.0.1:3002
+      user_credential: ogx_files
+      outbound_chain: vector-store-outbound (project_state_owner_headers x-tenant-id/x-user-id)
+      timeout_ms: 5000
+      max_response_bytes: 10485760
+      max_total_response_bytes: 67108864
+      max_state_bytes: 136314880
+      on_failure: closed
+    promotes: executes assigned file_search_call items against vector store 3002; injects the caller-scoped ogx_files credential on the vector-store callout; reconciles results in place in ResponsesState.accumulated_output
+    scenarios:
+      S1:
+        state: inert
+        note: no file_search_call emitted
+      S2:
+        state: inert
+        note: no file_search_call emitted
+      S3:
+        state: inert
+        note: no file_search_call emitted
+      S4:
+        state: inert
+        note: no file_search_call emitted
+      S5:
+        state: active
+        note: executes file_search_call via vector store 3002 with the ogx_files credential; on_failure closed
+      S6:
+        state: inert
+        note: MCP, not file_search
+      S7:
+        state: inert
+        note: web_search, not file_search
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: no file_search_call emitted
+  - id: ai_guardrails
+    name: ai_guardrails
+    group: irr-step
+    filter_type: ai_guardrails
+    phase: IRR step request-body EOS; checks only newly produced local Responses tool results; records blocked/provider-failure verdicts for openai_agentic_loop; no response phase
+    config:
+      provider.type: nemo
+      provider.endpoint: http://127.0.0.1:3003/v1/checks
+      provider.guardrails.config_ids:
+      - your-config
+      provider.timeout_ms: 5000
+      provider.max_message_checks: 32
+      phase.request: false
+      phase.response: false
+      phase.tool_results: true
+    promotes: checks the new MCP, web-search, or file-search result suffix before it can be sent to the model on the next IRR round; a block or check failure is finalized by openai_agentic_loop
+    scenarios:
+      S1:
+        state: inert
+        note: no local tool result produced
+      S2:
+        state: inert
+        note: no local tool result produced
+      S3:
+        state: inert
+        note: no local tool result produced
+      S4:
+        state: inert
+        note: no local tool result produced
+      S5:
+        state: active
+        note: checks the file-search result before model re-entry
+      S6:
+        state: active
+        note: checks the MCP result before model re-entry
+      S7:
+        state: active
+        note: checks the web-search result before model re-entry
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: no local tool result produced
+  - id: openai_agentic_loop
+    name: openai_agentic_loop
+    group: irr-step
+    filter_type: openai_agentic_loop
+    phase: IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)
+    config:
+      max_infer_iters: 7
+    promotes: 'extracts completed function_call/web_search_call/file_search_call/MCP items; records dispatcher assignments; publishes action=loop|done (issue #1046 sole transition authority)'
+    scenarios:
+      S1:
+        state: active
+        note: parses single round; action=done (no tools)
+      S2:
+        state: active
+        note: parses streaming round; action=done
+      S3:
+        state: active
+        note: parses single round; action=done
+      S4:
+        state: active
+        note: parses round over rehydrated context; action=done
+      S5:
+        state: active
+        note: assigns file_search_call then action=loop; finalizes with done
+      S6:
+        state: active
+        note: assigns MCP call then action=loop; finalizes with done
+      S7:
+        state: active
+        note: assigns web_search_call then action=loop; finalizes with done
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: parses the translated round; action=done (no tools)
+  - id: irr_headers
+    name: headers (IRR step)
+    group: irr-step
+    filter_type: headers
+    phase: IRR step request-phase; sets outbound header
+    config:
+      request_set:
+      - name: Content-Type
+        value: application/json
+    promotes: 'forces Content-Type: application/json on the outbound subrequest'
+    scenarios:
+      S1:
+        state: active
+        note: sets Content-Type
+      S2:
+        state: active
+        note: sets Content-Type
+      S3:
+        state: active
+        note: sets Content-Type
+      S4:
+        state: active
+        note: sets Content-Type
+      S5:
+        state: active
+        note: sets Content-Type each round
+      S6:
+        state: active
+        note: sets Content-Type each round
+      S7:
+        state: active
+        note: sets Content-Type each round
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: sets Content-Type on the outbound chat-completions subrequest
+  - id: irr_load_balancer
+    name: load_balancer (IRR step)
+    group: irr-step
+    filter_type: load_balancer
+    phase: IRR step request-phase; selects the endpoint for the router-bound cluster (cluster_source:bound_upstream) and publishes its typed application_protocol BEFORE the protocol-adaptive body builders
+    config:
+      cluster_source: bound_upstream
+      clusters:
+      - name: inference-backend
+        endpoints:
+        - 127.0.0.1:3001
+        http.application_protocol: openai_responses
+        http.application_provider: vllm
+      - name: chat-completions-backend
+        endpoints:
+        - 127.0.0.1:3001
+        http.application_protocol: openai_chat_completions
+        http.application_provider: vllm
+    promotes: resolves the request-level binding to a concrete endpoint (no second routing decision) and publishes the selected cluster's application_protocol; every selected_upstream gate below reads this fresh selection so exactly one protocol-adaptive body builder fires each round
+    scenarios:
+      S1:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol
+      S2:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol
+      S3:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol
+      S4:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol
+      S5:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses) each round
+      S6:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses) each round
+      S7:
+        state: active
+        note: selects inference-backend 127.0.0.1:3001 (openai_responses) each round
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: selects chat-completions-backend 127.0.0.1:3001 (openai_chat_completions); publishes protocol
+  - id: openai_responses_proxy
+    name: openai_responses_proxy
+    group: irr-step
+    filter_type: openai_responses_proxy
+    phase: IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Responses (selected_upstream.application_protocol=openai_responses); response-phase handles buffered/streamed
+    config:
+      conditions:
+      - 'when selected_upstream.application_protocol: openai_responses'
+    promotes: on a native-Responses upstream rebuilds the outbound Responses body from ResponsesState; auto-selects typed streaming when the effective body has stream:true; inert when the selected upstream speaks Chat Completions
+    scenarios:
+      S1:
+        state: active
+        note: rebuilds body; buffered (stream:false)
+      S2:
+        state: active
+        note: rebuilds body; auto-selects typed streaming (stream:true)
+      S3:
+        state: active
+        note: rebuilds body; buffered
+      S4:
+        state: active
+        note: rebuilds body with rehydrated history
+      S5:
+        state: active
+        note: rebuilds body each round incorporating file_search results
+      S6:
+        state: active
+        note: rebuilds body each round incorporating MCP results
+      S7:
+        state: active
+        note: rebuilds body each round incorporating web_search results
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: inert
+        note: selected upstream is openai_chat_completions, not openai_responses -> gate fails; the body builder does not fire
+  - id: responses_to_chat_completions
+    name: responses_to_chat_completions
+    group: irr-step
+    filter_type: responses_to_chat_completions
+    phase: IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Chat Completions; request-phase translates Responses->Chat, response-phase (reverse) translates Chat->Responses
+    config:
+      max_rewritten_body_bytes: 33554432
+      max_emitted_sse_frame_bytes: 50331648
+      max_stream_events: 100000
+      stream_timeout_secs: 300
+      conditions:
+      - 'when selected_upstream.application_protocol: openai_chat_completions'
+    promotes: when the selected upstream speaks Chat Completions, translates the canonical Responses request into a Chat Completions request and (because response filters run in reverse) converts the Chat response - finite JSON or streamed SSE - back into a Responses resource / Responses SSE before openai_agentic_loop and openai_stream_events observe it; inert when the selected upstream speaks Responses natively
+    scenarios:
+      S1:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S2:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S3:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S4:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S5:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S6:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S7:
+        state: inert
+        note: selected upstream openai_responses; no translation
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: translates the Responses request to Chat Completions and the Chat response back to Responses for chat-completions-backend
+  - id: path_rewrite
+    name: path_rewrite
+    group: irr-step
+    filter_type: path_rewrite
+    phase: IRR step request-phase; rewrites the outbound path to /v1/chat/completions when the selected upstream speaks Chat Completions
+    config:
+      replace.pattern: ^/v1/responses/?$
+      replace.replacement: /v1/chat/completions
+      conditions:
+      - 'when selected_upstream.application_protocol: openai_chat_completions + path_prefix /v1/responses + methods [POST]'
+    promotes: the translator leaves the request URI unchanged, so this rewrites POST /v1/responses -> /v1/chat/completions for the Chat backend; the identical protocol gate plus the create verb/path guards ensure only translated create requests are rewritten
+    scenarios:
+      S1:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S2:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S3:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S4:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S5:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S6:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S7:
+        state: inert
+        note: selected upstream openai_responses; no path rewrite
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: skipped
+        note: IRR not entered
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: active
+        note: rewrites POST /v1/responses -> /v1/chat/completions
+  scenarios:
+  - id: S1
+    label: Stateful create
+    request: POST /v1/responses {model,input} (store defaults true)
+    entersIRR: true
+    loopRounds: 1
+  - id: S2
+    label: Streaming create
+    request: POST /v1/responses {model,input,stream:true}
+    entersIRR: true
+    loopRounds: 1
+  - id: S3
+    label: Stateless create
+    request: POST /v1/responses {model,input,store:false}
+    entersIRR: true
+    loopRounds: 1
+  - id: S4
+    label: Multi-turn
+    request: POST /v1/responses {input,previous_response_id}
+    entersIRR: true
+    loopRounds: 1
+  - id: S5
+    label: File search
+    request: POST /v1/responses tools:[{type:file_search,vector_store_ids}]
+    entersIRR: true
+    loopRounds: 2+ (model emits file_search_call, callout via vector store 3002, re-enter, finalize)
+  - id: S6
+    label: MCP loop
+    request: POST /v1/responses tools:[{type:mcp,server_label,server_url,allowed_tools,require_approval:never}]
+    entersIRR: true
+    loopRounds: 2+ (mcp_tool_resolve then model emits MCP call, dispatch via 8001, finalize)
+  - id: S7
+    label: Web search
+    request: POST /v1/responses; model emits web_search_call (per-user brave_search key required)
+    entersIRR: true
+    loopRounds: 2+ (web_search via Brave, re-enter, finalize)
+  - id: S8
+    label: GET retrieve
+    request: GET /v1/responses/{id}
+    entersIRR: false
+    loopRounds: 0
+  - id: S9
+    label: WebSocket
+    request: 'GET /v1/responses with Upgrade: websocket'
+    entersIRR: false
+    loopRounds: 0
+  - id: S10
+    label: Non-Responses body on /v1/responses
+    request: POST /v1/responses with Chat Completions / Anthropic / unclassified body
+    entersIRR: false
+    loopRounds: 0
+  - id: S11
+    label: Dedicated services
+    request: POST /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores
+    entersIRR: false
+    loopRounds: 0
+  - id: S12
+    label: Direct OpenAI passthrough
+    request: 'POST /v1/responses {model:gpt-5,...} (application_provider=openai)'
+    entersIRR: false
+    loopRounds: 0
+  - id: S13
+    label: Chat Completions backend
+    request: 'POST /v1/responses {model:vllm-chat,store:false} (managed vllm, openai_chat_completions)'
+    entersIRR: true
+    loopRounds: 1
+  clusters:
+  - name: inference-backend
+    endpoints:
+    - 127.0.0.1:3001
+    definedIn: router route (path_prefix /v1/responses) + IRR-step load_balancer (cluster_source:bound_upstream)
+    routedBy: router binds managed native Responses for gpt-4.1/default models; the IRR inference step resolves it on 3001
+    note: application_provider vllm; the IRR-step load_balancer publishes application_protocol openai_responses so openai_responses_proxy fires
+  - name: openai-responses-backend
+    endpoints:
+    - 127.0.0.1:3001
+    definedIn: router route (model gpt-5) + direct-openai-dispatch load_balancer (cluster_source:bound_upstream)
+    routedBy: router binds this when x-praxis-ai-model is gpt-5; the direct-openai terminal branch forwards the original request unchanged
+    note: application_provider openai -> the managed body filters and the IRR are skipped; the provider owns the response
+  - name: chat-completions-backend
+    endpoints:
+    - 127.0.0.1:3001
+    definedIn: router route (model vllm-chat) + IRR-step load_balancer (cluster_source:bound_upstream)
+    routedBy: router binds this when x-praxis-ai-model is vllm-chat; the IRR inference step resolves it on 3001
+    note: application_provider vllm, application_protocol openai_chat_completions -> responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy
+  - name: prompts-api
+    endpoints:
+    - 127.0.0.1:9998
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: router path_prefix /v1/prompts (application_provider direct)
+  - name: embeddings-api
+    endpoints:
+    - 127.0.0.1:9997
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: router path_prefix /v1/embeddings (application_provider direct)
+  - name: files-api
+    endpoints:
+    - 127.0.0.1:9999
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: router path_prefix /v1/files (application_provider direct)
+  - name: vector-stores-backend
+    endpoints:
+    - 127.0.0.1:3002
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: router path_prefix /v1/vector_stores (application_provider direct)
+  - name: responses-websocket-backend
+    endpoints:
+    - 127.0.0.1:3001
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: 'router path /v1/responses + upgrade:websocket (application_provider direct)'
+  externalServices:
+  - name: MCP server
+    endpoint: http://127.0.0.1:8001/mcp
+    connectorId: trusted-mcp
+    usedBy:
+    - openai_mcp_tool_resolve (tools/list)
+    - openai_mcp_dispatch (tool calls)
+    credential: user_credential mcp_gateway (x-user-mcp-key) + opaque authorization_assertion mcp_gateway (x-mcp-authorized); both forwarded ONLY to connector_id trusted-mcp, never a client-supplied server_url
+  - name: Files API
+    endpoint: http://127.0.0.1:9999
+    usedBy:
+    - openai_file_resolve callout (files_api_url)
+    - files-api cluster (/v1/files direct-services branch)
+    credential: user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_id callouts; file_url downloads use the separate credential-free resolver
+  - name: Vector store
+    endpoint: http://127.0.0.1:3002
+    usedBy:
+    - openai_file_search_callout (vector_store_url)
+    - vector-stores-backend cluster (/v1/vector_stores direct-services branch)
+    credential: user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts
+  - name: NeMo Guardrails
+    endpoint: http://127.0.0.1:3003/v1/checks
+    usedBy:
+    - ai_guardrails (local tool-result checks inside the IRR)
+  - name: Brave Search
+    endpoint: provider:brave (external Brave API)
+    usedBy:
+    - openai_web_search
+    credential: user_credential brave_search (per-user slot from x-user-brave-key); WEB_SEARCH_API_KEY still required by provider config; missing per-user slot fails closed (no shared-key fallback)
+  knobs:
+    max_infer_iters: 7
+    max_iterations: 8
+    max_iterations_constraint: 'must be >= max_infer_iters + 1 (7+1=8): initial inference plus allowed tool-backed continuations'
+    timeout_ms: 360000
+    step_timeout_ms: 300000
+    max_response_bytes: 67108864
+    max_stream_response_bytes: 67108864
+    max_state_bytes: 136314880
+    file_search.timeout_ms: 5000
+    file_search.max_response_bytes: 10485760
+    file_search.max_total_response_bytes: 67108864
+    file_search.max_state_bytes: 136314880
+    file_search.on_failure: closed
+    mcp_dispatch.max_calls_per_round: 32
+    mcp_dispatch.max_parallel_calls: 8
+    mcp_dispatch.max_result_bytes: 1048576
+    mcp_dispatch.max_total_result_bytes: 8388608
+    web_search.max_calls_per_round: 32
+    file_resolve.timeout_ms: 10000
+    file_resolve.on_missing: reject
+    insecure_options.allow_private_endpoints: true
+    insecure_options.allow_private_upstreams: true
+scen_meta:
+  overview:
+    narr: '<b>Overview.</b> All filters shown at rest. trace_context opens the spine and callout_credentials anchors the identity band — since #1341 it is the single establishing filter for scoped secrets AND the MCP authorization assertion. Select a scenario chip to trace the exact path — active filters glow, and skipped / inert / passthrough filters are dimmed and labeled with their state.'
+    clusters: []
+    services: []
+  S1:
+    narr: <b>Stateful create</b> (store defaults true) runs the full pre-IRR spine, enters the IRR for one inference round, then persists the composed response on the reverse path.
+    clusters:
+    - inference-backend
+    services: []
+  S2:
+    narr: <b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.
+    clusters:
+    - inference-backend
+    services: []
+  S3:
+    narr: <b>Stateless create</b> (store:false) runs identically, but the store is inert on the reverse path — nothing is persisted.
+    clusters:
+    - inference-backend
+    services: []
+  S4:
+    narr: <b>Multi-turn.</b> openai_responses_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.
+    clusters:
+    - inference-backend
+    services: []
+  S5:
+    narr: <b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.
+    clusters:
+    - inference-backend
+    - vector-stores-backend
+    services:
+    - Vector store
+    - NeMo Guardrails
+  S6:
+    narr: <b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.
+    clusters:
+    - inference-backend
+    services:
+    - MCP server
+    - NeMo Guardrails
+  S7:
+    narr: <b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.
+    clusters:
+    - inference-backend
+    services:
+    - Brave Search
+    - NeMo Guardrails
+  S8:
+    narr: <b>GET retrieve.</b> openai_response_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
+    clusters: []
+    services: []
+  S9:
+    narr: <b>WebSocket.</b> A GET /v1/responses handshake with Upgrade:websocket is bound by the router to responses-websocket-backend; the direct-services terminal branch forwards it to 3001, so the managed body filters and the IRR never run.
+    clusters:
+    - responses-websocket-backend
+    services: []
+  S10:
+    narr: <b>Non-Responses body.</b> A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, so no router route matches — a route-miss returns a bare 404 before any body filter runs.
+    clusters: []
+    services: []
+  S11:
+    narr: <b>Dedicated services.</b> /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores are bound by the router to their path_prefix cluster (application_provider direct); the direct-services terminal branch forwards straight upstream and the IRR never runs.
+    clusters:
+    - prompts-api
+    - embeddings-api
+    - files-api
+    - vector-stores-backend
+    services:
+    - Files API
+    - Vector store
+  S12:
+    narr: <b>Direct OpenAI passthrough.</b> A create with model gpt-5 is bound by the router to openai-responses-backend (application_provider openai); the direct-openai terminal branch forwards the ORIGINAL Responses request unchanged to 3001. The managed body filters and the IRR are skipped — the provider owns the response.
+    clusters:
+    - openai-responses-backend
+    services: []
+  S13:
+    narr: <b>Chat Completions backend.</b> A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.
+    clusters:
+    - chat-completions-backend
+    services: []
+wire:
+  S1:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello, world!\"\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'content-type: application/json'
+    - 'x-request-id: req_d1561f573ba741d7adf74a0ad57445f0'
+    resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_001\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}"
+    notes: 'Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_response_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.'
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml:202-205
+    - examples/configs/openai/responses/full-flow-agentic.yaml:192-198
+    - tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:51-144
+    - tests/integration/tests/suite/examples/openai_response_store.rs:20,48-78
+  S2:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'Accept: text/event-stream'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello\",\n  \"stream\": true\n}"
+    resStatus: 200 OK
+    resKind: sse
+    resHeaders:
+    - 'Content-Type: text/event-stream'
+    - 'Cache-Control: no-cache'
+    resBody: 'event: response.created
+
+      data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_a1b2c3d4e5f60718","object":"response","created_at":1730902147,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt-4.1","output":[],"parallel_tool_calls":true,"previous_response_id":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1.0,"truncation":"disabled","metadata":{},"usage":null}}
+
+
+      event: response.in_progress
+
+      data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_a1b2c3d4e5f60718","object":"response","created_at":1730902147,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt-4.1","output":[],"parallel_tool_calls":true,"previous_response_id":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1.0,"truncation":"disabled","metadata":{},"usage":null}}
+
+
+      event: response.output_item.added
+
+      data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_a1b2c3d4e5f60718","type":"message","role":"assistant","status":"in_progress","content":[]}}
+
+
+      event: response.content_part.added
+
+      data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+
+      event: response.output_text.delta
+
+      data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"delta":"Hi"}
+
+
+      event: response.output_text.delta
+
+      data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"delta":" there"}
+
+
+      event: response.output_text.delta
+
+      data: {"type":"response.output_text.delta","sequence_number":6,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"delta":"!"}
+
+
+      event: response.output_text.done
+
+      data: {"type":"response.output_text.done","sequence_number":7,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"text":"Hi there!"}
+
+
+      event: response.content_part.done
+
+      data: {"type":"response.content_part.done","sequence_number":8,"item_id":"msg_a1b2c3d4e5f60718","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hi there!","annotations":[]}}
+
+
+      event: response.output_item.done
+
+      data: {"type":"response.output_item.done","sequence_number":9,"output_index":0,"item":{"id":"msg_a1b2c3d4e5f60718","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi there!","annotations":[]}]}}
+
+
+      event: response.completed
+
+      data: {"type":"response.completed","sequence_number":10,"response":{"id":"resp_a1b2c3d4e5f60718","object":"response","created_at":1730902147,"completed_at":1730902148,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt-4.1","output":[{"id":"msg_a1b2c3d4e5f60718","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi there!","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1.0,"truncation":"disabled","metadata":{},"usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":13}}}
+
+
+      '
+    notes: 'Full native Responses SSE lifecycle composed by openai_stream_events inside the IRR: response.created/in_progress carry an in_progress response with empty output[], the message item streams through output_item.added -> content_part.added -> several output_text.delta -> output_text.done -> content_part.done -> output_item.done, and the terminal response.completed carries the fully assembled response object (status completed, output[], usage). sequence_number is monotonic and integer on every frame; the client stream ends on response.completed with no trailing data: [DONE] (client fixtures set done:false). store defaults to true so this streamed resource is accumulated into response_object and persisted pre-IRR, retrievable via GET /v1/responses/{id}. Bare create: only Content-Type (plus Accept for SSE) is relevant; no credential/trace headers apply.'
+    provenance:
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:372-455 (exact request {"model":"gpt-4.1","input":"Hello","stream":true} against THIS config; native SSE lifecycle, resp id + created_at + model in terminal, store-default persistence + retrieval)
+    - tests/integration/fixtures/inference/recordings/synthetic/responses/chat-basic-stream.json:50-113 (full client lifecycle with sequence_number on every frame, two output_text.delta, output_text.done/content_part.done/output_item.done ordering, usage detail shape, done:false = no [DONE])
+    - 'tests/integration/fixtures/inference/recordings/openai/responses/native-basic-stream.json:54-107 (native OpenAI lifecycle frame shapes: message item content[], content_part output_text part, terminal response object with usage)'
+    - tests/integration/tests/suite/examples/openai_stream_events.rs:63-157 (openai_stream_events composes ONE lifecycle + populates response_object for SQLite persistence; asserts content-type text/event-stream and response.completed present)
+    - 'tests/integration/sdk/openai/test_openai_responses_vllm.py:255-293,2540-2556 (SDK stream contract: response.created first, monotonic integer sequence_number, content_part.added/done + output_item.added/done + output_text.done present, deltas concatenate to terminal output_text, terminal completed carries usage)'
+    - examples/configs/openai/responses/full-flow-agentic.yaml:207-210,512-659 (streaming create curl example; IRR step with openai_stream_events + openai_responses_proxy typed streaming; store PRE-IRR persists accumulated response_object)
+  S3:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello, world!\",\n  \"store\": false\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'content-type: application/json'
+    - 'x-request-id: req_d1561f573ba741d7adf74a0ad57445f0'
+    resBody: "{\n  \"id\": \"resp_def456\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": false,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_002\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}"
+    notes: Same shape as S1 but the body sets store:false and carries no other stateful marker, so the object echoes store:false and is NOT persisted. A subsequent GET /v1/responses/resp_def456 returns 404 (test_stateless_request asserts NotFound). The native recording is itself a store:false turn, grounding the echoed field.
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml:212-215
+    - tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:30-39,100
+    - tests/integration/sdk/openai/test_openai_responses_vllm.py:1658-1677
+  S4:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: acme'
+    - 'x-auth-user: user_42'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What did I just ask?\",\n  \"previous_response_id\": \"resp_abc123\"\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'content-type: application/json'
+    - 'x-request-id: req_a72c0f9e4b8d4f1e9c2a1b3d5e6f7a80'
+    resBody: "{\n  \"id\": \"resp_ghi789\",\n  \"object\": \"response\",\n  \"created_at\": 1010,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": \"resp_abc123\",\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_003\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"You just asked: \\\"Hello, world!\\\"\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 24,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 8,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 32\n  }\n}"
+    notes: 'Multi-turn continuation. previous_response_id is a stateful marker: openai_responses_rehydrate loads resp_abc123''s stored history (owner-scoped by x-auth-tenant/x-auth-user) and prepends it into the upstream input array, stripping previous_response_id from the outbound body so the backend echoes null. The rehydrate filter then restores the caller''s previous_response_id (resp_abc123) into the returned object (issue #932), so the client always sees the id it sent.'
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml:217-220
+    - examples/configs/openai/responses/full-flow-agentic.yaml:60-72
+    - tests/integration/tests/suite/examples/rehydrate.rs:66-88
+    - tests/integration/sdk/openai/test_openai_responses_vllm.py:1913-1960
+    - tests/integration/sdk/openai/test_openai_responses_vllm.py:1962-2021
+  S5:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-user-ogx-key: Bearer integration-ogx-key'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    - 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What does the README say about deployment?\",\n  \"include\": [\n    \"file_search_call.results\"\n  ],\n  \"tools\": [\n    {\n      \"type\": \"file_search\",\n      \"vector_store_ids\": [\n        \"vs_abc123\"\n      ]\n    }\n  ]\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_final\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"fs_1\",\n      \"type\": \"file_search_call\",\n      \"status\": \"completed\",\n      \"queries\": [\n        \"deployment instructions\"\n      ],\n      \"results\": [\n        {\n          \"file_id\": \"file-readme\",\n          \"filename\": \"README.md\",\n          \"score\": 0.92,\n          \"content\": [\n            {\n              \"type\": \"text\",\n              \"text\": \"Deploy the gateway by building the container image with `make container`, then run it behind an auth boundary.\"\n            }\n          ],\n          \"attributes\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"msg_final\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Deploy by building the container image and running it.\",\n          \"annotations\": [\n            {\n              \"type\": \"file_citation\",\n              \"file_id\": \"file-readme\",\n              \"filename\": \"README.md\",\n              \"index\": 54\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 12,\n    \"total_tokens\": 42\n  }\n}"
+    notes: 'Buffered final composed object after a 2-round model->tool->model loop. Round 1: model emits a pending file_search_call (id fs_1, status "searching", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {"query":"deployment instructions","rewrite_query":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a <|file-readme|> marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:["file_search_call.results"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).'
+    provenance:
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:1190-1305
+    - tests/integration/tests/suite/examples/file_search_callout.rs:37-146
+    - apis/src/openai/responses/file_search_callout/citations.rs:158-213
+    - apis/src/openai/include.rs:206-224
+    - examples/configs/openai/responses/full-flow-agentic.yaml:585-607
+  S6:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: acme'
+    - 'x-auth-user: user_42'
+    - 'x-user-mcp-key: mcp-user-secret-7f3a2c'
+    - 'x-mcp-authorized: mcpa_eyJ0ZW5hbnQiOiJhY21lIiwic3ViIjoidXNlcl80MiJ9.opaque-short-lived-assertion'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What is the weather in SF?\",\n  \"tools\": [\n    {\n      \"type\": \"mcp\",\n      \"server_label\": \"weather\",\n      \"connector_id\": \"trusted-mcp\",\n      \"allowed_tools\": [\n        \"get_weather\"\n      ],\n      \"require_approval\": \"never\"\n    }\n  ]\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_2\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"mcpl_9f2c1a7b3d4e5f60\",\n      \"type\": \"mcp_list_tools\",\n      \"server_label\": \"weather\",\n      \"tools\": [\n        {\n          \"name\": \"get_weather\",\n          \"description\": \"Get the weather for a location\",\n          \"input_schema\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"location\": {\n                \"type\": \"string\"\n              }\n            },\n            \"required\": [\n              \"location\"\n            ],\n            \"additionalProperties\": false\n          }\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"id\": \"fc_1\",\n      \"call_id\": \"call_abc\",\n      \"name\": \"weather__get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"status\": \"completed\"\n    },\n    {\n      \"type\": \"mcp_call\",\n      \"id\": \"call_abc\",\n      \"approval_request_id\": null,\n      \"server_label\": \"weather\",\n      \"name\": \"get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"output\": \"mock result for get_weather\"\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_2\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The weather in SF is 72F and sunny.\"\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 11,\n    \"total_tokens\": 41\n  }\n}"
+    notes: 'Distinctive shape: a two-phase agentic loop composed into one buffered Responses object. openai_mcp_tool_resolve first resolves connector_id ''trusted-mcp'' to server_url http://127.0.0.1:8001/mcp, calls tools/list, and seeds one mcp_list_tools item (server_label is the client label ''weather'', not the connector id; tools carry input_schema not inputSchema). The model then emits a function_call (name prefixed ''weather__get_weather''); openai_mcp_dispatch executes it against the same connector and appends the mcp_call record (name is the bare ''get_weather'', server_label ''weather'', id = the call_id, approval_request_id null since require_approval:never, output = the tool result). openai_agentic_loop signals loop, a second inference round returns the assistant message, then done. The mcp_gateway credential (x-user-mcp-key) and authorization assertion (x-mcp-authorized) are forwarded ONLY to the configured connector_id target, never to an arbitrary client server_url; the buffered terminal keeps the last round''s backend response id (resp_2) and sums usage across both rounds (30/11/41).'
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml:88-93
+    - examples/configs/openai/responses/full-flow-agentic.yaml:414-425
+    - examples/configs/openai/responses/full-flow-agentic.yaml:326-345
+    - examples/configs/openai/responses/full-flow-agentic.yaml:569-578
+    - tests/integration/tests/suite/examples/openai_agentic_loop.rs:438-536
+    - tests/integration/tests/suite/examples/openai_agentic_loop.rs:1270-1318
+    - tests/integration/tests/suite/examples/openai_agentic_loop.rs:2106-2264
+    - tests/integration/tests/suite/examples/openai_agentic_loop.rs:6813-6819
+    - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:56-137
+    - apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2606-2635
+    - apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2705-2715
+    - apis/src/openai/responses/mcp_dispatch/mod.rs:1774-1816
+    - apis/src/openai/responses/mcp_dispatch/mod.rs:1630-1716
+  S7:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: acme'
+    - 'x-auth-user: alice'
+    - 'x-user-brave-key: alice-brave-secret'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What are the latest headlines about the Toronto Raptors?\",\n  \"tools\": [\n    {\n      \"type\": \"web_search\"\n    }\n  ]\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_0a1b2c3d4e5f60718293a4b5c6\",\n  \"object\": \"response\",\n  \"created_at\": 1783307880,\n  \"status\": \"completed\",\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"output\": [\n    {\n      \"type\": \"web_search_call\",\n      \"id\": \"ws_68a1f0c2d1348190a7c3e5f102\",\n      \"status\": \"completed\",\n      \"action\": {\n        \"type\": \"search\",\n        \"query\": \"latest Toronto Raptors headlines\"\n      }\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_68a1f0c3a2b48190b4d6f70213\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The Raptors are finalizing their rotation ahead of the season opener, with Scottie Barnes expected to take on a larger playmaking role, and the team added frontcourt depth in a roster move this week.\",\n          \"annotations\": [\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.nba.com/raptors/news\",\n              \"title\": \"Toronto Raptors News | NBA.com\",\n              \"start_index\": 0,\n              \"end_index\": 132\n            },\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.sportsnet.ca/nba/toronto-raptors/\",\n              \"title\": \"Toronto Raptors - Sportsnet\",\n              \"start_index\": 134,\n              \"end_index\": 195\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 318,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 96,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 414\n  }\n}"
+    notes: 'Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:["web_search_call.action.sources"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.'
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml:551-565
+    - examples/configs/openai/responses/full-flow-agentic.yaml:326-337
+    - apis/src/openai/responses/web_search/mod.rs:819-856
+    - apis/src/openai/responses/file_search_callout/citations.rs:507-512
+    - apis/src/openai/responses/file_search_callout/citations.rs:563
+    - tests/integration/fixtures/agentic_api/web_search_nonstreaming.json:25-83
+    - tests/integration/fixtures/inference/recordings/synthetic/responses/chat-web-search.json:63-92
+    - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:139-175
+    - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:225-245
+  S8:
+    reqMethod: GET
+    reqPath: /v1/responses/resp_abc123
+    reqHeaders:
+    - 'Host: localhost:8080'
+    - 'Accept: application/json'
+    - 'x-auth-tenant: acme'
+    - 'x-auth-user: alice'
+    reqBody: ''
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}"
+    notes: openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.
+    provenance:
+    - apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)
+    - apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)
+    - apis/src/openai/responses/store/filter.rs:1034-1037 (owner-scoped via require_state_owner)
+    - tests/integration/tests/suite/examples/openai_response_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:33 (FIRST_RESPONSE_JSON completed shape), 441-452 (GET stored streamed resource, status/output asserted)
+    - 'tests/integration/tests/suite/codex_http.rs:1105-1114 (OpenResponses usage: input_tokens_details.cached_tokens + output_tokens_details.reasoning_tokens required)'
+    - examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_response_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)
+  S9:
+    reqMethod: GET
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Host: localhost:8080'
+    - 'x-auth-tenant: acme'
+    - 'x-auth-user: alice'
+    - 'Connection: Upgrade'
+    - 'Upgrade: websocket'
+    - 'Sec-WebSocket-Version: 13'
+    - 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+    reqBody: ''
+    resStatus: 101 Switching Protocols
+    resKind: handshake
+    resHeaders:
+    - 'Upgrade: websocket'
+    - 'Connection: Upgrade'
+    - 'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo='
+    resBody: "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+    notes: 'A GET /v1/responses carrying Upgrade: websocket is bound by the top-level router to responses-websocket-backend (application_provider=direct) via the dedicated upgrade:websocket route. The direct-services terminal branch then forwards the handshake straight to 3001 and rejoins at terminal, so the managed body filters and the IRR never run (the IRR buffers responses and cannot handle 101 upgrades). The Sec-WebSocket-Accept is the RFC 6455 SHA-1 of the client key; after 101 the tunnel is bidirectional and the backend streams response.create-style Responses events.'
+    provenance:
+    - 'tests/integration/tests/suite/examples/full_flow_agentic.rs:1113-1196 (full_flow_websocket_upgrade_preserves_handshake_and_ordered_text: WS request head + ordered text relay)'
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:1374-1397 (full_flow_websocket_handshake_reaches_inference_backend: handshake returns SWITCHING_PROTOCOLS and reaches the 3001 backend)
+    - tests/integration/fixtures/openai/responses/websocket-codex-0.144.1.json:15-19 (WS response.create client kind and Responses event schema)
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + upgrade:websocket -> responses-websocket-backend; direct-services branch when bound_upstream.application_provider=direct forwards to 3001 and rejoins terminal)'
+  S10:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    reqBody: "{\n  \"model\": \"gpt-4.1\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}"
+    resStatus: 404 Not Found
+    resKind: none
+    resHeaders:
+    - 'Connection: close'
+    resBody: ''
+    notes: 'A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so none of the router''s /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.'
+    provenance:
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)'
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:521-560 (full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend: same route-miss for an Anthropic body)
+    - ~/.cargo/registry/.../praxis-proxy-filter-0.7.1/src/builtins/http/traffic_management/router/mod.rs (route-miss => Rejection::status(404), body:None) [praxis core dep]
+    - '~/.cargo/registry/.../praxis-proxy-protocol-0.7.1/src/http/pingora/convert.rs (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]'
+  S11:
+    reqMethod: POST
+    reqPath: /v1/embeddings
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    reqBody: "{\n  \"model\": \"text-embedding-3-small\",\n  \"input\": \"The quick brown fox\"\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"object\": \"embedding\",\n      \"index\": 0,\n      \"embedding\": [\n        0.0023064255,\n        -0.009327292,\n        0.015797347,\n        -0.0079056\n      ]\n    }\n  ],\n  \"model\": \"text-embedding-3-small\",\n  \"usage\": {\n    \"prompt_tokens\": 5,\n    \"total_tokens\": 5\n  }\n}"
+    notes: 'POST /v1/embeddings matches the top-level router''s path_prefix `/v1/embeddings` -> cluster embeddings-api (application_provider=direct, 127.0.0.1:9997). Because the binding is direct, the direct-services terminal branch forwards it straight upstream and rejoins at `terminal`, so it NEVER enters the IRR and the managed body filters never run. The gateway forwards the embeddings backend''s response verbatim, so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same direct-services branch by path_prefix and likewise skip the IRR: /v1/prompts -> prompts-api (127.0.0.1:9998), /v1/files -> files-api (127.0.0.1:9999), /v1/vector_stores -> vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string "embeddings-api"); this is the minimal truthful OpenAI embeddings shape.'
+    provenance:
+    - examples/configs/openai/responses/full-flow-agentic.yaml (router path_prefix /v1/embeddings -> embeddings-api; direct-services-dispatch load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:1559-1588 (full_flow_agentic_non_responses_path_bypasses_irr proves a dedicated-service path bypasses the IRR and the direct-services branch forwards the backend response verbatim)
+    - tests/integration/tests/suite/examples/openai_embeddings_routing.rs:14-60 (embeddings routing functional test; backend returns marker string, no JSON embeddings fixture exists)
+  S12:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    - 'x-user-ogx-key: Bearer integration-ogx-key'
+    reqBody: "{\n  \"model\": \"gpt-5\",\n  \"input\": \"continue at the provider\",\n  \"background\": true,\n  \"previous_response_id\": \"resp_provider_owned\",\n  \"conversation\": \"conv_provider_owned\"\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}"
+    notes: 'model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_request, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider''s response (status:queued) is returned verbatim without gateway composition.'
+    provenance:
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough: 200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:413-439 (full_flow_managed_provider_rejects_background_before_forwarding: the managed path rejects background:true with 400, contrasting the direct passthrough)
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:gpt-5 -> openai-responses-backend; direct-openai branch when bound_upstream.application_provider=openai forwards to 3001 and rejoins terminal; body filters + IRR gated unless application_provider=openai)'
+  S13:
+    reqMethod: POST
+    reqPath: /v1/responses
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    - 'x-user-ogx-key: Bearer integration-ogx-key'
+    reqBody: "{\n  \"model\": \"vllm-chat\",\n  \"input\": \"hello\",\n  \"store\": false\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}"
+    notes: 'model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
+    provenance:
+    - tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding: 200, response.object==response + output text "translated"; backend gets one /v1/chat/completions request whose body has messages and no input)
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'
+timeline:
+  S1:
+    summary: 'A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -> IRR forwards the create to inference-backend 127.0.0.1:3001 -> the model returns a final assistant message with NO tool-call items -> the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states ''IRR terminates after the first pass via the default `done: true` branch''). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -> next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.'
+    rounds: single round · no tools
+    steps:
+    - n: 1
+      round: round 1
+      from: client
+      to: gateway
+      kind: request
+      title: Client create POST (no tools)
+      channel: POST http://{proxy}/v1/responses
+      note: 'Exact request body at full_flow_agentic.rs:1317. json_post() wraps it with the trusted ingress identity headers x-auth-tenant: integration-tenant, x-auth-user: integration-user, x-user-ogx-key: Bearer integration-ogx-key via the authenticated_request helper (constants TEST_TENANT/TEST_SUBJECT/TEST_OGX_CREDENTIAL at :58-60). No `store` field is sent and the test asserts nothing about persistence — this is a plain create, not verified as stateful.'
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"Hello"}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1317
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:66-80
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:58-60
+    - n: 2
+      round: round 1
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: IRR forwards the classified create to inference
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: 'Router maps /v1/responses -> cluster inference-backend at 127.0.0.1:3001 (yaml:624-639). Exactly one model request is made for a no-server-tool create and the body is forwarded byte-exact — grounded in the sibling tests single_pass_completes_through_irr (model_reqs.len()==1, openai_agentic_loop.rs:60-67) and explicit_false_preserves_original_request_bytes (byte-exact passthrough, :85-88); the S1 passthrough test uses a non-capturing backend so it does not itself assert the forwarded body. Identity projection (inference receives x-tenant-id: integration-tenant and x-user-id: integration-user via project_state_owner_headers at yaml:532-534, and raw x-auth-tenant/x-auth-user are stripped at the IRR boundary) is asserted in the sibling file_search round-trip at full_flow_agentic.rs:1261-1279, not in the S1 test.'
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"Hello"}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1317
+      - examples/configs/openai/responses/full-flow-agentic.yaml:624-639
+      - examples/configs/openai/responses/full-flow-agentic.yaml:532-534
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:60-67
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:85-88
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1261-1279
+    - n: 3
+      round: round 1
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Final assistant message — no tool-call items
+      channel: 200 POST /v1/responses
+      note: 'Exact canned backend response at full_flow_agentic.rs:1309. openai_agentic_loop (sole loop owner, max_infer_iters: 7, yaml:608-613) parses this response, finds no hosted-tool items, so it does NOT publish action=loop. The IRR on_result then takes the `default: true / done: true` branch (yaml:646-658) and finalizes after the first pass — no re-entry. The same terminate-on-default mechanic is documented at openai_agentic_loop.rs:6919-6923.'
+      bodyKind: json
+      body: '{"id":"resp_456","object":"response","output":[{"id":"msg_456","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1309
+      - examples/configs/openai/responses/full-flow-agentic.yaml:608-613
+      - examples/configs/openai/responses/full-flow-agentic.yaml:646-658
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:6919-6923
+    - n: 4
+      round: final
+      from: gateway
+      to: client
+      kind: response
+      title: Final Responses object returned verbatim
+      channel: 200 POST /v1/responses
+      note: Status 200 (assert at :1320) and the client body equals the backend response byte-for-byte (assert_eq!(parse_body(&raw), response) at :1321), confirming a single-round pass-through with no loop re-entry.
+      bodyKind: json
+      body: '{"id":"resp_456","object":"response","output":[{"id":"msg_456","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1320-1321
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1309
+  S5:
+    summary: 'Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_callout POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose <|file-q4|> marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.'
+    rounds: 2 rounds · hosted file_search
+    steps:
+    - n: 1
+      round: round 1
+      from: client
+      to: gateway
+      kind: request
+      title: Client posts a hosted file_search request
+      channel: POST http://127.0.0.1:8080/v1/responses
+      note: 'VERIFIED. Body matches full_flow_agentic.rs:1242-1246. Authorization: Bearer search-key prepended via replacen at :1247-1251. json_post -> authenticated_request (:78-79, :67-75) injects x-auth-tenant: integration-tenant / x-auth-user: integration-user / x-user-ogx-key: Bearer integration-ogx-key (consts at :58-60); these ingress identity headers are consumed pre-IRR by state_owner + callout_credentials. Listener is 127.0.0.1:8080 (config :302-305).'
+      bodyKind: json
+      body: '{"model": "gpt-4.1", "input": "What do the documents say about Q4?", "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1242-1251
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:57-75
+      - examples/configs/openai/responses/full-flow-agentic.yaml:302-305
+    - n: 2
+      round: round 1
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: IRR round-1 inference request carries the file_search tool
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: 'VERIFIED. openai_responses_proxy (config :645) rebuilds the outbound body from ResponsesState. S5 asserts per-round inference headers at :1261-1279: authorization: bearer search-key (client key preserved), projected x-tenant-id: integration-tenant + x-user-id: integration-user (project_state_owner_headers, config :532-534), and NO x-auth-tenant:/x-auth-user: (raw ingress identity stripped at the IRR boundary). Router path /v1/responses -> cluster inference-backend endpoint 127.0.0.1:3001 (config :624-639). The exact wire body is NOT asserted by S5; shown faithful to the client input+tools it is rebuilt from.'
+      bodyKind: json
+      body: '{"model": "gpt-4.1", "input": "What do the documents say about Q4?", "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1242-1246
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1261-1279
+      - examples/configs/openai/responses/full-flow-agentic.yaml:526-534
+      - examples/configs/openai/responses/full-flow-agentic.yaml:624-639
+    - n: 3
+      round: round 1
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Model emits a file_search_call (status searching)
+      channel: 200 http://127.0.0.1:3001/v1/responses
+      note: VERIFIED. Exact quote of first_model_response (full_flow_agentic.rs:1191-1202), served first by StatefulCapturingBackend (:1220-1224). openai_agentic_loop parses this, records the file_search_call assignment for the dispatcher, and publishes action=loop.
+      bodyKind: json
+      body: '{"id": "resp_search", "object": "response", "status": "completed", "output": [{"id": "fs_1", "type": "file_search_call", "status": "searching", "queries": ["What were the Q4 results?"]}], "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1191-1202
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1220-1224
+    - n: 4
+      round: callout
+      from: gateway
+      to: vector-store
+      kind: request
+      title: openai_file_search_callout searches the vector store
+      channel: POST http://127.0.0.1:3002/v1/vector_stores/vs_q4/search
+      note: 'VERIFIED. Exactly one POST callout (S5 asserts search_callouts.len()==1 at :1281-1283). Body shape confirmed by the sibling assertion query=="What were the Q4 results?" + rewrite_query==false (file_search_callout.rs:131-133) and by VectorStoreSearchRequest (client.rs:120-143, rewrite_query always false at :138/:159). URL path v1/vector_stores/{store_id}/search built by search_url/resource_url (client.rs:887-903); destination is vector_store_url http://127.0.0.1:3002 (config :586). Headers asserted at :1284-1304: authorization: bearer integration-ogx-key (scoped ogx_files slot, NOT client search-key), x-tenant-id, x-user-id, no x-auth-*. Outbound chain sets X-Vector-Store-Client: praxis-ai-gateway (config :596-599). Request also carries optional filters/max_num_results/ranking_options/search_mode (omitted, skip_serializing_if none, not asserted).'
+      bodyKind: json
+      body: '{"query": "What were the Q4 results?", "rewrite_query": false}'
+      provenance:
+      - tests/integration/tests/suite/examples/file_search_callout.rs:131-133
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1281-1304
+      - apis/src/openai/responses/file_search_callout/client.rs:120-143
+      - apis/src/openai/responses/file_search_callout/client.rs:786-902
+      - examples/configs/openai/responses/full-flow-agentic.yaml:585-607
+    - n: 5
+      round: callout
+      from: vector-store
+      to: gateway
+      kind: response
+      title: Vector store returns the matching chunk
+      channel: 200 http://127.0.0.1:3002/v1/vector_stores/vs_q4/search
+      note: 'VERIFIED. Exact quote of search_response (full_flow_agentic.rs:1225-1234). The dispatcher reconciles in place: accumulated_output[fs_1].status becomes completed (status->completed proven by sibling unit test tests.rs:512; results are NOT added because the S5 request sets no include:[file_search_call.results], no-results-when-unset proven by tests.rs:611-612), citation_files gains file-q4 -> q4-results.txt, and the model-context bridge is appended to state.messages via model_context_messages (mod.rs:1339-1366).'
+      bodyKind: json
+      body: '{"data": [{"file_id": "file-q4", "filename": "q4-results.txt", "score": 0.99, "content": [{"type": "text", "text": "Q4 revenue was $42 million."}], "attributes": null}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1225-1234
+      - apis/src/openai/responses/file_search_callout/tests.rs:611-612
+      - apis/src/openai/responses/file_search_callout/mod.rs:1339-1366
+    - n: 6
+      round: round 2
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: IRR round-2 inference request with results bridged in
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: 'VERIFIED. The [function_call, function_call_output] bridge shape is quoted from model_context_messages (mod.rs:1339-1366): call_id = file_search_{output_index}_{call_hash:016x} (:1350), arguments = json!({"query": query}).to_string() (:1351). Output string built from CONTEXT_TEMPLATE + ANNOTATION_TEMPLATE (model_context.rs:26-29), score via to_string (model_context.rs:382). Unit test tests.rs:520-536 confirms messages == [message, function_call, function_call_output] and the output starts_with ''file_search found 1 chunks for ...'', contains ''<|file-...|>'', ends_with content+''\n''. Same per-round headers as round 1 (:1261-1279). The round-2 wire body is NOT directly asserted by S5; reconstructed faithfully from the bridge unit test + templates + mod.rs applied to S5 data.'
+      bodyKind: json
+      body: '{"model": "gpt-4.1", …, "input": [ …prior items…, {"type": "function_call", "call_id": "file_search_0_<hash16>", "name": "file_search", "arguments": "{\"query\":\"What were the Q4 results?\"}", "status": "completed"}, {"type": "function_call_output", "call_id": "file_search_0_<hash16>", "output": "file_search found 1 chunks for \"What were the Q4 results?\":\n[0] q4-results.txt (score: 0.99) cite as <|file-q4|>\nQ4 revenue was $42 million.\n"}]}'
+      provenance:
+      - apis/src/openai/responses/file_search_callout/mod.rs:1339-1366
+      - apis/src/openai/responses/file_search_callout/tests.rs:520-536
+      - apis/src/openai/responses/file_search_callout/model_context.rs:26-29
+      - apis/src/openai/responses/file_search_callout/model_context.rs:382
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1261-1279
+    - n: 7
+      round: round 2
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Model returns the answer with a citation marker
+      channel: 200 http://127.0.0.1:3001/v1/responses
+      note: VERIFIED. Exact quote of final_model_response (full_flow_agentic.rs:1203-1219), served second by StatefulCapturingBackend (:1220-1224). openai_agentic_loop sees no further hosted-tool calls and publishes done (exit to client).
+      bodyKind: json
+      body: '{"id": "resp_final", "object": "response", "status": "completed", "output": [{"id": "msg_final", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "Q4 revenue was $42 million <|file-q4|>", "annotations": []}]}], "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1203-1219
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1220-1224
+    - n: 8
+      round: final
+      from: gateway
+      to: client
+      kind: response
+      title: Final /v1/responses object returned to client
+      channel: 200 http://127.0.0.1:8080/v1/responses
+      note: 'VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The <|file-q4|> marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_callout.rs:117-125: text=="Q4 revenue was $42 million", annotations[0].file_id=="file-q4") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.'
+      bodyKind: json
+      body: '{"id": "resp_final", "object": "response", "status": "completed", "output": [{"id": "fs_1", "type": "file_search_call", "status": "completed", "queries": ["What were the Q4 results?"]}, {"id": "msg_final", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "Q4 revenue was $42 million", "annotations": [{"type": "file_citation", "file_id": "file-q4", "filename": "q4-results.txt", "index": …}]}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1254-1259
+      - tests/integration/tests/suite/examples/file_search_callout.rs:117-125
+      - apis/src/openai/responses/file_search_callout/citations.rs:209-212
+  S6:
+    summary: 'A model-tool-model MCP loop: the gateway resolves MCP tools out of band (initialize/tools/list), lowers them to encoded function tools for round-1 inference, executes the model-selected MCP call via JSON-RPC tools/call, appends the tool result as a function_call_output for round-2 inference, and returns a single composed Responses object. Config STRUCTURE is grounded in full-flow-agentic.yaml (statically validated by full_flow_agentic.rs); WIRE PAYLOADS are faithful trims of the round-trip integration test (openai_agentic_loop.rs), the SSE test (openai_mcp_streaming.rs), the MCP mock-server fixtures (tests/utils agentic/mcp.rs), the mcp_client credential unit tests, and the mcp_dispatch result-construction tests. JSON-RPC id scalars are illustrative/rmcp-generated; only the envelope shapes are grounded.'
+    rounds: 2 rounds · MCP tool loop
+    steps:
+    - n: 1
+      round: pre-IRR
+      from: client
+      to: gateway
+      kind: request
+      title: Client POST /v1/responses with an MCP tool
+      channel: POST http://localhost:8080/v1/responses
+      note: 'Faithful trim of the integration-test request bodies (openai_agentic_loop.rs:299-311 and openai_mcp_streaming.rs:109-119), which pass server_url directly as a dynamic 127.0.0.1:<mcp-port>/mcp; normalized here to the documented connector port :8001. NOTE: the config curl example (yaml:232-242) actually shows server_url http://mcp-weather:8001/mcp, and per yaml:422 real clients reference the trusted-mcp connector via connector_id, not server_url. The round-trip test additionally sends conversation.id=conv_native and parallel_tool_calls=true (trimmed here). In full-flow-agentic the trusted boundary supplies x-user-mcp-key (->mcp_gateway slot) and x-mcp-authorized (->mcp_gateway assertion); callout_credentials strips both ingress headers before the IRR.'
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"What is the weather in SF?","tools":[{"type":"mcp","server_label":"weather","server_url":"http://127.0.0.1:8001/mcp","allowed_tools":["get_weather"],"require_approval":"never"}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:299-311
+      - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:109-119
+      - examples/configs/openai/responses/full-flow-agentic.yaml:232-242
+      - examples/configs/openai/responses/full-flow-agentic.yaml:326-345
+    - n: 2
+      round: pre-IRR (mcp_tool_resolve)
+      from: gateway
+      to: mcp-server
+      kind: request
+      title: 'MCP handshake: JSON-RPC initialize'
+      channel: POST http://127.0.0.1:8001/mcp
+      note: 'openai_mcp_tool_resolve opens a fresh Streamable HTTP transport; rmcp .serve() performs the handshake (mod.rs:403). For the connector target the exchange carries forwarded credentials: Authorization: Bearer <mcp_gateway>, x-mcp-authorized: <assertion>, x-tenant-id/x-user-id (asserted in mcp_client tests). JSON-RPC envelope is standard; the id scalar (0) and params (protocolVersion/capabilities/clientInfo) are rmcp-generated and trimmed — only protocolVersion 2025-03-26 is grounded (mcp.rs:35).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{…},"clientInfo":{…}}}'
+      provenance:
+      - apis/src/mcp_client/mod.rs:359-403
+      - apis/src/mcp_client/mod.rs:716-750
+      - tests/utils/src/agentic/mcp.rs:35
+      - tests/utils/src/agentic/mcp.rs:409-410
+      - apis/src/mcp_client/tests.rs:1280-1290
+      - apis/src/mcp_client/tests.rs:1312-1345
+      - apis/src/callout_credentials.rs:45
+    - n: 3
+      round: pre-IRR (mcp_tool_resolve)
+      from: mcp-server
+      to: gateway
+      kind: response
+      title: initialize result
+      channel: 200 http://127.0.0.1:8001/mcp
+      note: 'Faithful to handle_initialize (mcp.rs:435-457): protocolVersion=DEFAULT_PROTOCOL_VERSION ''2025-03-26'', capabilities {tools:{}}, serverInfo name ''praxis-test-mcp'' / version ''0.0.0-test''. Stateful mock also returns header MCP-Session-Id: mock-mcp-session-1 (mcp.rs:452-453, constant at :44). Followed by a notifications/initialized (HTTP 202, no body — mcp.rs:461-463).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"praxis-test-mcp","version":"0.0.0-test"}}}'
+      provenance:
+      - tests/utils/src/agentic/mcp.rs:435-457
+      - tests/utils/src/agentic/mcp.rs:44
+      - tests/utils/src/agentic/mcp.rs:452-453
+      - tests/utils/src/agentic/mcp.rs:461-463
+    - n: 4
+      round: pre-IRR (mcp_tool_resolve)
+      from: gateway
+      to: mcp-server
+      kind: request
+      title: JSON-RPC tools/list
+      channel: POST http://127.0.0.1:8001/mcp
+      note: 'Envelope grounded in the transport test fixture (subrequest_transport.rs:1767 shows tools/list with id:2, params {}); the id scalar is rmcp-generated. Same forwarded credentials as initialize (mcp_client tests assert Authorization: Bearer per-user-token + x-mcp-authorized: signed-assertion + x-tenant-id/x-user-id on every connector exchange). Response body is bounded/paginated by the client (mod.rs:359-409 / paginate_tools).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+      provenance:
+      - apis/src/mcp_client/subrequest_transport.rs:1767
+      - apis/src/mcp_client/mod.rs:359-409
+      - apis/src/mcp_client/tests.rs:1280-1290
+      - apis/src/mcp_client/tests.rs:1424-1430
+    - n: 5
+      round: pre-IRR (mcp_tool_resolve)
+      from: mcp-server
+      to: gateway
+      kind: response
+      title: tools/list result (get_weather)
+      channel: 200 http://127.0.0.1:8001/mcp
+      note: 'Envelope/key-order grounded in handle_tools_list (mcp.rs:467-497 emits name, inputSchema, then description). The get_weather fixture (name/inputSchema location schema/description) is grounded in the test McpToolFixture at openai_mcp_streaming.rs:88-98 (and identically openai_agentic_loop.rs:282-290). openai_mcp_tool_resolve writes mcp_tool_map to ResponsesState keyed by (server_label, tool_name); discovery also surfaces an mcp_list_tools output item (issue #1022). mcp_dispatch/tests.rs:2112-2116 grounds the resolver-side inputSchema shape (uses a ''city'' schema there).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"get_weather","inputSchema":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"],"additionalProperties":false},"description":"Get the weather for a location"}]}}'
+      provenance:
+      - tests/utils/src/agentic/mcp.rs:467-497
+      - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:88-98
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:282-290
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:2112-2116
+    - n: 6
+      round: round 1
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: Round-1 inference carrying the resolved MCP tools
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: The resolver lowers each MCP tool to an encoded function tool named <server_label>__<tool_name> (encode_function_name -> weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Resolved to inference-backend 127.0.0.1:3001 by the IRR-step load_balancer (cluster_source:bound_upstream).
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"What is the weather in SF?","parallel_tool_calls":true,"tools":[{"type":"function","name":"weather__get_weather",…}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:365-382
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:2124-2126
+      - examples/configs/openai/responses/full-flow-agentic.yaml:624-639
+    - n: 7
+      round: round 1
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Round-1 response emits the MCP (encoded) tool call
+      channel: 200 http://127.0.0.1:3001/v1/responses
+      note: Exact quote of first_response (openai_agentic_loop.rs:250-262, identical at openai_mcp_streaming.rs:58-70). openai_agentic_loop parses this, recognizes weather__get_weather as an MCP call via mcp_tool_map (is_mcp_tool_call, mcp_dispatch/tests.rs:349-353), assigns it to openai_mcp_dispatch, and signals action=loop.
+      bodyKind: json
+      body: '{"id":"resp_1","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"weather__get_weather","arguments":"{\"location\":\"SF\"}","status":"completed"}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:250-262
+      - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:58-70
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:349-353
+    - n: 8
+      round: callout (mcp_dispatch)
+      from: gateway
+      to: mcp-server
+      kind: request
+      title: JSON-RPC tools/call get_weather
+      channel: POST http://127.0.0.1:8001/mcp
+      note: 'Envelope grounded in the transport test fixture (subrequest_transport.rs:1761 shows tools/call with id:1 and params {name, arguments}); the id scalar is rmcp-generated. openai_mcp_dispatch decodes the encoded name back to the original tool_name get_weather (mcp_dispatch/tests.rs:2158-2189) and forwards the model''s arguments (round-trip test asserts call_body.params.arguments.location == ''SF'', openai_agentic_loop.rs:359-360). The dispatch outbound_chain stamps X-MCP-Client: praxis-ai-gateway (asserted openai_agentic_loop.rs:352-358); for a connector target it also carries Bearer <mcp_gateway> + x-mcp-authorized + x-tenant-id/x-user-id, whereas for a request-supplied server_url the round-trip test asserts x-tenant-id must NOT cross (openai_agentic_loop.rs:342-347).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{"location":"SF"}}}'
+      provenance:
+      - apis/src/mcp_client/subrequest_transport.rs:1761
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:334-360
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:2158-2189
+      - apis/src/mcp_client/mod.rs:716-750
+    - n: 9
+      round: callout (mcp_dispatch)
+      from: mcp-server
+      to: gateway
+      kind: response
+      title: tools/call result
+      channel: 200 http://127.0.0.1:8001/mcp
+      note: 'Faithful to write_known_tool_result (mcp.rs:653-674): text = format!(''mock result for {name}''). openai_mcp_dispatch converts the content blocks into (a) an mcp_call output item {type:mcp_call, id:call_abc, server_label:weather, name:get_weather, output:''mock result for get_weather''} in accumulated_output and (b) a function_call_output message {type:function_call_output, call_id:call_abc, output:''mock result for get_weather''} for re-entry — both shapes grounded in build_success_result tests (mcp_dispatch/tests.rs:508-556).'
+      bodyKind: json
+      body: '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"mock result for get_weather"}],"isError":false}}'
+      provenance:
+      - tests/utils/src/agentic/mcp.rs:653-674
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:508-556
+    - n: 10
+      round: round 2
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: Round-2 inference with the tool result appended
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: 'openai_agentic_loop rebuilds the outbound body: input is a single-item array carrying the new function_call_output delta whose output contains ''mock result for get_weather'' (asserted len==1 + contains, openai_agentic_loop.rs:392-415); it resets tool_choice to ''auto'' (424-427) and preserves parallel_tool_calls=true (420-423). conversation.id=conv_native preserved for the native-continuation variant (388-391). call_id call_abc carried from the round-1 function_call.'
+      bodyKind: json
+      body: '{"model":"gpt-4.1","conversation":{"id":"conv_native"},"parallel_tool_calls":true,"tool_choice":"auto","input":[{"type":"function_call_output","call_id":"call_abc","output":"mock result for get_weather"}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:384-427
+    - n: 11
+      round: round 2
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Final inference response (assistant message)
+      channel: 200 http://127.0.0.1:3001/v1/responses
+      note: Exact quote of second_response (openai_agentic_loop.rs:263-272, identical at openai_mcp_streaming.rs:71-80). No further tool calls, so openai_agentic_loop signals done and the IRR exits to the client.
+      bodyKind: json
+      body: '{"id":"resp_2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The weather in SF is 72F and sunny."}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:263-272
+      - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:71-80
+    - n: 12
+      round: final
+      from: gateway
+      to: client
+      kind: response
+      title: Composed /v1/responses object returned to client
+      channel: 200 http://localhost:8080/v1/responses
+      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_response_store (yaml:372-379) persists it for GET /v1/responses/{id}.
+      bodyKind: json
+      body: '{"id":"resp_2","object":"response","status":"completed","output":[…,{"type":"mcp_call","id":"call_abc","server_label":"weather","name":"get_weather","output":"mock result for get_weather"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The weather in SF is 72F and sunny."}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:319-325
+      - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:132-136
+      - apis/src/openai/responses/mcp_dispatch/tests.rs:546-556
+      - examples/configs/openai/responses/full-flow-agentic.yaml:372-379
+  S7:
+    summary: 'Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml''s web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml''s own structural guards; hence grounded:false.'
+    rounds: 2 rounds · web_search (+ fail-closed variant)
+    steps:
+    - n: 1
+      round: round 1
+      from: client
+      to: gateway
+      kind: request
+      title: Client POST /v1/responses with web_search tool
+      channel: POST http://127.0.0.1:8080/v1/responses
+      note: Classified openai_responses create request; the router binds inference-backend (managed native Responses, application_provider vllm), so the direct branches stay inert and it flows through the body filters into the IRR. In full-flow-agentic.yaml the trusted boundary would also carry x-user-brave-key (see step 4 note).
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"Search for Rust 2025 edition features","tools":[{"type":"web_search_preview"}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3271-3279
+      - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route path_prefix /v1/responses + x-praxis-ai-format:openai_responses -> inference-backend)'
+    - n: 2
+      round: round 1
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: IRR inference round 1 — proxy rebuilds outbound Responses body
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: openai_responses_proxy rebuilds the outbound body from ResponsesState and routes to inference-backend (127.0.0.1:3001). The test asserts the backend received exactly 2 requests (this is req[0]); round-1 body is not asserted verbatim, so this is the rebuilt body faithful to the client input.
+      bodyKind: json
+      body: '{"model":"gpt-4.1","input":"Search for Rust 2025 edition features","tools":[{"type":"web_search_preview"}], …}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3302-3307
+      - examples/configs/openai/responses/full-flow-agentic.yaml:624-645
+    - n: 3
+      round: round 1
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Round-1 inference emits a web_search_call item
+      channel: 200 POST http://127.0.0.1:3001/v1/responses
+      note: openai_agentic_loop parses this, records the web_search_call assignment for the openai_web_search dispatcher, and publishes action=loop.
+      bodyKind: json
+      body: '{"id":"resp_ws_1","object":"response","status":"completed","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Rust 2025 edition"}}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3235-3245
+    - n: 4
+      round: callout
+      from: gateway
+      to: brave
+      kind: request
+      title: openai_web_search Brave callout (deferred per-user x-subscription-token)
+      channel: GET https://api.search.brave.com/res/v1/web/search?q=Rust%202025%20edition&count=5
+      note: 'URL modeled by build_brave_request: {base}/res/v1/web/search?q={percent-encoded query}&count={count}; count=5 from default_context_size Medium (result_count). Only Accept: application/json rides in-chain; the API key is staged as a deferred x-subscription-token injected only at the resolved authority. With user_credential: brave_search the per-user secret from x-user-brave-key is used, not the shared api_key — the slot wiring (brave_search slot, source_header x-user-brave-key, web_search user_credential brave_search) is proven structurally by full_flow_agentic.rs:1409-1457, and the runtime behavior by scoped-credentials: callout carries ''x-subscription-token: alice-brave-secret'', shared ''test-key'' absent, ''x-user-brave-key'' stripped. In the round-trip functional test the provider base_url is patched to a local mock via load_web_search_config (openai_agentic_loop.rs:5506-5509).'
+      bodyKind: none
+      provenance:
+      - apis/src/web_search/provider.rs:585-607
+      - apis/src/web_search/provider.rs:189-195
+      - apis/src/web_search/config.rs:90-96
+      - examples/configs/openai/responses/full-flow-agentic.yaml:551-565
+      - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:139-168
+      - tests/integration/tests/suite/examples/full_flow_agentic.rs:1409-1457
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:5506-5509
+    - n: 5
+      round: callout
+      from: brave
+      to: gateway
+      kind: response
+      title: Brave results payload as the code models it
+      channel: 200 GET /res/v1/web/search
+      note: parse_brave_results reads web.results[].{title,url,description→snippet}. spawn_search_mock serves exactly this body. Scoped-credentials uses the same shape ({title:'Praxis Proxy releases', url:'https://github.com/praxis-proxy/praxis/releases', description:'Current Praxis Proxy releases.'}).
+      bodyKind: json
+      body: '{"web":{"results":[{"title":"Rust 2025 Edition","url":"https://blog.rust-lang.org/2025","description":"The Rust 2025 edition is here."}]}}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:4739-4748
+      - apis/src/web_search/provider.rs:709-730
+      - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:116-122
+    - n: 6
+      round: round 2
+      from: gateway
+      to: inference-backend
+      kind: request
+      title: IRR re-entry — results appended as a synthetic function_call/function_call_output bridge
+      channel: POST http://127.0.0.1:3001/v1/responses
+      note: 'Issue #808: a hosted web_search_call is NOT a valid Responses input item, so the continuation bridges results as function_call + function_call_output (output = format_search_results). Test asserts input has NO web_search_call, has a function_call name==web_search, and a function_call_output whose output contains ''blog.rust-lang.org''.'
+      bodyKind: json
+      body: '{…, "input":[ …, {"type":"function_call","call_id":"<bridge>","name":"web_search","arguments":"{\"query\":\"Rust 2025 edition\"}","status":"completed"}, {"type":"function_call_output","call_id":"<bridge>","output":"[1] Rust 2025 Edition\nhttps://blog.rust-lang.org/2025\nThe Rust 2025 edition is here."} ]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3309-3341
+      - apis/src/openai/responses/web_search/mod.rs:876-905
+      - apis/src/web_search/mod.rs:66-82
+    - n: 7
+      round: round 2
+      from: inference-backend
+      to: gateway
+      kind: response
+      title: Round-2 inference returns the final assistant message
+      channel: 200 POST http://127.0.0.1:3001/v1/responses
+      note: openai_agentic_loop parses this terminal message and publishes action=done, exiting the IRR to the client.
+      bodyKind: json
+      body: '{"id":"resp_ws_2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust 2025 brings great features."}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3246-3255
+    - n: 8
+      round: final
+      from: gateway
+      to: client
+      kind: response
+      title: Final /v1/responses object (web_search_call reconciled in place + message)
+      channel: 200 POST http://127.0.0.1:8080/v1/responses
+      note: Final id is resp_ws_2; the successful search updated the model's placeholder in place, so output carries exactly one completed web_search_call (id=ws_1, status=completed) merged with the round-2 message. Test asserts response['id']=='resp_ws_2' and exactly one web_search_call with id ws_1 / status completed.
+      bodyKind: json
+      body: '{"id":"resp_ws_2", …, "output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Rust 2025 edition"}}, {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust 2025 brings great features."}]}]}'
+      provenance:
+      - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3283-3300
+    - n: 9
+      round: fail-closed variant
+      from: gateway
+      to: client
+      kind: response
+      title: Missing x-user-brave-key → 401 before any provider callout or inference round
+      channel: 401 POST http://127.0.0.1:8080/v1/responses
+      note: 'Alternate path (not part of the success chronology). When user_credential: brave_search is configured and the per-user slot is empty (no x-user-brave-key), the round-0 credential preflight fails closed with a JSON 401 carrying missing_callout_context BEFORE any provider callout AND before any inference round (search.requests() empty, model.requests() empty). Also holds for stream:true (252-331). Full body envelope is not asserted verbatim — only that it contains ''missing_callout_context''.'
+      bodyKind: json
+      body: '{ … "code":"missing_callout_context" … }'
+      provenance:
+      - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:225-250
+      - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:252-331
+      - examples/configs/openai/responses/full-flow-agentic.yaml:252-257
+groups:
+  trace:
+    c: var(--c-trace)
+    label: trace
+  identity:
+    c: var(--c-identity)
+    label: identity
+  conversations:
+    c: var(--c-conversations)
+    label: conversations
+  classification:
+    c: var(--c-classification)
+    label: classification
+  context:
+    c: var(--c-context)
+    label: context
+  store:
+    c: var(--c-store)
+    label: store / persist
+  routing:
+    c: var(--c-routing)
+    label: routing
+  irr:
+    c: var(--c-irr)
+    label: IRR (loop owner)
+  irr-step:
+    c: var(--c-dispatch)
+    label: IRR step
+  backend:
+    c: var(--c-backend)
+    label: backend
+state_label:
+  active: active
+  passthrough: passthrough
+  inert: inert
+  skipped: skipped

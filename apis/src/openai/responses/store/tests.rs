@@ -18,16 +18,15 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::{
-    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    ResponseStoreFilter,
     config::{ResponseStoreConfig, validate_config},
-    list_input_items,
 };
 use crate::{
     openai::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    service::responses::input_items::DEFAULT_PAGE_LIMIT,
+    service::responses::{ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items},
     store::{
         DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
         SqliteResponseStore,
@@ -403,7 +402,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
@@ -2910,7 +2909,7 @@ fn postgres_config_allows_private_with_private_database_url_opt_in() {
 }
 
 #[test]
-fn postgres_config_allows_unspecified_with_private_database_url_opt_in() {
+fn postgres_config_rejects_unspecified_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
@@ -2923,8 +2922,8 @@ allow_private_database_url: true
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_ok(),
-        "explicit private database URL opt-in should allow unspecified hosts"
+        result.is_err(),
+        "unspecified database hosts must remain blocked after the private-target opt-in"
     );
 }
 

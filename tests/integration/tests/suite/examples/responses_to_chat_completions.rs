@@ -115,7 +115,7 @@ fn responses_to_chat_completions_rejects_malformed_input_before_upstream() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_prompt_template_before_upstream() {
+fn responses_validator_rejects_prompt_template_before_chat_upstream() {
     let backend = StatefulCapturingBackend::new(vec![(200, r#"{}"#.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
@@ -134,15 +134,15 @@ fn responses_to_chat_completions_rejects_prompt_template_before_upstream() {
     );
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
 
-    assert_eq!(parse_status(&raw), 400, "unrepresentable prompt must return HTTP 400");
+    assert_eq!(parse_status(&raw), 400, "managed prompt must return HTTP 400");
     assert_eq!(
         response["error"]["type"], "invalid_request_error",
-        "unrepresentable prompt must use the invalid-request error type"
+        "managed prompt must use the invalid-request error type"
     );
     assert_eq!(
         response["error"]["message"],
-        "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
-        "unrepresentable prompt must explain why Chat translation rejected it"
+        "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
+        "the canonical validator must own managed-provider prompt policy"
     );
     assert!(
         backend.requests().is_empty(),

@@ -28,8 +28,9 @@ use crate::openai::{
         MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
         schema_binding,
     },
-    responses::store::DEFAULT_PAGE_LIMIT,
 };
+#[cfg(feature = "openai-conversations")]
+use crate::service::responses::input_items::DEFAULT_PAGE_LIMIT;
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{

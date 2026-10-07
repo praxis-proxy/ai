@@ -19,8 +19,8 @@ use super::{
     pool::apply_pool_config,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, events_table, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
-        sqlite_key_column_folding,
+        check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
+        schema_version_table, sqlite_key_column_folding,
     },
 };
 
@@ -98,7 +98,7 @@ impl SqliteResponseStore {
             sqlx::query(AssertSqlSafe(statement.as_str()))
                 .execute(&pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| ddl_error(statement, &e))?;
         }
 
         validate_schema(&pool, &tables).await?;
@@ -1324,9 +1324,6 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
         require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
@@ -1342,6 +1339,11 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            return Ok(());
+        }
         sqlite_create_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1367,6 +1369,7 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
         let deleted =
             sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
 
@@ -1378,6 +1381,32 @@ impl ConversationItemStore for SqliteResponseStore {
 // -----------------------------------------------------------------------------
 // Transactional Helpers
 // -----------------------------------------------------------------------------
+
+/// Check existence after `BEGIN IMMEDIATE` so a concurrent delete cannot pass
+/// the check and commit before the item mutation.
+async fn sqlite_require_conversation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conv_table: &str,
+    owner: &StateOwner,
+    conversation_id: &str,
+) -> Result<(), StoreError> {
+    let sql = format!(
+        "SELECT 1 FROM {conv_table} \
+         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+    );
+    let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(conversation_id)
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    if row.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
 
 /// Body of [`SqliteResponseStore::create_items_and_sync_messages`].
 ///

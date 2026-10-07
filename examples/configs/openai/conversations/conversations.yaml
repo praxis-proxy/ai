@@ -33,7 +33,7 @@ filter_chains:
         tenant_id: default
 
       # Required request-head classifier for openai_conversations.
-      - filter: openai_operation
+      - filter: ai_operation
 
       - filter: openai_conversations
         backend: sqlite

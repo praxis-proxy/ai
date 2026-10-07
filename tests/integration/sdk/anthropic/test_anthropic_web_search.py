@@ -44,11 +44,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError
 
 CONFIG_PATH = "examples/configs/anthropic/full-flow-agentic.yaml"
+SCOPED_CONFIG_PATH = "examples/configs/anthropic/web-search-scoped-credentials.yaml"
 TOOL_USE_ID = "toolu_web_search_01"
 FINAL_TEXT = "Potato is a starchy tuber native to the Americas."
+LARGE_ASSISTANT_TEXT = "Searching first. " + "x" * (256 * 1024)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -194,21 +196,30 @@ def _answer_round_sse() -> bytes:
     return body
 
 
-def _search_round_json() -> bytes:
+def _search_round_json(
+    large_assistant_content: bool = False, sequence_tool_block: bool = False
+) -> bytes:
+    content = []
+    if large_assistant_content:
+        content.append({"type": "text", "text": LARGE_ASSISTANT_TEXT})
+    if sequence_tool_block:
+        content.append(["tool_use", "WebSearch", TOOL_USE_ID, ["potato"]])
+    else:
+        content.append(
+            {
+                "type": "tool_use",
+                "id": TOOL_USE_ID,
+                "name": "WebSearch",
+                "input": {"query": "potato"},
+            }
+        )
     return json.dumps(
         {
             "id": "msg_search_1",
             "type": "message",
             "role": "assistant",
             "model": "openai/gpt-oss-20b",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": TOOL_USE_ID,
-                    "name": "WebSearch",
-                    "input": {"query": "potato"},
-                }
-            ],
+            "content": content,
             "stop_reason": "tool_use",
             "stop_sequence": None,
             "usage": {"input_tokens": 20, "output_tokens": 8},
@@ -294,7 +305,21 @@ class _ModelHandler(BaseHTTPRequestHandler):
             body = _answer_round_sse() if answering else _search_round_sse()
             content_type = "text/event-stream"
         else:
-            body = _answer_round_json() if answering else _search_round_json()
+            large_assistant_content = any(
+                isinstance(message.get("content"), str)
+                and "large assistant content" in message["content"]
+                for message in request.get("messages", [])
+            )
+            sequence_tool_block = any(
+                isinstance(message.get("content"), str)
+                and "sequence-shaped tool block" in message["content"]
+                for message in request.get("messages", [])
+            )
+            body = (
+                _answer_round_json()
+                if answering
+                else _search_round_json(large_assistant_content, sequence_tool_block)
+            )
             content_type = "application/json"
 
         # Close after each response so the proxy never pools a keep-alive
@@ -453,6 +478,64 @@ def anthropic_client(web_search_stack):
     )
 
 
+@pytest.fixture(scope="module")
+def scoped_credential_client(web_search_stack, request):
+    """Run the shipped per-user credential example through the Anthropic SDK."""
+    proxy_port = _free_port()
+    model_port = web_search_stack["model"].port
+    search_port = web_search_stack["search"].port
+    with open(SCOPED_CONFIG_PATH) as f:
+        config = f.read()
+    for old, new in [
+        ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+        ('endpoints: ["127.0.0.1:8000"]', f'endpoints: ["127.0.0.1:{model_port}"]'),
+        (
+            "api_key: ${WEB_SEARCH_API_KEY}",
+            f"api_key: test-key\n                base_url: http://127.0.0.1:{search_port}",
+        ),
+        (
+            "allow_private_endpoints: true",
+            "allow_private_endpoints: true\n  allow_private_upstreams: true",
+        ),
+    ]:
+        assert old in config, f"scoped example drift: {old} not found"
+        config = config.replace(old, new)
+
+    config_fd, config_path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(config_fd, "w") as f:
+        f.write(config)
+    log_fd, log_path = tempfile.mkstemp(suffix=".log")
+    log_file = os.fdopen(log_fd, "w")
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "WEB_SEARCH_API_KEY": "test-key"},
+    )
+    try:
+        _wait_for_proxy(proxy_port)
+        yield Anthropic(
+            base_url=f"http://127.0.0.1:{proxy_port}",
+            api_key="test-anthropic-key",
+            max_retries=0,
+            timeout=10,
+        )
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== Scoped Praxis logs ===\n{f.read()}", file=sys.stderr)
+        os.unlink(config_path)
+        os.unlink(log_path)
+
+
 def _messages_kwargs() -> dict:
     return {
         "model": "openai/gpt-oss-20b",
@@ -506,6 +589,59 @@ class TestAnthropicWebSearch:
         # body, not a header.
         assert search.requests[0].get("api_key") == "test-key", search.requests[0]
 
+    def test_buffered_large_assistant_content_reenters_complete(
+        self, anthropic_client, web_search_stack
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+        kwargs = _messages_kwargs()
+        kwargs["messages"][0]["content"] = "Use web search with large assistant content."
+
+        response = anthropic_client.messages.create(**kwargs)
+
+        assert response.content[0].text == FINAL_TEXT
+        assert len(model.requests) == 2
+        assert len(search.requests) == 1
+        assistant_turns = [
+            message for message in model.requests[1]["messages"] if message["role"] == "assistant"
+        ]
+        assert len(assistant_turns) == 1
+        assert assistant_turns[0]["content"] == [
+            {"type": "text", "text": LARGE_ASSISTANT_TEXT},
+            {
+                "type": "tool_use",
+                "id": TOOL_USE_ID,
+                "name": "WebSearch",
+                "input": {"query": "potato"},
+            },
+        ]
+
+    def test_buffered_sequence_tool_block_reenters_complete(
+        self, anthropic_client, web_search_stack
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+        kwargs = _messages_kwargs()
+        kwargs["messages"][0]["content"] = "Use web search with a sequence-shaped tool block."
+
+        response = anthropic_client.messages.create(**kwargs)
+
+        assert response.content[0].text == FINAL_TEXT
+        assert len(model.requests) == 2
+        assert len(search.requests) == 1
+        assert search.requests[0]["query"] == "potato"
+        assistant_turns = [
+            message for message in model.requests[1]["messages"] if message["role"] == "assistant"
+        ]
+        assert len(assistant_turns) == 1
+        assert assistant_turns[0]["content"] == [
+            ["tool_use", "WebSearch", TOOL_USE_ID, ["potato"]]
+        ]
+
     def test_streaming_web_search_loop(self, anthropic_client, web_search_stack):
         model = web_search_stack["model"]
         search = web_search_stack["search"]
@@ -549,6 +685,34 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
         assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
+
+
+class TestAnthropicWebSearchCredential:
+    def test_missing_user_key_surfaces_authentication_error(
+        self, scoped_credential_client, web_search_stack
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            scoped_credential_client.messages.create(
+                **_messages_kwargs(),
+                extra_headers={"x-auth-tenant": "acme", "x-auth-user": "alice"},
+            )
+
+        error = exc_info.value
+        assert error.status_code == 401, "missing credential must return 401"
+        assert error.body["type"] == "error", "error envelope type must be error"
+        assert error.body["error"]["type"] == "authentication_error", (
+            "error type must be authentication_error"
+        )
+        assert "brave_search" in error.body["error"]["message"], (
+            "error message must name the missing brave_search credential"
+        )
+        assert model.requests == [], "missing credential must fail before inference"
+        assert search.requests == [], "missing credential must not reach the provider"
 
 
 if __name__ == "__main__":

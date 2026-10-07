@@ -43,7 +43,7 @@ use self::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
         MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
@@ -132,7 +132,6 @@ impl FileSearchCalloutFilter {
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
-        require_inline_outbound_chain(&cfg.outbound_chain)?;
         let outbound = ctx.bind_chain(&cfg.outbound_chain)?;
         let validated = build_config_with_client(&cfg, client)?;
         Ok(Self::build(validated, Arc::new(outbound)))
@@ -253,7 +252,9 @@ impl FileSearchCalloutFilter {
         // replayed here. Bridges are next-round-only and never persisted (see
         // `MAX_TOTAL_MODEL_CONTEXT_BYTES`).
         for bridge in bridges {
+            let result_start = state.messages.len();
             state.messages.extend(bridge);
+            state.mark_local_tool_results_from(result_start);
         }
         Ok(())
     }
@@ -1267,7 +1268,10 @@ fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Val
         .map(extract_file_search_queries)
         .unwrap_or_default();
 
-    let call_id = object.get("call_id").and_then(Value::as_str).map(ToOwned::to_owned);
+    let call_id = object.remove("call_id").and_then(|value| match value {
+        Value::String(call_id) => Some(call_id),
+        _ => None,
+    });
 
     object.insert("type".to_owned(), Value::String("file_search_call".to_owned()));
     object.insert("status".to_owned(), Value::String("searching".to_owned()));
@@ -1284,7 +1288,6 @@ fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Val
 
     object.remove("name");
     object.remove("arguments");
-    object.remove("call_id");
 }
 
 /// Mark assigned pending calls the per-continuation server cap dropped as incomplete.

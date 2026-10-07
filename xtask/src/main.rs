@@ -22,6 +22,14 @@ mod echo;
 mod filter_docs;
 mod fips;
 #[cfg(feature = "dev")]
+mod flow_generator;
+#[cfg(feature = "dev")]
+mod flow_graph;
+#[cfg(feature = "dev")]
+mod flow_visualizer;
+#[cfg(feature = "dev")]
+mod html;
+#[cfg(feature = "dev")]
 mod inference_fixtures;
 #[cfg(feature = "dev")]
 mod lint_deps;
@@ -47,6 +55,8 @@ mod sync_example_readme;
 mod sync_inference_readme;
 #[cfg(feature = "dev")]
 mod sync_responses_readme;
+#[cfg(feature = "dev")]
+mod visualize_config;
 
 use clap::{Parser, Subcommand};
 
@@ -124,6 +134,16 @@ enum Command {
     /// Verify or regenerate the inference fixture coverage inventory.
     #[cfg(feature = "dev")]
     SyncInferenceReadme(sync_inference_readme::Args),
+
+    /// Verify (and later regenerate) the checked-in flow-visualizer HTML
+    /// against the config it documents.
+    #[cfg(feature = "dev")]
+    SyncFlowVisualizers(flow_visualizer::Args),
+
+    /// Render an arbitrary Praxis config as a self-contained, offline HTML
+    /// document (structure from the parser, semantics only for known filters).
+    #[cfg(feature = "dev")]
+    VisualizeConfig(visualize_config::Args),
 
     /// Generate per-filter documentation under `docs/filters/`.
     #[cfg(feature = "dev")]
@@ -207,6 +227,8 @@ fn run_dev(command: Command) {
         Command::OpenresponsesCoverage(args) => openresponses_coverage::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
+        Command::SyncFlowVisualizers(args) => flow_visualizer::run(&args),
+        Command::VisualizeConfig(args) => visualize_config::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
     }

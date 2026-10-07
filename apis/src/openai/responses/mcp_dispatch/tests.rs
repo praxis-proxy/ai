@@ -2489,6 +2489,16 @@ async fn resume_approval_deny_resumes_without_tool_call() {
         .iter()
         .find(|m| m["type"] == "function_call_output")
         .expect("denial should append a function_call_output");
+    let denial_index = state
+        .messages
+        .iter()
+        .position(|m| m["type"] == "function_call_output")
+        .expect("denial should append a function_call_output");
+    assert_eq!(
+        state.pending_local_tool_guardrail_start,
+        Some(denial_index),
+        "the denied approval result should be marked for guardrail evaluation"
+    );
     assert_eq!(denial["call_id"], "call_1", "denial correlates to the original call id");
     let output = denial["output"].as_str().unwrap();
     assert!(

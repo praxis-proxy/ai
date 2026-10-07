@@ -15,9 +15,13 @@ use praxis_filter::{
     HttpFilterContext, IterationState, NextIterationBody, Rejection, StreamTerminationCause, SubRequestResponseMode,
     parse_filter_config,
 };
-use serde::{Deserialize, de::IgnoredAny};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Value, json};
 
+use super::wire;
 use crate::{
     anthropic::messages_to_chat_completions::RESPONSE_RAW_BYTES_KEY,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
@@ -160,7 +164,7 @@ impl TextField<'_> {
     }
 }
 
-/// Borrowed input object for a candidate managed search.
+/// Borrowed input fields for a candidate managed search.
 #[derive(Deserialize)]
 struct SearchInput<'a> {
     /// Candidate search query.
@@ -168,13 +172,13 @@ struct SearchInput<'a> {
     query: Option<TextField<'a>>,
 }
 
-/// A search input object or an ignored value of another type.
+/// A parsed search input or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum InputField<'a> {
-    /// Parsed input object.
+    /// Parsed search input.
     Input(#[serde(borrow)] SearchInput<'a>),
-    /// Input with a non-object value.
+    /// Input that could not be parsed as a search input.
     Other(IgnoredAny),
 }
 
@@ -195,13 +199,13 @@ struct ResponseBlock<'a> {
     input: Option<InputField<'a>>,
 }
 
-/// A response content object or an ignored value of another type.
+/// A parsed response content block or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ContentField<'a> {
     /// Parsed content block.
     Block(#[serde(borrow)] ResponseBlock<'a>),
-    /// Non-object content value.
+    /// Content value that could not be parsed as a response block.
     Other(IgnoredAny),
 }
 
@@ -220,6 +224,198 @@ struct ResponseEnvelope<'a> {
     /// Message content blocks.
     #[serde(borrow)]
     content: Option<Vec<ContentField<'a>>>,
+}
+
+/// Re-entry needs owned content. Deserialize it once while retaining the
+/// duplicate-field behavior of the borrowed classifier.
+#[derive(Deserialize)]
+struct ReentryResponseEnvelope<'a> {
+    /// Anthropic object type.
+    #[serde(rename = "type", borrow)]
+    kind: Option<TextField<'a>>,
+    /// Message role.
+    #[serde(borrow)]
+    role: Option<TextField<'a>>,
+    /// Stop reason.
+    #[serde(borrow)]
+    stop_reason: Option<TextField<'a>>,
+    /// Owned content blocks that can be moved into the next request.
+    content: Option<Vec<TrackedContentValue>>,
+}
+
+/// Owned content block with the two validity gates of the borrowed deserializer.
+struct TrackedContentValue {
+    /// Complete owned JSON value, including fields the classifier ignores.
+    value: Value,
+    /// A duplicate recognized block field makes `ContentField::Block` fail,
+    /// leaving the block ignored by the classifier.
+    valid: bool,
+    /// A duplicate input query makes `InputField::Input` fail, so a selected
+    /// managed call has no valid query.
+    input_valid: bool,
+}
+
+impl<'de> Deserialize<'de> for TrackedContentValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        TrackedValueSeed {
+            scope: TrackedScope::Block,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+/// The known fields whose duplication changes typed classification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackedScope {
+    /// A response content block.
+    Block,
+    /// Its `input` object, if present.
+    Input,
+}
+
+impl TrackedScope {
+    /// Return the bit assigned to a field the typed classifier would reject
+    /// when duplicated. Unknown fields may still use JSON's last-value rule.
+    fn duplicate_mask(self, key: &str) -> u8 {
+        match self {
+            Self::Block => match key {
+                "type" => 1,
+                "name" => 2,
+                "id" => 4,
+                "input" => 8,
+                _ => 0,
+            },
+            Self::Input => u8::from(key == "query"),
+        }
+    }
+}
+
+/// Pass the duplicate-field scope to serde's nested value deserializer.
+struct TrackedValueSeed {
+    /// The current object's known fields.
+    scope: TrackedScope,
+}
+
+impl<'de> DeserializeSeed<'de> for TrackedValueSeed {
+    type Value = TrackedContentValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(TrackedValueVisitor { scope: self.scope })
+    }
+}
+
+/// Build an owned JSON value and track duplicates in one pass.
+struct TrackedValueVisitor {
+    /// The current object's known fields.
+    scope: TrackedScope,
+}
+
+impl TrackedValueVisitor {
+    /// Wrap a non-object JSON value with valid duplicate-field gates.
+    fn plain(value: Value) -> TrackedContentValue {
+        TrackedContentValue {
+            value,
+            valid: true,
+            input_valid: true,
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for TrackedValueVisitor {
+    type Value = TrackedContentValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value in response content")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Bool(v)))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::from(v)))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::from(v)))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        let number = serde_json::Number::from_f64(v).ok_or_else(|| E::custom("non-finite JSON number"))?;
+        Ok(Self::plain(Value::Number(number)))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::String(v.to_owned())))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::String(v)))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Null))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Null))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        let mut input_valid = true;
+        loop {
+            if self.scope == TrackedScope::Block && values.len() == 3 {
+                let Some(input) = seq.next_element_seed(TrackedValueSeed {
+                    scope: TrackedScope::Input,
+                })?
+                else {
+                    break;
+                };
+                input_valid &= input.valid;
+                values.push(input.value);
+            } else {
+                let Some(value) = seq.next_element()? else {
+                    break;
+                };
+                values.push(value);
+            }
+        }
+        Ok(TrackedContentValue {
+            value: Value::Array(values),
+            valid: true,
+            input_valid,
+        })
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = serde_json::Map::new();
+        let mut seen = 0_u8;
+        let mut valid = true;
+        let mut input_valid = true;
+        while let Some(key) = map.next_key::<String>()? {
+            let mask = self.scope.duplicate_mask(&key);
+            if mask != 0 {
+                valid &= seen & mask == 0;
+                seen |= mask;
+            }
+            let value = if self.scope == TrackedScope::Block && key == "input" {
+                let input = map.next_value_seed(TrackedValueSeed {
+                    scope: TrackedScope::Input,
+                })?;
+                input_valid &= input.valid;
+                input.value
+            } else {
+                map.next_value::<Value>()?
+            };
+            values.insert(key, value);
+        }
+        Ok(TrackedContentValue {
+            value: Value::Object(values),
+            valid,
+            input_valid,
+        })
+    }
 }
 
 /// Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
@@ -413,7 +609,7 @@ impl AnthropicWebSearchFilter {
     fn resolve_callout_identity(&self, ctx: &HttpFilterContext<'_>) -> Result<CalloutIdentity, Rejection> {
         stage_callout_identity(ctx, self.user_credential_slot.as_deref()).map_err(
             |CalloutContextMissing::Credential { slot }| {
-                anthropic_rejection(
+                wire::error_rejection(
                     401,
                     "authentication_error",
                     &format!("web search requires the '{slot}' per-user credential, which was not provided"),
@@ -479,6 +675,9 @@ impl AnthropicWebSearchFilter {
                 callout,
                 &pending.query,
                 Some(self.default_context_size),
+                // Anthropic web-search location translation is out of scope for
+                // issue #1548; preserve the current location-free behavior.
+                None,
                 identity,
             )
             .await
@@ -537,7 +736,7 @@ impl AnthropicWebSearchFilter {
             },
         };
         if request.get("messages").and_then(Value::as_array).is_none() {
-            return Ok(FilterAction::Reject(anthropic_rejection(
+            return Ok(FilterAction::Reject(wire::error_rejection(
                 400,
                 "invalid_request_error",
                 "messages must be an array for web search re-entry",
@@ -605,7 +804,7 @@ impl AnthropicWebSearchFilter {
     /// response phase, so the loop ends without emitting anything further.
     fn reject_oversized_reentry(ctx: &mut HttpFilterContext<'_>, streaming: bool) -> FilterAction {
         if !streaming {
-            return FilterAction::Reject(anthropic_rejection(
+            return FilterAction::Reject(wire::error_rejection(
                 413,
                 "request_too_large",
                 "web search request exceeds configured max_body_bytes",
@@ -663,7 +862,7 @@ impl AnthropicWebSearchFilter {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(observed_len);
         if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
-            return Ok(FilterAction::Reject(anthropic_rejection(
+            return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
                 "api_error",
                 "web-search upstream response exceeded the configured max_body_bytes",
@@ -685,14 +884,14 @@ impl AnthropicWebSearchFilter {
             ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
             ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
             ResponseDecision::InvalidManagedCall => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
+                return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
                     "invalid_request_error",
                     "WebSearch tool use requires a non-empty id and input.query",
                 )));
             },
             ResponseDecision::QueryTooLong => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
+                return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
                     "invalid_request_error",
                     "WebSearch input.query must not exceed 8192 bytes",
@@ -1146,59 +1345,73 @@ fn finish_streaming_round(logical: &mut streaming::LogicalStream, reentry: Reent
 }
 
 /// Select a sole, well-formed server-owned search call.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validates one small external JSON envelope linearly"
-)]
 fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
     let Ok(response) = serde_json::from_slice::<ResponseEnvelope<'_>>(response_bytes) else {
         return ResponseDecision::Done;
     };
-    let stop_reason = response.stop_reason.as_ref().and_then(TextField::as_str);
-    if response.kind.as_ref().and_then(TextField::as_str) != Some("message")
-        || response.role.as_ref().and_then(TextField::as_str) != Some("assistant")
+    let tools = response.content.as_deref().into_iter().flatten().filter_map(|field| {
+        let ContentField::Block(block) = field else {
+            return None;
+        };
+        if block.kind.as_ref().and_then(TextField::as_str) != Some("tool_use") {
+            return None;
+        }
+        Some(ToolCall {
+            name: block.name.as_ref().and_then(TextField::as_str),
+            id: block.id.as_ref().and_then(TextField::as_str),
+            query: block.input.as_ref().and_then(|input| match input {
+                InputField::Input(input) => input.query.as_ref().and_then(TextField::as_str),
+                InputField::Other(_) => None,
+            }),
+        })
+    });
+    classify_tool_calls(
+        response.kind.as_ref().and_then(TextField::as_str),
+        response.role.as_ref().and_then(TextField::as_str),
+        response.stop_reason.as_ref().and_then(TextField::as_str),
+        tools,
+    )
+}
+
+/// Candidate `tool_use` fields borrowed from either response representation.
+struct ToolCall<'a> {
+    /// Candidate tool name.
+    name: Option<&'a str>,
+    /// Candidate tool-use ID.
+    id: Option<&'a str>,
+    /// Candidate query if its input object is valid.
+    query: Option<&'a str>,
+}
+
+/// Apply the same managed-search decision to borrowed and owned responses.
+fn classify_tool_calls<'a>(
+    kind: Option<&'a str>,
+    role: Option<&'a str>,
+    stop_reason: Option<&'a str>,
+    tools: impl Iterator<Item = ToolCall<'a>>,
+) -> ResponseDecision {
+    if kind != Some("message")
+        || role != Some("assistant")
         // vLLM's Messages-compatible endpoint currently labels otherwise
         // valid tool-use responses as `end_turn`.
         || !matches!(stop_reason, Some("tool_use" | "end_turn"))
     {
         return ResponseDecision::Done;
     }
-    let Some(content) = response.content.as_deref() else {
-        return ResponseDecision::Done;
-    };
-    let mut tools = content.iter().filter_map(|field| match field {
-        ContentField::Block(block) if block.kind.as_ref().and_then(TextField::as_str) == Some("tool_use") => {
-            Some(block)
-        },
-        ContentField::Block(_) | ContentField::Other(_) => None,
-    });
+    let mut tools = tools;
     let Some(tool) = tools.next() else {
         return ResponseDecision::Done;
     };
     if tools.next().is_some() {
         return ResponseDecision::Done;
     }
-    if tool.name.as_ref().and_then(TextField::as_str) != Some(MANAGED_TOOL_NAME) {
+    if tool.name != Some(MANAGED_TOOL_NAME) {
         return ResponseDecision::Done;
     }
-    let Some(id) = tool
-        .id
-        .as_ref()
-        .and_then(TextField::as_str)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(id) = tool.id.filter(|value| !value.is_empty()) else {
         return ResponseDecision::InvalidManagedCall;
     };
-    let Some(query) = tool
-        .input
-        .as_ref()
-        .and_then(|input| match input {
-            InputField::Input(input) => input.query.as_ref().and_then(TextField::as_str),
-            InputField::Other(_) => None,
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(query) = tool.query.map(str::trim).filter(|value| !value.is_empty()) else {
         return ResponseDecision::InvalidManagedCall;
     };
     if query.len() > MAX_SEARCH_QUERY_BYTES {
@@ -1211,26 +1424,76 @@ fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
 
 /// Recover the managed call and complete content from the accounted response.
 fn managed_search_from_response(response_bytes: &[u8]) -> Result<(PendingSearch, Vec<Value>), FilterError> {
-    let ResponseDecision::Managed(pending) = classify_response(response_bytes) else {
+    let response: ReentryResponseEnvelope<'_> = serde_json::from_slice(response_bytes).map_err(|_error| {
+        FilterError::from(format!(
+            "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
+        ))
+    })?;
+    let tools = response
+        .content
+        .as_deref()
+        .into_iter()
+        .flatten()
+        .filter_map(reentry_tool_call);
+    let ResponseDecision::Managed(pending) = classify_tool_calls(
+        response.kind.as_ref().and_then(TextField::as_str),
+        response.role.as_ref().and_then(TextField::as_str),
+        response.stop_reason.as_ref().and_then(TextField::as_str),
+        tools,
+    ) else {
         return Err(FilterError::from(format!(
             "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
         )));
     };
-    let mut response: Value = serde_json::from_slice(response_bytes).map_err(|error| {
-        FilterError::from(format!(
-            "{FILTER_NAME}: previous response parsing failed during re-entry: {error}"
-        ))
-    })?;
     let assistant_content = response
-        .get_mut("content")
-        .and_then(Value::as_array_mut)
-        .map(std::mem::take)
+        .content
+        .map(|content| content.into_iter().map(|field| field.value).collect())
         .ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: previous response content unavailable during re-entry"
             ))
         })?;
     Ok((pending, assistant_content))
+}
+
+/// Borrow tool fields from the owned content only when the typed classifier
+/// would have accepted this block.
+fn reentry_tool_call(field: &TrackedContentValue) -> Option<ToolCall<'_>> {
+    if !field.valid {
+        return None;
+    }
+    let (kind, name, id, input) = match &field.value {
+        Value::Object(block) => (
+            block.get("type").and_then(Value::as_str),
+            block.get("name").and_then(Value::as_str),
+            block.get("id").and_then(Value::as_str),
+            block.get("input"),
+        ),
+        Value::Array(block) => {
+            let [kind, name, id, input] = block.as_slice() else {
+                return None;
+            };
+            (kind.as_str(), name.as_str(), id.as_str(), Some(input))
+        },
+        _ => return None,
+    };
+    if kind != Some("tool_use") {
+        return None;
+    }
+    let query = if field.input_valid { reentry_query(input) } else { None };
+    Some(ToolCall { name, id, query })
+}
+
+/// Read a query from either map or sequence form of Serde's `SearchInput`.
+fn reentry_query(input: Option<&Value>) -> Option<&str> {
+    match input? {
+        Value::Object(input) => input.get("query").and_then(Value::as_str),
+        Value::Array(input) => match input.as_slice() {
+            [query] => query.as_str(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Append the assistant tool call and matching user result block.
@@ -1241,7 +1504,7 @@ fn append_search_turns(
     outcome: &SearchOutcome,
 ) -> Result<(), Rejection> {
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
-        return Err(anthropic_rejection(
+        return Err(wire::error_rejection(
             400,
             "invalid_request_error",
             "messages must be an array for web search re-entry",
@@ -1291,13 +1554,6 @@ fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(
         .or_default()
         .set("action", action)?;
     Ok(())
-}
-
-/// Build an Anthropic JSON error response.
-fn anthropic_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
-    Rejection::status(status)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(super::wire::error_body(error_type, message, None)))
 }
 
 #[cfg(test)]

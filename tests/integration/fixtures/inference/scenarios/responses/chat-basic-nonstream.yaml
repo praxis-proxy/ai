@@ -9,6 +9,7 @@ features:
   - responses.chat.response.text
   - responses.chat.continuation
   - responses.chat.auto_tool_choice_without_tools
+  - responses.chat.shared_controls
 turns:
   - name: initial
     request:
@@ -21,10 +22,27 @@ turns:
         kind: json
         value:
           model: ${MODEL}
-          input: What is 2+2? Reply with just the number.
+          input:
+            - role: user
+              content:
+                - type: input_text
+                  text: What is 2+2? Reply with just the number.
+                  prompt_cache_breakpoint:
+                    mode: explicit
           store: true
           stream: false
           tool_choice: auto
+          safety_identifier: tenant-user
+          user: legacy-user
+          prompt_cache_key: cache-key
+          prompt_cache_retention: 24h
+          prompt_cache_options:
+            ttl: 30m
+            mode: explicit
+          text:
+            format:
+              type: text
+            verbosity: high
     expect:
       client_status: 200
       client_body_kind: json

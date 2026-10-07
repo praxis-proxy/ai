@@ -511,8 +511,9 @@ pub trait ConversationItemStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the items table is not configured
-    /// or a database operation fails.
+    /// Returns [`StoreError::NotFound`] if the conversation does not exist
+    /// in the owner's scope when the transaction begins. No items are committed.
+    /// Other [`StoreError`] values indicate an unavailable table or failed write.
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,
@@ -532,8 +533,9 @@ pub trait ConversationItemStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the items table is not configured
-    /// or a database operation fails.
+    /// Returns [`StoreError::NotFound`] if the conversation does not exist
+    /// in the owner's scope when the transaction begins. The item is preserved.
+    /// Other [`StoreError`] values indicate an unavailable table or failed write.
     async fn delete_item_and_sync_messages(
         &self,
         owner: &StateOwner,

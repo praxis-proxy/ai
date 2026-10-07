@@ -10,9 +10,9 @@
 //! Chat Completions clients work transparently.
 //!
 //! Streaming (SSE) responses are parsed per-chunk through the shared
-//! [`SseFrameParser`]; each
-//! completed frame's `data:` payload is stripped of Azure-specific
-//! fields and re-emitted as standard SSE.
+//! [`SseFrameParser`]; each completed frame's `data:` payload is parsed
+//! once, stripped of Azure-specific fields when present, and re-emitted
+//! as standard SSE.
 
 mod config;
 pub(crate) mod request;
@@ -41,6 +41,8 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 const RESPONSE_TRANSFORM_SSE: &str = "sse";
 /// Metadata key preserving the upstream error status for the body phase.
 const RESPONSE_STATUS_KEY: &str = "azureai_translation.response_status";
+/// OpenAI Chat Completions SSE sentinel that marks logical stream completion.
+const DONE_SENTINEL: &[u8] = b"[DONE]";
 
 /// Transforms requests targeting Azure OpenAI deployments into standard
 /// Chat Completions-compatible form and normalizes responses back.
@@ -49,7 +51,8 @@ const RESPONSE_STATUS_KEY: &str = "azureai_translation.response_status";
 /// handles the `api-version` query parameter, strips Azure-specific
 /// response fields (`prompt_filter_results`, `content_filter_results`,
 /// `content_filter_offsets`), drops Azure async-filter annotation SSE
-/// chunks (no `delta` and no `finish_reason`), and normalizes error
+/// chunks with no Chat payload or metadata, keeps usage and metadata in
+/// chunks with empty choices, and normalizes error
 /// responses where Azure omits the `type` field.
 ///
 /// # YAML
@@ -346,36 +349,50 @@ fn strip_sse_chunk(
 /// Serialize parsed [`SseFrame`]s back to SSE wire format, stripping
 /// Azure-specific fields from each data payload.
 fn rebuild_sse_frames(frames: &[SseFrame]) -> Vec<u8> {
-    const DONE_SENTINEL: &[u8] = b"[DONE]";
-
     let mut output = Vec::new();
     for frame in frames {
-        if frame.data.starts_with(DONE_SENTINEL) {
-            output.extend_from_slice(b"data: [DONE]\n\n");
-            continue;
-        }
-
-        if let Some(event) = &frame.event_type {
-            output.extend_from_slice(b"event: ");
-            output.extend_from_slice(event.as_bytes());
-            output.extend_from_slice(b"\n");
-        }
-
-        let stripped = response::strip_azure_fields(&frame.data);
-        let data = stripped.as_deref().unwrap_or(&frame.data);
-
-        // Drop async-filter annotation chunks. They have no `delta` or
-        // `finish_reason` and crash standard OpenAI SDKs.
-        if response::is_filter_only_chunk(data) {
-            debug!("dropping Azure async-filter annotation SSE chunk");
-            continue;
-        }
-
-        output.extend_from_slice(b"data: ");
-        output.extend_from_slice(data);
-        output.extend_from_slice(b"\n\n");
+        append_sse_frame(&mut output, frame);
     }
     output
+}
+
+/// Append one SSE frame.
+///
+/// Filter-only payloads drop the whole frame, including its event type.
+fn append_sse_frame(output: &mut Vec<u8>, frame: &SseFrame) {
+    if frame.data.starts_with(DONE_SENTINEL) {
+        output.extend_from_slice(b"data: [DONE]\n\n");
+        return;
+    }
+
+    let payload = response::normalize_sse_payload(&frame.data);
+    if matches!(payload, response::SsePayloadAction::Drop) {
+        debug!("dropping Azure async-filter annotation SSE chunk");
+        return;
+    }
+
+    if let Some(event) = &frame.event_type {
+        output.extend_from_slice(b"event: ");
+        output.extend_from_slice(event.as_bytes());
+        output.extend_from_slice(b"\n");
+    }
+
+    match payload {
+        response::SsePayloadAction::Drop => {},
+        response::SsePayloadAction::ForwardOriginal(data) => {
+            append_sse_data(output, data);
+        },
+        response::SsePayloadAction::ForwardRewritten(data) => {
+            append_sse_data(output, &data);
+        },
+    }
+}
+
+/// Append a `data:` field terminated by a blank line.
+fn append_sse_data(output: &mut Vec<u8>, data: &[u8]) {
+    output.extend_from_slice(b"data: ");
+    output.extend_from_slice(data);
+    output.extend_from_slice(b"\n\n");
 }
 
 // -----------------------------------------------------------------------------
@@ -662,6 +679,19 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_sse_frames_preserves_done_sentinel_with_event_type() {
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: b"[DONE]".to_vec(),
+        }];
+        let output = rebuild_sse_frames(&frames);
+        assert_eq!(
+            output, b"data: [DONE]\n\n",
+            "[DONE] must ignore event: and emit the same bytes as a bare sentinel"
+        );
+    }
+
+    #[test]
     fn rebuild_sse_frames_preserves_clean_event() {
         let data = br#"{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}]}"#;
         let frames = vec![SseFrame {
@@ -689,6 +719,86 @@ mod tests {
         assert!(
             output.starts_with("event: message\ndata: "),
             "event type should be re-emitted, got: {output}"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_forwards_malformed_payload() {
+        let data = b"not json {";
+        let frames = vec![SseFrame {
+            event_type: None,
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(
+            rebuilt, b"data: not json {\n\n",
+            "malformed JSON must be forwarded unchanged"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_preserves_event_type_on_rewritten_payload() {
+        let data = br#"{"choices":[{"delta":{"content":"Hi"},"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        let output = std::str::from_utf8(&rebuilt).unwrap();
+        assert!(
+            output.starts_with("event: message\ndata: "),
+            "event type should be re-emitted on rewritten payloads, got: {output}"
+        );
+        assert!(
+            !output.contains("content_filter_results"),
+            "Azure filter fields must still be stripped on named events"
+        );
+    }
+
+    #[test]
+    fn rebuild_sse_frames_named_event_filter_only_chunk_drops_entire_frame() {
+        let data = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: Some("message".to_owned()),
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(rebuilt, b"", "filter-only named events must emit no bytes");
+    }
+
+    #[test]
+    fn rebuild_sse_frames_filter_only_without_event_is_empty() {
+        let data = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let frames = vec![SseFrame {
+            event_type: None,
+            data: data.to_vec(),
+        }];
+        let rebuilt = rebuild_sse_frames(&frames);
+        assert_eq!(rebuilt, b"", "filter-only chunks without event: must emit no bytes");
+    }
+
+    #[test]
+    fn rebuild_sse_frames_named_event_filter_only_then_clean_keeps_clean_frame() {
+        let filter_only = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
+        let content = br#"{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}]}"#;
+        let frames = vec![
+            SseFrame {
+                event_type: Some("message".to_owned()),
+                data: filter_only.to_vec(),
+            },
+            SseFrame {
+                event_type: None,
+                data: content.to_vec(),
+            },
+        ];
+        let rebuilt = rebuild_sse_frames(&frames);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"data: ");
+        expected.extend_from_slice(content);
+        expected.extend_from_slice(b"\n\n");
+        assert_eq!(
+            rebuilt, expected,
+            "dropping an annotation must not change the next event"
         );
     }
 

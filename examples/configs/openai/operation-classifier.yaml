@@ -1,6 +1,6 @@
-# OpenAI Operation Classifier
+# AI Operation Classifier
 #
-# Identifies supported OpenAI operations from the request head — method,
+# Identifies supported AI operations from the request head — method,
 # normalized path, and protocol headers — and publishes the result so a
 # pipeline can branch on a proxy-owned fact instead of a path prefix.
 #
@@ -8,17 +8,22 @@
 # classification is available before any body-handling decision is made.
 #
 # Published per matched request:
-#   - a typed OpenAiOperationMatch in request extensions
-#   - metadata: openai_operation.application_protocol,
-#     openai_operation.operation_id
+#   - a typed AiOperationMatch in request extensions
+#   - metadata: ai_operation.application_protocol,
+#     ai_operation.operation_id
 #   - filter results: application_protocol, operation_id
 #   - headers: x-praxis-ai-application-protocol, x-praxis-ai-operation
 #
 # The application protocol is provider-qualified (openai_responses,
-# openai_conversations, openai_chat_completions, ...) so one identifier
-# space can describe every AI application protocol the proxy classifies.
-# This matches the cluster-side `application_protocol` vocabulary in
-# praxis-proxy/praxis#1106.
+# openai_conversations, openai_chat_completions, anthropic_messages, ...)
+# so one identifier space can describe every AI application protocol the
+# proxy classifies. This matches the cluster-side `application_protocol`
+# vocabulary in praxis-proxy/praxis#1106.
+#
+# One filter serves every provider: each protocol declares its own
+# operation registry and the classifier aggregates them. This example
+# branches the OpenAI protocols; `anthropic/unified-gateway.yaml` shows
+# the same filter branching Anthropic Messages beside them.
 #
 # Consuming the classification:
 #   The classifier runs in the header phase. Its headers are pending
@@ -69,9 +74,15 @@
 #   # falls through to the default backend
 #   curl -X PUT http://localhost:8080/v1/responses
 #
+#   # classified anthropic_messages/messages_post -> default backend here;
+#   # see anthropic/unified-gateway.yaml for a branch on it
+#   curl -X POST http://localhost:8080/v1/messages \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"claude-opus-4-8","max_tokens":16,"messages":[]}'
+#
 #   # spoofing attempt: the supplied header is replaced, not honored
 #   curl -X POST http://localhost:8080/v1/responses \
-#     -H "x-praxis-ai-application-protocol: openai_files" \
+#     -H "x-praxis-ai-application-protocol: anthropic_messages" \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello"}'
 #
@@ -89,7 +100,7 @@ filter_chains:
       # Classify from the request head. Header names are configurable;
       # set either to null to publish metadata and results without a
       # header.
-      - filter: openai_operation
+      - filter: ai_operation
         headers:
           application_protocol: x-praxis-ai-application-protocol
           operation: x-praxis-ai-operation
@@ -99,7 +110,7 @@ filter_chains:
         branch_chains:
           - name: conversations
             on_result:
-              filter: openai_operation
+              filter: ai_operation
               key: application_protocol
               result: openai_conversations
             chains:
@@ -112,7 +123,7 @@ filter_chains:
             rejoin: shared_load_balancer
           - name: chat-completions
             on_result:
-              filter: openai_operation
+              filter: ai_operation
               key: application_protocol
               result: openai_chat_completions
             chains:

@@ -21,8 +21,8 @@ use super::{
     postgres_tls::PgTlsConfig,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, events_table, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
-        schema_version_table, validate_postgres_identifiers,
+        check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
+        pg_key_column_folding, schema_version_table, validate_postgres_identifiers,
     },
 };
 
@@ -126,7 +126,7 @@ impl PostgresResponseStore {
             sqlx::query(AssertSqlSafe(statement.as_str()))
                 .execute(&pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| ddl_error(statement, &e))?;
         }
 
         validate_schema(&pool, &tables).await?;
@@ -157,6 +157,71 @@ impl PostgresResponseStore {
     /// credentials before it becomes a [`StoreError::Database`].
     fn db_err(&self, e: impl std::fmt::Display) -> StoreError {
         StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
+    }
+
+    /// Append items at the next positions and rebuild the message cache.
+    ///
+    /// Separate from the trait method so the insert loop and the cache rebuild
+    /// live in a boxed future; inlined into the trait method, the combined
+    /// future exceeds the workspace's stack-size budget.
+    ///
+    /// Runs inside the caller's transaction, so an error rolls back the items it
+    /// already inserted.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "transactional helper that threads table names and scope identifiers"
+    )]
+    async fn insert_items_and_sync(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        items_table: &str,
+        conv_table: &str,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        let max_sql = format!(
+            "SELECT COALESCE(MAX(position), 0) AS max_pos \
+             FROM {items_table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
+        );
+        let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let max_pos: i64 = max_row.try_get("max_pos").map_err(|e| self.db_err(&e))?;
+
+        let insert_sql = format!(
+            "INSERT INTO {items_table} \
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        );
+        for (i, item) in items.iter().enumerate() {
+            let offset = i64::try_from(i).unwrap_or(i64::MAX);
+            let position = max_pos.saturating_add(1).saturating_add(offset);
+            let item_data =
+                serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+                .bind(&item.item_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .bind(conversation_id)
+                .bind(&item_data)
+                .bind(item.created_at)
+                .bind(position)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+        }
+
+        pg_rebuild_messages(tx, items_table, conv_table, owner, conversation_id).await
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -1422,9 +1487,6 @@ impl ConversationItemStore for PostgresResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
         require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
@@ -1441,7 +1503,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1449,48 +1511,16 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
-
-        let max_sql = format!(
-            "SELECT COALESCE(MAX(position), 0) AS max_pos \
-             FROM {items_table} \
-             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
-        );
-        let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
-            .bind(owner.tenant_id())
-            .bind(owner.issuer())
-            .bind(owner.subject())
-            .bind(conversation_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| self.db_err(&e))?;
-        let max_pos: i64 = max_row.try_get("max_pos").map_err(|e| self.db_err(&e))?;
-
-        let insert_sql = format!(
-            "INSERT INTO {items_table} \
-             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-        );
-        for (i, item) in items.iter().enumerate() {
-            let offset = i64::try_from(i).unwrap_or(i64::MAX);
-            let position = max_pos.saturating_add(1).saturating_add(offset);
-            let item_data =
-                serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
-                .bind(&item.item_id)
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
-                .bind(conversation_id)
-                .bind(&item_data)
-                .bind(item.created_at)
-                .bind(position)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| self.db_err(&e))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| self.db_err(&e))?;
+            return Ok(());
+        }
+
+        Box::pin(self.insert_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items)).await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
@@ -1516,7 +1546,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1524,6 +1554,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \

@@ -72,6 +72,7 @@ pub(crate) fn transform_response(
     let Some(obj) = value.as_object() else {
         return Err("response body is not a JSON object".to_owned());
     };
+    validate_translatable_response(obj)?;
 
     let id = match obj.get("id").and_then(Value::as_str) {
         Some(id) => format!("msg_{id}"),
@@ -99,6 +100,49 @@ pub(crate) fn transform_response(
         body,
         original_finish_reason,
     })
+}
+
+/// Refuse a successful Chat response whose output would be silently lost.
+#[expect(clippy::too_many_lines, reason = "sequential response shape validation")]
+fn validate_translatable_response(obj: &Map<String, Value>) -> Result<(), String> {
+    let choices = obj
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or("Chat response requires `choices` array")?;
+    let [choice] = choices.as_slice() else {
+        return Err("Chat response must contain exactly one choice".to_owned());
+    };
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or("Chat choice requires a `message` object")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err("Chat choice requires an assistant message".to_owned());
+    }
+    if !matches!(message.get("content"), None | Some(Value::Null | Value::String(_))) {
+        return Err("Chat assistant `content` cannot be translated to Anthropic Messages".to_owned());
+    }
+    if message
+        .get("tool_calls")
+        .is_some_and(|value| !value.is_null() && !value.is_array())
+    {
+        return Err("Chat assistant `tool_calls` must be an array".to_owned());
+    }
+    if message.get("refusal").is_some_and(|value| !value.is_null())
+        || message.get("audio").is_some_and(|value| !value.is_null())
+        || message.get("function_call").is_some_and(|value| !value.is_null())
+        || message
+            .get("annotations")
+            .is_some_and(|value| !value.is_null() && value.as_array().is_none_or(|annotations| !annotations.is_empty()))
+        || choice.get("logprobs").is_some_and(|value| !value.is_null())
+    {
+        return Err("Chat response field cannot be translated to Anthropic Messages".to_owned());
+    }
+    match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("stop" | "length" | "tool_calls") => {},
+        _ => return Err("Chat finish_reason cannot be translated to Anthropic Messages".to_owned()),
+    }
+    Ok(())
 }
 
 /// Transform an upstream 4xx or 5xx response into Anthropic error format.
@@ -313,6 +357,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn semantic_chat_response_losses_are_rejected() {
+        for (message, finish_reason) in [
+            (
+                json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
+                "stop",
+            ),
+            (json!({"role": "assistant", "content": null, "refusal": "no"}), "stop"),
+            (json!({"role": "assistant", "content": "partial"}), "content_filter"),
+        ] {
+            let body = json!({"choices": [{"message": message, "finish_reason": finish_reason}]});
+            let error = transform_response(body.to_string().as_bytes(), "m", &[]).err().unwrap();
+            assert!(!error.is_empty());
+        }
+    }
 
     fn assert_null_fields(value: &Value, fields: &[&str]) {
         for field in fields {
@@ -616,16 +676,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_choices_produces_empty_content() {
+    fn empty_choices_are_rejected() {
         let body =
             br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
-        let tr = transform_response(body, "gpt-4", &[]).unwrap();
-        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
-
-        assert!(
-            parsed["content"].as_array().unwrap().is_empty(),
-            "empty choices should produce empty content"
-        );
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
+        assert!(error.contains("exactly one choice"), "{error}");
     }
 
     #[test]

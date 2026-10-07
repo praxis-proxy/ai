@@ -679,23 +679,6 @@ async fn alibaba_metadata_ipv4_mapped_ipv6_is_blocked() {
     );
 }
 
-#[test]
-fn alibaba_metadata_via_dns_is_blocked() {
-    // The upfront DNS classifier is gone: `prepare_url_target` normalizes every
-    // resolved address and then applies the SSRF hook. A hostname that resolves
-    // to the Alibaba metadata endpoint is refused by that hook, so assert the
-    // hook itself rejects the address regardless of the private-upstream flag.
-    let ip = "100.100.100.200".parse::<IpAddr>().unwrap();
-    assert!(
-        is_ssrf_blocked_ip(&ip, false),
-        "a hostname resolving to Alibaba metadata must be blocked after DNS"
-    );
-    assert!(
-        is_ssrf_blocked_ip(&ip, true),
-        "cloud-metadata addresses stay blocked even when private upstreams are permitted"
-    );
-}
-
 #[tokio::test]
 async fn ssrf_blocks_invalid_url() {
     assert!(validate_url("not-a-url").await.is_err());
@@ -903,20 +886,6 @@ async fn ssrf_blocks_aws_imds_ipv6() {
 }
 
 #[test]
-fn aws_imds_v6_detected_by_is_always_sensitive() {
-    let ip = "fd00:ec2::254".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
-}
-
-#[test]
-fn unspecified_ip_detected_by_is_always_sensitive() {
-    let v4 = "0.0.0.0".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
-    let v6 = "::".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&v6), ":: should be SSRF-sensitive");
-}
-
-#[test]
 fn no_authorization_field_injects_no_auth_header() {
     let headers = serde_json::json!({"x-custom": "val"});
     let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
@@ -926,30 +895,10 @@ fn no_authorization_field_injects_no_auth_header() {
     );
 }
 
-#[test]
-fn ipv6_link_local_detected_by_is_always_sensitive() {
-    let fe80 = "fe80::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
-    let febf = "febf::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&febf), "febf::1 should be SSRF-sensitive");
-    let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_always_sensitive(&fe00), "fe00::1 is not link-local");
-}
-
 #[tokio::test]
 async fn ssrf_blocks_ipv6_unique_local() {
     assert!(validate_url("http://[fc00::1]/mcp").await.is_err());
     assert!(validate_url("http://[fd00:ec2::23]/mcp").await.is_err());
-}
-
-#[test]
-fn ipv6_unique_local_detected_by_is_always_sensitive() {
-    let fc00 = "fc00::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
-    let fd00 = "fd00:ec2::23".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
-    let fb00 = "fb00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_always_sensitive(&fb00), "fb00::1 is not unique-local");
 }
 
 // =========================================================================
@@ -975,11 +924,31 @@ async fn allow_loopback_permits_localhost_hostname() {
 }
 
 #[tokio::test]
-async fn allow_loopback_still_blocks_link_local() {
+async fn allow_private_still_blocks_metadata() {
     assert!(
         validate_mcp_target("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn allow_private_permits_ipv6_unique_local() {
+    assert!(
+        validate_mcp_target("http://[fc00::1]/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok(),
+        "an explicit private-target opt-in should permit IPv6 unique-local addresses"
+    );
+}
+
+#[tokio::test]
+async fn allow_private_permits_non_metadata_link_local() {
+    assert!(
+        validate_mcp_target("http://169.254.1.1/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok(),
+        "an explicit private-target opt-in should permit non-metadata link-local addresses"
     );
 }
 

@@ -96,6 +96,16 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
+`has_prompt_id` detects OpenAI's deprecated reusable prompt
+object (`prompt: { id, version, variables }`). OpenAI retires
+reusable prompts and `v1/prompts` on 2026-11-30; on managed
+paths, clients should move the saved prompt's content into the
+structured `input` form covered by content-policy extraction.
+Top-level `instructions` is not currently included in that
+extraction, so content moved there bypasses managed-path content
+screening. Praxis keeps recognizing the shape for routing while
+OpenAI still supports it.
+
 Requests with `background: true` are rejected before mode
 classification because Praxis does not implement the
 asynchronous Responses lifecycle.
@@ -141,12 +151,14 @@ Classifies AI API request bodies and promotes format,
 model, stream, store, background, and mode to
 headers, metadata, and filter results.
 
-### `openai_responses_validate`
+### `openai_responses_request`
 
-Parses Responses API request JSON, enriches filter metadata,
+Parses Responses API request JSON once, enriches filter metadata,
 and generates cryptographically random response and
 conversation IDs with `resp_` and `conv_` prefixes.
 Provider-owned parameter combinations pass through unchanged.
+Offers both the pre-read and bound-upstream body phases, so a
+chain can defer it until a logical provider is bound.
 
 ### `anthropic_messages_format`
 

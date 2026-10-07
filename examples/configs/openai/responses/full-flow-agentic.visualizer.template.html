@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  full-flow-agentic.visualizer.html  —  GENERATED, DO NOT HAND-EDIT (interactive)
+  ----------------------------------------------------------------------------
+  This is the TEMPLATE for a generated, self-contained visualizer of the Praxis
+  AI Gateway request pipeline. The checked-in HTML is produced by:
+
+      cargo xtask sync-flow-visualizers --fix
+
+  from THREE inputs (see docs/developing/flow-visualizers.md):
+
+      * config   examples/configs/openai/responses/full-flow-agentic.yaml
+                 — the STRUCTURE: which filters run, in what order, the
+                   clusters/endpoints and the scalar limits ("knobs").
+      * sidecar  full-flow-agentic.visualizer.yaml
+                 — the SEMANTICS: display names, prose, scenarios, the
+                   "On the wire" / "Inside the loop" examples, timelines.
+      * template this file
+                 — the static shell (CSS + vanilla JS + inline SVG) with six
+                   @@BLOCK@@ placeholders the generator fills.
+
+  Do NOT hand-edit the generated *.visualizer.html: it is overwritten on the
+  next --fix and `make lint` rejects manual edits. Edit the config, the sidecar,
+  or this template instead, then regenerate.
+
+  Structure is never invented by the sidecar. It is read from the config through
+  the pinned praxis_core parser (the same parser the proxy uses) and
+  cross-checked against the sidecar at generation time: an added, removed,
+  reordered, relocated, or mistyped filter — or a cluster/endpoint or surfaced
+  knob that disagrees with the config — fails generation with an actionable
+  message. Curated semantics that the config cannot express come from the
+  sidecar verbatim; the generator never fabricates behavioral explanations.
+
+  The data the renderer reads (PIPELINE, plus WIRE, TIMELINE, and friends) is
+  embedded as JS objects, so the diagram, prose, badges, and scenario logic all
+  read one source and cannot disagree with each other.
+
+  Zero external network dependencies: inline CSS + vanilla JS + inline SVG only.
+  Open by double-clicking; works offline.
+
+  Build features required by the config:
+      --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Praxis · Agentic flow studio</title>
+<style>
+  :root{
+    /* Okabe-Ito–derived base (8 hues) plus three added categories. Not a pure
+       colorblind-safe set: the extra categories share hue families with the
+       base, so identity/backend (blue) and context/store (teal-green) are
+       separated by a large LIGHTNESS step rather than hue alone, and every
+       group is also carried by a redundant text label + line-style token so
+       identity never depends on color. Tuned for near-black. */
+    --c-identity:#7cc5f2;   /* light blue — paired with backend by lightness */
+    --c-conversations:#a99cf5;
+    --c-classification:#f2a838;
+    --c-context:#79e0cf;    /* light teal — paired with store by lightness */
+    --c-store:#12b184;      /* deep green — clearly darker than context */
+    --c-routing:#f4e04d;
+    --c-irr:#d98cbb;
+    --c-dispatch:#f4713b;
+    --c-loop:var(--c-irr);  /* loop owner shares the IRR hue (one token) */
+    --c-backend:#3f9bd8;    /* medium blue — clearly darker than identity */
+    --c-trace:#8fa3b8;      /* slate — cross-cutting trace / correlation */
+
+    --bg:#070a0d;
+    --bg2:#0b1116;
+    --panel:#0c1319;
+    --ink:#e2edf3;
+    --ink-dim:#9db0bd;      /* raised for WCAG AA on panel */
+    --ink-faint:#6d8492;
+    --stroke:#1d2b34;
+    --stroke-lit:#2c4250;
+    --accent:#4fd1e0;
+    --grid:rgba(79,209,224,0.035);
+    --grid2:rgba(79,209,224,0.07);
+    --ok:#3ad29f;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+    --dim-floor:.62;        /* accessibility: unfocused text stays legible */
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1100px 620px at 78% -12%, rgba(63,155,216,0.07), transparent 60%),
+      radial-gradient(900px 520px at 8% 4%, rgba(217,140,187,0.045), transparent 62%),
+      var(--bg);
+    color:var(--ink);
+    font-family:var(--mono);
+    font-size:13px;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    padding:24px;
+  }
+
+  .sheet{
+    position:relative;
+    max-width:1400px;
+    margin:0 auto;
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+      linear-gradient(var(--grid2) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid2) 1px, transparent 1px),
+      var(--bg2);
+    background-size:24px 24px, 24px 24px, 120px 120px, 120px 120px, auto;
+    border:1px solid var(--stroke-lit);
+    border-radius:10px;
+    box-shadow:0 0 0 5px rgba(0,0,0,0.30), 0 34px 90px rgba(0,0,0,0.55);
+    padding:26px 30px 40px;
+  }
+  /* softened registration crosshairs — accents, not noise */
+  .xhair{position:absolute;width:12px;height:12px;pointer-events:none;opacity:.5}
+  .xhair.tl{top:9px;left:9px;border-top:1px solid var(--stroke-lit);border-left:1px solid var(--stroke-lit)}
+  .xhair.tr{top:9px;right:9px;border-top:1px solid var(--stroke-lit);border-right:1px solid var(--stroke-lit)}
+  .xhair.bl{bottom:9px;left:9px;border-bottom:1px solid var(--stroke-lit);border-left:1px solid var(--stroke-lit)}
+  .xhair.br{bottom:9px;right:9px;border-bottom:1px solid var(--stroke-lit);border-right:1px solid var(--stroke-lit)}
+
+  /* ---- header ---- */
+  header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;
+    border-bottom:1px solid var(--stroke);padding-bottom:18px}
+  h1{font-size:20px;letter-spacing:1.5px;margin:0;font-weight:600}
+  h1 .tick{color:var(--accent)}
+  .sub{color:var(--ink-dim);font-size:12px;letter-spacing:.6px;margin-top:8px;max-width:70ch}
+  .features{margin-top:10px;font-size:11px;color:var(--ink-faint);letter-spacing:.3px}
+  .features code{color:var(--accent);background:rgba(79,209,224,.08);border:1px solid var(--stroke-lit);
+    border-radius:4px;padding:2px 7px;white-space:pre-wrap;word-break:break-word}
+
+  .tiles{display:flex;gap:10px;flex-wrap:wrap}
+  .tile{border:1px solid var(--stroke-lit);border-radius:8px;padding:9px 14px;min-width:92px;
+    background:linear-gradient(180deg,#0e161d,#0a1014)}
+  .tile .k{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase}
+  .tile .v{font-size:19px;color:var(--ink);margin-top:2px}
+  .tile .v small{font-size:11px;color:var(--ink-dim)}
+
+  /* ---- controls ---- */
+  .controls{display:flex;flex-wrap:wrap;gap:14px 22px;align-items:center;margin:18px 0 6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .chips .lbl,.seg .lbl{color:var(--ink-faint);font-size:10px;letter-spacing:1.8px;margin-right:2px;text-transform:uppercase}
+  .chip{
+    appearance:none;cursor:pointer;font-family:var(--mono);font-size:11.5px;letter-spacing:.4px;
+    color:var(--ink-dim);background:linear-gradient(180deg,#0e161d,#0a1014);
+    border:1px solid var(--stroke-lit);border-radius:6px;padding:6px 11px;
+    display:inline-flex;align-items:center;gap:7px;transition:.14s;
+  }
+  .chip .tag{font-size:9.5px;color:var(--ink-faint);letter-spacing:1px}
+  .chip:hover{color:var(--ink);border-color:var(--accent)}
+  .chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .chip.active{color:#04121a;background:var(--accent);border-color:var(--accent);font-weight:600}
+  .chip.active .tag{color:#04121a}
+
+  .seg{display:flex;align-items:center;gap:8px}
+  .seghint{color:var(--ink-faint);font-size:10px;letter-spacing:.3px;max-width:34ch;line-height:1.4}
+  .segbtns{display:inline-flex;border:1px solid var(--stroke-lit);border-radius:6px;overflow:hidden}
+  .segbtns button{appearance:none;cursor:pointer;font-family:var(--mono);font-size:11px;letter-spacing:.6px;
+    color:var(--ink-dim);background:transparent;border:none;padding:7px 13px;transition:.14s}
+  .segbtns button:hover{color:var(--ink)}
+  .segbtns button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .segbtns button.on{background:var(--accent);color:#04121a;font-weight:600}
+
+  .play{appearance:none;cursor:pointer;font-family:var(--mono);font-size:11.5px;letter-spacing:.6px;
+    color:#04121a;background:var(--ok);border:1px solid var(--ok);border-radius:6px;padding:7px 15px;
+    display:inline-flex;align-items:center;gap:8px;font-weight:600;transition:.14s}
+  .play:hover{filter:brightness(1.08)}
+  .play:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .play .ico{width:0;height:0;border-left:9px solid #04121a;border-top:6px solid transparent;border-bottom:6px solid transparent}
+  .play.playing .ico{width:9px;height:10px;border:none;background:
+    linear-gradient(#04121a,#04121a) left/3px 100% no-repeat,
+    linear-gradient(#04121a,#04121a) right/3px 100% no-repeat}
+
+  /* ---- narrative caption ---- */
+  .narr{margin:14px 0 4px;padding:12px 16px;border:1px solid var(--stroke-lit);border-left:3px solid var(--accent);
+    border-radius:8px;background:rgba(79,209,224,.05);font-size:12.5px;color:var(--ink);letter-spacing:.2px}
+  .narr b{color:var(--accent)}
+  .narr .rounds{color:var(--ink-dim);font-size:11px;margin-left:6px}
+
+  /* ---- on-the-wire payloads (example request / response per scenario) ---- */
+  .wire{margin:14px 0 2px;border:1px solid var(--stroke-lit);border-radius:10px;
+    background:linear-gradient(180deg,#0c1319,#0a1015);box-shadow:0 12px 30px rgba(0,0,0,.28);overflow:hidden}
+  /* Overview renders an explanatory empty state inside each payload view. */
+  .wire .wh{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--stroke);
+    cursor:pointer;user-select:none}
+  .wire.collapsed .wh{border-bottom:none}
+  .wire .wh .wt{font-size:10.5px;letter-spacing:2px;color:var(--ink-dim);text-transform:uppercase}
+  .wire .wh .wsub{color:var(--ink-faint);font-size:11px;letter-spacing:.3px}
+  .wire .wh:hover .wt{color:var(--ink)}
+  .wire .wh:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .wire .wh .caret{margin-left:auto;color:var(--ink-faint);transition:transform .16s}
+  .wire.collapsed .caret{transform:rotate(-90deg)}
+  .wire.collapsed .wbody{display:none}
+  .wire .wbody{display:grid;grid-template-columns:1fr 1fr;gap:0}
+  .wire .pane{padding:13px 15px;min-width:0}
+  .wire .pane.req{border-right:1px solid var(--stroke)}
+  .wire .plabel{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .wire .plabel .tag{font-size:9px;letter-spacing:1.6px;text-transform:uppercase;border-radius:5px;padding:2px 8px;
+    border:1px solid var(--stroke-lit);color:var(--ink-faint)}
+  .wire .plabel .tag.rq{color:var(--accent);border-color:var(--accent)}
+  .wire .plabel .tag.rs{color:var(--ok);border-color:var(--ok)}
+  .wire .reqline{font-size:12px;color:var(--ink);word-break:break-all}
+  .wire .reqline .mth{color:var(--accent);font-weight:600}
+  .wire .status{font-size:12px}
+  .wire .status.ok{color:var(--ok)} .wire .status.warn{color:var(--c-dispatch)} .wire .status.info{color:var(--c-backend)}
+  .wire .copy{margin-left:auto;appearance:none;cursor:pointer;font-family:var(--mono);font-size:9px;letter-spacing:.8px;
+    text-transform:uppercase;color:var(--ink-faint);background:transparent;border:1px solid var(--stroke-lit);
+    border-radius:5px;padding:2px 8px;transition:.14s}
+  .wire .copy:hover{color:var(--ink);border-color:var(--accent)}
+  .wire .copy:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .wire .copy.done{color:var(--ok);border-color:var(--ok)}
+  .wire .hdrs{margin:7px 0 0;font-size:10.5px;color:var(--ink-faint);line-height:1.55;word-break:break-all}
+  .wire .hdrs .hn{color:var(--ink-dim)}
+  .wire pre{margin:9px 0 0;padding:11px 12px;background:rgba(0,0,0,.34);border:1px solid var(--stroke);border-radius:8px;
+    overflow:auto;max-height:380px;font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--ink-dim);
+    white-space:pre;tab-size:2}
+  .wire .wfoot{grid-column:1/-1;padding:11px 15px;border-top:1px solid var(--stroke);font-size:10.5px;
+    color:var(--ink-faint);line-height:1.55}
+  .wire .wfoot .note b{color:var(--ink-dim)}
+  .wire .wfoot .prov{margin-top:6px;opacity:.85}
+  .wire .wfoot .prov code{color:var(--accent);background:rgba(79,209,224,.07);border:1px solid var(--stroke);
+    border-radius:4px;padding:1px 5px;margin-right:5px;font-size:9.5px}
+  .wire .empty{grid-column:1/-1;padding:22px 16px;color:var(--ink-faint);font-size:11.5px;text-align:center;line-height:1.6}
+  /* ---- Inside the loop: round-by-round chronology (single column) ---- */
+  .timeline .wbody{display:block;padding:2px 0}
+  .timeline .tsummary{padding:11px 16px;color:var(--ink-faint);font-size:11px;line-height:1.55;
+    border-bottom:1px solid var(--stroke)}
+  .timeline .tsummary b{color:var(--ink-dim)}
+  .tlist{position:relative;padding:4px 16px 12px}
+  .tstep{position:relative;display:grid;grid-template-columns:20px 1fr;gap:12px;padding:9px 0}
+  .trail{position:relative;display:flex;justify-content:center}
+  .trail::before{content:"";position:absolute;top:-9px;bottom:-9px;left:50%;width:1px;
+    background:var(--stroke-lit);transform:translateX(-50%)}
+  .tstep:first-child .trail::before{top:6px}
+  .tstep:last-child .trail::before{bottom:auto;height:6px}
+  .tdot{position:relative;z-index:1;width:11px;height:11px;border-radius:50%;margin-top:2px;
+    background:var(--bg);border:2px solid var(--ink-faint)}
+  .tstep.k-request .tdot{border-color:var(--accent)}
+  .tstep.k-response .tdot{border-color:var(--ok)}
+  .tstep.k-final .tdot{border-color:var(--c-irr);background:var(--c-irr)}
+  .tstep.k-fail .tdot{border-color:var(--c-dispatch);background:var(--c-dispatch)}
+  .tmain{min-width:0}
+  .thead{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;font-size:11.5px}
+  .tround{font-family:var(--mono);font-size:8.5px;letter-spacing:1.3px;text-transform:uppercase;
+    color:var(--ink-faint);border:1px solid var(--stroke-lit);border-radius:5px;padding:1px 7px;align-self:center}
+  .tstep.k-request .tround{color:var(--accent)} .tstep.k-response .tround{color:var(--ok)}
+  .tstep.k-final .tround{color:var(--c-irr);border-color:var(--c-irr)}
+  .tstep.k-fail .tround{color:var(--c-dispatch);border-color:var(--c-dispatch)}
+  .tactor{font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
+  .tarrow{color:var(--ink-faint);font-size:10px}
+  .ttitle{color:var(--ink);font-weight:600}
+  .tchan{margin-top:4px;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);word-break:break-all}
+  .tchan .mth{color:var(--accent);font-weight:600}
+  .tnote{margin-top:4px;font-size:10.5px;color:var(--ink-faint);line-height:1.5}
+  .tbody{margin-top:7px}
+  .tbody>summary{cursor:pointer;font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;
+    color:var(--ink-faint);list-style:none;display:flex;align-items:center;gap:8px}
+  .tbody>summary::-webkit-details-marker{display:none}
+  .tbody>summary::before{content:"\25B8";font-size:9px;color:var(--ink-faint)}
+  .tbody[open]>summary::before{content:"\25BE"}
+  .tbody>summary:hover{color:var(--ink)}
+  .tbody .tbk{color:var(--ink-faint);border:1px solid var(--stroke);border-radius:4px;padding:0 5px;letter-spacing:.6px}
+  .tprov{margin-top:7px}
+  .tprov code{color:var(--accent);background:rgba(79,209,224,.07);border:1px solid var(--stroke);
+    border-radius:4px;padding:1px 5px;margin-right:5px;font-size:9px}
+  /* JSON + SSE token highlight (shared with pre blocks) */
+  .tk-key{color:var(--c-identity)} .tk-str{color:var(--ok)} .tk-num{color:var(--c-classification)}
+  .tk-bool{color:var(--c-irr)} .tk-nul{color:var(--ink-faint)} .tk-pun{color:var(--ink-faint)}
+  .sse-evt{color:var(--accent)} .sse-key{color:var(--ink-faint)}
+  @media(max-width:820px){
+    .wire .wbody{grid-template-columns:1fr}
+    .wire .pane.req{border-right:none;border-bottom:1px solid var(--stroke)}
+  }
+
+  /* ---- layout: flow + right rail ---- */
+  .layout{display:grid;grid-template-columns:1fr 320px;gap:22px;margin-top:18px;align-items:start}
+  .rail{position:sticky;top:16px;display:flex;flex-direction:column;gap:16px}
+
+  .panel{border:1px solid var(--stroke-lit);border-radius:10px;background:linear-gradient(180deg,#0d151b,#0a1015);
+    padding:14px 15px;box-shadow:0 12px 30px rgba(0,0,0,.28)}
+  .panel h3{margin:0 0 11px;font-size:10.5px;letter-spacing:2px;color:var(--ink-dim);text-transform:uppercase;
+    display:flex;align-items:center;gap:8px}
+  .panel h3::after{content:"";flex:1;height:1px;background:var(--stroke)}
+
+  /* legend */
+  .lg{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-dim);letter-spacing:.3px;margin:5px 0}
+  .lg i{width:13px;height:13px;border-radius:3px;flex:none;box-shadow:0 0 0 1px rgba(0,0,0,.5) inset}
+  .lg .st{margin-left:auto;font-size:9.5px;color:var(--ink-faint)}
+  .linekey{margin-top:10px;border-top:1px solid var(--stroke);padding-top:10px}
+  .lksub,.keysub{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase;margin:0 0 7px}
+  .linekey .row{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--ink-dim);margin:6px 0}
+  .linekey svg{flex:none}
+
+  /* states key */
+  .statekey{display:flex;flex-direction:column;gap:9px}
+  .skrow{display:flex;align-items:flex-start;gap:9px;font-size:11px;color:var(--ink-dim);line-height:1.4}
+  .skbadge{flex:none;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;
+    border:1px solid var(--stroke-lit);border-radius:20px;padding:2px 9px;min-width:78px;text-align:center;color:var(--ink-faint)}
+  .skdef{padding-top:1px}
+
+  /* donut caps */
+  .caps{display:flex;gap:8px;justify-content:space-around;flex-wrap:wrap}
+  .donut{text-align:center;font-size:10px;color:var(--ink-dim)}
+  .donut .lab{margin-top:4px;letter-spacing:.6px}
+  .donut .lab b{display:block;color:var(--ink);font-size:11px}
+  .capnote{margin-top:11px;font-size:10.5px;color:var(--ink-faint);line-height:1.5;border-top:1px solid var(--stroke);padding-top:9px}
+  .capnote b{color:var(--c-loop)}
+
+  /* backends + services */
+  .bk{border:1px solid var(--stroke-lit);border-left:3px solid var(--c-backend);border-radius:7px;
+    padding:9px 11px;margin:8px 0;background:rgba(0,0,0,.22);transition:.16s}
+  .bk .bh{display:flex;align-items:center;gap:8px}
+  .bk .nm{font-size:12px;color:var(--ink)}
+  .bk .ep{margin-left:auto;font-size:11px;color:var(--c-backend);letter-spacing:.3px;display:inline-flex;align-items:center;gap:6px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(58,210,159,.6)}
+  .bk.live .dot{animation:pulse 2.2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(58,210,159,.55)}70%{box-shadow:0 0 0 6px rgba(58,210,159,0)}100%{box-shadow:0 0 0 0 rgba(58,210,159,0)}}
+  .bk .from{margin-top:5px;font-size:10px;color:var(--ink-faint);letter-spacing:.3px}
+  .bk.hlcluster{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 22px -8px var(--accent)}
+  .bk.dimcluster{opacity:var(--dim-floor)}
+  .svc{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-dim);margin:7px 0;
+    border:1px solid var(--stroke);border-radius:6px;padding:7px 9px;transition:.16s}
+  .svc .ep{margin-left:auto;color:var(--accent);font-size:10px}
+  .svc.hlcluster{border-color:var(--accent);color:var(--ink)}
+  .svc.dimcluster{opacity:var(--dim-floor)}
+
+  /* ---- section bands ---- */
+  .band-lbl{display:flex;align-items:center;gap:12px;margin:24px 0 14px;color:var(--ink-dim);
+    font-size:10.5px;letter-spacing:2.4px;text-transform:uppercase}
+  .band-lbl::after{content:"";flex:1;height:1px;background:var(--stroke)}
+  .band-lbl .n{color:var(--accent);border:1px solid var(--stroke-lit);border-radius:5px;padding:1px 8px;font-size:10px}
+  .band-lbl .hint{color:var(--ink-faint);letter-spacing:.6px;text-transform:none;font-size:10.5px}
+
+  /* ---- spine ---- */
+  .spine{display:flex;flex-direction:column;gap:0}
+  .node{display:grid;grid-template-columns:250px 40px 1fr;align-items:stretch}
+  .gutter{padding:12px 12px 12px 0;text-align:right}
+  .gutter .glbl{font-size:9px;letter-spacing:1.8px;color:var(--ink-faint);text-transform:uppercase}
+  .gutter .stateset{margin-top:6px;display:inline-block;text-align:left;border-left:2px solid var(--gc,var(--stroke-lit));
+    padding:6px 10px;background:rgba(0,0,0,.26);border-radius:0 6px 6px 0;max-width:230px}
+  .gutter .kv{font-size:10.5px;color:var(--ink);white-space:normal;word-break:break-word}
+  .gutter .kv b{color:var(--gc);font-weight:600}
+
+  .rail-line{position:relative}
+  .rail-line::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;
+    background:repeating-linear-gradient(var(--stroke-lit) 0 6px, transparent 6px 11px);transform:translateX(-.5px)}
+  .rail-line .port{position:absolute;left:50%;top:34px;width:11px;height:11px;transform:translate(-50%,-50%);
+    border-radius:50%;background:var(--bg2);border:1.5px solid var(--gc,var(--accent));
+    box-shadow:0 0 0 3px var(--bg2), 0 0 10px -2px var(--gc)}
+  .rail-line .stub{position:absolute;left:50%;top:34px;width:20px;height:1px;background:var(--gc,var(--stroke-lit));transform:translateY(-.5px)}
+
+  /* filter card (rounded/shadow polish, monospace designators) */
+  .card{position:relative;margin:8px 0;padding:12px 15px;border:1px solid var(--stroke-lit);
+    border-left:3px solid var(--gc,var(--accent));border-radius:10px;
+    background:linear-gradient(180deg,#0d151b,#0a1015);box-shadow:0 10px 26px rgba(0,0,0,.26);
+    transition:opacity .18s, box-shadow .18s, border-color .18s}
+  .card .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .card .ord{font-size:9px;letter-spacing:1px;color:var(--ink-faint);border:1px solid var(--stroke);border-radius:5px;padding:1px 6px}
+  .card .id{font-size:9px;letter-spacing:1.6px;color:var(--gc);border:1px solid var(--gc);
+    border-radius:5px;padding:1px 7px;text-transform:uppercase;opacity:.92}
+  .card .nm{font-size:14px;color:var(--ink);letter-spacing:.2px}
+  .card .statebadge{margin-left:auto;font-size:9.5px;letter-spacing:1.2px;text-transform:uppercase;
+    border:1px solid var(--stroke-lit);border-radius:20px;padding:2px 10px;color:var(--ink-faint);display:none}
+  .card .sm{margin-top:7px;color:var(--ink-dim);font-size:11.5px;line-height:1.5;max-width:74ch}
+  .card .scnote{margin-top:8px;font-size:11px;color:var(--ink);line-height:1.5;
+    border-left:2px solid var(--gc);padding:5px 10px;background:rgba(255,255,255,.02);border-radius:0 6px 6px 0;display:none}
+  .card .scnote .pfx{color:var(--gc);letter-spacing:1px;font-size:9.5px;text-transform:uppercase;margin-right:6px}
+
+  .card .expander{margin-top:9px}
+  .card .exbtn{appearance:none;cursor:pointer;font-family:var(--mono);font-size:10.5px;letter-spacing:.6px;
+    color:var(--ink-dim);background:transparent;border:1px solid var(--stroke-lit);border-radius:6px;padding:4px 10px;transition:.14s}
+  .card .exbtn:hover{color:var(--ink);border-color:var(--gc)}
+  .card .exbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .card .detail{display:none;margin-top:11px;border-top:1px solid var(--stroke);padding-top:11px;font-size:11px}
+  .card .detail.open{display:block}
+  .card .detail .dh{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase;margin:9px 0 5px}
+  .card .detail .dh:first-child{margin-top:0}
+  .card .kvrow{display:flex;gap:8px;margin:3px 0;line-height:1.45}
+  .card .kvrow .kk{color:var(--gc);min-width:150px;word-break:break-word}
+  .card .kvrow .vv{color:var(--ink-dim);word-break:break-word}
+  .card .prose{color:var(--ink-dim);line-height:1.55}
+
+  /* state styling — highlight-forward */
+  .card.st-active{border-left-color:var(--gc)}
+  .card.st-active.hl{box-shadow:0 0 0 1px var(--gc), 0 0 30px -8px var(--gc)}
+  .card.dimmed{opacity:var(--dim-floor)}
+  .card.st-active .statebadge{display:inline-block;color:var(--ok);border-color:var(--ok)}
+  .card.st-passthrough .statebadge{display:inline-block;color:var(--ink-dim)}
+  .card.st-inert .statebadge{display:inline-block;color:var(--c-classification)}
+  .card.st-skipped .statebadge{display:inline-block;color:var(--ink-faint)}
+  body.scenario .card.st-active .scnote{display:block}
+  body.scenario .card .sm{display:none}
+
+  .card.pulse{animation:cardpulse 1.15s ease}
+  @keyframes cardpulse{0%{box-shadow:0 0 0 1px var(--gc)}40%{box-shadow:0 0 0 2px var(--gc),0 0 40px -6px var(--gc)}100%{box-shadow:0 0 0 1px var(--gc)}}
+
+  /* svg wraps */
+  .svgwrap{border:1px solid var(--stroke);border-radius:10px;background:rgba(0,0,0,.24);padding:8px}
+  svg.diagram{display:block;width:100%;height:auto}
+  .svgcap{margin:8px 2px 0;font-size:10.5px;color:var(--ink-faint);line-height:1.5;max-width:96ch}
+  .svgcap b{color:var(--ink-dim)}
+  .svgcap em{color:var(--accent);font-style:normal}
+  .s-mono{font-family:var(--mono)}
+
+  /* svg scenario states */
+  .flt{transition:opacity .2s}
+  svg .flt.dim{opacity:var(--dim-floor)}
+  svg .flt.on rect{filter:drop-shadow(0 0 6px currentColor)}
+
+  /* phase emphasis */
+  .arc-req{transition:opacity .2s, stroke-width .2s}
+  .arc-res{transition:opacity .2s, stroke-width .2s}
+  body.phase-request .arc-res{opacity:.28}
+  body.phase-request .arc-req{opacity:1}
+  body.phase-response .arc-req{opacity:.28}
+  body.phase-response .arc-res{opacity:1}
+
+  /* irr-step card grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+
+  /* tooltip layer (supplement only) */
+  #tt{position:fixed;z-index:50;max-width:320px;pointer-events:none;opacity:0;transform:translateY(4px);
+    transition:opacity .12s, transform .12s;background:#0b141b;border:1px solid var(--stroke-lit);
+    border-radius:8px;padding:10px 12px;box-shadow:0 18px 40px rgba(0,0,0,.55);font-size:11px;color:var(--ink)}
+  #tt.show{opacity:1;transform:translateY(0)}
+  #tt .tth{color:var(--accent);font-size:11px;letter-spacing:.5px;margin-bottom:5px}
+  #tt .ttk{color:var(--ink-faint);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-top:7px}
+  #tt .ttv{color:var(--ink-dim);line-height:1.45}
+
+  .footnote{margin-top:22px;border-top:1px solid var(--stroke);padding-top:14px;color:var(--ink-faint);
+    font-size:10.5px;line-height:1.6}
+  .footnote b{color:var(--ink-dim)}
+  .titleblock{margin-top:16px;display:inline-grid;grid-template-columns:repeat(4,auto);
+    border:1px solid var(--stroke-lit);border-radius:8px;overflow:hidden;font-size:9.5px;letter-spacing:.5px;background:rgba(0,0,0,.3)}
+  .titleblock div{padding:6px 12px;border-left:1px solid var(--stroke);color:var(--ink-dim)}
+  .titleblock div:first-child{border-left:none}
+  .titleblock b{color:var(--ink);display:block;font-size:11px;letter-spacing:1px}
+  .titleblock span{color:var(--ink-faint)}
+
+  .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+  @media(max-width:1080px){
+    .layout{grid-template-columns:1fr}
+    .rail{position:static;flex-direction:row;flex-wrap:wrap}
+    .rail .panel{flex:1 1 260px}
+  }
+  @media(max-width:720px){
+    body{padding:10px}
+    .sheet{padding:18px 14px 30px}
+    .node{grid-template-columns:1fr}
+    .gutter{text-align:left;padding:8px 0 0}
+    .gutter .stateset{max-width:100%}
+    .rail-line{display:none}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{animation:none !important;transition:none !important}
+    .bk.live .dot{animation:none}
+  }
+
+  /* ---- Flow studio visual shell ---- */
+  :root{color-scheme:dark;--bg:#080d19;--bg2:#0d1424;--panel:#111b2c;--ink:#eef3ff;--ink-dim:#b0bdd3;--ink-faint:#899ab5;--stroke:#23314b;--stroke-lit:#334664;--accent:#94eaff;--sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  html{scroll-behavior:smooth;scroll-padding-top:90px}
+  body{padding:0;font:14px/1.6 var(--sans);background:radial-gradient(ellipse at 85% 6%,#24234566,transparent 36%),radial-gradient(ellipse at 8% 0%,#102b4966,transparent 35%),var(--bg)}
+  button{touch-action:manipulation}
+  [hidden]{display:none!important}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+  .skip-link{position:fixed;top:-100px;left:20px;z-index:100;background:var(--accent);color:var(--bg);padding:10px 20px;border-radius:8px}
+  .skip-link:focus{top:10px}
+  .appbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:20px;height:76px;padding:0 max(32px,calc((100vw - 1536px)/2));background:#080d19e8;border-bottom:1px solid #ffffff0e;backdrop-filter:blur(18px)}
+  .brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--ink)}
+  .brand svg{width:40px;height:40px}.brand strong{font-size:24px;letter-spacing:-1px}.brand strong span{font-weight:400;color:var(--accent);margin-left:5px}
+  .brand-divider{height:20px;width:1px;background:var(--stroke-lit);margin:0 9px}.brand-label{font-size:13px;color:var(--ink-dim)}
+  .offline{font:10px var(--mono);letter-spacing:.5px;color:var(--ink-dim);display:flex;align-items:center;gap:9px}.offline i{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+  .sheet{max-width:1600px;padding:0 32px 36px;border:0;border-radius:0;background:none;box-shadow:none}.xhair{display:none}
+  header.hero{display:grid;grid-template-columns:1.4fr 1fr;gap:24px 40px;border:0;padding:48px 0 30px;align-items:center}
+  .eyebrow{font:10px/1.5 var(--mono);letter-spacing:2px;color:var(--accent);display:flex;align-items:center;gap:10px}.eyebrow>span{width:20px;height:1px;background:var(--accent)}
+  h1{font:600 clamp(38px,4.5vw,66px)/1.07 var(--sans);letter-spacing:-3px;margin:18px 0}
+  h1>span{background:linear-gradient(100deg,#94eaff,#b5a0ff);color:transparent;background-clip:text}
+  .sub{font:15px/1.7 var(--sans);letter-spacing:0;max-width:61ch;margin:0;color:var(--ink-dim)}
+  .features{max-width:65ch;font:12px/1.7 var(--sans);margin-top:18px}.features summary{cursor:pointer;color:var(--ink-dim);width:fit-content}.features summary span{color:var(--accent);padding-left:6px}.features p{margin:10px 0}.features code{display:block;padding:10px;font:11px/1.7 var(--mono)}
+  .hero-art{height:260px;position:relative;display:grid;place-items:center;overflow:hidden;background:radial-gradient(ellipse,#7184ff20,transparent 68%);isolation:isolate}
+  .gateway-mark{width:128px;filter:drop-shadow(0 0 28px #6a8eff38);transform:rotate(-9deg);animation:arrive .8s ease both}.gateway-mark svg{width:100%;display:block}
+  .orbit{position:absolute;width:260px;height:160px;border:1px solid #668eff30;border-radius:50%;transform:rotate(-28deg);z-index:-1}.orbit-two{width:340px;height:215px;transform:rotate(28deg);border-style:dashed;border-color:#94eaff22}
+  .orbit:after{content:"";position:absolute;top:20px;left:33px;width:6px;height:6px;background:var(--accent);box-shadow:0 0 15px var(--accent);border-radius:50%}
+  .orbit-label{position:absolute;background:#0d1729;border:1px solid #334664;padding:5px 10px;border-radius:6px;color:var(--ink-dim);font:9px var(--mono);letter-spacing:1px}.orbit-label-a{left:8%;top:42px}.orbit-label-b{right:5%;top:124px}.orbit-label-c{left:15%;bottom:31px}.art-caption{position:absolute;bottom:0;font:9px var(--mono);letter-spacing:3px;color:var(--ink-faint)}
+  .tiles{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--stroke);border-radius:14px;background:linear-gradient(110deg,#131e32,#0d1424);margin-top:8px;overflow:hidden}
+  .tile{border:0;border-left:1px solid var(--stroke);border-radius:0;padding:18px 24px;background:none;min-width:0;display:flex;flex-direction:column-reverse;gap:4px}.tile:first-child{border-left:0}.tile .v{font:500 29px/1.2 var(--sans);letter-spacing:-.8px}.tile .v small{font-size:12px}.tile .k{font:10px var(--mono);letter-spacing:1px;color:var(--ink-dim)}
+  .section-intro{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px}.muted{color:var(--ink-faint);font-size:11px}
+  .controls{gap:14px;margin:16px 0}.chips{width:100%;gap:7px}.chips>.lbl{display:none}
+  .chip{font:12px var(--sans);letter-spacing:0;padding:9px 12px;border-radius:8px;background:#111b2b;border-color:var(--stroke)}.chip .tag{font:9px var(--mono);letter-spacing:0}.chip.active{background:#94eaff18;color:var(--accent);border-color:#94eaff88;box-shadow:0 0 20px #94eaff08}.chip.active .tag{color:var(--accent)}
+  .segbtns{border-radius:8px}.segbtns button{font:11px var(--sans);padding:9px 14px}.segbtns button.on{background:#94eaff18;color:var(--accent)}.seghint{font:11px/1.5 var(--sans);letter-spacing:0;max-width:none}.seg .lbl{font-size:9px}
+  .play{margin-left:auto;font:600 12px var(--sans);padding:10px 16px;background:var(--accent);border-color:var(--accent);border-radius:8px;box-shadow:0 4px 24px #94eaff13}
+  .narr{margin:18px 0 26px;padding:16px 20px;font-size:13px;letter-spacing:0;border-color:#334664;background:linear-gradient(110deg,#94eaff08,#b5a0ff06);border-left-color:var(--accent);border-radius:10px}.narr .rounds{font:11px var(--mono)}
+  .workspace-bar{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--stroke);gap:20px;scroll-margin-top:90px}.view-tabs{display:flex;gap:24px}.view-tabs button{border:0;border-bottom:2px solid transparent;background:none;color:var(--ink-faint);font:500 13px var(--sans);padding:15px 0;cursor:pointer;white-space:nowrap}.view-tabs button:hover{color:var(--ink)}.view-tabs [aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}.tab-num{font:9px var(--mono);margin-right:7px;color:var(--ink-faint)}.view-tabs [aria-selected=true] .tab-num{color:var(--accent)}.workspace-hint{font-size:11px;color:var(--ink-faint)}
+  .layout{grid-template-columns:minmax(0,1fr) 282px;gap:24px;margin-top:24px}#flow{min-width:0}.view-panel{animation:arrive .24s ease}.view-panel:focus{outline-offset:6px}.rail{position:static;gap:14px}
+  .panel{border-color:var(--stroke);border-radius:12px;background:linear-gradient(140deg,#121c2d,#0e1625);box-shadow:none;padding:17px}.panel h3{font:500 11px var(--sans);letter-spacing:.5px;color:var(--ink)}.panel h3:after{display:none}.lg{font-size:12px;letter-spacing:0;margin:7px 0}.lg .st{font:9px var(--mono)}.lg i{width:8px;height:8px;border-radius:50%}.linekey .row{font-size:11px}.skbadge{font:9px var(--mono)}.capnote{font-size:11px}
+  .bk{padding:10px 9px}.bk .bh{flex-wrap:wrap}.bk .nm{font:11px var(--mono);overflow-wrap:anywhere}.bk .ep{font:10px var(--mono)}.bk .from{font-size:11px;letter-spacing:0}.svc{flex-wrap:wrap;font-size:11px}.bk.live .dot{animation:none}
+  .band-lbl{font:600 15px var(--sans);color:var(--ink);text-transform:none;letter-spacing:-.2px;flex-wrap:wrap;gap:10px;margin:28px 0 14px}.band-lbl:first-child{margin-top:0}.band-lbl .n{font:10px var(--mono);padding:4px 7px;border-radius:5px}.band-lbl .hint{font:11px/1.5 var(--sans);letter-spacing:0;flex-basis:100%;padding-left:38px}.band-lbl:after{display:none}
+  .svgwrap{padding:16px 8px;border-color:var(--stroke);border-radius:14px;background:radial-gradient(ellipse at 50% 0%,#22315433,transparent 75%),#0b1321;overflow:auto}.diagram{min-width:760px}.svgcap{font-size:12px;margin:14px 2px;color:var(--ink-dim)}
+  svg.diagram rect[fill="#0c1319"],svg.diagram rect[fill="#101820"]{fill:#111c2f}svg.diagram text[fill="#6d8492"]{fill:#97abc5}svg .flt.on rect{filter:none;stroke-width:1.5}
+  .node{grid-template-columns:210px 30px minmax(0,1fr)}.card{padding:18px;background:linear-gradient(120deg,#131f31,#0e1727);border-color:var(--stroke);border-left-color:var(--gc,var(--accent));box-shadow:none;border-radius:12px;min-width:0}.card .nm{font:500 14px/1.5 var(--mono);overflow-wrap:anywhere}.card .sm,.card .scnote{font-size:13px}.card .ord,.card .id,.card .statebadge{font-family:var(--mono)}.card .id{font-size:9px;letter-spacing:.5px}.card .detail{font:12px/1.6 var(--mono)}.card .kvrow{flex-wrap:wrap}.card .exbtn{font:11px var(--sans);padding:7px 11px}.card.st-active.hl{box-shadow:none;border-top-color:var(--stroke-lit)}.card.dimmed{opacity:.8}.gutter .glbl{font:9px var(--mono)}.gutter .kv{font:11px/1.65 var(--mono)}.grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr));gap:14px}
+  .wire{margin:0;border-color:var(--stroke);border-radius:14px;background:#0e1727;box-shadow:none}.wire .wh{padding:18px}.wire .wh .wt{font:600 14px var(--sans);text-transform:none;letter-spacing:0;color:var(--ink)}.wire .wh .wsub{font:11px var(--sans);letter-spacing:0}.wire .pane{padding:20px}.wire .hdrs{font:11px/1.7 var(--mono)}.wire .reqline,.wire .status{font:12px var(--mono)}.wire pre{font-size:12px;line-height:1.7;padding:16px;background:#080f1c;max-height:560px}.wire .copy{font:10px var(--sans);padding:5px 10px}.wire .wfoot{font-size:12px;padding:18px}.wire .empty{padding:48px 24px;font-size:14px}
+  .tlist{padding:16px 20px}.tstep{padding:12px 0}.timeline .tsummary{padding:18px 20px;font-size:12px}.tbody>summary{font:11px var(--sans);text-transform:none;letter-spacing:0}.tnote{font-size:12px}.tprov code{font-size:10px;overflow-wrap:anywhere}.wire .wfoot .prov code{font-size:10px;overflow-wrap:anywhere}.footnote{font-size:11px;color:var(--ink-faint);margin-top:32px}.titleblock{display:none}
+  @keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  @media(min-width:1600px){.sheet{padding-left:40px;padding-right:40px}}
+  @media(max-width:1100px){.layout{grid-template-columns:minmax(0,1fr)}.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.workspace-hint{display:none}.hero-art{height:240px}.orbit-label-a{left:0}.orbit-label-b{right:0}}
+  @media(max-width:720px){.appbar{padding:0 18px;height:64px}.brand-label,.brand-divider,.offline{display:none}.sheet{padding:0 18px 28px}header.hero{grid-template-columns:1fr;padding-top:34px;gap:18px}.hero-art{display:none}h1{letter-spacing:-1.8px;font-size:43px}.sub{font-size:14px}.tiles{grid-template-columns:repeat(2,1fr)}.tile{padding:16px}.tile:nth-child(3){border-left:0;border-top:1px solid var(--stroke)}.tile:nth-child(4){border-top:1px solid var(--stroke)}.tile .v{font-size:25px}.section-intro .muted{display:none}.chips{gap:6px}.chip{font-size:11px;padding:9px}.seghint{display:none}.play{margin-left:0}.narr{padding:14px;font-size:12px}.view-tabs{width:100%;gap:0;justify-content:space-between}.view-tabs button{font-size:11px}.tab-num{display:none}.layout{margin-top:20px}.node{grid-template-columns:minmax(0,1fr)}.gutter{text-align:left;padding:8px 0 0}.rail-line{display:none}.card .nm{font-size:12px}.wire .wh{flex-wrap:wrap;padding:14px}.wire .wh .wsub{order:3;flex-basis:100%}.wire .pane{padding:14px}.band-lbl .hint{padding-left:0}.rail{grid-template-columns:minmax(0,1fr)}}
+  @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body class="phase-request">
+<a class="skip-link" href="#workspace">Skip to flow explorer</a>
+<div class="appbar"><a class="brand" href="#top"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M13 6h22l7 7v22l-7 7H13l-7-7V13Z" fill="#121d38" stroke="#829aff"/><path d="m15 16 8 8-8 8m12-16 8 8-8 8" stroke="#94eaff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg><strong>praxis<span>ai</span></strong><span class="brand-divider"></span><span class="brand-label">Flow studio</span></a><span class="offline"><i></i> Self-contained · Offline ready</span></div>
+<div class="sheet" id="top">
+  <span class="xhair tl"></span><span class="xhair tr"></span><span class="xhair bl"></span><span class="xhair br"></span>
+
+  <header class="hero">
+    <div class="hero-copy">
+      <div class="eyebrow"><span></span> OPENAI RESPONSES / AGENTIC PIPELINE</div>
+      <h1>Every request.<br><span>The whole journey.</span></h1>
+      <p class="sub">Explore the gateway from the first request to the final response. Follow state, routing, and the model → tool → model loop, one scenario at a time.</p>
+      <details class="features"><summary>About this configuration <span>↗</span></summary><p>One listener serves Responses, Conversations, prompts, embeddings, files, and vector stores. Typed credential slots scope per-user credentials; each callout carries trace identity with a fresh span.</p><code>--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite</code></details>
+    </div>
+    <div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="gateway-mark"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M13 6h22l7 7v22l-7 7H13l-7-7V13Z" fill="#121d38" stroke="#829aff"/><path d="m15 16 8 8-8 8m12-16 8 8-8 8" stroke="#94eaff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div><span class="orbit-label orbit-label-a">REQUEST</span><span class="orbit-label orbit-label-b">TOOL CALL</span><span class="orbit-label orbit-label-c">RESPONSE</span><div class="art-caption">ONE GATEWAY. EVERY HOP.</div></div>
+    <div class="tiles" id="tiles" aria-label="Configuration summary"></div>
+  </header>
+
+  <div class="section-intro"><span class="eyebrow">01 / CHOOSE A SCENARIO</span><span class="muted">Examples grounded in repository fixtures</span></div>
+  <div class="controls">
+    <div class="chips" id="chips" role="radiogroup" aria-label="Request scenario">
+      <span class="lbl" aria-hidden="true">Scenario</span>
+    </div>
+    <div class="seg" role="group" aria-label="Pipeline phase">
+      <span class="lbl">Phase</span>
+      <div class="segbtns" id="phase">
+        <button type="button" data-phase="request" class="on" aria-pressed="true">Request ▶</button>
+        <button type="button" data-phase="response" aria-pressed="false">◀ Response</button>
+      </div>
+      <span class="seghint">Highlight the request or response path in the topology.</span>
+    </div>
+    <button type="button" class="play" id="play" aria-label="Animate the selected request end to end"><span class="ico"></span><span id="playtxt">Play trace</span></button>
+  </div>
+
+  <p class="narr" id="narr" role="status" aria-live="polite"></p>
+
+<div class="workspace-bar" id="workspace" tabindex="-1"><div class="view-tabs" role="tablist" aria-label="Explore the flow">
+<button type="button" role="tab" id="tab-topology" aria-controls="view-topology" aria-selected="true" tabindex="0" data-view="topology"><span class="tab-num">01</span>Topology</button>
+<button type="button" role="tab" id="tab-filters" aria-controls="view-filters" aria-selected="false" tabindex="-1" data-view="filters"><span class="tab-num">02</span>Filters</button>
+<button type="button" role="tab" id="tab-exchange" aria-controls="view-exchange" aria-selected="false" tabindex="-1" data-view="exchange"><span class="tab-num">03</span>Wire exchange</button>
+<button type="button" role="tab" id="tab-timeline" aria-controls="view-timeline" aria-selected="false" tabindex="-1" data-view="timeline"><span class="tab-num">04</span>Timeline</button>
+</div><span class="workspace-hint">Explore the structure. Inspect the details.</span></div>
+  <div class="layout">
+    <!-- ============ FLOW COLUMN ============ -->
+    <main id="flow">
+
+<section class="view-panel" id="view-topology" role="tabpanel" aria-labelledby="tab-topology" tabindex="0">      <div class="band-lbl"><span class="n">02</span> Route fork <span class="hint">— bypass unless-gate vs. the Internal Request Router</span></div>
+      <div class="svgwrap">
+        <svg class="diagram" viewBox="0 0 980 260" role="img" aria-label="Route fork: the bypass branch (dedicated services, WebSocket, and 404 route-miss) versus the Internal Request Router entering the agentic loop">
+          <defs>
+            <marker id="mk-route" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#f4e04d"/></marker>
+            <marker id="mk-dim" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6d8492"/></marker>
+          </defs>
+          <line x1="490" y1="6" x2="490" y2="40" stroke="#2c4250"/>
+          <text x="500" y="24" class="s-mono" fill="#6d8492" font-size="10">from spine · x-praxis-ai-format</text>
+          <g>
+            <path d="M490,40 L534,68 L490,96 L446,68 Z" fill="#0c1319" stroke="#f4e04d" stroke-width="1.3"/>
+            <text x="490" y="72" text-anchor="middle" class="s-mono" fill="#f4e04d" font-size="10.5">unless-gate</text>
+          </g>
+          <text x="490" y="116" text-anchor="middle" class="s-mono" fill="#6d8492" font-size="9.5">POST /v1/responses + x-praxis-ai-format:openai_responses ?</text>
+
+          <!-- left: bypass branch -->
+          <path d="M446,68 C 300,68 250,96 250,132" fill="none" stroke="#6d8492" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#mk-dim)"/>
+          <g class="flt" data-fid="bypass_gate">
+            <rect x="24" y="132" width="452" height="104" rx="8" fill="#0c1319" stroke="#2c4250"/>
+            <rect x="24" y="132" width="3" height="104" fill="#f4e04d"/>
+            <text x="42" y="154" class="s-mono" fill="#e2edf3" font-size="12.5">NO → BYPASS CARRIER (branch → rejoin terminal)</text>
+            <text x="42" y="174" class="s-mono" fill="#9db0bd" font-size="10.5">router path_prefix → /v1/prompts · /v1/embeddings</text>
+            <text x="42" y="189" class="s-mono" fill="#9db0bd" font-size="10.5">/v1/files · /v1/vector_stores → dedicated backends</text>
+            <text x="42" y="209" class="s-mono" fill="#3f9bd8" font-size="10.5">/v1/responses + Upgrade:websocket → inference-backend</text>
+            <text x="42" y="227" class="s-mono" fill="#f4713b" font-size="10.5">non-Responses body → route-miss 404</text>
+          </g>
+
+          <!-- right: IRR -->
+          <path d="M534,68 C 700,68 740,96 740,132" fill="none" stroke="#f4e04d" stroke-width="1.5" marker-end="url(#mk-route)"/>
+          <g class="flt" data-fid="iterative_request_router">
+            <rect x="504" y="132" width="452" height="104" rx="8" fill="#0c1319" stroke="#f4e04d"/>
+            <rect x="504" y="132" width="3" height="104" fill="#f4e04d"/>
+            <text x="522" y="154" class="s-mono" fill="#e2edf3" font-size="12.5">YES → INTERNAL REQUEST ROUTER (terminal)</text>
+            <text x="522" y="176" class="s-mono" fill="#9db0bd" font-size="10.5">classified openai_responses create → agentic loop</text>
+            <text x="522" y="194" class="s-mono" fill="#9db0bd" font-size="10.5">strips x-praxis-* → step router is PATH-ONLY</text>
+            <text x="522" y="214" class="s-mono" fill="#d98cbb" font-size="10.5">initial_step:inference · max_iterations 8</text>
+          </g>
+        </svg>
+      </div>
+
+      <div class="band-lbl"><span class="n">03</span> Agentic loop <span class="hint">— openai_agentic_loop is the sole transition authority (issue #1046)</span></div>
+      <div class="svgwrap">
+        <svg class="diagram" viewBox="0 0 980 430" role="img" aria-label="Agentic inference loop: forward request-phase arc to the backend, reverse response-phase arc, the dispatch bus feeding three dispatchers, the loop owner, and the done exit that triggers reverse-path persistence">
+          <defs>
+            <marker id="mk-req" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4fd1e0"/></marker>
+            <marker id="mk-res" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#f2a838"/></marker>
+            <marker id="mk-disp" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#f4713b"/></marker>
+            <marker id="mk-done" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#d98cbb"/></marker>
+            <marker id="mk-bk" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3f9bd8"/></marker>
+          </defs>
+
+          <rect x="12" y="12" width="956" height="406" rx="10" fill="none" stroke="#1d2b34" stroke-dasharray="3 5"/>
+          <text x="28" y="32" class="s-mono" fill="#6d8492" font-size="10" letter-spacing="2">IRR INFERENCE STEP · canonical #1046 order</text>
+
+          <line x1="16" y1="196" x2="86" y2="196" stroke="#f4e04d" stroke-width="1.4" marker-end="url(#mk-route)"/>
+          <text x="18" y="187" class="s-mono" fill="#6d8492" font-size="9.5">from IRR</text>
+
+          <!-- loop owner -->
+          <g class="flt" data-fid="openai_agentic_loop">
+            <rect x="90" y="140" width="256" height="120" rx="9" fill="#101820" stroke="#d98cbb" stroke-width="1.5"/>
+            <rect x="90" y="140" width="4" height="120" fill="#d98cbb"/>
+            <text x="108" y="166" class="s-mono" fill="#d98cbb" font-size="8.5" letter-spacing="1.6">LOOP-OWNER · SOLE TRANSITION AUTHORITY</text>
+            <text x="108" y="190" class="s-mono" fill="#e2edf3" font-size="14.5">openai_agentic_loop</text>
+            <text x="108" y="212" class="s-mono" fill="#9db0bd" font-size="10.5">parse model output · assign tool calls</text>
+            <text x="108" y="229" class="s-mono" fill="#9db0bd" font-size="10.5">publish action = loop | done</text>
+            <text x="108" y="249" class="s-mono" fill="#6d8492" font-size="9.5">max_infer_iters 7</text>
+          </g>
+
+          <!-- stream_events (composes lifecycle) -->
+          <g class="flt" data-fid="openai_stream_events">
+            <rect x="90" y="286" width="256" height="52" rx="8" fill="#101820" stroke="#f2a838"/>
+            <text x="106" y="308" class="s-mono" fill="#e2edf3" font-size="12">openai_stream_events</text>
+            <text x="106" y="325" class="s-mono" fill="#6d8492" font-size="9.5">composes ONE SSE lifecycle · populates response_object</text>
+          </g>
+
+          <!-- forward arc -->
+          <path class="arc-req" d="M346,172 C 470,120 540,92 636,92" fill="none" stroke="#4fd1e0" stroke-width="1.8" marker-end="url(#mk-req)"/>
+          <text x="392" y="118" class="s-mono arc-req" fill="#4fd1e0" font-size="10.5" letter-spacing="1">REQUEST PHASE ▶ dispatch + proxy</text>
+
+          <!-- reverse arc -->
+          <path class="arc-res" d="M636,320 C 540,320 470,250 346,224" fill="none" stroke="#f2a838" stroke-width="1.8" stroke-dasharray="7 4" marker-end="url(#mk-res)"/>
+          <text x="392" y="300" class="s-mono arc-res" fill="#f2a838" font-size="10.5" letter-spacing="1">◀ RESPONSE PHASE · agentic_loop parses, then stream_events</text>
+
+          <!-- dispatch bus -->
+          <line x1="636" y1="82" x2="636" y2="330" stroke="#f4713b" stroke-width="1.4"/>
+          <text x="628" y="74" text-anchor="end" class="s-mono" fill="#f4713b" font-size="9.5" letter-spacing="1">DISPATCH BUS (request-phase, no response phase)</text>
+          <circle cx="636" cy="118" r="3.2" fill="#f4713b"/>
+          <circle cx="636" cy="186" r="3.2" fill="#f4713b"/>
+          <circle cx="636" cy="254" r="3.2" fill="#f4713b"/>
+
+          <line x1="636" y1="118" x2="702" y2="118" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_web_search">
+            <rect x="704" y="98" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search</text>
+            <text x="720" y="133" class="s-mono" fill="#6d8492" font-size="9.5">Brave · per-user brave_search slot</text>
+          </g>
+          <line x1="636" y1="186" x2="702" y2="186" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_mcp_dispatch">
+            <rect x="704" y="166" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="185" class="s-mono" fill="#e2edf3" font-size="12">openai_mcp_dispatch</text>
+            <text x="720" y="201" class="s-mono" fill="#6d8492" font-size="9.5">8001 · mcp_gateway cred + assertion · ≤8∥</text>
+          </g>
+          <line x1="636" y1="254" x2="702" y2="254" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_file_search_callout">
+            <rect x="704" y="234" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_callout</text>
+            <text x="720" y="269" class="s-mono" fill="#6d8492" font-size="9.5">3002 · ogx_files cred · on_failure closed</text>
+          </g>
+
+          <!-- proxy + backend -->
+          <g class="flt" data-fid="openai_responses_proxy">
+            <rect x="704" y="300" width="252" height="44" rx="8" fill="#101820" stroke="#3f9bd8"/>
+            <text x="720" y="319" class="s-mono" fill="#e2edf3" font-size="12">openai_responses_proxy</text>
+            <text x="720" y="335" class="s-mono" fill="#6d8492" font-size="9.5">rebuild body · header hook after LB select</text>
+          </g>
+          <line class="arc-req" x1="830" y1="344" x2="830" y2="372" stroke="#3f9bd8" stroke-width="1.4" marker-end="url(#mk-bk)"/>
+          <g class="flt" data-fid="__inference">
+            <rect x="704" y="374" width="252" height="40" rx="8" fill="#0c1319" stroke="#3f9bd8"/>
+            <text x="720" y="399" class="s-mono" fill="#3f9bd8" font-size="12">inference-backend · 127.0.0.1:3001</text>
+          </g>
+
+          <!-- done exit -->
+          <path d="M204,260 L204,318 L58,318 L58,360" fill="none" stroke="#d98cbb" stroke-width="1.4" marker-end="url(#mk-done)"/>
+          <g>
+            <rect x="30" y="362" width="330" height="50" rx="8" fill="#0c1319" stroke="#d98cbb"/>
+            <text x="46" y="383" class="s-mono" fill="#e2edf3" font-size="11.5">▣ DONE → compose terminal event</text>
+            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_response_store persists</text>
+          </g>
+        </svg>
+      </div>
+      <p class="svgcap"><b>How to read this:</b> a semantic hub view — the loop owner directs the three request-phase dispatchers and the proxy. The arcs show the request vs. response <em>phases</em>, not the linear filter order. The canonical request-phase order (project_state_owner_headers → openai_stream_events → dispatchers → openai_agentic_loop → headers → router → load_balancer → openai_responses_proxy) is shown in the Filters view.</p>
+
+</section>
+<section class="view-panel" id="view-filters" role="tabpanel" aria-labelledby="tab-filters" tabindex="0" hidden>      <div class="band-lbl"><span class="n">01</span> Pre-IRR spine <span class="hint">— sequential filters run once; state accumulates in the left gutter</span></div>
+      <div class="spine" id="spine"></div>
+
+      <div class="band-lbl"><span class="n">04</span> IRR step filters <span class="hint">— the inference-step chain in canonical order; annotations update per scenario</span></div>
+      <div class="grid" id="irrgrid"></div>
+
+</section>
+<section class="view-panel" id="view-exchange" role="tabpanel" aria-labelledby="tab-exchange" tabindex="0" hidden>  <section class="wire" id="wire" aria-label="Example request and response for the selected scenario">
+    <div class="wh" id="wireToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="wireBody">
+      <span class="wt">On the wire</span>
+      <span class="wsub" id="wireSub">example request &amp; response — pick a scenario</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="wbody" id="wireBody"></div>
+  </section>
+
+</section>
+<section class="view-panel" id="view-timeline" role="tabpanel" aria-labelledby="tab-timeline" tabindex="0" hidden>  <section class="wire timeline" id="timeline" aria-label="Round-by-round agentic-loop chronology for the selected scenario">
+    <div class="wh" id="tlToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="tlBody">
+      <span class="wt">Inside the loop</span>
+      <span class="wsub" id="tlSub">round-by-round chronology — pick a scenario</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="wbody" id="tlBody"></div>
+  </section>
+
+</section>
+    </main>
+
+    <!-- ============ RIGHT RAIL ============ -->
+    <aside class="rail" aria-label="Reference">
+      <div class="panel">
+        <h3>Groups</h3>
+        <div id="legend"></div>
+        <div class="linekey" aria-label="Line semantics">
+          <div class="lksub">Line semantics</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#4fd1e0" stroke-width="2"/></svg> solid — forward / request phase</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#f2a838" stroke-width="2" stroke-dasharray="6 3"/></svg> dashed — return / response phase</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#f4713b" stroke-width="2" stroke-dasharray="1 4" stroke-linecap="round"/></svg> dotted — dispatch (request-phase, no response)</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Filter states</h3>
+        <div class="statekey">
+          <div class="skrow"><span class="skbadge" style="color:var(--ok);border-color:var(--ok)">active</span><span class="skdef">runs and mutates this request</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--ink-dim)">passthrough</span><span class="skdef">runs, but is a no-op for this input</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--c-classification);border-color:var(--c-classification)">inert</span><span class="skdef">loaded, but its trigger condition is absent</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--ink-faint)">skipped</span><span class="skdef">never reached on this path</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Loop caps</h3>
+        <div class="caps" id="caps"></div>
+        <div class="capnote">Constraint: <b>max_iterations ≥ max_infer_iters + 1</b> (7 + 1 = 8) — initial inference plus the allowed tool-backed continuations.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Backends</h3>
+        <div id="backends"></div>
+      </div>
+
+      <div class="panel">
+        <h3>External services</h3>
+        <div id="services"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="footnote" id="foot"></div>
+  <div class="titleblock" aria-hidden="true">
+    <div><span>DWG</span><b>FULL-FLOW-AGENTIC</b></div>
+    <div><span>SRC</span><b>*.yaml</b></div>
+    <div><span>VIEW</span><b>SCHEMATIC</b></div>
+    <div><span>SHEET</span><b>1 / 1</b></div>
+  </div>
+</div>
+
+<div id="tt" role="tooltip" aria-hidden="true"></div>
+
+<script>
+/* ============================================================================
+   PIPELINE — generated from full-flow-agentic.yaml and its curated sidecar.
+   The YAML is the structural source of truth. All rendering, tracing,
+   and tooltips are driven from this object.
+   ========================================================================= */
+const PIPELINE = @@PIPELINE@@;
+
+/* Per-scenario narrative + cluster/service highlight (derived, kept beside PIPELINE). */
+const SCEN_META = @@SCEN_META@@;
+
+/* ============================================================================
+   WIRE — example request + response payloads per scenario (embedded from the
+   repo's integration fixtures/tests; keyed to full-flow-agentic.yaml). Update
+   alongside PIPELINE whenever the request/response shapes change. Bodies are
+   representative and trimmed for teaching, but structurally faithful to the
+   OpenAI Responses API shapes this gateway emits.
+   ========================================================================= */
+const WIRE = @@WIRE@@;
+
+/* ============================================================================
+   TIMELINE — round-by-round agentic-loop chronology per scenario (embedded from
+   the repo's integration fixtures/tests; keyed to full-flow-agentic.yaml).
+   Each step is one hop on the wire: {n, from, to, kind:request|response, round,
+   title, channel, bodyKind:json|sse|text|none, body, note, provenance[]}.
+   Bodies are real fixture/mock payloads, trimmed with … where long. Update
+   alongside WIRE/PIPELINE whenever the loop mechanics or payload shapes change.
+   ========================================================================= */
+const TIMELINE = @@TIMELINE@@;
+
+/* group → color + label */
+const GROUPS = @@GROUPS@@;
+/* per-filter color override for the mixed irr-step group */
+function filterColor(f){
+  if(f.group!=="irr-step") return GROUPS[f.group].c;
+  if(f.id==="openai_agentic_loop") return "var(--c-loop)";
+  if(["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)) return "var(--c-dispatch)";
+  if(f.id==="openai_stream_events") return "var(--c-classification)";
+  if(["irr_router","irr_load_balancer","openai_responses_proxy"].includes(f.id)) return "var(--c-backend)";
+  return "var(--c-context)";
+}
+
+const STATE_LABEL = @@STATE_LABEL@@;
+
+/* ---- small DOM helpers ---- */
+function el(tag,cls,txt){const n=document.createElement(tag);if(cls)n.className=cls;if(txt!=null)n.textContent=txt;return n;}
+function fmtBytes(n){
+  if(n>=1048576 && n%1048576===0) return (n/1048576)+" MiB";
+  if(n>=1024 && n%1024===0) return (n/1024)+" KiB";
+  return n+" B";
+}
+
+/* ============================================================================
+   RENDER — header tiles
+   ========================================================================= */
+(function renderTiles(){
+  const wrap=document.getElementById("tiles");
+  const disp=PIPELINE.filters.filter(f=>["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)).length;
+  const tiles=[
+    ["Filters",PIPELINE.filters.length,""],
+    ["Dispatchers",disp,""],
+    ["Clusters",PIPELINE.clusters.length,""],
+    ["Loop caps",PIPELINE.knobs.max_infer_iters,"/ "+PIPELINE.knobs.max_iterations]
+  ];
+  tiles.forEach(([k,v,s])=>{
+    const t=el("div","tile");
+    t.appendChild(el("div","k",k));
+    const vv=el("div","v");vv.textContent=v;if(s){const sm=el("small");sm.textContent=" "+s;vv.appendChild(sm);}
+    t.appendChild(vv);wrap.appendChild(t);
+  });
+})();
+
+/* ============================================================================
+   RENDER — scenario chips
+   ========================================================================= */
+(function renderChips(){
+  const wrap=document.getElementById("chips");
+  function chip(id,label,tag){
+    const b=el("button","chip");b.type="button";b.setAttribute("role","radio");
+    b.dataset.scen=id;b.setAttribute("aria-checked","false");
+    b.appendChild(document.createTextNode(label));
+    if(tag){const t=el("span","tag");t.textContent=tag;b.appendChild(t);}
+    return b;
+  }
+  wrap.appendChild(chip("overview","All / overview"));
+  PIPELINE.scenarios.forEach(s=>wrap.appendChild(chip(s.id,s.label,s.id)));
+})();
+
+/* ============================================================================
+   RENDER — spine (pre-IRR filters: order 1..15) + IRR-step grid (order 16..26)
+   ========================================================================= */
+function gutterFor(f){
+  const box=el("div","stateset");box.style.setProperty("--gc",filterColor(f));
+  const kv=el("div","kv");
+  kv.innerHTML="<b>promotes</b> — "+escapeHtml(f.promotes);
+  box.appendChild(kv);
+  return box;
+}
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function detailFor(f){
+  const d=el("div","detail");
+  d.id="detail-"+f.id;
+  // config knobs
+  const keys=Object.keys(f.config||{});
+  if(keys.length){
+    d.appendChild(el("div","dh","Config knobs"));
+    keys.forEach(k=>{
+      const row=el("div","kvrow");
+      row.appendChild(el("span","kk",k));
+      let v=f.config[k];
+      if(typeof v!=="string")v=JSON.stringify(v);
+      row.appendChild(el("span","vv",v));
+      d.appendChild(row);
+    });
+  }
+  d.appendChild(el("div","dh","Phase"));
+  const p=el("div","prose");p.textContent=f.phase;d.appendChild(p);
+  d.appendChild(el("div","dh","Promotes / effect"));
+  const pr=el("div","prose");pr.textContent=f.promotes;d.appendChild(pr);
+  return d;
+}
+
+function cardFor(f,inSpine){
+  const card=el("div","card flt");
+  card.dataset.fid=f.id;
+  card.style.setProperty("--gc",filterColor(f));
+  card.setAttribute("tabindex","0");
+  card.setAttribute("role","group");
+  card.setAttribute("aria-label",f.name+" filter, order "+f.order);
+
+  const top=el("div","top");
+  top.appendChild(el("span","ord","#"+f.order));
+  top.appendChild(el("span","id",GROUPS[f.group].label));
+  top.appendChild(el("span","nm",f.name));
+  const badge=el("span","statebadge");badge.dataset.role="badge";top.appendChild(badge);
+  card.appendChild(top);
+
+  const sm=el("div","sm");sm.textContent=f.promotes;card.appendChild(sm);
+
+  const scnote=el("div","scnote");
+  const pfx=el("span","pfx");pfx.dataset.role="scpfx";
+  const txt=el("span");txt.dataset.role="scnote";
+  scnote.appendChild(pfx);scnote.appendChild(txt);
+  card.appendChild(scnote);
+
+  const exWrap=el("div","expander");
+  const btn=el("button","exbtn");btn.type="button";btn.textContent="▸ details";
+  const detail=detailFor(f);
+  btn.setAttribute("aria-expanded","false");
+  btn.setAttribute("aria-controls",detail.id);
+  btn.addEventListener("click",()=>{
+    const open=detail.classList.toggle("open");
+    btn.setAttribute("aria-expanded",open?"true":"false");
+    btn.textContent=(open?"▾":"▸")+" details";
+  });
+  exWrap.appendChild(btn);
+  card.appendChild(exWrap);
+  card.appendChild(detail);
+
+  attachTooltip(card,f);
+  return card;
+}
+
+(function renderSpine(){
+  const spine=document.getElementById("spine");
+  PIPELINE.filters.filter(f=>f.group!=="irr"&&f.group!=="irr-step").forEach(f=>{
+    const node=el("div","node");
+    // gutter
+    const g=el("div","gutter");
+    g.appendChild(el("div","glbl",(f.group==="store"?"reads + writes state":"writes state")));
+    const gs=gutterFor(f);
+    g.appendChild(gs);
+    node.appendChild(g);
+    // rail
+    const rail=el("div","rail-line");
+    const stub=el("span","stub");stub.style.setProperty("--gc",filterColor(f));
+    const port=el("span","port");port.style.setProperty("--gc",filterColor(f));
+    rail.appendChild(stub);rail.appendChild(port);
+    node.appendChild(rail);
+    // card
+    node.appendChild(cardFor(f,true));
+    spine.appendChild(node);
+  });
+})();
+
+(function renderIrrGrid(){
+  const grid=document.getElementById("irrgrid");
+  PIPELINE.filters.filter(f=>f.group==="irr"||f.group==="irr-step").forEach(f=>{
+    grid.appendChild(cardFor(f,false));
+  });
+})();
+
+/* ============================================================================
+   RENDER — right rail: legend, caps donuts, backends, services
+   ========================================================================= */
+(function renderLegend(){
+  const wrap=document.getElementById("legend");
+  function swatch(color,label){
+    const row=el("div","lg");
+    const i=el("i");i.style.background=color;
+    row.appendChild(i);
+    row.appendChild(document.createTextNode(label));
+    wrap.appendChild(row);
+  }
+  // Pre-IRR / sequential groups (one hue each).
+  [
+    ["trace","trace / correlation"],
+    ["identity","identity adapters"],
+    ["conversations","conversations"],
+    ["classification","classify"],
+    ["context","context / rehydrate"],
+    ["store","store / persist"],
+    ["routing","routing / bypass"]
+  ].forEach(([g,label])=>swatch(GROUPS[g].c,label));
+  // The IRR step is a MIXED group — filterColor() paints its cards in four
+  // different hues by role, so the key lists each role with its true color
+  // instead of one swatch that would contradict the grid.
+  const sub=el("div","keysub");sub.textContent="IRR step (mixed)";
+  sub.style.marginTop="9px";sub.style.paddingTop="9px";sub.style.borderTop="1px solid var(--stroke)";
+  wrap.appendChild(sub);
+  [
+    ["var(--c-loop)","loop owner — IRR + agentic_loop"],
+    ["var(--c-dispatch)","dispatchers — web / mcp / file_search"],
+    ["var(--c-classification)","stream compose — stream_events"],
+    ["var(--c-backend)","route + proxy + backend"]
+  ].forEach(([c,label])=>swatch(c,label));
+})();
+
+function donut(value,max,label,color){
+  const r=26,c=2*Math.PI*r,frac=Math.max(0,Math.min(1,value/max));
+  const wrap=el("div","donut");
+  const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  svg.setAttribute("width","72");svg.setAttribute("height","72");svg.setAttribute("viewBox","0 0 72 72");
+  svg.setAttribute("role","img");svg.setAttribute("aria-label",label+" "+value+" of "+max);
+  const bg=document.createElementNS(svg.namespaceURI,"circle");
+  bg.setAttribute("cx","36");bg.setAttribute("cy","36");bg.setAttribute("r",r);
+  bg.setAttribute("fill","none");bg.setAttribute("stroke","#1d2b34");bg.setAttribute("stroke-width","7");
+  svg.appendChild(bg);
+  const fg=document.createElementNS(svg.namespaceURI,"circle");
+  fg.setAttribute("cx","36");fg.setAttribute("cy","36");fg.setAttribute("r",r);
+  fg.setAttribute("fill","none");fg.setAttribute("stroke",color);fg.setAttribute("stroke-width","7");
+  fg.setAttribute("stroke-linecap","round");fg.setAttribute("stroke-dasharray",c);
+  fg.setAttribute("stroke-dashoffset",c*(1-frac));
+  fg.setAttribute("transform","rotate(-90 36 36)");
+  fg.dataset.circ=c;
+  // Respect reduced motion: skip the sweep so the ring updates instantly.
+  if(!window.matchMedia("(prefers-reduced-motion: reduce)").matches){
+    fg.style.transition="stroke-dashoffset .5s ease";
+  }
+  svg.appendChild(fg);
+  const t=document.createElementNS(svg.namespaceURI,"text");
+  t.setAttribute("x","36");t.setAttribute("y","41");t.setAttribute("text-anchor","middle");
+  t.setAttribute("fill","#e2edf3");t.setAttribute("font-size","16");t.setAttribute("font-family","var(--mono)");
+  t.textContent=value;t.dataset.role="donutval";
+  svg.appendChild(t);
+  wrap.appendChild(svg);
+  const lab=el("div","lab");lab.innerHTML="<b>"+label+"</b>max "+max;wrap.appendChild(lab);
+  wrap._fg=fg;wrap._txt=t;wrap._max=max;
+  return wrap;
+}
+let donutInfer,donutIter;
+(function renderCaps(){
+  const wrap=document.getElementById("caps");
+  donutInfer=donut(0,PIPELINE.knobs.max_infer_iters,"infer",getComputedStyle(document.documentElement).getPropertyValue("--c-loop"));
+  donutIter=donut(0,PIPELINE.knobs.max_iterations,"iter",getComputedStyle(document.documentElement).getPropertyValue("--accent"));
+  wrap.appendChild(donutInfer);wrap.appendChild(donutIter);
+})();
+function setDonut(d,v){
+  const c=parseFloat(d._fg.dataset.circ);
+  const frac=Math.max(0,Math.min(1,v/d._max));
+  d._fg.setAttribute("stroke-dashoffset",c*(1-frac));
+  d._txt.textContent=v;
+}
+
+(function renderBackends(){
+  const wrap=document.getElementById("backends");
+  PIPELINE.clusters.forEach(cl=>{
+    const b=el("div","bk live");b.dataset.cluster=cl.name;
+    const bh=el("div","bh");
+    bh.appendChild(el("span","nm",cl.name));
+    const ep=el("span","ep");
+    const dot=el("span","dot");ep.appendChild(dot);
+    ep.appendChild(document.createTextNode(cl.endpoints.join(", ")));
+    bh.appendChild(ep);
+    b.appendChild(bh);
+    b.appendChild(el("div","from",cl.routedBy));
+    attachTooltipRaw(b,cl.name,[["endpoints",cl.endpoints.join(", ")],["defined in",cl.definedIn],["routed by",cl.routedBy],...(cl.note?[["note",cl.note]]:[])]);
+    wrap.appendChild(b);
+  });
+})();
+
+(function renderServices(){
+  const wrap=document.getElementById("services");
+  PIPELINE.externalServices.forEach(s=>{
+    const row=el("div","svc");row.dataset.service=s.name;
+    row.appendChild(el("span","nm",s.name));
+    const ep=el("span","ep");ep.textContent=s.endpoint;row.appendChild(ep);
+    const rows=[["endpoint",s.endpoint],["used by",s.usedBy.join("; ")]];
+    if(s.connectorId)rows.push(["connector",s.connectorId]);
+    if(s.credential)rows.push(["credential",s.credential]);
+    attachTooltipRaw(row,s.name,rows);
+    wrap.appendChild(row);
+  });
+})();
+
+(function renderFoot(){
+  const k=PIPELINE.knobs;
+  const foot=document.getElementById("foot");
+  foot.innerHTML=
+    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_response_store is pre-IRR (#9) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
+    "<b>Trace + scoped credentials.</b> trace_context (#1) establishes a typed correlation identity BEFORE the IRR snapshots request extensions, so every nested web-search / OGX / MCP callout keeps this request's trace while Praxis core mints a fresh span per hop. callout_credentials captures per-user secrets into typed slots (brave_search / ogx_files / mcp_gateway) and STRIPS the raw x-user-* ingress headers; each dispatcher selects only its slot (web_search→brave_search, file_resolve + file_search→ogx_files, MCP→mcp_gateway), and the legacy raw authorization forward has been dropped from the file callouts. Unified in #1341, callout_credentials (#3) also captures the MCP authorization assertion in the same establishing filter: it deletes any client-supplied x-mcp-authorized and sets a verified, opaque, short-lived assertion forwarded unchanged ONLY to configured connector_id targets — the MCP Gateway makes the authorization decision. (The former standalone callout_authorization filter was removed in #1341.)<br><br>"+
+    "<b>Timeouts</b> "+k.timeout_ms+" ms loop / "+k.step_timeout_ms+" ms step · "+
+    "<b>Byte caps</b> response "+fmtBytes(k.max_response_bytes)+" · state "+fmtBytes(k.max_state_bytes)+" · "+
+    "<b>MCP</b> "+k["mcp_dispatch.max_parallel_calls"]+" parallel, result "+fmtBytes(k["mcp_dispatch.max_result_bytes"])+"/"+fmtBytes(k["mcp_dispatch.max_total_result_bytes"])+" · "+
+    "<b>file_search</b> "+k["file_search.timeout_ms"]+" ms, on_failure "+k["file_search.on_failure"]+" · "+
+    "<b>file_resolve</b> "+k["file_resolve.timeout_ms"]+" ms, on_missing "+k["file_resolve.on_missing"]+".";
+})();
+
+/* ============================================================================
+   TOOLTIP (supplement only — duplicates on-card text, never gates meaning)
+   ========================================================================= */
+const tt=document.getElementById("tt");
+function showTip(html,x,y){
+  tt.innerHTML=html;tt.classList.add("show");tt.setAttribute("aria-hidden","false");
+  const pad=14,w=tt.offsetWidth,h=tt.offsetHeight;
+  let nx=x+pad,ny=y+pad;
+  if(nx+w>window.innerWidth-8)nx=x-w-pad;
+  if(ny+h>window.innerHeight-8)ny=y-h-pad;
+  tt.style.left=Math.max(8,nx)+"px";tt.style.top=Math.max(8,ny)+"px";
+}
+function hideTip(){tt.classList.remove("show");tt.setAttribute("aria-hidden","true");}
+function tipHtml(title,rows){
+  let h="<div class='tth'>"+escapeHtml(title)+"</div>";
+  rows.forEach(([k,v])=>{h+="<div class='ttk'>"+escapeHtml(k)+"</div><div class='ttv'>"+escapeHtml(v)+"</div>";});
+  return h;
+}
+function attachTooltip(node,f){
+  const rows=[["phase",f.phase],["promotes",f.promotes]];
+  const keys=Object.keys(f.config||{});
+  if(keys.length)rows.push(["config",keys.map(k=>k+"="+(typeof f.config[k]==="string"?f.config[k]:JSON.stringify(f.config[k]))).join("  ·  ")]);
+  const html=tipHtml(f.name,rows);
+  node.addEventListener("mousemove",e=>showTip(html,e.clientX,e.clientY));
+  node.addEventListener("mouseleave",hideTip);
+  node.addEventListener("focus",()=>{const r=node.getBoundingClientRect();showTip(html,r.left,r.bottom);});
+  node.addEventListener("blur",hideTip);
+}
+function attachTooltipRaw(node,title,rows){
+  const html=tipHtml(title,rows);
+  node.addEventListener("mousemove",e=>showTip(html,e.clientX,e.clientY));
+  node.addEventListener("mouseleave",hideTip);
+}
+
+/* ============================================================================
+   ON THE WIRE — render example request/response payloads for a scenario.
+   Self-contained JSON + SSE highlighter (no dependencies).
+   ========================================================================= */
+function hlJson(json){
+  // Tokenize raw JSON, wrapping each token in a colored span (text escaped).
+  const re=/("(?:\\.|[^"\\])*")(?=\s*:)|("(?:\\.|[^"\\])*")|(true|false)|(null)|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([{}\[\],:])/g;
+  let out="",last=0,m;
+  while((m=re.exec(json))){
+    out+=escapeHtml(json.slice(last,m.index));
+    let cls="tk-pun";
+    if(m[1]!==undefined)cls="tk-key";
+    else if(m[2]!==undefined)cls="tk-str";
+    else if(m[3]!==undefined)cls="tk-bool";
+    else if(m[4]!==undefined)cls="tk-nul";
+    else if(m[5]!==undefined)cls="tk-num";
+    out+='<span class="'+cls+'">'+escapeHtml(m[0])+'</span>';
+    last=re.lastIndex;
+  }
+  out+=escapeHtml(json.slice(last));
+  return out;
+}
+function hlSse(src){
+  return src.split("\n").map(line=>{
+    if(line.startsWith("event:"))return '<span class="sse-evt">'+escapeHtml(line)+'</span>';
+    if(line.startsWith("data:")){
+      const rest=line.slice(5).trim();
+      if(rest.startsWith("{")||rest.startsWith("["))return '<span class="sse-key">data:</span> '+hlJson(rest);
+      return '<span class="sse-key">data:</span> '+escapeHtml(rest);
+    }
+    return escapeHtml(line);
+  }).join("\n");
+}
+function hlHandshake(src){
+  return src.split("\n").map(line=>{
+    if(/^HTTP\//.test(line))return '<span class="sse-evt">'+escapeHtml(line)+'</span>';
+    const i=line.indexOf(":");
+    if(i>0)return '<span class="sse-key">'+escapeHtml(line.slice(0,i))+'</span>'+escapeHtml(line.slice(i));
+    return escapeHtml(line);
+  }).join("\n");
+}
+function hlBody(src,kind){
+  if(!src)return "";
+  if(kind==="sse")return hlSse(src);
+  if(kind==="handshake")return hlHandshake(src);
+  return hlJson(src);
+}
+function statusClass(st){return /^2/.test(st)?"ok":/^1/.test(st)?"info":"warn";}
+function headerLines(arr){
+  if(!arr||!arr.length)return "";
+  return arr.map(h=>{
+    const i=h.indexOf(":");
+    return i>0?'<span class="hn">'+escapeHtml(h.slice(0,i))+':</span>'+escapeHtml(h.slice(i+1)):escapeHtml(h);
+  }).join("<br>");
+}
+function makeCopy(text){
+  const b=el("button","copy");b.type="button";b.textContent="copy";
+  b.addEventListener("click",()=>{
+    const ok=()=>{b.textContent="copied";b.classList.add("done");setTimeout(()=>{b.textContent="copy";b.classList.remove("done");},1400);};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(ok).catch(()=>{});}
+    else{try{const ta=document.createElement("textarea");ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand("copy");ta.remove();ok();}catch(e){}}
+  });
+  return b;
+}
+function renderWire(scen){
+  const wrap=document.getElementById("wireBody");
+  const sub=document.getElementById("wireSub");
+  wrap.innerHTML="";
+  const w=WIRE[scen];
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+  if(!w){
+    sub.textContent=scen==="overview"?"example request & response — pick a scenario":"no example captured for this scenario";
+    const e=el("div","empty");
+    e.innerHTML=scen==="overview"
+      ? "Select a scenario chip above to inspect the exact <b>request</b> it sends and the <b>response</b> the gateway returns."
+      : "No example payload is recorded for this scenario.";
+    wrap.appendChild(e);
+    return;
+  }
+  sub.textContent=(sdef?sdef.label:scen)+" — example request & response";
+
+  // request pane
+  const rq=el("div","pane req");
+  const rql=el("div","plabel");
+  rql.appendChild(Object.assign(el("span","tag rq"),{textContent:"request"}));
+  if(w.reqBody)rql.appendChild(makeCopy(w.reqBody));
+  rq.appendChild(rql);
+  const line=el("div","reqline");
+  line.innerHTML='<span class="mth">'+escapeHtml(w.reqMethod)+'</span> '+escapeHtml(w.reqPath);
+  rq.appendChild(line);
+  if(w.reqHeaders&&w.reqHeaders.length){const h=el("div","hdrs");h.innerHTML=headerLines(w.reqHeaders);rq.appendChild(h);}
+  if(w.reqBody){const pre=el("pre");pre.innerHTML=hlBody(w.reqBody,"json");rq.appendChild(pre);}
+  else{const none=el("div","hdrs");none.innerHTML="<span class='hn'>(no request body)</span>";rq.appendChild(none);}
+  wrap.appendChild(rq);
+
+  // response pane
+  const rs=el("div","pane rs");
+  const rsl=el("div","plabel");
+  rsl.appendChild(Object.assign(el("span","tag rs"),{textContent:"response"}));
+  if(w.resBody&&w.resKind!=="none")rsl.appendChild(makeCopy(w.resBody));
+  rs.appendChild(rsl);
+  const st=el("div","status "+statusClass(w.resStatus));
+  st.textContent=w.resStatus+(w.resKind==="sse"?"  ·  text/event-stream":w.resKind==="handshake"?"  ·  upgrade":"");
+  rs.appendChild(st);
+  if(w.resHeaders&&w.resHeaders.length){const h=el("div","hdrs");h.innerHTML=headerLines(w.resHeaders);rs.appendChild(h);}
+  if(w.resBody){const pre=el("pre");pre.innerHTML=hlBody(w.resBody,w.resKind);rs.appendChild(pre);}
+  wrap.appendChild(rs);
+
+  // footer: note + provenance
+  if(w.notes||(w.provenance&&w.provenance.length)){
+    const foot=el("div","wfoot");
+    if(w.notes){const n=el("div","note");n.innerHTML="<b>Note.</b> "+escapeHtml(w.notes);foot.appendChild(n);}
+    if(w.provenance&&w.provenance.length){
+      const p=el("div","prov");
+      p.innerHTML="Grounded in: "+w.provenance.map(x=>"<code>"+escapeHtml(x)+"</code>").join("");
+      foot.appendChild(p);
+    }
+    wrap.appendChild(foot);
+  }
+}
+/* ON THE WIRE — INSIDE THE LOOP: round-by-round agentic chronology.
+   Grounded in the repo's integration fixtures/tests; see TIMELINE provenance. */
+function renderTimeline(scen){
+  const wrap=document.getElementById("tlBody");
+  const sub=document.getElementById("tlSub");
+  wrap.innerHTML="";
+  const t=TIMELINE[scen];
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+  if(!t||!t.steps||!t.steps.length){
+    sub.textContent="round-by-round chronology";
+    const e=el("div","empty");
+    e.innerHTML=scen==="overview"
+      ? "Select a scenario to explore its <b>round-by-round timeline</b>."
+      : (sdef&&sdef.entersIRR)
+        ? "This scenario runs a <b>single inference round</b> with no tool callout. Inspect the full request and response in the <b>Wire exchange</b> view."
+        : "This scenario does <b>not</b> enter the agentic loop; it is answered or bypassed before the IRR.";
+    wrap.appendChild(e);
+    return;
+  }
+  sub.textContent=(sdef?sdef.label:scen)+" — "+(t.rounds||"round-by-round chronology");
+  if(t.summary){const s=el("div","tsummary");s.innerHTML="<b>Flow.</b> "+escapeHtml(t.summary);wrap.appendChild(s);}
+  const list=el("div","tlist");
+  t.steps.forEach(st=>{
+    // a response back to the client is the terminal hop: green if 2xx, red if it fails closed (e.g. 401)
+    const isClientResp=st.kind==="response"&&st.to==="client";
+    const chStatus=(st.channel||"").match(/^\s*(\d{3})/);
+    const isFail=isClientResp&&chStatus&&!/^2/.test(chStatus[1]);
+    const isFinal=isClientResp&&!isFail;
+    const step=el("div","tstep k-"+(isFail?"fail":isFinal?"final":st.kind));
+    const rail=el("div","trail");rail.appendChild(el("span","tdot"));step.appendChild(rail);
+    const main=el("div","tmain");
+    const head=el("div","thead");
+    let h="";
+    if(st.round)h+='<span class="tround">'+escapeHtml(st.round)+'</span>';
+    h+='<span class="tactor">'+escapeHtml(st.from)+'</span><span class="tarrow">→</span><span class="tactor">'+escapeHtml(st.to)+'</span>';
+    if(st.title)h+='<span class="ttitle">'+escapeHtml(st.title)+'</span>';
+    head.innerHTML=h;main.appendChild(head);
+    if(st.channel){
+      const c=el("div","tchan");const sp=st.channel.indexOf(" ");
+      c.innerHTML=sp>0?'<span class="mth">'+escapeHtml(st.channel.slice(0,sp))+'</span> '+escapeHtml(st.channel.slice(sp+1)):escapeHtml(st.channel);
+      main.appendChild(c);
+    }
+    if(st.note)main.appendChild(el("div","tnote",st.note));
+    if(st.body&&st.bodyKind&&st.bodyKind!=="none"){
+      const det=el("details","tbody");
+      const sm=el("summary");sm.innerHTML="payload <span class='tbk'>"+escapeHtml(st.bodyKind)+"</span>";
+      const cp=makeCopy(st.body);cp.addEventListener("click",e=>e.stopPropagation());sm.appendChild(cp);
+      det.appendChild(sm);
+      const pre=el("pre");pre.innerHTML=hlBody(st.body,st.bodyKind);det.appendChild(pre);
+      main.appendChild(det);
+    }
+    if(st.provenance&&st.provenance.length){
+      const p=el("div","tprov");p.innerHTML=st.provenance.map(x=>"<code>"+escapeHtml(x)+"</code>").join("");
+      main.appendChild(p);
+    }
+    step.appendChild(main);list.appendChild(step);
+  });
+  wrap.appendChild(list);
+}
+/* collapse toggle for the wire + timeline panels */
+[["wire","wireToggle"],["timeline","tlToggle"]].forEach(([secId,togId])=>{
+  const sec=document.getElementById(secId),tog=document.getElementById(togId);
+  if(!sec||!tog)return;
+  const flip=()=>{const collapsed=sec.classList.toggle("collapsed");tog.setAttribute("aria-expanded",collapsed?"false":"true");};
+  tog.addEventListener("click",flip);
+  tog.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();flip();}});
+});
+
+/* ============================================================================
+   SCENARIO ENGINE — single source of truth drives highlight + tooltip + caps
+   ========================================================================= */
+const body=document.body;
+let currentScen="overview";
+
+function stateForSvg(fid,scen){
+  // map svg-only ids to filter ids
+  if(fid==="__inference"){
+    return SCEN_META[scen]&&SCEN_META[scen].clusters.includes("inference-backend")?"active":"skipped";
+  }
+  const f=PIPELINE.filters.find(x=>x.id===fid);
+  if(!f)return null;
+  if(scen==="overview")return "overview";
+  return (f.scenarios[scen]||{}).state||"skipped";
+}
+
+function applyScenario(scen){
+  currentScen=scen;
+  const overview=scen==="overview";
+  body.classList.toggle("scenario",!overview);
+
+  // narrative
+  const meta=SCEN_META[scen]||SCEN_META.overview;
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+  let narrHtml=meta.narr;
+  if(sdef){
+    narrHtml+=" <span class='rounds'>· "+escapeHtml(sdef.request)+" · loop rounds: "+escapeHtml(String(sdef.loopRounds))+"</span>";
+  }
+  document.getElementById("narr").innerHTML=narrHtml;
+
+  // example request/response payloads for this scenario
+  renderWire(scen);
+  // round-by-round agentic-loop chronology for this scenario
+  renderTimeline(scen);
+
+  // cards
+  document.querySelectorAll(".card.flt").forEach(card=>{
+    const f=PIPELINE.filters.find(x=>x.id===card.dataset.fid);
+    card.classList.remove("st-active","st-passthrough","st-inert","st-skipped","dimmed","hl","pulse");
+    const badge=card.querySelector("[data-role=badge]");
+    if(overview){badge.textContent="";return;}
+    const sc=f.scenarios[scen]||{state:"skipped",note:""};
+    card.classList.add("st-"+sc.state);
+    if(sc.state==="active"){card.classList.add("hl");}
+    else{card.classList.add("dimmed");}
+    badge.textContent=STATE_LABEL[sc.state]||sc.state;
+    card.querySelector("[data-role=scpfx]").textContent="→ this request:";
+    card.querySelector("[data-role=scnote]").textContent=sc.note||"";
+  });
+
+  // svg filter groups
+  document.querySelectorAll("svg .flt").forEach(g=>{
+    g.classList.remove("on","dim");
+    if(overview)return;
+    const st=stateForSvg(g.dataset.fid,scen);
+    if(st==="active")g.classList.add("on");
+    else g.classList.add("dim");
+  });
+
+  // backends + services
+  document.querySelectorAll(".bk").forEach(b=>{
+    b.classList.remove("hlcluster","dimcluster");
+    if(overview)return;
+    if(meta.clusters.includes(b.dataset.cluster))b.classList.add("hlcluster");
+    else b.classList.add("dimcluster");
+  });
+  document.querySelectorAll(".svc").forEach(s=>{
+    s.classList.remove("hlcluster","dimcluster");
+    if(overview)return;
+    if(meta.services.includes(s.dataset.service))s.classList.add("hlcluster");
+    else s.classList.add("dimcluster");
+  });
+
+  // caps donuts — reflect this scenario's steady-state
+  const rounds=sdef?sdef.loopRounds:0;
+  let iterVal=0,inferVal=0;
+  if(sdef&&sdef.entersIRR){
+    if(typeof rounds==="number"){iterVal=rounds;inferVal=rounds;}
+    else{iterVal=2;inferVal=2;} // 2+ scenarios: show model→tool→model steady state
+  }
+  setDonut(donutInfer,inferVal);
+  setDonut(donutIter,iterVal);
+}
+
+/* ---- chip wiring (keyboard: arrows + home/end, activate) ---- */
+const chipEls=Array.from(document.querySelectorAll("#chips .chip"));
+function selectChip(btn){
+  chipEls.forEach(c=>{c.classList.remove("active");c.setAttribute("aria-checked","false");c.tabIndex=-1;});
+  btn.classList.add("active");btn.setAttribute("aria-checked","true");btn.tabIndex=0;
+  applyScenario(btn.dataset.scen);
+}
+chipEls.forEach((btn,i)=>{
+  btn.tabIndex=i===0?0:-1;
+  btn.addEventListener("click",()=>{stopPlay();selectChip(btn);});
+  btn.addEventListener("keydown",e=>{
+    let ni=-1;
+    if(e.key==="ArrowRight"||e.key==="ArrowDown")ni=(i+1)%chipEls.length;
+    else if(e.key==="ArrowLeft"||e.key==="ArrowUp")ni=(i-1+chipEls.length)%chipEls.length;
+    else if(e.key==="Home")ni=0;
+    else if(e.key==="End")ni=chipEls.length-1;
+    if(ni>=0){e.preventDefault();chipEls[ni].focus();stopPlay();selectChip(chipEls[ni]);}
+  });
+});
+
+/* ---- focused workspace views ---- */
+const viewTabs=Array.from(document.querySelectorAll("[role=tab][data-view]"));
+function setView(view){
+  viewTabs.forEach(tab=>{
+    const selected=tab.dataset.view===view;
+    tab.setAttribute("aria-selected",String(selected));
+    tab.tabIndex=selected?0:-1;
+    document.getElementById(tab.getAttribute("aria-controls")).hidden=!selected;
+  });
+}
+viewTabs.forEach((tab,index)=>{
+  tab.addEventListener("click",()=>{stopPlay();setView(tab.dataset.view);});
+  tab.addEventListener("keydown",event=>{
+    let next=index;
+    if(event.key==="ArrowRight")next=(index+1)%viewTabs.length;
+    else if(event.key==="ArrowLeft")next=(index-1+viewTabs.length)%viewTabs.length;
+    else if(event.key==="Home")next=0;
+    else if(event.key==="End")next=viewTabs.length-1;
+    else return;
+    event.preventDefault();stopPlay();setView(viewTabs[next].dataset.view);viewTabs[next].focus();
+  });
+});
+
+/* ---- phase toggle ---- */
+document.getElementById("phase").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-phase]");if(!b)return;
+  document.querySelectorAll("#phase button").forEach(x=>{x.classList.remove("on");x.setAttribute("aria-pressed","false");});
+  b.classList.add("on");b.setAttribute("aria-pressed","true");
+  body.classList.remove("phase-request","phase-response");
+  body.classList.add("phase-"+b.dataset.phase);
+  stopPlay();setView("topology");
+});
+
+/* ============================================================================
+   PLAY — animate the selected request; respects reduced motion
+   ========================================================================= */
+const reduce=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+let playTimer=null,playing=false;
+const playBtn=document.getElementById("play"),playTxt=document.getElementById("playtxt");
+
+function stopPlay(){
+  if(playTimer){clearTimeout(playTimer);playTimer=null;}
+  playing=false;playBtn.classList.remove("playing");playTxt.textContent="Play trace";
+  document.querySelectorAll(".card.pulse").forEach(c=>c.classList.remove("pulse"));
+}
+function startPlay(){
+  setView("filters");
+  const scen=currentScen==="overview"?"S1":currentScen;
+  if(currentScen==="overview")selectChip(chipEls.find(c=>c.dataset.scen==="S1"));
+  playing=true;playBtn.classList.add("playing");playTxt.textContent="Stop";
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+
+  // sequential pulse over active filters in order
+  const active=PIPELINE.filters.filter(f=>((f.scenarios[scen]||{}).state)==="active").sort((a,b)=>a.order-b.order);
+  const cards=active.map(f=>document.querySelector('.card.flt[data-fid="'+f.id+'"]')).filter(Boolean);
+
+  if(reduce){
+    // no motion: jump to final iteration counts
+    finishRounds(sdef);
+    stopPlay();
+    return;
+  }
+
+  let idx=0;
+  const step=()=>{
+    if(!playing)return;
+    document.querySelectorAll(".card.pulse").forEach(c=>c.classList.remove("pulse"));
+    if(idx<cards.length){
+      const card=cards[idx];card.classList.add("pulse");
+      card.scrollIntoView({behavior:"smooth",block:"center"});
+      idx++;playTimer=setTimeout(step,650);
+    }else{
+      // animate loop rounds on the counters for tool scenarios
+      animateRounds(sdef,()=>{ if(playing){stopPlay();} });
+    }
+  };
+  step();
+}
+function finishRounds(sdef){
+  if(!sdef||!sdef.entersIRR){setDonut(donutInfer,0);setDonut(donutIter,0);return;}
+  const r=typeof sdef.loopRounds==="number"?sdef.loopRounds:3;
+  setDonut(donutInfer,r);setDonut(donutIter,r);
+}
+function animateRounds(sdef,done){
+  if(!sdef||!sdef.entersIRR){done();return;}
+  const total=typeof sdef.loopRounds==="number"?sdef.loopRounds:3;
+  let n=0;
+  const tick=()=>{
+    if(!playing){return;}
+    n++;
+    setDonut(donutInfer,Math.min(n,PIPELINE.knobs.max_infer_iters));
+    setDonut(donutIter,Math.min(n,PIPELINE.knobs.max_iterations));
+    if(n<total){playTimer=setTimeout(tick,700);}
+    else{playTimer=setTimeout(done,700);}
+  };
+  tick();
+}
+playBtn.addEventListener("click",()=>{ if(playing)stopPlay(); else startPlay(); });
+
+/* ============================================================================
+   INIT
+   ========================================================================= */
+/* Select a concrete scenario so every view has an example ready to inspect. */
+selectChip(chipEls.find(c=>c.dataset.scen==="S1")||chipEls[0]);
+</script>
+</body>
+</html>
