@@ -122,7 +122,14 @@ pub fn example_config_path(filename: &str) -> String {
 /// in a YAML string.
 ///
 /// Rewrites both `0.0.0.0:8080` and `127.0.0.1:8080` to the given
-/// `listener_port`, then applies every entry in `port_map`.
+/// `listener_port`, and applies every entry in `port_map`.
+///
+/// Rewriting is a single left-to-right pass, and an address only matches when
+/// its port is not followed by another digit. Both rules keep one replacement
+/// from corrupting another: a chain of plain `str::replace` calls rewrites
+/// text it has already produced, so patching `127.0.0.1:3001` over a listener
+/// already moved to `127.0.0.1:30011` would leave a trailing `1` welded to the
+/// substituted port.
 ///
 /// # Examples
 ///
@@ -134,11 +141,36 @@ pub fn example_config_path(filename: &str) -> String {
 /// assert_eq!(result, "address: \"127.0.0.1:9999\"");
 /// ```
 pub fn patch_yaml(yaml: &str, listener_port: u16, port_map: &HashMap<&str, u16>) -> String {
-    let mut result = yaml
-        .replace("0.0.0.0:8080", &format!("127.0.0.1:{listener_port}"))
-        .replace("127.0.0.1:8080", &format!("127.0.0.1:{listener_port}"));
-    for (original, port) in port_map {
-        result = result.replace(original, &format!("127.0.0.1:{port}"));
+    // Longest needle first so a shorter address that prefixes another cannot
+    // claim the match; `port_map` wins ties, since it is caller-supplied.
+    let mut rules: Vec<(&str, u16)> = port_map.iter().map(|(address, port)| (*address, *port)).collect();
+    rules.sort_unstable_by_key(|(address, _)| std::cmp::Reverse(address.len()));
+    for listener in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+        if !port_map.contains_key(listener) {
+            rules.push((listener, listener_port));
+        }
+    }
+
+    let mut result = String::with_capacity(yaml.len());
+    let mut rest = yaml;
+    'next: while !rest.is_empty() {
+        for (address, port) in &rules {
+            // A trailing digit means the needle matched a longer port, not
+            // this address.
+            if let Some(tail) = rest.strip_prefix(*address)
+                && !tail.starts_with(|next: char| next.is_ascii_digit())
+            {
+                result.push_str("127.0.0.1:");
+                result.push_str(&port.to_string());
+                rest = tail;
+                continue 'next;
+            }
+        }
+        let mut chars = rest.chars();
+        if let Some(head) = chars.next() {
+            result.push(head);
+        }
+        rest = chars.as_str();
     }
     result
 }
@@ -177,6 +209,35 @@ mod tests {
         assert!(
             result.contains("127.0.0.1:6666"),
             "second endpoint should be patched to port 6666"
+        );
+    }
+
+    /// Regression: a listener port that begins with an endpoint port used to
+    /// be rewritten a second time by that endpoint's replacement.
+    #[test]
+    fn patch_yaml_does_not_rewrite_a_listener_that_extends_an_endpoint() {
+        let map = HashMap::from([("127.0.0.1:3001", 26000_u16)]);
+        let yaml = "address: \"0.0.0.0:8080\"\nendpoint: \"127.0.0.1:3001\"";
+
+        let result = patch_yaml(yaml, 30011, &map);
+
+        assert_eq!(
+            result, "address: \"127.0.0.1:30011\"\nendpoint: \"127.0.0.1:26000\"",
+            "the listener keeps its own port and the endpoint is patched once"
+        );
+    }
+
+    /// The pass must not re-examine text it just produced.
+    #[test]
+    fn patch_yaml_does_not_rewrite_its_own_output() {
+        let map = HashMap::from([("127.0.0.1:3000", 3001_u16), ("127.0.0.1:3001", 4000_u16)]);
+        let yaml = "a: \"127.0.0.1:3000\"\nb: \"127.0.0.1:3001\"";
+
+        let result = patch_yaml(yaml, 8080, &map);
+
+        assert_eq!(
+            result, "a: \"127.0.0.1:3001\"\nb: \"127.0.0.1:4000\"",
+            "the port substituted for the first address must not be patched again"
         );
     }
 
