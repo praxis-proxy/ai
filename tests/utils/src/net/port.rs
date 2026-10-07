@@ -150,7 +150,7 @@ fn seed_offset() -> u16 {
 /// process has claimed, registering it before the bind is attempted.
 ///
 /// Falls back to an OS-assigned port when the ephemeral range leaves no room
-/// for a band; see [`bind_ephemeral_port`].
+/// for a band.
 ///
 /// # Panics
 ///
@@ -251,7 +251,7 @@ impl std::fmt::Display for PortGuard {
 /// The returned port is unbound, so the caller races anything that binds an
 /// explicit port. It does not race a listener bound to port `0`, because the
 /// band sits below the OS ephemeral range — unless that range reaches so low
-/// that no band exists and [`bind_ephemeral_port`] supplies the port.
+/// that no band exists and an OS-assigned port supplies the allocation.
 pub fn free_port() -> u16 {
     let (_listener, port) = bind_unique_port();
     port
