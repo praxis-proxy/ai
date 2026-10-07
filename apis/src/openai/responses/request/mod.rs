@@ -55,7 +55,7 @@ use tracing::{debug, trace};
 
 use super::{
     bound_body_outcome,
-    config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
+    config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config, validate_request_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
@@ -104,6 +104,7 @@ impl OpenaiResponsesRequestFilter {
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
+        validate_request_config(FILTER_NAME, &cfg)?;
         let shared = build_config(FILTER_NAME, cfg.shared)?;
         Ok(Box::new(Self {
             config: ResponsesRequestConfig { shared, ..cfg },
@@ -213,8 +214,20 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         "openai_responses_request"
     }
 
+    /// A discard-only instance works entirely at the header phase, so it declares
+    /// no body access.
+    ///
+    /// `discard_cached_parse` drops a parse an earlier publisher cached, at
+    /// `on_request` — which runs after routing. Such an instance is placed on a
+    /// direct-upstream terminal branch, where body hooks never run; declaring body
+    /// access there fails pipeline validation. It neither classifies nor initializes
+    /// state, so it needs the body in no phase.
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        if self.config.discard_cached_parse {
+            BodyAccess::None
+        } else {
+            BodyAccess::ReadOnly
+        }
     }
 
     /// The managed owner also offers the bound-upstream phase, so a chain can
@@ -272,7 +285,18 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    /// On a direct route, drop a parse an earlier publisher cached for a managed
+    /// owner this route never reaches.
+    ///
+    /// The header phase runs after the router has bound the route, so a facts
+    /// publisher placed on a direct-upstream branch (`initialize_state: false`,
+    /// `discard_cached_parse: true`) frees the cached parse here: managed routes
+    /// keep it for their single deserialization while the direct path forwards the
+    /// original body without a copy nothing consumes. A no-op otherwise.
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if self.config.discard_cached_parse {
+            invalidate_cached_request_parse(ctx);
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -398,20 +422,26 @@ struct CachedRequestParse {
     operation: ResponsesOperation,
 }
 
-/// Drop any cached pre-routing parse so a later managed owner re-parses the body.
+/// Drop any cached pre-routing parse, used by two callers.
 ///
 /// The pre-routing fact publisher may hand its parse to the managed owner through
-/// [`CachedRequestParse`]. That parse is taken from the body as received. A filter
-/// that rewrites the body between the two passes — for example
+/// [`CachedRequestParse`]. That parse is taken from the body as received.
+///
+/// A filter that rewrites the body between the two passes — for example
 /// `openai_responses_model_rewrite` remapping the model across providers —
 /// invalidates it: the owner builds [`ResponsesState`] from the cached parse, so a
 /// stale copy would carry the pre-rewrite model and silently undo the rewrite in
 /// every downstream consumer (the translated request would name the original
 /// model). Dropping the cache makes the owner re-parse the mutated body, a single
 /// deserialization paid only when the body actually changed.
+///
+/// A direct route that the router bound to a provider-owned upstream never reaches
+/// the managed owner, so an `openai_responses_request` placed on that branch with
+/// `discard_cached_parse` calls this at the header phase to free the cache the
+/// managed path would otherwise have consumed.
 pub(crate) fn invalidate_cached_request_parse(ctx: &mut HttpFilterContext<'_>) {
     if ctx.extensions.remove::<CachedRequestParse>().is_some() {
-        trace!("dropped cached request parse after a request-body mutation");
+        trace!("dropped cached request parse");
     }
 }
 

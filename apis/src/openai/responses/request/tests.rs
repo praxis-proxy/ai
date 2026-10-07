@@ -442,6 +442,124 @@ async fn cache_parse_for_owner_retains_the_parse() {
     );
 }
 
+/// The managed owner reuses the cached parse, deserializing the body once.
+///
+/// The facts pass caches its parse and publishes the model fact. Clearing that
+/// fact isolates the signal: were the owner to re-parse, `classify_fresh_request`
+/// would republish it; because the owner instead consumes the cache through
+/// `finish_managed_request`, the fact stays cleared — proof the create body was
+/// deserialized exactly once across both phases.
+#[tokio::test]
+async fn the_managed_owner_reuses_the_cached_parse_deserializing_once() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
+    // Isolate the re-parse signal: only a re-parse would restore this fact.
+    ctx.filter_metadata.remove("openai_responses_request.model");
+
+    drop(
+        default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "the owner consumes the cached parse"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "the owner initializes state from the reused parse"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.model"),
+        "the owner reused the cache instead of re-parsing, so the fact stays cleared"
+    );
+}
+
+/// A direct-route discard instance frees the cache at the header phase.
+///
+/// The facts pass caches a parse for a managed owner. On a route the router binds
+/// direct, the managed owner never runs, so an `openai_responses_request` with
+/// `discard_cached_parse: true` drops the cache at `on_request` — which runs after
+/// binding — leaving nothing for the direct forward to retain.
+#[tokio::test]
+async fn discard_cached_parse_frees_the_cache_at_the_header_phase() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
+
+    let discard = filter("initialize_state: false\ndiscard_cached_parse: true\n");
+    let action = discard.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "the direct-route discard frees the cache after binding"
+    );
+}
+
+/// Without the discard flag the header phase leaves a cached parse intact.
+#[tokio::test]
+async fn without_discard_the_header_phase_leaves_the_cache() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    drop(default_filter().on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_some(),
+        "a header phase without the discard flag must not drop the cache"
+    );
+}
+
+/// `from_config` rejects `discard_cached_parse` on a managed owner.
+#[test]
+fn discard_cached_parse_is_rejected_on_the_managed_owner() {
+    let value: serde_yaml::Value = serde_yaml::from_str("discard_cached_parse: true\n").unwrap();
+    let err = OpenaiResponsesRequestFilter::from_config(&value)
+        .err()
+        .expect("managed owner + discard must be rejected");
+    assert!(
+        err.to_string().contains("initialize_state: false"),
+        "the managed owner consumes its own parse and cannot discard: {err}"
+    );
+}
+
+/// `from_config` rejects discarding and caching on the same entry.
+#[test]
+fn discard_cached_parse_and_caching_are_mutually_exclusive() {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\ndiscard_cached_parse: true\n")
+            .unwrap();
+    let err = OpenaiResponsesRequestFilter::from_config(&value)
+        .err()
+        .expect("caching + discard must be rejected");
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "an entry caches a parse or discards one, not both: {err}"
+    );
+}
+
 /// A body rewrite between the facts pass and the managed owner must win.
 ///
 /// `openai_responses_model_rewrite` remaps the model in the body after the
@@ -829,6 +947,21 @@ fn the_filter_declares_bounded_buffering() {
         filter.request_body_mode(),
         BodyMode::StreamBuffer { max_bytes: Some(_) }
     ));
+}
+
+/// A discard-only instance does no body work, so it can live on a terminal branch.
+///
+/// Pipeline validation rejects a branch filter that declares body access, because
+/// body hooks never run inside a branch. The discard instance acts only at the
+/// header phase, so it must declare none.
+#[test]
+fn a_discard_instance_declares_no_body_access() {
+    let filter = filter("initialize_state: false\ndiscard_cached_parse: true\n");
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::None,
+        "a discard-only instance must be placeable on a terminal branch"
+    );
 }
 
 // -----------------------------------------------------------------------------

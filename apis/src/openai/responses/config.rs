@@ -134,6 +134,10 @@ pub(crate) struct ResponsesClassificationConfig {
 /// owner can be configured from the same filter.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent managed-path lifecycle gates: owner, parse-cache, parse-discard"
+)]
 pub(crate) struct ResponsesRequestConfig {
     /// Classification and promotion settings, shared with the classifier.
     #[serde(flatten)]
@@ -175,6 +179,22 @@ pub(crate) struct ResponsesRequestConfig {
     /// directly and never publishes one for another entry.
     #[serde(default)]
     pub cache_parse_for_owner: bool,
+
+    /// Whether this entry drops a parse an earlier publisher cached, after binding.
+    ///
+    /// Off by default. Set this to `true` on an `initialize_state: false` instance
+    /// placed on a provider-owned (direct) route whose managed owner never runs —
+    /// for example inside a direct-upstream terminal branch. A pre-routing publisher
+    /// that set [`Self::cache_parse_for_owner`] hands its single parse to the managed
+    /// owner, which consumes it after binding; but a request the router binds direct
+    /// skips that owner, so the cached parse would otherwise sit in request
+    /// extensions for the whole forward with nothing to consume it. Discarding it at
+    /// the header phase — which runs after the route is bound — frees it on the
+    /// direct path while managed routes keep the parse for their single
+    /// deserialization. Rejected together with `initialize_state: true` (the owner
+    /// consumes its own parse) or with `cache_parse_for_owner` on the same entry.
+    #[serde(default)]
+    pub discard_cached_parse: bool,
 }
 
 /// The filter owns the managed-path lifecycle unless a chain opts out.
@@ -196,6 +216,28 @@ pub(crate) fn build_config(
 ) -> Result<ResponsesClassificationConfig, FilterError> {
     validate_classification_headers(filter, &cfg.headers)?;
     Ok(cfg)
+}
+
+/// Reject `discard_cached_parse` combinations that can never be correct.
+///
+/// Discarding a cached parse only makes sense on a pre-routing publisher
+/// (`initialize_state: false`) that itself does not cache — it drops a parse an
+/// *earlier* publisher left for a managed owner the direct route never reaches.
+/// A managed owner (`initialize_state: true`) consumes its own cache, and a
+/// publisher that caches (`cache_parse_for_owner: true`) is the producer, not the
+/// discarder; combining either with discard is a configuration error.
+pub(crate) fn validate_request_config(filter: &str, cfg: &ResponsesRequestConfig) -> Result<(), FilterError> {
+    if cfg.discard_cached_parse && cfg.initialize_state {
+        return Err(FilterError::from(format!(
+            "{filter}: discard_cached_parse requires initialize_state: false; a managed owner consumes its own parse"
+        )));
+    }
+    if cfg.discard_cached_parse && cfg.cache_parse_for_owner {
+        return Err(FilterError::from(format!(
+            "{filter}: discard_cached_parse and cache_parse_for_owner are mutually exclusive; an entry caches a parse or discards one, not both"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate dedicated names and reject collisions across header fields.
@@ -262,6 +304,47 @@ mod tests {
         assert!(
             cfg.cache_parse_for_owner,
             "a pre-routing publisher can opt in to the deserialize-once handoff"
+        );
+    }
+
+    #[test]
+    fn discard_cached_parse_defaults_off() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(
+            !cfg.discard_cached_parse,
+            "an entry must not discard a cached parse unless a chain opts in"
+        );
+    }
+
+    #[test]
+    fn validate_request_config_accepts_discard_on_a_facts_publisher() {
+        let cfg: ResponsesRequestConfig =
+            serde_yaml::from_str("initialize_state: false\ndiscard_cached_parse: true\n").unwrap();
+        assert!(
+            validate_request_config("openai_responses_request", &cfg).is_ok(),
+            "a direct-route publisher may discard an earlier cached parse"
+        );
+    }
+
+    #[test]
+    fn validate_request_config_rejects_discard_on_the_managed_owner() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("discard_cached_parse: true\n").unwrap();
+        let err = validate_request_config("openai_responses_request", &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("initialize_state: false"),
+            "the managed owner consumes its own parse and cannot discard: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_request_config_rejects_discard_with_caching() {
+        let cfg: ResponsesRequestConfig =
+            serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\ndiscard_cached_parse: true\n")
+                .unwrap();
+        let err = validate_request_config("openai_responses_request", &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "caching and discarding on one entry must be rejected: {err}"
         );
     }
 
