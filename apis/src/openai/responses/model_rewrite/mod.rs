@@ -155,6 +155,12 @@ impl ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // The body changed, so a parse cached by an upstream fact publisher is now
+        // stale: it was taken before this rewrite, and a managed owner reusing it
+        // would build its state — and the translated request — from the original
+        // model, silently undoing the rewrite. Drop it so the owner re-parses.
+        super::request::invalidate_cached_request_parse(ctx);
+
         serialize_and_update(body, &value, &result, self.name())
     }
 }

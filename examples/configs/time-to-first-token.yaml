@@ -15,6 +15,11 @@
 # A classifying filter (openai_responses_request, anthropic_messages_format, or
 # anthropic_messages_to_chat_completions) must run upstream to set model metadata in the request
 # path. Without one, all TTFT samples are labeled "unknown".
+#
+# openai_responses_request classifies only Responses operations, so native Chat
+# Completions requests (POST /v1/chat/completions) carry no model fact and are
+# labeled "unknown". This example measures Responses traffic (see the curl above);
+# Anthropic and translated-to-Chat traffic are labeled by their own classifiers.
 
 listeners:
   - name: default

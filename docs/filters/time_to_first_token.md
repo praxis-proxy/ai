@@ -9,7 +9,9 @@ Measures time-to-first-token for streaming AI responses.
 
 Activates only for successful `text/event-stream` responses. On the first non-empty body chunk, records `ctx.request_start.elapsed()` as a Prometheus histogram and deactivates for the remainder of the response.
 
-The histogram's `model` label is read from metadata set by an upstream classifying filter (`openai_responses_request`, `anthropic_messages_format`, or `anthropic_messages_to_chat_completions`). If none runs before this filter, all TTFT samples are labeled `unknown`.
+The histogram's `model` label is read from metadata set by an upstream classifying filter: `openai_responses_request` (Responses create bodies), `anthropic_messages_format`, or `anthropic_messages_to_chat_completions` (Anthropic, including Anthropic-to-Chat translation). If none runs before this filter, all TTFT samples are labeled `unknown`.
+
+Native Chat Completions requests — `POST /v1/chat/completions` sent directly by a client — are an intentional gap. `openai_responses_request` classifies only Responses operations, and no filter publishes a Chat Completions model fact, so these samples are labeled `unknown`. Chat traffic that originates as a Responses or Anthropic request and is translated downstream keeps the model its originating classifier promoted.
 
 ## Example
 

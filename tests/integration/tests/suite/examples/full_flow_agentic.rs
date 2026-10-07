@@ -502,8 +502,7 @@ fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_chat_body_as_responses");
 
-    let config =
-        load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -525,7 +524,11 @@ fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
         "the body must route by model to the shared inference backend, not miss the route"
     );
     let requests = backend.requests();
-    assert_eq!(requests.len(), 1, "the matched Responses operation must reach the backend once");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
+    );
 }
 
 #[test]
@@ -544,8 +547,7 @@ fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses()
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_anthropic_body_as_responses");
 
-    let config =
-        load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -567,7 +569,11 @@ fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses()
         "the body must route by model to the shared inference backend, not miss the route"
     );
     let requests = backend.requests();
-    assert_eq!(requests.len(), 1, "the matched Responses operation must reach the backend once");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
+    );
 }
 
 /// Streaming persistence and retrieval, end to end. A `stream: true` create

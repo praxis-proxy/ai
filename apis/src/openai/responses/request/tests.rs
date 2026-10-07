@@ -442,6 +442,70 @@ async fn cache_parse_for_owner_retains_the_parse() {
     );
 }
 
+/// A body rewrite between the facts pass and the managed owner must win.
+///
+/// `openai_responses_model_rewrite` remaps the model in the body after the
+/// pre-routing facts pass cached its parse. Were the owner to reuse that stale
+/// parse, it would rebuild state — and the translated request — from the
+/// original model, silently undoing the rewrite. The rewrite drops the cache,
+/// so the owner re-parses the mutated body and the effective model wins.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "staged three-pass handoff regression")]
+async fn a_model_rewrite_invalidates_the_cached_parse_so_the_owner_reparses() {
+    use crate::openai::responses::model_rewrite::ModelRewriteFilter;
+
+    let body_model = |body: &Option<Bytes>| -> String {
+        serde_json::from_slice::<serde_json::Value>(body.as_ref().unwrap())
+            .unwrap()
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned()
+    };
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "old-model", "input": "hi"})).unwrap(),
+    ));
+
+    // The pre-routing facts pass caches the parse of the body as received.
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
+
+    // A model rewrite mutates the body, which invalidates the cached parse.
+    let rewrite =
+        ModelRewriteFilter::from_config(&serde_yaml::from_str("model_aliases:\n  old-model: \"new-model\"\n").unwrap())
+            .unwrap();
+    drop(rewrite.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "the rewrite drops the stale parse so the owner re-parses"
+    );
+    assert_eq!(
+        body_model(&body),
+        "new-model",
+        "the rewrite replaced the forwarded model"
+    );
+
+    // The managed owner re-parses the mutated body, so its facts name the
+    // rewritten model, not the stale original a reused parse would carry.
+    drop(
+        default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.model")
+            .map(String::as_str),
+        Some("new-model"),
+        "the owner re-parsed the rewritten body; a reused stale parse would read old-model"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_some());
+}
+
 /// The default is unchanged, so an existing chain keeps its state.
 #[tokio::test]
 async fn state_is_initialized_by_default() {

@@ -398,6 +398,23 @@ struct CachedRequestParse {
     operation: ResponsesOperation,
 }
 
+/// Drop any cached pre-routing parse so a later managed owner re-parses the body.
+///
+/// The pre-routing fact publisher may hand its parse to the managed owner through
+/// [`CachedRequestParse`]. That parse is taken from the body as received. A filter
+/// that rewrites the body between the two passes — for example
+/// `openai_responses_model_rewrite` remapping the model across providers —
+/// invalidates it: the owner builds [`ResponsesState`] from the cached parse, so a
+/// stale copy would carry the pre-rewrite model and silently undo the rewrite in
+/// every downstream consumer (the translated request would name the original
+/// model). Dropping the cache makes the owner re-parse the mutated body, a single
+/// deserialization paid only when the body actually changed.
+pub(crate) fn invalidate_cached_request_parse(ctx: &mut HttpFilterContext<'_>) {
+    if ctx.extensions.remove::<CachedRequestParse>().is_some() {
+        trace!("dropped cached request parse after a request-body mutation");
+    }
+}
+
 /// A matched Responses operation and its declared request-body shape.
 struct MatchedOperation {
     /// Which Responses operation the request head resolved to.
