@@ -43,8 +43,8 @@ pub use responses::implementation_openapi_json as responses_openapi_json;
 pub use responses::{
     AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchCalloutFilter, OpenaiResponsesRequestFilter,
     WebSearchFilter, local_tool_guardrail_messages, openai_responses_proxy::ResponsesProxyFilter,
-    record_local_tool_guardrail_failure,
-    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::OpenaiStreamEventsFilter,
+    record_local_tool_guardrail_failure, responses_to_chat_completions::ResponsesToChatCompletionsFilter,
+    stream_events::OpenaiStreamEventsFilter,
 };
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};
