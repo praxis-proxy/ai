@@ -32,7 +32,6 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
       - filter: openai_tool_parse
 
       # Resolves request-supplied MCP server_url tools before the first model
