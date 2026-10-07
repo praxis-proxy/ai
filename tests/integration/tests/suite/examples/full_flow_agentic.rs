@@ -820,12 +820,18 @@ fn full_flow_local_stream_completion_updates_conversation() {
     ])
     .header("content-type", "text/event-stream")
     .start_with_shutdown();
+    // The full-flow config screens new local tool results through NeMo before
+    // model re-entry. With `max_tool_calls: 0` the web_search result resolves as
+    // `failed`, which is still a model-facing output and is therefore checked, so
+    // the guardrail phase needs a reachable endpoint that approves it.
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"ok"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_local_stream_conversation");
     let proxy = start_proxy(&load_full_flow_config_with_db(
         proxy_port,
         &db,
-        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+        &HashMap::from([("127.0.0.1:3001", backend.port()), ("127.0.0.1:3003", nemo.port())]),
     ));
 
     let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));

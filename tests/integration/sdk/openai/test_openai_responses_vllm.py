@@ -1896,6 +1896,19 @@ def witness_backend_client(tmp_path_factory, request):
 
 
 @pytest.fixture()
+def witness_backend_tool_client(tmp_path_factory, request, nemo_guardrails_server):
+    """Witness proxy whose IRR tool-result guardrail has a reachable NeMo endpoint.
+
+    A request-side tool-limit completion still produces a (failed) tool result
+    that the full-flow guardrail screens before re-entry, so the phase needs a
+    live endpoint even though no hosted search is dispatched.
+    """
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, nemo_port=nemo_guardrails_server
+    )
+
+
+@pytest.fixture()
 def witness_tool_client(tmp_path_factory, request, search_server, nemo_guardrails_server):
     """Full-flow witness with a deterministic hosted web-search endpoint."""
     yield from _witness_proxy_session(
@@ -2869,10 +2882,10 @@ class TestOpenAIResponsesVLLM:
                 stream.close()
 
     def test_streamed_local_completion_append_failure_withholds_terminal(
-        self, witness_backend_client
+        self, witness_backend_tool_client
     ):
         """A request-side tool-limit completion must append before its SSE terminal."""
-        client, _ = witness_backend_client
+        client, _ = witness_backend_tool_client
         conversation = client.conversations.create()
         gate = threading.Event()
         ResponsesWitnessHandler.terminal_gate = gate
