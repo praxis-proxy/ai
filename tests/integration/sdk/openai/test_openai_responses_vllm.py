@@ -3996,6 +3996,48 @@ class TestResponsesCompactionVLLM:
         assert exc_info.value.status_code == 400, "invalid compaction threshold must return 400"
         assert "compact_threshold" in str(exc_info.value), "error must name the compact_threshold field"
 
+    def test_explicit_compact_rejects_malformed_input_content(self, compact_client):
+        """Issue #1403: a message item whose ``content`` is wrong-typed must fail
+        with 400 before any summarization callout, not be silently formatted into
+        empty text and compacted/stored anyway.
+
+        ``extra_body`` injects the malformed field verbatim so the request body
+        carries ``content: 123``, which the typed ``input`` parameter would not
+        let a caller express.
+        """
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                extra_body={"input": [{"role": "user", "content": 123}]},
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "malformed content must return 400"
+        assert error.type == "invalid_request_error"
+        assert "content" in str(error), "error must name the offending field"
+        assert len(CompactionHandler.requests) == before, (
+            "a rejected malformed-content request must never reach the summarizer"
+        )
+
+    def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
+        """Control for the #1403 rejection: a well-typed inline input compacts
+        with exactly one summarization callout and returns a compaction object."""
+        before = len(CompactionHandler.requests)
+        result = compact_client.responses.compact(
+            model=VLLM_MODEL,
+            input=[
+                {"role": "user", "content": "Explain TCP vs UDP."},
+                {"role": "assistant", "content": "TCP is reliable; UDP is not."},
+            ],
+        )
+
+        assert result.id, "a successful compact returns an identified compaction"
+        assert result.object == "response.compaction"
+        assert len(CompactionHandler.requests) == before + 1, (
+            "a valid explicit compact must make exactly one summarization callout"
+        )
+
     def test_below_threshold_skips_compaction(self, compact_client):
         first = compact_client.responses.create(
             model=VLLM_MODEL,
