@@ -31,7 +31,7 @@
 #
 # Pipeline ordering (pre-IRR, runs once):
 #   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — validates parameters, generates IDs
+#   2. openai_responses_request — validates parameters, generates IDs
 #   3. openai_response_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
 #
@@ -160,7 +160,13 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: openai_tool_parse
 

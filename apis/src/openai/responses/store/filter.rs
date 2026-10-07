@@ -653,7 +653,7 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 /// store filter that is absent, request-conditioned out, or ordered after
 /// dispatch.
 ///
-/// It is written from `on_request_body` because `openai_responses_validate`
+/// It is written from `on_request_body` because `openai_responses_request`
 /// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
 /// the same body phase, so `ResponsesState` is not yet present during
 /// `on_request`.

@@ -107,7 +107,7 @@ fn openai_responses_proxy_example_preserves_prompt_without_validation() {
     assert_eq!(
         backend_guard.body(),
         body,
-        "prompt rejection belongs to openai_responses_validate, not the protocol adapter"
+        "prompt rejection belongs to openai_responses_request, not the protocol adapter"
     );
 }
 

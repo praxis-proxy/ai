@@ -21,7 +21,7 @@
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
 //!
-//! The `openai_responses_validate` filter runs after the classifier
+//! The `openai_responses_request` filter runs after the classifier
 //! to validate JSON syntax, reject conflicting history selectors, and
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
@@ -62,7 +62,7 @@ pub(crate) mod responses_to_chat_completions;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
 #[allow(
     dead_code,
-    reason = "the Responses operation registry is consumed by the openai_operation classifier"
+    reason = "the Responses operation registry is consumed by the ai_operation classifier"
 )]
 pub(crate) mod routes;
 #[cfg(feature = "openai-responses")]
@@ -930,7 +930,6 @@ pub(crate) mod rehydrate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod request;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod validate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod web_search;
 
@@ -947,6 +946,5 @@ pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]
 pub use request::OpenaiResponsesRequestFilter;
 #[cfg(feature = "openai-responses")]
-pub use validate::OpenaiResponsesValidateFilter;
 #[cfg(feature = "openai-responses")]
 pub use web_search::WebSearchFilter;

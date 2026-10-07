@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_responses_validate` for every Responses API create
+//! `openai_responses_request` for every Responses API create
 //! request.
 
 mod config;

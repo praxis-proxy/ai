@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration for the `openai_operation` classifier.
+//! Configuration for the `ai_operation` classifier.
 
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -68,7 +68,7 @@ fn default_operation_header() -> Option<String> {
     Some(DEFAULT_OPERATION_HEADER.to_owned())
 }
 
-/// Parsed `openai_operation` configuration.
+/// Parsed `ai_operation` configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperationClassifierConfig {
@@ -115,7 +115,7 @@ pub(crate) fn build_config(config: &OperationClassifierConfig) -> Result<Validat
         && protocol == operation
     {
         return Err(format!(
-            "openai_operation: headers.application_protocol and headers.operation must differ, both are {protocol:?}"
+            "ai_operation: headers.application_protocol and headers.operation must differ, both are {protocol:?}"
         )
         .into());
     }

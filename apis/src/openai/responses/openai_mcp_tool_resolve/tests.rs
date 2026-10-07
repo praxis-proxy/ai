@@ -5323,7 +5323,7 @@ fn build_failure_populates_response_object_state() {
 
 /// When no `ResponsesState` exists yet -- a valid pipeline of
 /// `openai_response_store` + this filter *without*
-/// `openai_responses_validate`/`openai_responses_rehydrate` to build state up
+/// `openai_responses_request`/`openai_responses_rehydrate` to build state up
 /// front -- the terminal-failure build must still CREATE the state and populate
 /// `response_object`, or the store would have nothing to persist and the failure
 /// would be lost. `get_or_insert_with` (not `get_mut`) is what makes this work.

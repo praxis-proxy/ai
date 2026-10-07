@@ -151,8 +151,8 @@ fn full_flow_validates_before_parsing_tools() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let validate = yaml
-        .find("      - filter: openai_responses_validate")
-        .expect("full-flow config should validate managed requests");
+        .find("      - filter: openai_responses_request")
+        .expect("full-flow config should process managed create requests");
     let tool_parse = yaml
         .find("      - filter: openai_tool_parse")
         .expect("full-flow config should parse tools for managed requests");

@@ -1,7 +1,7 @@
 # Responses Format Routing
 #
 # Routes AI API traffic by request-head operation identity and body format.
-# The `openai_operation` filter classifies supported OpenAI operations from
+# The `ai_operation` filter classifies supported AI operations from
 # the HTTP method and path alone, without reading the body. Chat Completions
 # traffic branches on `application_protocol: openai_chat_completions`.
 #
@@ -36,11 +36,11 @@ listeners:
 filter_chains:
   - name: ai-routing
     filters:
-      - filter: openai_operation
+      - filter: ai_operation
         branch_chains:
           - name: chat-completions
             on_result:
-              filter: openai_operation
+              filter: ai_operation
               key: application_protocol
               result: openai_chat_completions
             chains:

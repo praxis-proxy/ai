@@ -310,7 +310,7 @@ pub(crate) enum McpApprovalState {
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Created by `openai_responses_validate` for every Responses API
+/// Created by `openai_responses_request` for every Responses API
 /// create request. When `previous_response_id` is present,
 /// `openai_responses_rehydrate` replaces it with an enriched
 /// version that includes conversation history. Uses

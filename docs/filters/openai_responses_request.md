@@ -7,13 +7,15 @@ Processes a Responses request body once and initializes state.
 
 ## Configuration Notes
 
-Replaces the `openai_responses_format` and `openai_responses_validate` pair. Configuration is unchanged from `openai_responses_format`, so a chain that ran both swaps them for this one filter and keeps the same `on_invalid` and `headers` settings.
+Configuration matches `openai_responses_format`, so a chain keeps the same `on_invalid` and `headers` settings wherever this filter is placed.
 
 The operation is recognized from the request head, and the registry decides which operations carry a body worth parsing: create, compact, and input token counts. Bodyless operations — fetch, delete, cancel, list input items, and the `WebSocket` handshake — are released untouched, as is Conversations API traffic. `on_invalid` governs only bodies that fail to parse.
 
-Rejects `background=true` and non-null `prompt` with a 400, matching the managed-path policy enforced by `openai_responses_validate`.
+Rejects `background=true` and non-null `prompt` with a 400, the managed-path policy this filter now owns.
 
 Promotes `openai_responses_format.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
+
+Extends the shared classification settings with the one option that only this filter honours, so the classifier it replaces does not advertise an option it ignores.
 
 ## Configuration
 
@@ -25,6 +27,7 @@ Promotes `openai_responses_format.*` metadata, publishes filter results under `o
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |
 | `headers.mode` | string | no | Header name for the computed mode (`stateless` or `stateful`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-responses-mode` remains allowed. |
+| `initialize_state` | bool | no | Whether to initialize `ResponsesState` for a create request. On by default, because the stateful Responses filters read it. A passthrough chain that only classifies and routes consumes none of it, and building it there costs an identifier, a conversation resolution, and retaining the parsed body for the rest of the request. Classification metadata, headers, and filter results are published either way, so routing is unaffected. |
 
 ## Example
 

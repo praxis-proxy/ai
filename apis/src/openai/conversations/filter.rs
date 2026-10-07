@@ -6,7 +6,7 @@
 //! conversation store resolved from the per-listener registry the serving
 //! runtime provisions.
 //!
-//! The `openai_operation` filter must run earlier in the same chain. Its typed
+//! The `ai_operation` filter must run earlier in the same chain. Its typed
 //! match is the sole runtime authority for Conversations dispatch.
 
 use async_trait::async_trait;
@@ -27,11 +27,9 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
-    openai::{
-        operation_classifier::OpenAiOperationMatch,
-        responses::{bound_body_outcome, state::ResponsesState},
-    },
+    openai::responses::{bound_body_outcome, state::ResponsesState},
     operation::Transport,
+    operation_classifier::AiOperationMatch,
     service::conversations::build_item_records,
     state_owner::{StateOwner, require_state_owner},
     store::{OwnerScopedResponseStore, ResponseStoreRegistry},
@@ -47,7 +45,7 @@ use crate::{
 /// forwarded upstream. Unmatched paths pass through as `Continue`. The filter
 /// keeps only request-scoped state: it resolves the store from the per-request
 /// registry the serving runtime provisions, and takes an owner-bound handle.
-/// `openai_operation` must precede this filter in the same chain.
+/// `ai_operation` must precede this filter in the same chain.
 /// For a managed `POST /v1/responses` with `conversation`, completed JSON and
 /// SSE responses append the request input and final output items to the local
 /// Conversation. Streaming append-back reads the canonical terminal response
@@ -59,7 +57,7 @@ use crate::{
 /// # YAML
 ///
 /// ```yaml
-/// - filter: openai_operation
+/// - filter: ai_operation
 /// - filter: openai_conversations
 ///   backend: postgres
 ///   database_url: postgres://praxis:password@db.example.com/praxis
@@ -199,19 +197,15 @@ impl OpenaiConversationsFilter {
     }
 
     /// Recover a matched parameter from the immutable original request path.
-    fn path_parameter<'a>(
-        ctx: &'a HttpFilterContext<'_>,
-        matched: &OpenAiOperationMatch,
-        name: &str,
-    ) -> Option<&'a str> {
+    fn path_parameter<'a>(ctx: &'a HttpFilterContext<'_>, matched: &AiOperationMatch, name: &str) -> Option<&'a str> {
         matched.path_parameters.get(ctx.request.uri.path(), name)
     }
 
     /// Resolve and validate the Conversations operation from generic classifier state.
     fn matched_operation(
         ctx: &HttpFilterContext<'_>,
-    ) -> Result<Option<(OpenAiOperationMatch, ConversationOperation)>, FilterError> {
-        let Some(matched) = ctx.extensions.get::<OpenAiOperationMatch>().copied() else {
+    ) -> Result<Option<(AiOperationMatch, ConversationOperation)>, FilterError> {
+        let Some(matched) = ctx.extensions.get::<AiOperationMatch>().copied() else {
             return Ok(None);
         };
         if matched.application_protocol != APPLICATION_PROTOCOL {
@@ -229,7 +223,7 @@ impl OpenaiConversationsFilter {
 
     /// Validate that generic classifier metadata describes the registry operation.
     fn validate_operation_match(
-        matched: OpenAiOperationMatch,
+        matched: AiOperationMatch,
         operation: ConversationOperation,
     ) -> Result<(), FilterError> {
         let expected_body = operation.request_body();
@@ -256,7 +250,7 @@ impl OpenaiConversationsFilter {
     async fn handle_body_operation(
         ctx: &HttpFilterContext<'_>,
         store: &OwnerScopedResponseStore,
-        matched: OpenAiOperationMatch,
+        matched: AiOperationMatch,
         operation: ConversationOperation,
         body: &[u8],
     ) -> Result<FilterAction, FilterError> {
@@ -287,7 +281,7 @@ impl OpenaiConversationsFilter {
     async fn begin_body_operation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        matched: OpenAiOperationMatch,
+        matched: AiOperationMatch,
         operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
         ctx.set_request_body_mode(BodyMode::StreamBuffer {
@@ -308,7 +302,7 @@ impl OpenaiConversationsFilter {
     async fn dispatch_read_operation(
         &self,
         ctx: &HttpFilterContext<'_>,
-        matched: OpenAiOperationMatch,
+        matched: AiOperationMatch,
         operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
         let store = match Self::scoped_store(ctx) {

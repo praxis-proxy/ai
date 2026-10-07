@@ -675,6 +675,9 @@ impl AnthropicWebSearchFilter {
                 callout,
                 &pending.query,
                 Some(self.default_context_size),
+                // Anthropic web-search location translation is out of scope for
+                // issue #1548; preserve the current location-free behavior.
+                None,
                 identity,
             )
             .await

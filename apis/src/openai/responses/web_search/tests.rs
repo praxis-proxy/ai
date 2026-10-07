@@ -1935,6 +1935,575 @@ async fn initial_request_tool_choice_forces_web_search_rejects() {
     assert_eq!(rejection.status, 401, "forced web search without a credential must 401");
 }
 
+#[tokio::test]
+async fn initial_request_allowing_a_continuation_tool_rejects_missing_credential() {
+    // `allowed_tools` excludes web search but permits file_search. Its continuation
+    // resets tool_choice to "auto" and retains the declared web-search tool, so web
+    // search is reachable and its missing per-user credential must fail closed at
+    // round 0 — the re-entry check fires only after streaming commits HTTP 200.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "stream": true,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "file_search"}]},
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a reachable web-search tool with a missing credential must reject, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 401,
+        "reachable web search without a credential must 401"
+    );
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "missing_callout_context");
+}
+
+// -----------------------------------------------------------------------------
+// Round-0 user_location preflight (issue #1548)
+// -----------------------------------------------------------------------------
+
+/// Request body declaring a hosted web-search tool with the given `user_location`.
+fn web_search_request_with_location(user_location: &Value) -> Value {
+    serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [{"type": "web_search", "user_location": user_location}],
+    })
+}
+
+#[tokio::test]
+async fn preflight_rejects_location_field_the_provider_cannot_honor() {
+    // Brave supports only `country`; a `city` it cannot forward must be rejected
+    // explicitly rather than silently dropped (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "city": "Paris"})),
+    )
+    .await;
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an unsupported location field must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "unsupported location use must be a 400");
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("city"),
+        "rejection message should name the unsupported field: {body}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_country_for_a_provider_that_cannot_map_it() {
+    // Tavily's `country` is a full-name enum the canonical ISO code cannot map to,
+    // so even a country is unsupported and must be rejected rather than dropped.
+    let yaml = make_filter_yaml("tavily", "tvly-test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR"})),
+    )
+    .await;
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a country Tavily cannot map must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("country"));
+}
+
+#[tokio::test]
+async fn preflight_allows_a_supported_country() {
+    // Brave accepts an ISO country directly, so a country-only location passes the
+    // preflight; with no pending calls the filter simply continues.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR"})),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a supported country must pass preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_ignores_null_and_empty_location_members() {
+    // Null/empty members are canonical "unset" and must never trip the preflight,
+    // even for a provider that honors no location field.
+    let yaml = make_filter_yaml("tavily", "tvly-test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({
+            "type": "approximate",
+            "country": null,
+            "city": "",
+        })),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "null/empty members must not trip the preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_skips_when_no_user_location_is_declared() {
+    // No `user_location` means nothing to translate or reject, even for Tavily.
+    let filter = {
+        let yaml = make_filter_yaml("tavily", "tvly-test-key");
+        WebSearchFilter::from_config(&yaml).unwrap()
+    };
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "web_search"}],
+        }),
+    )
+    .await;
+    assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+}
+
+#[tokio::test]
+async fn preflight_skips_when_allowed_tools_excludes_web_search() {
+    // `allowed_tools` constrains the callable set: when it names only a client
+    // function, web search cannot run this turn, so an unsupported location on the
+    // (ineligible) web-search tool must not trigger a rejection (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "lookup"}]},
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an excluded web-search tool must not be rejected for its location, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_allowed_tools_includes_web_search() {
+    // When `allowed_tools` does name web search, an unsupported location on it must
+    // still be rejected, matching the default-eligible behavior.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "web_search"}]},
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an allowed web-search tool with an unsupported location must reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_allowed_tools_names_another_continuation_tool() {
+    // `allowed_tools` excludes web search but permits file_search. A file-search
+    // continuation resets tool_choice to "auto" and retains the declared web-search
+    // tool, so web search becomes reachable and its unsupported location must be
+    // rejected at round 0 rather than silently dropped later (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "file_search"}]},
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a reachable web-search tool with an unsupported location must reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_forces_another_continuation_tool() {
+    // Forcing file_search (not web search) still drives a continuation that re-opens
+    // tool_choice, so a declared web-search tool is reachable and its unsupported
+    // location must be rejected at round 0.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": [{"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}}],
+            "tool_choice": {"type": "file_search"},
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("forcing a continuation tool must still preflight web search, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+}
+
+#[tokio::test]
+async fn preflight_rejects_a_country_the_provider_cannot_represent() {
+    // Brave carries the country in the `X-Loc-Country` header. A value with a
+    // control character passes the field-support check but cannot be encoded, so it
+    // must be rejected here rather than silently dropped at dispatch (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR\n"})),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an unrepresentable country must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("country"),
+        "rejection message should name the offending field: {body}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_inspects_every_declared_web_search_tool() {
+    // A request may declare more than one web-search tool. The first carries no
+    // location, but a second (`web_search_preview`) carries an unsupported `city`.
+    // The preflight must inspect every tool rather than only the first, or the
+    // unsupported field slips past (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "city": "Paris"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an unsupported field on a later web-search tool must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_web_search_tools_with_conflicting_countries() {
+    // Dispatch forwards a single country, so two web-search tools that declare
+    // different countries cannot both be honored. Honoring only the first would
+    // silently drop the other, so the request is rejected (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "DE"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("conflicting countries must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert!(body["error"]["message"].as_str().unwrap().contains("conflicting"));
+}
+
+#[tokio::test]
+async fn preflight_allows_web_search_tools_repeating_the_same_country() {
+    // Two web-search tools naming the *same* country agree with the single country
+    // dispatch forwards, so the request passes the preflight and continues.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "matching countries across tools must pass preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_a_malformed_country_for_you_com() {
+    // You.com carries the country in a JSON alpha-2 enum. A malformed value passes
+    // the field-support check but is not a well-formed alpha-2 code, so it must be
+    // rejected here rather than forwarded for You.com to 400 on (issue #1548).
+    let yaml = make_filter_yaml("you", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "France"})),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a malformed You.com country must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert!(body["error"]["message"].as_str().unwrap().contains("country"));
+}
+
+/// A declared `tool_search` with the given `execution`, plus a web-search tool
+/// carrying an unsupported `city`, so the preflight decision turns only on whether the
+/// `tool_search` declaration is server-executed.
+fn web_search_with_declared_tool_search(execution: Option<&str>) -> Value {
+    let mut tool_search = serde_json::json!({"type": "tool_search"});
+    if let Some(mode) = execution {
+        tool_search["execution"] = serde_json::json!(mode);
+    }
+    serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}},
+            tool_search,
+        ],
+    })
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_forces_a_server_executed_discovery_tool() {
+    // `tools` declares a server-executed `tool_search` (hosted MCP connector discovery);
+    // `tool_choice` forces it with a bare selector. Its continuation re-opens tool_choice,
+    // so the declared web-search tool is reachable and its unsupported location must be
+    // rejected at round 0 — resolving `execution` from the declaration, not the selector
+    // (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut request = web_search_with_declared_tool_search(Some("server"));
+    request["tool_choice"] = serde_json::json!({"type": "tool_search"});
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("forcing the server discovery tool must still preflight web search, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_allowed_tools_names_a_server_executed_discovery_tool() {
+    // `tools` declares a server-executed `tool_search`; `allowed_tools` names it with a
+    // bare selector (no `execution`). The declaration is authoritative: its deferred
+    // discovery continuation resets tool_choice to "auto" and retains the declared
+    // web-search tool, so web search becomes reachable and its unsupported location must
+    // be rejected at round 0 (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut request = web_search_with_declared_tool_search(Some("server"));
+    request["tool_choice"] = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "tool_search"}],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a reachable web-search tool with an unsupported location must reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_rejects_from_declaration_even_when_selector_claims_client_execution() {
+    // Adversarial: `tools` declares a server-executed `tool_search`, but the
+    // `allowed_tools` selector carries `execution: "client"`. A selector only names the
+    // tool by type; `execution` is a declaration property, so the server declaration
+    // wins and web search is reachable — reject at round 0 (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut request = web_search_with_declared_tool_search(Some("server"));
+    request["tool_choice"] = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "tool_search", "execution": "client"}],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a server-executed declaration must win over a client selector, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[tokio::test]
+async fn preflight_skips_when_allowed_tools_names_a_default_client_discovery_tool() {
+    // `tools` declares a bare `tool_search` (defaults to client execution); `allowed_tools`
+    // names it. A client tool search returns its call to the API client without a
+    // server-side continuation, so the excluded web-search tool stays unreachable and its
+    // unsupported location must NOT be rejected (issue #1548 — a client round trip can
+    // never enable web search this response).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut request = web_search_with_declared_tool_search(None);
+    request["tool_choice"] = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "tool_search"}],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a client-executed tool search must leave web search unreachable, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_skips_when_allowed_tools_names_an_explicit_client_discovery_tool() {
+    // `tools` declares an explicit `execution: "client"` tool_search — unambiguously a
+    // client round trip — so it cannot make the excluded web-search tool reachable and
+    // its unsupported location must NOT be rejected (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut request = web_search_with_declared_tool_search(Some("client"));
+    request["tool_choice"] = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "tool_search"}],
+    });
+    let action = run_initial_request(filter.as_ref(), request).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an explicit client-executed tool search must leave web search unreachable, got {action:?}"
+    );
+}
+
+/// Run `on_request_body` for a fresh initial request carrying a caller-built
+/// `ResponsesState` — e.g. one with a populated `mcp_tool_map`, as it would be after
+/// `openai_mcp_tool_resolve` has rewritten MCP tools to functions.
+#[cfg(feature = "openai-mcp-tools")]
+async fn run_initial_request_with_state(filter: &dyn HttpFilter, state: ResponsesState) -> FilterAction {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(state);
+    filter.on_request_body(&mut ctx, &mut None, true).await.unwrap()
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+#[tokio::test]
+async fn preflight_rejects_when_allowed_tools_names_a_resolved_mcp_function() {
+    // `openai_mcp_tool_resolve` rewrites an MCP selector to a plain `function` and
+    // populates `mcp_tool_map`, so `allowed_tools` names only that function. Its MCP
+    // continuation re-opens tool_choice and retains the declared web-search tool, so
+    // web search is reachable and its unsupported location must be rejected at round 0
+    // rather than silently dropped later (issue #1548).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}},
+            {"type": "function", "name": "docs__lookup", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "docs__lookup"}]},
+    }));
+    state.mcp_tool_map.insert(
+        ("docs".to_owned(), "lookup".to_owned()),
+        serde_json::json!({"server_label": "docs", "tool_definition": {"name": "lookup"}}),
+    );
+
+    let action = run_initial_request_with_state(filter.as_ref(), state).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a resolved MCP function must keep web search eligible, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(body["error"]["message"].as_str().unwrap().contains("city"));
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+#[tokio::test]
+async fn preflight_skips_when_allowed_tools_names_a_non_mcp_function() {
+    // With MCP tools resolved, an `allowed_tools` function whose name is NOT in
+    // `mcp_tool_map` is a genuine client function: it returns to the client without a
+    // server continuation, so web search stays unreachable and its unsupported
+    // location must NOT be rejected (issue #1548 — preserves the client-function case).
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "city": "Paris"}},
+            {"type": "function", "name": "client_lookup", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "client_lookup"}]},
+    }));
+    // A resolved MCP tool exists, but it is not the one `allowed_tools` permits.
+    state.mcp_tool_map.insert(
+        ("docs".to_owned(), "lookup".to_owned()),
+        serde_json::json!({"server_label": "docs", "tool_definition": {"name": "lookup"}}),
+    );
+
+    let action = run_initial_request_with_state(filter.as_ref(), state).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a non-MCP client function must leave web search unreachable, got {action:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Query fan-out: one call, several queries
 // -----------------------------------------------------------------------------

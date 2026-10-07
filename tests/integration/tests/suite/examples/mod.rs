@@ -82,7 +82,7 @@ mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
-mod openai_responses_validate;
+mod openai_responses_request;
 // The state-ownership example selects the SQLite store backend.
 #[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;

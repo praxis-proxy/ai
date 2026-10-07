@@ -186,7 +186,12 @@ setup, the vLLM image digest, served model, and startup request matrix live in
 The `vllm-gpu-claude-acceptance` job in
 [`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
 runs all four scenarios sequentially against one shared vLLM container, each
-exactly once (no retry), on every nightly GPU run. It can also run independently
+exactly once (no retry), on every nightly GPU run. A fifth scenario on the same
+container drives a read-only planning turn over the native path and fails if the
+run exhausts its turn budget instead of answering, or if reasoning-channel text
+reaches the user-visible answer — the nightly regression guard for issue #1418,
+where a mismatched `--reasoning-parser` made Claude Code loop and render its
+reasoning as the plan. It can also run independently
 through the `run_claude_acceptance` workflow-dispatch input. Runtime pins must be
 complete; the job fails fast with an explanatory error if any required value is
 empty or still contains `TBD`.

@@ -283,6 +283,62 @@ async fn filter_results_are_published_under_this_filter() {
     );
 }
 
+/// A passthrough chain consumes no state, so it can opt out of building it.
+/// Classification is still published, since routing depends on it.
+#[tokio::test]
+async fn initialize_state_false_classifies_without_building_state() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "stream": true})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "classification is still published so routing is unaffected"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.stream")
+            .map(String::as_str),
+        Some("true"),
+        "promoted routing facts are still published"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state is built when the chain opted out"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("responses.response_id"),
+        "no identifier is generated when the chain opted out"
+    );
+}
+
+/// The default is unchanged, so an existing chain keeps its state.
+#[tokio::test]
+async fn state_is_initialized_by_default() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "omitting initialize_state must keep the previous behaviour"
+    );
+}
+
 #[tokio::test]
 async fn bodyless_responses_operations_are_left_alone() {
     // The registry declares these as carrying no body, so there is nothing to
@@ -582,4 +638,212 @@ fn the_filter_declares_bounded_buffering() {
         filter.request_body_mode(),
         BodyMode::StreamBuffer { max_bytes: Some(_) }
     ));
+}
+
+// -----------------------------------------------------------------------------
+// Bound-upstream phase and response teardown
+// -----------------------------------------------------------------------------
+
+#[test]
+fn declares_both_request_body_phases() {
+    let filter = default_filter();
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadOnly,
+        "a chain must be able to defer this filter until a provider is bound"
+    );
+}
+
+#[test]
+fn declares_a_streamed_response_body() {
+    let filter = default_filter();
+    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+    assert!(
+        matches!(filter.response_body_mode(), BodyMode::Stream),
+        "the response path is teardown only and must not buffer"
+    );
+}
+
+/// The bound-upstream phase initializes the same state as the pre-read phase.
+///
+/// Core schedules one hook or the other, never both, so the two must agree:
+/// a chain that defers this filter behind a `bound_upstream` condition has to
+/// end up with the same `ResponsesState` a pre-read chain would produce.
+#[tokio::test]
+async fn the_bound_upstream_phase_initializes_state_like_the_pre_read_phase() {
+    let body = json!({"model": "gpt-4.1", "input": "Hello"});
+
+    let filter = default_filter();
+    let request = create_request();
+    let mut pre_read_ctx = make_filter_context(&request);
+    let mut pre_read_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+    let pre_read_action = filter
+        .on_request_body(&mut pre_read_ctx, &mut pre_read_bytes, true)
+        .await
+        .unwrap();
+    assert!(matches!(pre_read_action, FilterAction::Release));
+
+    let mut bound_ctx = make_filter_context(&request);
+    let mut bound_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+    let outcome = filter
+        .on_bound_upstream_request_body(&mut bound_ctx, &mut bound_bytes)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+
+    let pre_read_state = pre_read_ctx.extensions.get::<ResponsesState>().unwrap();
+    let bound_state = bound_ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        pre_read_state.input, bound_state.input,
+        "both phases must derive state from the same parse"
+    );
+    assert!(
+        bound_state
+            .response_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("resp_")),
+        "the bound-upstream phase must mint a proxy-owned response identifier"
+    );
+}
+
+/// A managed `background: true` create is still rejected after binding.
+#[tokio::test]
+async fn the_bound_upstream_phase_still_rejects_managed_background() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut bytes = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "Hello", "background": true})).unwrap(),
+    ));
+
+    let outcome = filter
+        .on_bound_upstream_request_body(&mut ctx, &mut bytes)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, BoundUpstreamBodyOutcome::Reject(_)),
+        "managed background mode is unsupported in either phase"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "a rejected create must not leave Responses state behind"
+    );
+}
+
+/// A bodyless operation passes through the bound-upstream phase untouched.
+#[tokio::test]
+async fn the_bound_upstream_phase_releases_a_bodyless_operation() {
+    let filter = default_filter();
+    let request = make_request(http::Method::GET, "/v1/responses/resp_123");
+    let mut ctx = make_filter_context(&request);
+    let mut bytes = None;
+
+    let outcome = filter
+        .on_bound_upstream_request_body(&mut ctx, &mut bytes)
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "a fetch carries no body to process and must gain no state"
+    );
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+#[tokio::test]
+async fn response_teardown_drains_the_mcp_session_pool_at_eos() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_none(),
+        "outer response EOS must not leave live session ownership in request extensions"
+    );
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+#[tokio::test]
+async fn response_teardown_keeps_the_pool_before_eos() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+    let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_some(),
+        "streamed chunks must retain the pool for later agentic rounds"
+    );
+}
+
+/// A managed create with a conversation publishes what append-back needs.
+///
+/// `capture_validated_append_owner` runs right after the canonical conversation
+/// ID is published, and it only captures when these three facts hold. The
+/// captured owner itself is private to the Conversations filter, so this asserts
+/// the preconditions this filter owns; that the owner is actually captured and
+/// the turn persists under it is covered by the integration suite.
+#[cfg(feature = "openai-conversations")]
+#[tokio::test]
+async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut bytes = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": "Hello",
+            "conversation": "conv_abc123",
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.has_conversation"),
+        Some("true"),
+        "append-back is armed by the conversation selector"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.conversation_id"),
+        Some("conv_abc123"),
+        "the canonical conversation ID must be published before the owner is captured"
+    );
+    assert_ne!(
+        ctx.get_metadata("openai_responses_format.background"),
+        Some("true"),
+        "a background create does not arm local append-back"
+    );
+}
+
+/// A create without a conversation does not arm append-back.
+#[cfg(feature = "openai-conversations")]
+#[tokio::test]
+async fn a_create_without_a_conversation_does_not_arm_append_back() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut bytes = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "Hello"})).unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap());
+
+    assert_ne!(
+        ctx.get_metadata("openai_responses_format.has_conversation"),
+        Some("true"),
+        "no conversation selector means no local append-back"
+    );
 }

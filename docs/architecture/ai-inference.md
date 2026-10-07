@@ -141,12 +141,14 @@ Classifies AI API request bodies and promotes format,
 model, stream, store, background, and mode to
 headers, metadata, and filter results.
 
-### `openai_responses_validate`
+### `openai_responses_request`
 
-Parses Responses API request JSON, enriches filter metadata,
+Parses Responses API request JSON once, enriches filter metadata,
 and generates cryptographically random response and
 conversation IDs with `resp_` and `conv_` prefixes.
 Provider-owned parameter combinations pass through unchanged.
+Offers both the pre-read and bound-upstream body phases, so a
+chain can defer it until a logical provider is bound.
 
 ### `anthropic_messages_format`
 
