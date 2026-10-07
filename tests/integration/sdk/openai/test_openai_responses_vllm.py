@@ -7571,6 +7571,7 @@ listeners:
 filter_chains:
   - name: file-search-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
       - filter: openai_responses_request

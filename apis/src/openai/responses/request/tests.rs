@@ -34,9 +34,33 @@ fn create_request() -> Request {
     make_request(http::Method::POST, "/v1/responses")
 }
 
+/// Publish the operation match `ai_operation` produces for this request's head.
+///
+/// The consumer consumes operation identity from the typed match the classifier
+/// publishes, so every test must stage that match first. Running the real
+/// classifier — through the same body hook core drives in a `StreamBuffer`
+/// pre-read — exercises the production two-filter handoff rather than a
+/// hand-built extension.
+async fn classify_head(ctx: &mut HttpFilterContext<'_>) {
+    let classifier =
+        crate::operation_classifier::AiOperationFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    drop(classifier.on_request_body(ctx, &mut None, true).await.unwrap());
+}
+
+/// Build a filter context with the operation match already published.
+///
+/// Mirrors the chain order the workaround requires: `ai_operation` ahead of
+/// `openai_responses_request`, so the match is in extensions before the consumer
+/// reads it.
+async fn classified_context(request: &Request) -> HttpFilterContext<'_> {
+    let mut ctx = make_filter_context(request);
+    classify_head(&mut ctx).await;
+    ctx
+}
+
 /// Drive one body through the filter and return the action.
 async fn run(filter: &dyn HttpFilter, request: &Request, body: &serde_json::Value) -> FilterAction {
-    let mut ctx = make_filter_context(request);
+    let mut ctx = classified_context(request).await;
     let mut bytes = Some(Bytes::from(serde_json::to_vec(body).unwrap()));
     filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap()
 }
@@ -70,7 +94,7 @@ fn assert_prompt_template_rejection(action: FilterAction) {
 
 /// Drive one streaming create request and return its context.
 async fn run_streaming_create<'a>(filter: &dyn HttpFilter, request: &'a Request) -> HttpFilterContext<'a> {
-    let mut ctx = make_filter_context(request);
+    let mut ctx = classified_context(request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "stream": true})).unwrap(),
     ));
@@ -134,7 +158,7 @@ async fn a_create_request_publishes_validated_facts_and_state_from_one_parse() {
 async fn classification_leaves_the_body_intact_for_state() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
@@ -155,7 +179,7 @@ async fn classification_leaves_the_body_intact_for_state() {
 async fn a_model_only_create_is_classified_from_the_endpoint() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-5"})).unwrap()));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -199,7 +223,7 @@ async fn a_model_only_background_create_is_still_rejected() {
 async fn a_matched_operation_overrides_body_shape() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]})).unwrap(),
     ));
@@ -220,6 +244,54 @@ async fn a_matched_operation_overrides_body_shape() {
     assert!(
         ctx.filter_metadata.contains_key("responses.response_id"),
         "a Responses create mints its proxy-owned identifier"
+    );
+}
+
+/// Operation identity is sourced only from the published match. Without one —
+/// `ai_operation` missing or ordered after this filter — the consumer forwards
+/// the request untouched rather than re-matching the route itself.
+#[tokio::test]
+async fn the_consumer_releases_without_a_published_match() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-5", "input": "hi"})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a create body on /v1/responses is not processed without the operation match"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state is built when the operation identity is absent"
+    );
+}
+
+/// A published match for another protocol is not a Responses request. The
+/// consumer branches on the match's protocol, so a Chat Completions match — even
+/// one carrying a Responses-shaped body — is released untouched.
+#[tokio::test]
+async fn a_non_responses_match_is_released() {
+    let filter = default_filter();
+    let request = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-5", "input": "hi"})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a Chat Completions match must not be processed as a Responses request"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no Responses state is built for another protocol's match"
     );
 }
 
@@ -257,7 +329,7 @@ fn dedicated_default_header_targets_are_accepted() {
 async fn filter_results_are_published_under_this_filter() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
@@ -287,7 +359,7 @@ async fn filter_results_are_published_under_this_filter() {
 async fn initialize_state_false_classifies_without_building_state() {
     let filter = filter("initialize_state: false\n");
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "stream": true})).unwrap(),
     ));
@@ -327,7 +399,7 @@ async fn initialize_state_false_classifies_without_building_state() {
 async fn a_facts_publisher_retains_no_parse_by_default() {
     let filter = filter("initialize_state: false\n");
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
@@ -353,7 +425,7 @@ async fn a_facts_publisher_retains_no_parse_by_default() {
 async fn cache_parse_for_owner_retains_the_parse() {
     let filter = filter("initialize_state: false\ncache_parse_for_owner: true\n");
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
@@ -375,7 +447,7 @@ async fn cache_parse_for_owner_retains_the_parse() {
 async fn state_is_initialized_by_default() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
@@ -403,7 +475,7 @@ async fn bodyless_responses_operations_publish_identity_without_state() {
     ] {
         let filter = default_filter();
         let request = make_request(method.clone(), path);
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = classified_context(&request).await;
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -432,7 +504,7 @@ async fn an_absent_optional_body_is_not_an_invalid_body() {
         // is legitimate and must pass through.
         let filter = filter("on_invalid: reject\n");
         let request = make_request(http::Method::POST, path);
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = classified_context(&request).await;
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -458,7 +530,7 @@ async fn an_absent_optional_body_is_not_an_invalid_body() {
 async fn an_absent_required_body_still_follows_on_invalid() {
     let filter = filter("on_invalid: reject\n");
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -474,7 +546,7 @@ async fn an_absent_required_body_still_follows_on_invalid() {
 async fn a_malformed_optional_body_still_follows_on_invalid() {
     let filter = filter("on_invalid: reject\n");
     let request = make_request(http::Method::POST, "/v1/responses/compact");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from_static(b"{not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -492,7 +564,7 @@ async fn other_body_bearing_responses_operations_are_processed() {
     for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
         let filter = default_filter();
         let request = make_request(http::Method::POST, path);
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = classified_context(&request).await;
         let mut body = Some(Bytes::from(
             serde_json::to_vec(&json!({"model": "gpt-4.1", "previous_response_id": "resp_1"})).unwrap(),
         ));
@@ -519,7 +591,7 @@ async fn other_body_bearing_responses_operations_are_processed() {
 async fn a_non_responses_path_is_left_alone() {
     let filter = default_filter();
     let request = make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "messages": []})).unwrap(),
     ));
@@ -571,7 +643,7 @@ async fn background_mode_is_rejected_before_upstream_contact() {
 async fn prompt_template_is_rejected_before_state_initialization() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
@@ -592,7 +664,7 @@ async fn prompt_template_is_rejected_before_state_initialization() {
 async fn null_prompt_is_allowed() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "prompt": null})).unwrap(),
     ));
@@ -621,7 +693,7 @@ async fn an_unclassifiable_body_follows_on_invalid_continue() {
     ] {
         let filter = default_filter();
         let request = create_request();
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = classified_context(&request).await;
         let mut body = body;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -651,7 +723,7 @@ async fn an_unclassifiable_body_follows_on_invalid_reject() {
     ] {
         let filter = filter("on_invalid: reject\n");
         let request = create_request();
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = classified_context(&request).await;
         let mut body = body;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -664,7 +736,7 @@ async fn an_unclassifiable_body_follows_on_invalid_reject() {
 async fn store_and_background_defaults_follow_the_specification() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
@@ -731,7 +803,7 @@ async fn the_bound_upstream_phase_initializes_state_like_the_pre_read_phase() {
 
     let filter = default_filter();
     let request = create_request();
-    let mut pre_read_ctx = make_filter_context(&request);
+    let mut pre_read_ctx = classified_context(&request).await;
     let mut pre_read_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
     let pre_read_action = filter
         .on_request_body(&mut pre_read_ctx, &mut pre_read_bytes, true)
@@ -739,7 +811,7 @@ async fn the_bound_upstream_phase_initializes_state_like_the_pre_read_phase() {
         .unwrap();
     assert!(matches!(pre_read_action, FilterAction::Release));
 
-    let mut bound_ctx = make_filter_context(&request);
+    let mut bound_ctx = classified_context(&request).await;
     let mut bound_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
     let outcome = filter
         .on_bound_upstream_request_body(&mut bound_ctx, &mut bound_bytes)
@@ -782,7 +854,7 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
     let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
     let managed = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
 
     let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
     let facts_action = facts.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
@@ -824,7 +896,7 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
 async fn the_bound_upstream_phase_still_rejects_managed_background() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut bytes = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "Hello", "background": true})).unwrap(),
     ));
@@ -849,7 +921,7 @@ async fn the_bound_upstream_phase_still_rejects_managed_background() {
 async fn the_bound_upstream_phase_releases_a_bodyless_operation() {
     let filter = default_filter();
     let request = make_request(http::Method::GET, "/v1/responses/resp_123");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut bytes = None;
 
     let outcome = filter
@@ -869,7 +941,7 @@ async fn the_bound_upstream_phase_releases_a_bodyless_operation() {
 async fn response_teardown_drains_the_mcp_session_pool_at_eos() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -886,7 +958,7 @@ async fn response_teardown_drains_the_mcp_session_pool_at_eos() {
 async fn response_teardown_keeps_the_pool_before_eos() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
 
     let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
@@ -910,7 +982,7 @@ async fn response_teardown_keeps_the_pool_before_eos() {
 async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut bytes = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
@@ -946,7 +1018,7 @@ async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() 
 async fn a_create_without_a_conversation_does_not_arm_append_back() {
     let filter = default_filter();
     let request = create_request();
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = classified_context(&request).await;
     let mut bytes = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "Hello"})).unwrap(),
     ));
@@ -967,7 +1039,7 @@ async fn a_create_without_a_conversation_does_not_arm_append_back() {
 /// Drive one create body through the default filter and return its context.
 async fn run_ctx<'a>(config_yaml: &str, request: &'a Request, body: &serde_json::Value) -> HttpFilterContext<'a> {
     let filter = filter(config_yaml);
-    let mut ctx = make_filter_context(request);
+    let mut ctx = classified_context(request).await;
     let mut bytes = Some(Bytes::from(serde_json::to_vec(body).unwrap()));
     let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
     assert!(

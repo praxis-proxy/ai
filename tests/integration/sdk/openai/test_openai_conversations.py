@@ -306,6 +306,7 @@ def _write_passthrough_config(port: int, backend_port: int) -> str:
             {
                 "name": "passthrough-pipeline",
                 "filters": [
+                    {"filter": "ai_operation"},
                     {
                         "filter": "openai_responses_request",
                         "on_invalid": "continue",
@@ -379,6 +380,7 @@ def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -
             {
                 "name": "responses-test-pipeline",
                 "filters": [
+                    {"filter": "ai_operation"},
                     {
                         "filter": "state_owner",
                         "mode": "trusted_owner",

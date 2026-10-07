@@ -95,6 +95,39 @@ fn chat_completions_routes_to_chat_cluster() {
 }
 
 #[test]
+fn responses_url_with_chat_shaped_body_routes_to_responses_cluster() {
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let chat_guard = start_backend_with_shutdown("chat-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = routing_yaml(
+        proxy_port,
+        responses_guard.port(),
+        chat_guard.port(),
+        default_guard.port(),
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // A Chat-Completions-shaped body (`messages`, no `input`) posted to the
+    // Responses create URL. `ai_operation` matches the operation from the
+    // request head, so the published protocol is `openai_responses` and the
+    // Chat branch never fires; body shape must not override the URL-derived
+    // operation identity.
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "responses URL should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "responses-backend",
+        "a Chat-shaped body on the Responses URL must route by the matched \
+         operation, not the body shape"
+    );
+}
+
+#[test]
 fn unclassified_request_routes_to_default_cluster() {
     let responses_guard = start_backend_with_shutdown("responses-backend");
     let chat_guard = start_backend_with_shutdown("chat-backend");
@@ -899,6 +932,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -928,6 +962,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject
@@ -957,6 +992,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
       - filter: router
@@ -1019,6 +1055,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         branch_chains:
@@ -1114,6 +1151,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         branch_chains:
@@ -1169,6 +1207,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
       - filter: router
@@ -1211,6 +1250,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
       - filter: router

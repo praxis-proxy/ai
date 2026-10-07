@@ -434,6 +434,7 @@ filter_chains:
         credentials:
           - slot: ogx_files
             source_header: x-user-ogx-key
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -695,6 +696,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -796,6 +798,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -935,6 +938,7 @@ filter_chains:
         credentials:
           - slot: ogx_files
             source_header: x-user-ogx-key
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1063,6 +1067,7 @@ filter_chains:
 
   - name: file-resolve-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue

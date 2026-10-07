@@ -1552,6 +1552,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject
@@ -1614,6 +1615,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject
@@ -1680,6 +1682,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject
@@ -1719,6 +1722,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1750,6 +1754,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1782,6 +1787,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1813,6 +1819,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1845,6 +1852,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -1882,6 +1890,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue

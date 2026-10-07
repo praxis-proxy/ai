@@ -194,6 +194,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue

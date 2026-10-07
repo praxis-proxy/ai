@@ -3,12 +3,16 @@
 
 //! Request-body fact owner for body-bearing Responses operations.
 //!
-//! Operation identity comes from the request head through the Responses
-//! registry — the same source `ai_operation` uses — so the body is never
-//! inspected to decide whether this filter applies. A matched request is then
-//! deserialized once, and that one parsed value produces every downstream fact:
-//! the classification metadata, the promoted routing headers and filter
-//! results, the proxy-owned identifiers, and [`ResponsesState`].
+//! Operation identity is consumed from the typed `AiOperationMatch` that the
+//! `ai_operation` classifier publishes from the request head, so the body is
+//! never inspected to decide whether this filter applies and the identity is not
+//! re-derived here. `ai_operation` is ordered ahead of this filter in every chain
+//! and declares a read-only body hook, so its match is available even under the
+//! buffered body pre-read this filter triggers — the AI-only workaround for
+//! praxis-proxy/praxis#1142, whose limit is noted on [`matched_responses_operation`].
+//! A matched request is then deserialized once, and that one parsed value produces
+//! every downstream fact: the classification metadata, the promoted routing
+//! headers and filter results, the proxy-owned identifiers, and [`ResponsesState`].
 //!
 //! The filter runs in one of two roles, chosen by `initialize_state`:
 //!
@@ -59,7 +63,8 @@ use super::{
 };
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
-    operation::{RequestBody, Transport},
+    operation::RequestBody,
+    operation_classifier::AiOperationMatch,
 };
 
 /// Filter name as configured in a pipeline.
@@ -484,21 +489,22 @@ fn handle_unclassifiable(
     Ok(FilterAction::Release)
 }
 
-/// Classify a body on an operation the request head already identified as Responses.
+/// Classify a body on an operation `ai_operation` already identified as Responses.
 ///
-/// The matched operation is authoritative over body heuristics, so the format is
-/// `openai_responses` regardless of the body's shape. A valid create body may
-/// omit every discriminator the heuristics look for — `{"model":"gpt-5"}` is a
-/// legitimate create request — and a body whose keys resemble Chat Completions or
-/// Anthropic Messages is still a Responses request on `POST /v1/responses`.
-/// Publishing the body-derived format instead would let one request's JSON shape
-/// override the operation identity: the router would miss the Responses cluster,
-/// downstream Responses filters would skip the request, and `background: true`
-/// would slip past a rejection that keys off the published format.
+/// The consumed [`AiOperationMatch`] is authoritative over body heuristics, so the
+/// format is `openai_responses` regardless of the body's shape. A valid create
+/// body may omit every discriminator the heuristics look for — `{"model":"gpt-5"}`
+/// is a legitimate create request — and a body whose keys resemble Chat
+/// Completions or Anthropic Messages is still a Responses request on
+/// `POST /v1/responses`. Deriving the format from the body instead would let one
+/// request's JSON shape override the operation identity: the router would miss the
+/// Responses cluster, downstream Responses filters would skip the request, and
+/// `background: true` would slip past a rejection that keys off the published
+/// format.
 ///
 /// The remaining facts — model, stream, store, and the stateful markers — are
 /// still read from the body, since routing and state depend on them; only the
-/// protocol identity is fixed by the endpoint.
+/// protocol identity is fixed by the matched operation.
 fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
     let mut classified = classify_object(obj);
     classified.format = AiRequestFormat::Responses;
@@ -508,21 +514,23 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// The Responses operation the request head resolves to, with its declared
 /// request-body shape.
 ///
-/// Resolved from the request head through the shared registry — the same source
-/// of truth the `ai_operation` classifier uses — so no body heuristic decides
-/// whether this filter applies, and the filter works whether or not the
-/// classifier is present in the chain.
+/// Consumed from the typed [`AiOperationMatch`] that `ai_operation` publishes
+/// from the request head, so operation identity, protocol, and body shape all
+/// come from the one head classification rather than a second route lookup here.
+/// `ai_operation` is ordered ahead of this filter in every chain and declares a
+/// read-only body hook, so its match is in `ctx.extensions` even under the
+/// buffered body pre-read this filter's `BodyMode::StreamBuffer` triggers — core
+/// runs that pre-read in pipeline order, so the earlier filter publishes first.
 ///
-/// This re-matches the route rather than consuming the typed `AiOperationMatch`
-/// that `ai_operation` publishes, and that is deliberate on the current core.
-/// This filter reads the body with `BodyMode::StreamBuffer`, and praxis runs the
-/// buffered body pre-read before `ai_operation`'s request hook, so the match is
-/// not yet in `ctx.extensions` when this body hook runs. praxis-filter exposes no
-/// request-head phase this filter could hook instead. Both resolve the route from
-/// the same registry against the same method and path, so the two always agree;
-/// consuming the published match here waits on praxis-proxy/praxis#1142, which
-/// adds the early request-head phase. Matching on method and path alone keeps the
-/// operation identity authoritative over body shape either way.
+/// Only a match whose protocol is Responses is returned; another protocol's
+/// match (Chat Completions, Anthropic, Conversations), or no match at all, yields
+/// `None` and the request is released untouched. The requirement that
+/// `ai_operation` precede this filter is the AI-only workaround for
+/// praxis-proxy/praxis#1142: core exposes no request-head phase before the
+/// buffered pre-read, so a separate head classifier ordered first supplies the
+/// identity. The limit is stated with that issue: core can still reject an
+/// oversized body with a 413 before the first body hook runs, so this does not
+/// give #1142's guarantee of classification ahead of all pre-read work.
 ///
 /// Every matched Responses operation is returned, body-bearing or not: the
 /// endpoint is authoritative that the request is Responses even when there is no
@@ -530,15 +538,16 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// items, and the `WebSocket` handshake — still need their format fact promoted
 /// so header-based routing reaches the managed path; the caller inspects
 /// [`MatchedOperation::body`] to decide between publishing operation identity
-/// only and parsing a create body. A request that matches no Responses route
-/// (Chat Completions, Anthropic, `GET /`) yields `None` and is released
-/// untouched.
+/// only and parsing a create body.
 fn matched_responses_operation(ctx: &HttpFilterContext<'_>) -> Option<MatchedOperation> {
-    responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http).map(|route| {
-        MatchedOperation {
-            operation: route.spec.operation,
-            body: route.spec.request_body(),
-        }
+    let matched = ctx.extensions.get::<AiOperationMatch>()?;
+    if matched.application_protocol != responses_routes::APPLICATION_PROTOCOL {
+        return None;
+    }
+    let operation = responses_routes::operation_for_id(matched.operation_id)?;
+    Some(MatchedOperation {
+        operation,
+        body: matched.request_body,
     })
 }
 

@@ -416,7 +416,8 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
 fn is_replay_contained_filter(filter_type: &str) -> bool {
     matches!(
         filter_type,
-        "openai_agentic_loop"
+        "ai_operation"
+            | "openai_agentic_loop"
             | "anthropic_messages_format"
             | "anthropic_messages_protocol"
             | "anthropic_messages_to_chat_completions"

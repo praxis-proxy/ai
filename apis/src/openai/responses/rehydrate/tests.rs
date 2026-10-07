@@ -330,6 +330,7 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router

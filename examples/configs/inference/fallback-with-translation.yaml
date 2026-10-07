@@ -43,8 +43,11 @@
 #     which the router sets
 #
 # Pre-IRR filters:
-#   The facts openai_responses_request classifies the request; the owner
-#   openai_responses_request rejects malformed bodies before the IRR
+#   ai_operation publishes the typed operation identity once as a request
+#   extension. Extensions persist across IRR steps, so the per-step
+#   openai_responses_request passes consume the same match without re-adding
+#   ai_operation. The facts openai_responses_request classifies the request;
+#   the owner openai_responses_request rejects malformed bodies before the IRR
 #   allocates sub-request resources.
 #
 # Adapting for real providers:
@@ -69,6 +72,10 @@ listeners:
 filter_chains:
   - name: inference-failover
     filters:
+      # Publishes the typed operation consumed by every openai_responses_request
+      # pass below, including the per-IRR-step passes (extensions persist).
+      - filter: ai_operation
+
       - filter: openai_responses_request
         initialize_state: false
         cache_parse_for_owner: true

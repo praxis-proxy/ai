@@ -90,6 +90,7 @@ listeners:
 filter_chains:
   - name: classify_refused
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -107,6 +108,7 @@ filter_chains:
 
   - name: classify_timeout
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue

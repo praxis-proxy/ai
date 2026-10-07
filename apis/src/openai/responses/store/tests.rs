@@ -1858,6 +1858,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router
@@ -1967,6 +1968,7 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: openai_response_store
@@ -2076,6 +2078,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router
@@ -2204,6 +2207,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router
@@ -2296,6 +2300,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router
@@ -2437,6 +2442,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
+- filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
 - filter: router

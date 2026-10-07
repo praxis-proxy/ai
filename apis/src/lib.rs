@@ -207,6 +207,10 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
+            http "ai_operation" => crate::operation_classifier::AiOperationFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
             http "openai_responses_request" => crate::openai::OpenaiResponsesRequestFilter::from_config
         );
         praxis_filter::register_filters!(

@@ -562,6 +562,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -641,6 +642,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
@@ -740,6 +742,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
+      - filter: ai_operation
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
