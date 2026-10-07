@@ -1287,6 +1287,8 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["messages_to_chat_completions"],
             ]
         );
@@ -1357,11 +1359,13 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 60, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 48, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 53, "manifest recording inventory count");
+        assert_eq!(report.features_total, 62, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 49, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 54, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1412,10 +1416,11 @@ mod tests {
                 "responses/native-continuation",
                 "responses/native-continuation-stream",
                 "responses/native-tool-call",
+                "vertex/bounded-stream-limits",
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 60, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 62, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1697,6 +1702,14 @@ mod tests {
                 (
                     &"vertex.gemini.response.text_metadata".to_owned(),
                     &vec!["vertex/invalid-content".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.streaming.candidate_limit".to_owned(),
+                    &vec!["vertex/bounded-stream-limits".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.streaming.tool_slot_limit".to_owned(),
+                    &vec!["vertex/bounded-stream-limits".to_owned()]
                 ),
                 (
                     &"messages.error.malformed_success_status".to_owned(),
