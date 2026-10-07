@@ -4,7 +4,7 @@ Thank you for your interest in contributing! Start by
 reading the [development conventions]. Submissions that
 do not follow the conventions will be rejected.
 
-[development conventions]: docs/conventions.md
+[development conventions]: .github/CONTRIBUTING.md
 
 ## Getting Started
 
@@ -13,9 +13,9 @@ do not follow the conventions will be rejected.
 3. Build and test: `make build && make test`
 4. Run every gate locally before pushing: `make all`
 
-Requirements are listed in [docs/development.md].
+Requirements are listed in the [development setup guide].
 
-[docs/development.md]: docs/development.md
+[development setup guide]: docs/developing/getting-started.md#requirements
 
 ## Picking Up an Issue
 
@@ -27,7 +27,7 @@ self-assign something outside these rules, a bot unassigns
 it and points you back here. See [Picking Up Work] for the
 full policy.
 
-[Picking Up Work]: docs/development.md#picking-up-work
+[Picking Up Work]: docs/developing/project-management.md#bot-generated-issues
 
 ## Larger Changes
 
@@ -50,4 +50,4 @@ CI enforces reviewability on every PR:
 
 See the [PR conventions] section for details and override labels.
 
-[PR conventions]: docs/conventions.md#pull-request-conventions
+[PR conventions]: .github/CONTRIBUTING.md#pr-review-process
