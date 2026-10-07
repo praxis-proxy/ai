@@ -431,6 +431,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.mcp_namespace_lower_restore
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-mcp-namespace
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.stream_restore
     scopes:
       - responses_client_tool_compat

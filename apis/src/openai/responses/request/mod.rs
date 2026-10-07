@@ -76,7 +76,12 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
 /// Rejects `background=true` and non-null `prompt` with a 400, the
-/// managed-path policy this filter now owns.
+/// managed-path policy this filter now owns. A non-null `prompt` is the
+/// deprecated OpenAI reusable prompt object (`{ id, version, variables }`);
+/// OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients
+/// should move its content into `input` rather than rely on the gateway to
+/// resolve the saved object. Prefer `input` over top-level `instructions`,
+/// which managed-path content-policy extraction does not screen.
 ///
 /// Promotes `openai_responses_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates

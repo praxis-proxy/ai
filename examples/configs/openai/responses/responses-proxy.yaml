@@ -8,8 +8,11 @@
 #
 # This is a low-level protocol-adapter example, not a complete managed-provider
 # pipeline. It intentionally omits `openai_responses_request`, so provider-owned
-# fields such as `prompt` pass through unchanged. Use full-flow-agentic.yaml when
-# the gateway must bind provider ownership and enforce managed-route policy.
+# fields such as `prompt` pass through unchanged. (An object-valued `prompt` is
+# OpenAI's deprecated reusable prompt object, retired with v1/prompts on
+# 2026-11-30; it only resolves against an OpenAI-owned upstream, and new clients
+# should send prompt content via input.) Use full-flow-agentic.yaml
+# when the gateway must bind provider ownership and enforce managed-route policy.
 # The JSON response is relayed back to the client.
 
 listeners:

@@ -60,7 +60,9 @@ fn assert_prompt_template_rejection(action: FilterAction) {
         );
         assert_eq!(
             body.pointer("/error/message").and_then(serde_json::Value::as_str),
-            Some("prompt templates are supported only for OpenAI-owned upstreams"),
+            Some(
+                "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
+            ),
             "prompt template rejection must explain the provider-binding requirement"
         );
     }

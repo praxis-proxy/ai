@@ -136,6 +136,54 @@ fn namespace_member_name_hashed_form_is_disjoint_from_verbatim() {
 }
 
 #[test]
+fn namespace_member_name_hashes_pairs_whose_verbatim_split_is_ambiguous() {
+    // A component that embeds the `__` delimiter — or abuts it with a boundary `_` —
+    // makes the verbatim `agentic_ns__{namespace}__{member}` form re-split into two
+    // distinct pairs. Such a pair takes the hashed branch, whose input is an injective
+    // encoding of the pair, so the two alternative splits land on different wires.
+    for (left, right) in [(("a", "b__c"), ("a__b", "c")), (("a_", "b"), ("a", "_b"))] {
+        let left_flat = namespace_member_name(left.0, left.1);
+        let right_flat = namespace_member_name(right.0, right.1);
+        assert_eq!(
+            format!("{NAMESPACE_MEMBER_PREFIX}{}__{}", left.0, left.1),
+            format!("{NAMESPACE_MEMBER_PREFIX}{}__{}", right.0, right.1),
+            "the two pairs share a verbatim flattening, which is what makes them ambiguous"
+        );
+        assert_ne!(
+            left_flat, right_flat,
+            "the ambiguous pairs must not collapse onto one wire name"
+        );
+        for flat in [&left_flat, &right_flat] {
+            assert!(
+                flat.contains("___"),
+                "an ambiguous pair takes the hashed branch: {flat}"
+            );
+            assert!(
+                is_valid_function_name(flat),
+                "the hashed name stays schema-valid: {flat}"
+            );
+        }
+    }
+}
+
+#[test]
+fn namespace_member_name_keeps_codex_mcp_groups_readable() {
+    // Codex names an MCP tool namespace `mcp__{server}`, so the delimiter is routine in
+    // real client traffic. The pair is ambiguous and therefore hashed, but the readable
+    // prefix is retained so the model still sees which group a member belongs to. The
+    // exact wire name is pinned here because the integration suite asserts it verbatim.
+    let flat = namespace_member_name("mcp__codex_tui", "read_file");
+    assert_eq!(
+        flat, "agentic_ns__mcp__codex_tui__read_file___68857b231df97733",
+        "the readable prefix survives the hashed branch and the hash is stable"
+    );
+    assert!(
+        is_valid_function_name(&flat),
+        "the hashed name stays schema-valid: {flat}"
+    );
+}
+
+#[test]
 fn custom_public_item_id_prefixes_and_hashes() {
     assert_eq!(custom_public_item_id("ctc_keep"), "ctc_keep");
     assert_eq!(custom_public_item_id("fc_abc"), "ctc_abc");
@@ -3734,40 +3782,47 @@ fn client_tool_named_a_near_miss_of_a_hosted_tool_is_not_rejected() {
 }
 
 #[test]
-fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
-    // A `namespace` group name or member name carrying the `__` flattening delimiter
-    // would make its flattened wire name ambiguous with a distinct namespace/member
-    // pair, so both fail closed up front on either lowering path.
-    for tool in [
-        json!({
-            "type": "namespace",
-            "name": "a__b",
-            "description": "Ambiguous group name.",
-            "tools": [{"type": "function", "name": "c", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace",
-            "name": "a",
-            "description": "Ambiguous member name.",
-            "tools": [{"type": "function", "name": "b__c", "parameters": {"type": "object"}}]
-        }),
+fn namespace_name_embedding_the_delimiter_lowers_through_the_hashed_branch() {
+    // Codex names an MCP tool namespace `mcp__{server}` and its members
+    // `mcp__{server}__{tool}`, so the `__` flattening delimiter is routine in real
+    // client traffic and must not fail closed. The verbatim wire name would re-split
+    // ambiguously, so such a pair is flattened through the hashed branch instead — on
+    // both lowering paths.
+    for (tool, namespace, member) in [
+        (
+            json!({
+                "type": "namespace",
+                "name": "mcp__codex_tui",
+                "description": "Codex MCP tools.",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]
+            }),
+            "mcp__codex_tui",
+            "shell",
+        ),
+        (
+            json!({
+                "type": "namespace",
+                "name": "utils",
+                "description": "Delimiter in the member name.",
+                "tools": [{"type": "function", "name": "mcp__read", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "mcp__read",
+        ),
     ] {
+        let flat = namespace_member_name(namespace, member);
+
         // Declaration path.
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool.clone()] }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a namespace name embedding the reserved delimiter fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(
-            status, 400,
-            "the reserved delimiter is rejected on the declaration path"
-        );
+            .expect("a namespace embedding the delimiter lowers on the declaration path");
         assert!(
-            message.contains("delimiter") && message.contains(NAMESPACE_NAME_DELIMITER),
-            "the rejection names the reserved delimiter: {message}"
+            state.client_tool_lowering.contains_key(&flat),
+            "the declared member is registered under its hashed wire name"
         );
 
-        // Discovery path: the same reservation applies to a hoisted namespace.
+        // Discovery path: a hoisted namespace flattens the same way.
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [{"type": "tool_search"}],
             "input": [
@@ -3776,34 +3831,75 @@ fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
                 {"type": "tool_search_output", "call_id": "call_1", "tools": [tool]}
             ],
         }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a discovered namespace embedding the reserved delimiter fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(status, 400, "the reserved delimiter is rejected on the discovery path");
+            .expect("a namespace embedding the delimiter lowers on the discovery path");
         assert!(
-            message.contains("delimiter"),
-            "the discovery-path rejection names the reserved delimiter: {message}"
+            state.client_tool_lowering.contains_key(&flat),
+            "the discovered member is registered under its hashed wire name"
         );
     }
 }
 
 #[test]
-fn deferred_namespace_member_colliding_via_reserved_delimiter_fails_closed() {
-    // The namespace-internal analogue of the top-level cap bypass: a deferred member
-    // `a`/`b__c` and a genuinely distinct discovered member `a__b`/`c` both flatten to
-    // `agentic_ns__a__b__c`. The deferred member is withheld (never claimed), so without
-    // the delimiter reservation the discovery-path reclaim would credit the discovered
-    // member against the withheld one, admitting two logical tools under a cap of one.
-    // Reserving the delimiter fails the deferred declaration closed before it is withheld.
+fn codex_mcp_namespace_member_round_trips_through_lowering_and_restoration() {
+    // End-to-end shape of the Codex traffic the delimiter reservation used to reject: a
+    // `mcp__{server}` group lowers to a flat private function, and the backend's
+    // `function_call` restores to the original namespaced member.
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__codex_tui",
+            "description": "Codex MCP tools.",
+            "tools": [{"type": "function", "name": "read_file", "parameters": {"type": "object"}}]
+        }],
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("a Codex MCP namespace lowers");
+    let flat = namespace_member_name("mcp__codex_tui", "read_file");
+    let tools = state.request_body["tools"].as_array().expect("outbound tools");
+    assert_eq!(tools.len(), 1, "the group flattens to its single member");
+    assert_eq!(tools[0]["type"], "function", "the member lowers to a function");
+    assert_eq!(tools[0]["name"], flat, "the member carries its flat wire name");
+
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": flat,
+            "arguments": "{}",
+            "status": "completed"
+        }],
+    });
+    let item = &restore(&state, &response)["output"][0];
+    assert_eq!(item["name"], "read_file", "the original member name is restored");
     assert_eq!(
+        item["namespace"], "mcp__codex_tui",
+        "the group name is restored verbatim"
+    );
+}
+
+#[test]
+fn deferred_and_discovered_members_sharing_a_verbatim_split_both_count_against_the_cap() {
+    // The namespace-internal cap bypass the delimiter reservation used to prevent: a
+    // deferred member `a`/`b__c` and a genuinely distinct discovered member `a__b`/`c`
+    // share a verbatim flattening. The deferred member is withheld (never claimed), so a
+    // shared wire name would slip past `claim_lowered` and let the discovery-path reclaim
+    // credit the discovered member against the withheld one, admitting two logical tools
+    // under a cap that holds one. Hashing the ambiguous pairs separates the wires, so the
+    // reclaim no longer fires and the second member trips the cap.
+    assert_ne!(
         namespace_member_name("a", "b__c"),
         namespace_member_name("a__b", "c"),
-        "the two distinct members flatten to the same wire name absent the reservation"
+        "the two distinct members must not flatten to one wire name"
     );
+    // A cap of two admits {tool_search, one member}; a correctly counted second member trips it.
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
-        max_client_tools: 1,
+        max_client_tools: 2,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3823,12 +3919,15 @@ fn deferred_namespace_member_colliding_via_reserved_delimiter_fails_closed() {
     }));
     let action = capped
         .lower_request(&mut state, false, false)
-        .expect_err("a deferred member colliding via the reserved delimiter fails closed");
+        .expect_err("two members that share a verbatim split must both count against the cap");
     let (status, message) = reject_parts(&action);
-    assert_eq!(status, 400, "the collision is rejected rather than admitting the pair");
+    assert_eq!(
+        status, 400,
+        "the cap fails closed rather than crediting two tools as one"
+    );
     assert!(
-        message.contains("delimiter"),
-        "the rejection names the reserved delimiter: {message}"
+        message.contains("client tools"),
+        "the rejection names the client-tool cap: {message}"
     );
 }
 
@@ -3856,23 +3955,24 @@ fn namespace_names_with_single_underscores_are_accepted() {
 }
 
 #[test]
-fn namespace_boundary_underscore_colliding_pair_fails_closed() {
-    // The subtler namespace-flattening collision the `__`-substring guard alone misses:
-    // a boundary single `_` merges with the fixed `__` separator into `___`, so distinct
-    // pairs re-split to the same wire name. `a_`/`b` and `a`/`_b` both flatten to
-    // `agentic_ns__a___b`, yet none of the components contains `__`. A deferred member of
+fn namespace_boundary_underscore_pair_both_count_against_the_cap() {
+    // The subtler namespace-flattening collision a `__`-substring rule alone misses: a
+    // boundary single `_` merges with the fixed `__` separator into `___`, so distinct
+    // pairs re-split to the same verbatim wire name. `a_`/`b` and `a`/`_b` both flatten
+    // to `agentic_ns__a___b`, yet neither component contains `__`. A deferred member of
     // one pair (withheld, never claimed) and a discovered member of the other would let
-    // the discovery-path reclaim credit two distinct tools as one — a cap bypass — unless
-    // the boundary underscore is reserved too. Confirm the collision exists, then that it
-    // fails closed at a cap of one.
-    assert_eq!(
+    // the discovery-path reclaim credit two distinct tools as one — a cap bypass — so the
+    // boundary underscore routes to the hashed branch too. Confirm the wires differ, then
+    // that both members count.
+    assert_ne!(
         namespace_member_name("a_", "b"),
         namespace_member_name("a", "_b"),
-        "the boundary underscore makes the two distinct pairs flatten identically"
+        "the boundary-underscore pairs must not flatten identically"
     );
+    // A cap of two admits {tool_search, one member}; a correctly counted second member trips it.
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
-        max_client_tools: 1,
+        max_client_tools: 2,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3892,15 +3992,15 @@ fn namespace_boundary_underscore_colliding_pair_fails_closed() {
     }));
     let action = capped
         .lower_request(&mut state, false, false)
-        .expect_err("a boundary-underscore collision must fail closed rather than reclaim");
+        .expect_err("a boundary-underscore pair must count as two tools rather than reclaim");
     let (status, message) = reject_parts(&action);
     assert_eq!(
         status, 400,
-        "the collision is rejected rather than admitting the pair as one tool"
+        "the cap fails closed rather than admitting the pair as one tool"
     );
     assert!(
-        message.contains("delimiter"),
-        "the rejection names the reserved delimiter: {message}"
+        message.contains("client tools"),
+        "the rejection names the client-tool cap: {message}"
     );
 }
 
@@ -4009,37 +4109,57 @@ fn hash_colliding_deferred_and_discovered_members_both_count_against_the_cap() {
 }
 
 #[test]
-fn namespace_component_leading_or_trailing_underscore_fails_closed() {
-    // Keeping the flattening injective means reserving any boundary `_` that could abut
-    // the `__` separator; the rule is applied symmetrically to both the group name and
-    // member names, on the declaration path, so the behavior is pinned.
-    for tool in [
-        json!({
-            "type": "namespace", "name": "_utils", "description": "Leading-underscore group.",
-            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils_", "description": "Trailing-underscore group.",
-            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils", "description": "Leading-underscore member.",
-            "tools": [{"type": "function", "name": "_read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils", "description": "Trailing-underscore member.",
-            "tools": [{"type": "function", "name": "read_", "parameters": {"type": "object"}}]
-        }),
+fn namespace_component_leading_or_trailing_underscore_lowers_through_the_hashed_branch() {
+    // A boundary `_` that could abut the `__` separator makes the verbatim flattening
+    // ambiguous, so it routes to the hashed branch rather than failing closed. The rule
+    // is applied symmetrically to both the group name and member names, so the behavior
+    // is pinned on each.
+    for (tool, namespace, member) in [
+        (
+            json!({
+                "type": "namespace", "name": "_utils", "description": "Leading-underscore group.",
+                "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+            }),
+            "_utils",
+            "read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils_", "description": "Trailing-underscore group.",
+                "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+            }),
+            "utils_",
+            "read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils", "description": "Leading-underscore member.",
+                "tools": [{"type": "function", "name": "_read", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "_read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils", "description": "Trailing-underscore member.",
+                "tools": [{"type": "function", "name": "read_", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "read_",
+        ),
     ] {
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool] }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a boundary underscore in a namespace component fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(status, 400, "a boundary underscore is a bad request");
+            .expect("a boundary underscore in a namespace component lowers");
+        let flat = namespace_member_name(namespace, member);
         assert!(
-            message.contains("begin or end with '_'"),
-            "the rejection explains the boundary-underscore rule: {message}"
+            flat.contains("___"),
+            "the boundary-underscore pair takes the hashed branch: {flat}"
+        );
+        assert!(
+            state.client_tool_lowering.contains_key(&flat),
+            "the member is registered under its hashed wire name"
         );
     }
 }

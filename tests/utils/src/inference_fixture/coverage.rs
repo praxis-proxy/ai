@@ -1273,6 +1273,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
+                vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
@@ -1346,6 +1347,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
@@ -1363,9 +1365,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 62, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 49, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 54, "manifest recording inventory count");
+        assert_eq!(report.features_total, 63, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 50, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 55, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1409,6 +1411,7 @@ mod tests {
                 "responses/client-tool-compat",
                 "responses/client-tool-compat-chat",
                 "responses/client-tool-compat-chat-stream",
+                "responses/client-tool-compat-mcp-namespace",
                 "responses/client-tool-compat-stream",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
@@ -1420,7 +1423,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 62, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 63, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1641,6 +1644,10 @@ mod tests {
                     &vec!["responses/client-tool-compat".to_owned()]
                 ),
                 (
+                    &"responses.client_tool_compat.mcp_namespace_lower_restore".to_owned(),
+                    &vec!["responses/client-tool-compat-mcp-namespace".to_owned()]
+                ),
+                (
                     &"responses.client_tool_compat.stream_restore".to_owned(),
                     &vec!["responses/client-tool-compat-stream".to_owned()]
                 ),
@@ -1849,7 +1856,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[35..47] {
+        for feature in &manifest.features[35..48] {
             assert_eq!(
                 feature
                     .providers
@@ -1860,14 +1867,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[47]
+            manifest.features[48]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[48..52] {
+        for feature in &manifest.features[49..53] {
             assert_eq!(
                 feature
                     .providers
@@ -1877,7 +1884,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[52..60] {
+        for feature in &manifest.features[53..61] {
             assert_eq!(
                 feature
                     .providers

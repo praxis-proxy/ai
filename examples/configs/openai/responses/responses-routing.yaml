@@ -14,7 +14,8 @@
 # - tools array is non-empty
 # - store is true (the OpenAI spec default when omitted)
 # - conversation is set
-# - prompt.id is set
+# - prompt.id is set  (deprecated reusable prompt object; OpenAI retires it with
+#     v1/prompts on 2026-11-30 — prefer input)
 #
 # Stateless requires store=false and no other stateful markers.
 

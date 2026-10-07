@@ -389,6 +389,12 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// (default when omitted), `conversation`, or `prompt.id`;
 /// `stateless` when `store=false` with no other stateful markers.
 ///
+/// `prompt.id` refers to OpenAI's deprecated reusable prompt object, retired
+/// with `v1/prompts` on 2026-11-30; new clients should send prompt content
+/// through `input` instead of a saved prompt reference. Prefer `input` over
+/// top-level `instructions`, which managed-path content-policy extraction does
+/// not screen.
+///
 /// Use with branch chains to route stateful and stateless requests to
 /// different clusters.
 ///
@@ -598,7 +604,7 @@ fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
         FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "prompt templates are supported only for OpenAI-owned upstreams",
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
         ))
     })
 }
