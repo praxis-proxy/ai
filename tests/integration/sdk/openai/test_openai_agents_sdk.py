@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "openai-agents==0.23.1",
-#     "openai>=3.0.0,<4",
+#     "openai==3.26.0",
 #     "pytest>=8.0",
 # ]
 # ///
@@ -97,6 +97,10 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples/configs/openai/responses/responses-proxy.yaml"
 
 PINNED_AGENTS_VERSION = "0.23.1"
+# openai-agents==0.23.1 resolves openai to this exact 3.x release. Pin it so the
+# required gate runs against the recorded SDK pair, not any floating 3.x; bump
+# both together with the PEP 723 header above.
+PINNED_OPENAI_VERSION = "3.26.0"
 
 MODEL = "praxis-test-model"
 EXPECTED_CITY = "Boston"
@@ -222,7 +226,7 @@ class _Backend:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
         self.scripts: deque[dict[str, Any]] = deque()
 
     def reset(self) -> None:
@@ -234,9 +238,9 @@ class _Backend:
         with self.lock:
             self.scripts.append(body)
 
-    def record(self, path: str, body: dict[str, Any]) -> None:
+    def record(self, method: str, path: str, body: dict[str, Any]) -> None:
         with self.lock:
-            self.requests.append((path, body))
+            self.requests.append((method, path, body))
 
     def take(self) -> dict[str, Any] | None:
         with self.lock:
@@ -299,6 +303,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._relay(504, body, "application/json")
 
     def do_GET(self) -> None:
+        # Record non-POST traffic too: otherwise a GET reaching the backend would
+        # be invisible to the "every round was POST /v1/responses" assertion, which
+        # could then pass despite extra non-POST requests.
+        _STATE.record("GET", self.path, {})
         self.send_response(200)
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
@@ -311,7 +319,7 @@ class _Handler(BaseHTTPRequestHandler):
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             parsed = {"__unparsed__": raw.decode("utf-8", "replace")}
-        _STATE.record(self.path, parsed)
+        _STATE.record("POST", self.path, parsed)
 
         if LIVE:
             self._forward(raw)
@@ -440,12 +448,15 @@ def _unlink(*paths: str | None) -> None:
 
 @pytest.fixture(scope="session")
 def praxis_proxy() -> Any:
+    # Resolve the binary before opening any socket: a lookup failure here must not
+    # leave the backend server thread holding a listening socket (its cleanup only
+    # runs in the finally below, which the try does not yet guard).
+    binary = _find_binary()
     backend_port = _free_port()
     server = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    binary = _find_binary()
     proc: subprocess.Popen | None = None
     config_path: str | None = None
     log_path: str | None = None
@@ -547,31 +558,53 @@ class TestAgentsSdkResponsesLoop:
         result = Runner.run_sync(agent, prompt)
 
         # The loop produced a final textual answer.
-        assert isinstance(result.final_output, str) and result.final_output, result
+        assert isinstance(result.final_output, str) and result.final_output, (
+            f"the agent loop produced no final text output: {result!r}"
+        )
 
         # Every model round crossed Praxis as POST /v1/responses — never
         # /v1/agents/* and never Chat Completions.
-        paths = [path for path, _ in _STATE.requests]
+        methods = [method for method, _path, _body in _STATE.requests]
+        paths = [path for _method, path, _body in _STATE.requests]
         assert paths, "no requests reached the backend"
-        assert all(p == "/v1/responses" for p in paths), paths
-        assert not any("/v1/agents" in p for p in paths), paths
-        assert not any("/v1/chat/completions" in p for p in paths), paths
+        assert all(m == "POST" for m in methods), (
+            f"a non-POST request reached the backend: {list(zip(methods, paths))}"
+        )
+        assert all(p == "/v1/responses" for p in paths), (
+            f"a request used a path other than /v1/responses: {paths}"
+        )
+        assert not any("/v1/agents" in p for p in paths), (
+            f"the Agents SDK reached the unsupported /v1/agents surface: {paths}"
+        )
+        assert not any("/v1/chat/completions" in p for p in paths), (
+            f"the Agents SDK fell back to Chat Completions: {paths}"
+        )
 
         # The local tool executed with the expected city.
         assert TOOL_CALLS, "get_weather was never called"
-        assert all("boston" in c["city"].lower() for c in TOOL_CALLS), TOOL_CALLS
+        assert all("boston" in c["city"].lower() for c in TOOL_CALLS), (
+            f"get_weather ran with an unexpected city: {TOOL_CALLS}"
+        )
 
         # Round 1: the declared function schema crossed Praxis correctly.
-        _, round1 = _STATE.requests[0]
+        _method, _path, round1 = _STATE.requests[0]
         tools = round1.get("tools")
-        assert isinstance(tools, list) and len(tools) == 1, round1
+        assert isinstance(tools, list) and len(tools) == 1, (
+            f"round 1 did not forward exactly one tool declaration: {round1}"
+        )
         tool = tools[0]
-        assert tool["type"] == "function", tool
-        assert tool["name"] == "get_weather", tool
+        assert tool["type"] == "function", f"declared tool is not a function: {tool}"
+        assert tool["name"] == "get_weather", f"wrong tool name forwarded: {tool}"
         params = tool["parameters"]
-        assert "city" in params["properties"], params
-        assert params["properties"]["city"]["type"] == "string", params
-        assert "city" in params["required"], params
+        assert "city" in params["properties"], (
+            f"tool schema dropped the city property: {params}"
+        )
+        assert params["properties"]["city"]["type"] == "string", (
+            f"city parameter is not typed as a string: {params}"
+        )
+        assert "city" in params["required"], (
+            f"city parameter is not marked required: {params}"
+        )
 
         # Continuation round: the tool output crossed Praxis as the matching
         # function_call_output. Its payload is the exact value the local tool
@@ -579,7 +612,7 @@ class TestAgentsSdkResponsesLoop:
         continuation = next(
             (
                 body
-                for _, body in _STATE.requests
+                for _method, _path, body in _STATE.requests
                 if isinstance(body.get("input"), list)
                 and any(
                     isinstance(item, dict)
@@ -589,23 +622,48 @@ class TestAgentsSdkResponsesLoop:
             ),
             None,
         )
-        assert continuation is not None, _STATE.requests
+        assert continuation is not None, (
+            f"no continuation request carried a function_call_output: {_STATE.requests}"
+        )
         fco = _find_item(continuation["input"], "function_call_output")
-        assert fco["call_id"], fco
+        # The continuation's call_id must link back to a function_call the model
+        # actually emitted in its first response — not merely be nonempty — so a
+        # mismatched id (which some backends pass through unchecked) is caught.
+        assert result.raw_responses, "the SDK recorded no model responses"
+        first_call_ids = {
+            item.call_id
+            for item in result.raw_responses[0].output
+            if getattr(item, "type", None) == "function_call"
+        }
+        assert fco["call_id"] in first_call_ids, (
+            "continuation call_id does not match a function_call from the first "
+            f"model response: {fco['call_id']!r} not in {first_call_ids!r}"
+        )
         called_city = TOOL_CALLS[0]["city"]
-        assert fco["output"] == f"{TOOL_OUTPUT_MARKER}::{called_city}", fco
+        assert fco["output"] == f"{TOOL_OUTPUT_MARKER}::{called_city}", (
+            f"forwarded tool output does not match the local tool's return: {fco}"
+        )
 
         if LIVE:
             # A real model drives the rounds: at least the initial request plus
             # one continuation carrying the tool output.
-            assert len(paths) >= 2, paths
+            assert len(paths) >= 2, (
+                f"live loop made fewer than the two expected rounds: {paths}"
+            )
         else:
             # Scripted backend: exactly two rounds, the pinned call id, and the
             # unique final marker returned verbatim.
             assert len(paths) == 2, f"expected exactly two model rounds, got {paths}"
-            assert TOOL_CALLS == [{"city": EXPECTED_CITY}], TOOL_CALLS
-            assert fco["call_id"] == CALL_ID, fco
-            assert result.final_output == FINAL_OUTPUT_MARKER
+            assert TOOL_CALLS == [{"city": EXPECTED_CITY}], (
+                f"scripted run called the tool with unexpected args: {TOOL_CALLS}"
+            )
+            assert fco["call_id"] == CALL_ID, (
+                f"scripted continuation call_id drifted from the pinned id: {fco}"
+            )
+            assert result.final_output == FINAL_OUTPUT_MARKER, (
+                f"scripted final output did not cross back verbatim: "
+                f"{result.final_output!r}"
+            )
 
     def test_pinned_versions_recorded(self) -> None:
         agents_version = importlib.metadata.version("openai-agents")
@@ -618,8 +676,9 @@ class TestAgentsSdkResponsesLoop:
             f"openai-agents resolved to {agents_version}, expected the pinned "
             f"{PINNED_AGENTS_VERSION}; update the PEP 723 header and this pin together"
         )
-        assert openai_version.startswith("3."), (
-            f"openai resolved to {openai_version}; the Agents SDK requires the 3.x lane"
+        assert openai_version == PINNED_OPENAI_VERSION, (
+            f"openai resolved to {openai_version}, expected the pinned "
+            f"{PINNED_OPENAI_VERSION}; update the PEP 723 header and this pin together"
         )
 
 
