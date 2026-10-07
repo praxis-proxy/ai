@@ -29,6 +29,13 @@ listeners:
 filter_chains:
   - name: client-tool-compat
     filters:
+      # Owns the protocol decision for every OpenAI operation this chain can
+      # see, from the request head alone. A coding client also sends Chat
+      # Completions through the catch-all route below, and this is what keeps
+      # a proxy-generated failure on that path in the OpenAI error shape
+      # rather than RFC 9457 problem details.
+      - filter: openai_operation
+
       # Recognizes the operation from the request head, so bodyless and
       # non-Responses traffic a coding client also sends — GET /v1/models,
       # health probes — is released untouched instead of being rejected for

@@ -486,13 +486,21 @@ kill "$PRAXIS_PID"
   `request body rejected by filter filter="openai_responses_format"`: a
   Responses classifier is running unconditioned on every request the listener
   accepts, and an empty body classifies as non-JSON, which `on_invalid: reject`
-  turns into a 400 before routing. Both Codex examples in section 2 handle this
-  already — the native one uses the head-driven `openai_responses_request`, the
-  translated one scopes `openai_responses_format` to `POST /v1/responses` with
-  `conditions`. A config derived from an older copy needs the same treatment.
+  turns into a 400 before routing. Both Codex examples in section 2 lead with
+  the head-driven `openai_responses_request` instead, which releases any
+  operation it does not recognize without reading a body. A config derived from
+  an older copy needs the same swap: replace the
+  `openai_responses_format`/`openai_responses_validate` pair with
+  `openai_responses_request`, keeping the same `on_invalid` and `headers`.
   Do not reach for `on_invalid: continue` instead: it clears the probe but also
   forwards genuinely malformed Responses bodies to vLLM rather than rejecting
   them at the gateway.
+- RFC 9457 `application/problem+json` where an OpenAI client expects
+  `{"error": {...}}`: `openai_responses_request` resolves Responses operations
+  only, so it does not own the protocol decision for the Chat Completions and
+  other OpenAI traffic a coding client also sends. Put `openai_operation` ahead
+  of it, as both Codex examples do; it classifies from the request head and
+  installs the OpenAI error formatter for every OpenAI protocol.
 - `400` with `maximum context length is 32768 tokens` and a requested output
   count near 21,000: Claude Code's default output budget does not fit the
   window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.

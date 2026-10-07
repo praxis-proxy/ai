@@ -41,8 +41,8 @@ use nix::{
     unistd::Pid,
 };
 use praxis_test_utils::{
-    CapturedHttpRequest, HttpBackendEvent, HttpServerAction, example_config_path, free_port, http_send, parse_body,
-    parse_status, patch_yaml, start_proxy, start_scripted_http_backend, start_scripted_http_backend_turns,
+    CapturedHttpRequest, HttpBackendEvent, HttpServerAction, build_pipeline, example_config_path, free_port, http_send,
+    parse_body, parse_status, patch_yaml, start_proxy, start_scripted_http_backend, start_scripted_http_backend_turns,
     start_uri_echo_backend,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -453,9 +453,10 @@ async fn translated_chat_sse_reaches_client_before_upstream_finishes() {
 /// Prove a bodyless probe survives the translated chain.
 ///
 /// `GET /v1/models` carries no body, and an empty body classifies as non-JSON.
-/// The example scopes `openai_responses_format` to `POST /v1/responses`, so the
-/// probe must route through to the provider rather than being rejected with
-/// 400 "request body is not JSON" before it reaches the router.
+/// The example leads with `openai_responses_request`, which resolves the
+/// operation from the request head, so the probe must route through to the
+/// provider rather than being rejected with 400 "request body is not JSON"
+/// before it reaches the router.
 #[test]
 fn translated_chain_passes_bodyless_models_probe() {
     let backend = start_uri_echo_backend();
@@ -480,6 +481,33 @@ fn translated_chain_passes_bodyless_models_probe() {
         parse_body(&raw),
         "/v1/models",
         "model-discovery path must reach the provider unchanged"
+    );
+}
+
+/// The translated chain keeps a head-driven owner for the protocol decision.
+///
+/// `openai_responses_request` resolves Responses operations only, so it does
+/// not speak for the non-Responses traffic this chain's catch-all route also
+/// forwards. `openai_operation` does, and it is what installs the OpenAI error
+/// formatter for a proxy-generated failure on that path; the body classifier
+/// this chain used to run covered it. Nothing else here derives that fact, so
+/// removing the filter silently drops it.
+///
+/// Pinned at the pipeline rather than on the wire: every route here runs
+/// inside the `iterative_request_router` step, which answers an upstream
+/// transport failure with its own 502 and never reaches the `fail_to_proxy`
+/// path that consults the formatter.
+#[test]
+fn translated_chain_owns_the_openai_protocol_decision() {
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/codex-http-chat-translation.yaml"))
+        .expect("Codex translated-provider example should exist");
+    let patched = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", 19953)]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+
+    assert!(
+        build_pipeline(&config).contains_filter("openai_operation"),
+        "the chain must classify OpenAI operations from the request head so \
+         non-Responses traffic keeps the OpenAI error shape"
     );
 }
 

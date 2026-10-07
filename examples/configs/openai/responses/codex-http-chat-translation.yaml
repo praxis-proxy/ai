@@ -29,25 +29,25 @@ listeners:
 filter_chains:
   - name: codex-chat-provider
     filters:
-      # This chain rewrites the path away from /v1/responses, so the
-      # head-driven openai_responses_request cannot replace the pair here. The
-      # classifier is scoped instead: unconditioned, on_invalid: reject would
-      # reject every bodyless request a coding client also sends (GET
-      # /v1/models, health probes) as "request body is not JSON".
-      # openai_responses_validate needs no condition of its own; it releases
-      # any request the classifier did not mark as Responses.
-      - filter: openai_responses_format
+      # Owns the protocol decision for every OpenAI operation this chain can
+      # see, from the request head alone. The catch-all route below forwards
+      # non-Responses traffic too, and this is what keeps a proxy-generated
+      # failure on that path in the OpenAI error shape rather than RFC 9457
+      # problem details.
+      - filter: openai_operation
+
+      # Recognizes the operation from the request head, so bodyless requests a
+      # coding client also sends — GET /v1/models, health probes — are released
+      # untouched instead of being rejected as "request body is not JSON".
+      # The path rewrite to /v1/chat/completions happens inside the
+      # iterative-router step below, after this filter has already resolved the
+      # client-facing operation.
+      - filter: openai_responses_request
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
-        conditions:
-          - when:
-              path_prefix: "/v1/responses"
-              methods: [POST]
-
-      - filter: openai_responses_validate
 
       - filter: iterative_request_router
         initial_step: selected-provider

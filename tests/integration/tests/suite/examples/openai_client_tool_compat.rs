@@ -62,7 +62,7 @@ fn load_client_tool_compat_config_without_stream_owner(
     praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config without stream owner")
 }
 
-/// The backend requests that are inference rounds, dropping the harness probe.
+/// The backend requests that are not the harness readiness probe.
 ///
 /// `start_proxy` waits for the listener by sending `GET /`, and the chain's
 /// catch-all route forwards every path it does not otherwise handle to the
@@ -70,9 +70,23 @@ fn load_client_tool_compat_config_without_stream_owner(
 /// rounds under test, the same way `azure_translation` skips Pingora's
 /// health-check probe. It consumes no scripted response: the mock answers
 /// probes itself.
-fn inference_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
+///
+/// Only that one request is dropped, so a fail-closed assertion still catches
+/// anything that reached the backend by some other method or path.
+fn backend_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
     model
         .requests()
+        .into_iter()
+        .filter(|request| !(request.method == "GET" && request.uri == "/"))
+        .collect()
+}
+
+/// The backend requests that are inference rounds.
+///
+/// Narrower than [`backend_requests`]: round counting is about the POSTs the
+/// adapter issues, so anything else the chain forwards is not one.
+fn inference_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
+    backend_requests(model)
         .into_iter()
         .filter(|request| request.method == "POST")
         .collect()
@@ -120,6 +134,36 @@ fn bodyless_models_probe_reaches_the_backend() {
         parse_body(&raw),
         "/v1/models",
         "model-discovery path must reach the backend unchanged"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Protocol ownership on the catch-all route
+// -----------------------------------------------------------------------------
+
+/// The chain keeps a head-driven owner for the OpenAI protocol decision.
+///
+/// `openai_responses_request` resolves Responses operations only, so it does
+/// not speak for the `POST /v1/chat/completions` a coding client also sends
+/// through this chain's catch-all route. `openai_operation` does, and it is
+/// what installs the OpenAI error formatter for a proxy-generated failure on
+/// that path; the previous body classifier used to cover it. Nothing else in
+/// the chain derives that fact, so removing the filter silently drops it.
+///
+/// Pinned at the pipeline rather than on the wire: every route here runs
+/// inside the `iterative_request_router` step, which answers an upstream
+/// transport failure with its own 502 and never reaches the `fail_to_proxy`
+/// path that consults the formatter.
+#[test]
+fn the_chain_owns_the_openai_protocol_decision() {
+    let db = TempSqlite::new("client_tool_compat_protocol_owner");
+    let config = load_client_tool_compat_config(free_port(), 19952, db.url());
+    let pipeline = build_pipeline(&config);
+
+    assert!(
+        pipeline.contains_filter("openai_operation"),
+        "the chain must classify OpenAI operations from the request head so \
+         non-Responses traffic keeps the OpenAI error shape"
     );
 }
 
@@ -845,7 +889,7 @@ fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
         "the rejection names the missing streaming owner: {body}"
     );
     assert!(
-        inference_requests(&model).is_empty(),
+        backend_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
@@ -895,7 +939,7 @@ fn local_shell_declaration_fails_closed_before_upstream() {
         "the rejection names the unsupported tool: {body}"
     );
     assert!(
-        inference_requests(&model).is_empty(),
+        backend_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
