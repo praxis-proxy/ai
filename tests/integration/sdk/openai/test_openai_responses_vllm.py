@@ -338,7 +338,7 @@ def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint:
     The shipped example forwards every path to one backend and records the
     ``praxis_ai_ttft_seconds`` histogram. An ``admin`` listener is appended so the
     test can scrape that histogram and confirm the model label
-    ``openai_chat_completions_format`` published for a native chat completion.
+    ``openai_chat_completions_request`` published for a native chat completion.
     """
     with open(TTFT_CONFIG_PATH) as f:
         config = f.read()
@@ -1556,9 +1556,8 @@ def ttft_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy on the TTFT example with the /metrics endpoint exposed.
 
     Native ``POST /v1/chat/completions`` is forwarded straight to the backend, so
-    ``openai_chat_completions_format`` classifies the request and labels the
-    ``time_to_first_token`` histogram with the request model. Yields the proxy and
-    admin (metrics) ports.
+    ``openai_chat_completions_request`` publishes the request model for the
+    ``time_to_first_token`` histogram. Yields the proxy and admin (metrics) ports.
     """
     port = _free_port()
     metrics_port = _free_port()
@@ -9685,10 +9684,10 @@ class TestModelRewriteChatCompletionsVLLM:
 def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
     """A streamed native chat completion labels TTFT with its request model.
 
-    Drives ``openai_chat_completions_format`` through the OpenAI client: the
+    Drives ``openai_chat_completions_request`` through the OpenAI client: the
     filter reads the model from the native ``POST /v1/chat/completions`` body and
     publishes the fact ``time_to_first_token`` records as the
-    ``praxis_ai_ttft_seconds`` model label. Without the classifier the sample
+    ``praxis_ai_ttft_seconds`` model label. Without the request filter the sample
     would fall back to ``unknown``.
     """
     praxis_port, metrics_port = ttft_proxy

@@ -624,6 +624,102 @@ async fn a_model_rewrite_invalidates_the_cached_parse_so_the_owner_reparses() {
     assert!(ctx.extensions.get::<ResponsesState>().is_some());
 }
 
+/// The owner re-parses after any body rewrite, even one that never touched the cache.
+///
+/// `openai_responses_model_rewrite` drops the cache explicitly, but other request
+/// filters rewrite the body without knowing the cache exists — `openai_doc_extract`
+/// converting `input_file` parts to `input_text`, `openai_file_resolve` inlining
+/// `file_data`. The cache validates itself against the body in flight, so a rewrite
+/// between the caching pass and the owner is caught here with no invalidation at
+/// all. A stale reuse would rebuild state — and the translated request — from the
+/// pre-rewrite body. This drives the rewrite as a direct edit to model exactly what
+/// such a filter produces, without the model-rewrite filter's explicit discard.
+#[tokio::test]
+async fn an_intervening_body_rewrite_makes_the_owner_reparse_without_explicit_invalidation() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "old-model", "input": "hi"})).unwrap(),
+    ));
+
+    // The pre-routing facts pass caches the parse of the body as received.
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
+
+    // A body-rewriting filter edits the body without touching the cache — as
+    // openai_doc_extract or openai_file_resolve do. Only model_rewrite discards the
+    // cache explicitly; the cache must stay correct for the ones that do not.
+    body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "new-model", "input": "hi"})).unwrap(),
+    ));
+
+    // The managed owner detects the stale cache and re-parses the current body.
+    drop(
+        default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.model")
+            .map(String::as_str),
+        Some("new-model"),
+        "a reused stale parse would publish old-model; the owner must re-parse the rewritten body"
+    );
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "the stale cache is dropped when the owner re-parses"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_some());
+}
+
+/// A facts-only instance never consumes a cached parse or applies managed policy.
+///
+/// Reserving cache consumption for a managed owner keeps a second
+/// `initialize_state: false` pass from running the managed finish on a parse an
+/// earlier pass cached: it must not reject `background: true` or mint
+/// `ResponsesState` on a pure classification path. It classifies fresh and leaves
+/// the cache for a managed owner, exactly as it would with no cache present. Were
+/// the consume unguarded, this second facts pass would reject with the managed
+/// background 400.
+#[tokio::test]
+async fn a_facts_only_instance_does_not_consume_the_cache_or_apply_managed_policy() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "background": true})).unwrap(),
+    ));
+
+    // A pre-routing facts pass caches the parse; a facts-only pass enforces no
+    // managed policy, so the cache carries a background body intact.
+    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let first = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Release),
+        "a facts-only pass releases a background body rather than rejecting it"
+    );
+    assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
+
+    // A second facts-only instance reaches the cache but must not consume it.
+    let second = filter("initialize_state: false\n");
+    let action = second.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a facts-only pass must release a background body, not apply the managed-owner 400"
+    );
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_some(),
+        "the facts-only pass leaves the cache for a managed owner"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "a facts-only pass mints no state"
+    );
+}
+
 /// The default is unchanged, so an existing chain keeps its state.
 #[tokio::test]
 async fn state_is_initialized_by_default() {
@@ -1064,11 +1160,14 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
         ctx.extensions.get::<ResponsesState>().is_none(),
         "the pre-routing pass mints no state"
     );
+    // Isolate the re-parse signal: only a re-parse would restore this fact.
+    ctx.filter_metadata.remove("openai_responses_request.model");
 
-    // Corrupt the body so any re-parse in the managed pass would fail.
-    let mut corrupted = Some(Bytes::from_static(b"not json {{"));
+    // The bound-upstream managed pass receives the same body the facts pass cached,
+    // so its staleness check passes and it consumes the parse rather than
+    // deserializing the create body a second time.
     let outcome = managed
-        .on_bound_upstream_request_body(&mut ctx, &mut corrupted)
+        .on_bound_upstream_request_body(&mut ctx, &mut bytes)
         .await
         .unwrap();
     assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
@@ -1077,6 +1176,10 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
         ctx.extensions.get::<CachedRequestParse>().is_none(),
         "the managed pass must consume the cached parse"
     );
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_request.model"),
+        "the managed pass reused the cache instead of re-parsing, so the fact stays cleared"
+    );
     let state = ctx
         .extensions
         .get::<ResponsesState>()
@@ -1084,7 +1187,7 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
     assert_eq!(
         state.request_body.pointer("/input").and_then(serde_json::Value::as_str),
         Some("deserialize once"),
-        "state must come from the original parse, not the corrupted bytes"
+        "state must come from the cached parse"
     );
 }
 

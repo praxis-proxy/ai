@@ -121,6 +121,9 @@ impl OpenaiResponsesRequestFilter {
             parsed,
             classified,
             operation,
+            // The raw body only backs the staleness check at consume; the owner has
+            // already confirmed the parse matches the body in flight.
+            raw: _,
         } = cached;
 
         if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
@@ -185,6 +188,10 @@ impl OpenaiResponsesRequestFilter {
             parsed,
             classified,
             operation,
+            // Cloning `Bytes` bumps a refcount; it does not copy the body, which is
+            // alive in the pipeline regardless. Held so the owner can detect a body
+            // rewrite between this pass and its own.
+            raw: body.clone().unwrap_or_default(),
         };
 
         if !self.config.initialize_state {
@@ -336,13 +343,34 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config.shared);
         }
 
-        // A managed pass reuses the parse a pre-routing pass cached, so a managed
-        // create body is deserialized exactly once across both phases.
-        if let Some(cached) = ctx.extensions.remove::<CachedRequestParse>() {
-            return Ok(self.finish_managed_request(ctx, cached));
+        // A managed owner reuses the parse a pre-routing pass cached, so a managed
+        // create body is deserialized exactly once across both phases — under two
+        // guards.
+        //
+        // Only a managed owner may consume it. Consuming the cache runs the managed
+        // finish, which applies the create-field rejections and initializes state; a
+        // facts-only instance (`initialize_state: false`) reusing it would enforce
+        // managed-path policy it must not — rejecting `background: true` or minting
+        // `ResponsesState` on a pure classification pass. A facts-only instance
+        // therefore leaves the cache in place and classifies fresh below.
+        //
+        // And only while the body is unchanged. A request filter between the caching
+        // pass and this owner may rewrite the body (model remap, document
+        // extraction, file inlining); the cached parse is then stale, so the owner
+        // re-parses the current bytes rather than rebuild state — and the translated
+        // request — from a body no longer being sent.
+        // The short-circuit keeps a facts-only instance from even removing the
+        // cache: `remove` runs only once `initialize_state` has held.
+        if self.config.initialize_state
+            && let Some(cached) = ctx.extensions.remove::<CachedRequestParse>()
+        {
+            if cached.matches_body(body) {
+                return Ok(self.finish_managed_request(ctx, cached));
+            }
+            trace!("cached parse is stale after an intervening body rewrite; re-parsing");
         }
 
-        // Otherwise parse, classify, and publish facts from this phase.
+        // No reusable cache: parse, classify, and publish facts from this phase.
         self.classify_fresh_request(ctx, body, matched.operation)
     }
 
@@ -420,6 +448,27 @@ struct CachedRequestParse {
     classified: ClassifiedRequest,
     /// The operation the request head resolved to.
     operation: ResponsesOperation,
+    /// The raw body the parse was taken from, held to detect an intervening
+    /// rewrite. Cloning [`Bytes`] bumps a refcount rather than copying the body,
+    /// and the buffer is alive in the pipeline regardless, so this adds no
+    /// allocation.
+    raw: Bytes,
+}
+
+impl CachedRequestParse {
+    /// Whether the body now in flight is still the one this parse was taken from.
+    ///
+    /// A request filter placed between the caching pass and the managed owner may
+    /// rewrite the body — `openai_responses_model_rewrite` remapping the model,
+    /// `openai_doc_extract` converting `input_file` parts to `input_text`,
+    /// `openai_file_resolve` inlining `file_data`. The cached parse is then stale,
+    /// so the owner must re-parse the current bytes rather than rebuild state, and
+    /// the translated upstream request, from a body no longer being sent. Comparing
+    /// the bytes keeps the cache correct under any such mutation without each
+    /// rewriting filter having to know the cache exists.
+    fn matches_body(&self, body: &Option<Bytes>) -> bool {
+        body.as_deref().unwrap_or_default() == self.raw.as_ref()
+    }
 }
 
 /// Drop any cached pre-routing parse, used by two callers.
@@ -427,13 +476,13 @@ struct CachedRequestParse {
 /// The pre-routing fact publisher may hand its parse to the managed owner through
 /// [`CachedRequestParse`]. That parse is taken from the body as received.
 ///
-/// A filter that rewrites the body between the two passes — for example
-/// `openai_responses_model_rewrite` remapping the model across providers —
-/// invalidates it: the owner builds [`ResponsesState`] from the cached parse, so a
-/// stale copy would carry the pre-rewrite model and silently undo the rewrite in
-/// every downstream consumer (the translated request would name the original
-/// model). Dropping the cache makes the owner re-parse the mutated body, a single
-/// deserialization paid only when the body actually changed.
+/// Correctness against an intervening body rewrite does not rest here: the owner
+/// compares the cached body against the one in flight ([`CachedRequestParse::matches_body`])
+/// and re-parses on a mismatch, so a stale parse is never consumed even if nothing
+/// invalidated it. `openai_responses_model_rewrite` still calls this right after it
+/// remaps the model, as an early free of a parse known to be stale rather than the
+/// sole safeguard — without it the owner would detect the mismatch and re-parse
+/// anyway.
 ///
 /// A direct route that the router bound to a provider-owned upstream never reaches
 /// the managed owner, so an `openai_responses_request` placed on that branch with
