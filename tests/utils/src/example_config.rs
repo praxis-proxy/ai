@@ -146,20 +146,7 @@ pub fn example_config_path(filename: &str) -> String {
 /// Panics if `port_map` contains an empty address, which would match at every
 /// position without consuming any input.
 pub fn patch_yaml(yaml: &str, listener_port: u16, port_map: &HashMap<&str, u16>) -> String {
-    assert!(
-        port_map.keys().all(|address| !address.is_empty()),
-        "port_map addresses must not be empty"
-    );
-
-    // Longest needle first so a shorter address that prefixes another cannot
-    // claim the match; `port_map` wins ties, since it is caller-supplied.
-    let mut rules: Vec<(&str, u16)> = port_map.iter().map(|(address, port)| (*address, *port)).collect();
-    rules.sort_unstable_by_key(|(address, _)| std::cmp::Reverse(address.len()));
-    for listener in ["0.0.0.0:8080", "127.0.0.1:8080"] {
-        if !port_map.contains_key(listener) {
-            rules.push((listener, listener_port));
-        }
-    }
+    let rules = patch_rules(listener_port, port_map);
 
     let mut result = String::with_capacity(yaml.len());
     let mut rest = yaml;
@@ -183,6 +170,30 @@ pub fn patch_yaml(yaml: &str, listener_port: u16, port_map: &HashMap<&str, u16>)
         rest = chars.as_str();
     }
     result
+}
+
+/// The `(address, replacement port)` rules [`patch_yaml`] matches, in the
+/// order it tries them.
+///
+/// # Panics
+///
+/// Panics if `port_map` contains an empty address.
+fn patch_rules<'a>(listener_port: u16, port_map: &HashMap<&'a str, u16>) -> Vec<(&'a str, u16)> {
+    assert!(
+        port_map.keys().all(|address| !address.is_empty()),
+        "port_map addresses must not be empty"
+    );
+
+    // Longest needle first so a shorter address that prefixes another cannot
+    // claim the match; `port_map` wins ties, since it is caller-supplied.
+    let mut rules: Vec<(&str, u16)> = port_map.iter().map(|(address, port)| (*address, *port)).collect();
+    rules.sort_unstable_by_key(|(address, _)| std::cmp::Reverse(address.len()));
+    for listener in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+        if !port_map.contains_key(listener) {
+            rules.push((listener, listener_port));
+        }
+    }
+    rules
 }
 
 // -----------------------------------------------------------------------------
