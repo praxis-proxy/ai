@@ -2,8 +2,9 @@
 
 This page is the single entry point for understanding what our GPU-backed
 nightly CI runs, what hardware it uses, and where the deeper documentation
-lives. Everything below executes against **real vLLM on a GPU**, as opposed to
-the CPU inference simulator used on ordinary PRs.
+lives. The GPU-backed jobs run against **real vLLM on a GPU**; ordinary PRs
+also get faster CPU-side coverage against the inference simulator (see the
+`vllm-responses` / `vllm-live-cpu` jobs below).
 
 > Note: `.github/workflows/nightly.yaml` is **not** the GPU suite. Despite the
 > name it is a CPU-only nightly (lint, docs, unit tests, audit, coverage). The
@@ -15,7 +16,7 @@ the CPU inference simulator used on ordinary PRs.
 | --- | --- | --- |
 | [`vllm-integration.yaml`](../../.github/workflows/vllm-integration.yaml) | `17 4 * * *` | Main GPU suite: live Responses SDK suite, OpenAI Agents SDK loop, and the Claude Code / Codex CLI acceptance jobs against real Qwen3-8B. |
 | [`anthropic-vllm-vision.yaml`](../../.github/workflows/anthropic-vllm-vision.yaml) | `31 6 * * *` | Vision companion: Anthropic SDK image requests through Praxis to `Qwen/Qwen3-VL-4B-Instruct` (the main nightly model is text-only). |
-| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | on `vllm/Containerfile` change + manual | Builds, live-tests, and publishes the model-baked GPU image to GHCR. |
+| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds, live-tests, and publishes the model-baked GPU image to GHCR. |
 | [`vllm-dev-endpoint.yaml`](../../.github/workflows/vllm-dev-endpoint.yaml) | manual only | On-demand vLLM endpoint over a Cloudflare tunnel for interactive testing. Not part of CI. |
 
 All also accept `workflow_dispatch`, and the main suite can be forced on a PR by
@@ -116,6 +117,7 @@ Reproduce the core suite against a local GPU (see
 [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) for serving vLLM):
 
 ```console
+cargo build -p praxis-ai-proxy --features full,store-sqlite
 VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
 ```
