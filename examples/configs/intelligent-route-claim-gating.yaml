@@ -1,0 +1,62 @@
+# Intelligent Route: Claim-Gated Candidate Selection (data residency)
+#
+# Fences candidates by the caller's data-residency region. `match_claims` reads
+# the `grid_region` claim off the authenticated identity and keeps only
+# candidates whose `region` label equals it, before the model-name pick runs on
+# the survivors. A US token stays on the US sites, an EU token on the EU site, a
+# UK token on the UK site.
+#
+# The gate is generic: adding another dimension (tier, sovereignty) is one more
+# match_claims entry plus one more candidate label, no code change. Residency is
+# just the first instance.
+#
+# It fails closed: no authenticated identity or a missing claim denies, and a
+# candidate lacking the region label is never eligible. Requires an identity/auth
+# filter (the policy engine's JWT plugin) earlier in the pipeline to publish the
+# identity the gate reads.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/intelligent-route-claim-gating.yaml
+
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+        header: X-Model
+
+      - filter: intelligent_route
+        local_site: hub
+        model_header: X-Model
+        # One gate fences residency. Add `{ claim: grid_tier, label: tier }` and a
+        # `tier:` label to fence a second dimension, config only.
+        match_claims:
+          - { claim: grid_region, label: region }
+        candidates:
+          - { kind: inference_model, name: Qwen3-Coder-30B-A3B, site: hub, cluster: site-us-a, labels: { region: us-east-1 } }
+          - { kind: inference_model, name: Qwen3-Coder-30B-A3B, site: hub, cluster: site-us-b, labels: { region: us-east-1 } }
+          - { kind: inference_model, name: Qwen3-Coder-30B-A3B, site: hub, cluster: site-eu,   labels: { region: eu-west-1 } }
+          - { kind: inference_model, name: Qwen3-Coder-30B-A3B, site: hub, cluster: site-uk,   labels: { region: eu-west-2 } }
+
+      - filter: load_balancer
+        clusters:
+          - name: site-us-a
+            endpoints: ["127.0.0.1:8001"]
+          - name: site-us-b
+            endpoints: ["127.0.0.1:8002"]
+          - name: site-eu
+            endpoints: ["127.0.0.1:8003"]
+          - name: site-uk
+            endpoints: ["127.0.0.1:8004"]
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

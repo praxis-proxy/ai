@@ -15,6 +15,8 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 
 **Selection:** session affinity is resolved first. New requests use the overlay's selection mode within the first viable producer-defined group. Missing group or policy metadata uses deterministic first-admitted ordering. Praxis AI does not recompute source geography, load, or score. `admission_state=none` is never eligible. `existing_only` is eligible only through an already-bound session affinity entry.
 
+**Entitlement fencing:** `match_claims` keeps only candidates whose `label` equals the caller's matching claim, before the pick. Adding a dimension (region, tier) is config, not code. Fails closed: no identity, a missing claim, or no in-scope candidate denies, and the fenced case returns 404 (not distinguishable from unknown). Affinity reuse and weighted selection respect it.
+
 **Metadata:** on successful selection, bounded in-process filter metadata is written under the `intelligent_route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_group`, `selection_mode`, and `selection_tier`). When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written. When the selected cluster is present in `provider_hop_clusters`, client-supplied `x-ai-routing-candidate`, `x-ai-routing-request-id`, and `x-ai-routing-revision` values are removed and replaced with the selected stable ID, a generated provider-hop request ID, and the serving overlay revision (envelope mode only). These AI-owned, non-reserved headers are sent only to an mTLS-authenticated provider gateway; the provider must run `peer_identity_trust` before consuming them. No credential reference or value is forwarded. No request-time database, control-plane, or metrics lookups are performed.
 
 **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call` and `mcp.name` is present, `mcp_tool` candidates are matched. Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
@@ -56,6 +58,7 @@ Supports two modes:
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `candidates[].traffic_weight` | integer | no | Optional bounded weight used only by weighted selection. |
+| `candidates[].labels` | object<string, string> | no | Attributes a request claim may fence on (e.g. `region: eu-west-1`). Empty unless the deployment gates routing on an entitlement. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `skip_paths` | string[] | no | Request-path prefixes that bypass model resolution entirely. Management and discovery endpoints (model listing, subscriptions, API-key management, health) carry no routable model; a matching request returns `Continue` before any model lookup. Defaults to the well-known OpenAI-style management paths; set an explicit list to override, or `[]` to disable path skipping. See `path_is_management` for the match rule. |
@@ -75,3 +78,6 @@ Supports two modes:
 | `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
 | `session_affinity.header` | string | no | Header name to extract the session key from. |
 | `session_affinity.ttl_secs` | integer | no | Binding TTL in seconds (default: 3600, max: 86400). |
+| `match_claims` | ClaimGate[] | no | Claim gates that fence candidates by an entitlement (residency, tier, and so on). Each gate reads one claim off the authenticated identity and keeps only candidates whose matching label equals it. Empty by default, which leaves selection unchanged. The fence is routing-time only: it constrains selections this filter makes. It does not gate discovery paths (`skip_paths` bypass it) and does not apply when an earlier filter already set `ctx.cluster`. A gate on a claim the mapper reserves (`sub`, `roles`, `teams`) never resolves and so always denies. |
+| `match_claims[].claim` | string | yes | Custom-claim name read from the authenticated identity (e.g. `grid_region`). |
+| `match_claims[].label` | string | yes | Candidate label the claim value must match (e.g. `region`). |
