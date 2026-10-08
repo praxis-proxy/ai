@@ -17,8 +17,8 @@
 //!
 //! So this lane is deliberately two scenarios, not seven:
 //!
-//! * a plain text turn, proving the documented path reaches a real model and
-//!   that no reasoning channel leaks into the user-visible answer; and
+//! * a plain text turn, proving the documented path reaches a real model and that no reasoning channel leaks into the
+//!   user-visible answer; and
 //! * a tool-call round trip, which is the scenario that earns GPU time.
 //!
 //! The `--pure`/model-headers lane stays on CPU: it is a config-parsing
