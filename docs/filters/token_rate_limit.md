@@ -15,7 +15,7 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 
 Observability is group-level by rule, never by user. Metrics carry only bounded `rule`, `algorithm`, `backend`, `result`, and `capacity` labels; accounting logs and optional OpenTelemetry spans likewise omit raw subject and bucket-key values. The Prometheus contract is:
 
-- `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and `praxis_trl_backend_errors_total` (503, fail closed) instead.
+- `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and `praxis_trl_backend_errors_total` (503, fail closed) instead. Hierarchy decisions use the same metrics with `rule` set to `hierarchy:org`, `hierarchy:team`, or `hierarchy:user`. A configured rule must not use those names.
 
 Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity), `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards also use `budget_exhausted`. Admitted reservations use `reserved`.
 
@@ -74,7 +74,7 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 | `rules[].estimation` | EstimationConfig | no | Configurable estimation strategy for computing the token cost reserved at admission time. Replaces the legacy `reserved_tokens` field with request-metadata-aware strategies. Mutually exclusive with [`reserved_tokens`](Self::reserved_tokens) -- specifying both on the same rule is a config error. Omitting both is also an error. |
 | `rules[].estimation.strategy` | `fixed` \| `max_tokens` \| `input_plus_max_tokens` \| `model_scaled` | yes | Which strategy to use for this rule's cost estimation. |
 | `rules[].estimation.multiplier` | number | no | Safety-margin multiplier applied to the computed estimate. Defaults to 1.0 (no margin). Must be positive and finite. |
-| `rules[].estimation.fallback_estimate` | integer | no | Token count to use when `max_tokens` is absent from the request. Required for `fixed`; optional for body-dependent strategies (if unset and the strategy can't extract a value, the request is admitted without a reservation). |
+| `rules[].estimation.fallback_estimate` | integer | no | Token count to use when `max_tokens` is absent from the request, or when `max_tokens` / `max_completion_tokens` is zero. Required for `fixed`; optional for body-dependent strategies. If unset and the body has no token count, the request is admitted without a reservation. A zero count with no fallback is kept, and a zero estimate is rejected, so the request is not forwarded unmetered. |
 | `rules[].estimation.model_multipliers` | object<string, number> | no | Per-model multiplier map for `model_scaled` strategy. |
 | `rules[].estimation.default_multiplier` | number | no | Default multiplier for models not listed in `model_multipliers`. |
 | `rules[].estimation.bytes_per_token` | number | no | Approximate bytes-per-token ratio for `input_plus_max_tokens`. Defaults to 4.0. |
@@ -109,6 +109,14 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 | `default_weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
 | `default_weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
 | `default_weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
+| `hierarchy` | HierarchyLevelConfig[] | no | Optional three-level hierarchy enforcing independent org, team, and user budgets on each request. Exactly three levels in `[org, team, user]` order are required when present; each level reuses the existing algorithm/capacity fields from [`RuleAlgorithm`]. Org and team set `identity_header`. The user level sets `identity: authenticated_subject`. Exactly one of those fields is present. A configured hierarchy applies to every request that reaches the filter. The rule list must include a catch-all (a rule with no `match`), and every rule must have `reserved_tokens` or `estimation.fallback_estimate`, so a request cannot skip the three budgets by missing a matcher or a body field. A fixed estimate (`reserved_tokens` or `strategy: fixed`) must fit in every level's capacity. An org, team, or user denial is always 429. A rule's `enforcement: soft` does not apply to those three levels. Soft still applies to the matched rule after the three levels accept. |
+| `hierarchy[].level` | `org` \| `team` \| `user` | yes | Which hierarchy level this entry configures. |
+| `hierarchy[].algorithm` | `sliding_window` \| `token_bucket` | yes | Algorithm choice and parameters for this level's budget. |
+| `hierarchy[].window` | string | one of | Sliding window duration (e.g. `"1h"`, `"60s"`). |
+| `hierarchy[].capacity` | integer | one of | Maximum tokens admitted within `window`. |
+| `hierarchy[].capacity` | integer | one of | Maximum tokens held at once (the bucket's ceiling). |
+| `hierarchy[].refill_rate` | number | one of | Tokens refilled per second, up to `capacity`. |
+| `hierarchy[].reservation_timeout` | string | no | How long a hierarchy reservation is tracked before expiry. |
 
 ## Example
 

@@ -1127,6 +1127,7 @@ fn debug_format_lists_configured_rule_names() {
         key_spec: super::compile_key_spec(cfg.key).unwrap(),
         epoch: std::time::Instant::now(),
         valkey_clock: false,
+        hierarchy: None,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1981,6 +1982,28 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
     assert_eq!(
         estimate_meta, "500",
         "estimate metadata should reflect extracted max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_zero_without_fallback_is_rejected() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 0, "messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 429),
+        "a zero max_tokens with no fallback must not be forwarded unmetered"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "a rejected zero estimate stores no reservation"
     );
 }
 
@@ -3686,6 +3709,7 @@ const ACCOUNTING_FIELDS: &[&str] = &[
     "message",
     "phase",
     "rule",
+    "level",
     "algorithm",
     "backend",
     "result",
@@ -4189,4 +4213,547 @@ fn soft_enforcement_rejects_deny_tier() {
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("deny tiers are incompatible"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy config validation (from_config)
+// -----------------------------------------------------------------------------
+
+fn hierarchy_yaml(hierarchy_block: &str) -> serde_yaml::Value {
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         {hierarchy_block}"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+fn valid_hierarchy_block() -> String {
+    "hierarchy:\n\
+     \x20 - level: org\n\
+     \x20   identity_header: x-org-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 5000000\n\
+     \x20 - level: team\n\
+     \x20   identity_header: x-team-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 1000000\n\
+     \x20 - level: user\n\
+     \x20   identity: authenticated_subject\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 100000\n"
+        .to_owned()
+}
+
+#[test]
+fn from_config_parses_valid_hierarchy() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_wrong_level_order() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject wrong order");
+    assert!(err.to_string().contains("must be"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_fewer_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 2 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_more_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-other\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 50000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 4 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_duplicate_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org2\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject duplicates");
+    assert!(
+        err.to_string().contains("must be") || err.to_string().contains("duplicate"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_org_level_with_identity_instead_of_identity_header() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject org with identity");
+    assert!(err.to_string().contains("identity_header"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_user_level_with_identity_header_instead_of_identity() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity_header: x-user-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject user with identity_header");
+    assert!(
+        err.to_string().contains("identity: authenticated_subject"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_without_a_catch_all_rule() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: scoped\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy without a catch-all rule should be rejected");
+    assert!(err.to_string().contains("catch-all"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_a_rule_can_skip_estimation() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy with a skippable estimate should be rejected");
+    assert!(err.to_string().contains("fallback_estimate"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy identity-miss 401 tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hierarchy_missing_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing org header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_blank_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("   "),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "blank org header should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn hierarchy_missing_org_header_records_unauthenticated_metric() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = hierarchy_yaml(&valid_hierarchy_block());
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        req.headers.insert(
+            http::header::HeaderName::from_static("x-team-id"),
+            http::HeaderValue::from_static("team-a"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+            "missing org header should return 401, got: {action:?}"
+        );
+    });
+    assert_eq!(
+        counter_value(
+            &snapshot,
+            "praxis_trl_unauthenticated_total",
+            &[("rule", "hierarchy:org")]
+        ),
+        Some(1),
+        "a missing org identity is counted on the hierarchy:org rule label"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_team_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing team header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_subject_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing authenticated subject should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_a_zero_fallback_estimate() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 0\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a zero fallback estimate should be rejected when hierarchy is configured");
+    assert!(err.to_string().contains("fallback_estimate > 0"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_reserved_tokens_exceed_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 300\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_fixed_multiplier_exceeds_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: fixed\n\
+         \x20     fallback_estimate: 300\n\
+         \x20     multiplier: 2\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 500\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a multiplied fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn extract_max_tokens_uses_fallback_for_zero_and_keeps_zero_without_one() {
+    let probe = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: None,
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&probe), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&probe), None), Some(0));
+    // `max_tokens: 0` is the chosen field, so `max_completion_tokens` is not used.
+    let completion = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: Some(12),
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&completion), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&completion), None), Some(0));
+}
+
+#[test]
+fn from_config_rejects_a_rule_named_like_a_hierarchy_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: hierarchy:user\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a rule named hierarchy:user should be rejected");
+    assert!(err.to_string().contains("reserved for hierarchy"), "got: {err}");
 }

@@ -47,7 +47,8 @@ use serde::Deserialize;
 /// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
 ///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
 ///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
-///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///   `praxis_trl_backend_errors_total` (503, fail closed) instead. Hierarchy decisions use the same metrics with `rule`
+///   set to `hierarchy:org`, `hierarchy:team`, or `hierarchy:user`. A configured rule must not use those names.
 ///
 /// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
 /// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
@@ -198,6 +199,92 @@ pub(super) struct TokenRateLimitConfig {
     /// reserves the estimation/`reserved_tokens` cost unweighted.
     #[serde(default)]
     pub default_weights: super::weights::TokenTypeWeightsConfig,
+
+    /// Optional three-level hierarchy enforcing independent org, team,
+    /// and user budgets on each request. Exactly three levels in
+    /// `[org, team, user]` order are required when present; each level
+    /// reuses the existing algorithm/capacity fields from [`RuleAlgorithm`].
+    /// Org and team set `identity_header`. The user level sets
+    /// `identity: authenticated_subject`. Exactly one of those fields is
+    /// present.
+    ///
+    /// A configured hierarchy applies to every request that reaches the
+    /// filter. The rule list must include a catch-all (a rule with no
+    /// `match`), and every rule must have `reserved_tokens` or
+    /// `estimation.fallback_estimate`, so a request cannot skip the three
+    /// budgets by missing a matcher or a body field. A fixed estimate
+    /// (`reserved_tokens` or `strategy: fixed`) must fit in every level's
+    /// capacity.
+    ///
+    /// An org, team, or user denial is always 429. A rule's
+    /// `enforcement: soft` does not apply to those three levels. Soft
+    /// still applies to the matched rule after the three levels accept.
+    #[serde(default)]
+    pub hierarchy: Option<Vec<HierarchyLevelConfig>>,
+}
+
+/// Hierarchy quota level tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchyLevel {
+    /// Organization-level quota.
+    Org,
+    /// Team-level quota.
+    Team,
+    /// User-level quota.
+    User,
+}
+
+/// Where one hierarchy level reads its identity. Exactly one variant is
+/// set. `identity_header` and `identity` cannot both be present, and a
+/// typo such as `authenicated_subject` fails while the config is parsed.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchyIdentitySource {
+    /// Request header carrying the org or team id.
+    IdentityHeader(String),
+    /// Authenticated subject for the user level.
+    Identity(HierarchySubjectSource),
+}
+
+/// The only accepted `identity` value on a hierarchy level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchySubjectSource {
+    /// [`praxis_filter::AuthenticatedIdentity::subject_id`].
+    AuthenticatedSubject,
+}
+
+/// One hierarchy level's configuration. Org and team levels use
+/// `identity_header` (a request header carrying the org/team ID);
+/// the user level uses `identity: authenticated_subject`.
+///
+/// **Deployment note:** org and team header values must be set by a
+/// trusted upstream component (an ingress or an identity filter) that
+/// strips any client-supplied value and writes its own. This filter
+/// hashes the header it receives. It has no org or team claim on
+/// [`praxis_filter::AuthenticatedIdentity`] to compare that header
+/// against. An authenticated client that can still set the header can
+/// choose another org or team bucket and can fill `max_keys`.
+// `deny_unknown_fields` omitted because `#[serde(flatten)]` on the
+// algorithm and identity enums is incompatible with it (same reason as
+// `RuleConfig`).
+#[derive(Debug, Deserialize)]
+pub(super) struct HierarchyLevelConfig {
+    /// Which hierarchy level this entry configures.
+    pub level: HierarchyLevel,
+
+    /// Exactly one identity source: `identity_header` or `identity`.
+    #[serde(flatten)]
+    pub identity: HierarchyIdentitySource,
+
+    /// Algorithm choice and parameters for this level's budget.
+    #[serde(flatten)]
+    pub algorithm: RuleAlgorithm,
+
+    /// How long a hierarchy reservation is tracked before expiry.
+    #[serde(default)]
+    pub reservation_timeout: Option<String>,
 }
 
 /// Serde default for [`TokenRateLimitConfig::max_keys`].
@@ -981,10 +1068,12 @@ pub(super) struct EstimationConfig {
     #[serde(default)]
     pub multiplier: Option<f64>,
 
-    /// Token count to use when `max_tokens` is absent from the request.
-    /// Required for `fixed`; optional for body-dependent strategies
-    /// (if unset and the strategy can't extract a value, the request is
-    /// admitted without a reservation).
+    /// Token count to use when `max_tokens` is absent from the request,
+    /// or when `max_tokens` / `max_completion_tokens` is zero. Required
+    /// for `fixed`; optional for body-dependent strategies. If unset and
+    /// the body has no token count, the request is admitted without a
+    /// reservation. A zero count with no fallback is kept, and a zero
+    /// estimate is rejected, so the request is not forwarded unmetered.
     #[serde(default)]
     pub fallback_estimate: Option<u64>,
 
@@ -1343,5 +1432,217 @@ mod tests {
             cfg.rules[0].weights,
             super::super::weights::TokenTypeWeightsConfig::default()
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Hierarchy config parsing
+    // -------------------------------------------------------------------------
+
+    fn hierarchy_cfg(hierarchy_yaml: &str) -> String {
+        format!(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 100000\n    reserved_tokens: 500\n{hierarchy_yaml}"
+        )
+    }
+
+    fn valid_hierarchy_cfg() -> String {
+        hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        )
+    }
+
+    #[test]
+    fn parses_valid_hierarchy() {
+        let cfg = parse(&valid_hierarchy_cfg()).unwrap();
+        let hierarchy = cfg.hierarchy.as_ref().expect("hierarchy should be present");
+        assert_eq!(hierarchy.len(), 3);
+        assert_eq!(hierarchy[0].level, HierarchyLevel::Org);
+        assert_eq!(
+            hierarchy[0].identity,
+            HierarchyIdentitySource::IdentityHeader("x-org-id".to_owned())
+        );
+        assert_eq!(hierarchy[1].level, HierarchyLevel::Team);
+        assert_eq!(
+            hierarchy[1].identity,
+            HierarchyIdentitySource::IdentityHeader("x-team-id".to_owned())
+        );
+        assert_eq!(hierarchy[2].level, HierarchyLevel::User);
+        assert_eq!(
+            hierarchy[2].identity,
+            HierarchyIdentitySource::Identity(HierarchySubjectSource::AuthenticatedSubject)
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_with_both_sources() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n",
+        );
+        assert!(parse(&yaml).is_err(), "both identity sources must fail at parse time");
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_with_neither_source() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n",
+        );
+        assert!(
+            parse(&yaml).is_err(),
+            "a missing identity source must fail at parse time"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_typo() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: user\n\
+             \x20   identity: authenicated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        assert!(parse(&yaml).is_err(), "an identity typo must fail at parse time");
+    }
+
+    #[test]
+    fn hierarchy_absent_parses_as_none() {
+        let cfg = parse(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n",
+        )
+        .unwrap();
+        assert!(cfg.hierarchy.is_none());
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_wrong_level_order() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(
+            cfg.hierarchy.is_some(),
+            "serde parse succeeds; validation is in from_config"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_fewer_than_three_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(
+            cfg.hierarchy.as_ref().unwrap().len(),
+            2,
+            "serde accepts it; from_config rejects"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_more_than_three_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-other\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 50000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(
+            cfg.hierarchy.as_ref().unwrap().len(),
+            4,
+            "serde accepts it; from_config rejects"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_duplicate_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id2\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(cfg.hierarchy.is_some(), "serde accepts it; from_config validates order");
     }
 }

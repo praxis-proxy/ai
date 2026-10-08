@@ -83,9 +83,13 @@ credentials, or MCP authorization assertions are copied into trace fields.
 
 When the experimental `token_rate_limit` filter and the `opentelemetry`
 feature are both enabled, every request that reaches a matching rule gets a
-request-scoped `token_rate_limit` span. It records these bounded fields:
+request-scoped `token_rate_limit` span. A hierarchy denial, authentication
+miss, or backend error before the rule reservation uses the same span with
+`token_rate_limit.rule` set to `hierarchy:org`, `hierarchy:team`, or
+`hierarchy:user`. It records these bounded fields:
 
-- `token_rate_limit.rule`: configured rule name.
+- `token_rate_limit.rule`: configured rule name, or `hierarchy:org`, `hierarchy:team`, or
+  `hierarchy:user` for a hierarchy-level outcome.
 - `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
 - `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
 - `token_rate_limit.decision`: `admitted` (reservation made), `denied` (429,

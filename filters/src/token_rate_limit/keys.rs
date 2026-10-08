@@ -440,7 +440,7 @@ fn mask_ipv6(addr: Ipv6Addr, prefix: u8) -> Ipv6Addr {
 }
 
 /// Read and trim a header value as UTF-8, treating blank as absent.
-fn header_value<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
+pub(super) fn header_value<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
     nonempty(headers.get(name).and_then(|value| value.to_str().ok()))
 }
 
