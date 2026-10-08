@@ -126,10 +126,10 @@ Point either test at a more capable model and its full completion oracle runs as
 hard assertions automatically.
 
 To iterate on just these two tests without running the ~90-minute full suite,
-dispatch `vllm-integration.yaml` with `run_compaction_only=true` (plus
-`run_live_vllm=true`): it provisions the GPU runner and runs only the Codex and
-Claude Code compaction steps, skipping the full Responses suite and every other
-acceptance step.
+dispatch `vllm-integration.yaml` with `run_compaction_only=true` **alone** (do
+NOT also pass `run_live_vllm=true`, which would trigger the full suite): it
+provisions the GPU runner and runs only the Codex and Claude Code compaction
+steps, skipping the full Responses suite and every other acceptance step.
 
 ## Jobs in the main suite (`vllm-integration.yaml`)
 
