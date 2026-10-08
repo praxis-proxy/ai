@@ -11,6 +11,11 @@
 # mode. One vLLM container serves both surfaces (`/v1/messages` natively AND
 # `/v1/chat/completions`), so all four scenarios share this single pinned model.
 #
+# A fifth scenario (issue #1418) drives one read-only PLANNING turn over the
+# native path against the same container, asserting it converges and that no
+# reasoning-channel text reaches the user-visible answer. See
+# `[claude_code.launch.planning]` below for its pins and its scope.
+#
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
 # lightweight `pins` job parses this manifest and exports its runtime values.
@@ -77,6 +82,39 @@ flags = [
   "--max-turns", "8",
 ]
 
+# Read-only planning scenario (issue #1418). Keep in sync with
+# PLANNING_LAUNCH_FLAGS and PermissionScenario::ReadOnlyPlanning in
+# claude_code_vllm.rs.
+#
+# SCOPE: this is NOT the interactive plan mode of the report. The pinned
+# executable exposes neither the plan-mode system prompt nor `ExitPlanMode` in
+# any headless transport (`-p`, with or without `--input-format stream-json`),
+# verified against 2.1.278, so plan mode cannot be driven from CI. The scenario
+# reproduces the shape of the turn that broke — a read-only, multi-file planning
+# request answered in prose — and asserts both observable symptoms are absent:
+# the run converges instead of exhausting its turn budget, and no reasoning
+# delimiter reaches the user-visible answer.
+#
+# Only `Read` is exposed, so the request itself carries no tool that could
+# mutate the workspace, and only `Read` is preapproved. The prompt deliberately
+# omits the `/no_think` suffix the coding task uses: that marker would suppress
+# Qwen3 thinking from the user turn and mask the server-side misconfiguration
+# this scenario exists to catch. Thinking must be off because the backend is
+# served with the flags below, not because the prompt asked.
+[claude_code.launch.planning]
+exposed_tools = ["Read"]
+permission_mode = "acceptEdits"
+allowed_tools = ["Read"]
+# Reasoning-channel delimiters asserted absent from user-visible assistant text.
+reasoning_leak_markers = ["<think>", "</think>"]
+flags = [
+  "--tools", "Read",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
 [vllm]
 # Container image pinned by digest for Claude Code acceptance
 # (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
@@ -116,6 +154,12 @@ seed = 0
 # path. Thinking is disabled by default for this deterministic coding task:
 # otherwise Qwen3 can consume the entire Claude Code turn budget reasoning about
 # which tool to call without issuing the call.
+#
+# `--reasoning-parser qwen3` and `--default-chat-template-kwargs` are a PAIR and
+# are the subject of issue #1418: serving Qwen3 with a parser for another family
+# and thinking on made Claude Code loop and render reasoning as its answer. The
+# planning scenario above is the nightly regression guard for exactly that, so
+# changing either flag here is expected to turn it red.
 #
 # `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
 # ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container

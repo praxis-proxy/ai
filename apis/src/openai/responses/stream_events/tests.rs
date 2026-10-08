@@ -29,6 +29,50 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
+#[test]
+fn done_after_terminal_at_max_events_is_allowed() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 1);
+
+    let mut done = Some(make_done_chunk());
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(state.event_count, 1, "[DONE] must not consume an event slot");
+    assert_eq!(state.completion_state, CompletionState::TerminalLifecycle);
+    assert!(state.deferred_done, "the downstream sentinel must be retained");
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    assert!(ctx.get_metadata("responses.stream_incomplete").is_none());
+    assert!(
+        eos.as_deref().is_some_and(|bytes| bytes.ends_with(b"data: [DONE]\n\n")),
+        "a valid terminal stream must forward its [DONE] sentinel"
+    );
+}
+
+#[test]
+fn counted_event_beyond_max_events_is_rejected() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let mut first = Some(make_sse_chunk("response.output_text.delta", &json!({"delta": "first"})));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut second = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"delta": "second"}),
+    ));
+    filter.on_response_body(&mut ctx, &mut second, false).unwrap();
+    assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
 fn make_filter() -> OpenaiStreamEventsFilter {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
@@ -50,14 +94,7 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
 /// through `arm_decision`; the end-to-end arming effect with a real IRR-inserted
 /// `IterationState` is covered by the functional integration tests.
 fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
-    ctx.current_filter_id = Some(0);
-    filter.arm(&mut ctx);
-    (filter, ctx)
+    make_armed_context_with_filter(make_filter())
 }
 
 #[test]
@@ -5211,10 +5248,12 @@ fn first_chunk_recaps_absolute_deadline_onto_live_body() {
     let state = ctx
         .get_filter_state::<StreamEventsState>()
         .expect("parser state must remain installed");
+    let started = state.started_at.expect("first chunk must start the deadline");
+    let expected = started + state.timeout;
     let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("the first chunk must publish a read timeout cap");
-    assert!(applied > Duration::from_secs(299) && applied <= state.timeout);
+        .stream_deadline_cap()
+        .expect("the first chunk must publish an absolute deadline");
+    assert_eq!(applied, expected);
     assert!(
         state.timeout <= Duration::from_secs(300),
         "unexpected test timeout budget: {:?}",
@@ -5236,18 +5275,15 @@ fn stream_deadline_cap_shrinks_after_first_chunk() {
     let adjusted_started = std::time::Instant::now() - Duration::from_millis(750);
     state.started_at = Some(adjusted_started);
     let expected = adjusted_started + state.timeout;
-    let now = std::time::Instant::now();
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "again"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("each chunk must republish a read timeout cap");
-    assert!(
-        applied <= expected.saturating_duration_since(now),
-        "each chunk must republish the remaining absolute budget, not a fresh relative timer at now={now:?}"
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
+        "each chunk must republish the same absolute cutoff, not a fresh relative timer"
     );
 }
 
@@ -5266,8 +5302,9 @@ fn stream_deadline_caps_live_body_after_first_chunk() {
     ctx.insert_filter_state(state);
     super::recap_stream_deadline(&mut ctx, expected);
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published on the live body"
     );
 }
@@ -5306,13 +5343,15 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let started = state.started_at.expect("first chunk must start the deadline");
     state.timeout = Duration::from_secs(1);
     state.started_at = Some(started.checked_sub(Duration::from_millis(750)).unwrap_or(started));
+    let expected = state.started_at.unwrap() + state.timeout;
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published for the live body even when ctx.upstream is None"
     );
 }
@@ -6663,4 +6702,18 @@ fn logical_stream_preserves_reasoning_wire_discriminators() {
         let payload: serde_json::Value = serde_json::from_str(data).unwrap();
         assert_eq!(payload["type"], event_type);
     }
+}
+
+// Test Utilities
+
+fn make_armed_context_with_filter(
+    filter: OpenaiStreamEventsFilter,
+) -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    filter.arm(&mut ctx);
+    (filter, ctx)
 }

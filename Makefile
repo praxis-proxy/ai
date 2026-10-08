@@ -14,9 +14,11 @@ V                ?=
 # Experimental filter features are package-specific and off by default.
 # Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
 # crate; it is not a praxis-ai-filters feature.
-FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
-INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
-# Features for `make release`; `full` matches the published container image.
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
+# Features for `make release`. The published container image builds
+# `full,store-sqlite` so it can also serve the SQLite-backed examples; `make
+# release` stays on `full` (PostgreSQL only), which is the production backend.
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the explicit lean (`standard`) proxy graph.
 # openssl-sys is not on the list: praxis performs all cryptography through the
@@ -187,8 +189,10 @@ test-integration:
 	cargo build -p praxis-ai-proxy --bin praxis-ai
 	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features $(INTEGRATION_EXPERIMENTAL_FEATURES)
+	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
-		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
+		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
@@ -196,8 +200,17 @@ test-inference-fixtures:
 	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
+# Both filters are needed. libtest matches each as a substring, and
+# `store::tests::pg_` is not a substring of
+# `store::tests::postgres_passes_shared_ownership_contract` (the character
+# after `pg` is `o`), so that test was never selected by this target and
+# never ran in CI. The file uses both naming conventions, so list both
+# prefixes; libtest ORs every filter that follows `--`, same as the
+# integration target below. When adding a PostgreSQL test, check it against
+# this list, because a missed prefix drops it silently.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
+		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
@@ -255,7 +268,7 @@ lint: lint-clippy lint-xtask
 lint-clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
-		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
+		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter \
 		-- -D warnings
 	$(MAKE) lint-lean
 	$(MAKE) check-dep-budget
@@ -276,6 +289,7 @@ lint-xtask:
 	cargo xtask sync-example-readme
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
+	cargo xtask sync-flow-visualizers
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry
@@ -345,8 +359,8 @@ coverage-check:
 # FIPS
 # -------------------------------------------------------------------
 #
-# The published image (`full`) enables every non-experimental filter. The
-# FIPS build turns off what is known not to be FIPS 140-3 compliant yet, so
+# The published image (`full,store-sqlite`) enables every non-experimental
+# filter. The FIPS build turns off what is known not to be FIPS 140-3 compliant, so
 # nobody has to know which features to pick:
 #
 #   policy-engine        praxis-policy carries its own cryptography (sha2,

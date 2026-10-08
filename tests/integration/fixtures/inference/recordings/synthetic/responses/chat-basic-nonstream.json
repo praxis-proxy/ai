@@ -34,11 +34,38 @@
           "body": {
             "kind": "json",
             "value": {
-              "input": "What is 2+2? Reply with just the number.",
+              "input": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "input_text",
+                      "text": "What is 2+2? Reply with just the number.",
+                      "prompt_cache_breakpoint": {
+                        "mode": "explicit"
+                      }
+                    }
+                  ]
+                }
+              ],
               "model": "synthetic-chat-model",
               "store": true,
               "stream": false,
-              "tool_choice": "auto"
+              "tool_choice": "auto",
+              "safety_identifier": "tenant-user",
+              "user": "legacy-user",
+              "prompt_cache_key": "cache-key",
+              "prompt_cache_retention": "24h",
+              "prompt_cache_options": {
+                "ttl": "30m",
+                "mode": "explicit"
+              },
+              "text": {
+                "format": {
+                  "type": "text"
+                },
+                "verbosity": "high"
+              }
             }
           }
         },
@@ -59,7 +86,20 @@
               "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",
               "incomplete_details": null,
-              "input": "What is 2+2? Reply with just the number.",
+              "input": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "input_text",
+                      "text": "What is 2+2? Reply with just the number.",
+                      "prompt_cache_breakpoint": {
+                        "mode": "explicit"
+                      }
+                    }
+                  ]
+                }
+              ],
               "instructions": null,
               "max_output_tokens": null,
               "max_tool_calls": null,
@@ -85,9 +125,9 @@
               "parallel_tool_calls": true,
               "presence_penalty": 0.0,
               "previous_response_id": null,
-              "prompt_cache_key": null,
+              "prompt_cache_key": "cache-key",
               "reasoning": null,
-              "safety_identifier": null,
+              "safety_identifier": "tenant-user",
               "service_tier": "default",
               "status": "completed",
               "store": true,
@@ -95,7 +135,8 @@
               "text": {
                 "format": {
                   "type": "text"
-                }
+                },
+                "verbosity": "high"
               },
               "tool_choice": "auto",
               "tools": [],
@@ -132,12 +173,29 @@
             "value": {
               "messages": [
                 {
-                  "content": "What is 2+2? Reply with just the number.",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "What is 2+2? Reply with just the number.",
+                      "prompt_cache_breakpoint": {
+                        "mode": "explicit"
+                      }
+                    }
+                  ],
                   "role": "user"
                 }
               ],
               "model": "synthetic-chat-model",
-              "stream": false
+              "stream": false,
+              "safety_identifier": "tenant-user",
+              "user": "legacy-user",
+              "prompt_cache_key": "cache-key",
+              "prompt_cache_retention": "24h",
+              "prompt_cache_options": {
+                "ttl": "30m",
+                "mode": "explicit"
+              },
+              "verbosity": "high"
             }
           }
         },
@@ -287,7 +345,15 @@
             "value": {
               "messages": [
                 {
-                  "content": "What is 2+2? Reply with just the number.",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "What is 2+2? Reply with just the number.",
+                      "prompt_cache_breakpoint": {
+                        "mode": "explicit"
+                      }
+                    }
+                  ],
                   "role": "user"
                 },
                 {

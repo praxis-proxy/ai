@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Responses persistence service.
+//! Responses record assembly and input-item listing.
 //!
-//! Owner-scoped business logic over the persisted-state store: record assembly,
-//! input-item listing, CRUD, and pending-approval coordination. The service is
-//! constructed from an already owner-scoped store handle resolved by the caller,
-//! constructs no backend and holds no connection pool, and returns transport-
-//! neutral [`StoreError`]s. The transport layer owns request decoding, HTTP input
-//! validation, and status mapping.
+//! Store operations use the already owner-scoped handle resolved by each caller.
 
 use std::ops::RangeInclusive;
 
@@ -21,7 +16,7 @@ use tracing::warn;
 use crate::{
     openai::responses::{append_stored_input_items, state::CollectedRound},
     state_owner::StateOwner,
-    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseRecord, StoreError},
+    store::ResponseRecord,
 };
 
 #[cfg(test)]
@@ -36,151 +31,48 @@ use crate::{
 )]
 mod tests;
 
-/// Owner-scoped Responses persistence service.
+/// Assemble a persisted [`ResponseRecord`] from a completed Responses API
+/// response object.
 ///
-/// Bound to one validated owner at construction through [`OwnerScopedResponseStore`],
-/// so no operation can widen or forge the owner scope. Persistence still passes the
-/// facade's owner check on the record.
-pub(crate) struct ResponsesService {
-    /// Owner-bound store handle the service operates through.
-    store: OwnerScopedResponseStore,
-}
-
-impl ResponsesService {
-    /// Bind the service to an owner-scoped store the caller resolved from the
-    /// registry (`get_scoped(name, &owner)`).
-    #[must_use]
-    pub(crate) fn new(store: OwnerScopedResponseStore) -> Self {
-        Self { store }
+/// Returns `None` when the object is null (an incomplete stream) or is
+/// missing a required field (`id`, `created_at`, `model`), i.e. it is not
+/// persistable. `request_input` is the original create-request `input`;
+/// `state_messages` is the accumulated persistence history when rehydrate
+/// populated it. `plan` carries the agentic collection metadata used to
+/// reconcile stored history so collected output is not duplicated by the final
+/// append, and to place late reasoning ahead of its turn.
+pub(crate) fn build_record(
+    response_object: Value,
+    owner: StateOwner,
+    request_input: Option<Value>,
+    state_messages: Option<Vec<Value>>,
+    plan: StoredOutputPlan<'_>,
+) -> Option<ResponseRecord> {
+    if response_object.is_null() {
+        warn!("response persistence: response_object is null (incomplete stream?)");
+        return None;
     }
 
-    /// Retrieve a stored response visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    pub(crate) async fn get(&self, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
-        self.store.get_response(id).await
-    }
+    let id = response_object.get("id").and_then(Value::as_str);
+    let created_at = response_object.get("created_at").and_then(Value::as_i64);
+    let model = response_object.get("model").and_then(Value::as_str);
 
-    /// Delete a stored response visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend mutation fails.
-    pub(crate) async fn delete(&self, id: &str) -> Result<bool, StoreError> {
-        self.store.delete_response(id).await
-    }
+    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
+        warn!("response persistence: missing required field (id, created_at, or model)");
+        return None;
+    };
 
-    /// Persist a response and the pending approvals it issued in one transaction.
-    ///
-    /// The record's owner is re-checked against the bound owner by the facade.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] on owner mismatch or a backend failure.
-    pub(crate) async fn persist(
-        &self,
-        record: &ResponseRecord,
-        pending_approvals: &[PendingApprovalRecord],
-    ) -> Result<(), StoreError> {
-        self.store
-            .persist_response_with_pending_approvals(record, pending_approvals)
-            .await
-    }
+    let capture = ResponseCapture::from_response_json(&response_object, request_input, state_messages, plan);
 
-    /// Persist a response record, re-checking its owner against the bound owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] on owner mismatch or a backend failure.
-    // Called only by the compact filter; absent when that feature is off.
-    #[cfg(feature = "openai-compact")]
-    pub(crate) async fn upsert(&self, record: &ResponseRecord) -> Result<(), StoreError> {
-        self.store.upsert_response(record).await
-    }
-
-    /// Load pending approvals issued to this owner for a response.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    // Called by the mcp-dispatch filter in production and by the service tests;
-    // absent in a store build that enables neither.
-    #[cfg(any(feature = "openai-mcp-tools", test))]
-    pub(crate) async fn get_pending_approvals(
-        &self,
-        response_id: &str,
-        approval_ids: &[&str],
-    ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
-        self.store.get_pending_approvals(response_id, approval_ids).await
-    }
-
-    /// Atomically consume approvals issued to this owner.
-    ///
-    /// Returns `Ok(None)` when all ids were consumed, or `Ok(Some(index))` for
-    /// the first already-consumed id (a replay), consuming none of the batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend mutation fails.
-    // Called by the mcp-dispatch filter in production and by the service tests;
-    // absent in a store build that enables neither.
-    #[cfg(any(feature = "openai-mcp-tools", test))]
-    pub(crate) async fn consume_approvals(
-        &self,
-        response_id: &str,
-        approval_ids: &[&str],
-        consumed_at: i64,
-    ) -> Result<Option<usize>, StoreError> {
-        self.store
-            .consume_approvals(response_id, approval_ids, consumed_at)
-            .await
-    }
-
-    /// Assemble a persisted [`ResponseRecord`] from a completed Responses API
-    /// response object.
-    ///
-    /// Returns `None` when the object is null (an incomplete stream) or is
-    /// missing a required field (`id`, `created_at`, `model`), i.e. it is not
-    /// persistable. `request_input` is the original create-request `input`;
-    /// `state_messages` is the accumulated persistence history when rehydrate
-    /// populated it. `plan` carries the agentic collection metadata used to
-    /// reconcile stored history so collected output is not duplicated by the
-    /// final append, and to place late reasoning ahead of its turn.
-    pub(crate) fn build_record(
-        response_object: Value,
-        owner: StateOwner,
-        request_input: Option<Value>,
-        state_messages: Option<Vec<Value>>,
-        plan: StoredOutputPlan<'_>,
-    ) -> Option<ResponseRecord> {
-        if response_object.is_null() {
-            warn!("response persistence: response_object is null (incomplete stream?)");
-            return None;
-        }
-
-        let id = response_object.get("id").and_then(Value::as_str);
-        let created_at = response_object.get("created_at").and_then(Value::as_i64);
-        let model = response_object.get("model").and_then(Value::as_str);
-
-        let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
-            warn!("response persistence: missing required field (id, created_at, or model)");
-            return None;
-        };
-
-        let capture = ResponseCapture::from_response_json(&response_object, request_input, state_messages, plan);
-
-        Some(ResponseRecord {
-            id: id.to_owned(),
-            owner,
-            created_at,
-            model: model.to_owned(),
-            response_object,
-            input: capture.input,
-            messages: capture.messages,
-        })
-    }
+    Some(ResponseRecord {
+        id: id.to_owned(),
+        owner,
+        created_at,
+        model: model.to_owned(),
+        response_object,
+        input: capture.input,
+        messages: capture.messages,
+    })
 }
 
 /// Stored input and message history extracted from a Responses API exchange.
@@ -229,7 +121,7 @@ pub(crate) struct StoredOutputPlan<'a> {
 }
 
 impl StoredOutputPlan<'_> {
-    /// An empty plan: no collector ran, so output is appended verbatim.
+    /// An empty plan: no collector ran, so output is appended (overlap-deduped).
     pub(crate) const EMPTY: StoredOutputPlan<'static> = StoredOutputPlan {
         reasoning_replay: &[],
         collected_rounds: &[],
@@ -240,7 +132,9 @@ impl StoredOutputPlan<'_> {
 /// Build the stored conversation history from response input and output.
 ///
 /// When no agentic collector ran, the response output is appended to the input
-/// history and late reasoning is rotated to the front of its turn. When a
+/// history (dropping any history-suffix/output-prefix overlap and duplicate
+/// compaction items so a rehydrated continuation stores each item once) and late
+/// reasoning is rotated to the front of its turn. When a
 /// collector ran, the history already contains the collected output interleaved
 /// with tool results; assembly rebuilds it, dropping the now-duplicate collected
 /// items, reinserting the uncollected ones (assistant messages, any other type)
@@ -256,17 +150,48 @@ fn assemble_stored_messages(input: Value, output: Option<&Value>, plan: StoredOu
     };
 
     if plan.collected_rounds.is_empty() {
-        // Non-agentic path: history is input-only; append the output and rotate
-        // late reasoning over just the appended slice.
-        let output_start = history.len();
-        history.extend(output_items);
-        if let Some(appended) = history.get_mut(output_start..) {
-            rotate_trailing_reasoning(appended, plan.reasoning_replay);
-        }
+        // Non-agentic path: no output collector ran, so `history` is the input
+        // (plus any rehydrated state). Append the output deduped, then rotate late
+        // reasoning over just the appended slice.
+        append_deduped_output(&mut history, &output_items, plan.reasoning_replay);
         return Value::Array(history);
     }
 
     Value::Array(rebuild_collected_history(&history, &output_items, plan))
+}
+
+/// Append the non-agentic response output to `history`, dropping items already
+/// present, then rotate late reasoning to the front of its turn.
+///
+/// A streamed or rehydrated response can echo state-owned input items back as the
+/// start of its output. Drop the largest history-suffix/output-prefix overlap so
+/// those (and a replayed compaction) are stored only once.
+fn append_deduped_output(history: &mut Vec<Value>, output_items: &[Value], reasoning_replay: &[RangeInclusive<usize>]) {
+    let output_start = history.len();
+
+    let overlap = (0..=history.len().min(output_items.len()))
+        .rev()
+        .find(|&length| {
+            history
+                .get(history.len() - length..)
+                .zip(output_items.get(..length))
+                .is_some_and(|(history_suffix, output_prefix)| history_suffix == output_prefix)
+        })
+        .unwrap_or(0);
+    let new_items = output_items
+        .iter()
+        .skip(overlap)
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) != Some("compaction")
+                || !history.iter().any(|message| message == *item)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    history.extend(new_items);
+
+    if let Some(appended) = history.get_mut(output_start..) {
+        rotate_trailing_reasoning(appended, reasoning_replay);
+    }
 }
 
 /// Rotate a turn's late reasoning to its front within the freshly appended output

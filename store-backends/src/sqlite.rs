@@ -13,14 +13,14 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PoolConfig,
-    ResponseRecord, ResponseStore, StoreError,
-    compression::{StoreCompressionConfig, decode, run_blocking},
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+    PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    compression::{StoreCompressionConfig, decode, decode_bytes, run_blocking},
     pool::apply_pool_config,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
-        sqlite_key_column_folding,
+        check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
+        schema_version_table, sqlite_key_column_folding,
     },
 };
 
@@ -98,7 +98,7 @@ impl SqliteResponseStore {
             sqlx::query(AssertSqlSafe(statement.as_str()))
                 .execute(&pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| ddl_error(statement, &e))?;
         }
 
         validate_schema(&pool, &tables).await?;
@@ -218,7 +218,6 @@ fn sqlite_pool_options(database_url: &str, pool_config: Option<&PoolConfig>) -> 
         apply_pool_config(SqlitePoolOptions::new(), pool_config)
     }
 }
-
 
 /// Return whether the database URL targets an in-memory `SQLite` database.
 pub(crate) fn is_memory_database_url(database_url: &str) -> bool {
@@ -550,6 +549,12 @@ impl ResponseStore for SqliteResponseStore {
             "DELETE FROM {} WHERE response_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
             pending_approvals_table(&self.tables.responses)
         );
+        // The durable SSE event log dies with the response so nothing stays
+        // replayable after a DELETE. Same transaction, same owner scope.
+        let delete_events_sql = format!(
+            "DELETE FROM {} WHERE response_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            events_table(&self.tables.responses)
+        );
 
         let mut tx = self
             .pool
@@ -567,6 +572,15 @@ impl ResponseStore for SqliteResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         sqlx::query(AssertSqlSafe(delete_approvals_sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlx::query(AssertSqlSafe(delete_events_sql.as_str()))
             .bind(id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -797,6 +811,142 @@ impl ResponseStore for SqliteResponseStore {
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(None)
+    }
+
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // One blocking hop compresses every payload; reads decode via `decode_bytes`.
+        let payloads = self
+            .compression
+            .encode_byte_values(&events.iter().map(|event| event.payload.as_slice()).collect::<Vec<_>>())
+            .await?;
+        let sql = events_insert_sql(&self.tables.responses);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        for (event, payload) in events.iter().zip(&payloads) {
+            // `Cow::Borrowed` (the `none` default) binds the event bytes directly;
+            // only a zstd frame owns, and `as_ref` borrows either without a copy.
+            let payload = payload.as_ref();
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .bind(response_id)
+                .bind(pad_sequence(event.sequence_number))
+                .bind(&event.event_type)
+                .bind(payload)
+                .bind(i64::from(event.terminal))
+                .bind(event.created_at)
+                .bind(response_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        let table = events_table(&self.tables.responses);
+        // The padded TEXT sequence sorts and compares identically to the numeric
+        // order (fixed width, zero-filled), so a lexical `>` cursor is exact and
+        // no CAST is needed. A `None` cursor drops the predicate entirely rather
+        // than picking a sentinel below zero, so sequence 0 is included.
+        let cursor_clause = if after.is_some() {
+            " AND sequence_number > ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT tenant_id, owner_issuer, owner_subject, response_id, sequence_number, \
+                    event_type, payload, terminal, created_at \
+             FROM {table} \
+             WHERE tenant_id = ? AND owner_issuer = ? AND owner_subject = ? AND response_id = ?{cursor_clause} \
+             ORDER BY sequence_number ASC \
+             LIMIT ?"
+        );
+
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id);
+        if let Some(cursor) = after {
+            query = query.bind(pad_sequence(cursor));
+        }
+        let rows = query
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        run_blocking(move || rows.iter().map(row_to_event_record).collect()).await
+    }
+
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        let table = events_table(&self.tables.responses);
+        // One indexed aggregate distinguishes "no log" (count 0) from "incomplete"
+        // (rows, no terminal) from "replayable" (has_terminal). MAX over the padded
+        // TEXT key equals the numeric maximum thanks to the fixed-width padding.
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt, MAX(sequence_number) AS max_seq, COALESCE(MAX(terminal), 0) AS has_terminal \
+             FROM {table} \
+             WHERE tenant_id = ? AND owner_issuer = ? AND owner_subject = ? AND response_id = ?"
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let count: i64 = row.try_get("cnt").map_err(|e| StoreError::Database(e.to_string()))?;
+        if count == 0 {
+            return Ok(EventLogStatus::Absent);
+        }
+        let max_seq: Option<String> = row
+            .try_get("max_seq")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let has_terminal: i64 = row
+            .try_get("has_terminal")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // COUNT(*) > 0 guarantees MAX(sequence_number) is non-null; a NULL here
+        // means the row set is corrupt, so fail closed rather than fabricate a
+        // sequence.
+        let max_sequence = max_seq
+            .as_deref()
+            .map(parse_sequence)
+            .transpose()?
+            .ok_or_else(|| StoreError::Database("event log has rows but no maximum sequence number".to_owned()))?;
+        if has_terminal != 0 {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 
@@ -1174,9 +1324,6 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
         require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
@@ -1192,6 +1339,11 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            return Ok(());
+        }
         sqlite_create_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1217,6 +1369,7 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
         let deleted =
             sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
 
@@ -1228,6 +1381,32 @@ impl ConversationItemStore for SqliteResponseStore {
 // -----------------------------------------------------------------------------
 // Transactional Helpers
 // -----------------------------------------------------------------------------
+
+/// Check existence after `BEGIN IMMEDIATE` so a concurrent delete cannot pass
+/// the check and commit before the item mutation.
+async fn sqlite_require_conversation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conv_table: &str,
+    owner: &StateOwner,
+    conversation_id: &str,
+) -> Result<(), StoreError> {
+    let sql = format!(
+        "SELECT 1 FROM {conv_table} \
+         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+    );
+    let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(conversation_id)
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    if row.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
 
 /// Body of [`SqliteResponseStore::create_items_and_sync_messages`].
 ///
@@ -1410,6 +1589,42 @@ fn pending_approval_insert_sql(responses_table: &str) -> String {
     )
 }
 
+/// Build the insert-if-absent SQL for the durable SSE event log.
+///
+/// `WHERE EXISTS(... responses ... owner triple)` refuses to attach events to a
+/// response the caller does not own, and `ON CONFLICT DO NOTHING` makes a
+/// re-released chunk idempotent instead of a duplicate-key error.
+fn events_insert_sql(responses_table: &str) -> String {
+    let table = events_table(responses_table);
+    format!(
+        "INSERT INTO {table} \
+         (tenant_id, owner_issuer, owner_subject, response_id, sequence_number, event_type, payload, \
+         terminal, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? \
+         WHERE EXISTS (SELECT 1 FROM {responses_table} WHERE id = ? AND tenant_id = ? \
+           AND owner_issuer = ? AND owner_subject = ?) \
+         ON CONFLICT (response_id, sequence_number) DO NOTHING"
+    )
+}
+
+/// Fixed-width, zero-padded decimal form of an event sequence number.
+///
+/// The event-log primary key stores `sequence_number` as TEXT because the key
+/// column folding contract requires TEXT affinity. Zero-padding to the width of
+/// `u64::MAX` (20 digits) makes lexical ordering identical to numeric ordering,
+/// so `ORDER BY sequence_number` and a `sequence_number > ?` cursor are exact
+/// without a per-row CAST.
+fn pad_sequence(sequence_number: u64) -> String {
+    format!("{sequence_number:020}")
+}
+
+/// Parse a stored padded sequence back into its numeric value.
+fn parse_sequence(stored: &str) -> Result<u64, StoreError> {
+    stored
+        .parse::<u64>()
+        .map_err(|e| StoreError::Database(format!("invalid stored sequence_number '{stored}': {e}")))
+}
+
 /// Turn an owner-filtered upsert no-op into a bounded, identity-free error.
 fn require_owner_preserving_write(rows_affected: u64, resource: &str) -> Result<(), StoreError> {
     if rows_affected == 1 {
@@ -1479,6 +1694,35 @@ fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecor
         response_object: decode(&response_object_json)?,
         input: decode(&input_json)?,
         messages: decode(&messages_json)?,
+    })
+}
+
+/// Convert a sqlx row to a [`ResponseEventRecord`].
+fn row_to_event_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseEventRecord, StoreError> {
+    let payload_bytes: Vec<u8> = row
+        .try_get("payload")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let sequence_number: String = row
+        .try_get("sequence_number")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let terminal: i64 = row
+        .try_get("terminal")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    Ok(ResponseEventRecord {
+        response_id: row
+            .try_get("response_id")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        owner: row_to_owner(row)?,
+        sequence_number: parse_sequence(&sequence_number)?,
+        event_type: row
+            .try_get("event_type")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        payload: decode_bytes(payload_bytes)?,
+        terminal: terminal != 0,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
     })
 }
 

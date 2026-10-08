@@ -13,7 +13,7 @@ Reads `intelligent_route.credential.*` filter metadata written by the preceding 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `credentials` | CredentialEntryConfig[] | yes | Credential entries, keyed by secretRef (name/namespace/key). |
+| `credentials` | CredentialEntryConfig[] | no | Credential entries, keyed by secretRef (name/namespace/key). May be empty only when `projected_credential_mount_base` is configured. |
 | `credentials[].name` | string | yes | Kubernetes Secret name — must match `intelligent_route.credential.name`. |
 | `credentials[].namespace` | string | yes | Kubernetes Secret namespace — must match `intelligent_route.credential.namespace`. |
 | `credentials[].key` | string | yes | Key within `Secret.data` — must match `intelligent_route.credential.key`. |
@@ -22,6 +22,7 @@ Reads `intelligent_route.credential.*` filter metadata written by the preceding 
 | `credentials[].value` | string | no | Inline token value.  Mutually exclusive with `env_var` and `file`. |
 | `credentials[].env_var` | string | no | Environment variable holding the token.  Mutually exclusive with `value` and `file`. |
 | `credentials[].file` | string | no | Path to a file containing the token. The initial value is validated at filter construction. A watcher revalidates the file after atomic projected-volume changes so Secret rotation does not require a restart. The file contents are trimmed of leading/trailing whitespace before use. The file must exist, be readable, and be non-empty; construction fails otherwise.  Use this source when the token is mounted from a Kubernetes Secret volume so that token bytes never appear in Praxis `ConfigMap`s. Mutually exclusive with `value` and `env_var`. |
+| `projected_credential_mount_base` | PathBuf | no | Optional root containing projected Secret directories. When configured, a credential reference selected from a live routing overlay may be resolved from `{root}/{namespace}/{secret-name}/{secret-key}` even when it was not present in the startup credential table. Including the namespace keeps same-name Secrets distinct. Projected `apikey` entries use `x-api-key`; providers requiring another header need a configured credential entry. This lets a no-route startup safely accept later credential-bearing overlay revisions: an absent or unmounted file rejects the request with 503 after the 250 ms cache refresh interval. A rotated or revoked token may be used until that interval expires. Overlay digest and scope validation do not authenticate the publisher: use only a trusted publisher and mount only Secrets this gateway is authorized to inject. The root must be read-only to untrusted processes; concurrent symlink rewriting is outside the containment guarantee. |
 
 ## Example
 

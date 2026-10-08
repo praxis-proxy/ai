@@ -24,6 +24,9 @@
           "headers": {
             "content-type": [
               "application/json"
+            ],
+            "x-request-id": [
+              "req_invalid_tool"
             ]
           },
           "body": {
@@ -42,7 +45,7 @@
           }
         },
         "response": {
-          "status": 200,
+          "status": 500,
           "headers": {
             "content-type": [
               "application/json"
@@ -52,10 +55,10 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "upstream response could not be transformed",
+                "message": "Internal proxy error",
                 "type": "api_error"
               },
-              "request_id": null,
+              "request_id": "req_invalid_tool",
               "type": "error"
             }
           }
@@ -68,6 +71,9 @@
           "headers": {
             "content-type": [
               "application/json"
+            ],
+            "x-request-id": [
+              "req_invalid_tool"
             ]
           },
           "body": {

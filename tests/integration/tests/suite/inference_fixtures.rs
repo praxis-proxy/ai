@@ -266,11 +266,11 @@ fn assert_malformed_tool_arguments_error(actual: &WireFixture, scenario_id: &str
     });
     let client_expected = json!({
         "type": "error",
-        "error": {"message": "upstream response could not be transformed", "type": "api_error"},
-        "request_id": null
+        "error": {"message": "Internal proxy error", "type": "api_error"},
+        "request_id": "req_malformed_tool"
     });
     assert_eq!(
-        turn.client.response.status, 200,
+        turn.client.response.status, 500,
         "client status changed for scenario `{scenario_id}` and provider `{provider}`"
     );
     let RecordedBody::Json { value: client } = &turn.client.response.body else {

@@ -21,7 +21,7 @@
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
 //!
-//! The `openai_responses_validate` filter runs after the classifier
+//! The `openai_responses_request` filter runs after the classifier
 //! to validate JSON syntax, reject conflicting history selectors, and
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
@@ -62,7 +62,7 @@ pub(crate) mod responses_to_chat_completions;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
 #[allow(
     dead_code,
-    reason = "the Responses operation registry is consumed by the openai_operation classifier"
+    reason = "the Responses operation registry is consumed by the ai_operation classifier"
 )]
 pub(crate) mod routes;
 #[cfg(feature = "openai-responses")]
@@ -74,6 +74,8 @@ pub(crate) mod stream_events;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
+#[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -118,7 +120,7 @@ use praxis_filter::{
     parse_filter_config,
 };
 #[cfg(feature = "openai-responses")]
-use praxis_filter::{Rejection, SubRequestResponseMode};
+use praxis_filter::{Rejection, RequestExtensions, SubRequestResponseMode};
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
@@ -207,6 +209,103 @@ pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
     Ok(Some(counter.bytes))
 }
 
+/// Read newly produced local tool results as request-rail messages.
+///
+/// Local Responses dispatchers mark the canonical `messages` suffix they
+/// append during IRR re-entry. Each configured tool-result guardrail reads the
+/// same marked suffix, so layered policies all evaluate the result. The loop
+/// owner clears the marker after every request-body filter has run. This copies
+/// only the `function_call_output` values required by the asynchronous callout;
+/// earlier conversation history is neither copied nor rescanned.
+///
+/// # Errors
+///
+/// Returns an error before cloning any result payload when the marked suffix
+/// exceeds `max_bytes` or cannot be measured as JSON.
+#[cfg(feature = "openai-responses")]
+pub fn local_tool_guardrail_messages(
+    extensions: &RequestExtensions,
+    max_bytes: usize,
+) -> Result<Vec<serde_json::Value>, FilterError> {
+    let Some(state) = extensions.get::<state::ResponsesState>() else {
+        return Ok(Vec::new());
+    };
+    let Some(start) = state.pending_local_tool_guardrail_start else {
+        return Ok(Vec::new());
+    };
+
+    let outputs: Vec<&serde_json::Value> = state
+        .messages
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|message| message.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output"))
+        .filter_map(|message| message.get("output"))
+        .collect();
+    ensure_local_tool_guardrail_outputs_fit(&outputs, max_bytes)?;
+
+    Ok(outputs
+        .into_iter()
+        .map(|output| {
+            serde_json::json!({
+                "role": "user",
+                "content": output,
+            })
+        })
+        .collect())
+}
+
+/// Bound the owned async-callout copy before allocating it.
+///
+/// # Errors
+///
+/// Returns an error when the outputs exceed `max_bytes` or cannot be measured
+/// as JSON.
+#[cfg(feature = "openai-responses")]
+fn ensure_local_tool_guardrail_outputs_fit(
+    outputs: &[&serde_json::Value],
+    max_bytes: usize,
+) -> Result<(), FilterError> {
+    let mut used = 0_usize;
+    for output in outputs {
+        // Conservatively include the fixed JSON envelope around each output.
+        // This bound is checked before cloning any payload into the async
+        // callout's owned message vector.
+        used = used.saturating_add(32);
+        let Some(size) = bounded_json_size(*output, max_bytes.saturating_sub(used))
+            .map_err(|error| -> FilterError { format!("failed to size local tool result: {error}").into() })?
+        else {
+            return Err(format!("local tool results exceed the guardrail evaluation limit ({max_bytes} bytes)").into());
+        };
+        used = used.saturating_add(size);
+        if used > max_bytes {
+            return Err(format!("local tool results exceed the guardrail evaluation limit ({max_bytes} bytes)").into());
+        }
+    }
+    Ok(())
+}
+
+/// Record a terminal tool-result guardrail failure for the agentic loop owner.
+///
+/// The guardrail runs after request-side dispatchers, but it must not become a
+/// second response-commit authority. The loop owner consumes this failure later
+/// in the same request phase and selects a buffered JSON rejection or an SSE
+/// error according to the already-established Responses lifecycle.
+#[must_use]
+#[cfg(feature = "openai-responses")]
+pub fn record_local_tool_guardrail_failure(
+    extensions: &mut RequestExtensions,
+    status: u16,
+    code: &'static str,
+    message: String,
+) -> bool {
+    let Some(state) = extensions.get_mut::<state::ResponsesState>() else {
+        return false;
+    };
+    state.dispatch_failure = Some(state::DispatchFailure { status, code, message });
+    true
+}
+
 /// JSON writer that counts bytes and stops at a fixed ceiling.
 #[cfg(feature = "openai-responses")]
 struct BoundedJsonCounter {
@@ -289,6 +388,12 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// request contains `previous_response_id`, non-empty `tools`, `store=true`
 /// (default when omitted), `conversation`, or `prompt.id`;
 /// `stateless` when `store=false` with no other stateful markers.
+///
+/// `prompt.id` refers to OpenAI's deprecated reusable prompt object, retired
+/// with `v1/prompts` on 2026-11-30; new clients should send prompt content
+/// through `input` instead of a saved prompt reference. Prefer `input` over
+/// top-level `instructions`, which managed-path content-policy extraction does
+/// not screen.
 ///
 /// Use with branch chains to route stateful and stateless requests to
 /// different clusters.
@@ -487,6 +592,21 @@ fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<Filte
         )));
     }
     None
+}
+
+/// Reject a non-null provider-owned prompt template on a gateway-managed path.
+///
+/// Callers own provider routing: direct OpenAI traffic must bypass the
+/// gateway-managed request processor or validator before reaching this check.
+#[cfg(feature = "openai-responses")]
+fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
+    body.get("prompt").is_some_and(|prompt| !prompt.is_null()).then(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
+        ))
+    })
 }
 
 /// Determine the routing mode for a Responses API request.
@@ -816,19 +936,21 @@ pub(crate) mod rehydrate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod request;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod validate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod web_search;
 
-#[cfg(feature = "openai-responses")]
-pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod contracts;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod openapi;
 #[cfg(feature = "openai-compact")]
 pub use compact::CompactFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub use openapi::implementation_openapi_json;
 #[cfg(feature = "store")]
 pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]
 pub use request::OpenaiResponsesRequestFilter;
 #[cfg(feature = "openai-responses")]
-pub use validate::OpenaiResponsesValidateFilter;
 #[cfg(feature = "openai-responses")]
 pub use web_search::WebSearchFilter;

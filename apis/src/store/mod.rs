@@ -37,8 +37,9 @@ pub use praxis_ai_store::{CompressionAlgorithm, PoolConfig, SslMode, StoreCompre
 // paths so existing `crate::store::*` references keep compiling. OwnerScopedStore
 // keeps its former name here.
 pub use praxis_ai_store::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, OwnerScopedStore as OwnerScopedResponseStore,
-    PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, StoreError,
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseEventRecord,
+    ResponseRecord, ResponseStore, StoreError,
 };
 #[cfg(feature = "store-sqlite")]
 pub use praxis_ai_store_backends::SqliteResponseStore;

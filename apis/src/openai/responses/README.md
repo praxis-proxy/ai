@@ -19,7 +19,6 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
 - **`openai_responses_request`** — Processes a Responses request body once and initializes state.
-- **`openai_responses_validate`** — Validates and enriches Responses API requests.
 - **`openai_stream_events`** — Composes the current IRR execution into one logical Responses stream.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
 - **`openai_web_search`** — Web search filter for model-driven `web_search_call` dispatch.
@@ -42,10 +41,9 @@ Body-phase columns show `Access / Mode` when the hook is implemented. When ordin
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — | — | — |
-| `openai_responses_proxy` | — | — | — | ReadWrite / StreamBuffer | — | — |
+| `openai_responses_proxy` | — | None / StreamBuffer | — | ReadWrite / StreamBuffer | — | — |
 | `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadWrite / Stream |
-| `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — | — | — |
-| `openai_responses_validate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | ReadOnly / Stream |
+| `openai_responses_request` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | ReadOnly / Stream |
 | `openai_stream_events` | ✓ | ReadOnly / Stream | — | — | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | — |
 | `openai_web_search` | — | ReadOnly / StreamBuffer | — | — | — | — |

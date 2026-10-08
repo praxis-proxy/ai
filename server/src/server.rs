@@ -102,6 +102,10 @@ fn boot_server(
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
+    if let Some(limit) = crate::fd_limit::apply(&config) {
+        praxis_core::fd::init(limit, config.runtime.shed_on_fd_pressure);
+        spawn_fd_sampler();
+    }
     warn_insecure_key_permissions(&config);
 
     let health_registry = build_health_registry(&config.clusters);
@@ -492,6 +496,39 @@ fn warn_insecure_key_permissions(config: &Config) {
 /// No-op on non-Unix platforms.
 #[cfg(not(unix))]
 fn warn_insecure_key_permissions(_config: &Config) {}
+
+// -----------------------------------------------------------------------------
+// File Descriptor Sampling
+// -----------------------------------------------------------------------------
+
+/// Keep the file descriptor sample current and publish it as the
+/// `praxis_process_open_fds` and `praxis_process_max_fds` gauges, on a
+/// dedicated thread so sampling never runs on a request worker. Nothing is
+/// spawned where descriptors are not tracked. Mirrors praxis 0.7.2's private
+/// `fd_sampler_loop`.
+fn spawn_fd_sampler() {
+    if praxis_core::fd::usage().is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to start the file descriptor sampler");
+                return;
+            },
+        };
+        rt.block_on(async {
+            loop {
+                praxis_core::fd::refresh();
+                if let Some(usage) = praxis_core::fd::usage() {
+                    praxis_protocol::http::pingora::metrics::set_process_fd_gauges(usage);
+                }
+                tokio::time::sleep(praxis_core::fd::sample_interval()).await;
+            }
+        });
+    });
+}
 
 // -----------------------------------------------------------------------------
 // Health Check Tasks

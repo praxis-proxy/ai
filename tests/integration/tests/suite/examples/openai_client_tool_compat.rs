@@ -355,6 +355,105 @@ fn namespace_tool_round_trip_lowers_and_restores() {
 }
 
 // -----------------------------------------------------------------------------
+// Round trip: a Codex MCP namespace whose group name carries the `__` delimiter
+// -----------------------------------------------------------------------------
+
+/// Codex names an MCP tool namespace `mcp__{server}`, so the `__` the adapter uses
+/// to delimit the flattened `agentic_ns__{namespace}__{member}` wire name appears
+/// inside the group name itself. Such a pair cannot take the verbatim wire name (it
+/// would re-split into a different namespace/member pair), so it is flattened
+/// through the hashed branch — and must not be rejected, which would break every
+/// Codex session that attaches an MCP server.
+#[test]
+fn codex_mcp_namespace_group_round_trips_through_the_hashed_wire_name() {
+    // The flat wire name for (`mcp__codex_tui`, `read_file`), pinned by the
+    // `namespace_member_name` unit tests in `praxis-ai-apis`.
+    const FLAT: &str = "agentic_ns__mcp__codex_tui__read_file___68857b231df97733";
+
+    let backend_response = serde_json::json!({
+        "id": "resp_mcp_ns",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_mcp1",
+            "call_id": "call_mcp1",
+            "name": FLAT,
+            "arguments": r#"{"path":"/etc/hosts"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_mcp_namespace");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Read the hosts file.",
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__codex_tui",
+            "description": "Codex MCP tools.",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }]
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an MCP-style namespace group name must not be rejected: {raw}"
+    );
+
+    // Request phase: the backend saw the hashed flat private function name.
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 1, "one inference round");
+    let backend_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
+    let backend_tools = backend_body["tools"]
+        .as_array()
+        .expect("backend request should carry lowered tools");
+    assert_eq!(
+        backend_tools[0]["type"], "function",
+        "the MCP namespace member lowered to a function"
+    );
+    assert_eq!(
+        backend_tools[0]["name"], FLAT,
+        "the delimiter-bearing group flattened through the hashed branch: {backend_body}"
+    );
+
+    // Response phase: the flat `function_call` restores to its namespaced form with
+    // the group name recovered verbatim, delimiter and all.
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    let output = response["output"].as_array().expect("output array present");
+    assert_eq!(output.len(), 1, "one restored output item: {response}");
+    assert_eq!(output[0]["name"], "read_file", "restored member name");
+    assert_eq!(
+        output[0]["namespace"], "mcp__codex_tui",
+        "the group name is restored verbatim: {response}"
+    );
+    let echoed_tools = response["tools"].as_array().expect("echoed tools present");
+    assert_eq!(
+        echoed_tools[0]["name"], "mcp__codex_tui",
+        "the client sees its original namespace tool: {response}"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Round trip: namespaced custom member lowered on the way out, restored on the way back
 // -----------------------------------------------------------------------------
 

@@ -64,7 +64,7 @@ const TEST_FILTER: &str = "fips::listener_";
 /// The feature set the FIPS build ships (the Makefile's `FIPS_FEATURES`), so
 /// the probes compile the suite exactly as `make test-integration-fips` does
 /// and share its build cache.
-const FIPS_FEATURES: &str = "openai-responses,aws-sigv4-filter";
+const FIPS_FEATURES: &str = "openai-responses,openai-file-resolve-filter,aws-sigv4-filter";
 
 // -----------------------------------------------------------------------------
 // CLI Arguments

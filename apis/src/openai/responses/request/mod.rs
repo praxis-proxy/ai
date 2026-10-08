@@ -10,13 +10,14 @@
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
 //!
-//! Create requests with `background=true` are rejected, because Praxis does not
-//! implement the asynchronous Responses lifecycle.
+//! Create requests with `background=true` or a non-null `prompt` are rejected,
+//! because Praxis does not implement the asynchronous Responses lifecycle or
+//! provider-owned prompt templates on gateway-managed paths.
 //!
-//! This replaces the pair of `openai_responses_format` and
-//! `openai_responses_validate`. Those two each parsed the
-//! same body independently, so routing facts, proxy-owned defaults, and state
-//! could be derived from different parses of one request.
+//! This filter owns that parse outright. The separate validation stage it
+//! replaced parsed the body a second time after `openai_responses_format` had
+//! already parsed it, so routing facts, proxy-owned defaults, and state could
+//! be derived from different parses of one request.
 //!
 //! Metadata keeps the `openai_responses_format` namespace, because twelve
 //! downstream filters read those keys and renaming them is a separate change
@@ -41,14 +42,15 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use super::{
-    config::{ResponsesFormatConfig, build_config},
+    bound_body_outcome,
+    config::{ResponsesFormatConfig, ResponsesRequestConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
@@ -64,10 +66,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
-/// Replaces the `openai_responses_format` and `openai_responses_validate` pair.
-/// Configuration is unchanged from `openai_responses_format`, so a chain that
-/// ran both swaps them for this one filter and keeps the same `on_invalid` and
-/// `headers` settings.
+/// Configuration matches `openai_responses_format`, so a chain keeps the same
+/// `on_invalid` and `headers` settings wherever this filter is placed.
 ///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
@@ -75,8 +75,13 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `background=true` with a 400, matching `openai_responses_format`,
-/// because Praxis does not implement the asynchronous Responses lifecycle.
+/// Rejects `background=true` and non-null `prompt` with a 400, the
+/// managed-path policy this filter now owns. A non-null `prompt` is the
+/// deprecated OpenAI reusable prompt object (`{ id, version, variables }`);
+/// OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients
+/// should move its content into `input` rather than rely on the gateway to
+/// resolve the saved object. Prefer `input` over top-level `instructions`,
+/// which managed-path content-policy extraction does not screen.
 ///
 /// Promotes `openai_responses_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
@@ -84,8 +89,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
 pub struct OpenaiResponsesRequestFilter {
-    /// Classification and promotion configuration.
-    config: ResponsesFormatConfig,
+    /// Classification, promotion, and state configuration.
+    config: ResponsesRequestConfig,
 }
 
 impl OpenaiResponsesRequestFilter {
@@ -95,9 +100,11 @@ impl OpenaiResponsesRequestFilter {
     ///
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponsesFormatConfig = parse_filter_config(FILTER_NAME, config)?;
-        let validated = build_config(FILTER_NAME, cfg)?;
-        Ok(Box::new(Self { config: validated }))
+        let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
+        let shared = build_config(FILTER_NAME, cfg.shared)?;
+        Ok(Box::new(Self {
+            config: ResponsesRequestConfig { shared, ..cfg },
+        }))
     }
 }
 
@@ -111,10 +118,34 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         BodyAccess::ReadOnly
     }
 
+    /// Also offer the bound-upstream phase, so a chain can defer this work
+    /// until the router has selected a logical provider.
+    ///
+    /// Declaring both hooks is what lets the operator choose with a
+    /// `bound_upstream` condition: core schedules the bound-upstream hook when
+    /// that condition is present and the pre-read hook otherwise, never both.
+    /// Deferring matters for mixed chains, where provider-owned traffic must
+    /// reach its upstream with its own fields intact while gateway-managed
+    /// requests are still held to the managed-path policy.
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    /// Streamed, because the response body is never buffered here.
+    ///
+    /// The response path exists only for end-of-stream teardown.
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -148,17 +179,17 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
                 path = ctx.request.uri.path(),
                 "optional request body absent, publishing operation identity only"
             );
-            return publish_bodyless_operation(ctx, &self.config);
+            return publish_bodyless_operation(ctx, &self.config.shared);
         }
 
         // The one parse feeds classification, promotion, and state alike. A body
         // that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
             Ok(pair) => pair,
-            Err(format) => return handle_unclassifiable(ctx, format, &self.config),
+            Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
         };
 
-        if let Some(action) = super::handle_unsupported_background(&classified) {
+        if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
             return Ok(action);
         }
 
@@ -170,11 +201,65 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
 
         Ok(FilterAction::Release)
     }
+
+    /// Same processing, deferred until a logical provider is bound.
+    ///
+    /// Shares one implementation with the pre-read hook so the two phases
+    /// cannot diverge, and so state is initialized exactly once however the
+    /// chain scheduled this filter.
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        // The bound-upstream phase receives the complete body, so end-of-stream
+        // is always reached.
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
+    }
+
+    /// Release per-request MCP sessions once the outer response is finished.
+    ///
+    /// This filter runs outside the iterative request/response loop, so its
+    /// terminal response-body hook sees extensions restored after every finite
+    /// or streamed agentic round — unlike a response-header hook, which precedes
+    /// streamed body execution. Draining here gives every warm session its final
+    /// opportunity for reuse before bounded graceful shutdown.
+    fn on_response_body(
+        &self,
+        #[cfg_attr(
+            not(feature = "openai-mcp-tools"),
+            expect(unused_variables, reason = "the response context only carries the MCP session pool")
+        )]
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            #[cfg(feature = "openai-mcp-tools")]
+            if let Some(pool) = ctx.extensions.remove::<crate::mcp_client::McpSessionPool>() {
+                pool.drain_in_background();
+            }
+        }
+        Ok(FilterAction::Continue)
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Reject provider-owned fields that gateway-managed create requests cannot honor.
+fn reject_unsupported_managed_fields(
+    classified: &ClassifiedRequest,
+    parsed: &serde_json::Value,
+) -> Option<FilterAction> {
+    super::handle_unsupported_background(classified).or_else(|| {
+        (classified.format == AiRequestFormat::Responses)
+            .then(|| super::reject_prompt_template(parsed))
+            .flatten()
+    })
+}
 
 /// Publish everything the one parse produced.
 ///
@@ -188,38 +273,17 @@ fn publish_request_facts(
     ctx: &mut HttpFilterContext<'_>,
     classified: &ClassifiedRequest,
     parsed: serde_json::Value,
-    config: &ResponsesFormatConfig,
+    config: &ResponsesRequestConfig,
     operation: ResponsesOperation,
 ) -> Result<(), FilterError> {
     let mode = super::compute_mode(classified);
 
     // Classification is published for every body, whatever it turned out to
     // be, exactly as the standalone classifier did.
-    publish_classification(ctx, classified, config, mode)?;
+    publish_classification(ctx, classified, &config.shared, mode)?;
 
-    // Proxy-owned identifiers and `ResponsesState` are Responses-only. A body
-    // positively identified as another protocol keeps that identity and must
-    // not gain Responses state, or state-driven filters such as the agentic
-    // loop would pick up traffic the previous validation stage released
-    // untouched.
-    if classified.format != AiRequestFormat::Responses {
-        trace!(
-            format = classified.format.as_str(),
-            "classified as another protocol, leaving Responses state uninitialized"
-        );
-        return Ok(());
-    }
-
-    // `ResponsesState` describes a response being created — it carries the
-    // conversation, the generated identifier, and the MCP approval state the
-    // agentic loop acts on. Compact and input-token-count are not creating a
-    // response, so giving them that state lets downstream filters read a
-    // token-count request as an approval submission.
-    if operation != ResponsesOperation::CreateResponse {
-        trace!(
-            operation = ?operation,
-            "body-bearing operation that does not create a response, leaving state uninitialized"
-        );
+    if let Some(reason) = state_skip_reason(classified, config, operation) {
+        trace!(reason, "leaving Responses state uninitialized");
         return Ok(());
     }
 
@@ -227,6 +291,11 @@ fn publish_request_facts(
     let conversation_id = resolve_conversation_id(ctx, &parsed);
 
     enrich_context(ctx, classified, &response_id, &conversation_id);
+    // Must follow `enrich_context`: the owner is bound to the canonical
+    // conversation ID that call publishes, and the Conversations response path
+    // reads this immutable owner when appending the completed turn.
+    #[cfg(feature = "openai-conversations")]
+    crate::openai::conversations::capture_validated_append_owner(ctx);
     insert_responses_state(ctx, parsed, &response_id);
 
     debug!(
@@ -245,6 +314,38 @@ struct MatchedOperation {
     operation: ResponsesOperation,
     /// The body shape the registry declares for it.
     body: RequestBody,
+}
+
+/// Why this request should not receive `ResponsesState`, if it should not.
+///
+/// `ResponsesState` describes a response being created: it carries the
+/// conversation, the generated identifier, and the MCP approval state the
+/// agentic loop acts on.
+///
+/// Returns `None` when state belongs, and otherwise the reason it does not, so
+/// the caller logs one line rather than repeating a guard per case.
+fn state_skip_reason(
+    classified: &ClassifiedRequest,
+    config: &ResponsesRequestConfig,
+    operation: ResponsesOperation,
+) -> Option<&'static str> {
+    if classified.format != AiRequestFormat::Responses {
+        // Another protocol keeps its own identity. Giving it Responses state
+        // would let state-driven filters pick up traffic the validation stage
+        // this replaces released untouched.
+        return Some("body is classified as another protocol");
+    }
+    if !config.initialize_state {
+        // The chain consumes no state. Classification is still published, so
+        // routing and branching are unaffected.
+        return Some("initialize_state is disabled for this chain");
+    }
+    if operation != ResponsesOperation::CreateResponse {
+        // Compact and input-token-count are not creating a response, and
+        // giving them create state lets a token count read as an approval.
+        return Some("operation does not create a response");
+    }
+    None
 }
 
 /// Publish the classification facts for one body.
@@ -319,7 +420,7 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// The declared request-body shape when this is a body-bearing operation.
 ///
 /// Resolved from the request head through the shared registry — the same source
-/// of truth the `openai_operation` classifier uses — so no body heuristic
+/// of truth the `ai_operation` classifier uses — so no body heuristic
 /// decides whether this filter applies, and the filter works whether or not the
 /// classifier is present in the chain.
 ///

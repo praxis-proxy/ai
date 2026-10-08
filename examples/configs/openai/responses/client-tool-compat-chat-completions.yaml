@@ -54,7 +54,13 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       # Persisted Responses/Conversations state is scoped to an immutable owner.
       # This single-tenant demo installs a fixed owner directly (no auth gateway

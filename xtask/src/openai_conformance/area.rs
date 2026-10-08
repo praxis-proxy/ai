@@ -12,7 +12,11 @@ pub(super) const OPENAI_REFERENCE_MANIFEST: &str = "docs/conformance/specs/opena
 pub(super) const CONVERSATIONS_SCOPE: OperationScope =
     OperationScope::new("conversations", "Conversations", &["/conversations"]).without_inherited_security();
 
-/// Runtime checks executed while generating the conformance report.
+/// Responses operations selected from the full OpenAI reference.
+pub(super) const RESPONSES_SCOPE: OperationScope =
+    OperationScope::new("responses", "Responses", &["/responses"]).without_inherited_security();
+
+/// Runtime checks executed while generating the Conversations conformance report.
 const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
     RuntimeVerificationCheck {
         kind: "route_dispatch",
@@ -33,6 +37,98 @@ const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         kind: "request_item_contract",
         evidence: "openai::conversations::tests::conformance_conversations_item_requests_reject_unknown_and_malformed_contracts",
         success_sentinel: "PRAXIS_CONFORMANCE_OK conversations request_item_contract",
+    },
+];
+
+/// Runtime checks executed while generating the Responses conformance report.
+const RESPONSES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
+    RuntimeVerificationCheck {
+        kind: "route_dispatch",
+        evidence: "openai::responses::tests::conformance_responses_routes_match_runtime_registry",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses route_dispatch",
+    },
+    RuntimeVerificationCheck {
+        kind: "success_response_contract",
+        evidence: "openai::responses::tests::conformance_responses_success_payloads_match_generated_response_schemas",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses success_response_contract",
+    },
+    RuntimeVerificationCheck {
+        kind: "sse_lifecycle_contract",
+        evidence: "openai::responses::tests::conformance_responses_sse_lifecycle_events_match_schemas",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses sse_lifecycle_contract",
+    },
+    RuntimeVerificationCheck {
+        kind: "schema_check_sensitivity",
+        evidence: "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses schema_check_sensitivity",
+    },
+];
+
+/// Evidence-backed discrepancies for Responses operations.
+const RESPONSES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
+    ContractException {
+        kind: super::model::ContractDriftKind::Request,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "requestBody.content.application/json.schema.allOf.deleted",
+        rationale: "Praxis defines CreateResponseRequest directly rather than inheriting allOf branches",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest schema",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Request,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "requestBody.content.application/json.schema.properties.added",
+        rationale: "Praxis defines CreateResponseRequest properties directly rather than inheriting allOf branches",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest properties",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Request,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "requestBody.content.application/json.schema.type.added",
+        rationale: "Praxis explicitly marks CreateResponseRequest as object type",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest type",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "responses.200.content.application/json.schema.allOf.deleted",
+        rationale: "Praxis defines ResponseResource directly rather than inheriting allOf branches",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource schema",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "responses.200.content.application/json.schema.properties.added",
+        rationale: "Praxis defines ResponseResource properties directly rather than inheriting allOf branches",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource properties",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "responses.200.content.application/json.schema.required.added",
+        rationale: "Praxis explicitly marks required properties on ResponseResource",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource required fields",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "responses.200.content.application/json.schema.type.added",
+        rationale: "Praxis explicitly marks ResponseResource as object type",
+        evidence: "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource type",
+    },
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/responses"),
+        detail: "responses.200.content.deleted",
+        rationale: "Praxis registers application/json for transformed responses and omits text/event-stream from the OpenAPI 200 response schema",
+        evidence: "praxis-ai-apis/openai/responses/routes/mod.rs: CreateResponse response spec",
     },
 ];
 
@@ -195,27 +291,50 @@ const fn update_metadata_request_exception(detail: &'static str) -> ContractExce
 }
 
 /// Areas included in the current OpenAI conformance suite.
-pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[ApiArea {
-    scope: CONVERSATIONS_SCOPE,
-    implementation_source: "generated:praxis-ai-apis/openai/conversations",
-    implementation_spec: conversations_implementation_spec,
-    supported_operations: conversations_supported_operations,
-    runtime_test_command: "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
-    runtime_test_args: &[
-        "test",
-        "-p",
-        "praxis-ai-apis",
-        "--no-default-features",
-        "--features",
-        "openai-conversations,store-all",
-        "--lib",
-        "conformance_conversations_",
-        "--",
-        "--show-output",
-    ],
-    runtime_checks: CONVERSATIONS_RUNTIME_CHECKS,
-    contract_exceptions: CONVERSATIONS_CONTRACT_EXCEPTIONS,
-}];
+pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[
+    ApiArea {
+        scope: CONVERSATIONS_SCOPE,
+        implementation_source: "generated:praxis-ai-apis/openai/conversations",
+        implementation_spec: conversations_implementation_spec,
+        supported_operations: conversations_supported_operations,
+        runtime_test_command: "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
+        runtime_test_args: &[
+            "test",
+            "-p",
+            "praxis-ai-apis",
+            "--no-default-features",
+            "--features",
+            "openai-conversations,store-all",
+            "--lib",
+            "conformance_conversations_",
+            "--",
+            "--show-output",
+        ],
+        runtime_checks: CONVERSATIONS_RUNTIME_CHECKS,
+        contract_exceptions: CONVERSATIONS_CONTRACT_EXCEPTIONS,
+    },
+    ApiArea {
+        scope: RESPONSES_SCOPE,
+        implementation_source: "generated:praxis-ai-apis/openai/responses",
+        implementation_spec: responses_implementation_spec,
+        supported_operations: responses_supported_operations,
+        runtime_test_command: "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        runtime_test_args: &[
+            "test",
+            "-p",
+            "praxis-ai-apis",
+            "--no-default-features",
+            "--features",
+            "openai-responses,store-all",
+            "--lib",
+            "conformance_responses_",
+            "--",
+            "--show-output",
+        ],
+        runtime_checks: RESPONSES_RUNTIME_CHECKS,
+        contract_exceptions: RESPONSES_CONTRACT_EXCEPTIONS,
+    },
+];
 
 /// Generate the Conversations implementation spec from crate code.
 fn conversations_implementation_spec() -> Result<String, String> {
@@ -234,6 +353,32 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
             mode: coverage_mode(spec.mode()),
             evidence: format!(
                 "praxis_ai_apis::openai::conversations_operation_specs::{:?}",
+                spec.operation
+            ),
+        })
+        .collect()
+}
+
+/// Generate the Responses implementation spec from crate code.
+fn responses_implementation_spec() -> Result<String, String> {
+    praxis_ai_apis::openai::responses_openapi_json()
+        .map_err(|e| format!("failed to generate Responses implementation OpenAPI spec: {e}"))
+}
+
+/// Return Responses operations from the runtime route table.
+fn responses_supported_operations() -> Vec<SupportedOperation> {
+    praxis_ai_apis::openai::responses_operation_specs()
+        .iter()
+        .filter(|spec| {
+            !praxis_ai_apis::openai::RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id())
+        })
+        .map(|spec| SupportedOperation {
+            method: spec.method().as_str().to_owned(),
+            path: spec.spec_path.to_owned(),
+            area: "Responses".to_owned(),
+            mode: coverage_mode(spec.mode()),
+            evidence: format!(
+                "praxis_ai_apis::openai::responses_operation_specs::{:?}",
                 spec.operation
             ),
         })

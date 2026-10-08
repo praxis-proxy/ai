@@ -14,6 +14,8 @@ use crate::GcpAdcFilter;
 use crate::HttpCalloutFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
+#[cfg(feature = "token-ceiling-filter")]
+use crate::TokenCeilingFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
@@ -116,6 +118,11 @@ fn register_agentic_filters(registry: &mut FilterRegistry) {
 #[cfg(feature = "aws-sigv4-filter")]
 fn register_aws_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "aws_sigv4_sign", Sigv4SignFilter::from_config);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_bedrock_converse" =>
+            praxis_ai_apis::bedrock::OpenaiChatCompletionsToBedrockConverseFilter::from_config
+    );
 }
 
 /// Register Azure-specific filters, capturing the shared sub-request
@@ -219,6 +226,11 @@ fn register_token_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "token_rate_limit" => TokenRateLimitFilter::from_config
+    );
+    #[cfg(feature = "token-ceiling-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_ceiling" => TokenCeilingFilter::from_config
     );
 }
 
@@ -328,7 +340,7 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_operation" => praxis_ai_apis::openai::OpenaiOperationFilter::from_config
+        http "ai_operation" => praxis_ai_apis::operation_classifier::AiOperationFilter::from_config
     );
 }
 
@@ -384,10 +396,6 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_request" => praxis_ai_apis::openai::OpenaiResponsesRequestFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_responses_validate" => praxis_ai_apis::openai::OpenaiResponsesValidateFilter::from_config
     );
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
@@ -684,7 +692,7 @@ mod tests {
             "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
-            "openai_operation",
+            "ai_operation",
             "a2a",
             "intelligent_route",
             "provider_route",
@@ -705,12 +713,10 @@ mod tests {
     fn build_ai_registry_includes_responses_request_when_enabled() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        for name in ["openai_responses_request", "openai_responses_validate"] {
-            assert!(
-                names.contains(&name),
-                "expected {name} in registry when openai-responses is enabled"
-            );
-        }
+        assert!(
+            names.contains(&"openai_responses_request"),
+            "expected openai_responses_request in registry when openai-responses is enabled"
+        );
     }
 
     #[cfg(feature = "policy-engine")]
@@ -792,12 +798,12 @@ provider:
         assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
         assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
+        assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.
     const OPTIONAL_FILTERS: &[(&str, bool)] = &[
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
-        ("openai_responses_validate", cfg!(feature = "openai-responses")),
         ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
         ("responses_to_chat_completions", cfg!(feature = "openai-responses")),
@@ -948,5 +954,49 @@ outbound_chain:
         let chains = HashMap::new();
         FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
             .expect("a resolvable outbound chain must build");
+    }
+
+    /// A named outbound chain remains resolvable when the callout is nested in
+    /// an iterative router step. This exercises the production chain-aware
+    /// pipeline builder rather than the standalone filter constructor.
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression fixture includes the complete nested YAML"
+    )]
+    fn file_search_callout_binds_named_outbound_chain_inside_irr() {
+        let registry = build_ai_registry();
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\
+- filter: iterative_request_router
+  initial_step: inference
+  max_iterations: 1
+  timeout_ms: 1000
+  steps:
+    - name: inference
+      filters:
+        - filter: openai_file_search_callout
+          vector_store_url: https://8.8.8.8
+          outbound_chain: vector-store-outbound
+      on_result:
+        - default: true
+          done: true
+",
+        )
+        .expect("IRR reproduction config should parse");
+        let chain_entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\
+- filter: headers
+  request_set:
+    - name: X-Vector-Store-Client
+      value: praxis-ai-gateway
+",
+        )
+        .expect("named outbound chain should parse");
+        let chains = HashMap::from([("vector-store-outbound", chain_entries.as_slice())]);
+
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+            .expect("named outbound chain should resolve inside the IRR step");
     }
 }

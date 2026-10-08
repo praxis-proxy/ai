@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "openai>=2.0",
+#     "openai>=2.0,<4",
 #     "pytest>=8.0",
 # ]
 # ///
@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from openai import APIError, APIStatusError, OpenAI
+from openai import APIError, APIStatusError, BadRequestError, OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -172,6 +172,13 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             return
 
         response = self._make_gemini_response(user_text, has_tool_use)
+        if "trigger text metadata" in user_text.lower():
+            response["candidates"][0]["content"]["parts"][0].update(
+                {"thought": False, "thoughtSignature": "sig-text"}
+            )
+            response["candidates"][0]["content"]["parts"].append(
+                {"thoughtSignature": "sig-only"}
+            )
         self._send_json_response(200, response)
 
     def _handle_streaming(self, request_json: dict[str, Any]) -> None:
@@ -202,6 +209,11 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             chunks = self._make_gemini_streaming_tool_chunks()
         else:
             chunks = self._make_gemini_streaming_chunks(user_text)
+            if "trigger text metadata" in user_text.lower():
+                chunks[0]["candidates"][0]["content"]["parts"][0]["thought"] = False
+                chunks[-1]["candidates"][0]["content"]["parts"].append(
+                    {"thoughtSignature": "sig-only"}
+                )
         body_lines = []
         for chunk in chunks:
             frame = f"data: {json.dumps(chunk)}\n\n"
@@ -489,6 +501,29 @@ def openai_client(vertex_proxy):
 class TestVertexGeminiChatCompletions:
     """End-to-end OpenAI SDK compatibility tests for Vertex Gemini translation."""
 
+    def test_unsupported_content_is_rejected_before_vertex(self, openai_client: OpenAI) -> None:
+        FakeVertexGeminiHandler.last_request_body = None
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/image.png",
+                                    "detail": "high",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert FakeVertexGeminiHandler.last_request_body is None
+
     def test_non_streaming_basic(self, openai_client: OpenAI) -> None:
         """Non-streaming request translates correctly and response is OpenAI-shaped."""
         response = openai_client.chat.completions.create(
@@ -527,6 +562,24 @@ class TestVertexGeminiChatCompletions:
 
         assert response.choices[0].message.content == "Hello! How can I help you today?"
         assert response.choices[0].finish_reason == "stop"
+
+    def test_text_part_metadata_in_finite_and_streamed_response(self, openai_client: OpenAI) -> None:
+        messages = [{"role": "user", "content": "Trigger text metadata"}]
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash", messages=messages
+        )
+        assert response.choices[0].message.content == (
+            "I received your message and I'm ready to assist."
+        )
+
+        with openai_client.chat.completions.create(
+            model="gemini-2.0-flash", messages=messages, stream=True
+        ) as stream:
+            chunks = list(stream)
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == (
+            response.choices[0].message.content
+        )
+        assert chunks[-1].choices[0].finish_reason == "stop"
 
     def test_streaming_basic(self, openai_client: OpenAI) -> None:
         """Streaming request produces proper OpenAI chunk stream with [DONE]."""
@@ -579,6 +632,7 @@ class TestVertexGeminiChatCompletions:
                     "function": {
                         "name": "get_weather",
                         "description": "Get weather for a location",
+                        "strict": False,
                         "parameters": {
                             "type": "object",
                             "properties": {"location": {"type": "string"}},
@@ -669,9 +723,9 @@ class TestVertexGeminiChatCompletions:
             )
 
         error = exc_info.value
-        assert error.status_code == 429
-        assert error.body["message"] == "Quota exceeded by fake Vertex backend"
-        assert error.body["type"] == "server_error"
+        assert error.status_code == 429, "upstream 429 must surface with its status preserved"
+        assert error.body["message"] == "Quota exceeded by fake Vertex backend", "error body must carry the upstream message"
+        assert error.body["type"] == "server_error", "error envelope type must be server_error"
         request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
         assert request_body["contents"] == [
             {"role": "user", "parts": [{"text": "Trigger upstream error"}]}
@@ -718,7 +772,7 @@ class TestVertexGeminiChatCompletions:
             for chunk in chunks
             if chunk.choices
         )
-        assert content == "partial"
+        assert content == "partial", "valid data before truncation must be preserved"
 
     def test_frames_after_stream_error_are_suppressed(self, openai_client: OpenAI) -> None:
         """An invalid frame makes the stream terminal and drops later frames."""
@@ -736,7 +790,7 @@ class TestVertexGeminiChatCompletions:
             for chunk in chunks
             if chunk.choices
         )
-        assert "must-not-leak" not in content
+        assert "must-not-leak" not in content, "frames after a stream error must not leak to the client"
 
     def test_invalid_include_usage_is_rejected(self, openai_client: OpenAI) -> None:
         """The proxy rejects an invalid include_usage type before Vertex."""
@@ -748,8 +802,8 @@ class TestVertexGeminiChatCompletions:
                 stream_options={"include_usage": "true"},
             )
 
-        assert exc_info.value.status_code == 400
-        assert "stream_options.include_usage" in exc_info.value.body["message"]
+        assert exc_info.value.status_code == 400, "invalid include_usage must return 400"
+        assert "stream_options.include_usage" in exc_info.value.body["message"], "error message must name the rejected stream_options.include_usage field"
 
     def test_malformed_tool_arguments_are_rejected(self, openai_client: OpenAI) -> None:
         """Malformed assistant tool arguments are never replaced with an empty object."""
@@ -774,8 +828,8 @@ class TestVertexGeminiChatCompletions:
                 ],
             )
 
-        assert exc_info.value.status_code == 400
-        assert "arguments are not valid JSON" in exc_info.value.body["message"]
+        assert exc_info.value.status_code == 400, "malformed tool arguments must return 400"
+        assert "arguments are not valid JSON" in exc_info.value.body["message"], "error message must explain the arguments are not valid JSON"
 
     def test_request_body_translation(self, openai_client: OpenAI) -> None:
         """Request is correctly translated from OpenAI to Gemini format."""

@@ -61,7 +61,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push container image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Containerfile
@@ -96,7 +96,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust (for the Red Hat image verification)
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           # The restored target/ would otherwise be swept into the build context.
           cache-target: "false"

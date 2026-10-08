@@ -46,7 +46,9 @@ use tracing::{debug, trace, warn};
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
     DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
-    error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
+    error::responses_error_rejection,
+    extract_conversation_id,
+    state::{ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -112,7 +114,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// The upstream `openai_responses_request` filter rejects requests that
     /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
@@ -1218,6 +1220,9 @@ fn build_state(
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.splice(0..0, replay);
+    state
+        .provider_compaction_ids
+        .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
@@ -1253,7 +1258,11 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 
 /// Return stored items that should be replayed as backend request input.
 fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
-    stored.iter().filter_map(canonical_openresponses_replay_item).collect()
+    stored
+        .iter()
+        .filter_map(canonical_openresponses_replay_item)
+        .map(strip_local_compaction_marker)
+        .collect()
 }
 
 /// Parse the request body and extract `previous_response_id`.

@@ -12,8 +12,8 @@ use praxis_ai_store::{
 };
 use serde_json::json;
 
-use super::{ConversationsService, build_item_records, duplicate_item_id, validate_item_count};
-use crate::StateOwner;
+use super::{build_item_records, duplicate_item_id, validate_item_count};
+use crate::{StateOwner, store::OwnerScopedResponseStore};
 
 /// Build a validated owner for a fixed tenant and issuer.
 fn owner(subject: &str) -> StateOwner {
@@ -29,9 +29,9 @@ fn registry() -> StoreRegistry {
     reg
 }
 
-/// Bind a service to the default backend for `owner`.
-fn service(reg: &StoreRegistry, owner: &StateOwner) -> ConversationsService {
-    ConversationsService::new(reg.get_scoped("default", owner).unwrap())
+/// Bind a store handle to the default backend for `owner`.
+fn scoped_store(reg: &StoreRegistry, owner: &StateOwner) -> OwnerScopedResponseStore {
+    reg.get_scoped("default", owner).unwrap()
 }
 
 /// A conversation record owned by `owner`.
@@ -76,6 +76,22 @@ fn build_item_records_generates_ids_for_items_without_them() {
     assert_eq!(records[0].owner, o);
     assert_eq!(records[0].position, 0);
     assert_eq!(records[0].item_data["id"], "item_1");
+}
+
+#[test]
+fn build_item_records_normalizes_easy_input_message_without_type() {
+    let records = build_item_records(
+        &owner("alice"),
+        "conv_1",
+        1000,
+        0,
+        [json!({"role": "user", "content": "hi"})],
+        counter(),
+    )
+    .unwrap();
+    assert_eq!(records[0].item_data["type"], "message");
+    assert_eq!(records[0].item_data["content"][0]["type"], "input_text");
+    assert_eq!(records[0].item_data["content"][0]["text"], "hi");
 }
 
 #[test]
@@ -154,7 +170,7 @@ fn validate_item_count_and_duplicate_detection() {
 async fn create_and_get_conversation_round_trip() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     let fetched = svc.get_conversation("conv_1").await.unwrap().unwrap();
@@ -166,7 +182,7 @@ async fn create_and_get_conversation_round_trip() {
 async fn update_metadata_and_delete() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     assert!(
@@ -186,7 +202,7 @@ async fn update_metadata_and_delete() {
 async fn create_items_list_get_delete_round_trip() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     let records = build_item_records(
@@ -199,20 +215,27 @@ async fn create_items_list_get_delete_round_trip() {
     )
     .unwrap();
 
-    assert!(svc.existing_item_ids("conv_1", &["item_a"]).await.unwrap().is_empty());
-    svc.create_items("conv_1", &records).await.unwrap();
+    assert!(
+        svc.get_existing_conversation_item_ids("conv_1", &["item_a"])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    svc.create_items_and_sync_messages("conv_1", &records).await.unwrap();
     assert_eq!(
-        svc.existing_item_ids("conv_1", &["item_a"]).await.unwrap(),
+        svc.get_existing_conversation_item_ids("conv_1", &["item_a"])
+            .await
+            .unwrap(),
         vec!["item_a".to_owned()]
     );
 
-    let listed = svc.list_items("conv_1", None, 10, true).await.unwrap();
+    let listed = svc.list_conversation_items("conv_1", None, 10, true).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].item_id, "item_a");
 
-    assert!(svc.get_item("conv_1", "item_a").await.unwrap().is_some());
-    assert!(svc.delete_item("conv_1", "item_a").await.unwrap());
-    assert!(svc.get_item("conv_1", "item_a").await.unwrap().is_none());
+    assert!(svc.get_conversation_item("conv_1", "item_a").await.unwrap().is_some());
+    assert!(svc.delete_item_and_sync_messages("conv_1", "item_a").await.unwrap());
+    assert!(svc.get_conversation_item("conv_1", "item_a").await.unwrap().is_none());
 }
 
 // -----------------------------------------------------------------------------
@@ -224,14 +247,20 @@ async fn get_conversation_is_owner_scoped() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    service(&reg, &alice)
+    scoped_store(&reg, &alice)
         .upsert_conversation(&conversation(&alice, "conv_1"))
         .await
         .unwrap();
 
-    assert!(service(&reg, &bob).get_conversation("conv_1").await.unwrap().is_none());
     assert!(
-        service(&reg, &alice)
+        scoped_store(&reg, &bob)
+            .get_conversation("conv_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        scoped_store(&reg, &alice)
             .get_conversation("conv_1")
             .await
             .unwrap()
@@ -244,7 +273,7 @@ async fn upsert_conversation_rejects_foreign_owner_record() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let svc = service(&reg, &alice);
+    let svc = scoped_store(&reg, &alice);
 
     // A record stamped with bob's owner cannot be written through alice's handle.
     let err = svc
@@ -255,13 +284,19 @@ async fn upsert_conversation_rejects_foreign_owner_record() {
 
     // Nothing was written under either owner.
     assert!(
-        service(&reg, &alice)
+        scoped_store(&reg, &alice)
             .get_conversation("conv_1")
             .await
             .unwrap()
             .is_none()
     );
-    assert!(service(&reg, &bob).get_conversation("conv_1").await.unwrap().is_none());
+    assert!(
+        scoped_store(&reg, &bob)
+            .get_conversation("conv_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -269,7 +304,7 @@ async fn create_items_rejects_foreign_owner_item() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let svc = service(&reg, &alice);
+    let svc = scoped_store(&reg, &alice);
     svc.upsert_conversation(&conversation(&alice, "conv_1")).await.unwrap();
 
     let foreign: Vec<ConversationItemRecord> = build_item_records(
@@ -281,9 +316,17 @@ async fn create_items_rejects_foreign_owner_item() {
         counter(),
     )
     .unwrap();
-    let err = svc.create_items("conv_1", &foreign).await.unwrap_err();
+    let err = svc
+        .create_items_and_sync_messages("conv_1", &foreign)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::InvalidInput(_)));
-    assert!(svc.list_items("conv_1", None, 10, true).await.unwrap().is_empty());
+    assert!(
+        svc.list_conversation_items("conv_1", None, 10, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -291,7 +334,7 @@ async fn items_are_isolated_across_owners() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let alice_svc = service(&reg, &alice);
+    let alice_svc = scoped_store(&reg, &alice);
     alice_svc
         .upsert_conversation(&conversation(&alice, "conv_1"))
         .await
@@ -305,10 +348,25 @@ async fn items_are_isolated_across_owners() {
         counter(),
     )
     .unwrap();
-    alice_svc.create_items("conv_1", &records).await.unwrap();
+    alice_svc
+        .create_items_and_sync_messages("conv_1", &records)
+        .await
+        .unwrap();
 
-    let bob_svc = service(&reg, &bob);
+    let bob_svc = scoped_store(&reg, &bob);
     assert!(bob_svc.get_conversation("conv_1").await.unwrap().is_none());
-    assert!(bob_svc.list_items("conv_1", None, 10, true).await.unwrap().is_empty());
-    assert!(bob_svc.get_item("conv_1", "item_a").await.unwrap().is_none());
+    assert!(
+        bob_svc
+            .list_conversation_items("conv_1", None, 10, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bob_svc
+            .get_conversation_item("conv_1", "item_a")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

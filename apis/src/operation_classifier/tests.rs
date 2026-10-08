@@ -1,0 +1,845 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Unit tests for the `ai_operation` classifier.
+
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+
+use praxis_filter::{BodyAccess, BodyMode, ErrorResponseFormatterHandle, Request};
+
+use super::*;
+use crate::test_utils::{make_filter_context, make_request};
+
+/// Build the filter from YAML, defaulting to an empty mapping.
+fn filter(yaml: &str) -> Box<dyn HttpFilter> {
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    AiOperationFilter::from_config(&value).unwrap()
+}
+
+/// Build a filter with default configuration.
+fn default_filter() -> Box<dyn HttpFilter> {
+    filter("{}")
+}
+
+/// Build a request for one method and path.
+fn req(method: &str, path: &str) -> Request {
+    make_request(http::Method::from_bytes(method.as_bytes()).unwrap(), path)
+}
+
+/// `WebSocket` opening handshake headers.
+fn websocket_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+    headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+    headers
+}
+
+#[test]
+fn declares_no_request_body_access_or_buffering() {
+    let filter = default_filter();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert!(
+        matches!(filter.request_body_mode(), BodyMode::Stream),
+        "the classifier must not request buffering"
+    );
+}
+
+#[tokio::test]
+async fn classifies_a_conversations_operation() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/conversations/conv_123");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_conversations")
+    );
+    assert_eq!(matched.operation_id, "getConversation");
+    assert_eq!(matched.transport, Transport::Http);
+    assert_eq!(matched.request_body, RequestBody::None);
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("ai_operation.application_protocol")
+            .map(String::as_str),
+        Some("openai_conversations")
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        Some("getConversation")
+    );
+}
+
+#[test]
+fn classifies_open_ended_protocols_and_registry_body_metadata() {
+    for (method, path, application_protocol, request_body) in [
+        (
+            "POST",
+            "/v1/conversations",
+            ApplicationProtocol::new("openai_conversations"),
+            RequestBody::Json { required: false },
+        ),
+        (
+            "GET",
+            "/v1/conversations/conv_bodyless",
+            ApplicationProtocol::new("openai_conversations"),
+            RequestBody::None,
+        ),
+        (
+            "POST",
+            "/v1/chat/completions",
+            ApplicationProtocol::new("openai_chat_completions"),
+            RequestBody::Json { required: true },
+        ),
+        (
+            "POST",
+            "/v1/responses",
+            ApplicationProtocol::new("openai_responses"),
+            RequestBody::Json { required: true },
+        ),
+    ] {
+        let matched = classify(method, path, Transport::Http).unwrap();
+        assert_eq!(matched.application_protocol, application_protocol, "{method} {path}");
+        assert_eq!(matched.request_body, request_body, "{method} {path}");
+    }
+}
+
+#[test]
+fn offset_backed_parameters_survive_request_lifecycle_phases() {
+    let path = "/v1/conversations/conv_%E2%9C%93/items/item%2Fraw";
+    let matched = classify("GET", path, Transport::Http).unwrap();
+
+    // Copy the stored value as later request/body hooks do, then recover raw
+    // path segments from the still-immutable request URI without cloning it.
+    let phase_match = matched;
+    assert_eq!(
+        phase_match.path_parameters.get(path, "conversation_id"),
+        Some("conv_%E2%9C%93")
+    );
+    assert_eq!(phase_match.path_parameters.get(path, "item_id"), Some("item%2Fraw"));
+    assert_eq!(phase_match.path_parameters.len(), 2);
+}
+
+#[test]
+fn conversations_normalization_and_malformed_paths_follow_the_shared_matcher() {
+    for (method, path, expected) in [
+        ("GET", "/v1/conversations/conv_1/", true),
+        ("GET", "/v1/conversations/conv_1?include=x", true),
+        ("GET", "/v1/conversations//items", false),
+        ("GET", "/v1/conversations/conv_1/items/", true),
+        ("GET", "/v1/conversations/conv_1/items/item_1/extra", false),
+        ("PATCH", "/v1/conversations/conv_1", false),
+    ] {
+        assert_eq!(
+            classify(method, path, Transport::Http).is_some(),
+            expected,
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn classifies_chat_completions_operations_from_the_request_head() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/chat/completions", "createChatCompletion"),
+        ("POST", "/v1/chat/completions/", "createChatCompletion"),
+        ("POST", "/v1/chat/completions?stream=true", "createChatCompletion"),
+        ("GET", "/v1/chat/completions", "listChatCompletions"),
+        ("GET", "/v1/chat/completions/chatcmpl_abc", "getChatCompletion"),
+        ("POST", "/v1/chat/completions/chatcmpl_abc", "updateChatCompletion"),
+        ("DELETE", "/v1/chat/completions/chatcmpl_abc", "deleteChatCompletion"),
+        (
+            "GET",
+            "/v1/chat/completions/chatcmpl_abc/messages",
+            "getChatCompletionMessages",
+        ),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied();
+        assert!(matched.is_some(), "{method} {path} must classify");
+        let matched = matched.unwrap();
+        assert_eq!(
+            matched.application_protocol,
+            ApplicationProtocol::new("openai_chat_completions"),
+            "{method} {path}"
+        );
+        assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+        assert_eq!(matched.transport, Transport::Http, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn websocket_handshake_on_chat_completions_does_not_match() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/chat/completions");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
+        "Chat Completions is HTTP-only, so a websocket handshake must not classify"
+    );
+}
+
+#[tokio::test]
+async fn websocket_handshake_on_conversations_is_not_classified() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/conversations/conv_123");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
+        "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
+    );
+}
+
+/// The error formatter is installed from the request head, so an OpenAI
+/// client keeps OpenAI-shaped errors on proxy failures without any
+/// protocol-specific filter later in the chain.
+///
+/// Membership is derived from the protocol name, so a registry added later —
+/// Files and Vector Stores, for instance — is covered without touching this
+/// filter.
+#[tokio::test]
+async fn an_openai_operation_installs_the_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/conversations/conv_123"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the OpenAI error formatter"
+        );
+    }
+}
+
+/// A request that matches no OpenAI operation is left alone, so non-OpenAI
+/// traffic on a shared listener keeps its default error shape.
+#[tokio::test]
+async fn an_unmatched_request_installs_no_error_formatter() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/unknown");
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "an unmatched request keeps the default error formatting"
+    );
+}
+
+#[tokio::test]
+async fn classifies_a_responses_operation() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_responses")
+    );
+    assert_eq!(matched.operation_id, "createResponse");
+}
+
+#[tokio::test]
+async fn publishes_proxy_owned_routing_headers() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let set: Vec<(String, String)> = ctx
+        .request_headers_to_set
+        .iter()
+        .map(|(name, value)| (name.as_str().to_owned(), value.to_str().unwrap().to_owned()))
+        .collect();
+
+    assert!(set.contains(&(
+        "x-praxis-ai-application-protocol".to_owned(),
+        "openai_responses".to_owned()
+    )));
+    assert!(set.contains(&("x-praxis-ai-operation".to_owned(), "createResponse".to_owned())));
+}
+
+#[tokio::test]
+async fn client_supplied_headers_cannot_spoof_a_matched_operation() {
+    let filter = default_filter();
+    let mut request = req("POST", "/v1/responses");
+    request
+        .headers
+        .insert("x-praxis-ai-application-protocol", "openai_files".parse().unwrap());
+    request
+        .headers
+        .insert("x-praxis-ai-operation", "createFile".parse().unwrap());
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    // set (overwrite) semantics, so the forged values cannot survive alongside.
+    let protocol = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-praxis-ai-application-protocol")
+        .map(|(_, value)| value.to_str().unwrap().to_owned());
+    assert_eq!(protocol.as_deref(), Some("openai_responses"));
+}
+
+#[tokio::test]
+async fn client_supplied_headers_are_stripped_when_nothing_matches() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/unknown");
+    request
+        .headers
+        .insert("x-praxis-ai-application-protocol", "openai_responses".parse().unwrap());
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(ctx.extensions.get::<AiOperationMatch>().is_none());
+    let removed: Vec<&str> = ctx
+        .request_headers_to_remove
+        .iter()
+        .map(http::HeaderName::as_str)
+        .collect();
+    assert!(removed.contains(&"x-praxis-ai-application-protocol"));
+    assert!(removed.contains(&"x-praxis-ai-operation"));
+    assert!(ctx.request_headers_to_set.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_handshake_selects_the_websocket_operation() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/responses");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(matched.transport, Transport::WebSocket);
+    assert_eq!(matched.operation_id, "praxis_createResponseWebSocket");
+}
+
+#[tokio::test]
+async fn plain_get_on_the_responses_collection_does_not_match() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
+        "a GET without upgrade headers is not the websocket operation"
+    );
+}
+
+#[tokio::test]
+async fn static_endpoints_are_not_consumed_as_identifiers() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/responses/input_tokens");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(matched.operation_id, "Getinputtokencounts");
+}
+
+#[tokio::test]
+async fn unsupported_methods_publish_no_operation() {
+    for (method, path) in [
+        ("PUT", "/v1/responses"),
+        ("PUT", "/v1/chat/completions"),
+        ("PATCH", "/v1/conversations/conv_1"),
+        ("DELETE", "/v1/responses"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_none(),
+            "{method} {path} must not classify"
+        );
+    }
+}
+
+#[tokio::test]
+async fn configured_header_names_are_honored() {
+    let filter = filter("\nheaders:\n  application_protocol: x-protocol\n  operation: x-operation\n");
+    let request = req("POST", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let names: Vec<&str> = ctx
+        .request_headers_to_set
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(names.contains(&"x-protocol"));
+    assert!(names.contains(&"x-operation"));
+}
+
+#[tokio::test]
+async fn headers_can_be_disabled_while_metadata_still_publishes() {
+    let filter = filter("\nheaders:\n  application_protocol: ~\n  operation: ~\n");
+    let request = req("POST", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(ctx.request_headers_to_set.is_empty());
+    assert_eq!(
+        ctx.filter_metadata
+            .get("ai_operation.application_protocol")
+            .map(String::as_str),
+        Some("openai_responses")
+    );
+}
+
+#[test]
+fn invalid_header_name_is_rejected_at_startup() {
+    let value: serde_yaml::Value = serde_yaml::from_str("headers:\n  application_protocol: \"bad header\"\n").unwrap();
+    assert!(AiOperationFilter::from_config(&value).is_err());
+}
+
+#[test]
+fn unknown_configuration_fields_are_rejected() {
+    let value: serde_yaml::Value = serde_yaml::from_str("nonsense: true\n").unwrap();
+    assert!(AiOperationFilter::from_config(&value).is_err());
+}
+
+#[test]
+fn header_targets_carrying_auth_or_framing_are_rejected() {
+    for target in [
+        "authorization",
+        "host",
+        "content-length",
+        "content-type",
+        "expect",
+        "cookie",
+        "transfer-encoding",
+    ] {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
+        assert!(
+            AiOperationFilter::from_config(&value).is_err(),
+            "{target} must not be an overwritable classifier target"
+        );
+    }
+}
+
+#[test]
+fn provider_credential_header_targets_are_rejected() {
+    for target in [
+        "x-api-key",
+        "X-Api-Key",
+        "api-key",
+        "x-goog-api-key",
+        "x-mcp-authorized",
+        "set-cookie",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(&format!("headers:\n  operation: {target}\n")).unwrap();
+        assert!(
+            AiOperationFilter::from_config(&value).is_err(),
+            "{target} carries credentials and must not be overwritten or stripped by the classifier"
+        );
+    }
+}
+
+#[test]
+fn unrelated_reserved_namespaces_are_rejected() {
+    // The classifier owns only its own two facts. Every other internal
+    // namespace belongs to some other filter, and a matched request would
+    // overwrite it while an unmatched one would strip it.
+    for target in [
+        "x-praxis-route",
+        "x-praxis-ai-format",
+        "x-praxis-responses-mode",
+        "x-mcp-session",
+        "x-a2a-task",
+    ] {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
+        assert!(
+            AiOperationFilter::from_config(&value).is_err(),
+            "{target} is not this classifier's to own"
+        );
+    }
+}
+
+#[test]
+fn dedicated_defaults_and_custom_names_remain_allowed() {
+    for config in [
+        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n",
+        "headers:\n  operation: x-praxis-ai-operation\n",
+        // Case-insensitive against the dedicated default.
+        "headers:\n  operation: X-Praxis-AI-Operation\n",
+        // Custom, non-reserved names stay configurable.
+        "headers:\n  application_protocol: x-my-protocol\n  operation: x-my-operation\n",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(config).unwrap();
+        assert!(
+            AiOperationFilter::from_config(&value).is_ok(),
+            "configuration should remain valid:\n{config}"
+        );
+    }
+}
+
+#[test]
+fn each_field_may_not_claim_the_other_fields_default() {
+    // x-praxis-ai-operation is a reserved internal name that belongs to the
+    // operation output, so the protocol output must not target it.
+    let value: serde_yaml::Value =
+        serde_yaml::from_str("headers:\n  application_protocol: x-praxis-ai-operation\n").unwrap();
+    assert!(
+        AiOperationFilter::from_config(&value).is_err(),
+        "one output must not claim the other's dedicated header"
+    );
+}
+
+#[test]
+fn both_outputs_targeting_one_header_is_rejected() {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str("headers:\n  application_protocol: x-same\n  operation: X-Same\n").unwrap();
+    assert!(
+        AiOperationFilter::from_config(&value).is_err(),
+        "a shared target would let the operation value replace the application protocol"
+    );
+}
+
+#[tokio::test]
+async fn publishes_filter_results_for_branch_conditions() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let results = ctx
+        .filter_results
+        .get("ai_operation")
+        .expect("the classifier must publish filter results for on_result branching");
+    assert_eq!(results.get("application_protocol"), Some("openai_responses"));
+    assert_eq!(results.get("operation_id"), Some("createResponse"));
+}
+
+#[tokio::test]
+async fn upgrade_headers_on_a_non_get_request_still_classify() {
+    let filter = default_filter();
+    let mut request = req("POST", "/v1/responses");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx
+        .extensions
+        .get::<AiOperationMatch>()
+        .copied()
+        .expect("upgrade headers must not suppress classification of a non-GET operation");
+    assert_eq!(matched.operation_id, "createResponse");
+    assert_eq!(matched.transport, Transport::Http);
+}
+
+#[test]
+fn a_websocket_handshake_must_be_a_get() {
+    assert_eq!(
+        request_transport("POST", &websocket_headers()),
+        Transport::Http,
+        "only GET carries the RFC 6455 opening handshake"
+    );
+}
+
+#[test]
+fn transport_detection_follows_the_opening_handshake() {
+    assert_eq!(request_transport("GET", &websocket_headers()), Transport::WebSocket);
+    assert_eq!(request_transport("GET", &http::HeaderMap::new()), Transport::Http);
+
+    // Connection is a token list.
+    let mut list = http::HeaderMap::new();
+    list.insert(http::header::CONNECTION, "keep-alive, Upgrade".parse().unwrap());
+    list.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+    assert_eq!(request_transport("GET", &list), Transport::WebSocket);
+
+    // Upgrade without Connection: upgrade is not a handshake.
+    let mut partial = http::HeaderMap::new();
+    partial.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+    assert_eq!(request_transport("GET", &partial), Transport::Http);
+
+    // Several nominated protocols are not treated as a websocket handshake.
+    let mut multi = http::HeaderMap::new();
+    multi.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+    multi.append(http::header::UPGRADE, "websocket".parse().unwrap());
+    multi.append(http::header::UPGRADE, "h2c".parse().unwrap());
+    assert_eq!(request_transport("GET", &multi), Transport::Http);
+}
+
+// -----------------------------------------------------------------------------
+// Anthropic Messages
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn classifies_an_anthropic_messages_operation() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("anthropic_messages")
+    );
+    assert_eq!(matched.operation_id, "messages_post");
+    assert_eq!(matched.transport, Transport::Http);
+    assert_eq!(matched.request_body, RequestBody::Json { required: true });
+}
+
+/// One classified operation, as a protocol identifier and operation ID.
+type ExpectedOperation = (&'static str, &'static str, &'static str, &'static str);
+
+/// Assert each listed request head classifies to its expected operation.
+async fn assert_classifies(cases: &[ExpectedOperation]) {
+    for &(method, path, protocol, operation_id) in cases {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx
+            .extensions
+            .get::<AiOperationMatch>()
+            .copied()
+            .expect("every listed operation must classify");
+        assert_eq!(matched.application_protocol.as_str(), protocol, "{method} {path}");
+        assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+    }
+}
+
+/// One filter resolves every registered protocol family.
+///
+/// The classifier aggregates each protocol's own registry, so OpenAI and
+/// Anthropic operations are recognized without a provider-specific branch.
+#[tokio::test]
+async fn one_filter_classifies_both_protocol_families() {
+    assert_classifies(&[
+        ("POST", "/v1/responses", "openai_responses", "createResponse"),
+        (
+            "POST",
+            "/v1/chat/completions",
+            "openai_chat_completions",
+            "createChatCompletion",
+        ),
+        (
+            "GET",
+            "/v1/conversations/conv_123",
+            "openai_conversations",
+            "getConversation",
+        ),
+        ("POST", "/v1/messages", "anthropic_messages", "messages_post"),
+        (
+            "GET",
+            "/v1/messages/batches/msgbatch_1",
+            "anthropic_messages",
+            "message_batches_retrieve",
+        ),
+    ])
+    .await;
+}
+
+/// Anthropic operations get the Anthropic error formatter from the head.
+///
+/// A bodyless operation such as `GET /v1/messages/batches/{id}` carries nothing
+/// for a body-format filter to classify, so the head is the only place this can
+/// be decided. Without it an unreachable upstream would answer an Anthropic
+/// client with RFC 9457 problem details.
+#[tokio::test]
+async fn anthropic_operations_install_the_anthropic_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("GET", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1"),
+        ("POST", "/v1/messages/batches/msgbatch_1/cancel"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_some(),
+            "{method} {path} must classify"
+        );
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the Anthropic error formatter"
+        );
+    }
+}
+
+/// The installed formatter produces the Anthropic envelope, not the OpenAI one.
+#[tokio::test]
+async fn an_anthropic_failure_body_uses_the_anthropic_envelope() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/messages/batches/msgbatch_1");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let handle = ctx
+        .extensions
+        .get::<ErrorResponseFormatterHandle>()
+        .expect("a bodyless Anthropic operation must still install a formatter");
+    let context = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
+    let body = handle.format(&context);
+    let parsed: serde_json::Value = serde_json::from_slice(body.body.as_ref()).expect("the formatter must emit JSON");
+
+    assert_eq!(parsed.get("type").and_then(serde_json::Value::as_str), Some("error"));
+    let error = parsed
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .expect("error object");
+    assert!(error.get("type").and_then(serde_json::Value::as_str).is_some());
+    assert!(error.get("message").and_then(serde_json::Value::as_str).is_some());
+    assert!(
+        parsed.get("request_id").and_then(serde_json::Value::as_str).is_some(),
+        "the Anthropic envelope carries a request_id"
+    );
+}
+
+#[tokio::test]
+async fn an_anthropic_batch_path_captures_its_identifier() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/messages/batches/msgbatch_abc123/results");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(matched.operation_id, "message_batches_results");
+    assert_eq!(
+        matched.path_parameters.get(request.uri.path(), "message_batch_id"),
+        Some("msgbatch_abc123"),
+        "path parameters are recovered from the immutable request path"
+    );
+}
+
+#[tokio::test]
+async fn publishes_anthropic_metadata_and_filter_results() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("ai_operation.application_protocol")
+            .map(String::as_str),
+        Some("anthropic_messages")
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        Some("messages_post")
+    );
+
+    let results = ctx.filter_results.get("ai_operation").unwrap();
+    assert_eq!(results.get("application_protocol"), Some("anthropic_messages"));
+    assert_eq!(results.get("operation_id"), Some("messages_post"));
+}
+
+#[tokio::test]
+async fn unregistered_anthropic_surfaces_publish_no_match() {
+    for (method, path) in [
+        ("POST", "/v1/complete"),
+        ("GET", "/v1/models"),
+        ("POST", "/v1/files"),
+        ("GET", "/v1/messages"),
+        ("GET", "/v1/messages/msg_123"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_none(),
+            "{method} {path} is outside every registered protocol"
+        );
+    }
+}
+
+/// The request head alone decides the operation.
+///
+/// A Chat Completions-shaped, malformed, empty, or absent body must not change
+/// which operation `POST /v1/messages` resolves to. The body is placed in the
+/// context so the assertion is about the classifier ignoring an available
+/// payload, not merely about one being unavailable.
+#[tokio::test]
+async fn a_request_body_never_changes_the_classified_operation() {
+    let bodies = [
+        None,
+        Some(bytes::Bytes::new()),
+        Some(bytes::Bytes::from_static(b"not json at all")),
+        Some(bytes::Bytes::from_static(br#"{"model":"gpt-4.1","messages":[]}"#)),
+        Some(bytes::Bytes::from_static(br#"{"input":"hi","model":"gpt-4.1"}"#)),
+        Some(bytes::Bytes::from_static(
+            br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[]}"#,
+        )),
+    ];
+
+    for body in bodies {
+        let filter = default_filter();
+        let request = req("POST", "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.buffered_request_body = body.clone();
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+        assert_eq!(
+            matched.application_protocol.as_str(),
+            "anthropic_messages",
+            "body {body:?} changed the classified protocol"
+        );
+        assert_eq!(
+            matched.operation_id, "messages_post",
+            "body {body:?} changed the classified operation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_anthropic_match_sets_the_configured_routing_headers() {
+    let filter = filter(
+        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n  operation: x-praxis-ai-operation\n",
+    );
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let set = ctx
+        .request_headers_to_set
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        set.contains(&("x-praxis-ai-application-protocol", "anthropic_messages")),
+        "{set:?}"
+    );
+    assert!(set.contains(&("x-praxis-ai-operation", "messages_post")), "{set:?}");
+}

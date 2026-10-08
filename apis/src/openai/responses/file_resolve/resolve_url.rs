@@ -5,8 +5,7 @@
 
 use std::net::IpAddr;
 
-use praxis_ai_store::url_security::is_cloud_metadata;
-use praxis_core::connectivity::normalize_mapped_ipv4;
+use praxis_core::connectivity::classify_ip;
 
 use super::resolve::{ResolveError, ResolvedFile, max_content_bytes_for_data_url};
 use crate::{
@@ -74,7 +73,7 @@ impl NormalizedOrigin {
         };
         let default_port = if url_scheme == "https" { 443 } else { 80 };
         let url_port = url.port().unwrap_or(default_port);
-        self.scheme == url_scheme && self.host == url_host.to_ascii_lowercase() && self.port == url_port
+        self.scheme == url_scheme && self.host.eq_ignore_ascii_case(url_host) && self.port == url_port
     }
 
     /// Reject IPs that are never valid in an allowlist: unspecified,
@@ -88,16 +87,17 @@ impl NormalizedOrigin {
             .unwrap_or(&self.host);
 
         let ip: IpAddr = match host_without_brackets.parse() {
-            Ok(ip) => normalize_mapped_ipv4(ip),
+            Ok(ip) => ip,
             Err(_) => return Ok(()),
         };
-        if ip.is_unspecified() {
+        let class = classify_ip(&ip);
+        if class.is_unspecified() {
             return Err("origin must not target an unspecified address".to_owned());
         }
-        if ip.is_multicast() {
+        if class.is_multicast() {
             return Err("origin must not target a multicast address".to_owned());
         }
-        if is_cloud_metadata(&ip) {
+        if class.is_cloud_metadata() {
             return Err("origin must not target a cloud metadata endpoint".to_owned());
         }
         Ok(())
@@ -481,8 +481,10 @@ impl FileUrlResolver {
 
 /// Check if a hostname is blocked (localhost and *.localhost).
 fn is_blocked_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower.ends_with(".localhost")
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("localhost"))
 }
 
 #[cfg(test)]
@@ -505,9 +507,11 @@ mod tests {
         },
     };
 
-    use praxis_ai_store::url_security::is_file_url_ssrf_blocked;
-
     use super::*;
+
+    fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
+        AddressPolicy::from_allow_private(allow_private).blocks(ip)
+    }
 
     fn test_client() -> SubRequestClient {
         crate::subrequest::isolated_client(4)
@@ -681,6 +685,20 @@ mod tests {
         let origin = NormalizedOrigin::parse("https://files.example.com").unwrap();
         let url = url::Url::parse("https://Files.Example.Com/file.pdf").unwrap();
         assert!(origin.matches_url(&url), "host matching should be case-insensitive");
+    }
+
+    /// Covers host normalization and effective-port comparison from RFC 6454
+    /// Sections 4 and 5.
+    #[test]
+    fn matches_url_preserves_normalized_host_and_authority_rules() {
+        let origin = NormalizedOrigin::parse("https://BÜCHER.example:443").unwrap();
+        let matching = url::Url::parse("https://bücher.EXAMPLE/file.pdf").unwrap();
+        let different_port = url::Url::parse("https://bücher.example:8443/file.pdf").unwrap();
+        assert!(origin.matches_url(&matching), "IDNA host and default port should match");
+        assert!(
+            !origin.matches_url(&different_port),
+            "a different effective port must not match"
+        );
     }
 
     #[test]
@@ -906,6 +924,33 @@ mod tests {
         assert!(
             is_file_url_ssrf_blocked(&"fd00:ec2::254".parse().unwrap(), true),
             "cloud metadata IPv6 should be blocked even with allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_blocks_metadata_even_when_origin_selects_private_policy() {
+        let resolver = FileUrlResolver {
+            // Construct directly because configuration correctly rejects
+            // metadata origins before a resolver can be built.
+            allowed_private_origins: vec![NormalizedOrigin {
+                scheme: "http".to_owned(),
+                host: "169.254.169.254".to_owned(),
+                port: 80,
+            }],
+            client: test_client(),
+        };
+
+        let result = resolver
+            .resolve_url(
+                "http://169.254.169.254/latest/meta-data/",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                1024,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
+            "cloud metadata must remain blocked after selecting the private-origin policy"
         );
     }
 
@@ -1736,6 +1781,29 @@ mod tests {
             !is_blocked_hostname("example.com"),
             "non-localhost should not be blocked"
         );
+        for host in ["LOCALHOST", "a.LoCaLhOsT", "A.B.LOCALHOST"] {
+            assert!(
+                is_blocked_hostname(host),
+                "mixed-case localhost must be blocked: {host}"
+            );
+        }
+        for host in ["notlocalhost", "a.localhost.example", "a.localhosť", "a.localhostx"] {
+            assert!(
+                !is_blocked_hostname(host),
+                "non-suffix host must remain allowed: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_checks_allocate_no_lowercase_copy() {
+        let origin = NormalizedOrigin::parse("https://files.example.com").unwrap();
+        let url = url::Url::parse("https://Files.Example.Com/file.pdf").unwrap();
+        let allocations = allocation_counter::measure(|| {
+            std::hint::black_box(origin.matches_url(&url));
+            std::hint::black_box(is_blocked_hostname("A.B.LOCALHOST"));
+        });
+        assert_eq!(allocations.count_total, 0, "hostname checks allocated: {allocations:?}");
     }
 
     // Coverage: NormalizedOrigin::parse with non-IP hostname

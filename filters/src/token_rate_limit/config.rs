@@ -27,10 +27,10 @@ use serde::Deserialize;
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
 /// static header-value matchers, per-rule algorithm choice, configurable
-/// estimation strategies (M3, see [`EstimationConfig`]), and M4
-/// token-type weights (`default_weights` / per-rule `weights`). CEL
-/// matchers and soft-limit tiers are still out of scope (see the module
-/// doc comment) -- upstream itself defers those.
+/// estimation strategies (M3, see [`EstimationConfig`]), M4
+/// token-type weights (`default_weights` / per-rule `weights`), graduated
+/// soft-limit tiers (S1), and per-rule soft over-quota enforcement
+/// (`ai#1241`). CEL matchers remain deferred (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -44,9 +44,14 @@ use serde::Deserialize;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
-/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before
-///   a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
+///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
+///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
 ///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///
+/// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
+/// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
+/// also use `budget_exhausted`. Admitted reservations use `reserved`.
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
@@ -76,21 +81,51 @@ use serde::Deserialize;
 /// Every previous `praxis_ai_token_rate_limit_*` name has moved to this
 /// prefix; no compatibility aliases are emitted.
 ///
-/// `budget_remaining` is the sum of the latest calculated remaining
-/// balances for the rule's retained keys, and `active_keys` is how many
-/// balances contribute. Window aging and refill are evaluated lazily during
-/// normal backend operations, so both are snapshots rather than
-/// continuously refreshed values. Like all Prometheus gauges they are f64
-/// and saturate at the largest exactly representable integer (2^53 - 1).
+/// `budget_remaining` is the remaining budget for the key of the most recent
+/// admission decision on this replica (admitted or denied), and
+/// `active_keys` is how many keys the backend currently retains. Both are
+/// snapshots taken as decisions happen, not continuously refreshed values.
+/// Like all Prometheus gauges they are f64 and saturate at the largest
+/// exactly representable integer (2^53 - 1).
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend every replica exports the rule-wide value it
-/// last observed from the shared store, so aggregate replicas with `max`;
-/// a replica that stops seeing traffic for a rule keeps exporting its last
-/// observation until it does. Valkey applies expiry incrementally on each
-/// admission, so its counts can briefly include entries that have just
-/// expired.
+/// With the `valkey` backend, `reservations_active` is scoped to the
+/// namespace and algorithm, so summing it over rules double-counts;
+/// aggregate with `max` across replicas and rules. `active_keys` is scoped
+/// per rule, so aggregate with `max` across replicas for each rule.
+/// Each replica exports the value it last observed from the shared store.
+/// `budget_remaining` stays per replica and per
+/// last decision on either backend: it describes whichever key that
+/// replica decided last, so `max` or `sum` across replicas says little
+/// beyond "some key had this much left". A replica that stops seeing
+/// traffic for a rule keeps exporting its last observation until it does.
+///
+/// The `valkey` backend requires Valkey or Redis 7.0+ (`PEXPIRE NX`/`GT`
+/// is used). The `valkey` backend keeps
+/// sliding-window usage in 60 fixed sub-windows per window (one per
+/// second for windows under a minute); usage leaves the window up to one
+/// sub-window late, never early. Changing a window's length changes its
+/// sub-window width and so starts that window's usage from zero. On the
+/// sliding window, concurrent admissions on one key are not serialised,
+/// so they can overshoot the budget by their combined estimates for one
+/// round trip. Usage written is never lost.
+///
+/// The `valkey` token bucket, by contrast, serialises admissions per key
+/// through an optimistic transaction: one key admits at most about one
+/// request per two Valkey round trips across the whole fleet, and
+/// contention shows up first as added latency, up to the 500 ms Valkey
+/// timeout, then as 503s. Use a non-`global` `key` for high-throughput
+/// token-bucket rules so the load spreads over many buckets.
+///
+/// During a rolling upgrade from the earlier scripted `valkey` backend,
+/// replicas on the old and new versions keep separate state, so for one
+/// window (and until old token buckets have drained) combined admissions
+/// can reach about twice the budget. All `valkey` timestamps come from
+/// the proxy replicas' clocks, not Valkey's: skew between replicas can
+/// under-count usage at window edges by up to the skew, and a replica
+/// whose clock runs fast trims other replicas' live reservations and keys
+/// from the caps early.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`
@@ -137,8 +172,8 @@ pub(super) struct TokenRateLimitConfig {
     /// rather than growing without bound.
     ///
     /// In-process ledgers enforce the cap per rule. Valkey enforces it
-    /// against the per-rule retained-key set (`{namespace}:v1:rule:{hash}:keys`,
-    /// or the token-bucket equivalent), not the namespace-wide set.
+    /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
+    /// or the token-bucket equivalent).
     /// Idle in-process keys are reaped by ledger cleanup, which walks a
     /// bounded number of entries per request (including busy ones) so a
     /// single in-window key cannot pin the table at this cap.
@@ -733,6 +768,66 @@ pub(super) struct RuleConfig {
     /// the algorithm's `capacity`.
     #[serde(default)]
     pub tiers: Option<Vec<TierConfig>>,
+
+    /// What happens when the algorithm denies a reservation because the
+    /// token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`]
+    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation.
+    #[serde(default)]
+    pub enforcement: EnforcementMode,
+
+    /// Request-header annotation applied when [`enforcement`](Self::enforcement)
+    /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
+    /// for budget exhaustion. Required for `soft` (at least one static header
+    /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
+    #[serde(default)]
+    pub over_quota: Option<OverQuotaConfig>,
+}
+
+/// Per-rule action when the admission algorithm denies a reservation.
+///
+/// Distinct from graduated S1 `tiers` (which annotate admitted traffic
+/// below capacity): this chooses hard 429 vs soft annotate when the
+/// request is *over* the algorithm's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EnforcementMode {
+    /// Reject with 429 and token-denominated rate-limit response headers.
+    #[default]
+    Hard,
+    /// Forward the request and annotate it for downstream handling (`ai#1241`).
+    Soft,
+}
+
+/// Annotation surface for soft over-quota forwarding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OverQuotaConfig {
+    /// Static headers set on the upstream request when over quota.
+    /// Required to be non-empty unless `include_remaining` or
+    /// `include_used` is true.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// When true, also set the remaining-quota header from the backend
+    /// snapshot at denial time (tokens still available in the window /
+    /// bucket — often `0` when the estimate no longer fits).
+    #[serde(default)]
+    pub include_remaining: bool,
+
+    /// When true, also set a used-quota header as `limit - remaining`
+    /// from the same denial-time backend snapshot.
+    #[serde(default)]
+    pub include_used: bool,
+
+    /// Header name for remaining tokens when `include_remaining` is true.
+    /// Defaults to `X-RateLimit-Remaining-Tokens`.
+    #[serde(default)]
+    pub remaining_header: Option<String>,
+
+    /// Header name for used tokens when `include_used` is true.
+    /// Defaults to `X-Token-Quota-Used`.
+    #[serde(default)]
+    pub used_header: Option<String>,
 }
 
 /// One graduated enforcement tier (proposal S1).

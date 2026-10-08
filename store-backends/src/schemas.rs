@@ -32,14 +32,15 @@ pub(crate) struct TableNames {
 
 /// Current schema version. Bump this when the DDL changes.
 ///
-/// Version 4 scopes conversation-item uniqueness to the complete owner so two
-/// tenants can use the same item and conversation identifiers safely. Version
-/// 3 stores the responses table's JSON payload columns
-/// (`response_object`, `input`, `messages`) as native binary (`BLOB`
-/// on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so the
-/// response store can persist compressed payloads. Older databases are not
-/// migrated in place and must be replaced with an empty schema-v4 store.
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+/// Version 5 adds the durable SSE event log table (`<responses>_events`) that
+/// backs `GET /v1/responses/{id}?stream=true` replay. Version 4 scopes
+/// conversation-item uniqueness to the complete owner so two tenants can use the
+/// same item and conversation identifiers safely. Version 3 stores the responses
+/// table's JSON payload columns (`response_object`, `input`, `messages`) as
+/// native binary (`BLOB` on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so
+/// the response store can persist compressed payloads. Older databases are not
+/// migrated in place and must be replaced with an empty schema-v5 store.
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 /// Suffix appended to the responses table name to derive the schema
 /// version table name.
@@ -48,6 +49,10 @@ const SCHEMA_VERSION_SUFFIX: &str = "_schema_version";
 /// Suffix appended to the responses table name to derive the
 /// server-owned pending-approval table name.
 const PENDING_APPROVALS_SUFFIX: &str = "_pending_approvals";
+
+/// Suffix appended to the responses table name to derive the durable
+/// SSE event log table name.
+const EVENTS_SUFFIX: &str = "_events";
 
 /// Derive the schema version table name from the responses table name.
 pub(crate) fn schema_version_table(responses: &str) -> String {
@@ -62,6 +67,16 @@ pub(crate) fn schema_version_table(responses: &str) -> String {
 /// exposed as a YAML option.
 pub(crate) fn pending_approvals_table(responses: &str) -> String {
     format!("{responses}{PENDING_APPROVALS_SUFFIX}")
+}
+
+/// Derive the durable SSE event log table name from the responses table
+/// name.
+///
+/// Like the schema version and pending-approvals tables, this is an internal
+/// derived table (not configured directly), so it is always created and never
+/// exposed as a YAML option.
+pub(crate) fn events_table(responses: &str) -> String {
+    format!("{responses}{EVENTS_SUFFIX}")
 }
 
 // -----------------------------------------------------------------------------
@@ -125,6 +140,24 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
         append_items_ddl(&mut stmts, i);
     }
 
+    // The durable SSE event log table is created before the pending-approvals
+    // table so the version table stays last and pending-approvals stays
+    // second-to-last (both asserted by tests and relied on by callers).
+    let e = events_table(r);
+    if e.eq_ignore_ascii_case(c) {
+        return Err(StoreError::Database(format!(
+            "derived events table name collides with conversation table: {e}"
+        )));
+    }
+    if let Some(items) = &tables.items
+        && e.eq_ignore_ascii_case(items)
+    {
+        return Err(StoreError::Database(format!(
+            "derived events table name collides with items table: {e}"
+        )));
+    }
+    stmts.push(events_ddl(&e, bytes_type));
+
     let a = pending_approvals_table(r);
     if a.eq_ignore_ascii_case(c) {
         return Err(StoreError::Database(format!(
@@ -160,6 +193,21 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
     Ok(stmts)
 }
 
+/// Add a repair pointer when legacy duplicate positions prevent index creation.
+pub(crate) fn ddl_error(statement: &str, error: &sqlx::Error) -> StoreError {
+    let hint = if statement.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS idx_")
+        && statement.contains("_position ")
+        && error
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+    {
+        "; see docs/store/legacy-item-position-repair.md for pre-index data repair"
+    } else {
+        ""
+    };
+    StoreError::Database(format!("{error}{hint}"))
+}
+
 /// Validate identifiers against `PostgreSQL`-specific DDL constraints.
 ///
 /// `PostgreSQL` truncates identifiers above 63 bytes. The
@@ -186,6 +234,11 @@ pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), S
         "response table name (pending-approvals suffix)",
         r,
         POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS,
+    )?;
+    validate_postgres_identifier_len(
+        "response table name (events suffix)",
+        r,
+        POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_EVENTS,
     )?;
     validate_postgres_identifier_len("conversation table name", c, POSTGRES_MAX_CONVERSATION_TABLE_LEN)?;
     validate_postgres_identifier_case("response table name", r)?;
@@ -288,6 +341,8 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
         "CREATE INDEX IF NOT EXISTS idx_{i}_conversation \
          ON {i}(conversation_id, position, item_id)"
     ));
+    // Pre-index databases with duplicate positions need the operator-run repair in
+    // docs/store/legacy-item-position-repair.md before this DDL can succeed.
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
          ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
@@ -325,6 +380,43 @@ fn pending_approvals_ddl(a: &str) -> String {
             created_at         BIGINT NOT NULL,
             consumed_at        BIGINT,
             PRIMARY KEY (response_id, approval_id)
+        )"
+    )
+}
+
+/// DDL for the durable SSE event log table.
+///
+/// One row per normalized outbound SSE event of a stored `stream: true` response,
+/// captured as the event leaves `openai_stream_events` and before the client sees
+/// it. `GET /v1/responses/{id}?stream=true` replays these rows in ascending
+/// `sequence_number`.
+///
+/// `sequence_number` is stored as fixed-width zero-padded `TEXT` rather than an
+/// integer: the schema-folding contract requires every primary key column to have
+/// TEXT affinity (SQLite) or an allow-listed text type OID (`PostgreSQL`), so a
+/// numeric key column is rejected as folding. Zero-padding to 20 digits
+/// (`u64::MAX` width) preserves lexicographic == numeric ordering, so
+/// `ORDER BY sequence_number` and `sequence_number > <cursor>` behave numerically.
+///
+/// `payload` is the dialect's binary type (`BLOB`/`BYTEA`) so event JSON can be
+/// stored compressed through the same codec as the responses payload columns.
+/// `terminal` is a `BIGINT` 0/1 flag; `(response_id, sequence_number)` is the
+/// primary key, and its index also serves the ordered range scan, so no extra
+/// unique index is generated. Owner columns inherit the issuing response's owner
+/// and gate every access.
+fn events_ddl(e: &str, bytes_type: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {e} (
+            tenant_id       TEXT NOT NULL,
+            owner_issuer    TEXT NOT NULL,
+            owner_subject   TEXT NOT NULL,
+            response_id     TEXT NOT NULL,
+            sequence_number TEXT NOT NULL,
+            event_type      TEXT NOT NULL,
+            payload         {bytes_type} NOT NULL,
+            terminal        BIGINT NOT NULL,
+            created_at      BIGINT NOT NULL,
+            PRIMARY KEY (response_id, sequence_number)
         )"
     )
 }
@@ -370,6 +462,13 @@ const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SC
 #[cfg(feature = "postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
     POSTGRES_MAX_IDENTIFIER_LEN - PENDING_APPROVALS_SUFFIX.len();
+
+/// Maximum responses table name length that leaves room for the `_events`
+/// suffix in the derived event log table name. Shorter than both the
+/// `_schema_version` and `_pending_approvals` suffixes, so it is never the
+/// binding constraint; validated for symmetry with the other derived tables.
+#[cfg(feature = "postgres")]
+const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_EVENTS: usize = POSTGRES_MAX_IDENTIFIER_LEN - EVENTS_SUFFIX.len();
 
 /// Validate the items table name and ensure it is distinct from the
 /// responses and conversations tables.
@@ -466,6 +565,19 @@ pub(crate) const PENDING_APPROVALS_COLUMNS: &[&str] = &[
     "consumed_at",
 ];
 
+/// Expected column names for the durable SSE event log table.
+pub(crate) const EVENTS_COLUMNS: &[&str] = &[
+    "tenant_id",
+    "owner_issuer",
+    "owner_subject",
+    "response_id",
+    "sequence_number",
+    "event_type",
+    "payload",
+    "terminal",
+    "created_at",
+];
+
 /// Expected column names for the items table.
 const ITEMS_COLUMNS: &[&str] = &[
     "item_id",
@@ -510,6 +622,13 @@ const ITEMS_POSITION_UNIQUE: &[&str] = &[
 /// Approval rows inherit their issuing Response owner. Since Response IDs are
 /// globally owner-immutable, `(response_id, approval_id)` is the conflict key.
 const PENDING_APPROVALS_PRIMARY_KEY: &[&str] = &["response_id", "approval_id"];
+
+/// Expected ordered primary key columns for the durable SSE event log table.
+///
+/// Event rows inherit their issuing Response owner. Since Response IDs are
+/// globally owner-immutable, `(response_id, sequence_number)` is the conflict key
+/// and its index backs the ordered replay range scan.
+const EVENTS_PRIMARY_KEY: &[&str] = &["response_id", "sequence_number"];
 
 /// The schema this store generates for one table: the columns it must contain
 /// and its exact ordered primary key.
@@ -561,14 +680,22 @@ const PENDING_APPROVALS_TABLE: ExpectedTable = ExpectedTable {
     unique_indexes: &[],
 };
 
+/// The durable SSE event log table contract.
+const EVENTS_TABLE: ExpectedTable = ExpectedTable {
+    columns: EVENTS_COLUMNS,
+    primary_key: EVENTS_PRIMARY_KEY,
+    unique_indexes: &[],
+};
+
 /// Collect the `(table_name, expected)` contract for every owner-scoped table.
 ///
-/// The server-owned pending-approvals table is included because its rows inherit
-/// Response ownership. The single-row schema version table holds no owner data;
-/// it is validated by value in `check_schema_version`, not structurally.
+/// The server-owned pending-approvals and durable SSE event log tables are
+/// included because their rows inherit Response ownership. The single-row schema
+/// version table holds no owner data; it is validated by value in
+/// `check_schema_version`, not structurally.
 ///
-/// Table names are returned owned because the pending-approvals name is derived
-/// from the responses name rather than borrowed from `tables`.
+/// Table names are returned owned because the pending-approvals and events names
+/// are derived from the responses name rather than borrowed from `tables`.
 pub(crate) fn expected_tables(tables: &TableNames) -> Vec<(String, ExpectedTable)> {
     let mut expected = vec![
         (tables.responses.clone(), RESPONSES_TABLE),
@@ -577,6 +704,7 @@ pub(crate) fn expected_tables(tables: &TableNames) -> Vec<(String, ExpectedTable
     if let Some(items) = &tables.items {
         expected.push((items.clone(), ITEMS_TABLE));
     }
+    expected.push((events_table(&tables.responses), EVENTS_TABLE));
     expected.push((pending_approvals_table(&tables.responses), PENDING_APPROVALS_TABLE));
     expected
 }
@@ -974,6 +1102,126 @@ mod tests {
         assert!(err.to_string().contains("exceeds"), "should reject long name: {err}");
     }
 
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pre_index_duplicate_positions_report_repair_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy_items.db").display());
+        let initial =
+            crate::SqliteResponseStore::new(&url, "legacy_responses", "legacy_conversations", None, None, None)
+                .await
+                .expect("store without items should initialize");
+        drop(initial);
+
+        let tables = TableNames {
+            responses: "legacy_responses".to_owned(),
+            conversations: "legacy_conversations".to_owned(),
+            items: Some("legacy_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).unwrap();
+        let items_table = ddl
+            .iter()
+            .find(|statement| statement.starts_with("CREATE TABLE IF NOT EXISTS legacy_items "))
+            .expect("items DDL should be generated");
+        let pool = sqlx::SqlitePool::connect(&url)
+            .await
+            .expect("existing database should open");
+        sqlx::query(sqlx::AssertSqlSafe(items_table.as_str()))
+            .execute(&pool)
+            .await
+            .expect("legacy items table should be created without the new index");
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO legacy_items \
+                 (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+                 VALUES (?, 'tenant', 'issuer', 'subject', 'conv', '{}', 1, 1)",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("legacy store permitted duplicate positions");
+        }
+        pool.close().await;
+
+        let err = crate::SqliteResponseStore::new(
+            &url,
+            "legacy_responses",
+            "legacy_conversations",
+            Some("legacy_items"),
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("new unique index must reject duplicate legacy positions");
+        assert!(
+            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            "startup must provide the repair path: {err}"
+        );
+        let pool = sqlx::SqlitePool::connect(&url)
+            .await
+            .expect("database should remain readable");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_items")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy rows should still exist");
+        assert_eq!(count, 2, "failed startup must not discard legacy rows");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn position_index_error_points_to_legacy_repair() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool should connect");
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TABLE items (conversation_id TEXT, position INTEGER)",
+        ))
+        .execute(&pool)
+        .await
+        .expect("table should be created");
+        sqlx::query(sqlx::AssertSqlSafe(
+            "INSERT INTO items VALUES ('conv_1', 1), ('conv_1', 1)",
+        ))
+        .execute(&pool)
+        .await
+        .expect("duplicate positions should be seeded before the index exists");
+        let index = "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_position ON items(conversation_id, position)";
+        let cause = sqlx::query(sqlx::AssertSqlSafe(index))
+            .execute(&pool)
+            .await
+            .expect_err("duplicate positions should prevent index creation");
+        let err = ddl_error(index, &cause);
+        assert!(
+            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            "startup error should identify the operator-run repair: {err}"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe("DROP TABLE items"))
+            .execute(&pool)
+            .await
+            .expect("table should be dropped");
+        let cause = sqlx::query(sqlx::AssertSqlSafe(index))
+            .execute(&pool)
+            .await
+            .expect_err("a missing table should prevent the same index statement");
+        let unrelated_index = ddl_error(index, &cause);
+        assert!(
+            !unrelated_index.to_string().contains("legacy-item-position-repair"),
+            "unrelated database errors on the position index must not recommend data repair: {unrelated_index}"
+        );
+    }
+
+    #[test]
+    fn unrelated_position_index_failure_has_no_repair_hint() {
+        let index = "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_position ON items(conversation_id, position)";
+        let err = ddl_error(index, &sqlx::Error::PoolClosed);
+        assert!(
+            !err.to_string().contains("legacy-item-position-repair"),
+            "non-database errors must not suggest a duplicate-position repair: {err}"
+        );
+    }
+
     #[test]
     fn generate_ddl_produces_valid_statements() {
         let tables = TableNames {
@@ -984,8 +1232,9 @@ mod tests {
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         assert_eq!(
             ddl.len(),
-            5,
-            "should produce 5 DDL statements (responses, conversations, tenant_id index, pending_approvals, version)"
+            6,
+            "should produce 6 DDL statements (responses, conversations, tenant_id index, events, pending_approvals, \
+             version)"
         );
         assert!(
             ddl[0].contains("test_responses"),
@@ -1133,15 +1382,23 @@ mod tests {
         let expected = expected_tables(&tables);
         assert_eq!(
             expected.len(),
-            3,
-            "should have responses, conversations, and pending-approvals only"
+            4,
+            "should have responses, conversations, events, and pending-approvals only"
         );
         assert_eq!(
-            expected[2].0, "r_pending_approvals",
+            expected[2].0, "r_events",
+            "third entry should be the derived events table"
+        );
+        assert_eq!(
+            expected[2].1.primary_key, EVENTS_PRIMARY_KEY,
+            "events primary key contract should match"
+        );
+        assert_eq!(
+            expected[3].0, "r_pending_approvals",
             "last entry should be the derived pending-approvals table"
         );
         assert_eq!(
-            expected[2].1.primary_key, PENDING_APPROVALS_PRIMARY_KEY,
+            expected[3].1.primary_key, PENDING_APPROVALS_PRIMARY_KEY,
             "pending-approvals primary key contract should match"
         );
     }
@@ -1154,15 +1411,27 @@ mod tests {
             items: Some("i".to_owned()),
         };
         let expected = expected_tables(&tables);
-        assert_eq!(expected.len(), 4, "should include items and pending-approvals tables");
+        assert_eq!(
+            expected.len(),
+            5,
+            "should include items, events, and pending-approvals tables"
+        );
         assert_eq!(expected[2].0, "i", "third entry should be the items table");
         assert_eq!(
             expected[2].1.primary_key, ITEMS_PRIMARY_KEY,
             "items primary key contract should match"
         );
         assert_eq!(
-            expected[3].0, "r_pending_approvals",
-            "fourth entry should be the derived pending-approvals table"
+            expected[3].0, "r_events",
+            "fourth entry should be the derived events table"
+        );
+        assert_eq!(
+            expected[3].1.primary_key, EVENTS_PRIMARY_KEY,
+            "events primary key contract should match"
+        );
+        assert_eq!(
+            expected[4].0, "r_pending_approvals",
+            "fifth entry should be the derived pending-approvals table"
         );
     }
 
@@ -1581,6 +1850,85 @@ mod tests {
     }
 
     #[test]
+    fn events_table_derives_name() {
+        assert_eq!(events_table("openai_responses"), "openai_responses_events");
+    }
+
+    #[test]
+    fn generate_ddl_includes_events_table() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: None,
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
+        // The events table is created just before the pending-approvals table,
+        // which is itself just before the version table.
+        let events_ddl = &ddl[ddl.len() - 3];
+        assert!(
+            events_ddl.contains("test_responses_events"),
+            "third-to-last DDL should create the events table: {events_ddl}"
+        );
+        for expected in [
+            "response_id     TEXT NOT NULL",
+            "sequence_number TEXT NOT NULL",
+            "event_type      TEXT NOT NULL",
+            "payload         BLOB NOT NULL",
+            "terminal        BIGINT NOT NULL",
+            "PRIMARY KEY (response_id, sequence_number)",
+        ] {
+            assert!(
+                events_ddl.contains(expected),
+                "events DDL should contain `{expected}`: {events_ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_ddl_postgres_uses_bytea_for_events_payload_column() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: None,
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Postgres).expect("valid names should produce DDL");
+        let events_ddl = &ddl[ddl.len() - 3];
+        assert!(
+            events_ddl.contains("payload         BYTEA NOT NULL"),
+            "Postgres events payload should be BYTEA: {events_ddl}"
+        );
+        assert!(!events_ddl.contains("BLOB"), "Postgres must not use BLOB: {events_ddl}");
+    }
+
+    #[test]
+    fn generate_ddl_rejects_events_collision_with_conversations() {
+        let tables = TableNames {
+            responses: "test".to_owned(),
+            conversations: "test_events".to_owned(),
+            items: None,
+        };
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
+        assert!(
+            err.to_string().contains("collides with conversation table"),
+            "should reject collision: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_ddl_rejects_events_collision_with_items() {
+        let tables = TableNames {
+            responses: "test".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_events".to_owned()),
+        };
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
+        assert!(
+            err.to_string().contains("collides with items table"),
+            "should reject collision: {err}"
+        );
+    }
+
+    #[test]
     fn postgres_identifier_rejects_long_responses_for_pending_approvals_table() {
         // A responses name that fits the version-table suffix but not the
         // longer pending-approvals suffix must still be rejected.
@@ -1653,9 +2001,9 @@ mod tests {
         let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names with items should produce DDL");
         assert_eq!(
             ddl.len(),
-            8,
-            "should produce 8 DDL statements (responses, conversations, tenant_id index, items, items indexes, \
-             pending_approvals, version)"
+            9,
+            "should produce 9 DDL statements (responses, conversations, tenant_id index, items, items indexes, \
+             events, pending_approvals, version)"
         );
         assert!(
             ddl[3].contains("test_items"),

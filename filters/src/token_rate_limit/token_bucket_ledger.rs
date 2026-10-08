@@ -39,20 +39,17 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::{ledger::DenialReason, remaining_total::RemainingTotal};
+use super::ledger::DenialReason;
+
 
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
 ///
-/// [`super::backend::TOKEN_BUCKET_RESERVE_SCRIPT`]'s Valkey/Lua path
-/// folds this ratio into a millisecond `PEXPIRE` TTL. Lua 5.1's `%.14g`
-/// number formatting switches to scientific notation past ~1e14, which
-/// `PEXPIRE`'s strict-integer parser rejects -- and since Redis doesn't
-/// roll back a script's earlier `redis.call()`s on a later error, that
-/// failure would permanently drain the bucket instead of just denying
-/// one request. Enforced here, shared by both backends, so a config
-/// rejected on one is rejected on both. 1e9 stays ~1e5x below the
-/// threshold, with margin for `reservation_timeout_ms` on top.
+/// The Valkey backend folds this ratio into the millisecond `PEXPIRE` TTL
+/// of every bucket hash; bounding it keeps that TTL a modest integer
+/// (at most ~1e12 ms, plus `reservation_timeout_ms`) rather than one that
+/// saturates or outlives any useful state. Enforced here, shared by both
+/// backends, so a config rejected on one is rejected on both.
 pub(super) const MAX_CAPACITY_REFILL_RATE_RATIO_SECS: f64 = 1e9;
 
 /// Upper bound on `capacity`/`reserved_tokens`, matching f64's 2^53
@@ -138,6 +135,9 @@ pub(super) struct Reservation {
     /// (`capacity - remaining`). Exposed for the filter's graduated
     /// tier evaluation (S1).
     pub(super) usage_after: u64,
+    /// Remaining token balance for this key after the reservation.
+    /// Reported as the rule's `budget_remaining` gauge.
+    pub(super) remaining: u64,
 }
 
 /// Result of attempting admission.
@@ -150,8 +150,12 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
-        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        /// Why admission failed (shared with sliding-window ledger).
+        /// Also distinguishes budget exhaustion from the `max_keys` cap.
         reason: DenialReason,
+        /// Remaining budget for this key at the time of the denial
+        /// (soft `include_remaining` / `include_used` annotation).
+        remaining: u64,
     },
 }
 
@@ -184,8 +188,6 @@ struct BucketState {
     tokens: f64,
     last_refill_ms: u64,
     active: HashMap<u64, ActiveReservation>,
-    /// Last remaining balance included in [`TokenBucketLedger::remaining_total`].
-    reported_remaining: u64,
 }
 
 impl BucketState {
@@ -198,7 +200,6 @@ impl BucketState {
             tokens: capacity as f64,
             last_refill_ms: 0,
             active: HashMap::new(),
-            reported_remaining: capacity,
         }
     }
 
@@ -272,7 +273,6 @@ pub(super) struct TokenBucketLedger {
     next_id: AtomicU64,
     key_count: AtomicUsize,
     active_reservations: AtomicUsize,
-    remaining_total: RemainingTotal,
 }
 
 impl TokenBucketLedger {
@@ -286,7 +286,6 @@ impl TokenBucketLedger {
             next_id: AtomicU64::new(1),
             key_count: AtomicUsize::new(0),
             active_reservations: AtomicUsize::new(0),
-            remaining_total: RemainingTotal::default(),
         })
     }
 
@@ -305,32 +304,16 @@ impl TokenBucketLedger {
         self.key_count.load(Ordering::Relaxed)
     }
 
-    /// Sum of the last calculated remaining balance for retained keys.
-    pub(super) fn remaining_total(&self) -> u64 {
-        self.remaining_total.reported()
-    }
-
-    /// Publish one key's whole-token balance, moving its contribution to
-    /// the aggregate.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "token balances are finite, non-negative, and bounded by validated capacity"
-    )]
-    fn publish_remaining(&self, state: &mut BucketState) {
-        let remaining = state.tokens.floor() as u64;
-        let previous = std::mem::replace(&mut state.reported_remaining, remaining);
-        self.remaining_total.replace(previous, remaining);
-    }
-
     /// Reserve an estimate against one key's bucket: refill to `now_ms`,
     /// admit and immediately decrement if enough tokens are available,
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        use super::ledger::DenialReason;
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
             return Decision::Denied {
                 retry_after_ms: 0,
                 reason: DenialReason::InvalidKey,
+                remaining: 0,
             };
         }
 
@@ -351,10 +334,10 @@ impl TokenBucketLedger {
                         return Decision::Denied {
                             retry_after_ms: 0,
                             reason: DenialReason::KeyCapacity,
+                            remaining: 0,
                         };
                     }
                     let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
-                    self.remaining_total.add(self.config.capacity);
                     entry.insert(state);
                 },
             }
@@ -371,12 +354,17 @@ impl TokenBucketLedger {
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
 
         #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "token balances are finite, non-negative, and bounded by validated capacity"
+        )]
+        let remaining_before = state.tokens.floor() as u64;
+        #[expect(
             clippy::cast_precision_loss,
             reason = "token estimates are far below f64's 2^53 mantissa"
         )]
         let estimate_f64 = estimate as f64;
         if estimate_f64 > state.tokens {
-            self.publish_remaining(&mut state);
             let deficit = estimate_f64 - state.tokens;
             let retry_after_ms = (deficit / self.config.refill_rate * 1000.0).ceil();
             #[expect(
@@ -388,6 +376,7 @@ impl TokenBucketLedger {
             return Decision::Denied {
                 retry_after_ms,
                 reason: DenialReason::WindowCapacity,
+                remaining: remaining_before,
             };
         }
         if self
@@ -397,10 +386,10 @@ impl TokenBucketLedger {
             })
             .is_err()
         {
-            self.publish_remaining(&mut state);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
                 reason: DenialReason::ReservationCapacity,
+                remaining: remaining_before,
             };
         }
 
@@ -412,7 +401,12 @@ impl TokenBucketLedger {
             reason = "capacity is bounded by MAX_F64_SAFE_INTEGER, difference is non-negative and within u64 range"
         )]
         let usage_after = (self.config.capacity as f64 - state.tokens).max(0.0) as u64;
-        self.publish_remaining(&mut state);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "token balances are finite, non-negative, and bounded by validated capacity"
+        )]
+        let remaining_after = state.tokens.floor() as u64;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.active.insert(
             id,
@@ -429,6 +423,7 @@ impl TokenBucketLedger {
             estimate,
             created_at_ms: now_ms,
             usage_after,
+            remaining: remaining_after,
         })
     }
 
@@ -466,7 +461,6 @@ impl TokenBucketLedger {
                 state.tokens = (state.tokens - overage as f64).max(0.0);
             }
         }
-        self.publish_remaining(&mut state);
         drop(state);
         Settlement::Applied {
             actual,
@@ -501,9 +495,7 @@ impl TokenBucketLedger {
                 self.reservations.remove(id);
             }
             self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
-            self.publish_remaining(&mut state);
             let empty = state.is_empty(self.config.capacity);
-            let reported_remaining = state.reported_remaining;
             drop(state);
             drop(entry);
             if empty
@@ -519,7 +511,6 @@ impl TokenBucketLedger {
                     .is_some()
             {
                 self.key_count.fetch_sub(1, Ordering::Relaxed);
-                self.remaining_total.subtract(reported_remaining);
             }
         }
         orphaned
@@ -741,7 +732,6 @@ mod tests {
             .keys
             .insert("alice".into(), Arc::new(Mutex::new(BucketState::new(10))));
         ledger.key_count.store(1, Ordering::Relaxed);
-        ledger.remaining_total.add(10);
 
         // `reserve` keeps this same DashMap entry guard while locking and
         // changing BucketState, so cleanup must not remove its key in-between.
@@ -760,7 +750,6 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         cleanup.join().unwrap();
         assert_eq!(ledger.key_count(), 0);
-        assert_eq!(ledger.remaining_total(), 0);
     }
 
     #[test]
@@ -878,37 +867,18 @@ mod tests {
     }
 
     #[test]
-    fn remaining_total_sums_latest_bucket_balances_across_keys() {
-        let l = ledger(100, 10.0);
-        let first = match l.reserve("alice", 40, 0) {
-            Decision::Admitted(reservation) => reservation,
-            other => panic!("expected admission, got {other:?}"),
+    fn decisions_carry_the_whole_token_balance_of_the_key_they_decided() {
+        let l = ledger(100, 1.0);
+        let Decision::Admitted(first) = l.reserve("alice", 30, 1_000) else {
+            panic!("30 of 100 tokens must be admitted");
         };
-        assert_eq!(l.remaining_total(), 60);
-        assert!(matches!(l.reserve("bob", 25, 0), Decision::Admitted(_)));
-        assert_eq!(l.remaining_total(), 135, "60 for alice plus 75 for bob");
-
-        assert!(matches!(
-            l.reconcile(first.id, Some(10), 0),
-            Settlement::Applied { refund: 30, .. }
-        ));
-        assert_eq!(l.remaining_total(), 165, "alice's refund must update the aggregate");
-
-        l.cleanup(10_000, 8);
+        assert_eq!(first.remaining, 70, "100 minus the 30 just taken");
+        let Decision::Denied { remaining, .. } = l.reserve("alice", 80, 1_000) else {
+            panic!("80 tokens are not available");
+        };
         assert_eq!(
-            l.remaining_total(),
-            0,
-            "fully refilled idle keys must leave the aggregate"
+            remaining, 70,
+            "a denial reports the refilled balance it was checked against"
         );
-    }
-
-    #[test]
-    fn remaining_total_stays_saturated_until_the_exact_sum_falls_below_the_gauge_limit() {
-        let l = ledger(MAX_F64_SAFE_INTEGER, 10_000_000.0);
-
-        assert!(matches!(l.reserve("alice", 1, 0), Decision::Admitted(_)));
-        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
-        assert!(matches!(l.reserve("bob", 1, 0), Decision::Admitted(_)));
-        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
     }
 }

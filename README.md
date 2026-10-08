@@ -31,7 +31,7 @@ backends and applies policy.
   clients reaching native vLLM endpoints or Chat Completions through translation.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
   serve Conversations endpoints locally, and use PostgreSQL or SQLite for
-  storage. See the [response store guide](docs/architecture/response-store.md)
+  storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
   and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
 - **Connect tools and agents.** Run Responses tool loops with MCP, web search,
   and file search; route stateless MCP calls and A2A task follow-ups. See the

@@ -28,8 +28,9 @@ use crate::openai::{
         MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
         schema_binding,
     },
-    responses::store::DEFAULT_PAGE_LIMIT,
 };
+#[cfg(feature = "openai-conversations")]
+use crate::service::responses::input_items::DEFAULT_PAGE_LIMIT;
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{
@@ -92,7 +93,7 @@ macro_rules! request_binding {
 }
 
 /// Convert a registry contract declaration into optional owned metadata.
-#[cfg(feature = "openai-conversations")]
+#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
 #[expect(
     unused_macro_rules,
     reason = "non-owning form is part of the registry API but current Conversations operations are all local"
@@ -107,17 +108,24 @@ macro_rules! operation_contract {
             request: $request:tt,
             response: $response:ty $(,)?
         }
-    ) => {
-        Some(OwnedOperationContract {
-            parameters: &[$($parameter),*],
-            request: request_binding!($request),
-            responses: &[ResponseSpec {
-                status: "200",
-                description: "OK",
-                content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
-            }],
-        })
-    };
+    ) => {{
+        #[cfg(feature = "openai-conversations")]
+        {
+            Some(OwnedOperationContract {
+                parameters: &[$($parameter),*],
+                request: request_binding!($request),
+                responses: &[ResponseSpec {
+                    status: "200",
+                    description: "OK",
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                }],
+            })
+        }
+        #[cfg(not(feature = "openai-conversations"))]
+        {
+            None
+        }
+    }};
 }
 
 /// Derive the runtime request-body shape from a registry request declaration.
@@ -278,7 +286,7 @@ macro_rules! conversation_operations {
                             request_body: contract_request_body!($contract_kind $contract),
                         },
                         spec_path: $path,
-                        #[cfg(feature = "openai-conversations")]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -594,7 +602,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn unmatched_parameter_name_returns_none() {

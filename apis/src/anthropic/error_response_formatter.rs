@@ -35,6 +35,31 @@ impl AnthropicErrorFormatter {
     pub(crate) fn new(request_id: String) -> Self {
         Self { request_id }
     }
+
+    /// Create a formatter, deriving the request identifier from the request head.
+    ///
+    /// Shared by every install site so a failure carries the same identifier
+    /// whether the formatter was installed from the classified request head or
+    /// from body-format classification.
+    pub(crate) fn from_request_headers(headers: &http::HeaderMap) -> Self {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map_or_else(generate_request_id, ToOwned::to_owned);
+        Self::new(request_id)
+    }
+}
+
+/// Generate a request identifier when the client did not send one.
+///
+/// Uses a timestamp-based hex string prefixed with `req_` to match
+/// the Anthropic convention without adding a UUID dependency.
+fn generate_request_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("req_{nanos:032x}")
 }
 
 impl ErrorResponseFormatter for AnthropicErrorFormatter {

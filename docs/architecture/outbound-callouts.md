@@ -12,6 +12,14 @@ redirect following are disabled for direct callouts. URL userinfo is rejected,
 and forwarded or configured credentials remain bound to the validated target
 origin.
 
+Private-target opt-ins allow loopback, private, shared-address-space,
+link-local, and other special-use destinations. They never allow recognized
+cloud metadata endpoints, unspecified addresses, or multicast addresses.
+IPv4-mapped IPv6 and well-known-prefix NAT64 forms receive the same verdict as
+their embedded IPv4 address. GCP ADC is the only exception: its dedicated,
+non-configurable metadata policy accepts recognized metadata addresses (and
+loopback test stubs) only after its authority has been independently restricted.
+
 ## Callout inventory
 
 `No-follow` means a redirect response is returned to the caller and its
@@ -26,6 +34,7 @@ origin.
 | `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
 | `ai_guardrails` with NeMo | Configured `endpoint` | Global `allow_private_upstreams` | No-follow | Configured `outbound_chain`; no downstream headers by default |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
+| `external_metering` balance check and usage report | Configured `metering_url` via `SubRequestClient` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
 | `azure_ad` token fetch | Configured authority plus tenant via `SubRequestClient` | `allow_private_authority` | No-follow | Client secret in the token POST body |
 | `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
@@ -33,8 +42,12 @@ origin.
 The request-derived `file_url` and MCP transports retain stricter policies:
 they resolve once per attempt, validate every address against `AddressPolicy`,
 do not follow redirects, and allow private access only through their narrow
-origin/loopback controls. GCP metadata intentionally allows its protocol-owned
-private destination via `AddressPolicy::AllowPrivate`.
+origin/loopback controls. GCP metadata intentionally allows only Google's two
+protocol-owned metadata addresses via `AddressPolicy::AllowGoogleMetadata`.
+
+`external_metering` calls out twice per request, so it resolves its configured
+host through the upstream DNS cache rather than on every call. Every cached
+address is still validated against `AddressPolicy` before connecting.
 
 Upstream cluster connections are not direct callouts. They use the core Praxis
 endpoint and TLS policy instead of these filter-level controls.

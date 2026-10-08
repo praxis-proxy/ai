@@ -9,7 +9,7 @@ mod config;
 mod error;
 
 /// Incremental Chat Completions SSE to Responses SSE conversion.
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -75,13 +75,10 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
-/// produced by `openai_responses_format` and `openai_responses_validate`.
+/// produced by `openai_responses_request`.
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
-/// OpenAI-managed `prompt` template references fail closed because Chat
-/// Completions has no equivalent field and silently dropping them would change
-/// the requested prompt.
 /// Supported hosted web-search tools are exposed to the Chat backend as a
 /// private, bounded `web_search` function. Returned calls are restored to
 /// canonical `web_search_call` output before downstream agentic filters run.
@@ -558,14 +555,14 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     }
 }
 
-/// Convert the validator-owned canonical state to a Chat request value.
+/// Convert the request filter's canonical state to a Chat request value.
 fn translate_canonical_state(
     ctx: &HttpFilterContext<'_>,
     reasoning: &ReasoningOptions,
 ) -> Result<serde_json::Value, SelectedUpstreamBodyOutcome> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
-            prerequisite = "openai_responses_validate",
+            prerequisite = "openai_responses_request",
             "request pipeline state is unavailable"
         );
         return Err(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()));

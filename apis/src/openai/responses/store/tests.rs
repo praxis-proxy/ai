@@ -4,6 +4,7 @@
 //! Unit tests for the `openai_response_store` filter.
 
 use std::{
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -12,21 +13,22 @@ use std::{
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, HttpFilter as _, HttpFilterContext,
-    parse_filter_config,
+    StreamingTerminalResponse, parse_filter_config,
 };
 use serde_json::json;
 
 use super::{
-    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    ResponseStoreFilter,
     config::{ResponseStoreConfig, validate_config},
-    list_input_items,
 };
 use crate::{
     openai::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    service::responses::input_items::DEFAULT_PAGE_LIMIT,
+    service::responses::{
+        InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items,
+    },
     store::{
         DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
         SqliteResponseStore,
@@ -402,7 +404,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
@@ -807,6 +809,12 @@ struct RecordingResponseStore {
     upserts: std::sync::atomic::AtomicUsize,
     fail: bool,
     records: std::sync::Mutex<std::collections::HashMap<String, ResponseRecord>>,
+    /// In-memory replay logs keyed by response id, kept ordered by
+    /// `sequence_number`. Mirrors the real backend's owner-gated, insert-if-absent
+    /// semantics so replay seam tests observe truthful behavior.
+    events: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::store::ResponseEventRecord>>>,
+    /// When true, `append_events` fails to prove the terminal seam fails closed.
+    fail_events: bool,
 }
 
 impl RecordingResponseStore {
@@ -815,14 +823,38 @@ impl RecordingResponseStore {
             upserts: std::sync::atomic::AtomicUsize::new(0),
             fail,
             records: std::sync::Mutex::new(std::collections::HashMap::new()),
+            events: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fail_events: false,
+        }
+    }
+
+    /// A store whose response upserts succeed but whose event-log appends fail,
+    /// used to prove the replay flush fails closed after the record is durable.
+    fn new_failing_events() -> Self {
+        Self {
+            fail_events: true,
+            ..Self::new(false)
         }
     }
 
     fn upsert_count(&self) -> usize {
         self.upserts.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Number of persisted replay events for a response.
+    fn event_count(&self, response_id: &str) -> usize {
+        self.events
+            .lock()
+            .expect("events mutex should not be poisoned")
+            .get(response_id)
+            .map_or(0, Vec::len)
+    }
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "each mock method is one short mutex-guarded critical section; holding the guard is what keeps the multi-step ops atomic"
+)]
 #[async_trait::async_trait]
 impl crate::store::ResponseStore for RecordingResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), crate::store::StoreError> {
@@ -892,6 +924,84 @@ impl crate::store::ResponseStore for RecordingResponseStore {
         _consumed_at: i64,
     ) -> Result<Option<usize>, crate::store::StoreError> {
         Ok(None)
+    }
+
+    async fn append_events(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        events: &[crate::store::ResponseEventRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        if self.fail_events {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced event-log failure".to_owned(),
+            ));
+        }
+        // Emulate the backend's EXISTS gate: silently drop rows whose parent
+        // response does not exist under the same owner.
+        let parent_exists = self
+            .records
+            .lock()
+            .expect("records mutex should not be poisoned")
+            .get(response_id)
+            .is_some_and(|record| record.owner == *owner);
+        if !parent_exists {
+            return Ok(());
+        }
+        let mut logs = self.events.lock().expect("events mutex should not be poisoned");
+        let log = logs.entry(response_id.to_owned()).or_default();
+        for event in events {
+            if event.owner != *owner {
+                continue;
+            }
+            // Insert-if-absent by sequence_number.
+            if log.iter().any(|e| e.sequence_number == event.sequence_number) {
+                continue;
+            }
+            log.push(event.clone());
+        }
+        log.sort_by_key(|e| e.sequence_number);
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::ResponseEventRecord>, crate::store::StoreError> {
+        let logs = self.events.lock().expect("events mutex should not be poisoned");
+        let Some(log) = logs.get(response_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(log
+            .iter()
+            .filter(|e| e.owner == *owner)
+            .filter(|e| after.is_none_or(|n| e.sequence_number > n))
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn event_log_status(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+    ) -> Result<crate::store::EventLogStatus, crate::store::StoreError> {
+        let logs = self.events.lock().expect("events mutex should not be poisoned");
+        let Some(log) = logs.get(response_id) else {
+            return Ok(crate::store::EventLogStatus::Absent);
+        };
+        let owned: Vec<&crate::store::ResponseEventRecord> = log.iter().filter(|e| e.owner == *owner).collect();
+        let Some(max_sequence) = owned.iter().map(|e| e.sequence_number).max() else {
+            return Ok(crate::store::EventLogStatus::Absent);
+        };
+        if owned.iter().any(|e| e.terminal) {
+            Ok(crate::store::EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(crate::store::EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 
@@ -992,6 +1102,107 @@ async fn streaming_terminal_frame_persists_before_eos_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_persists_before_release_and_only_once() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "local completion must be durable before release"
+    );
+
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "EOS must not repeat the local completion write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_at_eos_still_persists() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local_eos", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, true).unwrap());
+    assert_eq!(store.upsert_count(), 1, "an EOS terminal must still be durable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_at_eos_does_not_persist_completed_upstream_snapshot() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_failed_irr", false).await;
+
+    // IRR can retain an upstream `status: completed` snapshot while replacing
+    // its deferred response.completed with a client-visible SSE error. The
+    // inner step's error metadata does not reach this outer filter.
+    let mut error = Some(Bytes::from_static(b"event: error\ndata: {\"type\":\"error\"}\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut error, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(store.upsert_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_after_replay_decoder_overflow_does_not_persist() {
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(64).unwrap(), NonZeroU64::new(1).unwrap());
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_overflow_error", false).await;
+
+    // The first client-visible frame exceeds the replay decoder's byte limit.
+    // Its poisoned decoder cannot decode the later error, which can also be
+    // split across response-body callbacks.
+    let created = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"sequence_number\":0,\"padding\":\"{}\"}}\n\n",
+        "x".repeat(3072)
+    );
+    let mut body = Some(Bytes::from(created));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Release
+    ));
+    for part in [b"event: er".as_slice(), b"ror\ndata: {\"type\":\"error\"}\n\n"] {
+        let mut body = Some(Bytes::copy_from_slice(part));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Release
+        ));
+    }
+    drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        0,
+        "the hidden completed snapshot must not be persisted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persist_failure_fails_closed() {
     let filter = make_filter();
     let store = Arc::new(RecordingResponseStore::new(true));
@@ -1013,6 +1224,24 @@ async fn streaming_terminal_frame_persist_failure_fails_closed() {
         1,
         "the failing upsert must have been attempted for the terminal frame"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_fail_open_error_is_not_retried_at_eos() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_open", true).await;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    assert!(filter.on_response_body(&mut ctx, &mut terminal, false).is_err());
+    // A failure_mode: open pipeline suppresses the error above and delivers
+    // the chunk. EOS must not retry state already consumed by that write.
+    let mut eos_body = None;
+    let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
+    assert!(matches!(eos_action, FilterAction::Continue));
+    assert_eq!(store.upsert_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,6 +1323,222 @@ async fn streaming_without_terminal_signal_persists_only_at_eos() {
         store.upsert_count(),
         1,
         "the EOS fallback persists exactly once for non-deferred streams"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Replay event-log capture → terminal-seam flush
+// -----------------------------------------------------------------------------
+
+/// Three canonical SSE events (created, one delta, completed) in one chunk, the
+/// terminal event last. Each carries the numeric `sequence_number` capture keys
+/// on.
+const SEAM_EVENTS_CHUNK: &[u8] = b"event: response.created\n\
+data: {\"type\":\"response.created\",\"sequence_number\":0}\n\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_persist_at_terminal_seam() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
+
+    // The deferred terminal frame arrives with the captured events; the seam
+    // persists the record and then flushes the whole log before release.
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the terminal chunk is released after the record and log persist"
+    );
+    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
+    assert_eq!(
+        store.event_count("resp_seam"),
+        3,
+        "all captured events flush together at the terminal seam"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "events persist in ascending sequence order"
+    );
+    assert!(
+        events.last().unwrap().terminal,
+        "the terminal event must be marked terminal so the log is replayable"
+    );
+    assert!(
+        events.iter().take(2).all(|e| !e.terminal),
+        "non-terminal events must not be flagged terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_event_flush_failure_fails_closed() {
+    let filter = make_filter();
+    // Record upserts succeed; the event-log append fails.
+    let store = Arc::new(RecordingResponseStore::new_failing_events());
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam_fail", true).await;
+
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let result = filter.on_response_body(&mut ctx, &mut chunk, false);
+    assert!(
+        result.is_err(),
+        "a replay-log append failure must fail closed so the client never observes response.completed"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the record persists before the failing event flush is attempted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_over_budget_are_not_persisted() {
+    // A one-event count bound: the second event trips the bound, abandoning the
+    // whole log so the response stays retrievable as JSON but is not replayable.
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1).unwrap(), super::config::DEFAULT_MAX_EVENT_BYTES);
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam_budget", true).await;
+
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "an over-budget capture never withholds the client bytes"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the JSON record still persists when the log is abandoned"
+    );
+    assert_eq!(
+        store.event_count("resp_seam_budget"),
+        0,
+        "an over-budget log is dropped entirely so no partial replay is served"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_single_event_over_line_default_is_captured() {
+    // A single terminal event larger than the SSE decoder's 1 MiB default
+    // per-line cap but well within the 16 MiB replay byte budget. Before the
+    // capture decoder raised `max_line_bytes` alongside `max_record_bytes`, a
+    // >1 MiB `data:` line poisoned the decoder and abandoned the whole log; the
+    // event must now be captured and remain replayable.
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_big_event", true).await;
+
+    // ~2 MiB single-line terminal event: one `data: <json>` line whose padding
+    // pushes it past the 1 MiB default per-line limit but under 16 MiB.
+    let pad = "x".repeat(2 * 1024 * 1024);
+    let big_event = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0,\"pad\":\"{pad}\"}}\n\n"
+    );
+    let mut chunk = Some(Bytes::from(big_event));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a within-budget large event is captured and released at the terminal seam"
+    );
+    assert_eq!(
+        store.event_count("resp_big_event"),
+        1,
+        "a >1 MiB event under the byte budget must be captured, not dropped by a stale 1 MiB line cap"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_big_event", None, 10)
+        .await
+        .unwrap();
+    assert!(
+        events.last().is_some_and(|e| e.terminal),
+        "the large terminal event must remain marked terminal so the log is replayable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_event_within_budget_but_over_raw_framing_is_captured() {
+    // The configured `max_event_bytes` bounds the JSON `data` payload only, but
+    // the SSE decoder additionally counts framing: `max_record_bytes` sums the
+    // `event:` type value alongside the payload. Sizing the decoder to exactly
+    // the budget rejected a within-budget payload once framing pushed the record
+    // past it -- poisoning the decoder and abandoning the whole log so a
+    // completed response returned 400 on replay. The framing headroom must let
+    // the event decode and reach the authoritative payload check.
+    let budget: u64 = 100;
+    let filter =
+        ResponseStoreFilter::with_bounds(super::config::DEFAULT_MAX_EVENT_COUNT, NonZeroU64::new(budget).unwrap());
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_framing_boundary", true).await;
+
+    // A `data` payload within the byte budget whose SSE record (payload plus the
+    // `event: response.completed` type value) exceeds the raw budget. A decoder
+    // sized to exactly `max_event_bytes` reports `RecordTooLarge` here.
+    let event_type = "response.completed";
+    let prefix = r#"{"type":"response.completed","sequence_number":0,"p":""#;
+    let suffix = r#""}"#;
+    let target_data_len = 90_usize;
+    let pad_len = target_data_len - prefix.len() - suffix.len();
+    let data = format!("{prefix}{}{suffix}", "x".repeat(pad_len));
+    assert_eq!(data.len(), target_data_len, "test payload is the intended size");
+    assert!(
+        data.len() as u64 <= budget,
+        "the JSON payload must be within the configured byte budget"
+    );
+    assert!(
+        (event_type.len() + data.len()) as u64 > budget,
+        "the SSE record framing must exceed the raw budget so it exercises the headroom"
+    );
+
+    let event = format!("event: {event_type}\ndata: {data}\n\n");
+    let mut chunk = Some(Bytes::from(event));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a within-budget event is captured and released at the terminal seam"
+    );
+    assert_eq!(
+        store.event_count("resp_framing_boundary"),
+        1,
+        "an event within the payload budget must survive SSE framing, not be dropped as RecordTooLarge"
+    );
+
+    let events = store
+        .list_events_after(
+            &crate::test_utils::test_owner("default"),
+            "resp_framing_boundary",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(
+        events.last().is_some_and(|e| e.terminal),
+        "the terminal event must remain terminal so the log is replayable"
     );
 }
 
@@ -2466,7 +2911,7 @@ fn postgres_config_allows_private_with_private_database_url_opt_in() {
 }
 
 #[test]
-fn postgres_config_allows_unspecified_with_private_database_url_opt_in() {
+fn postgres_config_rejects_unspecified_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
@@ -2479,8 +2924,8 @@ allow_private_database_url: true
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_ok(),
-        "explicit private database URL opt-in should allow unspecified hosts"
+        result.is_err(),
+        "unspecified database hosts must remain blocked after the private-target opt-in"
     );
 }
 
@@ -3423,8 +3868,10 @@ async fn get_unrelated_path_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_response_rejects_stream_true() {
+async fn get_response_stream_true_without_log_returns_400() {
     let filter = make_filter();
+    // Seeded with no replay event log (a legacy or non-streamed record), so a
+    // replay request is a client error, not a 200 empty stream.
     let registry = init_store_and_seed("resp_stream", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
@@ -3433,9 +3880,16 @@ async fn get_response_rejects_stream_true() {
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
-    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    assert_eq!(rejection.status, 400, "replay without an event log should return 400");
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no replayable event stream"),
+        "message should explain the response is not replayable: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3484,6 +3938,317 @@ async fn get_response_no_query_still_returns_200() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
+// -----------------------------------------------------------------------------
+// GET /v1/responses/{id}?stream=true — SSE replay
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_returns_events_in_order_ending_with_terminal() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay",
+        owner.clone(),
+        vec![
+            event_record("resp_replay", &owner, 0, "response.created", false),
+            event_record("resp_replay", &owner, 1, "response.output_text.delta", false),
+            event_record("resp_replay", &owner, 2, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_replay?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(streaming.status, 200, "a replayable log streams with 200");
+    assert_eq!(
+        streaming.headers.get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream",
+        "replay uses the SSE content type"
+    );
+    assert_eq!(
+        streaming.headers.get(http::header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "replay must not be cached"
+    );
+
+    let body = drain_replay_body(streaming).await;
+    let text = String::from_utf8(body).unwrap();
+    let types: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("event: ")).collect();
+    assert_eq!(
+        types,
+        vec!["response.created", "response.output_text.delta", "response.completed"],
+        "events replay in original order, terminal last: {text}"
+    );
+    assert!(
+        text.contains("\"sequence_number\":2"),
+        "the terminal event payload is replayed verbatim: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_in_legacy_responses_format_pipeline_streams_not_buffers() {
+    // A legacy `openai_responses_format` classifier pipeline marks the request
+    // Responses-format with `stream=false` (the flag is read from a POST body the
+    // GET never carries). Without forcing streaming mode for replay GETs, the
+    // buffered-mode override would run and the runtime would reject the streaming
+    // replay body with a 500. The replay must still stream and the response body
+    // mode must stay `Stream`.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_legacy_replay",
+        owner.clone(),
+        vec![
+            event_record("resp_legacy_replay", &owner, 0, "response.created", false),
+            event_record("resp_legacy_replay", &owner, 1, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_legacy_replay?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    // The legacy classifier promotes these facts before the store filter runs.
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(
+        streaming.status, 200,
+        "the replay still streams under a legacy classifier pipeline"
+    );
+    assert_eq!(
+        streaming.headers.get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream",
+        "replay uses the SSE content type"
+    );
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::Stream,
+        "a replay GET must force streaming mode instead of the buffered Responses-format override"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_starting_after_skips_earlier_events() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay_cursor",
+        owner.clone(),
+        vec![
+            event_record("resp_replay_cursor", &owner, 0, "response.created", false),
+            event_record("resp_replay_cursor", &owner, 1, "response.output_text.delta", false),
+            event_record("resp_replay_cursor", &owner, 2, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_replay_cursor?stream=true&starting_after=1",
+    );
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    let text = String::from_utf8(drain_replay_body(streaming).await).unwrap();
+    let types: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("event: ")).collect();
+    assert_eq!(
+        types,
+        vec!["response.completed"],
+        "starting_after=1 returns only events with sequence_number > 1: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_missing_response_returns_404() {
+    let filter = make_filter();
+    let registry = store_registry().await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_absent?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 404, "replay of a missing response is a 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_incomplete_log_returns_400() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    // Events exist but none is terminal: the log is incomplete, so it must never
+    // be served as a complete replay.
+    let registry = seed_response_with_events(
+        "resp_incomplete",
+        owner.clone(),
+        vec![
+            event_record("resp_incomplete", &owner, 0, "response.created", false),
+            event_record("resp_incomplete", &owner, 1, "response.output_text.delta", false),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_incomplete?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 400, "an incomplete log is not replayable");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no replayable event stream"),
+        "message should explain the log is not replayable: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_cross_owner_returns_404() {
+    let filter = make_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let registry = seed_response_with_events(
+        "resp_private_replay",
+        owner.clone(),
+        vec![event_record(
+            "resp_private_replay",
+            &owner,
+            0,
+            "response.completed",
+            true,
+        )],
+    )
+    .await;
+
+    // A different owner in the same tenant must not see the response or its log.
+    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_private_replay?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(other);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 404, "another owner's replay log must look absent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_truncated_by_concurrent_delete_errors() {
+    // A concurrent DELETE can remove the event log after the first page streams but
+    // before the terminal event is reached. The replay must surface an error rather
+    // than a clean EOF that would hide the missing terminal frame from the client.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let (registry, store) = empty_registry().await;
+
+    let record = ResponseRecord {
+        id: "resp_truncated".to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({"status": "completed"}),
+        input: json!([]),
+        messages: json!([{"role": "user", "content": "hello"}]),
+    };
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed response should succeed");
+
+    // Put the terminal event on a later page so the first page is non-terminal and
+    // a second read is required to reach the terminal boundary.
+    let total = u64::from(super::filter::REPLAY_PAGE_LIMIT) + 50;
+    let terminal = total - 1;
+    let events: Vec<_> = (0..total)
+        .map(|seq| {
+            let is_terminal = seq == terminal;
+            let event_type = if is_terminal {
+                "response.completed"
+            } else {
+                "response.output_text.delta"
+            };
+            event_record("resp_truncated", &owner, seq, event_type, is_terminal)
+        })
+        .collect();
+    store
+        .append_events(&owner, "resp_truncated", &events)
+        .await
+        .expect("seed replay events should succeed");
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_truncated?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let mut streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+
+    // The first page streams non-terminal events; the terminal is still ahead.
+    let first = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("first page should not error")
+        .expect("first page should carry events");
+    assert!(
+        !std::str::from_utf8(&first).unwrap().contains("response.completed"),
+        "the terminal event must not be on the first page"
+    );
+
+    // A concurrent DELETE removes the whole log before the terminal is reached.
+    let deleted = store
+        .delete_response(&owner, "resp_truncated")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "the seeded response is deleted");
+
+    // The next read must error rather than ending cleanly without the terminal.
+    let error = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect_err("a log truncated before its terminal must error, not EOF");
+    assert!(
+        error.to_string().contains("truncated before its terminal event"),
+        "the error explains the mid-replay truncation: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_starting_after_terminal_returns_empty_body() {
+    // A cursor at or beyond the terminal is a legitimate empty tail, not a
+    // truncation: the replay ends cleanly with an empty body, never an error.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay_tail",
+        owner.clone(),
+        vec![
+            event_record("resp_replay_tail", &owner, 0, "response.created", false),
+            event_record("resp_replay_tail", &owner, 1, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_replay_tail?stream=true&starting_after=1",
+    );
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let mut streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    let chunk = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("a cursor beyond the terminal returns an empty body, not an error");
+    assert!(chunk.is_none(), "no events remain after the terminal: {chunk:?}");
 }
 
 // -----------------------------------------------------------------------------
@@ -4168,45 +4933,38 @@ fn parse_query_params_key_only_unknown_ignored() {
 }
 
 // -----------------------------------------------------------------------------
-// validate_get_response_query_params
+// parse_get_response_query
 // -----------------------------------------------------------------------------
 
 #[test]
-fn validate_get_response_query_params_no_query() {
-    assert!(
-        super::filter::validate_get_response_query_params(None).is_ok(),
-        "no query string should be valid"
-    );
+fn parse_get_response_query_no_query() {
+    let parsed = super::filter::parse_get_response_query(None).unwrap();
+    assert!(!parsed.stream, "no query string should default to non-stream");
+    assert_eq!(parsed.starting_after, None, "no query string should have no cursor");
 }
 
 #[test]
-fn validate_get_response_query_params_empty_query() {
-    assert!(
-        super::filter::validate_get_response_query_params(Some("")).is_ok(),
-        "empty query string should be valid"
-    );
+fn parse_get_response_query_empty_query() {
+    let parsed = super::filter::parse_get_response_query(Some("")).unwrap();
+    assert!(!parsed.stream, "empty query string should default to non-stream");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_false_accepted() {
-    assert!(
-        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
-        "stream=false should be accepted"
-    );
+fn parse_get_response_query_stream_false_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=false")).unwrap();
+    assert!(!parsed.stream, "stream=false should parse as non-stream");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_true_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
-    assert!(
-        err.contains("'stream' parameter is not supported"),
-        "stream=true should be rejected: {err}"
-    );
+fn parse_get_response_query_stream_true_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=true")).unwrap();
+    assert!(parsed.stream, "stream=true should now be accepted as a replay request");
+    assert_eq!(parsed.starting_after, None, "no cursor without starting_after");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_invalid_value_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+fn parse_get_response_query_stream_invalid_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=maybe")).unwrap_err();
     assert!(
         err.contains("must be 'true' or 'false'"),
         "stream=maybe should be rejected as invalid boolean: {err}"
@@ -4214,9 +4972,66 @@ fn validate_get_response_query_params_stream_invalid_value_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_bracket_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
-        .unwrap_err();
+fn parse_get_response_query_starting_after_with_stream_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=true&starting_after=5")).unwrap();
+    assert!(parsed.stream, "stream=true should be set");
+    assert_eq!(
+        parsed.starting_after,
+        Some(5),
+        "starting_after=5 should parse as cursor 5"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_order_independent() {
+    let parsed = super::filter::parse_get_response_query(Some("starting_after=9&stream=true")).unwrap();
+    assert!(parsed.stream, "stream=true should be set regardless of order");
+    assert_eq!(
+        parsed.starting_after,
+        Some(9),
+        "cursor should parse regardless of order"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_without_stream_rejected() {
+    let err = super::filter::parse_get_response_query(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("requires 'stream=true'"),
+        "starting_after without stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_with_stream_false_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=false&starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("requires 'stream=true'"),
+        "starting_after with stream=false should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_empty_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=true&starting_after=")).unwrap_err();
+    assert!(
+        err.contains("cursor must not be empty"),
+        "empty starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_non_numeric_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=true&starting_after=abc")).unwrap_err();
+    assert!(
+        err.contains("not a valid integer"),
+        "non-numeric starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_include_bracket_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include[]=file_search_call_results.results")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "include[] should be rejected: {err}"
@@ -4224,8 +5039,8 @@ fn validate_get_response_query_params_include_bracket_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_percent_encoded_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+fn parse_get_response_query_include_percent_encoded_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include%5B%5D=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "percent-encoded include[] should be rejected: {err}"
@@ -4233,8 +5048,8 @@ fn validate_get_response_query_params_include_percent_encoded_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_bare_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+fn parse_get_response_query_include_bare_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "bare include should be rejected: {err}"
@@ -4242,17 +5057,8 @@ fn validate_get_response_query_params_include_bare_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_starting_after_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
-    assert!(
-        err.contains("'starting_after' parameter is not supported"),
-        "starting_after should be rejected: {err}"
-    );
-}
-
-#[test]
-fn validate_get_response_query_params_include_obfuscation_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
+fn parse_get_response_query_include_obfuscation_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include_obfuscation=true")).unwrap_err();
     assert!(
         err.contains("'include_obfuscation' parameter is not supported"),
         "include_obfuscation should be rejected: {err}"
@@ -4260,8 +5066,8 @@ fn validate_get_response_query_params_include_obfuscation_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_unknown_param_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+fn parse_get_response_query_unknown_param_rejected() {
+    let err = super::filter::parse_get_response_query(Some("foo=bar")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "unknown param should be rejected: {err}"
@@ -4269,8 +5075,8 @@ fn validate_get_response_query_params_unknown_param_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_known_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+fn parse_get_response_query_key_only_known_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only known param should be rejected: {err}"
@@ -4278,8 +5084,8 @@ fn validate_get_response_query_params_key_only_known_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_include_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+fn parse_get_response_query_key_only_include_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only include should be rejected: {err}"
@@ -4287,8 +5093,8 @@ fn validate_get_response_query_params_key_only_include_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_unknown_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+fn parse_get_response_query_key_only_unknown_rejected() {
+    let err = super::filter::parse_get_response_query(Some("foo")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "key-only unknown param should be rejected: {err}"
@@ -4296,16 +5102,17 @@ fn validate_get_response_query_params_key_only_unknown_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+fn parse_get_response_query_percent_encoded_stream_false_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=%66alse")).unwrap();
     assert!(
-        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
-        "percent-encoded stream=false should be accepted"
+        !parsed.stream,
+        "percent-encoded stream=false should parse as non-stream"
     );
 }
 
 #[test]
-fn validate_get_response_query_params_invalid_utf8_key_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+fn parse_get_response_query_invalid_utf8_key_rejected() {
+    let err = super::filter::parse_get_response_query(Some("%FF=x")).unwrap_err();
     assert!(
         err.contains("Invalid percent-encoding in query parameter key"),
         "invalid UTF-8 key should be rejected: {err}"
@@ -4313,8 +5120,8 @@ fn validate_get_response_query_params_invalid_utf8_key_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_invalid_utf8_value_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+fn parse_get_response_query_invalid_utf8_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=%FF")).unwrap_err();
     assert!(
         err.contains("Invalid percent-encoding in value"),
         "invalid UTF-8 value should be rejected: {err}"
@@ -4322,17 +5129,21 @@ fn validate_get_response_query_params_invalid_utf8_value_rejected() {
 }
 
 #[test]
-fn known_params_and_validator_match_arms_in_sync() {
+fn known_params_and_parser_match_arms_in_sync() {
     for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
-        let result = super::filter::validate_get_response_param(param, "__probe__");
-        assert!(
-            result.is_err(),
-            "known param '{param}' should be handled by validate_get_response_param"
-        );
-        assert!(
-            !result.unwrap_err().contains("Unknown"),
-            "known param '{param}' should not produce an 'Unknown' error"
-        );
+        let mut parsed = super::filter::GetResponseQuery::default();
+        let result = super::filter::apply_get_response_param(&mut parsed, param, "__probe__");
+        // Every known param is handled by an explicit match arm, so the probe
+        // never falls through to the "Unknown query parameter" catch-all.
+        // `stream`/`starting_after` reject the non-boolean/non-numeric probe;
+        // the unsupported params reject with their own message. Either way the
+        // error must not be the unknown-parameter fallthrough.
+        if let Err(err) = result {
+            assert!(
+                !err.contains("Unknown"),
+                "known param '{param}' should not produce an 'Unknown' error: {err}"
+            );
+        }
     }
 }
 
@@ -5532,7 +6343,10 @@ fn postgres_config_rejects_ipv6_link_local() {
 // -----------------------------------------------------------------------------
 
 fn make_filter() -> ResponseStoreFilter {
-    ResponseStoreFilter
+    ResponseStoreFilter::with_bounds(
+        super::config::DEFAULT_MAX_EVENT_COUNT,
+        super::config::DEFAULT_MAX_EVENT_BYTES,
+    )
 }
 
 /// Build an in-memory default store plus a registry holding it, without touching
@@ -5643,11 +6457,81 @@ async fn init_store_and_seed_owner(
     registry
 }
 
+/// Build one replay event-log row for seeding a store directly.
+fn event_record(
+    response_id: &str,
+    owner: &crate::StateOwner,
+    sequence_number: u64,
+    event_type: &str,
+    terminal: bool,
+) -> crate::store::ResponseEventRecord {
+    crate::store::ResponseEventRecord {
+        response_id: response_id.to_owned(),
+        owner: owner.clone(),
+        sequence_number,
+        event_type: event_type.to_owned(),
+        payload: serde_json::to_vec(&json!({"type": event_type, "sequence_number": sequence_number}))
+            .expect("event payload serializes"),
+        terminal,
+        created_at: 1000,
+    }
+}
+
+/// A registry whose default store holds one completed response owned by `owner`
+/// plus the given replay event log. Backs the `?stream=true` replay tests.
+async fn seed_response_with_events(
+    id: &str,
+    owner: crate::StateOwner,
+    events: Vec<crate::store::ResponseEventRecord>,
+) -> ResponseStoreRegistry {
+    let (registry, store) = empty_registry().await;
+    let record = ResponseRecord {
+        id: id.to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({"status": "completed"}),
+        input: json!([]),
+        messages: json!([{"role": "user", "content": "hello"}]),
+    };
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed response should succeed");
+    store
+        .append_events(&owner, id, &events)
+        .await
+        .expect("seed replay events should succeed");
+    registry
+}
+
 fn expect_reject(action: FilterAction) -> praxis_filter::Rejection {
     match action {
         FilterAction::Reject(r) => r,
         other => panic!("expected Reject, got {other:?}"),
     }
+}
+
+/// Extract the boxed streaming terminal response from a replay action.
+fn expect_streaming(action: FilterAction) -> Box<StreamingTerminalResponse> {
+    match action {
+        FilterAction::StreamingTerminalResponse(s) => s,
+        other => panic!("expected StreamingTerminalResponse, got {other:?}"),
+    }
+}
+
+/// Drive a replay body to completion, concatenating every chunk into one buffer.
+async fn drain_replay_body(mut streaming: Box<StreamingTerminalResponse>) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(chunk) = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("replay chunk should not error")
+    {
+        out.extend_from_slice(&chunk);
+    }
+    out
 }
 
 fn assert_has_json_content_type(rejection: &praxis_filter::Rejection) {
@@ -5762,6 +6646,212 @@ conversations_table: openai_conversations
     assert!(
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// InputItemPage serialization & allocation tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn input_item_page_serialization_empty_page() {
+    let page = InputItemPage {
+        data: vec![],
+        next_cursor: None,
+        has_more: false,
+    };
+    let json_str = serde_json::to_string(&page).expect("empty page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": [],
+            "has_more": false,
+            "first_id": null,
+            "last_id": null
+        }),
+        "empty page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_full_page() {
+    let items: Vec<serde_json::Value> = (0..20)
+        .map(|i| {
+            json!({
+                "id": format!("msg_item_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": format!("content {i}")
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_item_19".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("full page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_item_0",
+            "last_id": "msg_item_19"
+        }),
+        "full page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_maximum_size_100_items() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_max_{i}"),
+                "type": "message",
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i} with additional metadata and details.")
+                    }
+                ],
+                "metadata": {
+                    "index": i,
+                    "tag": "max_page_test"
+                }
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_max_99".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("100-item page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_max_0",
+            "last_id": "msg_max_99"
+        }),
+        "maximum size 100-item page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_non_object_and_cursor_fallback() {
+    let page = InputItemPage {
+        data: vec![json!("plain string input"), json!(12345)],
+        next_cursor: Some("2".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("non-object page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": ["plain string input", 12345],
+            "has_more": true,
+            "first_id": null,
+            "last_id": "2"
+        }),
+        "non-object page serialization must fall back last_id to next_cursor"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_100_item_nontrivial_allocation_evidence() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_nontrivial_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i}: {}", "x".repeat(200))
+                    }
+                ],
+                "metadata": {
+                    "item_index": i,
+                    "nested_info": {
+                        "key_a": "value_a",
+                        "key_b": 42
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let page = InputItemPage {
+        data: items,
+        next_cursor: Some("msg_nontrivial_99".to_owned()),
+        has_more: true,
+    };
+
+    // Legacy pattern: serde_json::json! deep-copies page.data into a second Value tree
+    let legacy_fn = |p: &InputItemPage| -> Vec<u8> {
+        let first_id = p.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+        let last_id = p
+            .data
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or(p.next_cursor.as_deref());
+
+        let body = serde_json::json!({
+            "object": "list",
+            "data": p.data,
+            "has_more": p.has_more,
+            "first_id": first_id,
+            "last_id": last_id,
+        });
+        serde_json::to_vec(&body).unwrap()
+    };
+
+    // New pattern: direct serialization from &page without second Value or Vec<Value> tree
+    let direct_fn = |p: &InputItemPage| -> Vec<u8> { serde_json::to_vec(p).unwrap() };
+
+    let legacy_bytes = legacy_fn(&page);
+    let direct_bytes = direct_fn(&page);
+
+    assert_eq!(
+        legacy_bytes, direct_bytes,
+        "direct serialization output must match legacy json! output byte-for-byte"
+    );
+
+    let legacy_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(legacy_fn(&page));
+    });
+
+    let direct_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(direct_fn(&page));
+    });
+
+    assert!(
+        direct_allocs.count_total < legacy_allocs.count_total,
+        "direct serialization must perform fewer allocations: direct={} legacy={}",
+        direct_allocs.count_total,
+        legacy_allocs.count_total
+    );
+
+    assert!(
+        direct_allocs.bytes_total < legacy_allocs.bytes_total,
+        "direct serialization must allocate fewer bytes: direct={} legacy={}",
+        direct_allocs.bytes_total,
+        legacy_allocs.bytes_total
     );
 }
 

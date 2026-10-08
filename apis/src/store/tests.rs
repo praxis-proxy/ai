@@ -12,9 +12,9 @@ use super::{
     PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
     SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
-use crate::openai::{
-    include::IncludeFields,
-    responses::store::{ListParams, Order, list_input_items},
+use crate::{
+    openai::include::IncludeFields,
+    service::responses::{ListParams, Order, list_input_items},
 };
 
 /// Default issuing-response scope for pending-approval tests that do not
@@ -2358,13 +2358,9 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
 }
 
 #[tokio::test]
-async fn create_items_and_sync_messages_empty_batch_is_noop() {
+async fn create_items_and_sync_messages_empty_batch_requires_parent() {
     let store = make_store_with_items().await;
-    let empty: [ConversationItemRecord; 0] = [];
-    store
-        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &empty)
-        .await
-        .expect("empty batch should succeed");
+    assert_empty_batch_requires_parent(&store).await;
 }
 
 #[tokio::test]
@@ -2377,10 +2373,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_gone", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -2482,10 +2475,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -2854,7 +2844,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 4, "fresh store should stamp version 4");
+    assert_eq!(version, 5, "fresh store should stamp version 5");
 }
 
 #[tokio::test]
@@ -2957,15 +2947,17 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     );
 
     // Apply the documented operator migrations: CAST the responses payload
-    // columns to BLOB storage class and stamp the current schema version. This
-    // fixture has no items table, so v3 -> v4 requires only the version stamp.
+    // columns to BLOB storage class and stamp the current schema version. Later
+    // schema versions only add tables (e.g. the v5 replay event log), which the
+    // idempotent startup DDL creates, so migrating this fixture requires only the
+    // version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 4",
+        "UPDATE mr_schema_version SET version = 5",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2977,7 +2969,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-4 database");
+        .expect("store should start on a migrated version-5 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3721,14 +3713,14 @@ async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 4", fx.version),
+        format!("UPDATE {} SET version = 5", fx.version),
     ];
-    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v5: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v4, &[]).await;
+    let result = fx.init(&migrated_v5, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-4 database: {:?}",
+        "store should start on a migrated version-5 database: {:?}",
         result.err()
     );
 }
@@ -4035,6 +4027,15 @@ async fn pg_response_id_collision_cannot_transfer_ownership() {
 #[ignore]
 async fn postgres_passes_shared_ownership_contract() {
     ownership_contract(&make_pg_store_with_items().await).await;
+}
+
+/// The `PostgreSQL` backend satisfies the shared persisted-state contract suite,
+/// including the replay event-log contract. Mirrors
+/// [`sqlite_backend_satisfies_the_store_contract`] for the live PG backend.
+#[tokio::test]
+#[ignore]
+async fn postgres_backend_satisfies_the_store_contract() {
+    praxis_ai_store::contract_tests::run_contract_suite(&make_pg_store_with_items().await).await;
 }
 
 #[tokio::test]
@@ -4859,6 +4860,13 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
 
 #[tokio::test]
 #[ignore]
+async fn pg_create_items_and_sync_messages_empty_batch_requires_parent() {
+    let store = make_pg_store_with_items().await;
+    assert_empty_batch_requires_parent(&store).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
     let store = make_pg_store_with_items().await;
     // No conversation row exists — mirrors a conversation deleted between the
@@ -4868,10 +4876,7 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_missing", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -4915,10 +4920,7 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -5200,6 +5202,71 @@ async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &
         .record_pending_approvals(&owner, response_id, &records, 1000)
         .await
         .expect("seeding pending approvals should succeed");
+}
+
+async fn assert_empty_batch_requires_parent(store: &impl ConversationItemStore) {
+    let owner = crate::test_utils::test_owner("tenant_a");
+    let empty: [ConversationItemRecord; 0] = [];
+    let err = store
+        .create_items_and_sync_messages(&owner, "conv_empty", &empty)
+        .await
+        .expect_err("an empty batch must not bypass a missing parent");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+
+    let conversation = ConversationRecord {
+        conversation_id: "conv_empty".to_owned(),
+        owner,
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([{"role": "user", "content": "preserve cached history"}]),
+    };
+    store
+        .upsert_conversation(&conversation)
+        .await
+        .expect("upsert should succeed");
+    store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect("an empty batch for an existing parent should succeed");
+
+    for other_owner in [
+        crate::test_utils::test_owner("tenant_b"),
+        crate::StateOwner::from_trusted_parts(
+            conversation.owner.tenant_id(),
+            conversation.owner.issuer(),
+            "another_subject",
+        )
+        .expect("owner should be valid"),
+    ] {
+        let err = store
+            .create_items_and_sync_messages(&other_owner, &conversation.conversation_id, &empty)
+            .await
+            .expect_err("an empty batch must not bypass parent ownership");
+        assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+    }
+
+    let fetched = store
+        .get_conversation(&conversation.owner, &conversation.conversation_id)
+        .await
+        .expect("get should succeed")
+        .expect("conversation should still exist");
+    assert_eq!(
+        fetched.messages, conversation.messages,
+        "empty batches must leave the cache untouched"
+    );
+
+    assert!(
+        store
+            .delete_conversation(&conversation.owner, &conversation.conversation_id)
+            .await
+            .expect("delete should succeed"),
+        "the parent should be deleted"
+    );
+    let err = store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect_err("an empty batch must fail after the parent is deleted");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
 }
 
 fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseRecord {

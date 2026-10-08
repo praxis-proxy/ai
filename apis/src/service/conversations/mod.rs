@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Conversations persistence service.
+//! Conversation item-record assembly and validation shared by the HTTP handlers.
 //!
-//! Owner-scoped business logic over the persisted-state store: conversation and
-//! item CRUD, listing, denormalized message-cache updates, and the item-record
-//! assembly the create and append-back paths share. The service is constructed
-//! from an already owner-scoped store handle resolved by the caller, constructs
-//! no backend and holds no connection pool, and returns transport-neutral
-//! [`StoreError`]s. The transport layer owns request decoding, HTTP input
-//! validation, id generation, and status mapping.
+//! Store operations use the already owner-scoped handle resolved by each caller.
 
 use std::collections::HashSet;
 
@@ -18,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::{
     openai::conversations::{contracts::MAX_ITEMS_PER_REQUEST, item_schema::validate_output_item},
     state_owner::StateOwner,
-    store::{ConversationItemRecord, ConversationRecord, OwnerScopedResponseStore, StoreError},
+    store::{ConversationItemRecord, StoreError},
 };
 
 #[cfg(test)]
@@ -32,147 +26,6 @@ use crate::{
     reason = "tests"
 )]
 mod tests;
-
-/// Owner-scoped Conversations persistence service.
-///
-/// Bound to one validated owner at construction through [`OwnerScopedResponseStore`],
-/// so no operation can widen or forge the owner scope. Record-taking writes still
-/// pass the facade's owner check on the record.
-pub(crate) struct ConversationsService {
-    /// Owner-bound store handle the service operates through.
-    store: OwnerScopedResponseStore,
-}
-
-impl ConversationsService {
-    /// Bind the service to an owner-scoped store the caller resolved from the
-    /// registry (`get_scoped(name, &owner)`).
-    #[must_use]
-    pub(crate) fn new(store: OwnerScopedResponseStore) -> Self {
-        Self { store }
-    }
-
-    /// The immutable owner every operation is scoped to.
-    ///
-    /// Exposed so the transport can build owner-bearing records with the same
-    /// owner the service enforces; a record built with any other owner is still
-    /// rejected by the record-taking writes.
-    #[must_use]
-    pub(crate) fn owner(&self) -> &StateOwner {
-        self.store.owner()
-    }
-
-    /// Retrieve a conversation visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    pub(crate) async fn get_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<ConversationRecord>, StoreError> {
-        self.store.get_conversation(conversation_id).await
-    }
-
-    /// Insert or update a conversation, re-checking its owner against the bound
-    /// owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] on owner mismatch or a backend failure.
-    pub(crate) async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
-        self.store.upsert_conversation(record).await
-    }
-
-    /// Update only a conversation's metadata for this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend mutation fails.
-    pub(crate) async fn update_conversation_metadata(
-        &self,
-        conversation_id: &str,
-        metadata: &Value,
-    ) -> Result<bool, StoreError> {
-        self.store.update_conversation_metadata(conversation_id, metadata).await
-    }
-
-    /// Delete a conversation visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend mutation fails.
-    pub(crate) async fn delete_conversation(&self, conversation_id: &str) -> Result<bool, StoreError> {
-        self.store.delete_conversation(conversation_id).await
-    }
-
-    /// Return which of `item_ids` already exist in a conversation for this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    pub(crate) async fn existing_item_ids(
-        &self,
-        conversation_id: &str,
-        item_ids: &[&str],
-    ) -> Result<Vec<String>, StoreError> {
-        self.store
-            .get_existing_conversation_item_ids(conversation_id, item_ids)
-            .await
-    }
-
-    /// Atomically insert items and rebuild the conversation message cache,
-    /// re-checking each record's owner against the bound owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] on owner mismatch or a backend failure.
-    pub(crate) async fn create_items(
-        &self,
-        conversation_id: &str,
-        items: &[ConversationItemRecord],
-    ) -> Result<(), StoreError> {
-        self.store.create_items_and_sync_messages(conversation_id, items).await
-    }
-
-    /// List items for a conversation visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    pub(crate) async fn list_items(
-        &self,
-        conversation_id: &str,
-        after_item_id: Option<&str>,
-        limit: u32,
-        ascending: bool,
-    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
-        self.store
-            .list_conversation_items(conversation_id, after_item_id, limit, ascending)
-            .await
-    }
-
-    /// Retrieve a single conversation item visible to this owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend query fails.
-    pub(crate) async fn get_item(
-        &self,
-        conversation_id: &str,
-        item_id: &str,
-    ) -> Result<Option<ConversationItemRecord>, StoreError> {
-        self.store.get_conversation_item(conversation_id, item_id).await
-    }
-
-    /// Atomically delete an item and rebuild the conversation message cache.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] when the backend mutation fails.
-    pub(crate) async fn delete_item(&self, conversation_id: &str, item_id: &str) -> Result<bool, StoreError> {
-        self.store.delete_item_and_sync_messages(conversation_id, item_id).await
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Item-record assembly
@@ -272,6 +125,11 @@ fn default_item_status(map: &mut Map<String, Value>) {
 
 /// Normalize easy SDK message inputs into conversation message response objects.
 fn normalize_message_item(map: &mut Map<String, Value>) -> Result<(), StoreError> {
+    // Responses accepts an easy input message without `type`, but persisted
+    // Conversation items require the explicit message discriminator.
+    if !map.contains_key("type") && map.contains_key("role") && map.contains_key("content") {
+        map.insert("type".to_owned(), Value::String("message".to_owned()));
+    }
     if map.get("type").and_then(Value::as_str) != Some("message") {
         return Ok(());
     }

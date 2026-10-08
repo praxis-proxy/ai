@@ -7,7 +7,7 @@ Handles all `/v1/conversations` endpoints locally.
 
 ## Configuration Notes
 
-All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter holds no state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle at request time. `openai_operation` must precede this filter in the same chain.
+All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter keeps only request-scoped state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle. `ai_operation` must precede this filter in the same chain. For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE responses append the request input and final output items to the local Conversation. Streaming append-back reads the canonical terminal response state without buffering SSE. With the default fail-closed policy, it persists before `response.completed` is released; `failure_mode: open` opts out of that guarantee. Incomplete or failed streams do not append a turn. The provider owns history on a direct OpenAI passthrough route.
 
 ## Configuration
 
@@ -22,13 +22,13 @@ All matched requests are served from the owner-scoped store and never forwarded 
 | `ssl_client_cert` | string (secret) | no | Path to a PEM-encoded client certificate for mutual TLS with `PostgreSQL`. Only valid when `backend` is `postgres` and the effective SSL mode is `verify-ca` or `verify-full`. Must be configured together with `ssl_client_key`. Enables certificate authentication so the server does not challenge for a password. |
 | `ssl_client_key` | string (secret) | no | Path to the PEM-encoded private key for `ssl_client_cert`. Only valid when `backend` is `postgres`. Must be an unencrypted PKCS#8 key (mode `0600`) and configured together with `ssl_client_cert`. The native-tls backend (`OpenSSL` on Linux, Security.framework on macOS) accepts PKCS#8 only; convert a SEC1/PKCS#1 key with `openssl pkcs8 -topk8 -nocrypt`. |
 | `require_certificate_authentication` | bool | no | Enforce the certificate-authentication compliance profile for `PostgreSQL`. When enabled, the filter fails to start unless `ssl_mode` is `verify-full`, both `ssl_client_cert` and `ssl_client_key` are set, and no password reaches the connection (rejecting a password in `database_url`, TLS parameters in `database_url`, and the `PGPASSWORD` environment variable). It also rejects non-addressing connection parameters in `database_url` (`application_name`, `options`/`options[...]`, `statement-cache-capacity`), which the certificate-authentication rebuild would silently drop; set such defaults on the database role instead (`ALTER ROLE ... SET ...`). The `ssl_client_key` file must also be owner-only (mode `0600`, enforced on Unix). This keeps application-side password cryptography off the connection path. The `PostgreSQL` server must independently use a `cert` rule in `pg_hba.conf`; the proxy cannot enforce that server-side requirement. |
-| `allow_private_database_url` | bool | no | Allow `PostgreSQL` URLs that target local-sensitive addresses. By default, DNS names, localhost, loopback, private, link-local, cloud metadata, unspecified, and Unix socket targets are rejected. This opt-in is intended for local development and tests. |
+| `allow_private_database_url` | bool | no | Allow `PostgreSQL` URLs that target local-sensitive addresses. By default, DNS names, localhost, loopback, private, link-local, cloud metadata, unspecified, and Unix socket targets are rejected. This opt-in is intended for local development and tests; cloud metadata, unspecified, and multicast addresses remain blocked when it is enabled. |
 | `pool` | PoolConfig | no | Connection pool tuning options. When omitted, sqlx defaults apply (`max_connections = 10`, `idle_timeout = 600s`, `acquire_timeout = 30s`). |
 
 ## Example
 
 ```yaml
-- filter: openai_operation
+- filter: ai_operation
 - filter: openai_conversations
   backend: postgres
   database_url: postgres://praxis:password@db.example.com/praxis

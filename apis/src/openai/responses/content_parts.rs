@@ -41,24 +41,72 @@ pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec
     }
 }
 
+/// Filename extensions and their inferred MIME types.
+const KNOWN_EXTENSIONS: &[(&str, &str)] = &[
+    ("csv", "text/csv"),
+    ("doc", "application/msword"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    ("gif", "image/gif"),
+    ("html", "text/html"),
+    ("htm", "text/html"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("json", "application/json"),
+    ("pdf", "application/pdf"),
+    ("png", "image/png"),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ("txt", "text/plain"),
+    ("webp", "image/webp"),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    ("xml", "application/xml"),
+];
+
 /// Infer MIME type from a filename extension.
 pub(crate) fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
     let ext = filename?.rsplit('.').next()?;
-    match ext.to_ascii_lowercase().as_str() {
-        "csv" => Some("text/csv"),
-        "doc" => Some("application/msword"),
-        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        "gif" => Some("image/gif"),
-        "html" | "htm" => Some("text/html"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "json" => Some("application/json"),
-        "pdf" => Some("application/pdf"),
-        "png" => Some("image/png"),
-        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-        "txt" => Some("text/plain"),
-        "webp" => Some("image/webp"),
-        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        "xml" => Some("application/xml"),
-        _ => None,
+    KNOWN_EXTENSIONS
+        .iter()
+        .find_map(|&(known, mime)| ext.eq_ignore_ascii_case(known).then_some(mime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_mime_from_filename;
+
+    #[test]
+    fn mime_extension_matching_preserves_suffix_and_case_behavior() {
+        for (name, expected) in [
+            (Some("report.PdF"), Some("application/pdf")),
+            (Some("archive.report.JpEg"), Some("image/jpeg")),
+            (Some("report.unknown"), None),
+            (Some("report.pñg"), None),
+            (Some("report"), None),
+            (Some("png"), Some("image/png")),
+            (Some("report."), None),
+            (None, None),
+        ] {
+            assert_eq!(infer_mime_from_filename(name), expected, "filename: {name:?}");
+        }
+    }
+
+    #[test]
+    fn mime_extension_matching_allocates_no_lowercase_copy() {
+        let allocations = allocation_counter::measure(|| {
+            std::hint::black_box(infer_mime_from_filename(Some("report.PdF")));
+            std::hint::black_box(infer_mime_from_filename(Some("report.pñg")));
+        });
+        assert_eq!(
+            allocations.count_total, 0,
+            "MIME extension matching allocated: {allocations:?}"
+        );
     }
 }

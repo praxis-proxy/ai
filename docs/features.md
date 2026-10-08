@@ -61,7 +61,8 @@ A default production-proxy build (`cargo build -p praxis-ai-proxy`) compiles
 library crates keep `standard` as their lean default, and explicit
 `--no-default-features` proxy builds can select the backend-free, SQLite-only,
 PostgreSQL-only, or combined persistence profiles described below. The
-published container image and `make release` also build `full`. The FIPS build
+published container image builds `full,store-sqlite`, while `make release`
+builds `full`. The FIPS build
 (`make release-fips`, the `-fips` image) compiles only `openai-responses` and
 `aws-sigv4-filter` on top of the always-on filters; [FIPS 140-3](fips.md)
 lists what is left out and why.
@@ -69,7 +70,7 @@ lists what is left out and why.
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|
 | `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-credential-types`; the signature is computed by the system OpenSSL |
-| `openai-responses` | `openai_responses_validate`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
+| `openai-responses` | `openai_responses_request`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
 | `openai-file-resolve-filter` | `openai_file_resolve` | `reqwest` |
 | `store-postgres`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |

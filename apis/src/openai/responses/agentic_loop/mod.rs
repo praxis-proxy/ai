@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_responses_validate` for every Responses API create
+//! `openai_responses_request` for every Responses API create
 //! request.
 
 mod config;
@@ -319,6 +319,11 @@ impl HttpFilter for AgenticLoopFilter {
         if let Some(failure) = state.dispatch_failure.take() {
             return convert_dispatch_failure(ctx, state, &failure);
         }
+
+        // Every request-body filter in this IRR step has now run. Clear the
+        // shared suffix boundary only here, after all configured tool-result
+        // guardrails had an opportunity to inspect it.
+        state.pending_local_tool_guardrail_start = None;
 
         if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
             return finish_deferred_local_response(ctx, state);
@@ -629,8 +634,10 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
 /// the legacy grouped queues for this pass, so replayed credentials must join
 /// that log as well as remaining available to the normal request phase.
 fn queue_continuation_header(ctx: &mut HttpFilterContext<'_>, name: http::HeaderName, value: HeaderValue) {
-    ctx.request_headers_to_set.push((name.clone(), value.clone()));
-    if !ctx.pre_read_mutations.is_empty() {
+    if ctx.pre_read_mutations.is_empty() {
+        ctx.request_headers_to_set.push((name, value));
+    } else {
+        ctx.request_headers_to_set.push((name.clone(), value.clone()));
         ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, value));
     }
 }
@@ -962,6 +969,19 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 state.messages.push(item.clone());
                 state.persist_collected_output(absolute_index, item.clone());
             },
+            Some("compaction") => {
+                // Provider compaction items are valid replayable input. Keep
+                // them in both projections so a later continuation can send
+                // the opaque provider state back instead of translating it
+                // into an assistant summary.
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state
+                    .provider_compaction_ids
+                    .extend(ResponsesState::provider_compaction_ids_from_messages(
+                        std::slice::from_ref(item),
+                    ));
+            },
             Some("web_search_call") => {
                 // A hosted web_search_call is not a valid OpenResponses input
                 // item (issue #808), so it must not enter `messages`. The
@@ -1110,6 +1130,19 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
             Some("function_call" | "reasoning") => {
                 state.messages.push(item.clone());
                 state.persist_collected_output(absolute_index, item.clone());
+                state.accumulated_output.push(item);
+            },
+            Some("compaction") => {
+                // Provider compaction items are replayable input. Preserve them
+                // in both state projections before moving the item into the
+                // public streamed output accumulator.
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state
+                    .provider_compaction_ids
+                    .extend(ResponsesState::provider_compaction_ids_from_messages(
+                        std::slice::from_ref(&item),
+                    ));
                 state.accumulated_output.push(item);
             },
             Some("web_search_call") => {

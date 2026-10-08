@@ -4,7 +4,7 @@
 #
 # Reference: https://hub.docker.com/r/vllm/vllm-openai
 
-FROM docker.io/vllm/vllm-openai:v0.30.0
+FROM docker.io/vllm/vllm-openai:v0.31.0
 
 RUN pip install --no-cache-dir "huggingface-hub[cli]==1.*"
 

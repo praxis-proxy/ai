@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;
@@ -24,6 +25,7 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
+pub mod operation_classifier;
 mod project_state_owner_headers;
 pub mod promotion;
 #[cfg(feature = "store")]

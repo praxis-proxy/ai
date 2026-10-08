@@ -14,15 +14,15 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PoolConfig,
-    ResponseRecord, ResponseStore, SslMode, StoreError,
-    compression::{StoreCompressionConfig, decode, run_blocking},
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+    PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
+    compression::{StoreCompressionConfig, decode, decode_bytes, run_blocking},
     pool::apply_pool_config,
     postgres_tls::PgTlsConfig,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
-        schema_version_table, validate_postgres_identifiers,
+        check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
+        pg_key_column_folding, schema_version_table, validate_postgres_identifiers,
     },
 };
 
@@ -126,7 +126,7 @@ impl PostgresResponseStore {
             sqlx::query(AssertSqlSafe(statement.as_str()))
                 .execute(&pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| ddl_error(statement, &e))?;
         }
 
         validate_schema(&pool, &tables).await?;
@@ -157,6 +157,71 @@ impl PostgresResponseStore {
     /// credentials before it becomes a [`StoreError::Database`].
     fn db_err(&self, e: impl std::fmt::Display) -> StoreError {
         StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
+    }
+
+    /// Append items at the next positions and rebuild the message cache.
+    ///
+    /// Separate from the trait method so the insert loop and the cache rebuild
+    /// live in a boxed future; inlined into the trait method, the combined
+    /// future exceeds the workspace's stack-size budget.
+    ///
+    /// Runs inside the caller's transaction, so an error rolls back the items it
+    /// already inserted.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "transactional helper that threads table names and scope identifiers"
+    )]
+    async fn insert_items_and_sync(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        items_table: &str,
+        conv_table: &str,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        let max_sql = format!(
+            "SELECT COALESCE(MAX(position), 0) AS max_pos \
+             FROM {items_table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
+        );
+        let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let max_pos: i64 = max_row.try_get("max_pos").map_err(|e| self.db_err(&e))?;
+
+        let insert_sql = format!(
+            "INSERT INTO {items_table} \
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        );
+        for (i, item) in items.iter().enumerate() {
+            let offset = i64::try_from(i).unwrap_or(i64::MAX);
+            let position = max_pos.saturating_add(1).saturating_add(offset);
+            let item_data =
+                serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+                .bind(&item.item_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .bind(conversation_id)
+                .bind(&item_data)
+                .bind(item.created_at)
+                .bind(position)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+        }
+
+        pg_rebuild_messages(tx, items_table, conv_table, owner, conversation_id).await
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -545,6 +610,10 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "async_trait counts the store method group as one expansion"
+)]
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
@@ -618,6 +687,12 @@ impl ResponseStore for PostgresResponseStore {
             "DELETE FROM {} WHERE response_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             pending_approvals_table(&self.tables.responses)
         );
+        // The durable SSE event log dies with the response so nothing stays
+        // replayable after a DELETE. Same transaction, same owner scope.
+        let delete_events_sql = format!(
+            "DELETE FROM {} WHERE response_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            events_table(&self.tables.responses)
+        );
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
         let result = sqlx::query(AssertSqlSafe(delete_response_sql.as_str()))
             .bind(id)
@@ -628,6 +703,14 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| self.db_err(&e))?;
         sqlx::query(AssertSqlSafe(delete_approvals_sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe(delete_events_sql.as_str()))
             .bind(id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -876,6 +959,161 @@ impl ResponseStore for PostgresResponseStore {
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(None)
+    }
+
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // One blocking hop compresses every payload; reads decode via `decode_bytes`.
+        let payloads = self
+            .compression
+            .encode_byte_values(&events.iter().map(|event| event.payload.as_slice()).collect::<Vec<_>>())
+            .await?;
+        let lock_sql = events_parent_lock_sql(&self.tables.responses);
+        let sql = events_insert_sql(&self.tables.responses);
+
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+
+        // Pin the parent response row so a concurrent `delete_response` cannot
+        // remove it between the guard below and the inserts, which would orphan
+        // the event payloads. Missing parent => nothing to attach events to.
+        let parent = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+            .bind(response_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        if parent.is_none() {
+            tx.rollback().await.map_err(|e| self.db_err(&e))?;
+            return Ok(());
+        }
+
+        // One batched multi-row INSERT instead of a round trip per event. With
+        // the parent row already locked `FOR SHARE`, per-event awaits only add
+        // latency (thousands of events * one round trip each delays the withheld
+        // terminal frame by seconds). `UNNEST` pairs the per-event arrays by
+        // position while the owner triple and response id stay shared scalars, so
+        // the statement keeps nine bind parameters regardless of event count.
+        let sequence_numbers: Vec<String> = events.iter().map(|event| pad_sequence(event.sequence_number)).collect();
+        let event_types: Vec<&str> = events.iter().map(|event| event.event_type.as_str()).collect();
+        let terminals: Vec<i64> = events.iter().map(|event| i64::from(event.terminal)).collect();
+        let created_ats: Vec<i64> = events.iter().map(|event| event.created_at).collect();
+        // Bind a borrowed view of each payload; `Cow::Borrowed` (the `none`
+        // default) points straight at the event bytes, so this array holds
+        // pointers, not payload copies.
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(|payload| &**payload).collect();
+
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id)
+            .bind(sequence_numbers)
+            .bind(event_types)
+            .bind(payload_refs)
+            .bind(terminals)
+            .bind(created_ats)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        let table = events_table(&self.tables.responses);
+        // The padded TEXT sequence sorts and compares identically to the numeric
+        // order (fixed width, zero-filled), so a lexical `>` cursor is exact and
+        // no CAST is needed. A `None` cursor drops the predicate entirely rather
+        // than picking a sentinel below zero, so sequence 0 is included. The limit
+        // placeholder number shifts by one when the cursor predicate is present.
+        let (cursor_clause, limit_placeholder) = if after.is_some() {
+            (" AND sequence_number > $5", "$6")
+        } else {
+            ("", "$5")
+        };
+        let sql = format!(
+            "SELECT tenant_id, owner_issuer, owner_subject, response_id, sequence_number, \
+                    event_type, payload, terminal, created_at \
+             FROM {table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND response_id = $4{cursor_clause} \
+             ORDER BY sequence_number ASC \
+             LIMIT {limit_placeholder}"
+        );
+
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id);
+        if let Some(cursor) = after {
+            query = query.bind(pad_sequence(cursor));
+        }
+        let rows = Box::pin(query.bind(i64::from(limit)).fetch_all(&self.pool))
+            .await
+            .map_err(|e| self.db_err(&e))?;
+
+        run_blocking(move || rows.iter().map(row_to_event_record).collect()).await
+    }
+
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        let table = events_table(&self.tables.responses);
+        // One indexed aggregate distinguishes "no log" (count 0) from "incomplete"
+        // (rows, no terminal) from "replayable" (has_terminal). MAX over the padded
+        // TEXT key equals the numeric maximum thanks to the fixed-width padding.
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt, MAX(sequence_number) AS max_seq, \
+                    COALESCE(MAX(terminal), 0) AS has_terminal \
+             FROM {table} \
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND response_id = $4"
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+
+        let count: i64 = row.try_get("cnt").map_err(|e| StoreError::Database(e.to_string()))?;
+        if count == 0 {
+            return Ok(EventLogStatus::Absent);
+        }
+        let max_seq: Option<String> = row
+            .try_get("max_seq")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let has_terminal: i64 = row
+            .try_get("has_terminal")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // COUNT(*) > 0 guarantees MAX(sequence_number) is non-null; a NULL here
+        // means the row set is corrupt, so fail closed rather than fabricate a
+        // sequence.
+        let max_sequence = max_seq
+            .as_deref()
+            .map(parse_sequence)
+            .transpose()?
+            .ok_or_else(|| StoreError::Database("event log has rows but no maximum sequence number".to_owned()))?;
+        if has_terminal != 0 {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 
@@ -1249,9 +1487,6 @@ impl ConversationItemStore for PostgresResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
         require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
@@ -1268,7 +1503,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1276,48 +1511,16 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
-
-        let max_sql = format!(
-            "SELECT COALESCE(MAX(position), 0) AS max_pos \
-             FROM {items_table} \
-             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
-        );
-        let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
-            .bind(owner.tenant_id())
-            .bind(owner.issuer())
-            .bind(owner.subject())
-            .bind(conversation_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| self.db_err(&e))?;
-        let max_pos: i64 = max_row.try_get("max_pos").map_err(|e| self.db_err(&e))?;
-
-        let insert_sql = format!(
-            "INSERT INTO {items_table} \
-             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-        );
-        for (i, item) in items.iter().enumerate() {
-            let offset = i64::try_from(i).unwrap_or(i64::MAX);
-            let position = max_pos.saturating_add(1).saturating_add(offset);
-            let item_data =
-                serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
-                .bind(&item.item_id)
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
-                .bind(conversation_id)
-                .bind(&item_data)
-                .bind(item.created_at)
-                .bind(position)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| self.db_err(&e))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| self.db_err(&e))?;
+            return Ok(());
+        }
+
+        Box::pin(self.insert_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items)).await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
@@ -1343,7 +1546,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1351,6 +1554,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \
@@ -1452,6 +1658,67 @@ async fn pg_rebuild_messages(
 // Row Conversion
 // -----------------------------------------------------------------------------
 
+/// Build the batched insert SQL for the durable SSE event log.
+///
+/// The owner triple and response id are shared scalars (`$1`-`$4`); the
+/// per-event columns arrive as five position-paired arrays expanded by `UNNEST`
+/// (`$5`-`$9`), so one statement inserts an entire chunk regardless of event
+/// count. Owner scoping and parent existence are guaranteed by the caller's
+/// `FOR SHARE` lock ([`events_parent_lock_sql`]) rather than a per-row
+/// `WHERE EXISTS`; `ON CONFLICT DO NOTHING` keeps a re-released chunk idempotent
+/// instead of raising a duplicate-key error.
+fn events_insert_sql(responses_table: &str) -> String {
+    let table = events_table(responses_table);
+    format!(
+        "INSERT INTO {table} \
+         (tenant_id, owner_issuer, owner_subject, response_id, sequence_number, event_type, payload, \
+         terminal, created_at) \
+         SELECT $1, $2, $3, $4, ev.seq, ev.event_type, ev.payload, ev.terminal, ev.created_at \
+         FROM UNNEST($5::text[], $6::text[], $7::bytea[], $8::int8[], $9::int8[]) \
+           AS ev(seq, event_type, payload, terminal, created_at) \
+         ON CONFLICT (response_id, sequence_number) DO NOTHING"
+    )
+}
+
+/// Lock the parent response row `FOR SHARE` before appending its events.
+///
+/// `append_events` runs under READ COMMITTED, so without this lock the batched
+/// [`events_insert_sql`] could attach events to a parent that a concurrent
+/// `delete_response` removes an instant later, leaving orphaned event payloads
+/// behind after the delete reports success. Taking a `FOR SHARE` lock on the
+/// parent row at the start of the append transaction conflicts with the
+/// exclusive row lock `DELETE` acquires, so the two transactions serialize:
+/// either the parent is already gone (the append becomes a no-op) or it stays
+/// pinned until the append commits, after which the delete's own
+/// `DELETE FROM {responses}_events` removes the freshly written rows. This lock
+/// is also the sole owner/existence guard for the insert, which no longer
+/// carries a per-row `WHERE EXISTS`.
+fn events_parent_lock_sql(responses_table: &str) -> String {
+    format!(
+        "SELECT 1 FROM {responses_table} \
+         WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+         FOR SHARE"
+    )
+}
+
+/// Fixed-width, zero-padded decimal form of an event sequence number.
+///
+/// The event-log primary key stores `sequence_number` as TEXT because the key
+/// column folding contract requires TEXT affinity. Zero-padding to the width of
+/// `u64::MAX` (20 digits) makes lexical ordering identical to numeric ordering,
+/// so `ORDER BY sequence_number` and a `sequence_number > $N` cursor are exact
+/// without a per-row CAST.
+fn pad_sequence(sequence_number: u64) -> String {
+    format!("{sequence_number:020}")
+}
+
+/// Parse a stored padded sequence back into its numeric value.
+fn parse_sequence(stored: &str) -> Result<u64, StoreError> {
+    stored
+        .parse::<u64>()
+        .map_err(|e| StoreError::Database(format!("invalid stored sequence_number '{stored}': {e}")))
+}
+
 /// Turn an owner-filtered upsert no-op into a bounded, identity-free error.
 fn require_owner_preserving_write(rows_affected: u64, resource: &str) -> Result<(), StoreError> {
     if rows_affected == 1 {
@@ -1521,6 +1788,35 @@ fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
         response_object: decode(&response_object_json)?,
         input: decode(&input_json)?,
         messages: decode(&messages_json)?,
+    })
+}
+
+/// Convert a sqlx row to a [`ResponseEventRecord`].
+fn row_to_event_record(row: &PgRow) -> Result<ResponseEventRecord, StoreError> {
+    let payload_bytes: Vec<u8> = row
+        .try_get("payload")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let sequence_number: String = row
+        .try_get("sequence_number")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let terminal: i64 = row
+        .try_get("terminal")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    Ok(ResponseEventRecord {
+        response_id: row
+            .try_get("response_id")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        owner: row_to_owner(row)?,
+        sequence_number: parse_sequence(&sequence_number)?,
+        event_type: row
+            .try_get("event_type")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        payload: decode_bytes(payload_bytes)?,
+        terminal: terminal != 0,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
     })
 }
 
@@ -1675,5 +1971,56 @@ mod tests {
         assert_eq!(options.get_username(), "cert-user");
         assert_eq!(options.get_database(), Some("praxis"));
         assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
+    }
+
+    #[test]
+    fn events_parent_lock_scopes_by_owner_and_takes_share_lock() {
+        let sql = events_parent_lock_sql("openai_responses");
+
+        // Serializing the append against a concurrent delete depends on a
+        // `FOR SHARE` lock on the owned parent row, not the derived event table.
+        assert!(
+            sql.contains("FROM openai_responses"),
+            "locks the parent responses table: {sql}"
+        );
+        assert!(sql.ends_with("FOR SHARE"), "acquires a shared row lock: {sql}");
+        assert!(
+            sql.contains("id = $1")
+                && sql.contains("tenant_id = $2")
+                && sql.contains("owner_issuer = $3")
+                && sql.contains("owner_subject = $4"),
+            "scopes the lock to the owned response row: {sql}"
+        );
+    }
+
+    #[test]
+    fn events_insert_sql_is_a_single_batched_unnest() {
+        let sql = events_insert_sql("openai_responses");
+
+        // One statement inserts an entire chunk, so the terminal frame is never
+        // withheld for a per-event round trip.
+        assert_eq!(
+            sql.matches("INSERT INTO").count(),
+            1,
+            "the batched append is exactly one INSERT: {sql}"
+        );
+        assert!(
+            sql.contains("INSERT INTO openai_responses_events"),
+            "inserts into the derived event-log table: {sql}"
+        );
+        // Casts must match the event-log DDL column affinities: sequence_number
+        // TEXT, event_type TEXT, payload BYTEA, terminal BIGINT, created_at BIGINT.
+        assert!(
+            sql.contains("UNNEST($5::text[], $6::text[], $7::bytea[], $8::int8[], $9::int8[])"),
+            "position-paired arrays cast to the event-log column types: {sql}"
+        );
+        assert!(
+            !sql.contains("WHERE EXISTS"),
+            "the parent existence guard is the caller's FOR SHARE lock, not a per-row WHERE EXISTS: {sql}"
+        );
+        assert!(
+            sql.contains("ON CONFLICT (response_id, sequence_number) DO NOTHING"),
+            "a re-released chunk stays idempotent: {sql}"
+        );
     }
 }

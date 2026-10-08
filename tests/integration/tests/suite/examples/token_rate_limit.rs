@@ -22,9 +22,11 @@ use std::collections::HashMap;
 
 #[cfg(feature = "basic-auth-filter")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "basic-auth-filter")]
+use praxis_test_utils::build_pipeline;
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, load_example_config,
-    parse_body, parse_header, parse_status, patch_yaml, start_proxy,
+    Backend, PraxisProcess, StatefulCapturingBackend, allow_loopback_endpoints, example_config_path, free_port,
+    http_send, json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 
 /// Build a `POST` request carrying extra headers beyond the standard
@@ -522,6 +524,11 @@ fn basic_auth_json_post(
 
 /// Derive test-only credentials from runtime-only identifiers. The values
 /// never appear in diagnostics or source as hard-coded password literals.
+///
+/// The `{pid:x}-{port:x}` shape can collide with YAML scientific notation:
+/// pid `0x1e` and port `0x400` render as `1e-400`, a valid float literal that
+/// underflows to `0.0`. Any config consumer must therefore quote the value so
+/// it parses as a string rather than a number (see `authenticated_quota_config`).
 #[cfg(feature = "basic-auth-filter")]
 fn test_credential(nonce: u16) -> String {
     format!("{:x}-{:x}", std::process::id(), nonce)
@@ -560,9 +567,9 @@ fn authenticated_quota_config(
          \x20       strip_authorization: true\n\
          \x20       credentials:\n\
          \x20         - username: subject-a\n\
-         \x20           password: {subject_a_credential}\n\
+         \x20           password: \"{subject_a_credential}\"\n\
          \x20         - username: subject-b\n\
-         \x20           password: {subject_b_credential}\n\
+         \x20           password: \"{subject_b_credential}\"\n\
          \x20     - filter: token_rate_limit\n\
          {key_line}{backend_block}\
          \x20       rules:\n\
@@ -780,6 +787,36 @@ fn global_key_remains_the_default_with_basic_auth() {
     );
 }
 
+/// Regression for the intermittent `token_rate_limit` Valkey job failure
+/// ("basic_auth: invalid type: floating point 0.0, expected a string").
+///
+/// `test_credential` produces `{pid:x}-{port:x}` values; some combinations
+/// (pid `0x1e` → `1e`, port `0x400` → `400`) form `1e-400`, which YAML resolves
+/// as scientific notation that underflows to `0.0`. Left unquoted in the config,
+/// the `password: Option<String>` field then fails to deserialize and
+/// `build_pipeline` panics. `authenticated_quota_config` now quotes the value,
+/// so such credentials stay strings through pipeline construction.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn sci_notation_shaped_credentials_stay_strings_in_config() {
+    let proxy_port = free_port();
+    let backend_port = free_port();
+    // `1e-400` underflows to 0.0; `2e-300` is a representable tiny float. Both
+    // parse as non-string YAML scalars unless quoted, yet must survive config
+    // parsing and pipeline construction unchanged.
+    let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_port,
+        backend_port,
+        None,
+        None,
+        ("1e-400", "2e-300"),
+    ))
+    .expect("scientific-notation-shaped credentials must parse as strings");
+    // `build_pipeline` is the exact step that panicked in CI once the password
+    // resolved to a float; it must now build the basic_auth filter cleanly.
+    let _pipeline = build_pipeline(&config);
+}
+
 // -----------------------------------------------------------------------------
 // S1: Graduated soft-limit tiers (inject action)
 // -----------------------------------------------------------------------------
@@ -843,5 +880,95 @@ fn example_config_token_rate_limit_soft_tiers() {
             .to_ascii_lowercase()
             .contains("x-token-hour-tier:"),
         "team-beta's upstream request should carry the inject tier header"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Soft over-quota enforcement (ai#1241)
+// -----------------------------------------------------------------------------
+
+/// Smoke-tests `token-rate-limit-soft-enforcement.yaml` through a spawned
+/// `praxis-ai` binary: soft forwards over-quota traffic with annotation;
+/// hard still returns 429.
+#[test]
+fn example_config_token_rate_limit_soft_enforcement() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+
+    let path = example_config_path("token-rate-limit-soft-enforcement.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    // Shrink budgets so two reservations exhaust each rule.
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 100")
+        .replace("reserved_tokens: 500", "reserved_tokens: 60")
+        .replace("capacity: 50000", "capacity: 100")
+        .replace("reserved_tokens: 200", "reserved_tokens: 60");
+    let patched = patch_yaml(
+        &allow_loopback_endpoints(&yaml),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let _proxy = PraxisProcess::spawn(&patched, &proxy_addr);
+
+    let soft_first = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(parse_status(&soft_first), 200, "soft first request should be admitted");
+    let soft_second = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(
+        parse_status(&soft_second),
+        200,
+        "soft over-quota must forward instead of 429"
+    );
+    let soft_upstream = backend.requests()[1].headers.to_ascii_lowercase();
+    assert!(
+        soft_upstream.contains("x-over-quota:"),
+        "soft over-quota should annotate upstream request"
+    );
+    assert!(
+        soft_upstream.contains("x-ratelimit-remaining-tokens:"),
+        "soft over-quota should include remaining metadata"
+    );
+    assert!(
+        soft_upstream.contains("x-token-quota-used:"),
+        "soft over-quota should include used metadata"
+    );
+    assert!(
+        soft_upstream.contains("x-ratelimit-remaining-tokens: 40"),
+        "denial-time remaining after a 60-token reservation of 100: {soft_upstream}"
+    );
+    assert!(
+        soft_upstream.contains("x-token-quota-used: 60"),
+        "denial-time used after a 60-token reservation of 100: {soft_upstream}"
+    );
+
+    let hard_first = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(parse_status(&hard_first), 200, "hard first request should be admitted");
+    let hard_second = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(
+        parse_status(&hard_second),
+        429,
+        "hard over-quota must still reject with 429"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        3,
+        "hard rejection must not contact the provider"
     );
 }

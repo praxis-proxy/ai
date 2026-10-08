@@ -90,7 +90,7 @@ runs:
 
     - name: Start EC2 runner
       id: start-ec2-runner
-      uses: machulav/ec2-github-runner@a8c20fc0876503410b2b966c124abc2311984ce2 # v2.3.9
+      uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
       with:
         mode: start
         github-token: ${{ inputs.github-token }}

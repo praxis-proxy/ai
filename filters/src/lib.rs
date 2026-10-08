@@ -54,6 +54,8 @@ pub use store_readiness::{FILTER_NAME as STORE_READINESS_GATE_FILTER_NAME, Store
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
+#[cfg(feature = "token-ceiling-filter")]
+pub use token_usage::TokenCeilingFilter;
 pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
 
 /// Build an isolated client after installing the process-wide crypto provider.
@@ -77,23 +79,8 @@ pub(crate) mod test_utils {
     use std::sync::LazyLock;
 
     use http::{HeaderMap, Method, Uri};
-    use praxis_core::{
-        id::IdGenerator,
-        subrequest::{SubRequestClient, SubRequestConnector},
-    };
+    use praxis_core::id::IdGenerator;
     use praxis_filter::{HttpFilterContext, Request, RequestExtensions, Response};
-
-    /// Shared sub-request client for filter unit tests that exercise callouts.
-    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> = LazyLock::new(|| SubRequestClient::new(connector(4)));
-
-    /// A sub-request connector for tests. The connector builds a rustls
-    /// client config, and rustls needs the process-wide crypto provider (the
-    /// system OpenSSL, installed by the binary at startup) before that; the
-    /// helper installs it, which is a no-op after the first call.
-    pub(crate) fn connector(pool_size: usize) -> SubRequestConnector {
-        praxis_tls::provider::install();
-        SubRequestConnector::new(pool_size, None)
-    }
 
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
@@ -114,17 +101,7 @@ pub(crate) mod test_utils {
         reason = "test context constructor mirrors all context fields"
     )]
     pub(crate) fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
-        make_filter_context_with_subrequest(req, None)
-    }
-
-    /// Build a filter context wired to the shared test sub-request client.
-    pub(crate) fn make_filter_context_with_subrequest<'a>(
-        req: &'a Request,
-        client: Option<&'a SubRequestClient>,
-    ) -> HttpFilterContext<'a> {
-        let mut ctx = make_filter_context_inner(req);
-        ctx.subrequest_client = client.or(Some(&TEST_SUBREQUEST_CLIENT));
-        ctx
+        make_filter_context_inner(req)
     }
 
     #[expect(

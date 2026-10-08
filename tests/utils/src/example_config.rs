@@ -56,17 +56,54 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// assert!(yaml.contains("allow_private_endpoints: true"));
 /// ```
 pub fn allow_loopback_endpoints(yaml: &str) -> String {
-    if yaml.contains("allow_private_endpoints") {
+    ensure_insecure_option_bool(yaml, "allow_private_endpoints", true)
+}
+
+/// Set `insecure_options.<key>` when absent, via the parsed mapping.
+///
+/// Textual `replacen` misses layouts such as `insecure_options: # comment`
+/// or inline mappings; parsing preserves existing entries and explicit values.
+///
+/// # Panics
+///
+/// Panics if `yaml` is not valid YAML or its document root is not a mapping,
+/// so callers see the original parse/diagnostic instead of a later
+/// `Config::from_yaml` failure after a silent text append.
+fn ensure_insecure_option_bool(yaml: &str, key: &str, value: bool) -> String {
+    if insecure_options_has_key(yaml, key) {
         return yaml.to_owned();
     }
-    if yaml.contains("\ninsecure_options:") || yaml.starts_with("insecure_options:") {
-        return yaml.replacen(
-            "insecure_options:\n",
-            "insecure_options:\n  allow_private_endpoints: true\n",
-            1,
-        );
+    let mut root: serde_yaml::Value =
+        serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("example config is not valid YAML: {e}"));
+    let root_map = root
+        .as_mapping_mut()
+        .unwrap_or_else(|| panic!("example config root must be a mapping"));
+    let opts_key = serde_yaml::Value::String("insecure_options".into());
+    let opts = root_map
+        .entry(opts_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if let serde_yaml::Value::Mapping(m) = opts {
+        m.insert(serde_yaml::Value::String(key.into()), serde_yaml::Value::Bool(value));
+    } else {
+        let mut m = serde_yaml::Mapping::new();
+        m.insert(serde_yaml::Value::String(key.into()), serde_yaml::Value::Bool(value));
+        *opts = serde_yaml::Value::Mapping(m);
     }
-    format!("{yaml}\ninsecure_options:\n  allow_private_endpoints: true\n")
+    serde_yaml::to_string(&root).unwrap_or_else(|e| panic!("serialize example config YAML: {e}"))
+}
+
+/// True when the parsed `insecure_options` mapping sets `key`.
+///
+/// String search is not used: a comment mentioning the key must not
+/// suppress the harness override.
+fn insecure_options_has_key(yaml: &str, key: &str) -> bool {
+    let Ok(serde_yaml::Value::Mapping(root)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return false;
+    };
+    let Some(serde_yaml::Value::Mapping(opts)) = root.get(serde_yaml::Value::String("insecure_options".into())) else {
+        return false;
+    };
+    opts.contains_key(serde_yaml::Value::String(key.into()))
 }
 
 /// Resolve the absolute path to an example config file.
@@ -167,5 +204,31 @@ mod tests {
             config.listeners[0].address, "127.0.0.1:19999",
             "listener address should be patched"
         );
+    }
+
+    #[test]
+    fn allow_loopback_inserts_private_endpoints_when_insecure_options_has_inline_comment() {
+        let yaml = "listeners: []\ninsecure_options: # test settings\n  allow_private_upstreams: true\n";
+        let patched = allow_loopback_endpoints(yaml);
+        assert!(
+            insecure_options_has_key(&patched, "allow_private_endpoints"),
+            "inline comment on insecure_options must not block allow_private_endpoints insert"
+        );
+        assert!(
+            insecure_options_has_key(&patched, "allow_private_upstreams"),
+            "existing insecure_options entries must be preserved"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "example config is not valid YAML")]
+    fn allow_loopback_panics_on_invalid_yaml_with_parse_diagnostic() {
+        let _ = allow_loopback_endpoints("listeners: [\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "example config root must be a mapping")]
+    fn allow_loopback_panics_when_root_is_not_a_mapping() {
+        let _ = allow_loopback_endpoints("- just\n- a\n- list\n");
     }
 }

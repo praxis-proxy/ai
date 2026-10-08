@@ -3,6 +3,8 @@
 
 //! Input item pagination for the `OpenAI` Responses API.
 
+use serde::{Serialize, Serializer};
+
 use crate::{
     openai::include::{IncludeFields, project_item},
     store::{ResponseRecord, StoreError},
@@ -84,6 +86,63 @@ pub(crate) struct InputItemPage {
 
     /// Whether more pages exist beyond this one.
     pub has_more: bool,
+}
+
+impl InputItemPage {
+    /// Return the `first_id` cursor for this page, if present.
+    pub fn first_id(&self) -> Option<&str> {
+        self.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str())
+    }
+
+    /// Return the `last_id` cursor for this page, falling back to `next_cursor`.
+    ///
+    /// Items normally carry a synthetic ID (see [`normalize_input_items`]),
+    /// but non-object array entries cannot be tagged with one. Fall back
+    /// to the page's numeric cursor so `after`-based pagination stays
+    /// usable even for that edge case, instead of exposing a `null`
+    /// `last_id` clients have no way to resume from.
+    pub fn last_id(&self) -> Option<&str> {
+        self.data
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or(self.next_cursor.as_deref())
+    }
+}
+
+impl Serialize for InputItemPage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        InputItemPageView {
+            object: "list",
+            data: &self.data,
+            has_more: self.has_more,
+            first_id: self.first_id(),
+            last_id: self.last_id(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Borrowed view of an input item page formatted for direct JSON response serialization.
+#[derive(Serialize)]
+struct InputItemPageView<'a> {
+    /// Responses API object type (always `"list"`).
+    object: &'static str,
+
+    /// Page window data items.
+    data: &'a [serde_json::Value],
+
+    /// Whether additional items exist beyond this page window.
+    has_more: bool,
+
+    /// First item ID cursor in the page window.
+    first_id: Option<&'a str>,
+
+    /// Last item ID cursor (or fallback cursor) in the page window.
+    last_id: Option<&'a str>,
 }
 
 // -----------------------------------------------------------------------------
