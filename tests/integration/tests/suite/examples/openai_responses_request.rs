@@ -177,7 +177,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: openai_responses_request
         on_invalid: reject
         headers:

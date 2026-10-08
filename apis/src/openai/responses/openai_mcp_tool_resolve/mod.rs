@@ -1287,7 +1287,7 @@ fn build_list_tools_failure_response(
     // (the OpenAI default). `openai_stream_events` accumulates this failure into
     // `ResponsesState` and `openai_response_store` persists it, so this flag must
     // match what the caller observes on retrieval.
-    let store = ctx.get_metadata("openai_responses_format.store") != Some("false");
+    let store = ctx.get_metadata("openai_responses_request.store") != Some("false");
     let response_id = ctx
         .get_metadata("responses.response_id")
         .or_else(|| {
@@ -1317,7 +1317,7 @@ fn build_list_tools_failure_response(
     // even when no `ResponsesState` was built (e.g. no validate/rehydrate in the
     // pipeline); fall back to the captured options, then to an empty string.
     let model = ctx
-        .get_metadata("openai_responses_format.model")
+        .get_metadata("openai_responses_request.model")
         .or_else(|| {
             options
                 .and_then(|body| body.get("model"))
@@ -2875,7 +2875,7 @@ fn has_mcp_tools(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether the request is streaming.
 fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
+    ctx.get_metadata("openai_responses_request.stream")
         .is_some_and(|v| v == "true")
 }
 

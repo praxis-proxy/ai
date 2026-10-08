@@ -10,7 +10,7 @@
 # families: each protocol declares its own operation registry, and the
 # classifier aggregates them.
 #
-# Responses still routes on a body fact. `openai_responses_format`
+# Responses still routes on a body fact. `openai_responses_request`
 # classifies the body for its own filter results but does not promote a
 # format header (avoids overwriting), and `anthropic_messages_format`
 # promotes `x-praxis-ai-format` and `x-praxis-ai-model` for the requests
@@ -61,7 +61,8 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: ~

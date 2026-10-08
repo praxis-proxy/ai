@@ -486,16 +486,23 @@ fn full_flow_managed_chat_backend_translates_after_binding() {
 }
 
 #[test]
-fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
+    // #1602: a matched `POST /v1/responses` keeps the application protocol and
+    // operation ID published by `ai_operation`, regardless of body shape. A
+    // Chat Completions-shaped body is therefore still classified
+    // `openai_responses`, so it routes by model through the Responses catch-all
+    // to the shared inference backend instead of missing the format-constrained
+    // route (the pre-#1602 404).
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_chat_body","created_at":1000,"model":"gpt-4","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_chat_body_404");
+    let db = TempSqlite::new("full_flow_chat_body_as_responses");
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
-    );
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -506,34 +513,43 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         ),
     );
 
-    // The bypass carrier's `unless` gate is a positive allow-list of one
-    // format: a Chat Completions body is not classified openai_responses, so it
-    // runs the carrier and hits the bypass route-miss (no WebSocket Upgrade
-    // header on POST /v1/responses) rather than reaching the IRR.
     assert_eq!(
         parse_status(&raw),
-        404,
-        "a Chat Completions body must not match the format-constrained route"
+        200,
+        "a Chat Completions body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_chat_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 
 #[test]
-fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses() {
+    // #1602: body shape does not override operation identity. An Anthropic
+    // Messages-shaped body on `POST /v1/responses` is still the matched
+    // Responses create, so it routes by model through the catch-all to the
+    // shared inference backend rather than falling off the format-constrained
+    // route.
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_anthropic_body","created_at":1000,"model":"claude-3-5-sonnet","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_anthropic_body_404");
+    let db = TempSqlite::new("full_flow_anthropic_body_as_responses");
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
-    );
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
-    // An Anthropic Messages body posted to /v1/responses is classified
-    // anthropic_messages, not openai_responses. The same allow-list gate that
-    // rejects a Chat Completions body must reject this one — the catch-all is
-    // structural (allow only openai_responses), not a per-format reject rule.
     let raw = http_send(
         proxy.addr(),
         &json_post(
@@ -544,8 +560,19 @@ fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() 
 
     assert_eq!(
         parse_status(&raw),
-        404,
-        "an Anthropic Messages body must not match the format-constrained route"
+        200,
+        "an Anthropic Messages body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_anthropic_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 

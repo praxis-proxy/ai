@@ -124,7 +124,7 @@ exception - see below).
 In scope when the diff touches OpenAI-format code
 under `apis/src/openai/` or a related cross-cutting
 filter in `filters/src/`. Representative filters:
-`openai_responses_format`, `openai_responses_request`,
+`openai_responses_request`,
 `openai_responses_proxy`, `openai_responses_rehydrate`,
 `openai_responses_model_rewrite`,
 `openai_responses_compact`, `openai_response_store`,

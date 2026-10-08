@@ -14,7 +14,6 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_mcp_tool_resolve`** — Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server.
 - **`openai_response_store`** — Persists Responses API responses to the configured response store backend.
 - **`openai_responses_compact`** — Summarizes conversation history when the token count exceeds a configured threshold.
-- **`openai_responses_format`** — Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body.
 - **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses and Chat Completions request bodies.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
@@ -39,7 +38,6 @@ Body-phase columns show `Access / Mode` when the hook is implemented. When ordin
 | `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
 | `openai_response_store` | ✓ | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadOnly / Stream |
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — | — | — |
-| `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — | — | — |
 | `openai_responses_proxy` | — | None / StreamBuffer | — | ReadWrite / StreamBuffer | — | — |
 | `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadWrite / Stream |

@@ -82,6 +82,16 @@ on:
         required: false
         default: false
         type: boolean
+      run_compaction_only:
+        description: >-
+          Debug fast path: run ONLY the two self-compaction acceptance tests
+          (Claude Code and Codex) on a GPU runner. Skips the complete Responses
+          SDK suite and every other acceptance step so iterations are quick.
+          Implies both acceptance jobs regardless of run_claude_acceptance and
+          run_codex_acceptance.
+        required: false
+        default: false
+        type: boolean
       gpu_instance_type:
         description: >-
           Optional EC2 GPU instance-type override for transient capacity
@@ -543,6 +553,44 @@ jobs:
               raise SystemExit(
                   f"vLLM context {context} is below Claude client context {client_context}"
               )
+          # The compaction scenario deliberately runs the client with a LOWERED
+          # window so it auto-compacts mid-task. That window must stay positive
+          # and strictly below the real backend window; otherwise the client
+          # never crosses its threshold and the scenario proves nothing.
+          compaction_context = int(launch["compaction"]["max_context_tokens"])
+          if not 0 < compaction_context < context:
+              raise SystemExit(
+                  f"compaction window {compaction_context} must be in (0, {context})"
+              )
+          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
+          # tokens, so its effective auto-compaction threshold is
+          # `compaction_context - 15048`. A single ballast read must fit well
+          # under that headroom, or one post-compaction read immediately
+          # re-crosses the threshold and the client's rapid-refill breaker aborts
+          # the run. Total ballast must still exceed the threshold so compaction
+          # fires mid-task. Use ~4 bytes/token to approximate from the pinned
+          # byte sizes.
+          reserved = 15048
+          headroom = compaction_context - reserved
+          if headroom <= 0:
+              raise SystemExit(
+                  f"compaction window {compaction_context} must exceed the "
+                  f"{reserved}-token Claude Code reserve so the client has usable headroom"
+              )
+          ballast_bytes = int(launch["compaction"]["ballast_bytes"])
+          ballast_chapters = int(launch["compaction"]["ballast_chapters"])
+          per_chapter_tokens = ballast_bytes / 4
+          total_ballast_tokens = per_chapter_tokens * ballast_chapters
+          if per_chapter_tokens * 2 >= headroom:
+              raise SystemExit(
+                  f"a single ballast chapter (~{per_chapter_tokens:.0f} tokens) must be well "
+                  f"under the ~{headroom}-token post-compaction headroom to avoid the rapid-refill breaker"
+              )
+          if total_ballast_tokens <= headroom:
+              raise SystemExit(
+                  f"total ballast (~{total_ballast_tokens:.0f} tokens) must exceed the "
+                  f"~{headroom}-token threshold so compaction fires mid-task"
+              )
           exported = {
               "claude_url": claude["url"],
               "claude_sha256": claude["sha256"],
@@ -616,7 +664,7 @@ jobs:
       (
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance)
+          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -888,9 +936,10 @@ jobs:
       - name: Run Claude Code native-vLLM acceptance test (once, no retry)
         id: claude_native_edits
         # Keep the original success()-gating (run only when setup succeeded) and
-        # additionally skip on a focused degradation-only dispatch; the two
-        # translated steps below carry that run.
-        if: ${{ success() && env.DEGRADE_ONLY != 'true' }}
+        # additionally skip on a focused degradation-only or compaction-only
+        # dispatch; the two translated steps below carry the degradation run, and
+        # the compaction steps carry the compaction-only run.
+        if: ${{ success() && env.DEGRADE_ONLY != 'true' && !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -915,7 +964,7 @@ jobs:
 
       - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_edits
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -937,7 +986,7 @@ jobs:
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
         id: claude_native_auto
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -958,7 +1007,7 @@ jobs:
 
       - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_auto
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -978,7 +1027,7 @@ jobs:
 
       - name: Run Claude Code planning-turn regression (once, no retry)
         id: claude_planning
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1036,9 +1085,35 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-web-search.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run Claude Code compaction acceptance test (once, no retry)
+        id: claude_compaction
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # Grow accepted context over many tool turns until Claude Code crosses
+          # its own (lowered CLAUDE_CODE_MAX_CONTEXT_TOKENS) auto-compaction
+          # threshold mid-task. The run asserts the client emits a
+          # compact_boundary(trigger=auto) event, then issues a further tool call
+          # that lands an Edit using the pre-compaction marker. Summarization and
+          # every post-compaction request traverse ANTHROPIC_BASE_URL; the egress
+          # namespace guarantees Praxis is the client's only route. Runs once, no
+          # retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_compaction_crosses_context_window_on_native_vllm \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-compaction.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Run Anthropic SDK Messages against real vLLM
         id: anthropic_messages
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1052,7 +1127,7 @@ jobs:
 
       - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
         id: anthropic_stubbed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1068,7 +1143,7 @@ jobs:
 
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1094,7 +1169,7 @@ jobs:
           # Interleaved client and Praxis diagnostics for each run. The gateway
           # and native secrets are test constants, and Praxis does not emit auth
           # headers at the default log level, so these logs are safe to surface.
-          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed acceptance-planning acceptance-web-search; do
+          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed acceptance-planning acceptance-web-search acceptance-compaction; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || echo "no $log log captured"
           done
@@ -1121,6 +1196,7 @@ jobs:
             ${{ runner.temp }}/acceptance-auto-transformed.log
             ${{ runner.temp }}/acceptance-planning.log
             ${{ runner.temp }}/acceptance-web-search.log
+            ${{ runner.temp }}/acceptance-compaction.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
           retention-days: 30
@@ -1135,6 +1211,7 @@ jobs:
           CLAUDE_TRANSLATED_AUTO: ${{ steps.claude_translated_auto.outcome }}
           CLAUDE_PLANNING: ${{ steps.claude_planning.outcome }}
           CLAUDE_WEB_SEARCH: ${{ steps.claude_web_search.outcome }}
+          CLAUDE_COMPACTION: ${{ steps.claude_compaction.outcome }}
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
@@ -1143,6 +1220,7 @@ jobs:
           import json, os, pathlib, subprocess, sys
           names = ("CLAUDE_NATIVE_EDITS", "CLAUDE_TRANSLATED_EDITS", "CLAUDE_NATIVE_AUTO",
                    "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
+                   "CLAUDE_COMPACTION",
                    "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
                    "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
@@ -1225,7 +1303,7 @@ jobs:
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_codex_acceptance)
+          (inputs.run_live_vllm || inputs.run_codex_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -1455,6 +1533,7 @@ jobs:
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
         id: codex_native
+        if: ${{ !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1473,7 +1552,7 @@ jobs:
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
-        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1490,12 +1569,37 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run Codex native-Responses compaction acceptance test (once, no retry)
+        id: codex_compaction
+        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # Grow accepted context over many turns until Codex crosses its own
+          # (lowered) auto-compaction threshold and runs inline compaction,
+          # which POSTs the summarization prompt through Praxis to vLLM. A
+          # test-local HTTP observer between Codex and Praxis captures the
+          # compaction request on the wire; the egress namespace guarantees the
+          # client's only route is Praxis.
+          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            codex_http::pinned_codex_compaction_crosses_context_window_over_http \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Capture diagnostics on failure
         if: failure()
         run: |
           "$CONTAINER_RUNTIME" logs vllm > "$RUNNER_TEMP/codex-vllm.log" 2>&1 || true
           "$CONTAINER_RUNTIME" logs praxis-postgres > "$RUNNER_TEMP/codex-postgres.log" 2>&1 || true
-          for log in codex-acceptance-native codex-acceptance-translated; do
+          for log in codex-acceptance-native codex-acceptance-translated codex-acceptance-compaction; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || true
           done
@@ -1512,6 +1616,7 @@ jobs:
           path: |
             ${{ runner.temp }}/codex-acceptance-native.log
             ${{ runner.temp }}/codex-acceptance-translated.log
+            ${{ runner.temp }}/codex-acceptance-compaction.log
             ${{ runner.temp }}/codex-vllm.log
             ${{ runner.temp }}/codex-postgres.log
           if-no-files-found: ignore
@@ -1523,10 +1628,11 @@ jobs:
         env:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
+          CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
         run: |
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
-          names = ("CODEX_NATIVE", "CODEX_TRANSLATED")
+          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
           data = {
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
@@ -1593,7 +1699,7 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
       ) ||
       (
         github.event_name == 'pull_request' &&

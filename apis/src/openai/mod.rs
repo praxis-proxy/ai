@@ -24,8 +24,11 @@ pub(crate) mod sse;
 )]
 pub(crate) mod translation;
 
-pub use chat_completions::routes::{
-    ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
+pub use chat_completions::{
+    request::OpenaiChatCompletionsRequestFilter,
+    routes::{
+        ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
+    },
 };
 pub use conversations::{
     ConversationOperation, ConversationOperationSpec, operation_specs as conversations_operation_specs,
@@ -49,7 +52,7 @@ pub use responses::{
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};
 pub use responses::{
-    ModelRewriteFilter, ResponsesFormatFilter, ToolParseFilter,
+    ModelRewriteFilter, ToolParseFilter,
     routes::{
         PROTOCOL_EXTENSION_OPERATION_IDS as RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS, ResponsesOperation,
         ResponsesOperationSpec, operation_specs as responses_operation_specs,

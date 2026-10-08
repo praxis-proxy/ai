@@ -88,6 +88,7 @@ CLIENT_TOOL_COMPAT_CONFIG_PATH = (
 CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH = (
     "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml"
 )
+TTFT_CONFIG_PATH = "examples/configs/time-to-first-token.yaml"
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -330,6 +331,44 @@ def _write_full_flow_config(
 
     config = _patch_store_backend(config, db_path)
     return _persist_config(config)
+
+
+def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint: str) -> str:
+    """Patch the TTFT example to target the test backend and expose /metrics.
+
+    The shipped example forwards every path to one backend and records the
+    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` listener is appended so the
+    test can scrape that histogram and confirm the model label
+    ``openai_chat_completions_request`` published for a native chat completion.
+    """
+    with open(TTFT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3000", backend_endpoint)
+
+    admin_block = f'\nadmin:\n  address: "127.0.0.1:{metrics_port}"\n'
+    anchor = "\ninsecure_options:\n"
+    assert config.count(anchor) == 1, "TTFT example should declare insecure_options once"
+    config = config.replace(anchor, admin_block + anchor, 1)
+
+    return _persist_config(config)
+
+
+def _scrape_metrics(metrics_port: int) -> str:
+    """Fetch the Prometheus exposition text from the admin endpoint."""
+    response = httpx.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+    response.raise_for_status()
+    return response.text
+
+
+def _has_ttft_sample_for_model(metrics_text: str, model: str) -> bool:
+    """Whether the TTFT histogram carries a sample labeled with ``model``."""
+    label = f'model="{model}"'
+    return any(
+        line.startswith("praxis_ai_ttft_seconds") and label in line
+        for line in metrics_text.splitlines()
+    )
 
 
 def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
@@ -1023,6 +1062,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     def _send_conversation_response(self, request_body):
         """Serve native Responses without a model so append/hydration is deterministic."""
         request_input = json.dumps(request_body.get("input"))
+        leading_bom = "STREAM-LEADING-BOM-1546" in request_input
         local_tool_limit = "STREAM-LOCAL-DELETE-410" in request_input
         web_call_limit = "STREAM-WEB-LIMIT-410" in request_input
         tool_model = request_body["model"] == "sdk-conversation-tool-stream"
@@ -1089,11 +1129,20 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 {"type": "response.created", "sequence_number": 0, "response": created},
                 {"type": "response.completed", "sequence_number": 1, "response": response},
             ]
-            encoded_frames = [
-                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
-                for event in frames
-            ]
-            payload = b"".join(encoded_frames) + b"data: [DONE]\n\n"
+            if leading_bom:
+                encoded_frames = [
+                    f"data: {json.dumps(event)}\n\n".encode() for event in frames
+                ]
+            else:
+                encoded_frames = [
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                    for event in frames
+                ]
+            payload = (
+                (b"\xef\xbb\xbf" if leading_bom else b"")
+                + b"".join(encoded_frames)
+                + b"data: [DONE]\n\n"
+            )
             content_type = "text/event-stream"
         else:
             payload = json.dumps(response).encode()
@@ -1510,6 +1559,47 @@ def praxis_proxy(tmp_path_factory, request, backend_endpoint):
                     f"\n=== Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def ttft_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy on the TTFT example with the /metrics endpoint exposed.
+
+    Native ``POST /v1/chat/completions`` is forwarded straight to the backend, so
+    ``openai_chat_completions_request`` publishes the request model for the
+    ``time_to_first_token`` histogram. Yields the proxy and admin (metrics) ports.
+    """
+    port = _free_port()
+    metrics_port = _free_port()
+    log_dir = tmp_path_factory.mktemp("ttft")
+    config_path = _write_ttft_config(port, metrics_port, backend_endpoint=backend_endpoint)
+    binary = _find_binary()
+
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, metrics_port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== TTFT proxy Praxis logs ===\n{f.read()}", file=sys.stderr)
         os.unlink(config_path)
 
 
@@ -2601,6 +2691,34 @@ class TestOpenAIResponsesVLLM:
             "the proxy must echo the caller's previous_response_id back to the "
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
+        )
+
+    def test_leading_bom_preserves_first_data_only_stream_event(
+        self, witness_backend_client
+    ):
+        """A leading UTF-8 BOM must not hide the first data-only SSE event.
+
+        RFC 3629 Section 6 documents U+FEFF's UTF-8 BOM representation:
+        https://datatracker.ietf.org/doc/html/rfc3629#section-6
+        The requirement to strip one leading BOM while interpreting SSE comes
+        from the WHATWG HTML Standard Section 9.2.6:
+        https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream
+        """
+        client, _ = witness_backend_client
+
+        events = list(
+            client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LEADING-BOM-1546",
+                stream=True,
+                store=False,
+            )
+        )
+        event_types = [event.type for event in events]
+
+        assert event_types == ["response.created", "response.completed"], (
+            "the OpenAI client must receive the first data-only event after the "
+            f"proxy strips one leading UTF-8 BOM; got: {event_types}"
         )
 
     def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
@@ -7620,7 +7738,12 @@ listeners:
 filter_chains:
   - name: file-search-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        # A facts pass (initialize_state: false) always caches its single parse,
+        # so the managed owner below reuses it and the create body deserializes
+        # exactly once across both passes (#1602).
+        initialize_state: false
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -9637,6 +9760,49 @@ class TestModelRewriteChatCompletionsVLLM:
 
         assert response.status_code == 200, response.text
         assert response.json()["model"] == VLLM_MODEL, response.text
+
+
+# ---------------------------------------------------------------------------
+# Time to first token: native Chat Completions model label
+# ---------------------------------------------------------------------------
+
+
+@requires_real_inference
+def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
+    """A streamed native chat completion labels TTFT with its request model.
+
+    Drives ``openai_chat_completions_request`` through the OpenAI client: the
+    filter reads the model from the native ``POST /v1/chat/completions`` body and
+    publishes the fact ``time_to_first_token`` records as the
+    ``praxis_ai_ttft_seconds`` model label. Without the request filter the sample
+    would fall back to ``unknown``.
+    """
+    praxis_port, metrics_port = ttft_proxy
+    client = _make_openai_client(praxis_port)
+
+    stream = client.chat.completions.create(
+        model=VLLM_MODEL,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
+        max_tokens=16,
+        stream=True,
+    )
+    chunks = list(stream)
+    assert chunks, "native chat completion should stream at least one chunk"
+
+    # The histogram is recorded as the first SSE chunk is relayed on the response
+    # path; retry briefly so the scrape never races the recorder's render.
+    deadline = time.monotonic() + 10
+    metrics_text = ""
+    while time.monotonic() < deadline:
+        metrics_text = _scrape_metrics(metrics_port)
+        if _has_ttft_sample_for_model(metrics_text, VLLM_MODEL):
+            break
+        time.sleep(0.2)
+
+    assert _has_ttft_sample_for_model(metrics_text, VLLM_MODEL), (
+        "praxis_ai_ttft_seconds must carry a sample labeled with the request "
+        f"model {VLLM_MODEL!r}; got:\n{metrics_text}"
+    )
 
 
 if __name__ == "__main__":

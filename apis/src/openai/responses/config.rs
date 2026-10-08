@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration types for the Responses format classifier filter.
+//! Configuration types for the Responses request processor filter.
 
 use praxis_filter::{FilterError, builtins::http::payload_processing::OnInvalidBehavior};
 use serde::Deserialize;
@@ -11,7 +11,7 @@ use serde::Deserialize;
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
-// ResponsesFormatHeaders
+// ResponsesClassificationHeaders
 // -----------------------------------------------------------------------------
 
 /// Configurable header names for promoted classification facts.
@@ -21,7 +21,7 @@ use serde::Deserialize;
 /// non-`x-praxis-*` header.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ResponsesFormatHeaders {
+pub(crate) struct ResponsesClassificationHeaders {
     /// Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`).
     ///
     /// Must not be a hop-by-hop, framing, Host, credential, API-key, or
@@ -56,7 +56,7 @@ pub(crate) struct ResponsesFormatHeaders {
     pub mode: Option<String>,
 }
 
-impl Default for ResponsesFormatHeaders {
+impl Default for ResponsesClassificationHeaders {
     fn default() -> Self {
         Self {
             format: default_format_header(),
@@ -104,15 +104,17 @@ fn default_mode_header() -> Option<String> {
 }
 
 // -----------------------------------------------------------------------------
-// ResponsesFormatConfig
+// ResponsesClassificationConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the [`ResponsesFormatFilter`].
+/// Shared classification and promotion settings for the request processor.
 ///
-/// [`ResponsesFormatFilter`]: super::ResponsesFormatFilter
+/// The create request processor flattens these into [`ResponsesRequestConfig`]
+/// so a chain configures promotion headers and `on_invalid` the same way
+/// whether the filter runs as a pre-routing fact publisher or the managed owner.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ResponsesFormatConfig {
+pub(crate) struct ResponsesClassificationConfig {
     /// Behavior when the body cannot be classified.
     #[serde(default = "OnInvalidBehavior::default_continue")]
     pub on_invalid: OnInvalidBehavior,
@@ -122,28 +124,37 @@ pub(crate) struct ResponsesFormatConfig {
     /// Must not be hop-by-hop, framing, Host, credential, API-key, or
     /// other internal `x-praxis-*` names. Dedicated defaults remain allowed.
     #[serde(default)]
-    pub headers: ResponsesFormatHeaders,
+    pub headers: ResponsesClassificationHeaders,
 }
 
 /// Configuration for the create request processor.
 ///
-/// Extends the shared classification settings with the one option that only
-/// this filter honours, so the classifier it replaces does not advertise an
-/// option it ignores.
-#[cfg(feature = "openai-responses")]
+/// Extends the shared classification settings with the one option that gates
+/// the managed-path lifecycle, so a pre-routing fact publisher and the managed
+/// owner can be configured from the same filter.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponsesRequestConfig {
     /// Classification and promotion settings, shared with the classifier.
     #[serde(flatten)]
-    pub shared: ResponsesFormatConfig,
+    pub shared: ResponsesClassificationConfig,
 
-    /// Whether to initialize `ResponsesState` for a create request.
+    /// Whether this entry owns the managed-path request lifecycle.
     ///
-    /// On by default, because the stateful Responses filters read it. A
-    /// passthrough chain that only classifies and routes consumes none of it,
-    /// and building it there costs an identifier, a conversation resolution,
-    /// and retaining the parsed body for the rest of the request.
+    /// On by default, because the stateful Responses filters read the state it
+    /// builds. When enabled the filter is the managed owner: it initializes
+    /// `ResponsesState` and enforces the managed-path policy that rejects
+    /// provider-owned `background`/`prompt` and conflicting history selectors.
+    /// The owner reuses the parse a pre-routing publisher cached, so a managed
+    /// create body is deserialized exactly once across the two phases.
+    ///
+    /// A pre-routing fact publisher sets this to `false`: it classifies the
+    /// body, promotes the routing facts, and caches its single parse in request
+    /// extensions for a later managed owner to reuse, but mints no identifiers,
+    /// resolves no conversation, and enforces no managed-path policy — so
+    /// provider-owned traffic that the router may still bind to a direct upstream
+    /// keeps its fields intact. On a chain with no managed owner the cached parse
+    /// is released, unconsumed, when the request ends.
     ///
     /// Classification metadata, headers, and filter results are published
     /// either way, so routing is unaffected.
@@ -151,11 +162,10 @@ pub(crate) struct ResponsesRequestConfig {
     pub initialize_state: bool,
 }
 
-/// `ResponsesState` is initialized unless a chain opts out.
+/// The filter owns the managed-path lifecycle unless a chain opts out.
 ///
 /// Only the create request processor honours this, and that filter is compiled
 /// in with the Responses feature.
-#[cfg(feature = "openai-responses")]
 const fn default_initialize_state() -> bool {
     true
 }
@@ -165,13 +175,16 @@ const fn default_initialize_state() -> bool {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(filter: &str, cfg: ResponsesFormatConfig) -> Result<ResponsesFormatConfig, FilterError> {
-    validate_responses_format_headers(filter, &cfg.headers)?;
+pub(crate) fn build_config(
+    filter: &str,
+    cfg: ResponsesClassificationConfig,
+) -> Result<ResponsesClassificationConfig, FilterError> {
+    validate_classification_headers(filter, &cfg.headers)?;
     Ok(cfg)
 }
 
 /// Validate dedicated names and reject collisions across header fields.
-fn validate_responses_format_headers(filter: &str, headers: &ResponsesFormatHeaders) -> Result<(), FilterError> {
+fn validate_classification_headers(filter: &str, headers: &ResponsesClassificationHeaders) -> Result<(), FilterError> {
     for (field, name, dedicated) in [
         ("format", headers.format.as_deref(), "x-praxis-ai-format"),
         ("model", headers.model.as_deref(), "x-praxis-ai-model"),
@@ -181,7 +194,7 @@ fn validate_responses_format_headers(filter: &str, headers: &ResponsesFormatHead
         crate::promotion::validate_dedicated_promotion_header(filter, field, name, &[dedicated])?;
     }
     crate::promotion::reject_duplicate_promotion_fields(
-        "openai_responses_format",
+        filter,
         &[
             ("format", headers.format.as_deref()),
             ("model", headers.model.as_deref()),
@@ -211,14 +224,29 @@ mod tests {
 
     #[test]
     fn serde_defaults_responses_format_config() {
-        let cfg: ResponsesFormatConfig = serde_yaml::from_str("{}").unwrap();
+        let cfg: ResponsesClassificationConfig = serde_yaml::from_str("{}").unwrap();
 
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
     }
 
     #[test]
+    fn initialize_state_defaults_on() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(
+            cfg.initialize_state,
+            "an entry owns the managed-path lifecycle unless a chain opts out"
+        );
+    }
+
+    #[test]
+    fn initialize_state_opts_out_for_a_facts_publisher() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("initialize_state: false\n").unwrap();
+        assert!(!cfg.initialize_state, "a pre-routing publisher mints no state");
+    }
+
+    #[test]
     fn responses_format_headers_defaults() {
-        let h = ResponsesFormatHeaders::default();
+        let h = ResponsesClassificationHeaders::default();
         assert_eq!(h.format.as_deref(), Some("x-praxis-ai-format"));
         assert_eq!(h.model.as_deref(), Some("x-praxis-ai-model"));
         assert_eq!(h.stream.as_deref(), Some("x-praxis-ai-stream"));
@@ -229,7 +257,7 @@ mod tests {
 
     #[test]
     fn deny_unknown_fields_responses_format_config() {
-        let res = serde_yaml::from_str::<ResponsesFormatConfig>(
+        let res = serde_yaml::from_str::<ResponsesClassificationConfig>(
             r#"
 bogus: true
 "#,
@@ -239,7 +267,7 @@ bogus: true
 
     #[test]
     fn deny_unknown_fields_responses_format_headers() {
-        let res = serde_yaml::from_str::<ResponsesFormatHeaders>(
+        let res = serde_yaml::from_str::<ResponsesClassificationHeaders>(
             r#"
 format: x-test
 extra: true
@@ -252,22 +280,22 @@ extra: true
 
     #[test]
     fn build_config_minimal_ok() {
-        let cfg: ResponsesFormatConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(build_config("openai_responses_format", cfg).is_ok());
+        let cfg: ResponsesClassificationConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(build_config("openai_responses_request", cfg).is_ok());
     }
 
     #[test]
     fn build_config_invalid_header_name_rejected() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: Some("not a valid header!".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("not a valid HTTP header name"),
             "expected invalid header error, got: {err}"
@@ -276,30 +304,30 @@ extra: true
 
     #[test]
     fn build_config_valid_custom_headers_ok() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: Some("x-custom-format".into()),
                 model: Some("x-custom-model".into()),
                 stream: Some("x-custom-stream".into()),
                 mode: Some("x-custom-mode".into()),
             },
         };
-        assert!(build_config("openai_responses_format", cfg).is_ok());
+        assert!(build_config("openai_responses_request", cfg).is_ok());
     }
 
     #[test]
     fn build_config_authorization_header_rejected() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: default_format_header(),
                 model: Some("authorization".into()),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("authorization"),
             "authorization promotion header should be rejected: {err}"
@@ -308,16 +336,16 @@ extra: true
 
     #[test]
     fn build_config_api_key_header_rejected() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: default_format_header(),
                 model: Some("x-api-key".into()),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("x-api-key"),
             "x-api-key promotion header should be rejected: {err}"
@@ -326,16 +354,16 @@ extra: true
 
     #[test]
     fn build_config_unrelated_internal_header_rejected() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: Some("x-praxis-route".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("x-praxis-route"),
             "unrelated x-praxis-* promotion header should be rejected: {err}"
@@ -344,16 +372,16 @@ extra: true
 
     #[test]
     fn build_config_model_header_rejects_format_routing_fact() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: default_format_header(),
                 model: Some("x-praxis-ai-format".into()),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("x-praxis-ai-format"),
             "client-derived model must not overwrite format routing: {err}"
@@ -362,16 +390,16 @@ extra: true
 
     #[test]
     fn build_config_format_header_rejects_model_rewrite_fact() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: Some("x-praxis-ai-effective-model".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
                 mode: default_mode_header(),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("x-praxis-ai-effective-model"),
             "format fact must not overwrite model-rewrite routing: {err}"
@@ -380,28 +408,28 @@ extra: true
 
     #[test]
     fn build_config_accepts_dedicated_defaults() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders::default(),
+            headers: ResponsesClassificationHeaders::default(),
         };
         assert!(
-            build_config("openai_responses_format", cfg).is_ok(),
+            build_config("openai_responses_request", cfg).is_ok(),
             "dedicated classification defaults should remain allowed"
         );
     }
 
     #[test]
     fn build_config_rejects_duplicate_promotion_headers() {
-        let cfg = ResponsesFormatConfig {
+        let cfg = ResponsesClassificationConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            headers: ResponsesFormatHeaders {
+            headers: ResponsesClassificationHeaders {
                 format: Some("x-foo".into()),
                 model: Some("X-Foo".into()),
                 stream: Some("x-praxis-ai-stream".into()),
                 mode: Some("x-praxis-responses-mode".into()),
             },
         };
-        let err = build_config("openai_responses_format", cfg).unwrap_err();
+        let err = build_config("openai_responses_request", cfg).unwrap_err();
         assert!(
             err.to_string().contains("same header name"),
             "duplicate format and model headers should be rejected: {err}"
@@ -412,7 +440,7 @@ extra: true
 
     #[test]
     fn null_header_disables_promotion() {
-        let cfg: ResponsesFormatConfig = serde_yaml::from_str(
+        let cfg: ResponsesClassificationConfig = serde_yaml::from_str(
             r#"
 headers:
   format: null
@@ -427,6 +455,6 @@ headers:
         assert!(cfg.headers.model.is_none());
         assert!(cfg.headers.stream.is_none());
         assert!(cfg.headers.mode.is_none());
-        assert!(build_config("openai_responses_format", cfg).is_ok());
+        assert!(build_config("openai_responses_request", cfg).is_ok());
     }
 }

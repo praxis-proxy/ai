@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_responses_format` classifier filter.
+//! Integration tests for the `openai_responses_request` classifier filter.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -95,7 +95,7 @@ fn chat_completions_routes_to_chat_cluster() {
 }
 
 #[test]
-fn unknown_json_routes_to_default_cluster() {
+fn responses_url_with_chat_shaped_body_routes_to_responses_cluster() {
     let responses_guard = start_backend_with_shutdown("responses-backend");
     let chat_guard = start_backend_with_shutdown("chat-backend");
     let default_guard = start_backend_with_shutdown("default-backend");
@@ -110,16 +110,51 @@ fn unknown_json_routes_to_default_cluster() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4","prompt":"hello"}"#;
-    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+    // A Chat-Completions-shaped body (`messages`, no `input`) posted to the
+    // Responses create URL. `ai_operation` matches the operation from the
+    // request head, so the published protocol is `openai_responses` and the
+    // Chat branch never fires; body shape must not override the URL-derived
+    // operation identity.
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
-    assert_eq!(parse_status(&raw), 200, "unknown JSON should return 200");
+    assert_eq!(parse_status(&raw), 200, "responses URL should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "responses-backend",
+        "a Chat-shaped body on the Responses URL must route by the matched \
+         operation, not the body shape"
+    );
+}
+
+#[test]
+fn unclassified_request_routes_to_default_cluster() {
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let chat_guard = start_backend_with_shutdown("chat-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = routing_yaml(
+        proxy_port,
+        responses_guard.port(),
+        chat_guard.port(),
+        default_guard.port(),
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // An unrecognized endpoint: `ai_operation` does not match its head and
+    // `openai_responses_request` is gated to Responses create bodies, so no
+    // routing fact is promoted and the request falls through to default.
+    let body = r#"{"model":"gpt-4","prompt":"hello"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/other/endpoint", body));
+
+    assert_eq!(parse_status(&raw), 200, "unclassified request should return 200");
     assert_eq!(
         parse_body(&raw),
         "default-backend",
-        "unknown JSON on a non-create path should route to the default cluster; the \
-         endpoint is not authoritative there (on POST /v1/responses the same body is a \
-         Responses create request -- see responses_create_without_discriminator_*)"
+        "a request on an unrecognized endpoint promotes no routing fact and must \
+         fall through to the default cluster"
     );
 }
 
@@ -176,7 +211,7 @@ fn non_json_continues_by_default() {
 }
 
 #[test]
-fn unknown_json_rejected_when_configured() {
+fn non_responses_path_not_rejected_by_on_invalid() {
     let default_guard = start_backend_with_shutdown("default-backend");
     let proxy_port = free_port();
 
@@ -184,19 +219,22 @@ fn unknown_json_rejected_when_configured() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4","prompt":"hello"}"#;
+    // `on_invalid: reject` is head-gated to body-bearing Responses operations.
+    // A Chat Completions request is released before classification, so the
+    // reject policy never fires and the request reaches the backend.
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
 
     assert_eq!(
         parse_status(&raw),
-        400,
-        "unknown JSON should be rejected when on_invalid: reject; this uses a \
-         non-create path so the body is not promoted to responses by endpoint authority"
+        200,
+        "on_invalid: reject must not apply to non-Responses operations; the request \
+         is released before body classification"
     );
-    let response_body = parse_body(&raw);
-    assert!(
-        response_body.contains("unrecognized AI API format"),
-        "rejection should mention unrecognized format, got: {response_body}"
+    assert_eq!(
+        parse_body(&raw),
+        "default-backend",
+        "a released Chat Completions request should reach the default backend"
     );
 }
 
@@ -578,7 +616,7 @@ fn get_v1_responses_branch_routes_correctly() {
     let default_guard = start_backend_with_shutdown("default-branch-miss");
     let proxy_port = free_port();
 
-    let yaml = branch_yaml(proxy_port, responses_guard.port(), default_guard.port());
+    let yaml = operation_branch_yaml(proxy_port, responses_guard.port(), default_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -594,7 +632,7 @@ fn get_v1_responses_branch_routes_correctly() {
     assert_eq!(
         parse_body(&raw),
         "responses-branch-hit",
-        "GET path-classified request should trigger branch on format=responses"
+        "GET sub-resource should trigger the branch on the ai_operation application protocol"
     );
 }
 
@@ -818,7 +856,13 @@ fn proxy_failure_does_not_format_openai_error_for_unclassified_request() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// YAML config for routing by classified format using header matching.
+/// YAML config for routing by operation identity and classified format.
+///
+/// `ai_operation` identifies Chat Completions from the request head and branches
+/// it to the chat cluster without reading the body. `openai_responses_request`
+/// classifies Responses create bodies and promotes `x-praxis-ai-format`, while
+/// `ai_operation` promotes `x-praxis-ai-application-protocol` for the bodyless
+/// Responses sub-resources it alone classifies; the router accepts either fact.
 fn routing_yaml(proxy_port: u16, responses_port: u16, chat_port: u16, default_port: u16) -> String {
     format!(
         r#"
@@ -829,7 +873,23 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+        branch_chains:
+          - name: chat-completions
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: openai_chat_completions
+            rejoin: shared_load_balancer
+            chains:
+              - name: chat-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "chat"
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: router
         routes:
@@ -839,11 +899,12 @@ filter_chains:
             cluster: "responses"
           - path_prefix: "/"
             headers:
-              x-praxis-ai-format: "openai_chat_completions"
-            cluster: "chat"
+              x-praxis-ai-application-protocol: "openai_responses"
+            cluster: "responses"
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "responses"
             endpoints:
@@ -871,7 +932,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: router
         routes:
@@ -899,7 +962,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: router
         routes:
@@ -927,7 +992,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/"
@@ -944,6 +1011,11 @@ insecure_options:
 }
 
 /// YAML config that routes all traffic to an echo (body) backend.
+///
+/// `ai_operation` runs first so the OpenAI error formatter is installed from the
+/// request head for every classified operation — Chat Completions and bodyless
+/// Responses sub-resources included, which `openai_responses_request` does not
+/// classify.
 fn echo_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
@@ -954,7 +1026,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/"
@@ -981,12 +1055,63 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         branch_chains:
           - name: responses_branch
             on_result:
-              filter: openai_responses_format
+              filter: openai_responses_request
               key: format
+              result: openai_responses
+            rejoin: shared_load_balancer
+            chains:
+              - name: responses_chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "responses"
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "default"
+      - name: shared_load_balancer
+        filter: load_balancer
+        clusters:
+          - name: "default"
+            endpoints:
+              - "127.0.0.1:{default_port}"
+          - name: "responses"
+            endpoints:
+              - "127.0.0.1:{responses_port}"
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+/// YAML config for branch-based routing using the operation application protocol.
+///
+/// Bodyless Responses sub-resources (`GET /v1/responses/{id}`) are classified
+/// from the request head by `ai_operation`, not by the body-gated
+/// `openai_responses_request`, so this branches on the operation fact.
+fn operation_branch_yaml(proxy_port: u16, responses_port: u16, default_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: ai_operation
+        branch_chains:
+          - name: responses_branch
+            on_result:
+              filter: ai_operation
+              key: application_protocol
               result: openai_responses
             rejoin: shared_load_balancer
             chains:
@@ -1026,11 +1151,13 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         branch_chains:
           - name: background_branch
             on_result:
-              filter: openai_responses_format
+              filter: openai_responses_request
               key: background
               result: "true"
             rejoin: shared_load_balancer
@@ -1080,7 +1207,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/"
@@ -1121,7 +1250,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/"

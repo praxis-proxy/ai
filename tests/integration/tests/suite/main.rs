@@ -60,8 +60,8 @@ mod mcp;
 mod mcp_broker;
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;
-mod openai_responses_format;
 mod openai_responses_model_rewrite;
+mod openai_responses_request;
 mod openai_tool_parse;
 mod prompt_enrich;
 mod responses_routing;
