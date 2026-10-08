@@ -41,7 +41,8 @@
 # with the same request/trace IDs and a fresh outbound span ID.
 #
 # Requires WEB_SEARCH_API_KEY (the search provider key; this example uses Tavily,
-# whose key travels in the request body) and, for the Chat Completions backend,
+# whose key is injected as an `Authorization: Bearer` header per issue #1389
+# rather than in the request body) and, for the Chat Completions backend,
 # VLLM_API_KEY (the backend Bearer token injected toward that cluster). The native
 # Messages backend listens on 127.0.0.1:8000 and the Chat Completions backend on
 # 127.0.0.1:8001.

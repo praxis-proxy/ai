@@ -182,15 +182,21 @@ fn default_base_url(provider: SearchProvider) -> &'static str {
     }
 }
 
-/// The request header a header-authenticated provider carries its API key in, or
-/// `None` for a body-authenticated provider (Tavily, whose key travels in the
-/// request body and is protected instead by the executor re-pinning the staged
-/// upstream against mid-chain retargeting).
-fn provider_auth_header(provider: SearchProvider) -> Option<http::HeaderName> {
+/// The request header and value prefix a provider carries its API key under.
+///
+/// Every provider authenticates with a header credential that the executor
+/// injects only after it resolves and pins the destination, so the secret never
+/// rides the in-chain request (neither its headers nor its body) and can reach
+/// only the provider authority it was staged for. Brave and You.com send the raw
+/// key under a provider-specific header; Tavily sends it as an RFC 6750 bearer
+/// token in `Authorization` (its documented scheme — the key is never placed in
+/// the JSON body, which the outbound chain can read). The prefix is prepended to
+/// the secret to form the header value; it is empty for the raw-key providers.
+fn provider_auth(provider: SearchProvider) -> (http::HeaderName, &'static str) {
     match provider {
-        SearchProvider::Brave => Some(http::HeaderName::from_static("x-subscription-token")),
-        SearchProvider::You => Some(http::HeaderName::from_static("x-api-key")),
-        SearchProvider::Tavily => None,
+        SearchProvider::Brave => (http::HeaderName::from_static("x-subscription-token"), ""),
+        SearchProvider::You => (http::HeaderName::from_static("x-api-key"), ""),
+        SearchProvider::Tavily => (http::header::AUTHORIZATION, "Bearer "),
     }
 }
 
@@ -261,19 +267,17 @@ impl SearchClient {
     ) -> Result<Self, FilterError> {
         http::HeaderValue::from_str(config.api_key.expose_secret())
             .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
-        // Validate up front that a header-authenticated provider's effective base
-        // URL yields a bindable `host:port` authority: a malformed authority would
-        // otherwise only surface at callout time, silently dropping the deferred
-        // credential and dialing the provider unauthenticated. Body-authenticated
-        // providers (Tavily) stage no header credential, so they bind no authority.
-        if provider_auth_header(config.provider).is_some() {
-            let base = config
-                .base_url
-                .as_deref()
-                .unwrap_or_else(|| default_base_url(config.provider));
-            credential_authority(base)
-                .map_err(|e| FilterError::from(format!("{filter_name}: invalid search base URL: {e}")))?;
-        }
+        // Validate up front that the effective base URL yields a bindable
+        // `host:port` authority: a malformed authority would otherwise only
+        // surface at callout time, silently dropping the deferred credential and
+        // dialing the provider unauthenticated. Every provider defers a header
+        // credential bound to this authority.
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or_else(|| default_base_url(config.provider));
+        credential_authority(base)
+            .map_err(|e| FilterError::from(format!("{filter_name}: invalid search base URL: {e}")))?;
         Ok(Self {
             client: subrequest_client,
             timeout: Duration::from_millis(config.timeout_ms),
@@ -450,10 +454,10 @@ impl SearchClient {
     /// Resolve and stage the provider destination for a callout.
     ///
     /// Returns the bound request and the executor extensions: the pinned callout
-    /// [`StagedUpstream`], its [`StagedUpstreamFallback`] address set, and — for a
-    /// header-authenticated provider — the API key staged as an authority-bound
-    /// [`PendingCredentials`]. A resolution or staging failure logs and returns
-    /// `None`, which the caller maps to [`SearchOutcome::Failed`].
+    /// [`StagedUpstream`], its [`StagedUpstreamFallback`] address set, and the API
+    /// key staged as an authority-bound [`PendingCredentials`] (every provider
+    /// defers a header credential). A resolution or staging failure logs and
+    /// returns `None`, which the caller maps to [`SearchOutcome::Failed`].
     async fn prepare_staged_request(
         &self,
         url: &str,
@@ -478,10 +482,9 @@ impl SearchClient {
 
     /// Assemble the executor extensions for a resolved target: the pinned callout
     /// [`StagedUpstream`], its [`StagedUpstreamFallback`] address set, the caller's
-    /// trusted [`StateOwner`] when present, and — for a header-authenticated provider
-    /// — the API key staged as an authority-bound [`PendingCredentials`]. Any staging
-    /// failure logs and returns `None` (fail-closed) rather than dialing the provider
-    /// degraded.
+    /// trusted [`StateOwner`] when present, and the API key staged as an
+    /// authority-bound [`PendingCredentials`]. Any staging failure logs and returns
+    /// `None` (fail-closed) rather than dialing the provider degraded.
     ///
     /// [`StateOwner`]: crate::StateOwner
     fn stage_extensions(
@@ -507,9 +510,8 @@ impl SearchClient {
         };
         let fallback = StagedUpstreamFallback::from_prepared_target(target);
         // Stage the provider's static API credential so the executor injects it
-        // only after it has resolved and pinned the destination. A staging
-        // failure for a header-authenticated provider fails the callout closed
-        // rather than dialing the provider unauthenticated.
+        // only after it has resolved and pinned the destination. A staging failure
+        // fails the callout closed rather than dialing the provider unauthenticated.
         let pending = match self.staged_credentials(url, identity) {
             Ok(pending) => pending,
             Err(e) => {
@@ -520,38 +522,32 @@ impl SearchClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged);
         extensions.insert(fallback);
-        if let Some(pending) = pending {
-            extensions.insert(pending);
-        }
+        extensions.insert(pending);
         identity.project_context_into(&mut extensions);
         Some(extensions)
     }
 
-    /// Stage a header-authenticated provider's API key as an exact-authority-bound
+    /// Stage the provider's API key as an exact-authority-bound
     /// [`DeferredCredential`].
     ///
     /// Deferring the secret keeps it out of the outbound chain entirely: the
     /// executor injects it only after it resolves the destination and only into a
     /// request bound for the credential's authority, so a chain filter can neither
-    /// observe the secret (it is never present on the in-chain request) nor
-    /// exfiltrate it by retargeting `ctx.upstream` to another authority (the
-    /// credential is dropped, zeroized, on any authority mismatch). The credential
-    /// binds to the exact `host:port` authority [`credential_authority`] derives
-    /// from this same callout URL — the destination the executor resolves — so it
-    /// matches by construction while a divergence in *either* host or port drops it
-    /// (never a host wildcard). The secret is the caller's per-user credential when
-    /// present, else the shared provider key.
+    /// observe the secret (it is never present on the in-chain request — not in its
+    /// headers, and, for Tavily, not in its JSON body) nor exfiltrate it by
+    /// retargeting `ctx.upstream` to another authority (the credential is dropped,
+    /// zeroized, on any authority mismatch). The credential binds to the exact
+    /// `host:port` authority [`credential_authority`] derives from this same callout
+    /// URL — the destination the executor resolves — so it matches by construction
+    /// while a divergence in *either* host or port drops it (never a host wildcard).
+    /// The secret is the caller's per-user credential when present, else the shared
+    /// provider key; [`provider_auth`] selects the header and value prefix (a bearer
+    /// scheme for Tavily, the raw key otherwise).
     ///
-    /// Returns `Ok(None)` for a body-authenticated provider (Tavily) and
-    /// `Err(_)` if the URL has no host or the key is not a valid header value.
-    fn staged_credentials(
-        &self,
-        url: &str,
-        identity: &CalloutIdentity,
-    ) -> Result<Option<PendingCredentials>, FilterError> {
-        let Some(header) = provider_auth_header(self.provider) else {
-            return Ok(None);
-        };
+    /// Returns `Err(_)` if the URL has no host or the assembled header value is not
+    /// a valid header value.
+    fn staged_credentials(&self, url: &str, identity: &CalloutIdentity) -> Result<PendingCredentials, FilterError> {
+        let (header, prefix) = provider_auth(self.provider);
         // Bind to the exact `host:port` authority the executor resolves from this
         // same callout URL, so an exact-authority credential matches the resolved
         // destination by construction yet is dropped, zeroized, on any host or port
@@ -563,10 +559,14 @@ impl SearchClient {
         let secret = identity
             .user_credential()
             .map_or_else(|| self.api_key.expose_secret(), |user| user.expose_secret());
-        let credential = DeferredCredential::new(&authority, header, secret)?;
+        // Assemble the scheme-prefixed header value. The transient String is the
+        // same allocation `DeferredCredential::new` wraps in `Zeroizing`, so the
+        // secret is wiped on drop; the empty prefix leaves the raw key unchanged.
+        let value = format!("{prefix}{secret}");
+        let credential = DeferredCredential::new(&authority, header, value)?;
         let mut pending = PendingCredentials::new();
         pending.push(credential);
-        Ok(Some(pending))
+        Ok(pending)
     }
 
     /// Run the prepared callout through the outbound chain executor.
@@ -721,8 +721,13 @@ impl SearchClient {
         };
         let max_results = context_size.result_count();
 
+        // The API key is NOT set here: it is staged as an authority-bound
+        // `DeferredCredential` (`Authorization: Bearer <key>`) in
+        // `prepare_staged_request` and injected by the executor only after it
+        // resolves and pins the destination, so the outbound chain never observes
+        // the secret in the body and it can only reach the provider host it was
+        // prepared for.
         let body = serde_json::json!({
-            "api_key": self.api_key.expose_secret(),
             "query": query,
             "search_depth": search_depth,
             "max_results": max_results,
@@ -1053,8 +1058,7 @@ mod tests {
         // executor injects it at transport time.
         let pending = client
             .staged_credentials(&url, &shared_key_identity())
-            .expect("staging a valid You.com credential must succeed")
-            .expect("You.com authenticates via a header credential");
+            .expect("staging a valid You.com credential must succeed");
         assert!(!pending.is_empty(), "You.com must stage a deferred credential");
     }
 
@@ -1107,25 +1111,37 @@ mod tests {
             "Brave API key must be deferred, not set on the in-chain request"
         );
         assert!(
-            brave
+            !brave
                 .staged_credentials(&url, &shared_key_identity())
                 .expect("staging a valid Brave credential must succeed")
-                .is_some_and(|pending| !pending.is_empty()),
+                .is_empty(),
             "Brave must stage a deferred credential"
         );
     }
 
     #[test]
-    fn tavily_stages_no_header_credential() {
-        // Tavily carries its key in the body, so it stages no header credential.
+    fn tavily_defers_api_key_off_the_request_body() {
+        // Tavily authenticates with an `Authorization: Bearer` header injected by
+        // the executor after destination pinning, so the in-chain request body the
+        // outbound chain can read must not carry the key (issue #1389).
         let tavily = test_client_for(SearchProvider::Tavily);
-        let (url, _) = tavily.build_tavily_request("test", SearchContextSize::Medium);
+        let (url, request) = tavily.build_tavily_request("test", SearchContextSize::Medium);
+        let body: Value = serde_json::from_slice(&request.body).expect("Tavily body is JSON");
         assert!(
-            tavily
+            body.get("api_key").is_none(),
+            "Tavily API key must be deferred, not serialized into the in-chain request body: {body}"
+        );
+        assert_eq!(
+            body,
+            json!({"query": "test", "search_depth": "basic", "max_results": 5}),
+            "the in-chain Tavily body must carry only the non-secret search parameters"
+        );
+        assert!(
+            !tavily
                 .staged_credentials(&url, &shared_key_identity())
                 .expect("Tavily credential staging must not error")
-                .is_none(),
-            "Tavily authenticates via the body and must not stage a header credential"
+                .is_empty(),
+            "Tavily must stage a deferred bearer credential"
         );
     }
 
@@ -1942,6 +1958,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tavily_bearer_credential_reaches_pinned_provider_and_not_the_body() {
+        // Issue #1389: Tavily's key must travel as an `Authorization: Bearer`
+        // header injected by the executor at the pinned destination, never
+        // serialized into the request body where a body-reading outbound filter
+        // could observe, log, or exfiltrate it. Record the exact bytes the
+        // provider receives to prove both halves.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rx = spawn_recording_server(listener, 200, r#"{"results":[]}"#);
+
+        let client = test_client_for(SearchProvider::Tavily); // shared key "test-key"
+        let (_default_url, request) = client.build_tavily_request("potato", SearchContextSize::Medium);
+        let url = format!("http://{addr}/search");
+
+        let _outcome = client
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
+            .await;
+
+        let received = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the provider must have received the callout");
+        let received = String::from_utf8_lossy(&received);
+        assert!(
+            received.to_ascii_lowercase().contains("authorization: bearer test-key"),
+            "the Tavily key must be injected as a bearer header at the pinned provider: {received}"
+        );
+        let (_head, body) = received.split_once("\r\n\r\n").expect("the callout must carry a body");
+        assert!(
+            !body.contains("api_key") && !body.contains("test-key"),
+            "the Tavily key must never appear in the request body the outbound chain can read: {received}"
+        );
+    }
+
+    #[tokio::test]
     async fn per_user_credential_is_injected_instead_of_the_shared_key() {
         // Recording server model: see `search_2xx_with_valid_json_returns_results`.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2075,10 +2131,10 @@ mod tests {
         let brave = test_client_for(SearchProvider::Brave);
         let (url, _) = brave.build_brave_request("test", 5, None);
         assert!(
-            brave
+            !brave
                 .staged_credentials(&url, &shared_key_identity())
                 .expect("staging succeeds")
-                .is_some_and(|pending| !pending.is_empty()),
+                .is_empty(),
             "the shared provider key must still stage a deferred credential"
         );
     }

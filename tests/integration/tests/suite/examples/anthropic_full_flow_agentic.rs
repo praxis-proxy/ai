@@ -546,10 +546,18 @@ fn messages_web_search_round_trip_re_enters_the_model() {
     );
     assert_eq!(search.request_count(), 1);
     assert_eq!(search.last_json()["query"], "potato");
-    assert_eq!(
-        search.last_json()["api_key"],
-        "test-key",
-        "the Tavily key must travel in the request body"
+    // Issue #1389: the Tavily key travels as an `Authorization: Bearer` header
+    // injected at the pinned provider, never in the request body the outbound
+    // chain can read.
+    let raw_search = search.last_request().to_ascii_lowercase();
+    assert!(
+        raw_search.contains("authorization: bearer test-key"),
+        "the Tavily key must travel in the Authorization header: {raw_search}"
+    );
+    assert!(
+        search.last_json().get("api_key").is_none(),
+        "the Tavily key must not appear in the request body: {}",
+        search.last_json()
     );
 }
 
