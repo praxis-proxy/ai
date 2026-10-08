@@ -42,11 +42,11 @@ const REQUEST_MODEL_KEY: &str = "vertex_gemini.model";
 const REQUEST_INCLUDE_USAGE_KEY: &str = "vertex_gemini.include_usage";
 /// Number of terminal streaming candidates expected for this request.
 const REQUEST_CANDIDATE_COUNT_KEY: &str = "vertex_gemini.candidate_count";
-/// Fallback response ID when no upstream `responseId` is available.
+/// Prefix for a generated response ID when Vertex omits `responseId`.
 ///
-/// Used in both non-streaming (`response.rs`) and streaming (`mod.rs`)
-/// paths so that clients see a consistent id shape.
-pub(super) const FALLBACK_RESPONSE_ID: &str = "chatcmpl-vertex";
+/// The random suffix is minted in `response.rs` once per logical response and
+/// retained for every chunk of that response's stream.
+pub(super) const FALLBACK_RESPONSE_ID_PREFIX: &str = "chatcmpl-vertex-";
 
 // -----------------------------------------------------------------------------
 // Filter State

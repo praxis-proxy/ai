@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "scenario_id": "vertex/fallback-response-id",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-vertex-model",
+    "source_id": "controlled-vertex-fallback-response-id"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-vertex-synthetic-finite-0001": "chatcmpl-recorded-0001",
+      "chatcmpl-vertex-synthetic-finite-0002": "chatcmpl-recorded-0002",
+      "chatcmpl-vertex-synthetic-stream-0001": "chatcmpl-recorded-0003"
+    }
+  },
+  "turns": [
+    {
+      "name": "finite-missing-response-id",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"model": "synthetic-vertex-model", "messages": [{"role": "user", "content": "Hi"}]}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0001", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}], "usage": {}}}
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"candidates": [{"content": {"parts": [{"text": "Hello"}]}, "finishReason": "STOP"}]}}
+        }
+      }
+    },
+    {
+      "name": "finite-missing-response-id-repeat",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"model": "synthetic-vertex-model", "messages": [{"role": "user", "content": "Hi again"}]}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0002", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello again"}, "finish_reason": "stop"}], "usage": {}}}
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"contents": [{"role": "user", "parts": [{"text": "Hi again"}]}]}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"candidates": [{"content": {"parts": [{"text": "Hello again"}]}, "finishReason": "STOP"}]}}
+        }
+      }
+    },
+    {
+      "name": "streaming-missing-response-id",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"model": "synthetic-vertex-model", "messages": [{"role": "user", "content": "Hi"}], "stream": true}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["text/event-stream"]},
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {"event": null, "data": "{\"choices\":[{\"delta\":{\"content\":\"Hel\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}", "id": null, "retry": null},
+              {"event": null, "data": "{\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}", "id": null, "retry": null}
+            ],
+            "done": true
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:streamGenerateContent?alt=sse",
+          "headers": {"content-type": ["application/json"]},
+          "body": {"kind": "json", "value": {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}}
+        },
+        "response": {
+          "status": 200,
+          "headers": {"content-type": ["text/event-stream"]},
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {"event": null, "data": "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]},\"index\":0}]}", "id": null, "retry": null},
+              {"event": null, "data": "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\",\"index\":0}]}", "id": null, "retry": null}
+            ],
+            "done": false
+          }
+        }
+      }
+    }
+  ]
+}

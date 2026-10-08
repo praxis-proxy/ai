@@ -209,6 +209,9 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             chunks = self._make_gemini_streaming_tool_chunks()
         else:
             chunks = self._make_gemini_streaming_chunks(user_text)
+            if "trigger missing stream response id" in user_text.lower():
+                for chunk in chunks:
+                    chunk.pop("responseId", None)
             if "trigger text metadata" in user_text.lower():
                 chunks[0]["candidates"][0]["content"]["parts"][0]["thought"] = False
                 chunks[-1]["candidates"][0]["content"]["parts"].append(
@@ -621,6 +624,19 @@ class TestVertexGeminiChatCompletions:
             "models/gemini-2.0-flash:streamGenerateContent?alt=sse"
         )
 
+    def test_streaming_missing_response_id_is_stable(self, openai_client: OpenAI) -> None:
+        """A generated completion ID remains stable for all chunks of one stream."""
+        with openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "Trigger missing stream response id"}],
+            stream=True,
+        ) as stream:
+            chunks = list(stream)
+
+        ids = {chunk.id for chunk in chunks}
+        assert len(ids) == 1
+        assert next(iter(ids)).startswith("chatcmpl-vertex-")
+
     def test_tool_call(self, openai_client: OpenAI) -> None:
         """SDK receives a tool call and the backend sees Gemini declarations."""
         response = openai_client.chat.completions.create(
@@ -932,6 +948,9 @@ class TestVertexGeminiChatCompletions:
 
         assert response1.choices[0].message.content == "The answer is 4."
         assert response2.choices[0].message.content == "Hello! How can I help you today?"
+        assert response1.id.startswith("chatcmpl-vertex-")
+        assert response2.id.startswith("chatcmpl-vertex-")
+        assert response1.id != response2.id
 
     def test_tool_call_missing_arguments_rejected(self, vertex_proxy: int) -> None:
         """A tool call with no function.arguments field is rejected with 400."""
