@@ -7,6 +7,13 @@
 # reach a vLLM backend through Praxis while every byte of the Anthropic
 # wire format is preserved end to end.
 #
+# Two first-class client paths share this one chain:
+#   Claude Code -> POST /v1/messages         -> vLLM (native Anthropic Messages)
+#   OpenCode    -> POST /v1/chat/completions -> vLLM (native OpenAI Chat Completions)
+# Neither body is translated in either direction. vLLM serves both surfaces,
+# so one gateway backs both clients. See
+# `docs/developing/cli-vllm-through-praxis.md` for the client-side setup.
+#
 # Contrast with `messages-to-openai.yaml`, which TRANSLATES Anthropic
 # Messages into OpenAI Chat Completions for Chat-Completions-only
 # backends. This config deliberately omits the
@@ -16,7 +23,8 @@
 #
 # Credential isolation (three distinct credentials, each at its own boundary):
 #   - `basic_auth` authenticates the *client* to this gateway. A trusted
-#     caller (e.g. Claude Code via `ANTHROPIC_CUSTOM_HEADERS`) presents an
+#     caller (Claude Code via `ANTHROPIC_CUSTOM_HEADERS`, OpenCode via its
+#     `praxis-auth.ts` plugin or a per-model `headers` entry) presents an
 #     `Authorization: Basic ...` gateway credential; `basic_auth` verifies
 #     it and, with `strip_authorization: true`, removes it so it never
 #     reaches the backend.
@@ -68,9 +76,15 @@ filter_chains:
 
       # Supply a default `anthropic-version` header for internal or
       # non-SDK callers that omit it. Real Claude Code always sends one,
-      # so this is a no-op for it.
+      # so this is a no-op for it. Scoped to `/v1/messages` for the same
+      # reason `anthropic_validate` is: `anthropic-version` is meaningless
+      # on the OpenAI Chat Completions path OpenCode uses, and injecting it
+      # there would put a wrong header on the wire.
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
 
       # Strip the client's native Anthropic auth header so it never
       # reaches the backend. `credential_injection` below handles
@@ -86,6 +100,13 @@ filter_chains:
           - path: "/v1/messages/count_tokens"
             cluster: "vllm-backend"
           - path: "/v1/models"
+            cluster: "vllm-backend"
+          # OpenCode (and any other OpenAI-compatible client) posts native
+          # Chat Completions here. vLLM serves this endpoint natively, so
+          # it is the same untranslated passthrough as `/v1/messages`:
+          # Praxis authenticates the caller, scrubs client credentials,
+          # injects the backend credential, and routes. No body translation.
+          - path: "/v1/chat/completions"
             cluster: "vllm-backend"
           # Any other native endpoint (health checks and documented startup
           # probes) is proxied unchanged to the same backend.
