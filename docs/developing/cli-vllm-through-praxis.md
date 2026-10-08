@@ -393,9 +393,17 @@ claude --model "$VLLM_MODEL"
 `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` must be present in the environment of
 the Praxis process. The other variables configure Claude Code.
 
-For the translated `messages-to-openai-vllm.yaml` route, disable Anthropic
-thinking and prompt caching in Claude Code. Chat Completions cannot represent
-either feature, so Praxis rejects requests that include them:
+The translated `messages-to-openai-vllm.yaml` route enables
+`allow_lossy_features: [prompt_caching, extended_thinking]`, so you do **not**
+need to disable Anthropic thinking or prompt caching in Claude Code. Chat
+Completions cannot represent either feature, so Praxis strips the wire markers an
+unmodified client sends and reports the loss (a `WARN` log, the
+`praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
+`x-degraded-features` response header) instead of rejecting the request.
+
+To see the strict behavior instead — a 400 when either feature appears — use the
+`messages-to-openai.yaml` route (empty allowlist) and disable both features in
+Claude Code:
 
 ```console
 export CLAUDE_CODE_DISABLE_THINKING=1

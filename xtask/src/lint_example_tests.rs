@@ -20,6 +20,9 @@ const SKIP: &[&str] = &[
     "a2a-task-routing.yaml",
     "ai-inference-body-based-routing.yaml",
     "anthropic/messages-protocol.yaml",
+    // Fixture-only config backing the `messages/degrade-features` inference
+    // fixture; exercised through the replay harness, not a `.rs` example test.
+    "anthropic/messages-to-openai-degrade-fixture.yaml",
     "anthropic/messages-to-openai.yaml",
     "anthropic/request-validate.yaml",
     "anthropic/unified-gateway.yaml",

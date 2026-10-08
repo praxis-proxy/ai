@@ -19,6 +19,7 @@ pub(crate) mod response;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use metrics::counter;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     SelectedUpstreamBodyOutcome, SubRequestResponseMode, parse_filter_config,
@@ -77,6 +78,22 @@ struct StreamingErrorBuffer {
 /// report it back truthfully as `stop_reason: stop_sequence`.
 pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completions.stop_sequences";
 
+/// Metadata key carrying the comma-separated degraded-feature labels from the
+/// request-body phase to the response-header phase.
+const DEGRADED_FEATURES_KEY: &str = "anthropic_messages_to_chat_completions.degraded_features";
+
+/// Response header advertising which Anthropic features the translator degraded.
+///
+/// Logs and the per-feature counter are the operator's primary signal; this
+/// header is a convenience echo for clients and gateways. It is always set from
+/// the proxy's own record, replacing any backend-supplied copy.
+///
+/// The name avoids the Praxis reserved header prefixes (`x-praxis-`,
+/// `x-ext-protocol-`, `x-ext-agent-`): the protocol layer strips reserved
+/// headers from the client-bound response, so a reserved name would never reach
+/// the client.
+const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
+
 // -----------------------------------------------------------------------------
 // AnthropicMessagesToChatCompletionsFilter
 // -----------------------------------------------------------------------------
@@ -94,6 +111,22 @@ pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completi
 /// Unsupported semantic content is rejected because Chat Completions cannot
 /// represent it faithfully.
 ///
+/// `allow_lossy_features` opts specific Anthropic-only features into
+/// operator-approved degradation instead of that 400. A listed feature's wire
+/// markers are validated and then stripped so an unmodified client (for example
+/// Claude Code, which always sends `cache_control` and `thinking`) can still
+/// drive a Chat Completions backend. Each degradation is reported to the
+/// operator — one `WARN` log per request, a
+/// `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
+/// feature, and an `x-degraded-features` response header — because the
+/// request succeeds but the feature was silently dropped. `prompt_caching`
+/// removes `cache_control` markers (prompt and tool content are preserved, but
+/// explicit cache breakpoints are not honored, so cost and latency may differ);
+/// `extended_thinking` removes `thinking` and thinking-only `context_management`
+/// edits (the translated response carries no thinking blocks). Features absent
+/// from the allowlist, malformed markers, and other `context_management` edits
+/// are still rejected with a 400.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -105,6 +138,9 @@ pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completi
 /// ```yaml
 /// filter: anthropic_messages_to_chat_completions
 /// max_body_bytes: 1048576
+/// allow_lossy_features:
+///   - prompt_caching
+///   - extended_thinking
 /// ```
 pub struct AnthropicMessagesToChatCompletionsFilter {
     /// Parsed and validated configuration.
@@ -121,6 +157,14 @@ impl AnthropicMessagesToChatCompletionsFilter {
         let cfg: AnthropicMessagesToChatCompletionsConfig =
             parse_filter_config("anthropic_messages_to_chat_completions", config)?;
         let validated = build_config(cfg)?;
+        if validated.allowlist().any() {
+            warn!(
+                "anthropic_messages_to_chat_completions: allow_lossy_features is enabled; matching \
+                 requests will have unsupported Anthropic features degraded instead of rejected \
+                 (see the x-degraded-features response header and the \
+                 praxis_anthropic_messages_to_chat_completions_degraded_total counter)"
+            );
+        }
         Ok(Box::new(Self { config: validated }))
     }
 
@@ -209,6 +253,9 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let request_id = canonicalize_response_request_id(ctx);
+        // Advertise degradation on every forwarded response (streaming or not,
+        // success or error), independent of whether the body is transformed.
+        apply_degraded_features_header(ctx);
         let Some(transform) = response_transform(ctx) else {
             return Ok(FilterAction::Continue);
         };
@@ -255,10 +302,17 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             _ => return Ok(SelectedUpstreamBodyOutcome::Continue),
         };
 
+        let allow = self.config.allowlist();
         let transformed = match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(value) => {
                 extract_request_metadata(ctx, Some(&value));
-                request::transform_request(value)
+                match request::transform_request_degrading(value, allow) {
+                    Ok(output) => {
+                        record_degraded_features(ctx, output.degraded);
+                        Ok(output.body)
+                    },
+                    Err(msg) => Err(msg),
+                }
             },
             Err(error) => {
                 extract_request_metadata(ctx, None);
@@ -402,6 +456,62 @@ pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> 
         .get(STOP_SEQUENCES_KEY)
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_default()
+}
+
+/// Record degraded features as operator signals.
+///
+/// Emits a per-feature counter and one structured warning (fixed labels, no
+/// prompt data), and stashes the comma-separated labels in metadata so the
+/// response-header phase can advertise them. A no-op when nothing was degraded.
+fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::DegradedFeatures) {
+    if !degraded.any() {
+        return;
+    }
+    let mut features: Vec<&'static str> = Vec::new();
+    if degraded.prompt_caching {
+        features.push("prompt_caching");
+    }
+    if degraded.extended_thinking {
+        features.push("extended_thinking");
+    }
+    for feature in &features {
+        counter!(
+            "praxis_anthropic_messages_to_chat_completions_degraded_total",
+            "feature" => *feature
+        )
+        .increment(1);
+    }
+    let joined = features.join(",");
+    warn!(
+        degraded_features = joined.as_str(),
+        "degraded unsupported Anthropic features to complete the Chat Completions translation"
+    );
+    ctx.set_metadata(DEGRADED_FEATURES_KEY, joined);
+}
+
+/// Reconcile the degraded-feature response header with the proxy's own record.
+///
+/// Always clears any backend-supplied `x-degraded-features` first — even when no
+/// degradation occurred — so a forged upstream copy can never reach the client as
+/// a false Praxis signal, then re-inserts the header only when the proxy itself
+/// recorded a degradation.
+fn apply_degraded_features_header(ctx: &mut HttpFilterContext<'_>) {
+    let recorded = ctx.get_metadata(DEGRADED_FEATURES_KEY).map(str::to_owned);
+    let Some(response) = &mut ctx.response_header else {
+        return;
+    };
+    let mut modified = response.headers.remove(DEGRADED_FEATURES_HEADER).is_some();
+    if let Some(value) = recorded
+        && let Ok(header_value) = http::HeaderValue::from_str(&value)
+    {
+        response
+            .headers
+            .insert(http::HeaderName::from_static(DEGRADED_FEATURES_HEADER), header_value);
+        modified = true;
+    }
+    if modified {
+        ctx.response_headers_modified = true;
+    }
 }
 
 /// Install a translated request body, or reject when translation failed.
@@ -574,6 +684,8 @@ fn transform_non_streaming_body(
     reason = "tests"
 )]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use bytes::Bytes;
     use http::{Method, StatusCode};
 
@@ -1364,5 +1476,321 @@ mod tests {
         assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");
         assert_eq!(parsed["request_id"], "req_malformed");
         assert!(!ctx.filter_metadata.contains_key("openai.finish_reason"));
+    }
+
+    /// An allowlisted request that uses both degradable features drives the full
+    /// operator-signal path: the translated body drops the wire markers, a
+    /// per-feature counter is incremented, and the response header advertises
+    /// the degradation on the forwarded response.
+    #[test]
+    fn degradation_emits_counter_metadata_and_response_header() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("allow_lossy_features:\n  - prompt_caching\n  - extended_thinking").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let anthropic_body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "system": [
+                {"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let mut body = Some(Bytes::from(serde_json::to_vec(&anthropic_body).unwrap()));
+        let mut response = make_response();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let outcome = filter
+                    .on_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                    "a degraded-but-translatable request continues with a rewritten body"
+                );
+
+                // The forwarded Chat Completions body carries neither wire marker.
+                let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+                assert!(translated.get("thinking").is_none(), "thinking must be stripped");
+                let as_text = serde_json::to_string(&translated).unwrap();
+                assert!(!as_text.contains("cache_control"), "cache_control must be stripped");
+                assert!(
+                    translated.get("messages").is_some(),
+                    "translation must still produce messages"
+                );
+
+                // Both features are recorded for the response-header phase.
+                assert_eq!(
+                    ctx.get_metadata(DEGRADED_FEATURES_KEY),
+                    Some("prompt_caching,extended_thinking"),
+                    "both degraded features should be recorded in metadata"
+                );
+
+                ctx.response_header = Some(&mut response);
+                let action = filter.on_response(&mut ctx).await.unwrap();
+                assert!(
+                    matches!(action, FilterAction::Continue),
+                    "response phase should continue"
+                );
+            });
+        });
+
+        assert_eq!(
+            response
+                .headers
+                .get(DEGRADED_FEATURES_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("prompt_caching,extended_thinking"),
+            "the forwarded response should advertise the degraded features"
+        );
+
+        let snapshot: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key, value))
+            .collect();
+        let counter_for = |feature: &str| {
+            snapshot
+                .iter()
+                .find(|(key, _)| {
+                    key.key().name() == "praxis_anthropic_messages_to_chat_completions_degraded_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "feature" && label.value() == feature)
+                })
+                .and_then(|(_, value)| match value {
+                    metrics_util::debugging::DebugValue::Counter(count) => Some(*count),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            counter_for("prompt_caching"),
+            Some(1),
+            "prompt_caching counter must fire once"
+        );
+        assert_eq!(
+            counter_for("extended_thinking"),
+            Some(1),
+            "extended_thinking counter must fire once"
+        );
+    }
+
+    /// Without an allowlist the filter keeps the strict #1584 behavior: a request
+    /// that uses an Anthropic-only feature is rejected before any backend call,
+    /// and no degradation signal is produced.
+    #[test]
+    fn strict_mode_rejects_degradable_feature_without_signal() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let anthropic_body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let mut body = Some(Bytes::from(serde_json::to_vec(&anthropic_body).unwrap()));
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let outcome = filter
+                    .on_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(outcome, SelectedUpstreamBodyOutcome::Reject(_)),
+                    "strict mode must reject a request that uses a degradable feature"
+                );
+            });
+        });
+
+        assert_eq!(
+            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            None,
+            "strict mode records no degradation"
+        );
+        assert!(
+            snapshotter.snapshot().into_vec().is_empty(),
+            "strict mode emits no degradation counter"
+        );
+    }
+
+    /// A backend-supplied `x-degraded-features` header must never reach the client
+    /// as a false Praxis signal: when the proxy recorded no degradation, the
+    /// response phase strips the forged copy rather than forwarding it.
+    #[test]
+    fn response_strips_backend_forged_degraded_header_without_degradation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let mut response = make_response();
+        // A non-JSON success body avoids the response-transform path; this test
+        // only exercises the header reconciliation.
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        response.headers.insert(
+            http::HeaderName::from_static(DEGRADED_FEATURES_HEADER),
+            "prompt_caching,extended_thinking".parse().unwrap(),
+        );
+        ctx.response_header = Some(&mut response);
+
+        runtime.block_on(async {
+            let action = filter.on_response(&mut ctx).await.unwrap();
+            assert!(
+                matches!(action, FilterAction::Continue),
+                "response phase should continue"
+            );
+        });
+
+        assert_eq!(
+            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            None,
+            "no degradation is recorded for a clean request"
+        );
+        assert!(
+            !response.headers.contains_key(DEGRADED_FEATURES_HEADER),
+            "the forged backend header must be stripped so it cannot pose as a Praxis signal"
+        );
+    }
+
+    #[test]
+    fn degradation_emits_operator_warn_and_metadata() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let degraded = request::DegradedFeatures {
+            prompt_caching: true,
+            extended_thinking: true,
+        };
+
+        let events = capture_warn_events(|| record_degraded_features(&mut ctx, degraded));
+
+        assert_eq!(
+            events.len(),
+            1,
+            "degradation must emit exactly one WARN; got {events:?}"
+        );
+        let (message, degraded_features) = &events[0];
+        assert!(
+            message.contains("degraded unsupported Anthropic features to complete the Chat Completions translation"),
+            "WARN must carry the documented operator message; got {message:?}"
+        );
+        assert_eq!(
+            degraded_features.as_deref(),
+            Some("prompt_caching,extended_thinking"),
+            "WARN must name every degraded feature as a structured field"
+        );
+        assert_eq!(
+            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            Some("prompt_caching,extended_thinking"),
+            "degraded features must be stashed for the response-header phase"
+        );
+    }
+
+    #[test]
+    fn no_degradation_emits_no_warn_and_no_metadata() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        let events = capture_warn_events(|| {
+            record_degraded_features(&mut ctx, request::DegradedFeatures::default());
+        });
+
+        assert!(events.is_empty(), "no degradation must emit no WARN; got {events:?}");
+        assert_eq!(
+            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            None,
+            "no degradation must not stash metadata"
+        );
+    }
+
+    // Test Utilities
+
+    /// A captured WARN event: its rendered message and its `degraded_features`
+    /// field value, if present.
+    type CapturedWarn = (String, Option<String>);
+    /// Thread-shared sink the capture layer appends each WARN event to.
+    type WarnSink = Arc<Mutex<Vec<CapturedWarn>>>;
+
+    /// Capture every WARN event emitted on the current thread while `f` runs,
+    /// returning each event's message and its `degraded_features` field value.
+    ///
+    /// `tracing::subscriber::with_default` installs the subscriber for this thread
+    /// only, so the capture is deterministic and does not race other tests.
+    fn capture_warn_events<F: FnOnce()>(f: F) -> Vec<CapturedWarn> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let events: WarnSink = Arc::new(Mutex::new(Vec::new()));
+        let layer = WarnEventCapture(Arc::clone(&events));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        std::mem::take(&mut events.lock().unwrap())
+    }
+
+    struct WarnEventCapture(WarnSink);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnEventCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = WarnFieldVisitor::default();
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((visitor.message, visitor.degraded_features));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WarnFieldVisitor {
+        degraded_features: Option<String>,
+        message: String,
+    }
+
+    impl tracing::field::Visit for WarnFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "degraded_features" {
+                self.degraded_features = Some(value.to_owned());
+            }
+        }
     }
 }

@@ -101,8 +101,32 @@ three-boundary credential isolation but adds the
 `path_rewrite` that maps `POST /v1/messages` to `/v1/chat/completions`. The
 client still speaks the Anthropic wire format; Praxis rewrites both the request
 and the response, so vLLM only ever sees OpenAI Chat Completions.
-Claude Code must disable thinking and prompt caching for this translated route;
-see the [Claude Code setup](developing/cli-vllm-through-praxis.md#4-connect-claude-code).
+
+Chat Completions cannot represent the Anthropic-only features an unmodified
+Claude Code client always sends — prompt caching (`cache_control` markers) and
+extended thinking (`thinking`). The example enables **operator-approved
+degradation** on the translation filter so those requests succeed instead of
+failing closed with a 400:
+
+```yaml
+- filter: anthropic_messages_to_chat_completions
+  allow_lossy_features:
+    - prompt_caching
+    - extended_thinking
+```
+
+Each listed feature's wire markers are validated and then stripped, and the
+degradation is reported to the operator — one `WARN` log per request, a
+`praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
+feature, and an `x-degraded-features` response header. `prompt_caching`
+preserves all prompt and tool content but does not honor explicit cache
+breakpoints, so cost and latency may differ; `extended_thinking` means the
+translated response carries no thinking blocks. Remove an entry to make that
+feature fail closed again. Malformed markers, other `context_management` edits,
+and every feature not listed are still rejected with a 400. Leaving the
+allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
+keeps the strict reject behavior, which an operator who would rather see the
+unsupported request fail than silently lose the feature should prefer.
 
 `/v1/messages/count_tokens` has no Chat Completions equivalent, so the
 `path_rewrite` is anchored to `^/v1/messages$` and leaves it unrewritten. A
@@ -384,11 +408,18 @@ The `anthropic_messages_to_chat_completions` filter:
   `moderation`); a `null` or the field's documented
   default (for example `n: 1`) is dropped instead
 - Rejects non-null `thinking` and `context_management`
-  because Chat Completions has no equivalent
+  because Chat Completions has no equivalent, unless
+  `extended_thinking` is in `allow_lossy_features`, which
+  strips `thinking` and thinking-only `context_management`
+  edits and reports the degradation instead (other
+  `context_management` edits are still rejected)
 - Forwards every other field untouched (for example
   `top_k`) and leaves its validation to the backend
 - Rejects `thinking` content blocks and content blocks
-  carrying non-empty citations or prompt-cache controls
+  carrying non-empty citations or prompt-cache controls,
+  unless `prompt_caching` is in `allow_lossy_features`,
+  which strips `cache_control` markers (preserving the
+  prompt and tool content) and reports the degradation
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and

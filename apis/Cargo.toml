@@ -53,6 +53,7 @@ crc32fast = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
+metrics = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
@@ -86,6 +87,7 @@ utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+metrics-util = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite", "postgres", "tls-native-tls"] }
 axum = { workspace = true }
 praxis-ai-store = { workspace = true, features = ["test-support"] }

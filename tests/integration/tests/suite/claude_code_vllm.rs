@@ -28,11 +28,17 @@
 //! reaches the user-visible answer. See [`PLANNING_PROMPT`] for what that
 //! scenario does and does not prove.
 //!
-//! These tests assert only what a live end-to-end run uniquely proves: the real
-//! client completes the task through Praxis against a real backend. Wire
-//! fidelity — native passthrough or Chat Completions translation, credential
-//! isolation, and streaming semantics — is proven deterministically against
-//! controlled fake backends in
+//! These tests assert what a live end-to-end run uniquely proves: the real
+//! client completes the task through Praxis against a real backend. The
+//! transformed path additionally asserts the operator-degradation signal from the
+//! real run — it scrapes the proxy-owned per-feature degradation counter the
+//! filter emits while translating each request from the admin `/metrics` endpoint
+//! (see [`assert_degradation_signaled`]), because the task only completes once
+//! Praxis degrades the Anthropic-only features the client sends, yet a completed
+//! CLI run cannot show that signal directly. Wire fidelity —
+//! native passthrough or Chat Completions translation, credential isolation, and
+//! streaming semantics — is proven deterministically against controlled fake
+//! backends in
 //! `tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`
 //! and `.../anthropic_messages_to_openai_vllm.rs`, not observed here.
 //!
@@ -67,7 +73,7 @@ use std::{
 use praxis_core::config::Config;
 use praxis_test_utils::{
     CapturedChildOutput, ProxyGuard, basic_auth_header, capture_child_output, configure_isolated_process_group,
-    example_config_path, free_port, start_proxy,
+    example_config_path, free_port, http_get, start_proxy,
 };
 use serde_json::Value;
 
@@ -133,6 +139,11 @@ const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 /// Claude Code switch between its server-side and client-initiated auto-mode
 /// classifier paths.
 const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
+
+/// The Prometheus counter the `anthropic_messages_to_chat_completions` filter
+/// increments once per degraded feature while translating a request, on the
+/// request path before the backend responds.
+const DEGRADED_COUNTER: &str = "praxis_anthropic_messages_to_chat_completions_degraded_total";
 
 /// Selects how the pinned client authorizes tool calls in one acceptance run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,7 +438,13 @@ async fn pinned_claude_code_drives_native_vllm_through_full_flow() {
     let Some(live) = LiveConfig::from_env() else {
         return;
     };
-    run_full_flow(&live, native_vllm_config, PermissionScenario::AcceptEdits).await;
+    run_full_flow(
+        &live,
+        native_vllm_config,
+        PermissionScenario::AcceptEdits,
+        Expectation::NativePassthrough,
+    )
+    .await;
 }
 
 /// Prove the same client completes the same task through Praxis when Praxis
@@ -438,7 +455,13 @@ async fn pinned_claude_code_drives_transformed_vllm_through_full_flow() {
     let Some(live) = LiveConfig::from_env() else {
         return;
     };
-    run_full_flow(&live, transformed_vllm_config, PermissionScenario::AcceptEdits).await;
+    run_full_flow(
+        &live,
+        transformed_vllm_config,
+        PermissionScenario::AcceptEdits,
+        Expectation::DegradedTranslation,
+    )
+    .await;
 }
 
 /// Prove Claude Code's client-initiated auto-mode classifier can authorize the
@@ -448,7 +471,13 @@ async fn pinned_claude_code_auto_mode_drives_native_vllm_through_full_flow() {
     let Some(live) = LiveConfig::from_env() else {
         return;
     };
-    run_full_flow(&live, native_vllm_config, PermissionScenario::AutoClientClassifier).await;
+    run_full_flow(
+        &live,
+        native_vllm_config,
+        PermissionScenario::AutoClientClassifier,
+        Expectation::NativePassthrough,
+    )
+    .await;
 }
 
 /// Prove Claude Code's client-initiated auto-mode classifier can authorize the
@@ -458,7 +487,13 @@ async fn pinned_claude_code_auto_mode_drives_transformed_vllm_through_full_flow(
     let Some(live) = LiveConfig::from_env() else {
         return;
     };
-    run_full_flow(&live, transformed_vllm_config, PermissionScenario::AutoClientClassifier).await;
+    run_full_flow(
+        &live,
+        transformed_vllm_config,
+        PermissionScenario::AutoClientClassifier,
+        Expectation::DegradedTranslation,
+    )
+    .await;
 }
 
 /// Prove a read-only planning turn over the native path converges and keeps
@@ -477,20 +512,34 @@ async fn pinned_claude_code_planning_turn_converges_without_reasoning_leakage_on
     run_planning_flow(&live, native_vllm_config).await;
 }
 
+/// What a given acceptance path must prove beyond task completion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Expectation {
+    /// Native Anthropic passthrough: no body translation, so no degradation.
+    NativePassthrough,
+    /// Chat Completions translation with operator-approved degradation: the
+    /// transformed config strips the Anthropic-only features Claude Code sends by
+    /// default, so the degradation signal must be observable (see
+    /// [`assert_degradation_signaled`]).
+    DegradedTranslation,
+}
+
 /// Drives the pinned client end to end through a Praxis config built by
 /// `build_config`, asserting the task completed against the real backend.
 ///
 /// Both acceptance paths and both permission scenarios share this flow; only
-/// the config filter chain and client permission setup differ.
+/// the config filter chain, client permission setup, and post-run expectation
+/// differ.
 async fn run_full_flow(
     live: &LiveConfig,
     build_config: fn(&LiveConfig, u16) -> Config,
     permission_scenario: PermissionScenario,
+    expectation: Expectation,
 ) {
     assert_pinned_version(&live.claude_bin).await;
     live.require_egress_isolation_if_demanded();
 
-    let proxy = start_isolated_proxy(live, build_config);
+    let (proxy, admin_address) = start_isolated_proxy(live, build_config);
     let proxy_base_url = format!("http://{}", proxy.addr());
 
     let workspace = Workspace::create();
@@ -512,6 +561,67 @@ async fn run_full_flow(
     //    summary.
     workspace.assert_task_trace(&String::from_utf8_lossy(&output.stdout));
     workspace.assert_task_completed(started);
+
+    // The translated path additionally proves the operator-signal contract: the
+    // task above only completes because the Anthropic-only features Claude Code
+    // sends by default are degraded rather than rejected. A completed CLI run
+    // cannot show the signal directly (the client consumes the response and its
+    // headers), so this reads the proxy-owned per-feature degradation counter the
+    // filter emitted while translating the real run's requests.
+    if expectation == Expectation::DegradedTranslation {
+        let admin_address = admin_address
+            .as_deref()
+            .expect("the transformed config must enable an admin listener for degradation metrics");
+        assert_degradation_signaled(admin_address);
+    }
+}
+
+/// Prove Praxis emitted its degradation signal while translating the real Claude
+/// Code run's requests.
+///
+/// The filter increments a per-feature counter
+/// (`DEGRADED_COUNTER{feature="..."}`) each time it degrades an Anthropic feature,
+/// on the request-translation path. This reads that proxy-owned counter from the
+/// admin `/metrics` endpoint, so the assertions reflect the markers the real
+/// client actually sent during its task — not a header the test synthesizes.
+///
+/// An unmodified Claude Code client sends both Anthropic-only features by default
+/// — `cache_control` markers (prompt caching) and a `thinking` request field
+/// (extended thinking) — and the completed task above only converged because the
+/// transformed config degraded them instead of rejecting the turn. Both per-feature
+/// counters must therefore be non-zero. Because the filter increments them while
+/// translating the request, before any backend response, these assertions do not
+/// depend on the backend's first-byte latency the way asserting on the served reply
+/// would.
+fn assert_degradation_signaled(admin_address: &str) {
+    let prompt_caching = scrape_degraded_count(admin_address, "prompt_caching");
+    assert!(
+        prompt_caching >= 1,
+        "the real Claude Code run must have sent prompt-caching markers that Praxis degraded and \
+         counted via {DEGRADED_COUNTER}{{feature=\"prompt_caching\"}}; got {prompt_caching}"
+    );
+    let extended_thinking = scrape_degraded_count(admin_address, "extended_thinking");
+    assert!(
+        extended_thinking >= 1,
+        "the real Claude Code run must have sent a thinking request field that Praxis degraded and \
+         counted via {DEGRADED_COUNTER}{{feature=\"extended_thinking\"}}; got {extended_thinking}"
+    );
+}
+
+/// Read one labelled sample of [`DEGRADED_COUNTER`] from the admin `/metrics`
+/// scrape, returning `0` when the feature has not been degraded yet.
+fn scrape_degraded_count(admin_address: &str, feature: &str) -> u64 {
+    let (status, body) = http_get(admin_address, "/metrics", None);
+    assert_eq!(status, 200, "admin /metrics must be served; got {status}\n{body}");
+    let needle = format!("{DEGRADED_COUNTER}{{feature=\"{feature}\"}} ");
+    body.lines()
+        .find_map(|line| line.strip_prefix(&needle))
+        .map_or(0, |value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|error| panic!("parse {DEGRADED_COUNTER} value {value:?}: {error}"))
+        })
 }
 
 /// Drives one read-only planning turn and asserts it converged cleanly.
@@ -519,7 +629,7 @@ async fn run_planning_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16)
     assert_pinned_version(&live.claude_bin).await;
     live.require_egress_isolation_if_demanded();
 
-    let proxy = start_isolated_proxy(live, build_config);
+    let (proxy, _admin_address) = start_isolated_proxy(live, build_config);
     let proxy_base_url = format!("http://{}", proxy.addr());
 
     let workspace = PlanningWorkspace::create();
@@ -544,9 +654,16 @@ async fn run_planning_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16)
 /// reach Praxis and CANNOT reach the public internet, so all Anthropic traffic
 /// is forced through the proxy. That is real enforcement, not an advisory
 /// `ANTHROPIC_BASE_URL` that a client is free to ignore.
-fn start_isolated_proxy(live: &LiveConfig, build_config: fn(&LiveConfig, u16) -> Config) -> ProxyGuard {
+fn start_isolated_proxy(
+    live: &LiveConfig,
+    build_config: fn(&LiveConfig, u16) -> Config,
+) -> (ProxyGuard, Option<String>) {
     let proxy_port = free_port();
     let config = build_config(live, proxy_port);
+    // Surface the admin listener (set only by the transformed config) so the
+    // caller can scrape degradation metrics; the config is dropped after the
+    // proxy starts.
+    let admin_address = config.admin.address.clone();
     let proxy = start_proxy(&config);
 
     if let Some(namespace) = &live.netns {
@@ -557,7 +674,7 @@ fn start_isolated_proxy(live: &LiveConfig, build_config: fn(&LiveConfig, u16) ->
         verify_egress_isolation(namespace, bound.ip(), bound.port());
     }
 
-    proxy
+    (proxy, admin_address)
 }
 
 /// Asserts the pinned client exited on its own rather than being reaped.
@@ -684,8 +801,17 @@ fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
 }
 
 /// Build the transformed-vLLM config (Anthropic Messages -> Chat Completions).
+///
+/// Enables a loopback admin listener so the per-feature degradation counter the
+/// filter increments while translating each request can be scraped from
+/// `/metrics` after the live run (see [`assert_degradation_signaled`]). The
+/// listener binds `127.0.0.1` rather than the proxy's isolation veth, so only the
+/// host-side test can reach it — never the namespaced client — and no public-admin
+/// opt-in is needed.
 fn transformed_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
-    live_vllm_config(CONFIG_TRANSFORMED, live, proxy_port)
+    let mut config = live_vllm_config(CONFIG_TRANSFORMED, live, proxy_port);
+    config.admin.address = Some(format!("127.0.0.1:{}", free_port()));
+    config
 }
 
 /// Load an example config, patching the listener and backend endpoint for a live run.

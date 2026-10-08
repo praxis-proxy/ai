@@ -62,6 +62,18 @@ on:
         required: false
         default: false
         type: boolean
+      run_degradation_acceptance:
+        description: >-
+          Run only the two translated Claude Code cases (acceptEdits and
+          client-classified auto mode) that exercise operator-approved
+          degradation: a default-feature pinned client sends thinking and
+          cache_control, and the translator strips them so the loop completes
+          against vLLM's Chat Completions surface. When this is the only
+          selected input it skips the native, planning, and Anthropic SDK steps
+          and the complete Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
@@ -181,7 +193,7 @@ jobs:
       always() &&
       github.event_name != 'schedule' &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -378,7 +390,7 @@ jobs:
     if: |
       always() &&
       github.event_name != 'schedule' &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
@@ -604,7 +616,7 @@ jobs:
       (
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_claude_acceptance)
+          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -621,6 +633,12 @@ jobs:
     permissions:
       contents: read
     env:
+      # True only for a dispatch that requests the focused degradation cases and
+      # nothing broader. The two translated steps below always run on any
+      # acceptance trigger; this flag skips the native, planning, and Anthropic
+      # SDK steps so the focused run validates operator-approved degradation
+      # without paying for the full acceptance matrix.
+      DEGRADE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.run_degradation_acceptance && !inputs.run_claude_acceptance && !inputs.run_live_vllm }}
       # Pins resolved by the `pins` job (parsed on ubuntu; the GPU AMI's Python
       # 3.9 lacks tomllib).
       CLAUDE_URL: ${{ needs.pins.outputs.claude_url }}
@@ -869,6 +887,10 @@ jobs:
 
       - name: Run Claude Code native-vLLM acceptance test (once, no retry)
         id: claude_native_edits
+        # Keep the original success()-gating (run only when setup succeeded) and
+        # additionally skip on a focused degradation-only dispatch; the two
+        # translated steps below carry that run.
+        if: ${{ success() && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -915,7 +937,7 @@ jobs:
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
         id: claude_native_auto
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -956,7 +978,7 @@ jobs:
 
       - name: Run Claude Code planning-turn regression (once, no retry)
         id: claude_planning
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -982,7 +1004,7 @@ jobs:
 
       - name: Run Anthropic SDK Messages against real vLLM
         id: anthropic_messages
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -996,7 +1018,7 @@ jobs:
 
       - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
         id: anthropic_stubbed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1012,7 +1034,7 @@ jobs:
 
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1534,7 +1556,7 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance)
       ) ||
       (
         github.event_name == 'pull_request' &&
@@ -1973,7 +1995,7 @@ jobs:
       always() &&
       github.event_name != 'schedule' &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45

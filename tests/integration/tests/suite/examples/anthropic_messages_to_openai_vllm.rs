@@ -27,7 +27,7 @@ use std::{collections::HashMap, time::Duration};
 use praxis_core::config::Config;
 use praxis_test_utils::{
     Backend, StatefulCapturingBackend, StatefulCapturingGuard, basic_auth_header, free_port, http_send,
-    json_post_with_header, parse_body, parse_status, start_proxy,
+    json_post_with_header, parse_body, parse_header, parse_status, start_proxy,
 };
 use serde_json::{Value, json};
 
@@ -297,6 +297,94 @@ fn transform_vllm_translates_request_body_to_chat_completions() {
             .iter()
             .any(|m| m["role"] == "system" && m["content"] == "You are a coding assistant."),
         "the Anthropic `system` must be hoisted into a Chat Completions system message: {messages:?}"
+    );
+
+    drop(proxy);
+}
+
+// -----------------------------------------------------------------------------
+// Operator-approved degradation
+// -----------------------------------------------------------------------------
+
+#[test]
+fn transform_vllm_degrades_allowlisted_features_and_reports_them() {
+    // The example config enables `allow_lossy_features: [prompt_caching,
+    // extended_thinking]`, so a request carrying both Anthropic-only features
+    // (exactly what an unmodified Claude Code client sends) must succeed: the
+    // wire markers are stripped from the forwarded Chat Completions body, the
+    // prompt content is preserved, and the proxy reports the degradation through
+    // the `x-degraded-features` response header.
+    let backend = start_chat_backend();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "claude-opus-4-8",
+        // `budget_tokens` must be < `max_tokens` per the Anthropic schema, so a
+        // realistic client sends a larger ceiling than the thinking budget.
+        "max_tokens": 2048,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "system": [
+            {"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}}]
+        }],
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request.to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a degraded-but-translatable request still succeeds: {raw}"
+    );
+
+    // The proxy advertises exactly the degraded features it dropped.
+    let degraded = parse_header(&raw, "x-degraded-features").expect("the proxy must advertise the degraded features");
+    assert!(
+        degraded.contains("prompt_caching") && degraded.contains("extended_thinking"),
+        "both degraded features must be reported: {degraded}"
+    );
+
+    // The forwarded Chat Completions body carries neither wire marker, but the
+    // prompt content survives.
+    let requests = backend.requests();
+    let forwarded = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("backend should receive a POST request");
+    assert!(
+        !forwarded.body.contains("cache_control"),
+        "cache_control markers must be stripped before the backend: {}",
+        forwarded.body
+    );
+    let body: Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    assert!(
+        body.get("thinking").is_none(),
+        "the thinking field must be stripped before the backend: {body}"
+    );
+    let messages = body["messages"]
+        .as_array()
+        .expect("translated body should carry a Chat Completions `messages` array");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "system" && m["content"] == "Be brief"),
+        "the system prompt content must survive degradation: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"),
+        "the user message must survive degradation: {messages:?}"
+    );
+    assert!(
+        forwarded.body.contains("Hello"),
+        "the user prompt content must survive degradation: {}",
+        forwarded.body
     );
 
     drop(proxy);
