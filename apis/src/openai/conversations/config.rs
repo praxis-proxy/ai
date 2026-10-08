@@ -10,6 +10,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::openai::conversations::rate_limit::RateLimitConfig;
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
 
@@ -63,6 +64,9 @@ pub fn store_ref_config(filter_config: &serde_yaml::Value) -> Result<(String, Va
         .as_object_mut()
         .ok_or_else(|| FilterError::from(format!("{FILTER_NAME}: config must be a mapping")))?;
     obj.remove("backend");
+    // The per-owner rate limit is consumed by the conversations filter, not
+    // the backend factory, whose strict config rejects unknown fields.
+    obj.remove("rate_limit");
     // The parsed config is authoritative for the table set: it applies the same
     // defaults the filter uses and generates the unused responses table the
     // combined backend's DDL requires.
@@ -168,6 +172,17 @@ pub(crate) struct ConversationsConfig {
     /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// Per-owner request rate limit for local Conversations operations.
+    ///
+    /// When omitted, no rate limit is enforced. The limit is a fixed
+    /// sixty-second window shared by all eight Conversations operations,
+    /// counted per authenticated owner, matching the owner scoping of the
+    /// conversation store. Exceeding it produces the `429` response the
+    /// pinned OpenAI reference declares, with an `ErrorResponse` body and
+    /// an optional `Retry-After` header.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Serde default for [`ConversationsConfig::conversations_table`].
@@ -217,6 +232,9 @@ pub(crate) fn validate_config(cfg: &ConversationsConfig) -> Result<(), FilterErr
     }
     if let Some(pool) = &cfg.pool {
         pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
+    }
+    if let Some(rate_limit) = &cfg.rate_limit {
+        rate_limit.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
     validate_table_names(cfg)?;
     match cfg.backend {

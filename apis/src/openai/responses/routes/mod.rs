@@ -23,7 +23,10 @@ use std::ops::Deref;
 #[cfg(feature = "openai-responses-openapi")]
 use super::contracts::{CreateResponseRequest, ResponseResource};
 #[cfg(feature = "openai-responses-openapi")]
-use crate::openai::operation::{MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, schema_binding};
+use crate::openai::operation::{
+    INFERENCE_RATE_LIMITED_RESPONSE, INFERENCE_SERVICE_UNAVAILABLE_RESPONSE, MediaTypeSpec, OwnedOperationContract,
+    RequestBodySpec, ResponseSpec, schema_binding,
+};
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{
@@ -99,7 +102,8 @@ macro_rules! operation_contract {
         owned {
             parameters: [$($parameter:expr),* $(,)?],
             request: $request:tt,
-            response: $response:ty $(,)?
+            response: $response:ty,
+            errors: [$($error:expr),* $(,)?] $(,)?
         }
     ) => {{
         #[cfg(feature = "openai-responses-openapi")]
@@ -107,11 +111,15 @@ macro_rules! operation_contract {
             Some(OwnedOperationContract {
                 parameters: &[$($parameter),*],
                 request: request_binding!($request),
-                responses: &[ResponseSpec {
-                    status: "200",
-                    description: "OK",
-                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
-                }],
+                responses: &[
+                    ResponseSpec {
+                        status: "200",
+                        description: "OK",
+                        content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                        headers: &[],
+                    },
+                    $($error),*
+                ],
             })
         }
         #[cfg(not(feature = "openai-responses-openapi"))]
@@ -195,6 +203,7 @@ responses_operations! {
             parameters: [],
             request: [required CreateResponseRequest],
             response: ResponseResource,
+            errors: [INFERENCE_RATE_LIMITED_RESPONSE, INFERENCE_SERVICE_UNAVAILABLE_RESPONSE],
         },
     },
     CreateResponseWebSocket {

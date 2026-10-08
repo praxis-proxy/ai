@@ -23,6 +23,7 @@ use super::{
     CONVERSATIONS_STORE_NAME,
     config::{ConversationsConfig, validate_config},
     handlers,
+    rate_limit::{OwnerRateLimiter, SharedOwnerRateLimiter, reject_rate_limited},
     routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
 use crate::{
@@ -65,7 +66,19 @@ use crate::{
 ///   items_table: conversation_items
 ///   allow_private_database_url: true
 /// ```
-pub struct OpenaiConversationsFilter;
+pub struct OpenaiConversationsFilter {
+    /// Per-owner Conversations rate limiter; `None` disables limiting.
+    rate_limiter: Option<SharedOwnerRateLimiter>,
+}
+
+/// Marker extension recording that this exchange already consumed (or was
+/// denied) its rate-limit token.
+///
+/// Carried in request extensions rather than filter state because the body
+/// hook can be the first dispatch point for the exchange (pre-read and direct
+/// dispatch paths), and filter state is keyed to pipeline execution.
+#[derive(Debug)]
+struct RateLimitChecked;
 
 /// Per-request state used when another filter forces request-body pre-read
 /// before this filter's header hook has run.
@@ -144,7 +157,29 @@ impl OpenaiConversationsFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ConversationsConfig = parse_filter_config("openai_conversations", config)?;
         validate_config(&cfg)?;
-        Ok(Box::new(Self))
+        let rate_limiter = cfg.rate_limit.map(|limit| {
+            let limiter = OwnerRateLimiter::new(limit);
+            SharedOwnerRateLimiter::new(limiter)
+        });
+        Ok(Box::new(Self { rate_limiter }))
+    }
+
+    /// Construct a filter with no rate limiting.
+    ///
+    /// Production pipelines build the filter from YAML config; this
+    /// constructor serves tests that exercise the unlimited default.
+    #[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+    pub(super) fn unlimited() -> Self {
+        Self { rate_limiter: None }
+    }
+
+    /// Construct a filter limited to `requests_per_minute` per owner.
+    #[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+    pub(super) fn limited_for_tests(requests_per_minute: u32) -> Self {
+        let limiter = OwnerRateLimiter::new(super::rate_limit::RateLimitConfig { requests_per_minute });
+        Self {
+            rate_limiter: Some(SharedOwnerRateLimiter::new(limiter)),
+        }
     }
 
     /// Resolve the owner-scoped store, or the fail-closed action to return.
@@ -155,6 +190,26 @@ impl OpenaiConversationsFilter {
     fn scoped_store(ctx: &HttpFilterContext<'_>) -> Result<OwnerScopedResponseStore, FilterAction> {
         let owner = require_state_owner(ctx)?;
         resolve_store(ctx, owner).ok_or_else(|| FilterAction::Reject(reject_store_unavailable()))
+    }
+
+    /// Enforce the configured per-owner rate limit, if any.
+    ///
+    /// Returns the `429` rejection as a [`FilterAction`] when the owner has
+    /// exhausted its window. A missing owner yields the auth rejection, the
+    /// same fail-closed behavior as store resolution. Body-carrying
+    /// operations pass through both the request-head and body phases; the
+    /// per-exchange marker extension keeps the counter at one per request.
+    fn enforce_rate_limit_for(&self, ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+        let Some(limiter) = &self.rate_limiter else {
+            return Ok(());
+        };
+        if ctx.extensions.get::<RateLimitChecked>().is_some() {
+            return Ok(());
+        }
+        let owner = require_state_owner(ctx)?;
+        let decision = limiter.try_acquire(owner);
+        ctx.extensions.insert(RateLimitChecked);
+        decision.map_err(|retry_after_secs| FilterAction::Reject(reject_rate_limited(retry_after_secs)))
     }
 
     /// Mark the request phase complete and return any body captured earlier.
@@ -422,6 +477,13 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // Enforce the per-owner rate limit before any local dispatch so a
+        // limited owner cannot spend store or handler work. Non-conversations
+        // requests pass through untouched above.
+        if let Err(action) = self.enforce_rate_limit_for(ctx) {
+            return Ok(action);
+        }
+
         // The classifier publishes registry body metadata. Pair it with the
         // typed operation so corrupt or manually fabricated extension state
         // fails closed instead of selecting the wrong dispatch phase.
@@ -461,6 +523,13 @@ impl HttpFilter for OpenaiConversationsFilter {
         };
         if !matched.request_body.is_present() {
             return Ok(FilterAction::Continue);
+        }
+
+        // The request-head phase already counted normal streamed requests;
+        // the state flag inside makes this a no-op unless this hook is the
+        // first dispatch point for the exchange.
+        if let Err(action) = self.enforce_rate_limit_for(ctx) {
+            return Ok(action);
         }
 
         let empty: &[u8] = &[];

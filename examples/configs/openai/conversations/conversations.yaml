@@ -51,6 +51,13 @@ filter_chains:
         #     idle_timeout_secs: 600   # seconds before idle connections close (default: 600, 0 to disable)
         #     acquire_timeout_secs: 30 # seconds to wait for a connection (default: 30)
         #
+        # Per-owner rate limit (optional, disabled when omitted). One fixed
+        # 60-second window shared by all Conversations operations, counted per
+        # authenticated owner. Exceeding it returns the OpenAI-shaped 429 with
+        # an ErrorResponse body and a Retry-After header:
+        #   rate_limit:
+        #     requests_per_minute: 600
+        #
         # PostgreSQL backend:
         #   backend: postgres
         #   database_url: "postgres://user:pass@db.example.com:5432/praxis"

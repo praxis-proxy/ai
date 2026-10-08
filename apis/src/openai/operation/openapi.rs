@@ -14,7 +14,7 @@
 use std::borrow::{Borrow, Cow};
 
 use utoipa::openapi::{
-    Components, Content, Info, OpenApi, Paths, Ref, RefOr, Required, Tag,
+    Components, Content, HeaderBuilder, Info, OpenApi, Paths, Ref, RefOr, Required, Tag,
     path::{HttpMethod as OpenApiHttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn},
     request_body::RequestBodyBuilder,
     response::ResponseBuilder,
@@ -157,6 +157,33 @@ pub(crate) struct RequestBodySpec {
     pub(crate) content: &'static [MediaTypeSpec],
 }
 
+/// `OpenAPI` metadata for one response header.
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderSpec {
+    /// Header name, such as `Retry-After`.
+    pub(crate) name: &'static str,
+    /// Human-readable header description.
+    pub(crate) description: &'static str,
+    /// Generate the inline header schema.
+    schema: fn() -> RefOr<Schema>,
+}
+
+impl HeaderSpec {
+    /// Declare one header backed by an inline schema constructor.
+    pub(crate) const fn new(name: &'static str, description: &'static str, schema: fn() -> RefOr<Schema>) -> Self {
+        Self {
+            name,
+            description,
+            schema,
+        }
+    }
+
+    /// Generate the inline header schema.
+    pub(crate) fn schema(self) -> RefOr<Schema> {
+        (self.schema)()
+    }
+}
+
 /// One response contract owned by an operation.
 #[derive(Clone, Copy)]
 pub(crate) struct ResponseSpec {
@@ -166,6 +193,9 @@ pub(crate) struct ResponseSpec {
     pub(crate) description: &'static str,
     /// Response media representations. Empty for bodyless responses.
     pub(crate) content: &'static [MediaTypeSpec],
+    /// Response headers declared by the contract. Empty when the response
+    /// carries no owned headers.
+    pub(crate) headers: &'static [HeaderSpec],
 }
 
 /// `OpenAPI` contract owned by one local or transforming operation.
@@ -250,6 +280,10 @@ fn register_schema(components: &mut Components, binding: SchemaBinding) {
 }
 
 /// Build one `OpenAPI` operation from its registry metadata.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "one OpenAPI operation per registry entry; the builder chain is linear"
+)]
 fn build_operation(spec: &OpenAiOperationSpec, contract: OwnedOperationContract, tag: &str) -> Operation {
     let mut operation = OperationBuilder::new().operation_id(Some(spec.operation_id())).tag(tag);
 
@@ -257,6 +291,15 @@ fn build_operation(spec: &OpenAiOperationSpec, contract: OwnedOperationContract,
         let mut builder = ResponseBuilder::new().description(response.description);
         for media in response.content {
             builder = builder.content(media.content_type, schema_content(media.schema));
+        }
+        for header in response.headers {
+            builder = builder.header(
+                header.name,
+                HeaderBuilder::new()
+                    .description(Some(header.description))
+                    .schema(Some(header.schema()))
+                    .build(),
+            );
         }
         operation = operation.response(response.status, builder.build());
     }
@@ -302,7 +345,7 @@ const fn required(value: bool) -> Required {
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use serde_json::Value as JsonValue;
     use utoipa::ToSchema;
@@ -329,6 +372,19 @@ mod tests {
         id: String,
     }
 
+    /// Representative rate-limit retry header.
+    const RETRY_AFTER_HEADER: HeaderSpec = HeaderSpec::new(
+        "Retry-After",
+        "The minimum number of seconds to wait before retrying.",
+        || {
+            use utoipa::openapi::schema::{ObjectBuilder, Type};
+            ObjectBuilder::new()
+                .schema_type(Type::Integer)
+                .minimum(Some(1.0))
+                .into()
+        },
+    );
+
     /// Files-like operation exercising non-JSON and multiple response shapes.
     const FILE_OPERATION: OpenAiOperationSpec = OpenAiOperationSpec {
         runtime: OperationSpec {
@@ -352,11 +408,19 @@ mod tests {
                     status: "200",
                     description: "OK",
                     content: &[MediaTypeSpec::new("application/json", schema_binding!(FileResource))],
+                    headers: &[],
                 },
                 ResponseSpec {
                     status: "204",
                     description: "No content",
                     content: &[],
+                    headers: &[],
+                },
+                ResponseSpec {
+                    status: "429",
+                    description: "The request was rejected because a rate limit was exceeded.",
+                    content: &[MediaTypeSpec::new("application/json", schema_binding!(FileResource))],
+                    headers: &[RETRY_AFTER_HEADER],
                 },
             ],
         }),
@@ -441,5 +505,28 @@ mod tests {
                 .is_some()
         );
         assert!(value.pointer("/paths/~1files/post/responses/204/content").is_none());
+    }
+
+    #[test]
+    fn generated_contract_supports_response_headers() {
+        let document = implementation_openapi("Files test", "0.1.0", "Files", std::iter::once(&FILE_OPERATION));
+        let value = serde_json::to_value(document).unwrap();
+
+        let header = value
+            .pointer("/paths/~1files/post/responses/429/headers/Retry-After")
+            .expect("429 response must declare the Retry-After header");
+        assert_eq!(
+            header.pointer("/schema/type"),
+            Some(&JsonValue::String("integer".to_owned()))
+        );
+        assert_eq!(
+            header.pointer("/schema/minimum"),
+            Some(&JsonValue::Number(1_u64.into()))
+        );
+        assert!(
+            value
+                .pointer("/paths/~1files/post/responses/429/content/application~1json/schema/$ref")
+                .is_some()
+        );
     }
 }
