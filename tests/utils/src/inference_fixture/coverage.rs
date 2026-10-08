@@ -1370,8 +1370,8 @@ mod tests {
             ]
         );
         assert_eq!(report.features_total, 65, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 51, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 56, "manifest recording inventory count");
+        assert_eq!(report.scenarios_total, 52, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 57, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1395,6 +1395,7 @@ mod tests {
                 "messages/unrepresentable-parameters",
                 "messages/upstream-error",
                 "messages/upstream-error-stream",
+                "messages/upstream-error-unknown-type",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1481,7 +1482,10 @@ mod tests {
                 ),
                 (
                     &"messages.error.upstream".to_owned(),
-                    &vec!["messages/upstream-error".to_owned()]
+                    &vec![
+                        "messages/upstream-error".to_owned(),
+                        "messages/upstream-error-unknown-type".to_owned(),
+                    ]
                 ),
                 (
                     &"messages.error.malformed_success".to_owned(),

@@ -826,13 +826,12 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
     );
 
     assert_eq!(parse_status(&raw), 413);
-    // The 413 status must carry Anthropic's canonical `request_too_large` type,
-    // not `invalid_request_error`, so the buffered rejection matches the
-    // status->type mapping every other Anthropic error path uses.
+    // The 413 status must use the pinned Anthropic invalid-request type;
+    // `request_too_large` is not part of Anthropic's error vocabulary.
     let body: Value = serde_json::from_str(&parse_body(&raw)).expect("rejection body must be JSON");
     assert_eq!(
-        body["error"]["type"], "request_too_large",
-        "a 413 buffered re-entry rejection must be typed request_too_large: {body}"
+        body["error"]["type"], "invalid_request_error",
+        "a 413 buffered re-entry rejection must use invalid_request_error: {body}"
     );
     assert_eq!(
         model.requests().len(),

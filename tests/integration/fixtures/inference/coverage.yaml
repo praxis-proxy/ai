@@ -105,6 +105,7 @@ features:
     status: synthetic_only
     scenarios:
       - messages/upstream-error
+      - messages/upstream-error-unknown-type
     providers:
       synthetic:
         status: synthetic_only

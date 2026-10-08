@@ -210,7 +210,7 @@ impl AnthropicMessagesToChatCompletionsFilter {
         let buffer = ctx.extensions.remove::<StreamingErrorBuffer>().unwrap_or_default();
         if buffer.overflowed {
             *body = Some(Bytes::from(wire::error_body(
-                "api_error",
+                wire::ErrorType::Api,
                 "upstream response exceeded the configured max_body_bytes",
                 request_id.as_deref(),
             )));
@@ -370,7 +370,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         if raw_len > self.config.max_body_bytes {
             return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
-                "api_error",
+                wire::ErrorType::Api,
                 "upstream response exceeded the configured max_body_bytes",
             )));
         }
@@ -662,7 +662,7 @@ fn transform_non_streaming_body(
                 "failed to transform Chat Completions-compatible response"
             );
             *body = Some(Bytes::from(wire::error_body(
-                "api_error",
+                wire::ErrorType::Api,
                 "upstream response could not be transformed",
                 request_id,
             )));

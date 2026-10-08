@@ -79,11 +79,29 @@ class RecordingBackend(BaseHTTPRequestHandler):
     response_content_type = "application/json"
     send_tool_reply_once = False
     untranslatable_reply_once: str | None = None
+    error_response_once = False
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
+        if RecordingBackend.error_response_once:
+            RecordingBackend.error_response_once = False
+            reply = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "stubbed upstream failure",
+                        "type": "future_error",
+                    }
+                }
+            ).encode()
+            self.send_response(500)
+            self.send_header("content-type", self.response_content_type)
+            self.send_header("content-length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+            return
         if body.get("stream"):
             self._send_invalid_tool_id_stream()
             return
@@ -478,6 +496,22 @@ class TestResponseUsage:
 
 
 class TestResponseValidation:
+    def test_unrecognized_upstream_error_type_is_normalized(self, anthropic_client):
+        RecordingBackend.error_response_once = True
+        try:
+            with pytest.raises(APIStatusError) as excinfo:
+                anthropic_client.messages.create(
+                    model=MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+        finally:
+            RecordingBackend.error_response_once = False
+
+        error = excinfo.value
+        assert error.status_code == 500, "an unrecognized upstream error must surface as HTTP 500"
+        assert error.body["error"]["type"] == "api_error", "the Anthropic error type must normalize to api_error"
+
     @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
     def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
         RecordingBackend.untranslatable_reply_once = kind
