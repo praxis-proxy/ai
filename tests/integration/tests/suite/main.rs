@@ -55,6 +55,7 @@ mod harness;
 // Several replayed scenarios run examples backed by the SQLite response store.
 #[cfg(feature = "store-sqlite")]
 mod inference_fixtures;
+mod live_vllm;
 mod mcp;
 mod mcp_broker;
 #[cfg(feature = "store-sqlite")]
