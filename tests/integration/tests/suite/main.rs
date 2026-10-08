@@ -62,5 +62,6 @@ mod openai_mcp_tool_resolve;
 mod openai_responses_model_rewrite;
 mod openai_responses_request;
 mod openai_tool_parse;
+mod opencode;
 mod prompt_enrich;
 mod responses_routing;
