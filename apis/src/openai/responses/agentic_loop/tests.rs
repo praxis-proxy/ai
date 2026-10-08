@@ -13,13 +13,19 @@ use super::super::state::ResponsesState;
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
     openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
+    test_utils::{make_filter_context, make_request},
+};
+// `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
+// the collector-to-storage reconciliation tests below compile only with it.
+#[cfg(feature = "store")]
+use crate::{
     service::responses::{StoredOutputPlan, build_record},
     state_owner::StateOwner,
-    test_utils::{make_filter_context, make_request},
 };
 
 /// Exercise both collectors with real provenance, then pass that state through
 /// storage assembly.
+#[cfg(feature = "store")]
 fn assert_collected_rounds_reconcile(streaming: bool) {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
     let first = json!({"output": [
@@ -99,11 +105,13 @@ fn assert_collected_rounds_reconcile(streaming: bool) {
     assert_eq!(record.messages[5]["content"][0]["text"], "late");
 }
 
+#[cfg(feature = "store")]
 #[test]
 fn buffered_collector_provenance_reconciles_stored_rounds() {
     assert_collected_rounds_reconcile(false);
 }
 
+#[cfg(feature = "store")]
 #[test]
 fn streaming_collector_provenance_reconciles_stored_rounds() {
     assert_collected_rounds_reconcile(true);
@@ -112,6 +120,7 @@ fn streaming_collector_provenance_reconciles_stored_rounds() {
 /// A provider compaction item enters both `accumulated_output` and
 /// `persisted_messages`. The collector must record its provenance so storage
 /// assembly refreshes it in place rather than appending a second copy.
+#[cfg(feature = "store")]
 fn assert_collected_compaction_stored_once(streaming: bool) {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
     let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "provider-state"});
@@ -160,11 +169,13 @@ fn assert_collected_compaction_stored_once(streaming: bool) {
     assert_eq!(compactions, 1, "the provider compaction must be stored exactly once");
 }
 
+#[cfg(feature = "store")]
 #[test]
 fn buffered_collector_stores_compaction_once() {
     assert_collected_compaction_stored_once(false);
 }
 
+#[cfg(feature = "store")]
 #[test]
 fn streaming_collector_stores_compaction_once() {
     assert_collected_compaction_stored_once(true);
