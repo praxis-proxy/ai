@@ -82,6 +82,14 @@ on:
         required: false
         default: false
         type: boolean
+      run_opencode_acceptance:
+        description: >-
+          Run pinned OpenCode through the native Chat Completions path against
+          real Qwen3-8B. When run_live_vllm is false, this skips the complete
+          Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
       run_compaction_only:
         description: >-
           Debug fast path: run ONLY the two self-compaction acceptance tests
@@ -503,7 +511,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   pins:
-    name: Load Claude Code + vLLM acceptance pins
+    name: Load Claude Code + OpenCode + vLLM acceptance pins
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -522,6 +530,14 @@ jobs:
       vllm_image: ${{ steps.load.outputs.vllm_image }}
       vllm_served_model: ${{ steps.load.outputs.vllm_served_model }}
       vllm_flags: ${{ steps.load.outputs.vllm_flags }}
+      opencode_version: ${{ steps.load.outputs.opencode_version }}
+      opencode_install: ${{ steps.load.outputs.opencode_install }}
+      opencode_npm_package: ${{ steps.load.outputs.opencode_npm_package }}
+      opencode_url: ${{ steps.load.outputs.opencode_url }}
+      opencode_sha256: ${{ steps.load.outputs.opencode_sha256 }}
+      opencode_model: ${{ steps.load.outputs.opencode_model }}
+      opencode_vllm_image: ${{ steps.load.outputs.opencode_vllm_image }}
+      opencode_vllm_flags: ${{ steps.load.outputs.opencode_vllm_flags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -600,6 +616,87 @@ jobs:
               "vllm_served_model": vllm["served_model_name"],
               "vllm_flags": " ".join(flags),
           }
+
+          # ---- OpenCode -------------------------------------------------
+          # Exported so the acceptance job carries no hardcoded version
+          # strings. Scattering them is exactly how the Codex pins drifted.
+          oc_manifest = pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml")
+          oc = tomllib.loads(oc_manifest.read_text())
+          opencode, oc_provider, oc_vllm = oc["opencode"], oc["opencode"]["provider"], oc["vllm"]
+          oc_flags = oc_vllm["launch"]["flags"]
+
+          # 2.x replaces the `config` plugin hook the acceptance lane depends
+          # on, so crossing the major boundary needs a rewritten plugin rather
+          # than a version bump.
+          declared_major = int(opencode["major_series"])
+          actual_major = int(opencode["version"].split(".")[0])
+          if declared_major != actual_major:
+              raise SystemExit(
+                  f"opencode.major_series {declared_major} disagrees with version "
+                  f"{opencode['version']}"
+              )
+          if actual_major != 1:
+              raise SystemExit(
+                  "the OpenCode acceptance lane is pinned to the 1.x plugin contract; "
+                  f"version {opencode['version']} needs a rewritten praxis-auth plugin"
+              )
+
+          # The client window, the manifest, and the server flag must agree, or
+          # the client advertises a context the backend will not honor.
+          oc_context = int(oc_provider["context"])
+          oc_vllm_context = int(oc_vllm["context_length"])
+          oc_flag_context = int(oc_flags[oc_flags.index("--max-model-len") + 1])
+          if not oc_context == oc_vllm_context == oc_flag_context:
+              raise SystemExit(
+                  f"OpenCode context {oc_context}, vllm.context_length {oc_vllm_context}, and "
+                  f"--max-model-len {oc_flag_context} must all agree"
+              )
+          if int(oc_provider["output"]) >= oc_context:
+              raise SystemExit("opencode.provider.output must be below the context window")
+
+          # Tool-calling must be served, or the tool-call scenario silently
+          # degrades to a plain text turn and proves nothing.
+          if not oc_vllm["tool_call_parser"] or "--enable-auto-tool-choice" not in oc_flags:
+              raise SystemExit(
+                  "the OpenCode backend must serve tool calls: set vllm.tool_call_parser "
+                  "and pass --enable-auto-tool-choice"
+              )
+
+          # The prompt is positional; -p on `run` is the server Basic-auth
+          # password. Assert the manifest still records that.
+          if opencode["launch"]["prompt_is_positional"] is not True:
+              raise SystemExit("opencode.launch.prompt_is_positional must stay true")
+
+          # A github-release install is only reproducible with both pins.
+          if opencode["install"] == "github-release":
+              for key in ("url", "sha256"):
+                  if not opencode[key] or "TBD" in opencode[key]:
+                      raise SystemExit(f"install=github-release requires a concrete opencode.{key}")
+
+          # Bind the manifest to the example config: every prefix the client is
+          # allowed to reach must have an explicit route, so the OpenCode path
+          # can never silently regress onto the catch-all that exists for
+          # health checks and startup probes.
+          example = pathlib.Path("examples/configs") / oc["gateway"]["example_config"]
+          example_text = example.read_text()
+          for prefix in oc["startup_matrix"]["allowed_prefixes"]:
+              if f'- path: "{prefix}"' not in example_text:
+                  raise SystemExit(
+                      f"{example} must declare an explicit route for {prefix}; "
+                      "relying on the catch-all is not a supported client path"
+                  )
+
+          exported.update({
+              "opencode_version": opencode["version"],
+              "opencode_install": opencode["install"],
+              "opencode_npm_package": opencode["npm_package"],
+              "opencode_url": opencode["url"],
+              "opencode_sha256": opencode["sha256"],
+              "opencode_model": oc_provider["model_id"],
+              "opencode_vllm_image": oc_vllm["image"],
+              "opencode_vllm_flags": " ".join(oc_flags),
+          })
+
           with open(sys.argv[1], "a", encoding="utf-8") as out:
               for key, value in exported.items():
                   out.write(f"{key}={value}\n")
@@ -1693,13 +1790,349 @@ jobs:
   # EC2 GPU runner is provisioned for the run and torn down afterwards.
   # ----------------------------------------------------------------------------
 
+  # ----------------------------------------------------------------------------
+  # Pinned OpenCode drives Chat Completions to real vLLM
+  #
+  # The third documented coding client, and the only one on the OpenAI Chat
+  # Completions wire format:
+  #
+  #   OpenCode -> Praxis (anthropic/messages-native-vllm.yaml) -> vLLM /v1/chat/completions
+  #
+  # Nothing on that path translates a body, so this job deliberately does NOT
+  # re-prove wire fidelity — `examples::anthropic_messages_native_vllm` does
+  # that deterministically on every PR, and the `opencode-cpu` job in
+  # integration.yaml proves both documented credential recipes against a
+  # scripted backend. What only a real model shows is that a multi-turn
+  # tool-calling conversation survives the round trip under real token timing,
+  # with streamed `tool_calls` deltas crossing arbitrary chunk boundaries.
+  #
+  # Hence two scenarios, not seven: one plain text turn (which also guards the
+  # reasoning-parser pairing, as the Claude planning scenario does) and one
+  # tool-call round trip, which is the scenario that earns GPU time.
+  #
+  # Every pin comes from the `pins` job, so this file contains no hardcoded
+  # version string. Reproducibility-critical values live in
+  # tests/integration/fixtures/opencode-cli/pin.toml.
+  # ----------------------------------------------------------------------------
+
+  vllm-gpu-opencode-acceptance:
+    name: OpenCode acceptance on real vLLM (GPU)
+    needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
+    if: |
+      !cancelled() &&
+      needs.gpu-start-runner.result == 'success' &&
+      (
+        github.event_name == 'schedule' ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.run_live_vllm || inputs.run_opencode_acceptance)
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'vllm-full-suite'
+        )
+      )
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      OPENCODE_VERSION: ${{ needs.pins.outputs.opencode_version }}
+      OPENCODE_NPM_PACKAGE: ${{ needs.pins.outputs.opencode_npm_package }}
+      OPENCODE_VLLM_MODEL: ${{ needs.pins.outputs.opencode_model }}
+      OPENCODE_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
+      OPENCODE_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fail on unset pins
+        run: |
+          set -euo pipefail
+          # The pins job validates the manifest; this guards against an output
+          # silently arriving empty, which would otherwise install `opencode-ai@`
+          # and fail much later with a confusing error.
+          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_IMAGE OPENCODE_VLLM_FLAGS; do
+            value="${!name}"
+            if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
+              echo "::error::pin $name is empty or TBD: '$value'"
+              exit 1
+            fi
+          done
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-gpu-acceptance
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          set -euo pipefail
+          npm install -g "${OPENCODE_NPM_PACKAGE}@${OPENCODE_VERSION}"
+          # Resolve the NATIVE executable, not the npm launcher. The platform
+          # binary ships as an optionalDependency and is self-contained, so it
+          # can be staged beside the Rust artifacts; the launcher cannot,
+          # because it resolves its payload relative to the npm root.
+          npm_root="$(npm root -g)"
+          native="$npm_root/opencode-linux-x64/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode binary at $native; npm layout changed"
+            ls -la "$npm_root" || true
+            exit 1
+          fi
+          # The GPU AMI denies exec from the Actions _temp mount after entering
+          # a network namespace. Install beside the executable Rust artifacts.
+          dest="$GITHUB_WORKSPACE/target/acceptance-bin/opencode"
+          mkdir -p "$(dirname "$dest")"
+          install -m 0755 "$native" "$dest"
+          # The client prints the bare version with no product prefix.
+          test "$("$dest" --version)" = "${OPENCODE_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_BIN=$dest" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral vLLM backend credential
+        run: |
+          set -euo pipefail
+          # The "praxis-" prefix guarantees the value never starts with "-",
+          # which vLLM's argparse would read as a flag.
+          token="praxis-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$token"
+          echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
+
+      - name: Start keyed vLLM for OpenCode
+        run: |
+          set -euo pipefail
+          # Keyed deliberately: the credential-isolation proof requires the
+          # backend to REJECT a request that Praxis did not inject into.
+          mkdir -p "${GPU_HF_CACHE_DIR}"
+          # shellcheck disable=SC2086
+          docker run -d --name vllm-opencode \
+            --gpus all --ipc=host -p 8000:8000 \
+            -v "${GPU_HF_CACHE_DIR}:/root/.cache/huggingface" \
+            -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
+            -e VLLM_API_KEY="${VLLM_API_KEY}" \
+            "${OPENCODE_VLLM_IMAGE}" \
+            ${OPENCODE_VLLM_FLAGS} \
+            --served-model-name "${OPENCODE_VLLM_MODEL}"
+
+      - name: Preflight vLLM Chat Completions
+        id: opencode_vllm_preflight
+        run: |
+          set -uo pipefail
+          for _ in $(seq 1 240); do
+            if curl -fsS -H "Authorization: Bearer ${VLLM_API_KEY}" \
+                 http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "${ready:-0}" != 1 ]; then
+            echo "::error::vLLM did not become ready"
+            docker logs vllm-opencode --tail 200 || true
+            exit 1
+          fi
+          # Prove the surface the client actually uses, before any test runs.
+          curl -fsS -X POST http://127.0.0.1:8000/v1/chat/completions \
+            -H "Authorization: Bearer ${VLLM_API_KEY}" \
+            -H 'content-type: application/json' \
+            -d "{\"model\":\"${OPENCODE_VLLM_MODEL}\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping /no_think\"}]}" \
+            >/dev/null
+
+      - name: Build Praxis and OpenCode acceptance test
+        run: |
+          set -euo pipefail
+          cargo build -p praxis-ai-proxy --features full
+          cargo test -p praxis-tests-integration --features store-all --test suite --no-run
+
+      - name: Create restricted OpenCode network namespace
+        id: opencode_namespace
+        run: |
+          set -euo pipefail
+          # 10.202.0.0/24 — distinct from the Claude (10.200) and Codex (10.201)
+          # namespaces so the three acceptance jobs never collide on the shared
+          # instance. SELinux on this AMI otherwise blocks the staged CLI.
+          if command -v getenforce >/dev/null 2>&1; then
+            if [ "$(getenforce)" = Enforcing ]; then
+              sudo setenforce 0
+              echo "OPENCODE_RESTORE_SELINUX=1" >> "$GITHUB_ENV"
+            fi
+          fi
+          NS=praxis-opencode-ns
+          sudo ip netns add "$NS"
+          sudo ip link add oc-veth-host type veth peer name oc-veth-ns
+          sudo ip link set oc-veth-ns netns "$NS"
+          sudo ip addr add 10.202.0.1/24 dev oc-veth-host
+          sudo ip link set oc-veth-host up
+          sudo ip -n "$NS" addr add 10.202.0.2/24 dev oc-veth-ns
+          sudo ip -n "$NS" link set oc-veth-ns up
+          sudo ip -n "$NS" link set lo up
+          sudo iptables -I INPUT 1 -i oc-veth-host -s 10.202.0.2 -d 10.202.0.1 -j ACCEPT
+          if sudo firewall-cmd --state >/dev/null 2>&1; then
+            sudo firewall-cmd --zone=trusted --add-interface=oc-veth-host
+            echo "OPENCODE_FIREWALLD_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if command -v nft >/dev/null 2>&1; then
+            sudo nft -j list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              chain = item.get("chain", {})
+              if chain.get("hook") == "input" and chain.get("family") in {"ip", "inet"}:
+                  print(chain["family"], chain["table"], chain["name"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain; do
+              sudo nft insert rule "$family" "$table" "$chain" \
+                iifname oc-veth-host ip saddr 10.202.0.2 ip daddr 10.202.0.1 \
+                accept comment '"praxis-opencode-veth"'
+            done
+            echo "OPENCODE_NFT_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if sudo ip -n "$NS" route show default | grep -q .; then
+            echo "::error::OpenCode namespace has a default route" >&2
+            exit 1
+          fi
+          if sudo ip -n "$NS" route get 1.1.1.1 >/dev/null 2>&1; then
+            echo "::error::OpenCode namespace can route to the public internet" >&2
+            exit 1
+          fi
+          echo "OPENCODE_NS=$NS" >> "$GITHUB_ENV"
+
+      - name: Locate compiled suite test binary
+        id: opencode_test_binary
+        run: |
+          set -uo pipefail
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features store-all --test suite --no-run \
+              --message-format=json 2>/dev/null \
+            | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled suite test binary"
+            exit 1
+          fi
+          # A Rust test that early-returns reports as PASSED, so assert the gate
+          # variable really points at an executable before trusting any result.
+          test -x "$PRAXIS_TEST_OPENCODE_BIN"
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+
+      - name: Run OpenCode text-turn vLLM acceptance test (once, no retry)
+        id: opencode_text
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_vllm::opencode_vllm_plugin_auth_completes_text_turn \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-text.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenCode tool-call vLLM acceptance test (once, no retry)
+        id: opencode_tool_call
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The scenario that earns GPU time: streamed tool_calls deltas, a
+          # bash execution, and a role:"tool" turn back up, all crossing Praxis
+          # under real token timing.
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_vllm::opencode_vllm_tool_call_round_trip_writes_hash_verified_marker \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-tool-call.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Capture diagnostics on failure
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          docker logs vllm-opencode --tail 400 > "$RUNNER_TEMP/opencode-vllm.log" 2>&1 || true
+
+      - name: Upload OpenCode acceptance diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-vllm-gpu-diagnostics
+          path: |
+            ${{ runner.temp }}/opencode-acceptance-*.log
+            ${{ runner.temp }}/opencode-vllm.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Capture OpenCode acceptance scenarios
+        if: ${{ always() }}
+        env:
+          TEXT_OUTCOME: ${{ steps.opencode_text.outcome }}
+          TOOL_CALL_OUTCOME: ${{ steps.opencode_tool_call.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/opencode-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          # run_id/attempt must be INTEGERS and checkout_sha must come from the
+          # working tree: vllm_qualification.acceptance() compares all three
+          # against the values finish() is invoked with, and any mismatch
+          # silently degrades the suite to "unreported" rather than failing.
+          names = ("TEXT_OUTCOME", "TOOL_CALL_OUTCOME")
+          ids = ("opencode_text", "opencode_tool_call")
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": [
+                  {"id": case_id, "status": os.environ.get(name) or "unexecuted"}
+                  for case_id, name in zip(ids, names)
+              ],
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload OpenCode acceptance results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-vllm-acceptance-results
+          path: ${{ runner.temp }}/opencode-acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Tear down OpenCode network namespace
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          if [ "${OPENCODE_FIREWALLD_VETH:-}" = 1 ]; then
+            sudo firewall-cmd --zone=trusted --remove-interface=oc-veth-host 2>/dev/null || true
+          fi
+          if [ "${OPENCODE_NFT_VETH:-}" = 1 ]; then
+            sudo nft -a list ruleset 2>/dev/null \
+              | grep 'praxis-opencode-veth' || true
+          fi
+          sudo iptables -D INPUT -i oc-veth-host -s 10.202.0.2 -d 10.202.0.1 -j ACCEPT 2>/dev/null || true
+          sudo ip link del oc-veth-host 2>/dev/null || true
+          sudo ip netns del "${OPENCODE_NS:-praxis-opencode-ns}" 2>/dev/null || true
+          if [ "${OPENCODE_RESTORE_SELINUX:-}" = 1 ]; then
+            sudo setenforce 1 || true
+          fi
+
+      - name: Stop vLLM
+        if: ${{ always() }}
+        run: docker rm -f vllm-opencode 2>/dev/null || true
+
   gpu-start-runner:
     name: Start ephemeral EC2 GPU runner
     if: |
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
       ) ||
       (
         github.event_name == 'pull_request' &&
@@ -2041,7 +2474,8 @@ jobs:
   # still produce an explicit report and Actions summary.
   gpu-qualification-summary:
     name: Summarize vLLM Responses gateway GPU qualification
-    needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance]
+    needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance,
+            vllm-gpu-opencode-acceptance]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -2058,11 +2492,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/vllm-qualification-raw"
           gh run download "$GITHUB_RUN_ID" --name vllm-gpu-responses-raw \
             --dir "$RUNNER_TEMP/vllm-qualification-raw" || true
-          mkdir -p "$RUNNER_TEMP/claude-acceptance-raw" "$RUNNER_TEMP/codex-acceptance-raw"
+          mkdir -p "$RUNNER_TEMP/claude-acceptance-raw" "$RUNNER_TEMP/codex-acceptance-raw" \
+            "$RUNNER_TEMP/opencode-acceptance-raw"
           gh run download "$GITHUB_RUN_ID" --name claude-vllm-acceptance-results \
             --dir "$RUNNER_TEMP/claude-acceptance-raw" || true
           gh run download "$GITHUB_RUN_ID" --name codex-vllm-acceptance-results \
             --dir "$RUNNER_TEMP/codex-acceptance-raw" || true
+          gh run download "$GITHUB_RUN_ID" --name opencode-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/opencode-acceptance-raw" || true
 
       - name: Build report and Actions summary
         env:
@@ -2071,16 +2508,19 @@ jobs:
           GPU_SUITE_RESULT: ${{ needs.vllm-gpu-full-suite.result }}
           CLAUDE_RESULT: ${{ needs.vllm-gpu-claude-acceptance.result }}
           CODEX_RESULT: ${{ needs.vllm-gpu-codex-acceptance.result }}
+          OPENCODE_RESULT: ${{ needs.vllm-gpu-opencode-acceptance.result }}
         run: |
           python3 .github/scripts/vllm_qualification.py finish \
             --raw "$RUNNER_TEMP/vllm-qualification-raw/qualification-raw.json" \
             --claude-raw "$RUNNER_TEMP/claude-acceptance-raw/claude-acceptance.json" \
             --codex-raw "$RUNNER_TEMP/codex-acceptance-raw/codex-acceptance.json" \
+            --opencode-raw "$RUNNER_TEMP/opencode-acceptance-raw/opencode-acceptance.json" \
             --requested "$GPU_REQUESTED" \
             --start-result "$GPU_START_RESULT" \
             --suite-result "$GPU_SUITE_RESULT" \
             --claude-result "$CLAUDE_RESULT" \
             --codex-result "$CODEX_RESULT" \
+            --opencode-result "$OPENCODE_RESULT" \
             --run-id "$GITHUB_RUN_ID" \
             --attempt "$GITHUB_RUN_ATTEMPT" \
             --url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
@@ -2108,6 +2548,7 @@ jobs:
       - vllm-gpu-full-suite
       - vllm-gpu-claude-acceptance
       - vllm-gpu-codex-acceptance
+      - vllm-gpu-opencode-acceptance
     # Always tear down the instance, even on failure/cancel, but skip when the
     # runner was never started (non-GPU triggers).
     if: always() && needs.gpu-start-runner.result != 'skipped'

@@ -73,25 +73,25 @@ use super::harness::OPENCODE_PINNED_VERSION;
 /// Environment variable holding the path to the pinned OpenCode executable.
 const OPENCODE_BIN_ENV: &str = "PRAXIS_TEST_OPENCODE_BIN";
 /// Shipped example config the documented OpenCode path rides.
-const EXAMPLE_CONFIG: &str = "anthropic/messages-native-vllm.yaml";
+pub(super) const EXAMPLE_CONFIG: &str = "anthropic/messages-native-vllm.yaml";
 /// Pin manifest, relative to this crate's `fixtures/` directory.
-const PIN_MANIFEST: &str = "opencode-cli/pin.toml";
+pub(super) const PIN_MANIFEST: &str = "opencode-cli/pin.toml";
 /// The documented plugin, mirrored from the guide.
-const PLUGIN_FIXTURE: &str = "opencode-cli/praxis-auth.ts";
+pub(super) const PLUGIN_FIXTURE: &str = "opencode-cli/praxis-auth.ts";
 /// Gateway `basic_auth` username the example config configures.
-const GATEWAY_USER: &str = "gateway";
+pub(super) const GATEWAY_USER: &str = "gateway";
 /// Provider id the OpenCode configuration declares.
-const PROVIDER_ID: &str = "praxis";
+pub(super) const PROVIDER_ID: &str = "praxis";
 /// Served model name, addressed by the client as `<provider>/<model>`.
 const MODEL_ID: &str = "qwen3-8b";
 /// Chat Completions path every request must take.
-const CHAT_PATH: &str = "/v1/chat/completions";
+pub(super) const CHAT_PATH: &str = "/v1/chat/completions";
 /// Fixed prompt. Tool use is suppressed so one scripted reply ends the turn.
 const PROMPT: &str = "Reply with exactly PONG. Do not call any tools.";
 /// Text the scripted backend streams back.
 const REPLY: &str = "PONG";
 /// Log line the client emits, only under `--print-logs`, when the hook throws.
-const PLUGIN_FAILURE_LOG: &str = "plugin config hook failed";
+pub(super) const PLUGIN_FAILURE_LOG: &str = "plugin config hook failed";
 /// Bound on one child run. The client is a Bun binary with a slow cold start.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(90);
 /// Scripted responses to queue. A trivial prompt costs two turns (a toolless
@@ -127,7 +127,7 @@ const MODEL_OBJECT_KEYS: &[&str] = &[
 
 /// Which documented credential recipe a run exercises.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthLane {
+pub(super) enum AuthLane {
     /// `praxis-auth.ts` attaches the credential through the `config` hook.
     Plugin,
     /// A per-model `headers` map carries it, with plugins disabled.
@@ -139,7 +139,7 @@ enum AuthLane {
 
 impl AuthLane {
     /// Whether the client runs with `--pure` (no external plugins).
-    const fn is_pure(self) -> bool {
+    pub(super) const fn is_pure(self) -> bool {
         matches!(self, Self::ModelHeaders | Self::PureIgnoresPlugin)
     }
 
@@ -154,12 +154,12 @@ impl AuthLane {
 // -----------------------------------------------------------------------------
 
 /// Absolute path to a file under this crate's `fixtures/` directory.
-fn fixture_path(relative: &str) -> PathBuf {
+pub(super) fn fixture_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(relative)
 }
 
 /// Absolute path to the repository root.
-fn repo_root() -> PathBuf {
+pub(super) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -172,7 +172,7 @@ fn repo_root() -> PathBuf {
 /// Drawn once per test process from the OS RNG rather than a source literal, so
 /// it is a throwaway secret scoped to this run; the config and the client read
 /// the same value so they agree within a run.
-fn gateway_password() -> &'static str {
+pub(super) fn gateway_password() -> &'static str {
     static PASSWORD: OnceLock<String> = OnceLock::new();
     PASSWORD.get_or_init(|| {
         rand::random::<[u8; 16]>()
@@ -183,7 +183,7 @@ fn gateway_password() -> &'static str {
 }
 
 /// The `Authorization` header value a trusted caller presents to the gateway.
-fn gateway_credential() -> String {
+pub(super) fn gateway_credential() -> String {
     basic_auth_header(GATEWAY_USER, gateway_password())
 }
 
@@ -280,7 +280,7 @@ fn model_object(headers: Option<Value>) -> Value {
 ///
 /// `plugin` is only set for the plugin lane; the entry is a path relative to
 /// the configuration directory the caller seeded.
-fn client_config(base_url: &str, lane: AuthLane) -> Value {
+pub(super) fn client_config(base_url: &str, model: &str, lane: AuthLane) -> Value {
     let headers = (lane == AuthLane::ModelHeaders).then(|| json!({"Authorization": gateway_credential()}));
     let mut config = json!({
         "$schema": "https://opencode.ai/config.json",
@@ -290,7 +290,7 @@ fn client_config(base_url: &str, lane: AuthLane) -> Value {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Praxis",
                 "options": {"baseURL": base_url},
-                "models": {MODEL_ID: model_object(headers)},
+                "models": {model: model_object(headers)},
             },
         },
     });
@@ -304,13 +304,14 @@ fn client_config(base_url: &str, lane: AuthLane) -> Value {
 ///
 /// The plugin is copied from the committed fixture rather than written inline,
 /// so the executable loads exactly the source the guide publishes.
-fn seed_config_dir(dir: &Path, base_url: &str, lane: AuthLane) {
+pub(super) fn seed_config_dir(dir: &Path, base_url: &str, model: &str, lane: AuthLane) {
     std::fs::create_dir_all(dir).expect("client configuration directory should be creatable");
     if lane != AuthLane::ModelHeaders {
         std::fs::copy(fixture_path(PLUGIN_FIXTURE), dir.join("praxis-auth.ts"))
             .expect("documented plugin fixture should be copyable into the configuration directory");
     }
-    let config = serde_json::to_string_pretty(&client_config(base_url, lane)).expect("client config should serialize");
+    let config =
+        serde_json::to_string_pretty(&client_config(base_url, model, lane)).expect("client config should serialize");
     std::fs::write(dir.join("opencode.jsonc"), config).expect("client configuration should be writable");
 }
 
@@ -321,14 +322,14 @@ fn seed_config_dir(dir: &Path, base_url: &str, lane: AuthLane) {
 /// prompt that way would silently send it as a credential and leave the model
 /// with an empty turn. [`opencode_run_uses_positional_prompt_not_dash_p`]
 /// guards this.
-fn run_args(lane: AuthLane, prompt: &str) -> Vec<String> {
+pub(super) fn run_args(lane: AuthLane, model: &str, prompt: &str) -> Vec<String> {
     let mut args = vec!["run".to_owned()];
     if lane.is_pure() {
         args.push("--pure".to_owned());
     }
     args.extend([
         "--model".to_owned(),
-        format!("{PROVIDER_ID}/{MODEL_ID}"),
+        format!("{PROVIDER_ID}/{model}"),
         "--format".to_owned(),
         "json".to_owned(),
         // Mandatory: a failing plugin is otherwise entirely silent.
@@ -346,13 +347,47 @@ fn run_args(lane: AuthLane, prompt: &str) -> Vec<String> {
 // -----------------------------------------------------------------------------
 
 /// Launch the pinned client against `base_url` and capture its output.
-async fn launch(bin: &OsStr, home: &Path, workspace: &Path, base_url: &str, lane: AuthLane) -> CapturedChildOutput {
+/// Everything one headless run needs.
+///
+/// Grouped rather than passed positionally because the two lanes differ in
+/// four of these fields, and a bare argument list of this width invites the
+/// kind of transposition that would silently test the wrong thing.
+pub(super) struct LaunchSpec<'a> {
+    /// The pinned executable.
+    pub(super) bin: &'a OsStr,
+    /// Temporary HOME; also roots the XDG directories and the config dir.
+    pub(super) home: &'a Path,
+    /// Working directory for the run.
+    pub(super) workspace: &'a Path,
+    /// Praxis base URL, including the `/v1` suffix.
+    pub(super) base_url: &'a str,
+    /// Served model name, addressed as `<provider>/<model>`.
+    pub(super) model: &'a str,
+    /// Which credential recipe to exercise.
+    pub(super) lane: AuthLane,
+    /// The positional prompt.
+    pub(super) prompt: &'a str,
+    /// Bound on the child.
+    pub(super) timeout: Duration,
+}
+
+pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
+    let LaunchSpec {
+        bin,
+        home,
+        workspace,
+        base_url,
+        model,
+        lane,
+        prompt,
+        timeout,
+    } = spec;
     let config_home = home.join(".config");
-    seed_config_dir(&config_home.join("opencode"), base_url, lane);
+    seed_config_dir(&config_home.join("opencode"), base_url, model, lane);
 
     let mut command = tokio::process::Command::new(bin);
     command
-        .args(run_args(lane, PROMPT))
+        .args(run_args(lane, model, prompt))
         .current_dir(workspace)
         .env_clear()
         .env("HOME", home)
@@ -401,7 +436,7 @@ async fn launch(bin: &OsStr, home: &Path, workspace: &Path, base_url: &str, lane
     configure_isolated_process_group(&mut command);
 
     let child = command.spawn().expect("pinned OpenCode executable should start");
-    capture_child_output(child, CHILD_TIMEOUT).await
+    capture_child_output(child, timeout).await
 }
 
 /// Assert the child finished within its bound, surfacing both pipes on failure.
@@ -426,13 +461,13 @@ fn assert_not_timed_out(output: &CapturedChildOutput, scenario: &str) {
 /// asserts nothing about the schema beyond the `type` discriminant. Hard
 /// assertions on event shape break on every client release and would make this
 /// suite a liability rather than a guard.
-struct OpenCodeTrace {
+pub(super) struct OpenCodeTrace {
     events: Vec<Value>,
 }
 
 impl OpenCodeTrace {
     /// Parse the event stream, discarding any non-JSON preamble.
-    fn parse(stdout: &str) -> Self {
+    pub(super) fn parse(stdout: &str) -> Self {
         let events = stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
@@ -442,12 +477,12 @@ impl OpenCodeTrace {
     }
 
     /// Every `type` discriminant, in order.
-    fn event_types(&self) -> Vec<&str> {
+    pub(super) fn event_types(&self) -> Vec<&str> {
         self.events.iter().filter_map(|event| event["type"].as_str()).collect()
     }
 
     /// Concatenated assistant text across all `text` events.
-    fn assistant_text(&self) -> String {
+    pub(super) fn assistant_text(&self) -> String {
         self.events
             .iter()
             .filter(|event| event["type"].as_str() == Some("text"))
@@ -456,7 +491,7 @@ impl OpenCodeTrace {
     }
 
     /// Error events, which the client emits with an `APIError` payload.
-    fn errors(&self) -> Vec<&Value> {
+    pub(super) fn errors(&self) -> Vec<&Value> {
         self.events
             .iter()
             .filter(|event| event["type"].as_str() == Some("error"))
@@ -469,7 +504,7 @@ impl OpenCodeTrace {
 // -----------------------------------------------------------------------------
 
 /// Look up one header value from a captured newline-separated header block.
-fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+pub(super) fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
@@ -526,7 +561,17 @@ async fn run_lane(lane: AuthLane, bin: &OsStr) -> (CapturedChildOutput, Vec<prax
     let workspace = TempDir::new().expect("temporary workspace should be creatable");
     let base_url = format!("http://{}/v1", proxy.addr());
 
-    let output = launch(bin, home.path(), workspace.path(), &base_url, lane).await;
+    let output = launch(LaunchSpec {
+        bin,
+        home: home.path(),
+        workspace: workspace.path(),
+        base_url: &base_url,
+        model: MODEL_ID,
+        lane,
+        prompt: PROMPT,
+        timeout: CHILD_TIMEOUT,
+    })
+    .await;
     (output, backend.requests())
 }
 
@@ -709,7 +754,7 @@ fn assert_requests_authenticated(requests: &[praxis_test_utils::CapturedRequest]
 /// A line-oriented reader rather than a TOML parser: this crate has no `toml`
 /// dependency, and the handful of pins asserted here are all top-level scalars
 /// written one per line.
-fn pin_value(key: &str) -> String {
+pub(super) fn pin_value(key: &str) -> String {
     let manifest = std::fs::read_to_string(fixture_path(PIN_MANIFEST)).expect("pin manifest should be readable");
     let needle = format!("{key} =");
     let line = manifest
@@ -785,7 +830,7 @@ fn model_headers_config_is_schema_key_safe() {
     // The model object is `additionalProperties: false`, so an unknown key is a
     // hard startup error. Catching it here beats discovering it in a lane that
     // only runs when the executable is present.
-    let config = client_config("http://127.0.0.1:8080/v1", AuthLane::ModelHeaders);
+    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::ModelHeaders);
     let model = &config["provider"][PROVIDER_ID]["models"][MODEL_ID];
     let keys: Vec<&String> = model
         .as_object()
@@ -808,7 +853,7 @@ fn model_headers_config_is_schema_key_safe() {
 
 #[test]
 fn model_headers_config_carries_the_gateway_credential() {
-    let config = client_config("http://127.0.0.1:8080/v1", AuthLane::ModelHeaders);
+    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::ModelHeaders);
     let model = &config["provider"][PROVIDER_ID]["models"][MODEL_ID];
 
     assert_eq!(
@@ -830,7 +875,7 @@ fn model_headers_config_carries_the_gateway_credential() {
 
 #[test]
 fn plugin_config_declares_the_documented_plugin_path() {
-    let config = client_config("http://127.0.0.1:8080/v1", AuthLane::Plugin);
+    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::Plugin);
     assert_eq!(
         config["plugin"],
         json!(["./praxis-auth.ts"]),
@@ -848,7 +893,7 @@ fn opencode_run_uses_positional_prompt_not_dash_p() {
     // `claude -p "<prompt>"` habit would send the prompt as a credential and
     // leave the model with an empty turn, which is both a silent test failure
     // and a credential leak into process arguments.
-    let args = run_args(AuthLane::Plugin, PROMPT);
+    let args = run_args(AuthLane::Plugin, MODEL_ID, PROMPT);
 
     assert!(
         !args.iter().any(|arg| arg == "-p" || arg == "--password"),
@@ -882,19 +927,21 @@ fn opencode_run_uses_positional_prompt_not_dash_p() {
 #[test]
 fn pure_lanes_pass_the_pure_flag() {
     assert!(
-        run_args(AuthLane::ModelHeaders, PROMPT)
+        run_args(AuthLane::ModelHeaders, MODEL_ID, PROMPT)
             .iter()
             .any(|arg| arg == "--pure"),
         "the model-headers lane must disable plugins"
     );
     assert!(
-        run_args(AuthLane::PureIgnoresPlugin, PROMPT)
+        run_args(AuthLane::PureIgnoresPlugin, MODEL_ID, PROMPT)
             .iter()
             .any(|arg| arg == "--pure"),
         "the inversion lane must disable plugins"
     );
     assert!(
-        !run_args(AuthLane::Plugin, PROMPT).iter().any(|arg| arg == "--pure"),
+        !run_args(AuthLane::Plugin, MODEL_ID, PROMPT)
+            .iter()
+            .any(|arg| arg == "--pure"),
         "the plugin lane must load the plugin"
     );
 }

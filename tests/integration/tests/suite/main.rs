@@ -64,5 +64,6 @@ mod openai_responses_model_rewrite;
 mod openai_responses_request;
 mod openai_tool_parse;
 mod opencode;
+mod opencode_vllm;
 mod prompt_enrich;
 mod responses_routing;
