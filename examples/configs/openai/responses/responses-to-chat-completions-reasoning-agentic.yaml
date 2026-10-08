@@ -10,12 +10,17 @@ listeners:
 filter_chains:
   - name: responses-chat-reasoning-translation
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
+
       - filter: openai_responses_request
         on_invalid: reject
         headers:
