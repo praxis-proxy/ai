@@ -64,7 +64,7 @@ use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
-    service::responses::ResponsesService,
+    service::responses::{ResponsesService, StoredOutputPlan},
     state_owner::{StateOwner, require_state_owner},
     store::{PendingApprovalRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
@@ -240,7 +240,11 @@ fn build_streaming_record(
         owner,
         request_input,
         state_messages,
-        &state.translated_reasoning_replay,
+        StoredOutputPlan {
+            reasoning_replay: &state.translated_reasoning_replay,
+            collected_rounds: &state.collected_rounds,
+            collected_provenance: &state.collected_output_provenance,
+        },
     )
 }
 
@@ -252,12 +256,15 @@ fn build_buffered_record(
     owner: StateOwner,
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
-    let state_messages = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .map(|state| state.persisted_messages.clone());
     let json = decode_response_body(bytes)?;
-    ResponsesService::build_record(json, owner, request_input, state_messages, &[])
+    let state = ctx.extensions.get::<ResponsesState>();
+    let state_messages = state.map(|state| state.persisted_messages.clone());
+    let plan = state.map_or(StoredOutputPlan::EMPTY, |state| StoredOutputPlan {
+        reasoning_replay: &state.translated_reasoning_replay,
+        collected_rounds: &state.collected_rounds,
+        collected_provenance: &state.collected_output_provenance,
+    });
+    ResponsesService::build_record(json, owner, request_input, state_messages, plan)
 }
 
 /// Decode a buffered response body, logging and skipping on invalid JSON.

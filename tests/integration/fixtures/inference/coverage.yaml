@@ -442,3 +442,13 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.reasoning.agentic_replay
+    scopes:
+      - responses_agentic_loop
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/responses-to-chat-completions-reasoning-agentic
+    providers:
+      vllm:
+        status: live_covered

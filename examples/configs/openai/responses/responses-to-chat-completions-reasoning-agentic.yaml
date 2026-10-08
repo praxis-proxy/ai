@@ -1,0 +1,70 @@
+# Agentic reasoning storage fixture
+# Requires SQLite support (--features store-all).
+#
+# Exercises stored reasoning and previous_response_id replay through the agentic
+# loop, where the output collector records each round into the stored history.
+listeners:
+  - name: responses-chat-reasoning-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-chat-reasoning-translation]
+filter_chains:
+  - name: responses-chat-reasoning-translation
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+      - filter: openai_responses_validate
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+      - filter: openai_responses_rehydrate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        timeout_ms: 660000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                max_buffer_bytes: 67108864
+                max_events: 200000
+                timeout_secs: 600
+              - filter: openai_agentic_loop
+              - filter: responses_to_chat_completions
+                reasoning:
+                  dialect: vllm
+                  max_reasoning_bytes: 65536
+                max_rewritten_body_bytes: 33554432
+                max_emitted_sse_frame_bytes: 50331648
+                max_stream_events: 100000
+                stream_timeout_secs: 300
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "chat-completions-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "chat-completions-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

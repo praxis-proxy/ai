@@ -13,8 +13,101 @@ use super::super::state::ResponsesState;
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
     openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
+    service::responses::{ResponsesService, StoredOutputPlan},
+    state_owner::StateOwner,
     test_utils::{make_filter_context, make_request},
 };
+
+/// Exercise both collectors with real provenance, then pass that state through
+/// storage assembly.
+fn assert_collected_rounds_reconcile(streaming: bool) {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
+    let first = json!({"output": [
+        {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "first"}]},
+        {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+        {"type": "message", "id": "msg_1", "role": "assistant", "content": "searching"}
+    ]});
+    if streaming {
+        state.response_object = first;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&first, &mut state, &[]);
+    }
+    assert_eq!(state.collected_rounds[0].output_start, 0);
+    assert_eq!(state.collected_rounds[0].output_end, 3);
+    assert_eq!(state.collected_rounds[0].persisted_start, 1);
+    assert_eq!(state.collected_rounds[0].persisted_end, 3);
+    assert_eq!(state.collected_output_provenance, [(0, 1), (1, 2)]);
+
+    // Dispatch appends a result between rounds. It must remain after msg_1.
+    state.persisted_messages.push(json!({
+        "type": "function_call_output", "call_id": "call_1", "output": "result"
+    }));
+    let second = json!({"output": [
+        {"type": "message", "id": "msg_2", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "id": "rs_2", "content": [{"type": "reasoning_text", "text": "late"}]}
+    ]});
+    if streaming {
+        state.response_object = second;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&second, &mut state, &[]);
+    }
+    assert_eq!(state.collected_rounds[1].output_start, 3);
+    assert_eq!(state.collected_rounds[1].output_end, 5);
+    assert_eq!(state.collected_rounds[1].persisted_start, 4);
+    assert_eq!(state.collected_rounds[1].persisted_end, 5);
+    assert_eq!(state.collected_output_provenance, [(0, 1), (1, 2), (4, 4)]);
+
+    state.translated_reasoning_replay.push(3..=4);
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let response = json!({
+        "id": "resp_collected", "created_at": 1, "model": "m",
+        "output": state.accumulated_output
+    });
+    let record = ResponsesService::build_record(
+        response,
+        owner,
+        Some(json!([{"role": "user", "content": "question"}])),
+        Some(state.persisted_messages),
+        StoredOutputPlan {
+            reasoning_replay: &state.translated_reasoning_replay,
+            collected_rounds: &state.collected_rounds,
+            collected_provenance: &state.collected_output_provenance,
+        },
+    )
+    .unwrap();
+    let types: Vec<_> = record
+        .messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "message",
+            "reasoning",
+            "web_search_call",
+            "message",
+            "function_call_output",
+            "reasoning",
+            "message"
+        ]
+    );
+    assert_eq!(record.messages[5]["content"][0]["text"], "late");
+}
+
+#[test]
+fn buffered_collector_provenance_reconciles_stored_rounds() {
+    assert_collected_rounds_reconcile(false);
+}
+
+#[test]
+fn streaming_collector_provenance_reconciles_stored_rounds() {
+    assert_collected_rounds_reconcile(true);
+}
 
 // -----------------------------------------------------------------------------
 // Config Parsing

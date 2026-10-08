@@ -1270,6 +1270,7 @@ mod tests {
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop", "responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1324,11 +1325,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
             ]
         );
-        assert_eq!(report.features_total, 45);
-        assert_eq!(report.scenarios_total, 47);
-        assert_eq!(report.recordings_total, 52);
+        assert_eq!(report.features_total, 46);
+        assert_eq!(report.scenarios_total, 48);
+        assert_eq!(report.recordings_total, 53);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1356,6 +1358,7 @@ mod tests {
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
                 "responses/chat-null-tool-choice",
+                "responses/responses-to-chat-completions-reasoning-agentic",
                 "responses/chat-reasoning-disabled",
                 "responses/chat-reasoning-nonstream",
                 "responses/chat-reasoning-replay",
@@ -1381,7 +1384,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 45);
+        assert_eq!(manifest.features.len(), 46);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1612,6 +1615,10 @@ mod tests {
                     &"responses.streaming.invalid_event_type".to_owned(),
                     &vec!["responses/invalid-stream-event-type".to_owned()]
                 ),
+                (
+                    &"responses.chat.reasoning.agentic_replay".to_owned(),
+                    &vec!["responses/responses-to-chat-completions-reasoning-agentic".to_owned()]
+                ),
             ]
         );
         assert_eq!(
@@ -1751,6 +1758,14 @@ mod tests {
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("synthetic", CoverageStatus::SyntheticOnly)]
+        );
+        assert_eq!(
+            manifest.features[45]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("vllm", CoverageStatus::LiveCovered)]
         );
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())

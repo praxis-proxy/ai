@@ -5,7 +5,7 @@
 //! coordination exercised against the in-memory backend, with no request pipeline
 //! and no SQL database.
 
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use praxis_ai_store::{
     PendingApprovalRecord, PersistedStateBackend, ResponseRecord, StoreError, StoreRegistry, memory::InMemoryStore,
@@ -13,9 +13,22 @@ use praxis_ai_store::{
 use serde_json::{Value, json};
 
 use super::{
-    ListParams, Order, ResponsesService, assemble_stored_messages, list_input_items, normalize_translated_reasoning,
+    ListParams, Order, ResponsesService, StoredOutputPlan, assemble_stored_messages, list_input_items,
+    rotate_trailing_reasoning,
 };
-use crate::{StateOwner, openai::include::IncludeFields};
+use crate::{
+    StateOwner,
+    openai::{include::IncludeFields, responses::state::CollectedRound},
+};
+
+/// Build a non-agentic plan carrying only translator replay ranges.
+fn replay_plan(reasoning_replay: &[RangeInclusive<usize>]) -> StoredOutputPlan<'_> {
+    StoredOutputPlan {
+        reasoning_replay,
+        collected_rounds: &[],
+        collected_provenance: &[],
+    }
+}
 
 /// Build a validated owner for a fixed tenant and issuer.
 fn owner(subject: &str) -> StateOwner {
@@ -51,13 +64,19 @@ fn sample_record(owner: &StateOwner, id: &str) -> ResponseRecord {
 
 #[test]
 fn build_record_returns_none_for_null_response_object() {
-    let record = ResponsesService::build_record(Value::Null, owner("alice"), None, None, &[]);
+    let record = ResponsesService::build_record(Value::Null, owner("alice"), None, None, StoredOutputPlan::EMPTY);
     assert!(record.is_none(), "a null response object is not persistable");
 }
 
 #[test]
 fn build_record_returns_none_for_missing_required_fields() {
-    let record = ResponsesService::build_record(json!({"id": "resp_1"}), owner("alice"), None, None, &[]);
+    let record = ResponsesService::build_record(
+        json!({"id": "resp_1"}),
+        owner("alice"),
+        None,
+        None,
+        StoredOutputPlan::EMPTY,
+    );
     assert!(record.is_none(), "missing created_at/model is not persistable");
 }
 
@@ -72,9 +91,14 @@ fn build_record_uses_request_input_when_state_messages_absent() {
         "output": [{"type": "message", "content": "Stored streaming output"}]
     });
 
-    let record =
-        ResponsesService::build_record(response_object, owner("alice"), Some(request_input.clone()), None, &[])
-            .expect("streaming state should build a record");
+    let record = ResponsesService::build_record(
+        response_object,
+        owner("alice"),
+        Some(request_input.clone()),
+        None,
+        StoredOutputPlan::EMPTY,
+    )
+    .expect("streaming state should build a record");
 
     assert_eq!(
         record.input, request_input,
@@ -117,7 +141,7 @@ fn build_record_preserves_mcp_metadata_from_state_messages() {
         owner("alice"),
         Some(json!([{"role": "user", "content": "What next?"}])),
         Some(state_messages),
-        &[],
+        StoredOutputPlan::EMPTY,
     )
     .expect("streaming state should build a record");
 
@@ -145,7 +169,7 @@ fn build_record_falls_back_to_response_object_input() {
         "output": [{"type": "message", "role": "assistant", "content": "Hi"}]
     });
 
-    let record = ResponsesService::build_record(response_object, owner("alice"), None, None, &[])
+    let record = ResponsesService::build_record(response_object, owner("alice"), None, None, StoredOutputPlan::EMPTY)
         .expect("buffered response should build a record");
 
     assert_eq!(
@@ -309,7 +333,7 @@ fn trailing_reasoning_after_a_message_moves_ahead_of_its_turn() {
         json!({"type": "message", "role": "assistant", "id": "msg_1"}),
         json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
     ];
-    normalize_translated_reasoning(&mut items, &[0..=1]);
+    rotate_trailing_reasoning(&mut items, &[0..=1]);
     assert_eq!(types(&items), ["reasoning", "message"]);
 }
 
@@ -320,7 +344,7 @@ fn trailing_reasoning_moves_ahead_of_a_message_and_tool_call_turn() {
         json!({"type": "function_call", "id": "fc_1"}),
         json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
     ];
-    normalize_translated_reasoning(&mut items, &[0..=2]);
+    rotate_trailing_reasoning(&mut items, &[0..=2]);
     assert_eq!(types(&items), ["reasoning", "message", "function_call"]);
 }
 
@@ -332,7 +356,7 @@ fn reasoning_first_turns_are_left_untouched() {
         json!({"type": "message", "role": "assistant", "id": "msg_1"}),
     ];
     let before = items.clone();
-    normalize_translated_reasoning(&mut items, &[]);
+    rotate_trailing_reasoning(&mut items, &[]);
     assert_eq!(items, before);
 }
 
@@ -348,7 +372,7 @@ fn multi_round_agentic_reasoning_is_not_collapsed_onto_an_earlier_turn() {
         json!({"type": "message", "role": "assistant", "id": "msg_2"}),
     ];
     let before = items.clone();
-    normalize_translated_reasoning(&mut items, &[]);
+    rotate_trailing_reasoning(&mut items, &[]);
     assert_eq!(items, before);
 }
 
@@ -362,7 +386,7 @@ fn a_standalone_trailing_reasoning_turn_is_preserved() {
         json!({"type": "reasoning", "id": "rs_2"}),
     ];
     let before = items.clone();
-    normalize_translated_reasoning(&mut items, &[]);
+    rotate_trailing_reasoning(&mut items, &[]);
     assert_eq!(items, before);
 }
 
@@ -374,7 +398,7 @@ fn build_record_normalizes_replay_without_changing_the_response_object() {
         {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}
     ]);
     let response = json!({"id": "resp_late", "created_at": 1, "model": "m", "output": output});
-    let record = ResponsesService::build_record(response, owner("alice"), Some(input), None, &[0..=1])
+    let record = ResponsesService::build_record(response, owner("alice"), Some(input), None, replay_plan(&[0..=1]))
         .expect("translated response should build a record");
     assert_eq!(
         types(record.response_object["output"].as_array().unwrap()),
@@ -400,7 +424,7 @@ fn translated_reasoning_stays_with_its_round_even_when_message_ids_repeat() {
         {"type": "message", "role": "assistant", "id": "msg_shared", "content": "third"},
         {"type": "reasoning", "id": "rs_third", "content": [{"type": "reasoning_text", "text": "third thought"}]}
     ]);
-    let input = assemble_stored_messages(json!([]), Some(&output), &[1..=2, 3..=4]);
+    let input = assemble_stored_messages(json!([]), Some(&output), replay_plan(&[1..=2, 3..=4]));
     let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
         &json!({"model": "m", "input": input}),
         &crate::openai::translation::reasoning::ReasoningOptions {
@@ -427,7 +451,7 @@ fn late_reasoning_before_a_tool_call_replays_with_the_answer() {
         {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
         {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
     ]);
-    let input = assemble_stored_messages(json!([]), Some(&output), &[0..=1]);
+    let input = assemble_stored_messages(json!([]), Some(&output), replay_plan(&[0..=1]));
     let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
         &json!({"model": "m", "input": input}),
         &crate::openai::translation::reasoning::ReasoningOptions {
@@ -451,5 +475,275 @@ fn native_output_without_translator_provenance_keeps_its_order() {
         {"type": "message", "role": "assistant", "id": "msg_2"},
         {"type": "reasoning", "id": "rs_native"}
     ]);
-    assert_eq!(assemble_stored_messages(json!([]), Some(&output), &[]), output);
+    assert_eq!(
+        assemble_stored_messages(json!([]), Some(&output), replay_plan(&[])),
+        output
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Agentic provenance reconciliation
+//
+// A collector persists reasoning and tool-call items (never assistant messages)
+// into `persisted_messages`, so the final output must not be appended wholesale.
+// These tests drive `assemble_stored_messages` with the round boundaries and item
+// provenance a collector records, for both reasoning-first and late output.
+// -----------------------------------------------------------------------------
+
+/// Build one collected round's boundaries.
+fn round(output_start: usize, output_end: usize, persisted_start: usize, persisted_end: usize) -> CollectedRound {
+    CollectedRound {
+        output_start,
+        output_end,
+        persisted_start,
+        persisted_end,
+    }
+}
+
+/// Build an agentic plan from recorded rounds, provenance, and replay ranges.
+fn agentic_plan<'a>(
+    reasoning_replay: &'a [RangeInclusive<usize>],
+    collected_rounds: &'a [CollectedRound],
+    collected_provenance: &'a [(usize, usize)],
+) -> StoredOutputPlan<'a> {
+    StoredOutputPlan {
+        reasoning_replay,
+        collected_rounds,
+        collected_provenance,
+    }
+}
+
+fn types_of(value: &Value) -> Vec<&str> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
+        .collect()
+}
+
+#[test]
+fn agentic_reasoning_first_round_is_not_duplicated() {
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
+    ]);
+    let output = json!([
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
+        {"type": "message", "role": "assistant", "content": "answer"},
+    ]);
+    let rounds = [round(0, 2, 1, 2)];
+    let provenance = [(0, 1)];
+    let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[0..=0], &rounds, &provenance));
+    assert_eq!(types_of(&stored), ["message", "reasoning", "message"]);
+    assert_eq!(stored.as_array().unwrap()[2]["content"], "answer");
+}
+
+#[test]
+fn agentic_late_reasoning_round_is_reordered_reasoning_first() {
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "late"}]},
+    ]);
+    let output = json!([
+        {"type": "message", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "late"}]},
+    ]);
+    let rounds = [round(0, 2, 1, 2)];
+    let provenance = [(1, 1)];
+    let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[0..=1], &rounds, &provenance));
+    assert_eq!(types_of(&stored), ["message", "reasoning", "message"]);
+    let items = stored.as_array().unwrap();
+    assert_eq!(items[1]["content"][0]["text"], "late");
+    assert_eq!(items[2]["content"], "answer");
+}
+
+#[test]
+fn agentic_missing_message_lands_before_its_tool_result() {
+    // `[function_call, message]` round: the message is uncollected and must be
+    // reinserted inside the round window, ahead of the tool result dispatch
+    // appended afterwards — never after it.
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+    ]);
+    let output = json!([
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": "answer"},
+    ]);
+    let rounds = [round(0, 2, 1, 2)];
+    let provenance = [(0, 1)];
+    let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[], &rounds, &provenance));
+    assert_eq!(
+        types_of(&stored),
+        ["message", "function_call", "message", "function_call_output"]
+    );
+    assert_eq!(stored.as_array().unwrap()[2]["content"], "answer");
+}
+
+#[test]
+fn agentic_identical_reasoning_across_rounds_is_not_collapsed() {
+    // Two rounds whose reasoning text is byte-identical.
+    let same = json!([{"type": "reasoning_text", "text": "same"}]);
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "content": same},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+        {"type": "reasoning", "content": same},
+    ]);
+    let output = json!([
+        {"type": "reasoning", "content": same},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "reasoning", "content": same},
+        {"type": "message", "role": "assistant", "content": "answer"},
+    ]);
+    let rounds = [round(0, 2, 1, 3), round(2, 4, 4, 5)];
+    let provenance = [(0, 1), (1, 2), (2, 4)];
+    let stored = assemble_stored_messages(
+        history,
+        Some(&output),
+        agentic_plan(&[0..=0, 2..=2], &rounds, &provenance),
+    );
+    assert_eq!(
+        types_of(&stored),
+        [
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+            "reasoning",
+            "message"
+        ]
+    );
+}
+
+#[test]
+fn agentic_zero_persisted_all_message_round_between_two_collected_rounds() {
+    // A round that persisted nothing (all-message) is still recorded, so its
+    // message is placed between the surrounding rounds, not dropped or misordered.
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "one"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "three"}]},
+    ]);
+    let output = json!([
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "one"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": "interlude"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "three"}]},
+        {"type": "message", "role": "assistant", "content": "answer"},
+    ]);
+    let rounds = [round(0, 2, 1, 3), round(2, 3, 4, 4), round(3, 5, 4, 5)];
+    let provenance = [(0, 1), (1, 2), (3, 4)];
+    let stored = assemble_stored_messages(
+        history,
+        Some(&output),
+        agentic_plan(&[0..=0, 3..=3], &rounds, &provenance),
+    );
+    let items = stored.as_array().unwrap();
+    assert_eq!(
+        types_of(&stored),
+        [
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+            "message",
+            "reasoning",
+            "message"
+        ]
+    );
+    assert_eq!(items[4]["content"], "interlude");
+    assert_eq!(items[6]["content"], "answer");
+}
+
+#[test]
+fn agentic_uncollected_final_round_is_appended() {
+    // Output items beyond the last recorded span were never collected; they are
+    // appended (reordered) at the end of history.
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "one"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+    ]);
+    let output = json!([
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "one"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "late final"}]},
+    ]);
+    // Final round (output 2..4) never collected; its reasoning arrives late.
+    let rounds = [round(0, 2, 1, 3)];
+    let provenance = [(0, 1), (1, 2)];
+    let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[2..=3], &rounds, &provenance));
+    assert_eq!(
+        types_of(&stored),
+        [
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+            "reasoning",
+            "message"
+        ]
+    );
+    let items = stored.as_array().unwrap();
+    assert_eq!(items[4]["content"][0]["text"], "late final");
+    assert_eq!(items[5]["content"], "answer");
+}
+
+#[test]
+fn agentic_collected_file_search_item_is_refreshed_to_its_final_output() {
+    // File-search dispatch updates the item's accumulated_output copy (status and
+    // results) after collection. Stored history must track that final item, not the
+    // collector's pre-dispatch copy. Covers a completed and an incomplete call.
+    for (final_status, final_body) in [
+        ("completed", json!({"queries": ["q"], "results": [{"text": "hit"}]})),
+        ("incomplete", json!({"queries": ["q"]})),
+    ] {
+        let history = json!([
+            {"type": "message", "role": "user", "content": "q"},
+            // The collector's pre-dispatch copy: still searching, no results.
+            {"type": "file_search_call", "id": "fs_1", "status": "searching"},
+        ]);
+        let mut final_call = json!({"type": "file_search_call", "id": "fs_1", "status": final_status});
+        final_call
+            .as_object_mut()
+            .unwrap()
+            .extend(final_body.as_object().unwrap().clone());
+        let output = json!([final_call.clone()]);
+        let rounds = [round(0, 1, 1, 2)];
+        let provenance = [(0, 1)];
+        let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[], &rounds, &provenance));
+        let items = stored.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[1], final_call,
+            "stored file-search item must match the final output"
+        );
+    }
+}
+
+#[test]
+fn agentic_reorder_is_a_noop_when_named_item_is_not_reasoning() {
+    // Fail-safe: if the range's named end item is not a reasoning item (changed or
+    // mismatched), history is left untouched rather than reordered by a guess.
+    let history = json!([
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+    ]);
+    let output = json!([
+        {"type": "message", "role": "assistant", "content": "answer"},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+    ]);
+    let rounds = [round(0, 2, 1, 2)];
+    let provenance = [(1, 1)];
+    // Range names [0..=1] but item 1 is a function_call, not reasoning: no reorder.
+    let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[0..=1], &rounds, &provenance));
+    assert_eq!(types_of(&stored), ["message", "message", "function_call"]);
 }

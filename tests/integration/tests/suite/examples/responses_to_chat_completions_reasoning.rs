@@ -11,6 +11,7 @@ use praxis_test_utils::{
 };
 
 const EXAMPLE: &str = "openai/responses/responses-to-chat-completions-reasoning.yaml";
+const EXAMPLE_AGENTIC: &str = "openai/responses/responses-to-chat-completions-reasoning-agentic.yaml";
 
 fn load_test_config(
     test_name: &str,
@@ -19,6 +20,26 @@ fn load_test_config(
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        listener_port,
+        port_map,
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    (config, db)
+}
+
+/// Load the agentic variant of the reasoning example, which runs
+/// `openai_agentic_loop` ahead of the translator so the output collector records
+/// each round into the stored history.
+fn load_agentic_config(
+    test_name: &str,
+    listener_port: u16,
+    port_map: &HashMap<&str, u16>,
+) -> (praxis_core::config::Config, TempSqlite) {
+    let db = TempSqlite::new(test_name);
+    let yaml =
+        std::fs::read_to_string(example_config_path(EXAMPLE_AGENTIC)).expect("agentic example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         listener_port,
@@ -160,6 +181,88 @@ fn reasoning_only_completion_survives_stored_continuation() {
     assert_eq!(
         forwarded["messages"][2],
         serde_json::json!({"role": "user", "content": "Now answer."})
+    );
+}
+
+#[test]
+fn agentic_stored_reasoning_is_replayed_once() {
+    // With openai_agentic_loop, the round collector already records the reasoning
+    // into persisted history, so storage assembly must not append it a second time.
+    // The continuation must forward the assistant answer with its reasoning exactly
+    // once (a duplicate would exceed the per-item byte limit).
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_agentic_reasoning",
+        "object": "chat.completion",
+        "model": "deepseek-r1",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "4", "reasoning": "Two plus two is four."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16}
+    });
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, chat_response.to_string()), (200, chat_response.to_string())])
+            .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_agentic_config(
+        "agentic_stored_reasoning",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "deepseek-r1",
+        "input": "What is 2+2?",
+        "reasoning": {"effort": "medium"},
+        "stream": false,
+        "store": true
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200);
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(response["status"], "completed");
+    // The client-facing output keeps its announced order: reasoning then message.
+    let types: Vec<&str> = response["output"]
+        .as_array()
+        .expect("output should be an array")
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(types, ["reasoning", "message"]);
+
+    let continuation = serde_json::json!({
+        "model": "deepseek-r1",
+        "previous_response_id": response["id"],
+        "input": "Now what is that plus 10?",
+        "store": false,
+        "stream": false
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(parse_status(&raw), 200, "stored agentic continuation should succeed");
+
+    let captured = backend.requests();
+    assert_eq!(captured.len(), 2);
+    let forwarded: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    // The reasoning is replayed exactly once, attached to its assistant answer.
+    assert_eq!(
+        forwarded["messages"][1],
+        serde_json::json!({"role": "assistant", "content": "4", "reasoning": "Two plus two is four."})
+    );
+    assert_eq!(
+        forwarded["messages"][2],
+        serde_json::json!({"role": "user", "content": "Now what is that plus 10?"})
+    );
+    let assistant_turns = forwarded["messages"]
+        .as_array()
+        .expect("forwarded messages should be an array")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .count();
+    assert_eq!(
+        assistant_turns, 1,
+        "exactly one assistant turn; reasoning must not be duplicated"
     );
 }
 

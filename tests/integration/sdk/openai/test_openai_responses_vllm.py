@@ -377,13 +377,16 @@ def _write_reasoning_backend_config(
     db_path: str,
     backend_port: int,
     dialect: str = "vllm",
+    agentic: bool = False,
 ) -> str:
     """Patch the reasoning example to target a specific Chat backend port.
 
     Identical to :func:`_write_reasoning_config` except the ``127.0.0.1:3001``
     backend is pointed at ``backend_port`` (a capturing mock) so a test can
     observe the exact Chat Completions request body the backend receives after
-    the proxy replays reasoning in the assistant reasoning field.
+    the proxy replays reasoning in the assistant reasoning field. When ``agentic``
+    is set, the ``openai_agentic_loop`` filter runs ahead of the translator so the
+    output collector records each round into the stored history.
     """
     with open(REASONING_CONFIG_PATH) as f:
         config = f.read()
@@ -391,6 +394,11 @@ def _write_reasoning_backend_config(
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     config = config.replace("dialect: vllm", f"dialect: {dialect}")
+    if agentic:
+        config = config.replace(
+            "              - filter: responses_to_chat_completions",
+            "              - filter: openai_agentic_loop\n\n              - filter: responses_to_chat_completions",
+        )
     config = _patch_store_backend(config, db_path)
 
     return _persist_config(config)
@@ -1630,8 +1638,13 @@ def _reasoning_capture_session(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
     db_path = str(db_dir / "responses.db")
+    param = getattr(request, "param", "vllm")
     config_path = _write_reasoning_backend_config(
-        port, db_path, backend_port, getattr(request, "param", "vllm"),
+        port,
+        db_path,
+        backend_port,
+        "vllm" if param == "agentic" else param,
+        agentic=param == "agentic",
     )
     binary = _find_binary()
 
@@ -3076,6 +3089,29 @@ class TestResponsesReasoningVLLM:
             {"role": "assistant", "content": None, "reasoning": "I picked 42."},
             {"role": "user", "content": "Now answer."},
         ]
+
+    @pytest.mark.parametrize("reasoning_capture_client", ["agentic"], indirect=True)
+    @pytest.mark.parametrize("late", [False, True], ids=["reasoning-first", "reasoning-late"])
+    def test_agentic_stored_reasoning_is_replayed_once(self, reasoning_capture_client, late):
+        client, forwarded = reasoning_capture_client
+        thought = "x" * 40_000
+        deltas = [{"reasoning": thought}, {"content": "Answer"}]
+        ChatCaptureHandler.stream_deltas = list(reversed(deltas)) if late else deltas
+        with client.responses.stream(model=VLLM_MODEL, input="Question", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        assert first.status == "completed"
+        # The client-facing output keeps its announced order.
+        stored = client.responses.retrieve(first.id)
+        assert [item.type for item in stored.output] == (
+            ["message", "reasoning"] if late else ["reasoning", "message"]
+        )
+        client.responses.create(
+            model=VLLM_MODEL, previous_response_id=first.id, input="Continue", store=False,
+        )
+        # The forwarded history carries the reasoning exactly once, attached to its answer.
+        assistants = [item for item in forwarded[-1]["messages"] if item["role"] == "assistant"]
+        assert assistants == [{"role": "assistant", "content": "Answer", "reasoning": thought}]
 
     @pytest.mark.parametrize("item", [
         {"type": "reasoning", "encrypted_content": "opaque", "summary": []},

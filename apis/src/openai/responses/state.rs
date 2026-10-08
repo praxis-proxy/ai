@@ -638,6 +638,18 @@ pub(crate) struct ResponsesState {
     /// so adjacent assistant turns cannot be mistaken for a single completion.
     pub translated_reasoning_replay: Vec<RangeInclusive<usize>>,
 
+    /// Storage assembly uses these round boundaries to reconcile the duplicate
+    /// append: a round's `accumulated_output` span and the `persisted_messages`
+    /// window it occupied (captured BEFORE dispatch appended any tool result) let
+    /// the rebuild drop already-collected items, reinsert the uncollected ones in
+    /// their original round, and keep tool results in place. Empty means no
+    /// collector ran (the non-agentic path), so assembly appends output verbatim.
+    pub collected_rounds: Vec<CollectedRound>,
+
+    /// `(accumulated_output index, persisted_messages index)` for each output item
+    /// a collector persisted. This is the authoritative "already stored" signal.
+    pub collected_output_provenance: Vec<(usize, usize)>,
+
     /// Aggregate wire bytes `openai_stream_events` has charged against its
     /// accumulation budget across every IRR round of this request.
     ///
@@ -763,6 +775,28 @@ pub(crate) struct EmittedItem {
     /// IRR response can reach tens of MiB across rounds, so keeping a second full
     /// copy per item here would be payload-scale memory amplification.
     pub content_digest: u64,
+}
+
+/// Boundaries of one agentic round an output collector processed, in both the
+/// `accumulated_output` and `persisted_messages` coordinate spaces.
+///
+/// Recorded for every round the collector saw — including a round that persisted
+/// no items — so storage assembly can tell an all-`message` round apart from a
+/// round that was never collected. `persisted_end` is the length of
+/// `persisted_messages` at the moment collection finished, captured BEFORE
+/// dispatch appends this round's tool results, so the window names exactly the
+/// round's own output items and reinserted messages land ahead of their results.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CollectedRound {
+    /// Start index of the round's items in `accumulated_output`.
+    pub output_start: usize,
+    /// End (exclusive) index of the round's items in `accumulated_output`.
+    pub output_end: usize,
+    /// Start index of the round's window in `persisted_messages`.
+    pub persisted_start: usize,
+    /// End (exclusive) index of the round's window in `persisted_messages`,
+    /// captured before dispatch appends tool results.
+    pub persisted_end: usize,
 }
 
 /// Internally resolved MCP connector waiting for deferred discovery.
@@ -913,6 +947,8 @@ impl Default for ResponsesState {
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
             translated_reasoning_replay: Vec::new(),
+            collected_rounds: Vec::new(),
+            collected_output_provenance: Vec::new(),
             stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
@@ -966,6 +1002,28 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
+    /// Persist one collected output item to the durable history, recording the
+    /// `(accumulated_output index, persisted_messages index)` provenance in
+    /// lockstep so storage assembly can drop the later wholesale append of the
+    /// same item without guessing by value.
+    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: serde_json::Value) {
+        self.collected_output_provenance
+            .push((accumulated_index, self.persisted_messages.len()));
+        self.persisted_messages.push(item);
+    }
+
+    /// Record one agentic round's boundaries after a collector finished it, before
+    /// dispatch appends any tool result. `persisted_start`/`output_start` are the
+    /// lengths captured when the round began collecting.
+    pub(crate) fn record_collected_round(&mut self, output_start: usize, persisted_start: usize) {
+        self.collected_rounds.push(CollectedRound {
+            output_start,
+            output_end: self.accumulated_output.len(),
+            persisted_start,
+            persisted_end: self.persisted_messages.len(),
+        });
     }
 
     /// Borrow the public output owned by [`Self::response_object`].

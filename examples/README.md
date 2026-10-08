@@ -120,6 +120,7 @@ before sending requests.
 | [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists streaming and non-streaming Responses API responses to a database, serves stored data via GET endpoints, and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
+| [responses-to-chat-completions-reasoning-agentic.yaml](configs/openai/responses/responses-to-chat-completions-reasoning-agentic.yaml) | Exercises stored reasoning and previous_response_id replay through the agentic loop, where the output collector records each round into the stored history |
 | [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Translates finite and streaming vLLM reasoning into Responses reasoning output items, including storage and replay on continuation |
 | [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
 | [state-ownership.yaml](configs/openai/responses/state-ownership.yaml) | Provider-neutral owner isolation for persisted OpenAI Responses and Conversations |
