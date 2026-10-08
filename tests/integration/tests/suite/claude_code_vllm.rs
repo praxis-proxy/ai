@@ -1506,14 +1506,20 @@ impl Workspace {
     /// `compact_boundary` event with `trigger == "auto"` — not an inferred token
     /// count, nor an SDK compact call, nor a Praxis compaction filter. The marker
     /// (`source_token`) is read BEFORE the boundary, so it is part of the history
-    /// the client had to summarize; the re-read, Edit, and verification run AFTER
-    /// it. Under the acceptance job's enforced egress isolation the client's only
-    /// network route is Praxis, so the tool call the model requests in a
-    /// post-compaction turn — and the final answer it produces from that tool's
-    /// result — are requests that necessarily traversed Praxis after compaction.
-    /// The marker is high-entropy and stays on disk; the post-compaction re-read
-    /// recovers it, so the oracle rests on the task continuing past the boundary,
-    /// not on the model retaining the token verbatim through its own summarization.
+    /// the client had to summarize; the Edit and verification run AFTER it. Under
+    /// the acceptance job's enforced egress isolation the client's only network
+    /// route is Praxis, so the tool call the model requests in a post-compaction
+    /// turn — and the final answer it produces from that tool's result — are
+    /// requests that necessarily traversed Praxis after compaction.
+    ///
+    /// The oracle is: (a) the client self-compacted (boundary event), (b) at least
+    /// one tool call followed the boundary (continuation through Praxis), and
+    /// (c) the post-compaction write is CORRECT (uppercase marker into
+    /// `result/value.txt`, then a passing `./verify.sh`). The marker stays on disk
+    /// and the prompt steers a post-compaction re-read to recover it, but the oracle
+    /// does not mandate that re-read — a capable model may carry the token across its
+    /// own summary. Unlike the Codex lane, this lane keeps full completion as a hard
+    /// assertion rather than an XFAIL; see docs/developing/gpu-nightly-suite.md.
     fn assert_compaction_task_trace(&self, stdout: &str) {
         let trace = ToolTrace::parse(stdout);
 
@@ -1551,24 +1557,12 @@ impl Workspace {
             read_result.text,
         );
 
-        // The marker stays on disk and is re-read after the boundary: the task
-        // recovers the exact token by reading `source/value.txt` again in a
-        // post-compaction turn, which is the request that proves the compacted
-        // session continued through Praxis to recover state it needs.
-        let reread = trace.source_reference_after(compaction.seq).unwrap_or_else(|| {
-            panic!(
-                "client must re-read source/value.txt after compaction (seq {}) to recover the marker for \
-                 the write; tool calls observed: {:?}\nstdout:\n{stdout}",
-                compaction.seq,
-                trace.tool_use_names(),
-            )
-        });
-        assert!(
-            reread.seq > compaction.seq,
-            "the source re-read must come after the boundary; got seq {} vs {}",
-            reread.seq,
-            compaction.seq,
-        );
+        // The prompt steers the model to re-read `source/value.txt` on disk after
+        // the boundary to recover the exact token for the write, but the oracle
+        // does NOT mandate that specific tool call: a capable model may carry the
+        // token across its own summary and write it directly. Correctness of the
+        // post-compaction write (asserted below) is the requirement; the recovery
+        // mechanism is the model's choice. See docs/developing/gpu-nightly-suite.md.
 
         // A tool call the model requested in a post-compaction turn: under
         // enforced egress isolation this request could only have reached the

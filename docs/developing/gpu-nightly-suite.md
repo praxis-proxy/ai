@@ -71,9 +71,58 @@ Details per use case:
   against both major SDK generations to catch protocol drift. Tests marked
   `real_inference` / `vllm_compat` run only in live (GPU) mode; the same tests
   run on PRs against the CPU simulator (`VLLM_TEST_BACKEND=simulator`).
+- **CLI self-compaction (Codex + Claude Code).** Two acceptance tests prove a
+  real pinned CLI grows its context past its own window, performs its **own**
+  self-compaction, and keeps working through Praxis afterward — without ever
+  calling an SDK compact endpoint, injecting a canned summary, or enabling a
+  Praxis compaction filter. The compaction signal is captured directly: for Codex
+  from the client's inline-summarization POST on the client→upstream wire
+  (`codex_http::pinned_codex_compaction_crosses_context_window_over_http`), and
+  for Claude Code from its stream-json `compact_boundary {trigger: auto}` event
+  (`claude_code_vllm::pinned_claude_code_compaction_crosses_context_window_on_native_vllm`).
+  See the limitation note below for how task-completion is graded on Qwen3-8B.
 
 See also the vision companion workflow (`anthropic-vllm-vision.yaml`), which
 covers the Anthropic SDK image/vision path against `Qwen3-VL-4B-Instruct`.
+
+### Known model limitation: self-compaction task completion on Qwen3-8B
+
+The self-compaction tests prove two things independently of model capability,
+and these are **always hard assertions**:
+
+1. The pinned CLI performed its **own** self-compaction (Codex: the summarization
+   request observed on the wire; Claude Code: the `compact_boundary {trigger: auto}`
+   event), and that traffic **traversed Praxis**.
+2. The session **continued after the boundary** — at least one more successful
+   tool call flowed through Praxis post-compaction.
+
+What Qwen3-8B cannot do reliably is **finish the downstream chore** after it
+self-compacts. It either falls into a loop re-reading the same ballast file until
+the deadline (Codex), or drops the high-entropy marker across its own lossy
+summary and writes the wrong value. This is a model-capability limit, not a proxy
+or flake.
+
+Grading differs per lane by design:
+
+- **Codex — XFAIL on Qwen3-8B.** After the hard wire-compaction proof, the
+  downstream task-completion assertions (correct `result.txt`, wire ordering of
+  the write after compaction, the ordered JSONL trace, `./verify.sh`) are
+  **skipped** when the live model matches `COMPACTION_XFAIL_MODEL` (`qwen3-8b`),
+  with an `XFAIL (...)` line logged. The lane uses a shorter deadline
+  (`COMPACTION_XFAIL_CHILD_TIMEOUT`) on that model so a looping run ends quickly
+  after compaction is already captured. Point the test at a more capable model and
+  the full completion oracle runs as hard assertions automatically.
+- **Claude Code — strict.** This lane keeps full completion as hard assertions
+  (correct uppercase marker written into `result/value.txt`, then a passing
+  `./verify.sh`). The prompt steers a post-compaction re-read of `source/value.txt`
+  to recover the marker from disk, but the oracle does not mandate that specific
+  tool call — only that the post-compaction write is correct.
+
+To iterate on just these two tests without running the ~90-minute full suite,
+dispatch `vllm-integration.yaml` with `run_compaction_only=true` (plus
+`run_live_vllm=true`): it provisions the GPU runner and runs only the Codex and
+Claude Code compaction steps, skipping the full Responses suite and every other
+acceptance step.
 
 ## Jobs in the main suite (`vllm-integration.yaml`)
 
