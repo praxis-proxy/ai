@@ -25,7 +25,10 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -39,11 +42,12 @@ use serde::Deserialize;
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
-        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
-        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
-        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
-        set_credential_metadata,
+        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CANDIDATE_COUNT,
+        ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_OUTCOME, ROUTE_PROVIDER_HOP_REQUEST_ID,
+        ROUTE_RANK, ROUTE_SELECTION_GROUP, ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID,
+        SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
+    metrics::{self, DecisionOutcome, SessionEvent},
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
     picker,
 };
@@ -94,17 +98,33 @@ const MAX_SKIP_PATH_LEN: usize = 256;
 /// filter: intelligent_route
 /// overlay_file: /etc/praxis/routing/routing-overlay.json
 /// model_header: x-model
+/// clusters: [east-inference, west-provider-gateway]
 /// expected_overlay_scope:
 ///   network: production-grid
 ///   gateway: public-edge
 ///   namespace: grid-system
 ///   local_site: east-edge
 /// ```
+///
+/// `clusters` lists the clusters the downstream `load_balancer` declares.
+/// When present it is authoritative: pipeline validation checks every entry
+/// against the load balancer, and any overlay revision naming another
+/// cluster is rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntelligentRouteConfig {
     /// Static list of route candidates (mutually exclusive with `overlay_file`).
     candidates: Option<Vec<CandidateConfig>>,
+
+    /// Clusters the downstream `load_balancer` declares for this filter.
+    ///
+    /// When set, the list is authoritative: pipeline validation checks every
+    /// entry against the `load_balancer`, and a candidate (static or from any
+    /// overlay revision) naming a cluster outside the list is rejected — at
+    /// build for the initial snapshot, and on reload while retaining the
+    /// previous snapshot. When unset, only the initial snapshot's clusters are
+    /// reported to pipeline validation and overlay reloads are not checked.
+    clusters: Option<Vec<String>>,
 
     /// Name of the local site (required in static mode, provided by overlay
     /// in overlay mode).
@@ -346,13 +366,18 @@ enum AffinityOutcome<'a> {
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
-/// **Metadata:** on successful selection, bounded in-process filter
-/// metadata is written under the `intelligent_route.` namespace (`kind`, `name`,
-/// `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
+/// **Metadata:** every request leaves `intelligent_route.outcome` in the
+/// in-process filter metadata: `routed`, `reused`, `no_candidate`, `invalid`,
+/// `skipped`, `management`, or `preserved`. When a capability lookup happened,
+/// `intelligent_route.candidate_count` records how many candidates the serving
+/// snapshot carries for it before admission filtering. On successful
+/// selection, bounded metadata is written under the same namespace (`kind`,
+/// `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
 /// optionally `rank`, `selection_group`, `selection_mode`, and
 /// `selection_tier`). When session affinity is enabled,
 /// `session.bound`, `session.reused`, and `session.failover` keys are also
-/// written. When the selected cluster is present in `provider_hop_clusters`,
+/// written. All keys are available to the access log as `metadata.<key>`,
+/// including on 400 and 404 rejections. When the selected cluster is present in `provider_hop_clusters`,
 /// client-supplied `x-ai-routing-candidate`,
 /// `x-ai-routing-request-id`, and `x-ai-routing-revision` values
 /// are removed and replaced with the selected stable ID, a generated
@@ -362,6 +387,25 @@ enum AffinityOutcome<'a> {
 /// `peer_identity_trust` before consuming them.
 /// No credential reference or value is forwarded. No request-time database,
 /// control-plane, or metrics lookups are performed.
+///
+/// **Metrics:** the filter exports Prometheus series through the shared
+/// recorder. Label values come from closed vocabularies or from the bounded
+/// snapshot contract, never from client input, and candidate `stable_id`
+/// values are never used as labels.
+///
+/// - `praxis_ai_intelligent_route_decisions_total{outcome, kind}` — one per request; `outcome` uses the metadata
+///   vocabulary above and `kind` is `inference_model`, `mcp_tool`, or `none` before a lookup exists.
+/// - `praxis_ai_intelligent_route_selected_total{cluster, site, selection_mode}` — one per fresh selection (session
+///   reuse is not a selection).
+/// - `praxis_ai_intelligent_route_session_total{event}` — `bound`, `reused`, or `failover`, when session affinity is
+///   enabled.
+/// - `praxis_ai_intelligent_route_session_bindings` — live bindings in this process.
+/// - `praxis_ai_intelligent_route_snapshot_candidates` — candidates in the serving snapshot.
+/// - `praxis_ai_intelligent_route_snapshot_reloads_total{result}` — `accepted`, `unchanged`, `rejected`, or
+///   `read_error`, per overlay reload attempt.
+///
+/// Decision latency is already covered by the core
+/// `praxis_filter_duration_seconds{filter="intelligent_route"}` histogram.
 ///
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
 /// and `mcp.name` is present, `mcp_tool` candidates are matched.
@@ -449,8 +493,13 @@ enum AffinityOutcome<'a> {
 /// already-mounted Secret without rebuilding the filter pipeline.
 /// Every cluster name that may appear in any overlay version must
 /// already be configured in the downstream `load_balancer` filter.
-/// An overlay that references an unknown cluster will cause
-/// request-time failures, not a reload rejection.
+/// Pipeline validation checks the clusters this filter reports — the
+/// `clusters` list when configured, otherwise the clusters named by the
+/// initial snapshot plus `management_cluster` — so a cold-start overlay that
+/// names an unknown cluster fails pipeline build. With `clusters` configured,
+/// a reload naming a cluster outside the list is rejected and the previous
+/// snapshot is retained; without it, such a reload is accepted and the
+/// request fails when the `load_balancer` cannot resolve the cluster.
 ///
 /// [`ArcSwap`]: arc_swap::ArcSwap
 pub struct IntelligentRouteFilter {
@@ -468,6 +517,12 @@ pub struct IntelligentRouteFilter {
     session_affinity: Option<SessionAffinity>,
     /// Atomic snapshot of routing state (candidates + `local_site`).
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    /// Authoritative cluster allowlist (None = report the initial snapshot only).
+    allowed_clusters: ClusterAllowlist,
+    /// Whether the snapshot-size gauge has been published from the request
+    /// path. Construction may run before the metrics recorder is installed,
+    /// so the first request republishes it.
+    snapshot_gauge_published: AtomicBool,
 }
 
 impl IntelligentRouteFilter {
@@ -493,7 +548,8 @@ impl IntelligentRouteFilter {
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
         let skip_paths = validate_skip_paths(&cfg.skip_paths)?;
         let management_cluster = validate_management_cluster(cfg.management_cluster.as_deref(), &skip_paths)?;
-        let (snapshot, reload_handle) = build_route_snapshot(&mut cfg)?;
+        let allowed_clusters = validate_clusters(cfg.clusters.take())?;
+        let (snapshot, reload_handle) = build_route_snapshot(&mut cfg, allowed_clusters.as_ref())?;
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
 
@@ -505,7 +561,16 @@ impl IntelligentRouteFilter {
             provider_hop_clusters,
             session_affinity,
             snapshot,
+            allowed_clusters,
+            snapshot_gauge_published: AtomicBool::new(false),
         }))
+    }
+
+    /// Publish the serving snapshot's candidate count once from the request path.
+    fn publish_snapshot_gauge_once(&self) {
+        if !self.snapshot_gauge_published.swap(true, Ordering::Relaxed) {
+            metrics::set_snapshot_candidates(self.snapshot.load().candidates.len());
+        }
     }
 
     /// Handle a management/discovery path that bypasses model resolution.
@@ -547,6 +612,7 @@ impl IntelligentRouteFilter {
         kind: CapabilityKind,
         name: &str,
     ) -> Result<FilterAction, FilterError> {
+        ctx.set_metadata(ROUTE_CANDIDATE_COUNT, candidate_count(snap, kind, name).to_string());
         let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
         let outcome = resolve_affinity(
             self.session_affinity.as_ref(),
@@ -556,6 +622,8 @@ impl IntelligentRouteFilter {
             name,
         );
         if let AffinityOutcome::Reused(c) = outcome {
+            record_outcome(ctx, DecisionOutcome::Reused, Some(kind));
+            metrics::record_session_event(SessionEvent::Reused);
             return apply_reused(
                 ctx,
                 &snap.local_site,
@@ -570,8 +638,11 @@ impl IntelligentRouteFilter {
             picker::select_candidate(&snap.candidates, &snap.group_index, kind, name, snap.selection_mode)
         else {
             tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
+            record_outcome(ctx, DecisionOutcome::NoCandidate, Some(kind));
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
+        record_outcome(ctx, DecisionOutcome::Routed, Some(kind));
+        metrics::record_selected(c, snap.selection_mode);
         apply_route(
             ctx,
             &snap.local_site,
@@ -591,10 +662,16 @@ impl IntelligentRouteFilter {
 /// Return type for snapshot builders: shared snapshot + optional watcher.
 type SnapshotResult = Result<(Arc<ArcSwap<RouteSnapshot>>, Option<OverlayReloadHandle>), FilterError>;
 
+/// The optional authoritative cluster allowlist, shared with the overlay watcher.
+type ClusterAllowlist = Option<Arc<BTreeSet<Arc<str>>>>;
+
 /// Select and build the routing snapshot from the two mutually exclusive
 /// sources: an overlay file (hot-reloadable) or an inline static candidate
 /// list. Consumes the relevant fields out of `cfg`.
-fn build_route_snapshot(cfg: &mut IntelligentRouteConfig) -> SnapshotResult {
+fn build_route_snapshot(
+    cfg: &mut IntelligentRouteConfig,
+    allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
+) -> SnapshotResult {
     if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
         return Err("intelligent_route: cannot set both overlay_file and candidates".into());
     }
@@ -603,12 +680,12 @@ fn build_route_snapshot(cfg: &mut IntelligentRouteConfig) -> SnapshotResult {
     }
     if let Some(path) = cfg.overlay_file.take() {
         let reload = cfg.reload.take().unwrap_or_default();
-        build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope.take())
+        build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope.take(), allowed_clusters)
     } else if let Some(candidates_raw) = cfg.candidates.take() {
         if cfg.reload.is_some() {
             return Err("intelligent_route: reload block is not valid with static candidates".into());
         }
-        build_static_snapshot(candidates_raw, cfg.local_site.take())
+        build_static_snapshot(candidates_raw, cfg.local_site.take(), allowed_clusters)
     } else {
         Err("intelligent_route: either overlay_file or candidates must be set".into())
     }
@@ -619,6 +696,7 @@ fn build_overlay_snapshot(
     path: PathBuf,
     reload: &ReloadConfig,
     expected_scope: Option<ExpectedOverlayScope>,
+    allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
 ) -> SnapshotResult {
     let content = overlay::read_overlay_bounded(&path).map_err(|e| {
         FilterError::from(format!(
@@ -627,6 +705,7 @@ fn build_overlay_snapshot(
         ))
     })?;
     let snap = RouteSnapshot::from_overlay_with_scope(&content, expected_scope.as_ref())?;
+    accept_initial_snapshot(&snap, allowed_clusters)?;
     tracing::info!(
         path = %path.display(),
         contract_format = ?snap.contract_format,
@@ -643,6 +722,7 @@ fn build_overlay_snapshot(
             Arc::clone(&shared),
             reload.debounce_ms,
             expected_scope,
+            allowed_clusters.map(Arc::clone),
         )?)
     } else {
         None
@@ -651,7 +731,11 @@ fn build_overlay_snapshot(
 }
 
 /// Build a static snapshot from inline candidates.
-fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Option<String>) -> SnapshotResult {
+fn build_static_snapshot(
+    candidates_raw: Vec<CandidateConfig>,
+    local_site: Option<String>,
+    allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
+) -> SnapshotResult {
     let local_site_str = local_site
         .ok_or_else(|| FilterError::from("intelligent_route: local_site is required when candidates is set"))?;
     descriptor::validate_local_site(&local_site_str)?;
@@ -665,7 +749,35 @@ fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Optio
     }
     let candidates = descriptor::validate_candidates(candidates_raw)?;
     let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
+    accept_initial_snapshot(&snap, allowed_clusters)?;
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
+}
+
+/// Check the initial snapshot against the allowlist and publish its size.
+fn accept_initial_snapshot(
+    snap: &RouteSnapshot,
+    allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
+) -> Result<(), FilterError> {
+    if let Some(allowed) = allowed_clusters {
+        overlay::validate_snapshot_clusters(snap, allowed)?;
+    }
+    metrics::set_snapshot_candidates(snap.candidates.len());
+    Ok(())
+}
+
+/// Validate and deduplicate the optional authoritative cluster allowlist.
+fn validate_clusters(clusters: Option<Vec<String>>) -> Result<ClusterAllowlist, FilterError> {
+    let Some(clusters) = clusters else {
+        return Ok(None);
+    };
+    let mut validated: BTreeSet<Arc<str>> = BTreeSet::new();
+    for cluster in clusters {
+        descriptor::validate_name("clusters", &cluster)?;
+        if !validated.insert(Arc::from(cluster.as_str())) {
+            return Err(format!("intelligent_route: duplicate clusters entry '{cluster}'").into());
+        }
+    }
+    Ok(Some(Arc::new(validated)))
 }
 
 /// Build the runtime [`SessionAffinity`] from config, if enabled.
@@ -806,7 +918,30 @@ impl HttpFilter for IntelligentRouteFilter {
         true
     }
 
+    /// The clusters pipeline validation checks against the `load_balancer`.
+    ///
+    /// With a configured `clusters` list that list is authoritative; otherwise
+    /// the clusters named by the serving snapshot are reported. The
+    /// `management_cluster` is always included.
+    fn selected_clusters(&self) -> Vec<String> {
+        let mut clusters: BTreeSet<String> = match &self.allowed_clusters {
+            Some(allowed) => allowed.iter().map(ToString::to_string).collect(),
+            None => self
+                .snapshot
+                .load()
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.to_string())
+                .collect(),
+        };
+        if let Some(management) = &self.management_cluster {
+            clusters.insert(management.to_string());
+        }
+        clusters.into_iter().collect()
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        self.publish_snapshot_gauge_once();
         // Client-supplied routing protocol context is never allowed to survive an
         // edge routing decision.
         ctx.request_headers_to_remove
@@ -818,11 +953,13 @@ impl HttpFilter for IntelligentRouteFilter {
 
         // Management and discovery endpoints bypass model resolution entirely.
         if let Some(action) = self.try_management_skip(ctx) {
+            record_outcome(ctx, DecisionOutcome::Management, None);
             return Ok(action);
         }
 
         if ctx.cluster.is_some() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
+            record_outcome(ctx, DecisionOutcome::Preserved, None);
             return Ok(FilterAction::Continue);
         }
 
@@ -831,8 +968,14 @@ impl HttpFilter for IntelligentRouteFilter {
 
         let (kind, name) = match lookup {
             Lookup::Route { kind, name } => (kind, name),
-            Lookup::Skip => return Ok(FilterAction::Continue),
-            Lookup::Invalid => return Ok(FilterAction::Reject(Rejection::status(400))),
+            Lookup::Skip => {
+                record_outcome(ctx, DecisionOutcome::Skipped, None);
+                return Ok(FilterAction::Continue);
+            },
+            Lookup::Invalid => {
+                record_outcome(ctx, DecisionOutcome::Invalid, None);
+                return Ok(FilterAction::Reject(Rejection::status(400)));
+            },
         };
 
         self.select_and_route(ctx, &snap, kind, &name)
@@ -897,6 +1040,11 @@ fn record_session(
 ) {
     let bound = if let Some(key) = session_key {
         store_binding(affinity, key, stable_id);
+        metrics::record_session_event(if failover {
+            SessionEvent::Failover
+        } else {
+            SessionEvent::Bound
+        });
         true
     } else {
         false
@@ -1091,12 +1239,46 @@ fn store_binding(affinity: &SessionAffinity, key: &str, stable_id: &Arc<str>) {
             stable_id: Arc::clone(stable_id),
         },
     );
+    metrics::set_session_bindings(affinity.bindings.len());
 }
 
 /// Remove all expired bindings.
 fn evict_expired(affinity: &SessionAffinity) {
     let now = Instant::now();
     affinity.bindings.retain(|_, b| b.expires > now);
+    metrics::set_session_bindings(affinity.bindings.len());
+}
+
+// -----------------------------------------------------------------------------
+// Decision Record
+// -----------------------------------------------------------------------------
+
+/// Record how the request left the filter, as metadata and as a metric.
+///
+/// Written on every path, including rejections, so access logs and
+/// dashboards see the same vocabulary.
+fn record_outcome(ctx: &mut HttpFilterContext<'_>, outcome: DecisionOutcome, kind: Option<CapabilityKind>) {
+    ctx.set_metadata(ROUTE_OUTCOME, outcome.as_str());
+    metrics::record_decision(outcome, kind);
+}
+
+/// Candidates the snapshot carries for `(kind, name)`, before admission.
+///
+/// Grouped capabilities are counted from the precomputed index; ungrouped
+/// snapshots fall back to the same linear scan the legacy picker performs.
+fn candidate_count(snap: &RouteSnapshot, kind: CapabilityKind, name: &str) -> usize {
+    snap.group_index
+        .get(&kind)
+        .and_then(|by_name| by_name.get(name))
+        .map_or_else(
+            || {
+                snap.candidates
+                    .iter()
+                    .filter(|candidate| candidate.kind == kind && &*candidate.name == name)
+                    .count()
+            },
+            |groups| groups.iter().map(|group| group.candidate_indexes.len()).sum(),
+        )
 }
 
 // -----------------------------------------------------------------------------
@@ -1206,6 +1388,8 @@ fn write_provider_context(
     reason = "tests"
 )]
 mod tests {
+    use std::future::Future;
+
     use http::Method;
     use praxis_ai_apis::hash::{Sha256, hex};
 
@@ -2232,6 +2416,8 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            allowed_clusters: None,
+            snapshot_gauge_published: AtomicBool::new(false),
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -2386,6 +2572,8 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            allowed_clusters: None,
+            snapshot_gauge_published: AtomicBool::new(false),
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
@@ -3092,6 +3280,8 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
+            allowed_clusters: None,
+            snapshot_gauge_published: AtomicBool::new(false),
         };
 
         let mut first = crate::test_utils::make_request(Method::POST, "/chat");
@@ -3187,7 +3377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
         std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
-        overlay::handle_overlay_reload(&path, &shared, None);
+        overlay::handle_overlay_reload(&path, &shared, None, None);
 
         let serving = shared.load();
         assert!(
@@ -3241,7 +3431,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
         std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
-        overlay::handle_overlay_reload(&path, &shared, None);
+        overlay::handle_overlay_reload(&path, &shared, None, None);
 
         let serving = shared.load();
         let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
@@ -3284,6 +3474,8 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
+            allowed_clusters: None,
+            snapshot_gauge_published: AtomicBool::new(false),
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
@@ -3386,6 +3578,370 @@ mod tests {
     }
 
     // ---- Test utilities ----
+
+    // ---- Decision record (praxis-proxy/ai#74 Phase 0) ----
+
+    #[tokio::test]
+    async fn routed_decision_records_outcome_and_candidate_count() {
+        let f = make_filter(&[
+            ("inference_model", "llama", "site-a", "inf-a"),
+            ("inference_model", "llama", "site-b", "inf-b"),
+            ("inference_model", "granite", "site-a", "inf-c"),
+        ]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("routed"));
+        assert_eq!(
+            ctx.get_metadata(ROUTE_CANDIDATE_COUNT),
+            Some("2"),
+            "candidate_count counts every candidate for the looked-up capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_model_records_no_candidate_outcome() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("unknown"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 404));
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("no_candidate"));
+        assert_eq!(ctx.get_metadata(ROUTE_CANDIDATE_COUNT), Some("0"));
+        assert_no_route_metadata(&ctx);
+    }
+
+    #[tokio::test]
+    async fn blank_model_records_invalid_outcome_without_candidate_count() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static(""));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 400));
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("invalid"));
+        assert!(
+            ctx.get_metadata(ROUTE_CANDIDATE_COUNT).is_none(),
+            "no lookup happened, so no candidate count is defined"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_model_header_records_skipped_outcome() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("skipped"));
+    }
+
+    #[tokio::test]
+    async fn management_path_records_management_outcome() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let req = crate::test_utils::make_request(Method::GET, "/v1/models");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("management"));
+    }
+
+    #[tokio::test]
+    async fn preset_cluster_records_preserved_outcome() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("earlier"));
+
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("earlier"));
+        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("preserved"));
+    }
+
+    #[tokio::test]
+    async fn reused_session_records_reused_outcome() {
+        let f = parse(
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+        )
+        .unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", HeaderValue::from_static("session-1"));
+
+        let mut first = crate::test_utils::make_filter_context(&req);
+        let _unused = f.on_request(&mut first).await.unwrap();
+        assert_eq!(first.get_metadata(ROUTE_OUTCOME), Some("routed"));
+
+        let mut second = crate::test_utils::make_filter_context(&req);
+        let _unused = f.on_request(&mut second).await.unwrap();
+        assert_eq!(second.get_metadata(ROUTE_OUTCOME), Some("reused"));
+    }
+
+    // ---- Metrics ----
+
+    #[test]
+    fn decision_metrics_count_outcomes_selections_and_sessions() {
+        let snapshot = metrics_emitted_by(async {
+            let f = parse(
+                "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+            )
+            .unwrap();
+            let _first = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
+            let _second = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
+            let _unknown = route_path_model(f.as_ref(), "/chat", "unknown").await;
+            let _invalid = route_path_model(f.as_ref(), "/chat", "").await;
+            let bare = crate::test_utils::make_request(Method::POST, "/chat");
+            let mut skipped = crate::test_utils::make_filter_context(&bare);
+            let _unused = f.on_request(&mut skipped).await.unwrap();
+            let models = crate::test_utils::make_request(Method::GET, "/v1/models");
+            let mut management = crate::test_utils::make_filter_context(&models);
+            let _unused = f.on_request(&mut management).await.unwrap();
+        });
+
+        let decisions = |outcome: &str, kind: &str| {
+            counter_value(
+                &snapshot,
+                metrics::DECISIONS_TOTAL,
+                &[("outcome", outcome), ("kind", kind)],
+            )
+        };
+        assert_eq!(decisions("routed", "inference_model"), Some(1));
+        assert_eq!(decisions("reused", "inference_model"), Some(1));
+        assert_eq!(decisions("no_candidate", "inference_model"), Some(1));
+        assert_eq!(decisions("invalid", "none"), Some(1));
+        assert_eq!(decisions("skipped", "none"), Some(1));
+        assert_eq!(decisions("management", "none"), Some(1));
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                metrics::SELECTED_TOTAL,
+                &[
+                    ("cluster", "inf-a"),
+                    ("site", "site-a"),
+                    ("selection_mode", "deterministic")
+                ],
+            ),
+            Some(1),
+            "only the fresh selection counts; a reused binding is not a new selection"
+        );
+        assert_eq!(
+            counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "bound")]),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "reused")]),
+            Some(1)
+        );
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SESSION_BINDINGS, &[]),
+            Some(1.0),
+            "one session is bound"
+        );
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SNAPSHOT_CANDIDATES, &[]),
+            Some(2.0),
+            "the static snapshot carries two candidates"
+        );
+    }
+
+    #[test]
+    fn affinity_failover_is_counted_as_a_session_event() {
+        let snapshot = metrics_emitted_by(async {
+            let f = parse(
+                "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+            )
+            .unwrap();
+            let _first = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
+            let _other = route_path_model_with_session(f.as_ref(), "granite", "session-1").await;
+        });
+        assert_eq!(
+            counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "failover")]),
+            None,
+            "an unknown model never reaches affinity resolution"
+        );
+        assert_eq!(
+            counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "bound")]),
+            Some(1)
+        );
+    }
+
+    // ---- Cluster validation ----
+
+    #[test]
+    fn selected_clusters_reports_static_candidate_clusters_and_management_cluster() {
+        let f = parse(
+            "local_site: site-a\nskip_paths: [/v1/models]\nmanagement_cluster: mgmt\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-b\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+        )
+        .unwrap();
+        assert_eq!(f.selected_clusters(), vec!["inf-a", "inf-b", "mgmt"]);
+    }
+
+    #[test]
+    fn clusters_allowlist_is_reported_as_selected_clusters() {
+        let f = parse(
+            "local_site: site-a\nclusters: [spare, inf-a]\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            f.selected_clusters(),
+            vec!["inf-a", "spare"],
+            "an explicit allowlist is authoritative, so core validates every listed cluster"
+        );
+    }
+
+    #[test]
+    fn static_candidate_outside_clusters_allowlist_is_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nclusters: [inf-a]\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+        );
+        assert!(
+            err.to_string().contains("inf-b") && err.to_string().contains("clusters"),
+            "candidate cluster outside the allowlist must be rejected at build: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_clusters_entry_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nclusters: [inf-a, inf-a]\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+        );
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn blank_clusters_entry_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nclusters: [\"\"]\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+        );
+        assert!(
+            err.to_string().contains("blank") || err.to_string().contains("non-blank"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cold_start_overlay_outside_clusters_allowlist_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let candidate = serde_json::json!([{
+            "kind": "inference_model", "name": "llama-3", "site": "site-a", "cluster": "provider-a", "fresh": true
+        }]);
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": false },
+            "clusters": ["provider-b"],
+        });
+        let err = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap())
+            .err()
+            .expect("overlay naming a cluster outside the allowlist must fail construction");
+        assert!(err.to_string().contains("provider-a"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn overlay_reload_outside_clusters_allowlist_retains_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let allowed = serde_json::json!([{
+            "kind": "inference_model", "name": "llama-3", "site": "site-a", "cluster": "provider-a", "fresh": true
+        }]);
+        std::fs::write(&path, versioned_envelope(&allowed)).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": true, "debounce_ms": 10 },
+            "clusters": ["provider-a"],
+        });
+        let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
+        assert_eq!(filter.selected_clusters(), vec!["provider-a"]);
+        let before = route_path_model(filter.as_ref(), "/v1/chat/completions", "llama-3").await;
+        assert_eq!(before.1.as_deref(), Some("provider-a"));
+
+        let foreign = serde_json::json!([{
+            "kind": "inference_model", "name": "llama-3", "site": "site-a", "cluster": "provider-b", "fresh": true
+        }]);
+        std::fs::write(&path, versioned_envelope(&foreign)).unwrap();
+        // The watcher waits for the 10 ms debounce before parsing; allow it to
+        // reject the update and retain the last-known-good snapshot first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = route_path_model(filter.as_ref(), "/v1/chat/completions", "llama-3").await;
+        assert!(matches!(after.0, FilterAction::Continue));
+        assert_eq!(
+            after.1.as_deref(),
+            Some("provider-a"),
+            "a reload naming a cluster outside the allowlist must be rejected"
+        );
+    }
+
+    // ---- Metrics test utilities ----
+
+    /// Run `scenario` on the current thread with a local metrics recorder and
+    /// return every metric it emitted.
+    fn metrics_emitted_by<F>(scenario: F) -> Vec<(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)>
+    where
+        F: Future<Output = ()>,
+    {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || runtime.block_on(scenario));
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key, value))
+            .collect()
+    }
+
+    fn metric_value<'a>(
+        snapshot: &'a [(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<&'a metrics_util::debugging::DebugValue> {
+        snapshot
+            .iter()
+            .find(|(key, _)| {
+                key.key().name() == name
+                    && labels.iter().all(|(label, expected)| {
+                        key.key()
+                            .labels()
+                            .any(|candidate| candidate.key() == *label && candidate.value() == *expected)
+                    })
+            })
+            .map(|(_, value)| value)
+    }
+
+    fn counter_value(
+        snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<u64> {
+        match metric_value(snapshot, name, labels) {
+            Some(metrics_util::debugging::DebugValue::Counter(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn gauge_value(
+        snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        match metric_value(snapshot, name, labels) {
+            Some(metrics_util::debugging::DebugValue::Gauge(value)) => Some(value.into_inner()),
+            _ => None,
+        }
+    }
 
     fn assert_no_route_metadata(ctx: &HttpFilterContext<'_>) {
         for key in &[
@@ -3540,6 +4096,8 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
+            allowed_clusters: None,
+            snapshot_gauge_published: AtomicBool::new(false),
         }
     }
 

@@ -303,6 +303,7 @@ filter_chains:
       - filter: intelligent_route
         overlay_file: "{overlay}"
         model_header: X-Model
+        clusters: [granite-local, llama-remote]
         reload:
           enabled: true
           debounce_ms: 200

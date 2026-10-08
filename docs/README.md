@@ -13,6 +13,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 ## Architecture
 
 - [AI inference](architecture/ai-inference.md)
+- [Routing facts](architecture/routing-facts.md)
 - [Agentic protocols](architecture/agentic-protocols.md)
 - [Response store](architecture/response-store.md)
 - [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md)
