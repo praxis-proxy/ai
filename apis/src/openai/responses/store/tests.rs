@@ -18,16 +18,17 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::{
-    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    ResponseStoreFilter,
     config::{ResponseStoreConfig, validate_config},
-    list_input_items,
 };
 use crate::{
     openai::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    service::responses::input_items::DEFAULT_PAGE_LIMIT,
+    service::responses::{
+        InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items,
+    },
     store::{
         DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
         SqliteResponseStore,
@@ -403,7 +404,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
@@ -2910,7 +2911,7 @@ fn postgres_config_allows_private_with_private_database_url_opt_in() {
 }
 
 #[test]
-fn postgres_config_allows_unspecified_with_private_database_url_opt_in() {
+fn postgres_config_rejects_unspecified_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
@@ -2923,8 +2924,8 @@ allow_private_database_url: true
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_ok(),
-        "explicit private database URL opt-in should allow unspecified hosts"
+        result.is_err(),
+        "unspecified database hosts must remain blocked after the private-target opt-in"
     );
 }
 
@@ -4399,6 +4400,75 @@ async fn get_input_items_with_cursor() {
     assert_eq!(data[0]["id"], "item_3", "first item should be item_3 after item_2");
     assert_eq!(data[1]["id"], "item_4", "second item should be item_4");
     assert_eq!(body["has_more"], false, "should indicate no more items after this page");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_duplicate_ids_paginate_to_later_items() {
+    let filter = make_filter();
+    let registry = init_store_and_seed(
+        "resp_duplicate_cursor",
+        "default",
+        json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": "c", "type": "item_reference"}
+        ]),
+    )
+    .await;
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for expected_has_more in [true, true, false] {
+        let after = cursor
+            .as_ref()
+            .map_or_else(String::new, |value| format!("&after={value}"));
+        let req = crate::test_utils::make_request(
+            http::Method::GET,
+            &format!("/v1/responses/resp_duplicate_cursor/input_items?limit=1&order=asc{after}"),
+        );
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 200, "every valid duplicate-ID page must return 200");
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let item_id = body["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .and_then(|item| item["id"].as_str())
+            .unwrap();
+        let last_id = body["last_id"].as_str().unwrap();
+        assert_eq!(last_id, item_id, "last_id must project the final data item ID");
+        assert_eq!(
+            body["has_more"], expected_has_more,
+            "has_more must track whether another input occurrence remains"
+        );
+        let next_cursor = body["next_cursor"].as_str();
+        if expected_has_more {
+            assert_ne!(
+                next_cursor,
+                Some(item_id),
+                "duplicate reference targets need a separate HTTP continuation cursor"
+            );
+        }
+        ids.push(item_id.to_owned());
+        cursor = next_cursor.map(str::to_owned);
+    }
+
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("dup"),
+        "the first reference target must remain unchanged"
+    );
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("dup"),
+        "the second reference must retain the same target ID"
+    );
+    assert_eq!(
+        ids.get(2).map(String::as_str),
+        Some("c"),
+        "the position cursor must make the later unique item reachable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6645,6 +6715,212 @@ conversations_table: openai_conversations
     assert!(
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// InputItemPage serialization & allocation tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn input_item_page_serialization_empty_page() {
+    let page = InputItemPage {
+        data: vec![],
+        next_cursor: None,
+        has_more: false,
+    };
+    let json_str = serde_json::to_string(&page).expect("empty page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": [],
+            "has_more": false,
+            "first_id": null,
+            "last_id": null
+        }),
+        "empty page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_full_page() {
+    let items: Vec<serde_json::Value> = (0..20)
+        .map(|i| {
+            json!({
+                "id": format!("msg_item_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": format!("content {i}")
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_item_19".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("full page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_item_0",
+            "last_id": "msg_item_19"
+        }),
+        "full page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_maximum_size_100_items() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_max_{i}"),
+                "type": "message",
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i} with additional metadata and details.")
+                    }
+                ],
+                "metadata": {
+                    "index": i,
+                    "tag": "max_page_test"
+                }
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_max_99".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("100-item page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_max_0",
+            "last_id": "msg_max_99"
+        }),
+        "maximum size 100-item page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_non_object_and_cursor_fallback() {
+    let page = InputItemPage {
+        data: vec![json!("plain string input"), json!(12345)],
+        next_cursor: Some("2".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("non-object page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": ["plain string input", 12345],
+            "has_more": true,
+            "first_id": null,
+            "last_id": "2"
+        }),
+        "non-object page serialization must fall back last_id to next_cursor"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_100_item_nontrivial_allocation_evidence() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_nontrivial_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i}: {}", "x".repeat(200))
+                    }
+                ],
+                "metadata": {
+                    "item_index": i,
+                    "nested_info": {
+                        "key_a": "value_a",
+                        "key_b": 42
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let page = InputItemPage {
+        data: items,
+        next_cursor: Some("msg_nontrivial_99".to_owned()),
+        has_more: true,
+    };
+
+    // Legacy pattern: serde_json::json! deep-copies page.data into a second Value tree
+    let legacy_fn = |p: &InputItemPage| -> Vec<u8> {
+        let first_id = p.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+        let last_id = p
+            .data
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or(p.next_cursor.as_deref());
+
+        let body = serde_json::json!({
+            "object": "list",
+            "data": p.data,
+            "has_more": p.has_more,
+            "first_id": first_id,
+            "last_id": last_id,
+        });
+        serde_json::to_vec(&body).unwrap()
+    };
+
+    // New pattern: direct serialization from &page without second Value or Vec<Value> tree
+    let direct_fn = |p: &InputItemPage| -> Vec<u8> { serde_json::to_vec(p).unwrap() };
+
+    let legacy_bytes = legacy_fn(&page);
+    let direct_bytes = direct_fn(&page);
+
+    assert_eq!(
+        legacy_bytes, direct_bytes,
+        "direct serialization output must match legacy json! output byte-for-byte"
+    );
+
+    let legacy_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(legacy_fn(&page));
+    });
+
+    let direct_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(direct_fn(&page));
+    });
+
+    assert!(
+        direct_allocs.count_total < legacy_allocs.count_total,
+        "direct serialization must perform fewer allocations: direct={} legacy={}",
+        direct_allocs.count_total,
+        legacy_allocs.count_total
+    );
+
+    assert!(
+        direct_allocs.bytes_total < legacy_allocs.bytes_total,
+        "direct serialization must allocate fewer bytes: direct={} legacy={}",
+        direct_allocs.bytes_total,
+        legacy_allocs.bytes_total
     );
 }
 

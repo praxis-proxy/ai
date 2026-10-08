@@ -150,9 +150,11 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
-        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        /// Why admission failed (shared with sliding-window ledger).
+        /// Also distinguishes budget exhaustion from the `max_keys` cap.
         reason: DenialReason,
-        /// Remaining budget for this key at the time of the denial.
+        /// Remaining budget for this key at the time of the denial
+        /// (soft `include_remaining` / `include_used` annotation).
         remaining: u64,
     },
 }
@@ -306,6 +308,7 @@ impl TokenBucketLedger {
     /// admit and immediately decrement if enough tokens are available,
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        use super::ledger::DenialReason;
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
             return Decision::Denied {
                 retry_after_ms: 0,

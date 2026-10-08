@@ -1,0 +1,46 @@
+version: 1
+id: responses/client-tool-compat-mcp-namespace
+description: Codex MCP namespace group whose name carries the reserved __ delimiter lowered to a hashed flat function on a function-only Responses backend, then restored to a namespaced function_call.
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.client_tool_compat.mcp_namespace_lower_restore
+turns:
+  - name: mcp-namespace-lower-restore
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Read the hosts file.
+          store: false
+          stream: false
+          tools:
+            - type: namespace
+              name: mcp__codex_tui
+              description: Codex MCP tools.
+              tools:
+                - type: function
+                  name: read_file
+                  description: Read a file from the workspace.
+                  parameters:
+                    type: object
+                    properties:
+                      path:
+                        type: string
+                    required:
+                      - path
+                    additionalProperties: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

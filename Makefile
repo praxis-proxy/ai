@@ -194,6 +194,8 @@ test-integration:
 	cargo build -p praxis-ai-proxy --bin praxis-ai
 	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features $(INTEGRATION_EXPERIMENTAL_FEATURES)
+	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling \
 		$(if $(V),--nocapture)
@@ -203,8 +205,17 @@ test-inference-fixtures:
 	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
+# Both filters are needed. libtest matches each as a substring, and
+# `store::tests::pg_` is not a substring of
+# `store::tests::postgres_passes_shared_ownership_contract` (the character
+# after `pg` is `o`), so that test was never selected by this target and
+# never ran in CI. The file uses both naming conventions, so list both
+# prefixes; libtest ORs every filter that follows `--`, same as the
+# integration target below. When adding a PostgreSQL test, check it against
+# this list, because a missed prefix drops it silently.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
+		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
@@ -283,6 +294,7 @@ lint-xtask:
 	cargo xtask sync-example-readme
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
+	cargo xtask sync-flow-visualizers
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry

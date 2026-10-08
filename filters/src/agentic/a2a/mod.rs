@@ -26,13 +26,10 @@ use std::{borrow::Cow, fmt::Write as _, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::is_event_stream_content_type;
+use praxis_ai_apis::{is_event_stream_content_type, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::{
-        payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
-        value_safety::contains_control_chars,
-    },
+    builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
     parse_filter_config,
 };
 use tracing::{debug, trace};

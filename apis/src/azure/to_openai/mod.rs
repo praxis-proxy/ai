@@ -51,7 +51,8 @@ const DONE_SENTINEL: &[u8] = b"[DONE]";
 /// handles the `api-version` query parameter, strips Azure-specific
 /// response fields (`prompt_filter_results`, `content_filter_results`,
 /// `content_filter_offsets`), drops Azure async-filter annotation SSE
-/// chunks (no `delta` and no `finish_reason`), and normalizes error
+/// chunks with no Chat payload or metadata, keeps usage and metadata in
+/// chunks with empty choices, and normalizes error
 /// responses where Azure omits the `type` field.
 ///
 /// # YAML
@@ -357,11 +358,16 @@ fn rebuild_sse_frames(frames: &[SseFrame]) -> Vec<u8> {
 
 /// Append one SSE frame.
 ///
-/// Filter-only payloads skip the `data:` record, while a preceding `event:`
-/// line is still written (pre-existing behavior).
+/// Filter-only payloads drop the whole frame, including its event type.
 fn append_sse_frame(output: &mut Vec<u8>, frame: &SseFrame) {
     if frame.data.starts_with(DONE_SENTINEL) {
         output.extend_from_slice(b"data: [DONE]\n\n");
+        return;
+    }
+
+    let payload = response::normalize_sse_payload(&frame.data);
+    if matches!(payload, response::SsePayloadAction::Drop) {
+        debug!("dropping Azure async-filter annotation SSE chunk");
         return;
     }
 
@@ -371,12 +377,8 @@ fn append_sse_frame(output: &mut Vec<u8>, frame: &SseFrame) {
         output.extend_from_slice(b"\n");
     }
 
-    match response::normalize_sse_payload(&frame.data) {
-        response::SsePayloadAction::Drop => {
-            // Preserve pre-existing output: an unterminated `event:` line
-            // with no `data:` record. Correcting that is out of scope here.
-            debug!("dropping Azure async-filter annotation SSE chunk");
-        },
+    match payload {
+        response::SsePayloadAction::Drop => {},
         response::SsePayloadAction::ForwardOriginal(data) => {
             append_sse_data(output, data);
         },
@@ -754,17 +756,14 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_sse_frames_named_event_filter_only_chunk_matches_legacy_bytes() {
+    fn rebuild_sse_frames_named_event_filter_only_chunk_drops_entire_frame() {
         let data = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
         let frames = vec![SseFrame {
             event_type: Some("message".to_owned()),
             data: data.to_vec(),
         }];
         let rebuilt = rebuild_sse_frames(&frames);
-        assert_eq!(
-            rebuilt, b"event: message\n",
-            "filter-only named events must keep the pre-existing unterminated event: line"
-        );
+        assert_eq!(rebuilt, b"", "filter-only named events must emit no bytes");
     }
 
     #[test]
@@ -779,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_sse_frames_named_event_filter_only_then_clean_matches_legacy_bytes() {
+    fn rebuild_sse_frames_named_event_filter_only_then_clean_keeps_clean_frame() {
         let filter_only = br#"{"choices":[{"finish_reason":null,"content_filter_results":{}}]}"#;
         let content = br#"{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}]}"#;
         let frames = vec![
@@ -793,13 +792,13 @@ mod tests {
             },
         ];
         let rebuilt = rebuild_sse_frames(&frames);
-        let mut expected = b"event: message\n".to_vec();
+        let mut expected = Vec::new();
         expected.extend_from_slice(b"data: ");
         expected.extend_from_slice(content);
         expected.extend_from_slice(b"\n\n");
         assert_eq!(
             rebuilt, expected,
-            "unterminated event: from a filter-only frame must prefix the next record"
+            "dropping an annotation must not change the next event"
         );
     }
 

@@ -193,7 +193,7 @@ jobs:
           df -h /
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -281,8 +281,8 @@ jobs:
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.INFERENCE_MODEL }}
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
-            -s -m "critical_vllm"
+          uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py \
+            -s -m "critical_vllm" --sdk-version=3.x
 
       - name: vLLM container logs
         if: failure()

@@ -151,8 +151,8 @@ fn full_flow_validates_before_parsing_tools() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let validate = yaml
-        .find("      - filter: openai_responses_validate")
-        .expect("full-flow config should validate managed requests");
+        .find("      - filter: openai_responses_request")
+        .expect("full-flow config should process managed create requests");
     let tool_parse = yaml
         .find("      - filter: openai_tool_parse")
         .expect("full-flow config should parse tools for managed requests");
@@ -820,12 +820,18 @@ fn full_flow_local_stream_completion_updates_conversation() {
     ])
     .header("content-type", "text/event-stream")
     .start_with_shutdown();
+    // The full-flow config screens new local tool results through NeMo before
+    // model re-entry. With `max_tool_calls: 0` the web_search result resolves as
+    // `failed`, which is still a model-facing output and is therefore checked, so
+    // the guardrail phase needs a reachable endpoint that approves it.
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"ok"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_local_stream_conversation");
     let proxy = start_proxy(&load_full_flow_config_with_db(
         proxy_port,
         &db,
-        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+        &HashMap::from([("127.0.0.1:3001", backend.port()), ("127.0.0.1:3003", nemo.port())]),
     ));
 
     let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
@@ -869,6 +875,24 @@ fn full_flow_local_stream_completion_updates_conversation() {
     );
     assert_eq!(items[0]["content"][0]["text"], "search the weather");
     assert_eq!(items[1]["type"], "web_search_call");
+
+    // The guardrail phase must actually screen the failed web-search result
+    // before it re-enters the model; a test that never asserts the NeMo call
+    // would still pass if that phase were removed.
+    let nemo_requests = nemo.requests();
+    assert_eq!(
+        nemo_requests.len(),
+        1,
+        "NeMo must screen the failed web-search result exactly once",
+    );
+    let screened = &nemo_requests[0];
+    assert_eq!(screened.method, "POST", "guardrail callout must POST to NeMo");
+    assert_eq!(screened.uri, "/v1/checks", "guardrail callout must target /v1/checks");
+    assert!(
+        screened.body.contains("max_tool_calls was exhausted"),
+        "NeMo request must carry the failed web-search result: {}",
+        screened.body,
+    );
 }
 
 /// A chunked non-streaming Responses body must remain buffered until the
@@ -1646,6 +1670,121 @@ fn full_flow_agentic_single_pass_completes() {
 }
 
 #[test]
+fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
+    let first_model_response = json!({
+        "id": "resp_web_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_full_flow",
+            "status": "completed",
+            "action": {"type": "search", "query": "Praxis proxy"}
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let final_model_response = json!({
+        "id": "resp_web_search_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_web_search_final",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Praxis is a proxy.", "annotations": []}]
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_model_response.to_string()),
+        (200, final_model_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search = StatefulCapturingBackend::new(vec![(
+        200,
+        json!({
+            "web": {"results": [{
+                "title": "Praxis proxy",
+                "url": "https://praxis-proxy.github.io/",
+                "description": "A secure programmable proxy."
+            }]}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_agentic_web_search_guardrail");
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
+        "api_key: ${WEB_SEARCH_API_KEY}",
+        &format!(
+            "api_key: test-key\n                base_url: http://127.0.0.1:{}",
+            search.port()
+        ),
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3003", nemo.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search for Praxis proxy",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let request = json_post("/v1/responses", &request.to_string()).replacen(
+        "Content-Type: application/json",
+        "x-user-brave-key: test-key\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "web-search round trip failed: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(response["id"], "resp_web_search_final");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing web-search result should reach inference round two"
+    );
+    let second_input = serde_json::from_str::<Value>(&model.requests()[1].body).expect("second inference JSON");
+    assert!(
+        second_input["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("praxis-proxy.github.io"))
+            })),
+        "the checked web-search result should reach inference round two: {second_input:#}"
+    );
+
+    let search_requests = search.requests();
+    assert_eq!(search_requests.len(), 1, "the web-search dispatcher should run once");
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the new web-search result once"
+    );
+    let check: Value = serde_json::from_str(&nemo.requests()[0].body).expect("NeMo request JSON");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("praxis-proxy.github.io")),
+        "NeMo should receive the newly produced web-search result: {check:#}"
+    );
+}
+
+#[test]
 fn full_flow_agentic_file_search_round_trip() {
     let first_model_response = json!({
         "id": "resp_search",
@@ -1691,10 +1830,16 @@ fn full_flow_agentic_file_search_round_trip() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -1716,6 +1861,23 @@ fn full_flow_agentic_file_search_round_trip() {
     assert_eq!(response["output"][0]["type"], "file_search_call");
     assert_eq!(response["output"][0]["status"], "completed");
     assert_eq!(response["output"][1]["type"], "message");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing file-search result should reach inference round two"
+    );
+
+    let checks = nemo.requests();
+    assert_eq!(checks.len(), 1, "the local file-search result should be checked once");
+    assert_eq!(checks[0].uri, "/v1/checks");
+    let check: Value = serde_json::from_str(&checks[0].body).expect("NeMo request should contain JSON");
+    assert_eq!(check["messages"][0]["role"], "user");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Q4 revenue was $42 million")),
+        "NeMo should receive the newly produced file-search result: {check:#}"
+    );
 
     for request in model.requests() {
         let headers = request.headers.to_lowercase();
@@ -2011,10 +2173,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -2031,6 +2199,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
     let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the checked result should re-enter inference"
+    );
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the file-search result once"
+    );
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");

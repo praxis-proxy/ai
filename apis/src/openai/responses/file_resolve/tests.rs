@@ -1811,8 +1811,7 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
 fn display_redacts_signed_file_url() {
     use crate::openai::responses::file_resolve::resolve::ReferenceSource;
 
-    let source =
-        ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890".to_owned());
+    let source = ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890");
     let displayed = format!("{source}");
     assert!(
         !displayed.contains("SECRET_TOKEN"),

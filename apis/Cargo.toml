@@ -53,9 +53,11 @@ workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
+metrics = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
@@ -73,6 +75,7 @@ praxis-core = { workspace = true }
 # off-by-default experimental features in praxis 0.7.0.
 praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
+regex = { workspace = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -88,6 +91,7 @@ utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+metrics-util = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite", "postgres", "tls-native-tls"] }
 axum = { workspace = true }
 praxis-ai-store = { workspace = true, features = ["test-support"] }

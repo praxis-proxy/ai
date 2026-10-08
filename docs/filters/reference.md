@@ -48,7 +48,6 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_file_search_callout`](openai_file_search_callout.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
-| [`openai_operation`](openai_operation.md) | Classifies supported OpenAI operations from the request head. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
@@ -56,11 +55,16 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
 | [`openai_responses_request`](openai_responses_request.md) | Processes a Responses request body once and initializes state. |
-| [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
 | [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
+
+### Operation Classifier
+
+| Filter | Description |
+|--------|-------------|
+| [`ai_operation`](ai_operation.md) | Classifies supported AI operations from the request head. |
 
 ### Vertex
 

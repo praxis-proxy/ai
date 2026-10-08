@@ -74,9 +74,12 @@ pub(super) enum BackendReserve {
     Denied {
         /// Conservative delay before another admission attempt.
         retry_after_ms: u64,
-        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        /// Why admission failed — soft only forwards budget exhaustion
+        /// ([`DenialReason::WindowCapacity`]); protective denials stay hard 429.
         reason: DenialReason,
-        /// Remaining budget for the decided key at the time of denial.
+        /// Remaining budget for the decided key at denial time (not a
+        /// rule-wide aggregate). Soft `include_remaining` / `include_used`
+        /// use this for over-quota annotation.
         remaining: u64,
     },
 }

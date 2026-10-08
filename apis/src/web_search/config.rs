@@ -109,8 +109,9 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Optional callout-credential slot id. When set, the web-search callout uses the caller's
     /// per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot
-    /// name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily,
-    /// which authenticates via the request body.
+    /// name). Supported for every provider: each stages the secret as a destination-bound header
+    /// credential the executor injects after pinning the provider authority (Brave and You.com
+    /// under their provider header, Tavily as an `Authorization: Bearer` token).
     #[serde(default)]
     pub(crate) user_credential: Option<String>,
 
@@ -324,12 +325,6 @@ fn build_validated_config(
     raw: &WebSearchFilterConfig,
     api_key: String,
 ) -> Result<ValidatedConfig, FilterError> {
-    if raw.user_credential.is_some() && matches!(raw.provider, SearchProvider::Tavily) {
-        return Err(FilterError::from(format!(
-            "{filter_name}: user_credential is not supported for the Tavily provider \
-             (Tavily authenticates via the request body, not a header)"
-        )));
-    }
     if let Some(base_url) = raw.base_url.as_deref() {
         // Structural checks only (scheme, embedded credentials, path). Private-
         // address / SSRF enforcement is deferred to the outbound executor's
@@ -562,7 +557,7 @@ mod tests {
         for url in [
             "http://127.0.0.1:9999",
             "http://localhost:9999",
-            "http://169.254.169.254",
+            "http://169.254.1.1",
             "http://internal.search.example:8080",
         ] {
             let mut cfg = base_config();
@@ -723,15 +718,15 @@ mod tests {
     }
 
     #[test]
-    fn tavily_rejects_user_credential_slot() {
+    fn tavily_accepts_user_credential_slot() {
+        // Tavily now authenticates with an `Authorization: Bearer` header
+        // credential (issue #1389), so a per-user slot is supported just as it is
+        // for the other header-authenticated providers.
         let mut cfg = base_config();
         cfg.provider = SearchProvider::Tavily;
         cfg.user_credential = Some("tav".to_owned());
-        let err = build_config("anthropic_web_search", &cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("user_credential"),
-            "Tavily rejection must name the offending field: {err}"
-        );
+        let validated = build_config("anthropic_web_search", &cfg).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("tav"));
     }
 
     #[cfg(feature = "openai-responses")]

@@ -33,7 +33,22 @@
               "max_tokens": 64,
               "messages": [
                 {
-                  "content": "What is 2+2? Reply with just the number.",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Be concise."
+                    }
+                  ],
+                  "role": "system"
+                },
+                {
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "What is 2+2? Reply with just the number.",
+                      "citations": []
+                    }
+                  ],
                   "role": "user"
                 }
               ],
@@ -60,10 +75,6 @@
                 }
               },
               "stream": false,
-              "thinking": {
-                "budget_tokens": 1024,
-                "type": "enabled"
-              },
               "top_k": 40
             }
           }
@@ -122,6 +133,10 @@
             "value": {
               "max_completion_tokens": 64,
               "messages": [
+                {
+                  "content": "Be concise.",
+                  "role": "system"
+                },
                 {
                   "content": "What is 2+2? Reply with just the number.",
                   "role": "user"

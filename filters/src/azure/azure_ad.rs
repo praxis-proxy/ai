@@ -381,6 +381,7 @@ pub(crate) struct AzureAdConfig {
     pub(crate) authority_host: String,
 
     /// Allow a private authority host for a trusted internal identity service.
+    /// Cloud metadata, unspecified, and multicast addresses remain blocked.
     #[serde(default)]
     pub(crate) allow_private_authority: bool,
 }

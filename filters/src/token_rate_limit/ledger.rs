@@ -109,7 +109,8 @@ pub(super) enum Decision {
         retry_after_ms: u64,
         /// Bounded reason used for operational counters.
         reason: DenialReason,
-        /// Remaining budget for this key at the time of the denial.
+        /// Remaining budget for this key at the time of the denial
+        /// (soft `include_remaining` / `include_used` annotation).
         remaining: u64,
     },
 }

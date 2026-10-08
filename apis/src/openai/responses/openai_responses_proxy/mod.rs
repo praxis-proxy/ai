@@ -14,9 +14,6 @@
 //! history has changed it. Provider-owned conversation continuations
 //! send only their new message delta. It strips `previous_response_id`
 //! and `conversation` only after local rehydration consumes them.
-//! OpenAI-managed `prompt` template references fail closed unless the selected
-//! upstream declares `application_protocol: openai_responses` and
-//! `application_provider: openai`.
 
 mod config;
 
@@ -34,7 +31,7 @@ mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, collections::HashSet, fmt};
+use std::{borrow::Cow, collections::HashSet};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -43,11 +40,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
     SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
-use serde::{
-    Deserialize, Deserializer,
-    de::{IgnoredAny, MapAccess, Visitor},
-    ser::SerializeMap as _,
-};
+use serde::{Deserialize, ser::SerializeMap as _};
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
@@ -57,7 +50,7 @@ use super::{
     error::responses_error_rejection,
     state::{ResponsesState, normalize_input_owned},
 };
-use crate::{classifier::is_responses_create, json_body::SerializedJson};
+use crate::json_body::SerializedJson;
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter
@@ -72,12 +65,6 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 /// locally via the rehydrate filter.
 ///
 /// When no `ResponsesState` exists, preserves the request body unchanged.
-///
-/// Non-null `prompt` template references are rejected unless the load balancer
-/// selected a cluster declaring `application_protocol: openai_responses` and
-/// `application_provider: openai`. The check runs in the selected-upstream body
-/// phase, after routing has frozen that application metadata. Missing or
-/// different application metadata fails closed.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
@@ -118,24 +105,6 @@ pub struct ResponsesProxyFilter {
 }
 
 impl ResponsesProxyFilter {
-    /// Reject prompt templates unless the selected cluster declares OpenAI.
-    fn reject_prompt_for_non_openai_upstream(
-        ctx: &HttpFilterContext<'_>,
-        body: &Option<Bytes>,
-    ) -> Option<SelectedUpstreamBodyOutcome> {
-        (is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && request_has_prompt_template(ctx, body)
-            && !selected_backend_allows_prompt_templates(ctx))
-        .then(|| {
-            debug!("rejecting prompt template for non-OpenAI Responses backend");
-            SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "prompt templates are supported only when the selected upstream declares application_protocol: openai_responses and application_provider: openai",
-            ))
-        })
-    }
-
     /// Create from parsed YAML config.
     ///
     /// # Errors
@@ -651,9 +620,6 @@ impl HttpFilter for ResponsesProxyFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
-        if let Some(action) = Self::reject_prompt_for_non_openai_upstream(ctx, body) {
-            return Ok(action);
-        }
         let preserve_native_compaction = selected_backend_uses_native_responses(ctx);
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
@@ -741,114 +707,9 @@ struct EffectiveResponseMode {
     stream: bool,
 }
 
-/// Allocation-free result of validating a request while locating `prompt`.
-struct PromptTemplateProbe {
-    /// Whether at least one top-level `prompt` value was non-null.
-    present: bool,
-}
-
-impl<'de> Deserialize<'de> for PromptTemplateProbe {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(PromptTemplateProbeVisitor)
-    }
-}
-
-/// Streaming visitor that validates the full object without retaining values.
-struct PromptTemplateProbeVisitor;
-
-impl<'de> Visitor<'de> for PromptTemplateProbeVisitor {
-    type Value = PromptTemplateProbe;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a Responses request object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut present = false;
-        while let Some(field) = map.next_key::<PromptTemplateField>()? {
-            match field {
-                PromptTemplateField::Prompt => {
-                    present |= map.next_value::<Option<IgnoredAny>>()?.is_some();
-                },
-                PromptTemplateField::Other => {
-                    map.next_value::<IgnoredAny>()?;
-                },
-            }
-        }
-        Ok(PromptTemplateProbe { present })
-    }
-}
-
-/// Top-level field discriminator that never retains field names.
-enum PromptTemplateField {
-    /// The OpenAI-managed prompt template field.
-    Prompt,
-    /// Every other request field.
-    Other,
-}
-
-impl<'de> Deserialize<'de> for PromptTemplateField {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_identifier(PromptTemplateFieldVisitor)
-    }
-}
-
-/// Borrowing visitor for the top-level field discriminator.
-struct PromptTemplateFieldVisitor;
-
-impl Visitor<'_> for PromptTemplateFieldVisitor {
-    type Value = PromptTemplateField;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON object field")
-    }
-
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(if v == "prompt" {
-            PromptTemplateField::Prompt
-        } else {
-            PromptTemplateField::Other
-        })
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Whether raw JSON carries a non-null top-level `prompt`.
-///
-/// The visitor validates the top-level object and discards every value via
-/// [`IgnoredAny`], which `serde_json` skips iteratively — so a non-null `prompt`
-/// is detected at any nesting depth without recursion, a depth limit, or
-/// retained allocation. A body that is not valid JSON is not attributed to
-/// prompt templates: it cannot carry a prompt that a strict OpenAI-compatible
-/// backend would parse and honor, and rejecting a malformed request belongs to
-/// normal request validation, not this prompt-template guard.
-fn raw_request_has_prompt(body: &[u8]) -> bool {
-    serde_json::from_slice::<PromptTemplateProbe>(body).is_ok_and(|probe| probe.present)
-}
-
-/// Whether the canonical or passthrough request carries a non-null `prompt`.
-fn request_has_prompt_template(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
-    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
-        return state.request_body.get("prompt").is_some_and(|prompt| !prompt.is_null());
-    }
-
-    body.as_deref().is_some_and(raw_request_has_prompt)
-}
 
 /// Whether the selected backend uses the native Responses wire protocol.
 ///
@@ -856,11 +717,6 @@ fn request_has_prompt_template(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>
 /// provider name, since one provider may support multiple application protocols.
 fn selected_backend_uses_native_responses(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.selected_application_protocol() == Some("openai_responses")
-}
-
-/// Whether the selected cluster may receive OpenAI-managed prompt templates.
-fn selected_backend_allows_prompt_templates(ctx: &HttpFilterContext<'_>) -> bool {
-    selected_backend_uses_native_responses(ctx) && ctx.selected_application_provider() == Some("openai")
 }
 
 /// Align the typed Praxis response mode with the effective serialized request.

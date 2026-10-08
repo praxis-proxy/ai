@@ -23,11 +23,9 @@ use super::{
     validate::validate_metadata,
 };
 use crate::{
-    openai::{
-        operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter, classify},
-        responses::{DEFAULT_TENANT_ID, state::ResponsesState},
-    },
+    openai::responses::{DEFAULT_TENANT_ID, state::ResponsesState},
     operation::{ApplicationProtocol, Transport},
+    operation_classifier::{AiOperationFilter, AiOperationMatch, classify},
     store::{
         ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
         PersistedStateBackend, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
@@ -48,7 +46,7 @@ fn build_test_filter() -> OpenaiConversationsFilter {
     OpenaiConversationsFilter
 }
 
-/// Publish the same generic extension as `openai_operation`.
+/// Publish the same generic extension as `ai_operation`.
 fn insert_classifier_matches(ctx: &mut HttpFilterContext<'_>, req: &Request) {
     if let Some(matched) = classify(req.method.as_str(), req.uri.path(), Transport::Http) {
         ctx.extensions.insert(matched);
@@ -1492,7 +1490,7 @@ async fn impossible_classifier_body_metadata_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
-    let matched = ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap();
+    let matched = ctx.extensions.get_mut::<AiOperationMatch>().unwrap();
     matched.request_body = crate::operation::RequestBody::Json { required: true };
 
     let result = filter.on_request(&mut ctx).await;
@@ -1504,7 +1502,7 @@ async fn conversations_unknown_operation_id_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
-    ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap().operation_id = "unknownConversationOperation";
+    ctx.extensions.get_mut::<AiOperationMatch>().unwrap().operation_id = "unknownConversationOperation";
 
     assert!(filter.on_request(&mut ctx).await.is_err());
 }
@@ -1514,7 +1512,7 @@ async fn missing_classifier_match_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
-    let _removed = ctx.extensions.remove::<OpenAiOperationMatch>();
+    let _removed = ctx.extensions.remove::<AiOperationMatch>();
 
     let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
         panic!("expected missing classifier to fail closed");
@@ -1532,10 +1530,10 @@ async fn conversations_upgrade_cannot_bypass_the_classifier_dependency() {
     let mut ctx = base_owned_filter_context(&req);
 
     let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    let classifier = OpenaiOperationFilter::from_config(&config).unwrap();
+    let classifier = AiOperationFilter::from_config(&config).unwrap();
     drop(classifier.on_request(&mut ctx).await.unwrap());
     assert!(
-        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
         "the HTTP-only Conversations route must remain unclassified on a WebSocket handshake"
     );
 
@@ -1551,7 +1549,7 @@ async fn another_protocol_match_fails_closed() {
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
     ctx.extensions
-        .get_mut::<OpenAiOperationMatch>()
+        .get_mut::<AiOperationMatch>()
         .unwrap()
         .application_protocol = ApplicationProtocol::new("openai_responses");
 
@@ -1566,7 +1564,7 @@ async fn classified_operation_missing_required_path_parameter_is_an_error() {
     let (filter, store) = harness();
     let req = make_request(Method::POST, "/v1/conversations");
     let mut ctx = conv_ctx(&store, &req);
-    let matched = ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap();
+    let matched = ctx.extensions.get_mut::<AiOperationMatch>().unwrap();
     matched.operation_id = ConversationOperation::UpdateConversation.operation_id();
     matched.request_body = ConversationOperation::UpdateConversation.request_body();
 
@@ -1629,7 +1627,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
     let req = make_request(Method::POST, "/v1/conversations");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(7);
-    let _removed_match = ctx.extensions.remove::<OpenAiOperationMatch>();
+    let _removed_match = ctx.extensions.remove::<AiOperationMatch>();
 
     let body_json = serde_json::json!({"metadata": {"phase": "deferred"}});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1689,7 +1687,7 @@ async fn bodyless_operation_ignores_invalid_deferred_body_bytes() {
     assert!(matches!(action, FilterAction::Release));
 
     insert_classifier_matches(&mut ctx, &req);
-    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.request_body, crate::operation::RequestBody::None);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
@@ -4257,12 +4255,8 @@ fn conformance_conversations_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
-        let matched = classify(operation.method().as_str(), &path, Transport::Http).unwrap_or_else(|| {
-            panic!(
-                "openai_operation did not classify {} {path}",
-                operation.method().as_str()
-            )
-        });
+        let matched = classify(operation.method().as_str(), &path, Transport::Http)
+            .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
         assert_eq!(
             ConversationOperation::from_operation_id(matched.operation_id),
             Some(operation.operation),
@@ -4435,6 +4429,50 @@ async fn update_conversation_metadata_concurrent_delete_returns_404() {
     );
     let resp = rejection_body(&rejection);
     assert_eq!(resp["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn create_items_concurrent_delete_returns_404() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::ConversationDeleted,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/conversations/conv_gone/items");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"items":[{"id":"item_1","type":"message","role":"user","content":"hi"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for deleted conversation, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "deletion after the first read must not become a 500"
+    );
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn delete_item_concurrent_delete_returns_404() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::ConversationDeleted,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::DELETE, "/v1/conversations/conv_gone/items/item_1");
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for deleted conversation, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "deletion before the item mutation must not become a 500"
+    );
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
 }
 
 #[tokio::test]
@@ -4652,6 +4690,8 @@ enum MetadataUpdateOutcome {
 
 /// Which append-path operation the fault-injecting store forces to error.
 enum AppendFailure {
+    /// The parent row vanished after the handler's initial read.
+    ConversationDeleted,
     /// Fail the item-insert path (`create_conversation_items` and the insert
     /// step of `create_items_and_sync_messages`).
     CreateItems,
@@ -4769,6 +4809,7 @@ impl ConversationItemStore for FailingItemStore {
             AppendFailure::MessageSync => {
                 return Err(StoreError::Database("mock message sync failure".to_owned()));
             },
+            AppendFailure::ConversationDeleted => return Err(StoreError::NotFound),
             AppendFailure::None => {},
         }
         Ok(())
@@ -4835,6 +4876,9 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<bool, StoreError> {
+        if matches!(self.append_failure, AppendFailure::ConversationDeleted) {
+            return Err(StoreError::NotFound);
+        }
         Ok(false)
     }
 }

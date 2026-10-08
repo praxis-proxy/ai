@@ -22,6 +22,37 @@ fn azure_proxy(backend_port: u16) -> praxis_test_utils::ProxyGuard {
 }
 
 #[test]
+fn azure_fixture_example_translates_chat_requests() {
+    let response = serde_json::json!({
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion",
+        "choices": [{"message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}]
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, response.to_string()), (200, response.to_string())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "azure/chat-completions-to-openai-fixture.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+    assert_eq!(parse_status(&raw), 200);
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"], "Hello");
+
+    let requests = backend.requests();
+    let captured = requests.iter().find(|request| request.method == "POST").unwrap();
+    assert!(captured.uri.contains("/openai/deployments/gpt-4o/chat/completions"));
+    assert!(captured.uri.contains("api-version=2024-10-21"));
+    let forwarded: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+    assert!(forwarded.get("model").is_none());
+}
+
+#[test]
 fn azure_translation_forwards_request_with_api_version() {
     let response_json = serde_json::json!({
         "id": "chatcmpl-abc",

@@ -6,6 +6,7 @@
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
+use super::config::LossyFeatureAllowlist;
 use crate::hash::{self, Sha256};
 
 // -----------------------------------------------------------------------------
@@ -46,39 +47,107 @@ const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "moderation",
 ];
 
-/// Anthropic Messages fields dropped with a warning instead of forwarded.
+/// Anthropic Messages fields without a Chat Completions equivalent.
 ///
-/// Claude Code sends both on every request, and neither has a Chat
-/// Completions equivalent: the translated response carries no thinking
-/// blocks, so `thinking` is visibly absent and `context_management` (which
-/// only edits thinking blocks) has nothing to act on. Forwarding them would
-/// make the outcome depend on the backend, since vLLM ignores unknown fields
-/// and the OpenAI API rejects them.
-const DROPPED_FIELDS: [&str; 2] = ["thinking", "context_management"];
+/// The translated response cannot carry thinking blocks, `context_management`
+/// can edit them, and a top-level `cache_control` applies a cache marker Chat
+/// Completions has no concept of. Non-null values are rejected before
+/// conversion; null values have no effect and are removed. Allowlisted lossy
+/// features ([`degrade_extended_thinking`], [`degrade_prompt_caching`]) strip
+/// their markers first, so a value only reaches this rejection when it was not
+/// degraded or was malformed.
+const UNMAPPABLE_FIELDS: [&str; 3] = ["thinking", "context_management", "cache_control"];
 
 /// Every `output_config` key in the Anthropic schema, including the beta
 /// `task_budget`; the schema declares no others (`additionalProperties:
 /// false`) and every one is nullable.
 const OUTPUT_CONFIG_KEYS: [&str; 3] = ["effort", "format", "task_budget"];
 
+/// Features the translator degraded instead of rejecting, one flag per
+/// allowlisted [`LossyFeature`](super::config::LossyFeature).
+///
+/// A flag is set only when a recognized marker was actually removed, so the
+/// operator signals report real degradation rather than mere opt-in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DegradedFeatures {
+    /// A recognized `thinking` request or thinking-only `context_management`
+    /// edit was removed.
+    pub extended_thinking: bool,
+    /// A valid `cache_control` marker was removed.
+    pub prompt_caching: bool,
+}
+
+impl DegradedFeatures {
+    /// Whether any feature was degraded.
+    pub(crate) fn any(self) -> bool {
+        self.extended_thinking || self.prompt_caching
+    }
+}
+
+/// The translated request body plus the features that were degraded producing it.
+#[derive(Debug)]
+pub(crate) struct TransformOutput {
+    /// The transformed Chat Completions-compatible request bytes.
+    pub body: Vec<u8>,
+    /// The features degraded while translating.
+    pub degraded: DegradedFeatures,
+}
+
+/// Transform an Anthropic Messages request with strict fidelity: every
+/// unrepresentable feature is rejected. Equivalent to
+/// [`transform_request_degrading`] with an empty allowlist.
+///
+/// A test-only convenience: the filter always calls
+/// [`transform_request_degrading`] with the configured allowlist, and the
+/// empty-allowlist path is exercised through the strict tests and
+/// [`empty_allowlist_matches_strict_wrapper`].
+#[cfg(test)]
+pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
+    transform_request_degrading(value, LossyFeatureAllowlist::default()).map(|output| output.body)
+}
+
 /// Transform a parsed Anthropic Messages request body into Chat
-/// Completions-compatible format.
+/// Completions-compatible format, degrading the features the operator
+/// allowlisted rather than rejecting them.
 ///
 /// Every top-level field falls into one of these buckets:
 /// - mapped fields are translated to their Chat Completions equivalent;
+/// - allowlisted lossy features are stripped after their wire markers are validated, and the removal is recorded in
+///   [`TransformOutput::degraded`];
 /// - [`UNREPRESENTABLE_FIELDS`] reject the request with an error message, because the proxy would otherwise fabricate
 ///   their effect in the translated response;
-/// - [`DROPPED_FIELDS`] are removed with a warning;
+/// - [`UNMAPPABLE_FIELDS`] reject when they carry a value and are not allowlisted;
 /// - everything else is forwarded untouched, and the backend validates it.
 ///
 /// A translated field always wins over a forwarded client key of the same
-/// name. Returns the transformed JSON bytes, or an error message.
-pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
+/// name. Returns the transformed JSON bytes and the degraded feature set, or
+/// an error message.
+#[expect(clippy::too_many_lines, reason = "linear request field extraction and mapping")]
+pub(crate) fn transform_request_degrading(
+    value: Value,
+    allow: LossyFeatureAllowlist,
+) -> Result<TransformOutput, String> {
     let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
+
+    // Degrade allowlisted features first: validate each feature's wire markers,
+    // strip them in place, and record what was actually removed. The strict
+    // validation below then runs on the cleaned body, so a leftover marker in an
+    // unrecognized position still fails closed. The strippers walk only
+    // Anthropic-structured positions and never descend into user-controlled tool
+    // `input` or `input_schema` JSON (see [`degrade_prompt_caching`]).
+    let mut degraded = DegradedFeatures::default();
+    if allow.extended_thinking {
+        degraded.extended_thinking = degrade_extended_thinking(&mut body)?;
+    }
+    if allow.prompt_caching {
+        degraded.prompt_caching = degrade_prompt_caching(&mut body)?;
+    }
+
+    validate_faithful_request(&body)?;
     reject_unrepresentable_fields(&mut body)?;
-    drop_unsupported_fields(&mut body);
+    remove_null_unmappable_fields(&mut body);
 
     // Take every mapped field up front, in one place. Each becomes an owned
     // local that is moved into the helper emitting it.
@@ -108,7 +177,542 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     convert_tool_choice(&mut chat, tool_choice, had_tools);
     forward_unmapped_fields(&mut chat, body);
 
-    serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))
+    let body = serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))?;
+    Ok(TransformOutput { body, degraded })
+}
+
+// -----------------------------------------------------------------------------
+// Feature Degradation
+// -----------------------------------------------------------------------------
+
+/// Remove recognized extended-thinking markers, returning whether any were.
+///
+/// Validates the `thinking` request and any `context_management` before
+/// removing them. A malformed `thinking` shape, or a `context_management` that
+/// carries anything other than thinking-only edits, is rejected with a specific
+/// 400 so unrepresentable intent never reaches the backend silently.
+fn degrade_extended_thinking(body: &mut Map<String, Value>) -> Result<bool, String> {
+    let mut degraded = false;
+
+    let thinking_recognized = match body.get("thinking") {
+        Some(value) if !value.is_null() => Some(thinking_request_is_recognized(value)),
+        _ => None,
+    };
+    if let Some(recognized) = thinking_recognized {
+        if !recognized {
+            return Err("unsupported `thinking` shape for Chat Completions translation".to_owned());
+        }
+        thinking_budget_within_max_tokens(body)?;
+        body.remove("thinking");
+        degraded = true;
+    }
+
+    let edit_count = match body.get("context_management") {
+        Some(value) if !value.is_null() => Some(recognized_thinking_edits(value)?),
+        _ => None,
+    };
+    if let Some(count) = edit_count {
+        body.remove("context_management");
+        // An empty edits list removes nothing observable, so only a non-empty
+        // thinking edit list counts as a real degradation.
+        degraded |= count > 0;
+    }
+
+    Ok(degraded)
+}
+
+/// Whether a `thinking` request is a shape the translator recognizes.
+///
+/// Recognized, mirroring the Anthropic `ThinkingConfigParam` discriminator:
+/// - `{"type": "enabled", "budget_tokens": <int ≥1024>, "display"?: <mode>}`
+/// - `{"type": "adaptive", "display"?: <mode>}`
+/// - `{"type": "disabled"}`
+///
+/// `budget_tokens` is required for `enabled` and must be an integer ≥1024 (the
+/// schema minimum), and `display` must be a recognized mode (see
+/// [`thinking_display_is_recognized`]). Any other shape is malformed to this
+/// translator and fails closed.
+fn thinking_request_is_recognized(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else { return false };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("enabled") => {
+            obj.keys()
+                .all(|key| matches!(key.as_str(), "type" | "budget_tokens" | "display"))
+                && obj
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|budget| budget >= 1024)
+                && thinking_display_is_recognized(obj.get("display"))
+        },
+        Some("adaptive") => {
+            obj.keys().all(|key| matches!(key.as_str(), "type" | "display"))
+                && thinking_display_is_recognized(obj.get("display"))
+        },
+        Some("disabled") => obj.keys().all(|key| key == "type"),
+        _ => false,
+    }
+}
+
+/// Whether an optional thinking `display` is a recognized `ThinkingDisplayMode`.
+///
+/// Absent or null selects the schema default (`summarized`); a present value
+/// must be one of the defined modes. The marker is stripped, so this only keeps
+/// a malformed value from being dropped silently.
+fn thinking_display_is_recognized(display: Option<&Value>) -> bool {
+    match display {
+        None | Some(Value::Null) => true,
+        Some(Value::String(mode)) => matches!(mode.as_str(), "summarized" | "omitted" | "updates"),
+        Some(_) => false,
+    }
+}
+
+/// Enforce the schema's cross-field rule that an `enabled` thinking
+/// `budget_tokens` stays below the request `max_tokens`.
+///
+/// Only the `enabled` variant carries a budget; `adaptive`/`disabled` have none
+/// to compare. When `max_tokens` is absent or non-numeric the backend owns that
+/// rejection, so this checks only the pair the client actually sent. A
+/// `budget_tokens` at or above `max_tokens` is malformed to the Anthropic schema
+/// and fails closed rather than being stripped and reported as a clean
+/// degradation.
+fn thinking_budget_within_max_tokens(body: &Map<String, Value>) -> Result<(), String> {
+    let Some(budget) = body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .filter(|thinking| thinking.get("type").and_then(Value::as_str) == Some("enabled"))
+        .and_then(|thinking| thinking.get("budget_tokens"))
+        .and_then(Value::as_u64)
+    else {
+        return Ok(());
+    };
+    let Some(max_tokens) = body.get("max_tokens").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    if budget >= max_tokens {
+        return Err(
+            "`thinking.budget_tokens` must be less than `max_tokens` for Chat Completions translation".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Count the edits in a `context_management` that carries only thinking edits.
+///
+/// Returns the edit count, or an error when the value is not an object, carries a
+/// key other than `edits`, or whose `edits` is not an array of well-formed
+/// `clear_thinking_20251015` edits (the only thinking-clearing edit the Anthropic
+/// schema defines; see [`thinking_edit_is_recognized`]). `edits` is optional in
+/// the schema (no `required`, `minItems: 0`), so an absent list — the no-op `{}` —
+/// is a valid `context_management` with zero edits. Any other edit type (for
+/// example `clear_tool_uses_*`), unknown edit field, or malformed `keep` is a
+/// shape the translator cannot honor and is rejected rather than silently dropped.
+fn recognized_thinking_edits(value: &Value) -> Result<usize, String> {
+    let error = || "unsupported `context_management` for Chat Completions translation".to_owned();
+    let obj = value.as_object().ok_or_else(error)?;
+    if obj.keys().any(|key| key != "edits") {
+        return Err(error());
+    }
+    // An absent `edits` is a valid zero-edit no-op. A present but non-array
+    // `edits` (including explicit `null`, which the schema does not allow) is
+    // malformed and fails closed.
+    let Some(edits_value) = obj.get("edits") else {
+        return Ok(0);
+    };
+    let edits = edits_value.as_array().ok_or_else(error)?;
+    for edit in edits {
+        if !thinking_edit_is_recognized(edit) {
+            return Err(error());
+        }
+    }
+    Ok(edits.len())
+}
+
+/// Whether a `context_management` edit is a well-formed `clear_thinking_20251015`.
+///
+/// Mirrors the Anthropic `ClearThinking20251015` schema: the object carries only
+/// `type` (`clear_thinking_20251015`) and an optional `keep`, and `keep` — when
+/// present — is a recognized shape (see [`clear_thinking_keep_is_recognized`]).
+/// Any other edit type, unknown field, or malformed `keep` fails closed, because
+/// the edit is stripped and a silently accepted malformed shape would be reported
+/// as a clean degradation.
+fn thinking_edit_is_recognized(edit: &Value) -> bool {
+    let Some(obj) = edit.as_object() else { return false };
+    obj.get("type").and_then(Value::as_str) == Some("clear_thinking_20251015")
+        && obj.keys().all(|key| matches!(key.as_str(), "type" | "keep"))
+        && clear_thinking_keep_is_recognized(obj.get("keep"))
+}
+
+/// Whether an optional `clear_thinking_20251015` `keep` is a recognized shape.
+///
+/// Mirrors the Anthropic schema's `keep` union: absent (the default), the string
+/// `"all"`, or a discriminated `{type}` object selecting `thinking_turns` (with an
+/// integer `value` ≥1) or `all`. The union carries no null, so an explicit
+/// `"keep": null` — along with unknown fields or any other value — is unrecognized
+/// and fails closed rather than being stripped as a clean degradation.
+fn clear_thinking_keep_is_recognized(keep: Option<&Value>) -> bool {
+    match keep {
+        None => true,
+        Some(Value::String(mode)) => mode == "all",
+        Some(Value::Object(obj)) => match obj.get("type").and_then(Value::as_str) {
+            Some("thinking_turns") => {
+                obj.keys().all(|key| matches!(key.as_str(), "type" | "value"))
+                    && obj.get("value").and_then(Value::as_u64).is_some_and(|value| value >= 1)
+            },
+            Some("all") => obj.keys().all(|key| key == "type"),
+            _ => false,
+        },
+        Some(_) => false,
+    }
+}
+
+/// Remove valid `cache_control` markers from every Anthropic-structured
+/// position, returning whether any were removed.
+///
+/// Walks only the positions the Anthropic schema places cache markers in: the
+/// top-level request `cache_control`, `system` text blocks, `tools` definitions,
+/// message content blocks, and the nested text parts of a `tool_result`. It
+/// never descends into a `tool_use` block's `input` or a tool's `input_schema`,
+/// because a `cache_control` key there is user data, not Anthropic metadata. A
+/// present but malformed marker is rejected with a specific 400.
+fn degrade_prompt_caching(body: &mut Map<String, Value>) -> Result<bool, String> {
+    let mut degraded = false;
+
+    // The top-level `cache_control` is request-wide Anthropic cache metadata
+    // with no Chat Completions equivalent, so it needs its own strip here rather
+    // than riding a content block like the per-position markers below.
+    strip_map_cache_control(body, &mut degraded)?;
+
+    if let Some(Value::Array(blocks)) = body.get_mut("system") {
+        for block in blocks.iter_mut() {
+            strip_cache_control(block, &mut degraded)?;
+        }
+    }
+
+    if let Some(Value::Array(tools)) = body.get_mut("tools") {
+        for tool in tools.iter_mut() {
+            strip_cache_control(tool, &mut degraded)?;
+        }
+    }
+
+    if let Some(Value::Array(messages)) = body.get_mut("messages") {
+        for message in messages.iter_mut() {
+            let Some(Value::Array(blocks)) = message.get_mut("content") else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                strip_cache_control(block, &mut degraded)?;
+                // A tool_result's content is itself an array of Anthropic text
+                // blocks, each a valid marker position.
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(Value::Array(parts)) = block.get_mut("content")
+                {
+                    for part in parts.iter_mut() {
+                        strip_cache_control(part, &mut degraded)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(degraded)
+}
+
+/// Remove a recognized `cache_control` marker from one block in place.
+///
+/// Sets `degraded` when a valid marker is removed. A non-object block or an
+/// absent/null marker is a no-op; a present but unrecognized marker is rejected.
+fn strip_cache_control(block: &mut Value, degraded: &mut bool) -> Result<(), String> {
+    let Some(obj) = block.as_object_mut() else {
+        return Ok(());
+    };
+    strip_map_cache_control(obj, degraded)
+}
+
+/// Remove a recognized `cache_control` marker from an object map in place.
+///
+/// Shared by [`strip_cache_control`] (block positions) and the top-level request
+/// marker. An absent or null marker is a no-op; a present but unrecognized marker
+/// is rejected so a malformed value is never silently dropped.
+fn strip_map_cache_control(obj: &mut Map<String, Value>, degraded: &mut bool) -> Result<(), String> {
+    match obj.get("cache_control") {
+        None | Some(Value::Null) => Ok(()),
+        Some(marker) if cache_control_marker_is_recognized(marker) => {
+            obj.remove("cache_control");
+            *degraded = true;
+            Ok(())
+        },
+        Some(_) => Err("unsupported `cache_control` marker for Chat Completions translation".to_owned()),
+    }
+}
+
+/// Whether a `cache_control` value is a recognized Anthropic cache marker.
+///
+/// Recognized: `{"type": "ephemeral", "ttl"?: "5m" | "1h"}` (the only TTLs the
+/// schema's `CacheControlEphemeral` enum defines). The marker is removed, so the
+/// backend never validates it; this check keeps a malformed value from being
+/// silently dropped.
+fn cache_control_marker_is_recognized(marker: &Value) -> bool {
+    let Some(obj) = marker.as_object() else {
+        return false;
+    };
+    obj.get("type").and_then(Value::as_str) == Some("ephemeral")
+        && obj.keys().all(|key| matches!(key.as_str(), "type" | "ttl"))
+        && obj
+            .get("ttl")
+            .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m" | "1h")))
+}
+
+/// Reject request data the translator would discard or change meaning.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential validation of the translated request shape"
+)]
+fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
+    for field in UNMAPPABLE_FIELDS {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!("`{field}` cannot be translated to Chat Completions"));
+        }
+    }
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::String(_) | Value::Null => {},
+            Value::Array(blocks) if blocks.iter().all(text_block_is_supported) => {},
+            _ => return Err("`system` must be a string or array of text blocks".to_owned()),
+        }
+    }
+    if body.get("stream").and_then(Value::as_bool) != Some(true)
+        && body.get("stream_options").is_some_and(|value| !value.is_null())
+    {
+        return Err("`stream_options` requires `stream: true`".to_owned());
+    }
+    if let Some(options) = body.get("stream_options").filter(|value| !value.is_null()) {
+        let options = options.as_object().ok_or("`stream_options` must be an object")?;
+        if options
+            .get("include_usage")
+            .is_some_and(|value| !value.is_boolean() && !value.is_null())
+        {
+            return Err("`stream_options.include_usage` must be a boolean".to_owned());
+        }
+    }
+    if let Some(metadata) = body.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = metadata.as_object().ok_or("`metadata` must be an object")?;
+        if metadata.keys().any(|key| key != "user_id")
+            || metadata
+                .get("user_id")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err("unsupported Anthropic `metadata` for Chat Completions translation".to_owned());
+        }
+    }
+    if let Some(messages) = body.get("messages") {
+        let messages = messages.as_array().ok_or("`messages` must be an array")?;
+        for message in messages {
+            if !has_only_keys(message, &["role", "content"]) {
+                return Err("unsupported Anthropic message field for Chat Completions translation".to_owned());
+            }
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or("message is missing a string `role`")?;
+            // Claude Code can put a text-only system message in this array.
+            // Chat Completions represents it directly; the backend owns ordering.
+            if !matches!(role, "system" | "user" | "assistant") {
+                return Err(format!("unsupported Anthropic message role `{role}`"));
+            }
+            match message.get("content") {
+                Some(Value::String(_)) => {},
+                Some(Value::Array(blocks)) => validate_content_blocks(blocks, role)?,
+                _ => return Err("message `content` must be a string or array".to_owned()),
+            }
+        }
+    }
+    if let Some(tools) = body.get("tools").filter(|tools| !tools.is_null()) {
+        let tools = tools.as_array().ok_or("`tools` must be an array")?;
+        for tool in tools {
+            let tool = tool.as_object().ok_or("tool must be an object")?;
+            let supported_type = match tool.get("type") {
+                None => true,
+                Some(Value::String(kind)) => kind == "custom",
+                _ => false,
+            };
+            if !supported_type {
+                return Err("typed Anthropic tools cannot be translated to Chat Completions".to_owned());
+            }
+            if !tool.get("name").is_some_and(Value::is_string) {
+                return Err("tool requires a string `name`".to_owned());
+            }
+            if !tool.get("input_schema").is_some_and(Value::is_object) {
+                return Err("tool requires an `input_schema` object".to_owned());
+            }
+            if tool.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type" | "name" | "description" | "input_schema" | "strict"
+                )
+            }) || tool
+                .get("description")
+                .is_some_and(|value| !value.is_string() && !value.is_null())
+                || tool
+                    .get("strict")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
+            {
+                return Err("unsupported Anthropic tool field for Chat Completions translation".to_owned());
+            }
+        }
+    }
+    if body
+        .get("output_config")
+        .is_some_and(|config| !config.is_null() && !config.is_object())
+    {
+        return Err("`output_config` must be an object".to_owned());
+    }
+    if let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) {
+        let valid = match choice {
+            Value::String(kind) => matches!(kind.as_str(), "auto" | "any" | "none"),
+            Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+                Some("auto" | "any" | "none") => choice
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "disable_parallel_tool_use")),
+                Some("tool") => {
+                    choice.get("name").is_some_and(Value::is_string)
+                        && choice
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "type" | "name" | "disable_parallel_tool_use"))
+                },
+                _ => false,
+            },
+            _ => false,
+        };
+        let valid_parallel = choice
+            .get("disable_parallel_tool_use")
+            .is_none_or(|value| value.is_boolean() || value.is_null());
+        let needs_tools = matches!(
+            choice.get("type").and_then(Value::as_str).or_else(|| choice.as_str()),
+            Some("any" | "tool")
+        );
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !valid || !valid_parallel || (needs_tools && !has_tools) {
+            return Err("unsupported Anthropic `tool_choice` for Chat Completions translation".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Validate content before lowering so the backend cannot accept a truncated request.
+#[expect(clippy::too_many_lines, reason = "one validation arm per supported content block")]
+fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") if text_block_is_supported(block) => {},
+            Some("image") if role == "user" && !has_tool_use => {
+                let source = block.get("source").ok_or("image block is missing `source`")?;
+                if !image_source_is_supported(source)
+                    || !has_only_keys(block, &["type", "source", "cache_control"])
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("image block has an unsupported `source`".to_owned());
+                }
+            },
+            Some("tool_use") if role == "assistant" => {
+                // The converter serializes any present JSON input as arguments;
+                // an absent input retains its established empty-object default.
+                if !block.get("id").is_some_and(Value::is_string)
+                    || !block.get("name").is_some_and(Value::is_string)
+                    || !has_only_keys(
+                        block,
+                        &["type", "id", "name", "input", "caller", "toolset_name", "cache_control"],
+                    )
+                    || !block.get("caller").is_none_or(direct_caller_is_supported)
+                    || !null_or_absent(block, "toolset_name")
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("tool_use block requires string `id` and `name`".to_owned());
+                }
+            },
+            Some("tool_result") if role == "user" => {
+                let text_content = match block.get("content") {
+                    None | Some(Value::String(_)) => true,
+                    Some(Value::Array(parts)) => parts.iter().all(text_block_is_supported),
+                    _ => false,
+                };
+                if !block.get("tool_use_id").is_some_and(Value::is_string)
+                    || !text_content
+                    || block.get("is_error") == Some(&Value::Bool(true))
+                    || block
+                        .get("is_error")
+                        .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                    || !has_only_keys(
+                        block,
+                        &[
+                            "type",
+                            "tool_use_id",
+                            "content",
+                            "is_error",
+                            "toolset_name",
+                            "cache_control",
+                        ],
+                    )
+                    || !null_or_absent(block, "toolset_name")
+                    || !null_or_absent(block, "cache_control")
+                {
+                    return Err("tool_result requires string `tool_use_id` and text `content`".to_owned());
+                }
+            },
+            Some(kind) => return Err(format!("unsupported Anthropic content block `{kind}`")),
+            None => return Err("Anthropic content block requires a string `type`".to_owned()),
+        }
+    }
+    Ok(())
+}
+
+/// Check that a JSON object contains only fields the translator understands.
+fn has_only_keys(value: &Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|fields| fields.keys().all(|key| keys.contains(&key.as_str())))
+}
+
+/// Null or empty citations carry no source information to preserve.
+fn text_block_is_supported(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block.get("text").is_some_and(Value::is_string)
+        && block
+            .get("citations")
+            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
+        && null_or_absent(block, "cache_control")
+        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
+}
+
+/// Nullable request metadata has no effect when absent or null.
+fn null_or_absent(value: &Value, key: &str) -> bool {
+    value.get(key).is_none_or(Value::is_null)
+}
+
+/// A direct caller is the only caller form this translator emits and consumes.
+fn direct_caller_is_supported(caller: &Value) -> bool {
+    caller.is_null()
+        || caller
+            .as_object()
+            .is_some_and(|fields| fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("direct"))
+}
+
+/// Check the fields used by `convert_image_source` without copying image data.
+fn image_source_is_supported(source: &Value) -> bool {
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            source.get("media_type").is_some_and(Value::is_string)
+                && source.get("data").is_some_and(Value::is_string)
+                && has_only_keys(source, &["type", "media_type", "data"])
+        },
+        Some("url") => source.get("url").is_some_and(Value::is_string) && has_only_keys(source, &["type", "url"]),
+        _ => false,
+    }
 }
 
 /// Forward every field the translation did not consume, leaving its
@@ -120,12 +724,10 @@ fn forward_unmapped_fields(chat: &mut Map<String, Value>, body: Map<String, Valu
     }
 }
 
-/// Remove every [`DROPPED_FIELDS`] entry, warning for each one that carried a value.
-fn drop_unsupported_fields(body: &mut Map<String, Value>) {
-    for field in DROPPED_FIELDS {
-        if body.remove(field).is_some_and(|value| !value.is_null()) {
-            warn!(field, "dropping Anthropic field with no Chat Completions equivalent");
-        }
+/// Remove null-only unmappable fields after validation treats them as absent.
+fn remove_null_unmappable_fields(body: &mut Map<String, Value>) {
+    for field in UNMAPPABLE_FIELDS {
+        body.remove(field);
     }
 }
 
@@ -398,7 +1000,7 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 
     let args = match block.remove("input") {
         Some(input) => serde_json::to_string(&input).unwrap_or_default(),
-        None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_default(),
+        None => "{}".to_owned(),
     };
 
     let mut function = Map::new();
@@ -971,6 +1573,129 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "enumerates semantic loss cases at one boundary")]
+    fn strict_translation_rejects_semantic_losses() {
+        for (request, field) in [
+            (json!({"thinking": {"type": "enabled"}}), "thinking"),
+            (json!({"context_management": {"edits": []}}), "context_management"),
+            (json!({"system": 42}), "system"),
+            (json!({"messages": [{"role": "user", "content": 42}]}), "content"),
+            (
+                json!({"messages": [{"role": "user", "content": [{"type": "unknown"}]}]}),
+                "unknown",
+            ),
+            (
+                json!({"messages": [{"role": "assistant", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/i.png"}},
+                    {"type": "tool_use", "id": "c1", "name": "f", "input": {}}
+                ]}]}),
+                "image",
+            ),
+            (
+                json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+                "typed",
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]}]}),
+                "text",
+            ),
+            (json!({"output_config": 42}), "output_config"),
+            (
+                json!({"stream": true, "stream_options": "include_usage"}),
+                "stream_options",
+            ),
+        ] {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(request.as_object().unwrap().clone());
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn strict_translation_accepts_generated_history_and_text_tool_results() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Hello", "citations": null, "cache_control": null},
+                    {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}, "caller": {"type": "direct"}, "toolset_name": null}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "toolset_name": null, "content": [
+                        {"type": "text", "text": "Sunny", "citations": null}
+                    ]}
+                ]}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["content"], "Hello");
+        assert_eq!(translated["messages"][0]["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(translated["messages"][1]["content"], "Sunny");
+    }
+
+    #[test]
+    fn strict_translation_accepts_empty_citations_in_history() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Hi", "citations": []}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hello", "citations": []}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [
+                    {"type": "text", "text": "Sunny", "citations": []}
+                ]}]}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["content"], "Hi");
+        assert_eq!(translated["messages"][1]["content"], "Hello");
+        assert_eq!(translated["messages"][2]["content"], "Sunny");
+    }
+
+    #[test]
+    fn strict_translation_preserves_system_message_in_history() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "Be concise"}]},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be concise"})
+        );
+        assert_eq!(translated["messages"][1], json!({"role": "user", "content": "Hi"}));
+    }
+
+    #[test]
+    fn strict_translation_treats_omitted_tool_result_content_as_empty() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1"}
+            ]}]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["role"], "tool");
+        assert_eq!(translated["messages"][0]["content"], "");
+    }
+
+    #[test]
+    fn strict_translation_rejects_nonempty_citations_and_indirect_caller() {
+        for block in [
+            json!({"type": "text", "text": "Hello", "citations": [{"url": "https://example.test"}]}),
+            json!({"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}, "caller": {"type": "server"}}),
+        ] {
+            let body = json!({"model": "m", "messages": [{"role": "assistant", "content": [block]}]});
+            assert!(transform_request(body).is_err());
+        }
+    }
+
+    #[test]
     fn basic_text_request() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#;
         let result = transform_bytes(body).unwrap();
@@ -1038,32 +1763,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_definition_with_non_string_name_falls_back_to_empty() {
+    fn tool_definition_with_non_string_name_is_rejected() {
         let body = br#"{"model":"m","tools":[{"name":42,"description":true,"input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["tools"][0]["function"]["name"], "",
-            "non-string name yields empty"
-        );
-        assert_eq!(
-            parsed["tools"][0]["function"]["description"], "",
-            "non-string description yields empty"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("string `name`"), "{error}");
     }
 
     #[test]
-    fn stream_options_dropped_when_streaming_disabled() {
+    fn stream_options_without_streaming_are_rejected() {
         let body = br#"{"model":"m","stream":false,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["stream"], false);
-        assert!(
-            parsed.get("stream_options").is_none(),
-            "stream_options is meaningless without streaming"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`stream_options` requires"), "{error}");
     }
 
     #[test]
@@ -1136,142 +1846,63 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_marked_in_tool_message_content() {
+    fn tool_result_error_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"cat: missing.txt: No such file or directory","is_error":true}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory",
-            "OpenAI-compatible tool messages should preserve Anthropic error semantics"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_image_promoted_to_followup_user_message() {
+    fn tool_result_image_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "tool", "first message is tool result");
-        assert_eq!(parsed["messages"][0]["content"], "chart", "tool text content");
-        assert_eq!(
-            parsed["messages"][1]["role"], "user",
-            "image should be promoted to user message"
-        );
-        assert_eq!(
-            parsed["messages"][1]["content"][0]["type"], "image_url",
-            "promoted image content type"
-        );
-        assert_eq!(
-            parsed["messages"][1]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
-            "promoted image URL"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn top_level_search_result_preserved_as_text_context() {
+    fn top_level_search_result_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","source":"https://docs.example.test/product","title":"Product Guide","content":[{"type":"text","text":"The default timeout is 30 seconds."},{"type":"text","text":"The maximum timeout is 120 seconds."}]},{"type":"text","text":"What is the timeout range?"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(
-            content[0]["text"],
-            "Search result: \"Product Guide\"\nSource: \"https://docs.example.test/product\"\nContent:\nThe default timeout is 30 seconds.\nThe maximum timeout is 120 seconds.",
-            "search result metadata and text should remain visible to the backend"
-        );
-        assert_eq!(
-            content[1]["text"], "What is the timeout range?",
-            "following user text should remain a separate content part"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_search_result_preserved_in_tool_message_content() {
+    fn tool_result_search_result_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://timeouts","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."}]},{"type":"text","text":"Applies to version 2."}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "tool");
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Search result: \"Timeout KB\"\nSource: \"kb://timeouts\"\nContent:\nTimeouts default to 30 seconds.\nApplies to version 2.",
-            "tool result search_result content should not be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_document_preserved_in_tool_message_content() {
+    fn tool_result_document_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"Before document."},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document fact."}]},"title":"Nested Doc"},{"type":"text","text":"After document."}]}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Before document.\nDocument: \"Nested Doc\"\nContent:\nNested document fact.\nAfter document.",
-            "tool result document content should be flattened in order with surrounding text"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn document_text_source_preserved_as_text_context() {
+    fn document_text_source_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"The grass is green. The sky is blue."},"title":"Color Notes","context":"trusted notes","citations":{"enabled":true}},{"type":"text","text":"What color is the grass?"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"],
-            "Document: \"Color Notes\"\nContext: \"trusted notes\"\nContent:\nThe grass is green. The sky is blue.",
-            "plain text document contents should remain visible to the backend"
-        );
-        assert_eq!(content[1]["text"], "What color is the grass?");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn document_file_source_preserved_as_reference_text() {
+    fn document_file_source_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_abc123"},"title":"Uploaded Contract"},{"type":"text","text":"Summarize the uploaded contract."}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"], "Document: \"Uploaded Contract\"\nSource: \"file:file_abc123\"",
-            "file-backed documents should remain visible as references instead of disappearing"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn document_source_variants_preserved_or_dropped_intentionally() {
+    fn document_source_variants_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Content block fact."}]},"title":"Content Doc"},{"type":"document","source":{"type":"url","url":"https://docs.example.test/file.pdf"}},{"type":"document","source":{"type":"base64","media_type":"application/pdf"}},{"type":"document","source":{"type":"unknown","data":"ignored"}}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-        let content = parsed["messages"][0]["content"].as_array().unwrap();
-
-        assert_eq!(
-            content[0]["text"], "Document: \"Content Doc\"\nContent:\nContent block fact.",
-            "content document source should flatten nested text blocks"
-        );
-        assert_eq!(
-            content[1]["text"], "Document\nSource: \"https://docs.example.test/file.pdf\"",
-            "URL document source should be preserved as a quoted reference"
-        );
-        assert_eq!(
-            content[2]["text"], "Document\nSource: \"base64:application/pdf\"",
-            "base64 document source should be preserved as a quoted media reference"
-        );
-        assert_eq!(
-            content.len(),
-            3,
-            "unknown document source without metadata should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn search_result_metadata_values_are_quoted() {
+    fn search_result_metadata_is_rejected() {
         let body = json!({
             "model": "claude-opus-4-8",
             "max_tokens": 1024,
@@ -1286,18 +1917,12 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_bytes(body.as_bytes()).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Search result: \"Title\\nSource: forged\"\nSource: \"https://docs.example.test/a\\nContext: forged\"\nContent:\nReal search text.",
-            "quoted search metadata should not create forged label lines"
-        );
+        let error = transform_bytes(body.as_bytes()).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
-    fn document_metadata_values_are_quoted() {
+    fn document_metadata_is_rejected() {
         let body = json!({
             "model": "claude-opus-4-8",
             "max_tokens": 1024,
@@ -1312,26 +1937,15 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_bytes(body.as_bytes()).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"],
-            "Document: \"Doc\\nContext: forged\"\nContext: \"safe\\nSource: forged\"\nContent:\nReal document text.",
-            "quoted document metadata should not create forged label lines"
-        );
+        let error = transform_bytes(body.as_bytes()).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
-    fn empty_search_result_and_document_blocks_dropped() {
+    fn empty_search_result_and_document_blocks_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","content":[]},{"type":"document","source":{"type":"content","content":[]}},{"type":"document","source":{"type":"text","data":""}},{"type":"document","source":{"type":"url","url":""}},{"type":"document","source":{"type":"file","file_id":""}},{"type":"document","source":{"type":"base64","media_type":""}}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "empty metadata-only blocks should not fabricate prompt text"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
     }
 
     #[test]
@@ -1346,7 +1960,7 @@ mod tests {
 
     #[test]
     fn tool_choice_any_mapped() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","input_schema":{"type":"object"}}],"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1363,16 +1977,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_dropped_when_all_tools_filtered() {
+    fn tool_choice_with_untranslatable_tools_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(parsed.get("tools").is_none(), "server-side tools should be filtered");
-        assert!(
-            parsed.get("tool_choice").is_none(),
-            "tool_choice without translated tools should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("typed"), "{error}");
     }
 
     #[test]
@@ -1399,7 +2007,7 @@ mod tests {
 
     #[test]
     fn tool_definition_strict_mapped() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true},{"name":"get_time","description":"Get time","input_schema":{"type":"object"},"strict":false},{"name":"get_news","description":"Get news","input_schema":{"type":"object"},"strict":"yes"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true},{"name":"get_time","description":"Get time","input_schema":{"type":"object"},"strict":false}],"messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1410,10 +2018,6 @@ mod tests {
         assert_eq!(
             parsed["tools"][1]["function"]["strict"], false,
             "Anthropic strict false should remain false"
-        );
-        assert!(
-            parsed["tools"][2]["function"].get("strict").is_none(),
-            "non-boolean strict values should be omitted"
         );
     }
 
@@ -1641,17 +2245,10 @@ mod tests {
     }
 
     #[test]
-    fn client_default_fields_are_dropped_not_forwarded() {
+    fn non_null_unmappable_fields_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        for field in ["thinking", "context_management"] {
-            assert!(
-                parsed.get(field).is_none(),
-                "`{field}` has no Chat Completions equivalent"
-            );
-        }
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
@@ -1703,18 +2300,11 @@ mod tests {
     }
 
     #[test]
-    fn hoist_system_non_string_non_array_skipped() {
+    fn non_string_system_is_rejected() {
         let body =
             br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":42,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["messages"].as_array().unwrap().len(),
-            1,
-            "non-string/non-array system should be skipped"
-        );
-        assert_eq!(parsed["messages"][0]["role"], "user");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`system`"), "{error}");
     }
 
     #[test]
@@ -1732,52 +2322,31 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_missing_role_skipped() {
+    fn message_missing_role_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "message without role should be skipped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("role"), "{error}");
     }
 
     #[test]
-    fn convert_messages_content_not_string_or_array() {
+    fn message_non_text_content_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":42}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["messages"][0]["role"], "user");
-        assert_eq!(
-            parsed["messages"][0]["content"], "",
-            "non-string/non-array content should become empty string"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("content"), "{error}");
     }
 
     #[test]
-    fn thinking_block_dropped() {
+    fn thinking_block_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "thinking blocks should be dropped entirely"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
-    fn unknown_block_type_dropped() {
+    fn unknown_block_type_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"custom_xyz","data":"something"}]}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed["messages"].as_array().unwrap().is_empty(),
-            "unknown block types should be dropped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("custom_xyz"), "{error}");
     }
 
     #[test]
@@ -1790,12 +2359,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_string_unknown_maps_to_auto() {
+    fn unknown_string_tool_choice_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"foo","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(parsed["tool_choice"], "auto", "unknown string tool_choice maps to auto");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
@@ -1824,27 +2391,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_object_tool_without_name_maps_to_auto() {
+    fn tool_choice_without_name_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert_eq!(
-            parsed["tool_choice"], "auto",
-            "tool without name should fallback to auto"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
-    fn tool_choice_non_string_non_object_skipped() {
+    fn non_string_tool_choice_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":true,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed.get("tool_choice").is_none(),
-            "non-string/non-object tool_choice should be skipped"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("`tool_choice`"), "{error}");
     }
 
     #[test]
@@ -1907,21 +2464,15 @@ mod tests {
     }
 
     #[test]
-    fn assistant_tool_calls_drop_image_parts() {
-        // The joined-string branch cannot carry an image part, so it is dropped
-        // while the surrounding text is still joined.
+    fn assistant_tool_calls_with_image_are_rejected() {
         let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"url","url":"https://example.com/i.png"}},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
-        let parsed: Value = serde_json::from_slice(&transform_bytes(body).unwrap()).unwrap();
-
-        assert_eq!(
-            parsed["messages"][0]["content"], "onetwo",
-            "text joins across the dropped image"
-        );
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("image"), "{error}");
     }
 
     #[test]
     fn tool_use_without_input_serializes_an_empty_object() {
-        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null}]}]}"#;
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null},{"type":"tool_use","id":"c3","name":"h","input":{}},{"type":"tool_use","id":"c4","name":"i","input":[1,2]},{"type":"tool_use","id":"c5","name":"j","input":"text"}]}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1934,6 +2485,9 @@ mod tests {
             calls[1]["function"]["arguments"], "null",
             "an explicit null input is preserved as null"
         );
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[3]["function"]["arguments"], "[1,2]");
+        assert_eq!(calls[4]["function"]["arguments"], "\"text\"");
     }
 
     #[test]
@@ -1984,15 +2538,10 @@ mod tests {
     }
 
     #[test]
-    fn only_client_tools_converted() {
+    fn server_tools_are_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        let tools = parsed["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2, "only untyped and custom client tools should remain");
-        assert_eq!(tools[0]["function"]["name"], "get_weather");
-        assert_eq!(tools[1]["function"]["name"], "get_time");
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("typed"), "{error}");
     }
 
     #[test]
@@ -2031,5 +2580,434 @@ mod tests {
             parsed.get("stream_options").is_none(),
             "stream_options should not be present when stream is false"
         );
+    }
+
+    #[test]
+    fn empty_allowlist_matches_strict_wrapper() {
+        // The public strict wrapper is degrading with an empty allowlist.
+        let body = json!({
+            "model": "m",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(transform_request(body.clone()).is_err());
+        assert!(transform_request_degrading(body, LossyFeatureAllowlist::default()).is_err());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts every Anthropic-structured cache_control position"
+    )]
+    fn prompt_caching_degradation_strips_markers_everywhere() {
+        let body = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{
+                "name": "lookup",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "c1", "name": "lookup", "input": {"q": "x"}, "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "cache_control": {"type": "ephemeral"}, "content": [
+                        {"type": "text", "text": "Sunny", "cache_control": {"type": "ephemeral"}}
+                    ]}
+                ]}
+            ]
+        });
+        let (translated, degraded) = degrade(body, CACHE).unwrap();
+        assert!(degraded.prompt_caching, "cache markers were removed");
+        assert!(!degraded.extended_thinking);
+        let serialized = translated.to_string();
+        assert!(
+            !serialized.contains("cache_control"),
+            "no cache_control survives translation: {serialized}"
+        );
+        // Prompt and tool content is preserved. Top-level system is hoisted to a
+        // leading system message, then the user/assistant/tool turns follow.
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be brief"})
+        );
+        assert_eq!(translated["messages"][1]["content"], "Hi");
+        assert_eq!(translated["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            translated["messages"][2]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"x\"}"
+        );
+    }
+
+    #[test]
+    fn prompt_caching_degradation_never_touches_tool_input_user_data() {
+        // A cache_control key inside tool_use.input is user data, not an
+        // Anthropic marker, and must survive verbatim as serialized arguments.
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "echo", "input": {"cache_control": {"type": "ephemeral"}, "x": 1}}
+            ]}]
+        });
+        let (translated, degraded) = degrade(body, CACHE).unwrap();
+        assert!(
+            !degraded.prompt_caching,
+            "no Anthropic marker was present, so nothing is degraded"
+        );
+        let args = translated["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let parsed_args: Value = serde_json::from_str(args).unwrap();
+        assert_eq!(
+            parsed_args["cache_control"],
+            json!({"type": "ephemeral"}),
+            "user data inside tool input is preserved: {args}"
+        );
+    }
+
+    #[test]
+    fn prompt_caching_degradation_rejects_malformed_marker() {
+        for marker in [
+            json!("ephemeral"),
+            json!({"type": "forever"}),
+            json!({"type": "ephemeral", "scope": "x"}),
+            // Only the schema's `5m`/`1h` TTLs are recognized; an arbitrary
+            // string or a non-string value fails closed rather than being dropped.
+            json!({"type": "ephemeral", "ttl": "7m"}),
+            json!({"type": "ephemeral", "ttl": 300}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Hi", "cache_control": marker}
+                ]}]
+            });
+            let error = transform_request_degrading(body, CACHE).unwrap_err();
+            assert!(error.contains("cache_control"), "{error}");
+        }
+    }
+
+    #[test]
+    fn prompt_caching_not_allowlisted_still_rejects() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        });
+        assert!(transform_request_degrading(body, THINK).is_err());
+    }
+
+    #[test]
+    fn prompt_caching_degradation_strips_top_level_cache_control() {
+        // A top-level request `cache_control` is Anthropic cache metadata, not a
+        // mapped field, so degradation strips it like any block-level marker.
+        let body = json!({
+            "model": "m",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (translated, degraded) = degrade(body, CACHE).unwrap();
+        assert!(degraded.prompt_caching, "the top-level marker counts as degradation");
+        assert!(
+            translated.get("cache_control").is_none(),
+            "the top-level marker is stripped: {translated}"
+        );
+    }
+
+    #[test]
+    fn top_level_cache_control_not_allowlisted_still_rejects() {
+        // Without the allowlist the strict validator must fail closed rather than
+        // forward the unmappable marker.
+        let body = json!({
+            "model": "m",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let error = transform_request_degrading(body, THINK).unwrap_err();
+        assert!(error.contains("cache_control"), "{error}");
+    }
+
+    #[test]
+    fn top_level_cache_control_malformed_marker_rejects() {
+        // A present-but-malformed top-level marker fails closed even when caching
+        // is allowlisted, so an unsupported shape is never silently dropped.
+        let body = json!({
+            "model": "m",
+            "cache_control": {"type": "forever"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let error = transform_request_degrading(body, CACHE).unwrap_err();
+        assert!(error.contains("cache_control"), "{error}");
+    }
+
+    #[test]
+    fn extended_thinking_degradation_accepts_adaptive_and_display() {
+        // The `adaptive` shape and the optional `display` mode are valid thinking
+        // requests per the Anthropic discriminator, so they degrade, not reject.
+        for thinking in [
+            json!({"type": "adaptive"}),
+            json!({"type": "adaptive", "display": "omitted"}),
+            json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 2048,
+                "thinking": thinking.clone(),
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let (translated, degraded) = degrade(body, THINK).unwrap();
+            assert!(degraded.extended_thinking, "{thinking} degrades");
+            assert!(translated.get("thinking").is_none(), "thinking removed for {thinking}");
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_rejects_unrecognized_thinking_shapes() {
+        // `enabled` requires an integer `budget_tokens` ≥1024, a `display` must be
+        // a defined mode, and unknown keys are not a recognized shape.
+        for thinking in [
+            json!({"type": "enabled"}),
+            json!({"type": "enabled", "budget_tokens": 512}),
+            json!({"type": "adaptive", "display": "verbose"}),
+            json!({"type": "adaptive", "budget_tokens": 1024}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 2048,
+                "thinking": thinking.clone(),
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let error = transform_request_degrading(body, THINK).unwrap_err();
+            assert!(error.contains("thinking"), "{thinking} -> {error}");
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_rejects_budget_at_or_above_max_tokens() {
+        // The schema requires `budget_tokens` to stay below `max_tokens`; an
+        // at-or-above budget is malformed and must fail closed rather than be
+        // stripped and reported as a clean degradation.
+        for max_tokens in [1024, 2000, 2048] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let error = transform_request_degrading(body, THINK).unwrap_err();
+            assert!(error.contains("max_tokens"), "max_tokens {max_tokens} -> {error}");
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_strips_thinking_and_edits() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015"}]},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (translated, degraded) = degrade(body, THINK).unwrap();
+        assert!(degraded.extended_thinking);
+        assert!(!degraded.prompt_caching);
+        assert!(translated.get("thinking").is_none(), "thinking removed");
+        assert!(
+            translated.get("context_management").is_none(),
+            "thinking-only context_management removed"
+        );
+        assert_eq!(translated["messages"][0]["content"], "Hi");
+    }
+
+    #[test]
+    fn extended_thinking_degradation_accepts_disabled_thinking() {
+        let body = json!({
+            "model": "m",
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (_, degraded) = degrade(body, THINK).unwrap();
+        assert!(degraded.extended_thinking);
+    }
+
+    #[test]
+    fn extended_thinking_degradation_rejects_malformed_thinking() {
+        for thinking in [
+            json!("on"),
+            json!({"type": "weird"}),
+            json!({"type": "enabled", "budget_tokens": "lots"}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "thinking": thinking,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let error = transform_request_degrading(body, THINK).unwrap_err();
+            assert!(error.contains("thinking"), "{error}");
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_rejects_non_thinking_context_edits() {
+        for cm in [
+            json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015"}, {"type": "clear_tool_uses_20250919"}]}),
+            // Only the exact `clear_thinking_20251015` edit is a thinking edit;
+            // a look-alike version is an unrecognized edit, not a thinking one.
+            json!({"edits": [{"type": "clear_thinking_20990101"}]}),
+            json!({"trigger": "x"}),
+            json!([]),
+        ] {
+            let body = json!({
+                "model": "m",
+                "context_management": cm,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let error = transform_request_degrading(body, THINK).unwrap_err();
+            assert!(error.contains("context_management"), "{error}");
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_accepts_recognized_clear_thinking_keep() {
+        // Every `keep` shape the Anthropic `ClearThinking20251015` schema defines
+        // is a recognized thinking edit and degrades rather than rejecting.
+        for keep in [
+            json!("all"),
+            json!({"type": "all"}),
+            json!({"type": "thinking_turns", "value": 3}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 2048,
+                "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": keep.clone()}]},
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let (translated, degraded) = degrade(body, THINK).unwrap();
+            assert!(degraded.extended_thinking, "keep {keep} degrades");
+            assert!(
+                translated.get("context_management").is_none(),
+                "context_management removed for keep {keep}"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_accepts_empty_context_management() {
+        // `edits` is optional (`minItems: 0`), so a context_management with no
+        // edits — the empty object `{}` or an empty `edits` array — is a valid
+        // no-op: it is stripped and served, not rejected, and removing a no-op is
+        // not itself a degradation.
+        for cm in [json!({}), json!({"edits": []})] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 2048,
+                "context_management": cm.clone(),
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let (translated, degraded) = degrade(body, THINK).unwrap();
+            assert!(
+                !degraded.extended_thinking,
+                "empty context_management {cm} is a no-op, not a degradation"
+            );
+            assert!(
+                translated.get("context_management").is_none(),
+                "empty context_management {cm} removed"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_thinking_degradation_rejects_malformed_clear_thinking_edits() {
+        // Unknown edit fields and malformed `keep` values are rejected, not
+        // stripped and reported as a clean degradation; the checked-in schema
+        // rejects these shapes.
+        for cm in [
+            json!({"edits": [{"type": "clear_thinking_20251015", "trigger": {"type": "input_tokens", "value": 1}}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": 3}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "recent"}]}),
+            // The `keep` union carries no null, so explicit null is malformed and
+            // must fail closed rather than be stripped as a clean degradation.
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": null}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns"}}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 0}}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "all", "value": 3}}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "nonsense"}}]}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "max_tokens": 2048,
+                "context_management": cm.clone(),
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let error = transform_request_degrading(body, THINK).unwrap_err();
+            assert!(error.contains("context_management"), "{cm} -> {error}");
+        }
+    }
+
+    #[test]
+    fn context_management_not_allowlisted_still_rejects() {
+        let body = json!({
+            "model": "m",
+            "context_management": {"edits": [{"type": "clear_thinking_20251015"}]},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(transform_request_degrading(body, CACHE).is_err());
+    }
+
+    #[test]
+    fn degradation_reports_each_feature_independently() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "system": [{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (_, degraded) = degrade(body, BOTH).unwrap();
+        assert_eq!(
+            degraded,
+            DegradedFeatures {
+                prompt_caching: true,
+                extended_thinking: true
+            }
+        );
+    }
+
+    #[test]
+    fn allowlisted_request_without_markers_reports_no_degradation() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (_, degraded) = degrade(body, BOTH).unwrap();
+        assert!(!degraded.any(), "nothing to degrade");
+    }
+
+    // Test Utilities
+
+    const CACHE: LossyFeatureAllowlist = LossyFeatureAllowlist {
+        prompt_caching: true,
+        extended_thinking: false,
+    };
+    const THINK: LossyFeatureAllowlist = LossyFeatureAllowlist {
+        prompt_caching: false,
+        extended_thinking: true,
+    };
+    const BOTH: LossyFeatureAllowlist = LossyFeatureAllowlist {
+        prompt_caching: true,
+        extended_thinking: true,
+    };
+
+    fn degrade(body: Value, allow: LossyFeatureAllowlist) -> Result<(Value, DegradedFeatures), String> {
+        let output = transform_request_degrading(body, allow)?;
+        let parsed = serde_json::from_slice(&output.body).map_err(|e| e.to_string())?;
+        Ok((parsed, output.degraded))
     }
 }

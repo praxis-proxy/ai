@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and publish exact-commit native vLLM GPU qualification evidence.
+"""Capture and publish exact-commit vLLM Responses gateway evidence.
 
 No third-party dependencies: this runs on both the GPU AMI and hosted runners.
 The report describes the locally built gateway binary and model-baked image,
@@ -15,14 +15,15 @@ import re
 import subprocess
 from datetime import datetime, timezone
 
-VERSION = 1
-PROFILE = "native-responses-live-vllm-gpu"
+VERSION = 2
+PROFILE = "responses-gateway-live-vllm-gpu"
 ARTIFACT = "vllm-qualification"
+# Keep the existing note delimiters so release reruns replace earlier sections.
 START = "<!-- praxis:native-vllm-qualification:start -->"
 END = "<!-- praxis:native-vllm-qualification:end -->"
 OUTCOMES = ("passed", "failed", "skipped", "xfailed", "xpassed", "unexecuted")
 LIMITATIONS = [
-    {"text": "Selected native text HTTP/SSE behavior only; no complete OpenAI API conformance claim.", "url": None},
+    {"text": "Selected text and tool behavior over native Responses and Responses-to-Chat HTTP/SSE paths; no complete OpenAI API conformance claim.", "url": None},
     {"text": "Streamed Conversation append remains outside the supported contract.", "url": "https://github.com/praxis-proxy/ai/issues/410"},
     {"text": "Background, WebSockets, and multimodal models are excluded.", "url": None},
     {"text": "Credentialed provider tests and optional client acceptance are separate evidence.", "url": None},
@@ -87,20 +88,30 @@ def model_revision(runtime, model):
     return command(runtime, "exec", "vllm", "python", "-c", code, model) or None
 
 
-def suite(name, path):
+def suite(name, path, profile=None):
     result = read_json(path)
     if not result:
         return {"name": name, "status": "unexecuted", "reason": "pytest result file missing", "selected": [], "deselected": [], "dependencies": {}}
-    cases = result.get("selected", [])
+    all_cases = result.get("selected", [])
+    cases = [case for case in all_cases if case.get("profile", "unclassified") == profile] if profile else all_cases
+    deselected = result.get("deselected", [])
+    if profile:
+        deselected = [case for case in deselected if case.get("profile", "unclassified") == profile]
     totals = {outcome: sum(case.get("outcome") == outcome for case in cases) for outcome in OUTCOMES}
     executed = sum(totals[key] for key in OUTCOMES if key != "unexecuted")
+    # A pytest exit of 1 from a failed case in another profile does not make
+    # this profile incomplete. Other nonzero exits still mean the run broke.
+    process_completed = result.get("exit_code") == 0 or (
+        result.get("exit_code") == 1
+        and any(case.get("outcome") in ("failed", "xpassed") for case in all_cases)
+    )
     if not executed:
         status, reason = "incomplete", "zero selected cases executed"
     elif totals["failed"]:
         status, reason = "failed", "selected tests failed"
     elif totals["xpassed"]:
         status, reason = "needs_review", "unexpected passes need contract review"
-    elif totals["unexecuted"] or result.get("exit_code") != 0:
+    elif totals["unexecuted"] or not process_completed:
         status, reason = "incomplete", "test process did not complete cleanly"
     elif totals["skipped"] == executed:
         status, reason = "skipped", "all selected cases skipped; no provider proof"
@@ -109,7 +120,7 @@ def suite(name, path):
     else:
         status, reason = "passed", "selected cases completed"
     return {"name": name, "status": status, "reason": reason, "selected": cases,
-            "deselected": result.get("deselected", []), "totals": totals,
+            "deselected": deselected, "totals": totals,
             "exit_code": result.get("exit_code"), "dependencies": result.get("dependencies", {}),
             "started_at": result.get("started_at"), "finished_at": result.get("finished_at")}
 
@@ -121,8 +132,36 @@ def capture(args):
     run_id = os.environ.get("GITHUB_RUN_ID")
     repo = os.environ.get("GITHUB_REPOSITORY")
     config = "examples/configs/openai/responses/full-flow-agentic.yaml"
-    native = suite("native_responses", args.native)
+    native = suite("native_responses", args.responses, "native")
+    translation = suite("translation", args.responses, "translation")
+    supporting = suite("supporting", args.responses, "supporting")
+    unclassified = suite("unclassified", args.responses, "unclassified")
+    if not unclassified["selected"]:
+        unclassified["status"] = "empty"
+        unclassified["reason"] = "all selected cases attributed"
     credentialed = suite("credentialed_tools", args.credentialed)
+    groups = (("native Responses", native), ("translation", translation),
+              ("supporting", supporting), ("credentialed tools", credentialed))
+    status, reason = "passed", "native and translation cases completed"
+    if args.setup != "passed":
+        status, reason = "incomplete", "GPU setup failed before qualification completed"
+    else:
+        problem = next(((label, group) for severity in ("failed", "needs_review")
+                        for label, group in groups if group["status"] == severity), None)
+        if problem:
+            label, group = problem
+            status, reason = group["status"], f"{label}: {group['reason']}"
+        else:
+            if unclassified["selected"]:
+                status, reason = "incomplete", "selected cases lack a known gateway profile"
+            else:
+                for label, group in groups:
+                    allowed = ("passed", "skipped") if label in ("supporting", "credentialed tools") else ("passed",)
+                    if label == "supporting" and not group["selected"]:
+                        continue
+                    if group["status"] not in allowed:
+                        status, reason = "incomplete", f"{label}: {group['reason']}"
+                        break
     gpu = command("nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total", "--format=csv,noheader")
     image_id = command(runtime, "image", "inspect", image, "--format={{.Id}}") if image else None
     resolved_revision = model_revision(runtime, model)
@@ -167,19 +206,17 @@ def capture(args):
         "runner": {"name": os.environ.get("RUNNER_NAME"), "os": os.environ.get("RUNNER_OS"),
                    "architecture": os.environ.get("RUNNER_ARCH"), "gpu": gpu,
                    "instance_type": os.environ.get("GPU_INSTANCE_TYPE")},
-        "suites": {"native_responses": native, "credentialed_tools": credentialed,
-                   "translation": {"status": "not_in_native_suite", "reason": "reported by separate translation/client acceptance jobs"},
-                   "simulator": {"status": "not_in_native_suite", "reason": "separate hosted simulator jobs"}},
+        "suites": {"native_responses": native, "translation": translation,
+                   "supporting": supporting, "unclassified": unclassified,
+                   "credentialed_tools": credentialed,
+                   "simulator": {"status": "separate_job", "reason": "separate hosted simulator jobs"}},
         "phases": {"provisioning": "passed", "setup": args.setup,
-                   "test_execution": native["status"]},
-        "status": native["status"] if args.setup == "passed" else "incomplete",
-        "reason": native["reason"] if args.setup == "passed" else "GPU setup failed before qualification completed",
+                   "test_execution": status},
+        "status": status,
+        "reason": reason,
         "limitations": LIMITATIONS,
-        "diagnostics": ["vllm-gpu-native-raw artifact: pytest output (including focused HTTP/SSE failure assertions), case JSON, and available service logs"],
+        "diagnostics": ["vllm-gpu-responses-raw artifact: pytest output (including focused HTTP/SSE failure assertions), case JSON, and available service logs"],
     }
-    if report["status"] == "passed" and credentialed["status"] in ("failed", "incomplete", "needs_review", "unexecuted"):
-        report["status"] = credentialed["status"] if credentialed["status"] != "unexecuted" else "incomplete"
-        report["reason"] = f"credentialed tools: {credentialed['reason']}"
     write_json(args.output, report)
 
 
@@ -194,6 +231,32 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "cases": []}
     return {"status": job_result, "job_status": job_result, "scope": scope,
             "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+
+
+def passing_suite_problem(report):
+    suites = report.get("suites", {})
+    for name, profile in (("native_responses", "native"), ("translation", "translation")):
+        group = suites.get(name, {})
+        cases = group.get("selected", [])
+        if (group.get("status") != "passed" or not cases
+                or not any(case.get("outcome") == "passed" for case in cases)
+                or any(case.get("profile") != profile
+                       or case.get("outcome") not in ("passed", "skipped", "xfailed")
+                       for case in cases)):
+            return f"passing report lacks executed {profile} cases with valid attribution"
+    supporting = suites.get("supporting", {})
+    if supporting.get("selected") and (
+        supporting.get("status") not in ("passed", "skipped")
+        or any(case.get("profile") != "supporting"
+               or case.get("outcome") not in ("passed", "skipped", "xfailed")
+               for case in supporting["selected"])
+    ):
+        return "passing report has invalid supporting case results"
+    if suites.get("unclassified", {}).get("selected"):
+        return "passing report contains unclassified selected cases"
+    if suites.get("credentialed_tools", {}).get("status") not in ("passed", "skipped"):
+        return "passing report lacks completed credentialed tool results"
+    return None
 
 
 def finish(raw, requested, start_result, suite_result, claude_result, codex_result, run_id, attempt, url, sha,
@@ -211,8 +274,8 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
                   "model": {}, "configuration": {}, "runner": {}, "suites": {},
                   "limitations": LIMITATIONS, "diagnostics": []}
         report["status"] = "incomplete" if requested else "not_requested"
-        report["reason"] = ("GPU provisioning failed or no current-attempt native result artifact was produced"
-                            if requested else "native GPU qualification was not requested")
+        report["reason"] = ("GPU provisioning failed or no current-attempt Responses result artifact was produced"
+                            if requested else "Responses GPU qualification was not requested")
     report["workflow"] = {"run_id": run_id, "attempt": attempt, "url": url}
     report["requested"] = requested
     report["phases"] = {"provisioning": start_result,
@@ -225,14 +288,14 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
         codex_raw, codex_result, run_id, attempt, sha,
         "native Responses and translated Chat")
     if not requested:
-        report["status"], report["reason"] = "not_requested", "native GPU qualification was not requested"
+        report["status"], report["reason"] = "not_requested", "Responses GPU qualification was not requested"
     elif suite_result != "success" and report["status"] == "passed":
         report["status"] = "incomplete"
         report["reason"] = f"selected cases passed but GPU suite job concluded {suite_result}"
     if requested and report["status"] == "passed":
-        native_cases = report.get("suites", {}).get("native_responses", {}).get("selected", [])
-        if not any(case.get("outcome") == "passed" for case in native_cases):
-            report["status"], report["reason"] = "incomplete", "no selected native case passed"
+        problem = passing_suite_problem(report)
+        if problem:
+            report["status"], report["reason"] = "incomplete", problem
     if requested and report["status"] == "passed" and not report.get("gateway", {}).get("checkout_sha"):
         report["status"], report["reason"] = "incomplete", "actual checkout SHA unavailable"
     if requested and report.get("gateway", {}).get("checkout_sha") and report["gateway"]["checkout_sha"] != sha:
@@ -254,19 +317,19 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
     return report
 
 
-def totals(report):
-    return report.get("suites", {}).get("native_responses", {}).get("totals", {})
+def totals(report, name):
+    return report.get("suites", {}).get(name, {}).get("totals", {})
 
 
 def render(report, detailed=False):
     status = report.get("status", "unavailable")
-    lines = [START, "### Native vLLM qualification", ""]
+    lines = [START, "### vLLM Responses gateway qualification", ""]
     if status == "unavailable":
-        lines.append("Native vLLM qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
+        lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
     elif status == "not_requested":
-        lines.append("Native vLLM qualification: GPU testing was not requested.")
+        lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
     else:
-        lines.append(f"Native vLLM qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
+        lines.append(f"vLLM Responses gateway qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
     gateway, backend, model = (report.get(key, {}) for key in ("gateway", "backend", "model"))
     if status not in ("unavailable", "not_requested"):
         lines += ["", f"Tested checkout: `{gateway.get('checkout_sha') or 'unavailable'}`; locally built gateway binary `{gateway.get('binary_sha256') or 'unavailable'}` (debug/full); Praxis core `{gateway.get('praxis_version') or 'unavailable'}`.",
@@ -274,8 +337,15 @@ def render(report, detailed=False):
         config = report.get("configuration", {})
         deps = report.get("suites", {}).get("native_responses", {}).get("dependencies", {})
         lines.append(f"SDK: OpenAI Python `{deps.get('openai') or 'unavailable'}`; config `{config.get('reference_path') or 'unavailable'}` (`{config.get('sha256') or 'unavailable'}`); storage `{config.get('storage_backend') or 'unavailable'}`.")
-        counts = totals(report)
-        lines.append("Native selected cases: " + ", ".join(f"{key} {counts.get(key, 0)}" for key in OUTCOMES) + ".")
+        for name, label in (("native_responses", "Native Responses"),
+                            ("translation", "Responses-to-Chat translation"),
+                            ("supporting", "Supporting")):
+            group = report.get("suites", {}).get(name, {})
+            counts = totals(report, name)
+            lines.append(f"{label}: {group.get('status', 'unavailable')}; selected cases: "
+                         + ", ".join(f"{key} {counts.get(key, 0)}" for key in OUTCOMES) + ".")
+        if report.get("suites", {}).get("unclassified", {}).get("selected"):
+            lines.append(f"Unclassified selected cases: {len(report['suites']['unclassified']['selected'])} (profile attribution required).")
         for name in ("credentialed_tools", "claude_acceptance", "codex_acceptance"):
             suite_data = report.get("suites", {}).get(name, {})
             cases = suite_data.get("cases", [])
@@ -289,14 +359,15 @@ def render(report, detailed=False):
         for limitation in report.get("limitations", []):
             label = limitation["text"]
             lines.append(f"- [{label}]({limitation['url']})" if limitation.get("url") else f"- {label}")
-        for suite_name in ("native_responses", "credentialed_tools"):
+        for suite_name in ("native_responses", "translation", "supporting", "unclassified", "credentialed_tools"):
             suite_data = report.get("suites", {}).get(suite_name, {})
             notable = [case for case in suite_data.get("selected", []) if case.get("outcome") != "passed"]
             if notable:
                 lines += ["", f"{suite_name.replace('_', ' ').title()} case reasons (complete list in `qualification.json`):"]
                 for case in notable[:20]:
                     reason = (str(case.get("reason", "")).splitlines() or [""])[0][:240]
-                    lines.append(f"- `{case['id']}`: {case.get('outcome')} | {reason}")
+                    sdk_info = f" [SDK {case['sdk_version']}]" if case.get("sdk_version") else f" [SDK {case['sdk_lane']}]" if case.get("sdk_lane") else ""
+                    lines.append(f"- `{case['id']}`{sdk_info}: {case.get('outcome')} | {reason}")
                 if len(notable) > 20:
                     lines.append(f"- {len(notable) - 20} further cases in the artifact")
         for suite_name in ("claude_acceptance", "codex_acceptance"):
@@ -311,7 +382,7 @@ def render(report, detailed=False):
                             reason = (str(item.get("reason", "")).splitlines() or [""])[0][:160]
                             lines.append(f"  - `{item['id']}`: {item.get('outcome')} | {reason}")
     else:
-        lines += ["", "Limitations: selected native text HTTP/SSE behavior only; [streamed Conversation append](https://github.com/praxis-proxy/ai/issues/410) and multimodal/background/WebSocket paths are excluded. See the attached `qualification.json` for case reasons and separate client/tool results."]
+        lines += ["", "Limitations: selected text and tool behavior over native Responses and Responses-to-Chat HTTP/SSE paths only; [streamed Conversation append](https://github.com/praxis-proxy/ai/issues/410) and multimodal/background/WebSocket paths are excluded. See the attached `qualification.json` for case reasons and separate client/tool results."]
     lines += [END, ""]
     return "\n".join(lines)
 
@@ -331,7 +402,7 @@ def unavailable(sha, reason, url=None):
 
 
 def choose_run(runs, jobs_by_id):
-    """Newest completed native GPU attempt; never fall back after invalid evidence."""
+    """Newest completed Responses GPU attempt; never fall back after invalid evidence."""
     for run in sorted(runs, key=lambda item: item["id"], reverse=True):
         if run.get("status") != "completed":
             continue
@@ -355,7 +426,7 @@ def verify(report, run, sha):
     if not isinstance(report, dict):
         return "report missing or invalid JSON"
     if report.get("schema_version") != VERSION or report.get("profile") != PROFILE:
-        return "report version or native profile mismatch"
+        return "report version or Responses gateway profile mismatch"
     if not all(isinstance(report.get(key), dict) for key in ("workflow", "gateway", "backend", "model", "configuration", "suites")):
         return "report structure invalid"
     if report.get("workflow", {}).get("run_id") != run["id"] or report.get("workflow", {}).get("attempt") != run["run_attempt"]:
@@ -365,14 +436,14 @@ def verify(report, run, sha):
     if run.get("head_sha") != sha or report.get("gateway", {}).get("checkout_sha") != sha:
         return "workflow or actual checkout SHA mismatch"
     if not report.get("requested"):
-        return "native GPU testing was not requested"
+        return "Responses GPU testing was not requested"
     if report.get("status") not in ("passed", "failed", "incomplete", "needs_review", "skipped", "unexecuted"):
         return "report status invalid"
     if report.get("status") == "passed":
-        native = report["suites"].get("native_responses", {})
-        cases = native.get("selected", [])
-        if native.get("status") != "passed" or not cases or not any(case.get("outcome") == "passed" for case in cases):
-            return "passing report has no executed native passing cases"
+        problem = passing_suite_problem(report)
+        if problem:
+            return problem
+        native = report["suites"]["native_responses"]
         if not native.get("dependencies", {}).get("openai"):
             return "passing report lacks OpenAI SDK version"
         for section, field in (("gateway", "binary_sha256"), ("gateway", "praxis_version"),
@@ -418,7 +489,7 @@ def release_evidence(args):
         else:
             chosen = choose_run(runs, jobs_by_id)
             if chosen is None:
-                report = unavailable(sha, "no completed native GPU attempt for this commit")
+                report = unavailable(sha, "no completed Responses GPU attempt for this commit")
             else:
                 run_id = chosen["id"]
                 url = chosen.get("html_url")
@@ -445,7 +516,7 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     cap = sub.add_parser("capture")
-    cap.add_argument("--native", required=True)
+    cap.add_argument("--responses", required=True)
     cap.add_argument("--credentialed", required=True)
     cap.add_argument("--setup", choices=("passed", "failed"), required=True)
     cap.add_argument("--output", required=True)

@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "scenario_id": "messages/tool-input-presence",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-tool-input-model",
+    "source_id": "controlled-anthropic-tool-input-presence"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_array": "call_recorded_0004",
+      "call_missing": "call_recorded_0001",
+      "call_null": "call_recorded_0002",
+      "call_object": "call_recorded_0003",
+      "chatcmpl-recorded-0002": "chatcmpl-recorded-0006",
+      "msg_chatcmpl-recorded-0002": "msg_recorded_0005"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "id": "call_recorded_0001",
+                      "name": "f",
+                      "type": "tool_use"
+                    },
+                    {
+                      "id": "call_recorded_0002",
+                      "input": null,
+                      "name": "g",
+                      "type": "tool_use"
+                    },
+                    {
+                      "id": "call_recorded_0003",
+                      "input": {},
+                      "name": "h",
+                      "type": "tool_use"
+                    },
+                    {
+                      "id": "call_recorded_0004",
+                      "input": [
+                        1,
+                        2
+                      ],
+                      "name": "i",
+                      "type": "tool_use"
+                    }
+                  ],
+                  "role": "assistant"
+                }
+              ],
+              "model": "synthetic-tool-input-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "container": null,
+              "content": [
+                {
+                  "citations": null,
+                  "text": "Sunny",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0005",
+              "model": "synthetic-tool-input-model",
+              "role": "assistant",
+              "stop_details": null,
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "type": "message",
+              "usage": {
+                "cache_creation": null,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+                "inference_geo": null,
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "output_tokens_details": null,
+                "server_tool_use": null,
+                "service_tier": null
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "role": "assistant",
+                  "tool_calls": [
+                    {
+                      "function": {
+                        "arguments": "{}",
+                        "name": "f"
+                      },
+                      "id": "call_recorded_0001",
+                      "type": "function"
+                    },
+                    {
+                      "function": {
+                        "arguments": "null",
+                        "name": "g"
+                      },
+                      "id": "call_recorded_0002",
+                      "type": "function"
+                    },
+                    {
+                      "function": {
+                        "arguments": "{}",
+                        "name": "h"
+                      },
+                      "id": "call_recorded_0003",
+                      "type": "function"
+                    },
+                    {
+                      "function": {
+                        "arguments": "[1,2]",
+                        "name": "i"
+                      },
+                      "id": "call_recorded_0004",
+                      "type": "function"
+                    }
+                  ]
+                }
+              ],
+              "model": "synthetic-tool-input-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "Sunny",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0006",
+              "model": "synthetic-tool-input-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 12,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

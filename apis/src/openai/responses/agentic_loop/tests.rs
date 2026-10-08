@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
@@ -431,6 +431,82 @@ async fn sets_content_type_on_reentry() {
         .iter()
         .any(|(k, v)| k == http::header::CONTENT_TYPE && v == "application/json");
     assert!(has_content_type, "IRR re-entry must set content-type: application/json");
+}
+
+#[test]
+fn continuation_headers_keep_order_in_the_legacy_queue() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    super::queue_continuation_header(&mut ctx, http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    super::queue_continuation_header(
+        &mut ctx,
+        http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    assert_eq!(
+        ctx.request_headers_to_set,
+        vec![
+            (http::header::AUTHORIZATION, "Bearer token".parse().unwrap()),
+            (http::header::CONTENT_TYPE, "application/json".parse().unwrap()),
+        ],
+        "continuation headers must queue into the legacy list in call order"
+    );
+    assert!(
+        ctx.pre_read_mutations.is_empty(),
+        "an empty ordered log must stay empty when no pre-read mutations exist"
+    );
+}
+
+#[test]
+fn continuation_headers_join_an_active_ordered_log() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        http::header::ACCEPT,
+        "application/json".parse().unwrap(),
+    ));
+    super::queue_continuation_header(&mut ctx, http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    super::queue_continuation_header(
+        &mut ctx,
+        http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        2,
+        "both continuation headers must reach the legacy queue"
+    );
+    assert_eq!(
+        ctx.pre_read_mutations.len(),
+        3,
+        "both continuation headers must also join the pre-existing ordered log"
+    );
+    for ((name, value), mutation) in ctx
+        .request_headers_to_set
+        .iter()
+        .zip(ctx.pre_read_mutations.iter().skip(1))
+    {
+        let TrustedHeaderMutation::Set(ordered_name, ordered_value) = mutation else {
+            panic!("continuation header must be an ordered Set");
+        };
+        assert_eq!(
+            (name, value),
+            (ordered_name, ordered_value),
+            "legacy queue and ordered log must carry identical continuation headers in the same order"
+        );
+    }
+    assert_eq!(
+        ctx.request_headers_to_set[0].0,
+        http::header::AUTHORIZATION,
+        "the first queued continuation header must be authorization"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[1].0,
+        http::header::CONTENT_TYPE,
+        "the second queued continuation header must be content-type"
+    );
 }
 
 #[tokio::test]

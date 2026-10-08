@@ -256,8 +256,9 @@ fn load_config_full(
         ),
         None => yaml,
     };
-    // Point the Tavily provider at the local body-authenticated stub with a known
-    // key so the test can assert the credential travels in the request body.
+    // Point the Tavily provider at the local stub with a known key so the test
+    // can assert the credential travels in the `Authorization` header (issue
+    // #1389), never in the request body the outbound chain can read.
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
@@ -276,7 +277,7 @@ fn load_config_full(
 }
 
 // -----------------------------------------------------------------------------
-// Tavily search stub (body-authenticated, captures each request)
+// Tavily search stub (header-authenticated, captures each raw request)
 // -----------------------------------------------------------------------------
 
 struct TavilyStub {
@@ -314,8 +315,12 @@ impl TavilyStub {
         self.requests.lock().expect("read search requests").len()
     }
 
+    fn raw_request(&self) -> String {
+        self.requests.lock().expect("read search requests")[0].clone()
+    }
+
     fn body_json(&self) -> Value {
-        let request = self.requests.lock().expect("read search requests")[0].clone();
+        let request = self.raw_request();
         let (_, body) = request.split_once("\r\n\r\n").expect("search request body");
         serde_json::from_str(body).expect("search request JSON")
     }
@@ -385,17 +390,22 @@ fn web_search_loop_translates_chat_completions_round_trip() {
         "the translated answer must carry the model's terminal text: {response}"
     );
 
-    // Exactly one managed Tavily search, body-authenticated with the configured
-    // key and the reconstructed query.
+    // Exactly one managed Tavily search with the reconstructed query, its key
+    // carried in the `Authorization` header (issue #1389), never the body.
     assert_eq!(search.request_count(), 1, "the loop dispatches exactly one search");
     let search_body = search.body_json();
     assert_eq!(
         search_body["query"], "potato",
         "the reconstructed query drove the search"
     );
-    assert_eq!(
-        search_body["api_key"], "test-key",
-        "the Tavily key must travel in the request body"
+    let raw_search = search.raw_request().to_ascii_lowercase();
+    assert!(
+        raw_search.contains("authorization: bearer test-key"),
+        "the Tavily key must travel in the Authorization header: {raw_search}"
+    );
+    assert!(
+        search_body.get("api_key").is_none(),
+        "the Tavily key must not appear in the request body: {search_body}"
     );
 
     // The backend saw two Chat Completions rounds; the re-entry carries the
@@ -652,16 +662,22 @@ fn streaming_web_search_loop_translates_chat_sse_into_one_anthropic_lifecycle() 
     );
     assert!(!body.contains(TOOL_CALL_ID), "the managed tool id never leaks: {body}");
 
-    // Exactly one body-authenticated Tavily search with the reconstructed query.
+    // Exactly one Tavily search with the reconstructed query, its key carried in
+    // the `Authorization` header (issue #1389), never the body.
     assert_eq!(search.request_count(), 1, "the streaming loop dispatches one search");
     let search_body = search.body_json();
     assert_eq!(
         search_body["query"], "potato",
         "the reconstructed query drove the search"
     );
-    assert_eq!(
-        search_body["api_key"], "test-key",
-        "the Tavily key must travel in the request body"
+    let raw_search = search.raw_request().to_ascii_lowercase();
+    assert!(
+        raw_search.contains("authorization: bearer test-key"),
+        "the Tavily key must travel in the Authorization header: {raw_search}"
+    );
+    assert!(
+        search_body.get("api_key").is_none(),
+        "the Tavily key must not appear in the request body: {search_body}"
     );
 
     // Two Chat Completions rounds; the first requests streaming transport and the

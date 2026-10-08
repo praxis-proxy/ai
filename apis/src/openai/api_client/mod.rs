@@ -27,7 +27,7 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{is_private_ip, prepare_url_target};
+use praxis_core::connectivity::prepare_url_target;
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback, SubrequestRuntime, TlsPeerIdentity,
@@ -390,14 +390,11 @@ impl ApiClient {
         // Pin the resolved target before dialing: the validation hook runs
         // once on the complete address set, rejecting private or reserved
         // addresses unless the bound pipeline opted into private upstreams.
-        let allow_private = outbound.pipeline.allow_private_upstreams();
+        let address_policy = AddressPolicy::from_allow_private(outbound.pipeline.allow_private_upstreams());
         let target = Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
-            if allow_private {
-                return Ok(());
-            }
-            if addresses.iter().any(|addr| is_private_ip(&addr.ip())) {
+            if addresses.iter().any(|addr| address_policy.blocks(&addr.ip())) {
                 return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
-                    "callout target resolves to a private or reserved address".into(),
+                    "callout target resolves to an address blocked by outbound policy".into(),
                 );
             }
             Ok(())
@@ -904,6 +901,32 @@ mod tests {
         assert!(
             matches!(err, ApiClientError::ResponseTooLarge { limit: 8 }),
             "the outbound-chain path should preserve the typed overflow and its limit: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_chain_rejects_metadata_with_private_upstreams_enabled() {
+        let client = test_client("http://169.254.169.254");
+        let outbound = private_outbound(&client);
+
+        let error = client
+            .get_via_chain(
+                "http://169.254.169.254/latest/meta-data/",
+                &HeaderMap::new(),
+                1024,
+                &outbound,
+            )
+            .await
+            .expect_err("metadata must be rejected before dialing");
+
+        assert!(
+            matches!(
+                error,
+                ApiClientError::Transport {
+                    source: SubRequestError::Connect(_),
+                }
+            ),
+            "metadata rejection should surface as a connect-policy error"
         );
     }
 

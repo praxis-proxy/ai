@@ -10,7 +10,6 @@
 use std::borrow::Cow;
 
 use serde_json::{Map, Value, json};
-use tracing::warn;
 
 // -----------------------------------------------------------------------------
 // Public Entry Point
@@ -53,6 +52,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     let Some(obj) = value.as_object() else {
         return Err("request body is not a JSON object".to_owned());
     };
+    validate_request_fields(obj)?;
 
     let (model, stream, include_usage, candidate_count) = extract_request_options(obj)?;
 
@@ -72,12 +72,12 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     }
 
     // Tools → tools
-    if let Some(tools) = convert_tools(obj) {
+    if let Some(tools) = convert_tools(obj)? {
         gemini.insert("tools".to_owned(), tools);
     }
 
     // Tool choice → toolConfig
-    if let Some(tool_config) = convert_tool_choice(obj) {
+    if let Some(tool_config) = convert_tool_choice(obj)? {
         gemini.insert("toolConfig".to_owned(), tool_config);
     }
 
@@ -90,6 +90,74 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         include_usage,
         candidate_count,
     })
+}
+
+/// Reject fields this full-body adapter would otherwise silently discard.
+#[expect(clippy::too_many_lines, reason = "sequential validation of request fields")]
+fn validate_request_fields(obj: &Map<String, Value>) -> Result<(), String> {
+    for (field, value) in obj {
+        if matches!(
+            field.as_str(),
+            "model"
+                | "messages"
+                | "stream"
+                | "stream_options"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "temperature"
+                | "top_p"
+                | "stop"
+                | "presence_penalty"
+                | "frequency_penalty"
+                | "seed"
+                | "n"
+                | "top_logprobs"
+                | "logprobs"
+                | "response_format"
+                | "tools"
+                | "tool_choice"
+        ) || value.is_null()
+            || matches!(
+                (field.as_str(), value),
+                ("parallel_tool_calls", Value::Bool(true)) | ("store", Value::Bool(false))
+            )
+        {
+            continue;
+        }
+        return Err(format!("`{field}` cannot be translated to Vertex Gemini"));
+    }
+    if let Some(stop) = obj.get("stop").filter(|value| !value.is_null())
+        && !stop.is_string()
+        && !stop
+            .as_array()
+            .is_some_and(|values| values.iter().all(Value::is_string))
+    {
+        return Err("`stop` must be a string or array of strings".to_owned());
+    }
+    if let Some(logprobs) = obj.get("logprobs").filter(|value| !value.is_null())
+        && !logprobs.is_boolean()
+    {
+        return Err("`logprobs` must be a boolean".to_owned());
+    }
+    if let Some(format) = obj.get("response_format").filter(|value| !value.is_null()) {
+        let format = format.as_object().ok_or("`response_format` must be an object")?;
+        match format.get("type").and_then(Value::as_str) {
+            Some("text" | "json_object") => {},
+            Some("json_schema")
+                if format
+                    .get("json_schema")
+                    .and_then(|schema| schema.get("schema"))
+                    .is_some() => {},
+            _ => return Err("unsupported `response_format` for Vertex Gemini translation".to_owned()),
+        }
+    }
+    if let Some(options) = obj.get("stream_options").filter(|value| !value.is_null()) {
+        let options = options.as_object().ok_or("`stream_options` must be an object")?;
+        if options.keys().any(|key| key != "include_usage") {
+            return Err("unsupported `stream_options` field for Vertex Gemini translation".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Extract fields that control upstream routing and streaming lifecycle.
@@ -199,9 +267,10 @@ fn expected_candidate_count(obj: &Map<String, Value>) -> u64 {
 /// - `assistant` → `role: "model"`
 /// - `tool` / `function` → `role: "user"` with `functionResponse` part
 fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Value>), String> {
-    let Some(Value::Array(messages)) = obj.get("messages") else {
-        return Ok((Vec::new(), None));
-    };
+    let messages = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("`messages` must be an array")?;
 
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
@@ -227,17 +296,42 @@ fn convert_one_message(
     i: usize,
     msg: &Value,
 ) -> Result<(), String> {
-    let Some(role) = msg.get("role").and_then(Value::as_str) else {
-        return Ok(());
-    };
+    let role = msg
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or("message is missing a string `role`")?;
+    validate_message_fields(msg, role)?;
     match role {
-        "system" | "developer" => collect_system_parts(system_parts, msg),
-        "user" => convert_user_message(contents, msg),
+        "system" | "developer" => collect_system_parts(system_parts, msg)?,
+        "user" => convert_user_message(contents, msg)?,
         "assistant" => convert_assistant_message(contents, msg)?,
         "tool" | "function" => {
-            convert_tool_result(contents, messages, i, msg, is_tool_result_continuation(messages, i));
+            convert_tool_result(contents, messages, i, msg, is_tool_result_continuation(messages, i))?;
         },
-        _ => warn!(role, "dropping message with unknown role"),
+        _ => return Err(format!("unsupported message role `{role}`")),
+    }
+    Ok(())
+}
+
+/// Reject message fields that the role-specific Gemini conversion would drop.
+fn validate_message_fields(msg: &Value, role: &str) -> Result<(), String> {
+    let Some(fields) = msg.as_object() else {
+        return Err("message must be an object".to_owned());
+    };
+    let allowed: &[&str] = match role {
+        "system" | "developer" | "user" => &["role", "content"],
+        "assistant" => &["role", "content", "tool_calls"],
+        "tool" => &["role", "content", "tool_call_id", "name"],
+        "function" => &["role", "content", "name"],
+        _ => return Ok(()),
+    };
+    if fields
+        .iter()
+        .any(|(key, value)| !allowed.contains(&key.as_str()) && !value.is_null())
+    {
+        return Err(format!(
+            "unsupported `{role}` message field for Vertex Gemini translation"
+        ));
     }
     Ok(())
 }
@@ -247,7 +341,7 @@ fn convert_one_message(
 // -----------------------------------------------------------------------------
 
 /// Collect system/developer message content into `systemInstruction` parts.
-fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) {
+fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
     match msg.get("content") {
         Some(Value::String(text)) => {
             if !text.is_empty() {
@@ -256,16 +350,21 @@ fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) {
         },
         Some(Value::Array(content_parts)) => {
             for part in content_parts {
-                if part.get("type").and_then(Value::as_str) == Some("text")
-                    && let Some(text) = part.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err("unsupported system content part".to_owned());
+                }
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("system text part is missing `text`")?;
+                if !text.is_empty() {
                     parts.push(json!({ "text": text }));
                 }
             }
         },
-        _ => {},
+        _ => return Err("system message `content` must be a string or array".to_owned()),
     }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -273,22 +372,23 @@ fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) {
 // -----------------------------------------------------------------------------
 
 /// Convert a `user` role message to a Gemini content entry.
-fn convert_user_message(contents: &mut Vec<Value>, msg: &Value) {
+fn convert_user_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
     let parts = match msg.get("content") {
         Some(Value::String(text)) => vec![json!({ "text": text })],
-        Some(Value::Array(content_parts)) => convert_multipart_content(content_parts),
-        _ => return,
+        Some(Value::Array(content_parts)) => convert_multipart_content(content_parts)?,
+        _ => return Err("user message `content` must be a string or array".to_owned()),
     };
 
     if !parts.is_empty() {
         contents.push(json!({ "role": "user", "parts": parts }));
     }
+    Ok(())
 }
 
 /// Convert OpenAI multipart content array to Gemini parts.
 ///
 /// Handles `text`, `image_url` (both URLs and base64 data URIs).
-fn convert_multipart_content(content_parts: &[Value]) -> Vec<Value> {
+fn convert_multipart_content(content_parts: &[Value]) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
 
     for part in content_parts {
@@ -296,22 +396,27 @@ fn convert_multipart_content(content_parts: &[Value]) -> Vec<Value> {
 
         match part_type {
             "text" => {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    parts.push(json!({ "text": text }));
-                }
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("text content part is missing `text`")?;
+                parts.push(json!({ "text": text }));
             },
             "image_url" => {
-                if let Some(gemini_part) = convert_image_url(part) {
-                    parts.push(gemini_part);
+                if part
+                    .get("image_url")
+                    .and_then(|image| image.get("detail"))
+                    .is_some_and(|detail| !detail.is_null() && detail != "auto")
+                {
+                    return Err("image_url detail cannot be translated to Vertex Gemini".to_owned());
                 }
+                parts.push(convert_image_url(part).ok_or("image_url part requires a supported URL")?);
             },
-            _ => {
-                warn!(part_type, "dropping unknown content part type");
-            },
+            _ => return Err(format!("unsupported user content part type `{part_type}`")),
         }
     }
 
-    parts
+    Ok(parts)
 }
 
 /// Convert an OpenAI `image_url` content part to a Gemini `inlineData`
@@ -368,13 +473,12 @@ fn guess_mime_type(url: &str) -> &'static str {
 fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
     let mut parts = Vec::new();
 
-    collect_assistant_content(&mut parts, msg.get("content"));
+    collect_assistant_content(&mut parts, msg.get("content"))?;
 
-    if let Some(Value::Array(tool_calls)) = msg.get("tool_calls") {
+    if let Some(tool_calls) = msg.get("tool_calls").filter(|calls| !calls.is_null()) {
+        let tool_calls = tool_calls.as_array().ok_or("assistant `tool_calls` must be an array")?;
         for tc in tool_calls {
-            if let Some(fc) = convert_tool_call(tc)? {
-                parts.push(fc);
-            }
+            parts.push(convert_tool_call(tc)?);
         }
     }
 
@@ -386,29 +490,33 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(
 }
 
 /// Convert string or array-form assistant content into Gemini text parts.
-fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) {
+fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) -> Result<(), String> {
     match content {
-        Some(Value::String(text)) if !text.is_empty() => parts.push(json!({ "text": text })),
+        Some(Value::String(text)) => {
+            if !text.is_empty() {
+                parts.push(json!({ "text": text }));
+            }
+        },
         Some(Value::Array(content_parts)) => {
             for part in content_parts {
                 let part_type = part.get("type").and_then(Value::as_str).unwrap_or("<missing>");
                 let text = match part_type {
-                    "text" => part.get("text").and_then(Value::as_str),
-                    "refusal" => part.get("refusal").and_then(Value::as_str),
-                    _ => {
-                        warn!(part_type, "dropping unknown assistant content part type");
-                        None
-                    },
+                    "text" => part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or("assistant text part is missing `text`")?,
+                    "refusal" => return Err("assistant refusal cannot be translated to Vertex Gemini".to_owned()),
+                    _ => return Err(format!("unsupported assistant content part type `{part_type}`")),
                 };
-                if let Some(text) = text
-                    && !text.is_empty()
-                {
+                if !text.is_empty() {
                     parts.push(json!({ "text": text }));
                 }
             }
         },
-        _ => {},
+        None | Some(Value::Null) => {},
+        _ => return Err("assistant `content` must be a string, array, or null".to_owned()),
     }
+    Ok(())
 }
 
 /// Convert a single OpenAI tool call to a Gemini `functionCall` part.
@@ -416,10 +524,19 @@ fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) {
 /// Copies `extra_content.google.thought_signature` onto the Part when present
 /// (required by Gemini 3 for tool continuations). Returns `Err` when
 /// `function.arguments` is absent, not valid JSON, or not a JSON object.
-fn convert_tool_call(tc: &Value) -> Result<Option<Value>, String> {
-    let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) else {
-        return Ok(None);
-    };
+#[expect(
+    clippy::too_many_lines,
+    reason = "tool-call validation and construction share one boundary"
+)]
+fn convert_tool_call(tc: &Value) -> Result<Value, String> {
+    if tc.get("type").and_then(Value::as_str) != Some("function") {
+        return Err("only function tool calls can be translated to Vertex Gemini".to_owned());
+    }
+    let name = tc
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .ok_or("tool call is missing required field function.name")?;
 
     let args_str = tc
         .get("function")
@@ -451,7 +568,7 @@ fn convert_tool_call(tc: &Value) -> Result<Option<Value>, String> {
         obj.insert("thoughtSignature".to_owned(), sig.clone());
     }
 
-    Ok(Some(part))
+    Ok(part)
 }
 
 /// Return the JSON type name of a value for error messages.
@@ -487,14 +604,20 @@ fn is_tool_result_continuation(messages: &[Value], index: usize) -> bool {
 /// 1. `msg["name"]` — present on deprecated `function` messages and some clients that add it to `tool` messages for
 ///    convenience
 /// 2. `tool_call_id` → nearest preceding assistant `tool_calls` entry with that id
-/// 3. Fallback to `"unknown"` with a warning (Gemini will likely reject this with 400)
+/// 3. Reject when neither source identifies the function.
 ///
 /// When `append_to_last` is `true`, the part is appended to the last `contents`
 /// entry rather than opening a new `user` turn (required for parallel tool calls).
-fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usize, msg: &Value, append_to_last: bool) {
-    let name = resolve_tool_function_name(messages, index, msg);
+fn convert_tool_result(
+    contents: &mut Vec<Value>,
+    messages: &[Value],
+    index: usize,
+    msg: &Value,
+    append_to_last: bool,
+) -> Result<(), String> {
+    let name = resolve_tool_function_name(messages, index, msg)?;
 
-    let content = tool_result_content(msg.get("content"));
+    let content = tool_result_content(msg.get("content"))?;
 
     // Gemini response must be a Struct (JSON object); wrap plain text and
     // valid-but-non-object JSON (arrays, numbers) in {"result": ...}.
@@ -515,33 +638,35 @@ fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usi
         && let Some(Value::Array(parts)) = last.get_mut("parts")
     {
         parts.push(part);
-        return;
+        return Ok(());
     }
 
     contents.push(json!({
         "role": "user",
         "parts": [part]
     }));
+    Ok(())
 }
 
 /// Flatten OpenAI tool-result text parts while borrowing the common string form.
-fn tool_result_content(content: Option<&Value>) -> Cow<'_, str> {
+fn tool_result_content(content: Option<&Value>) -> Result<Cow<'_, str>, String> {
     match content {
-        Some(Value::String(text)) => Cow::Borrowed(text),
-        Some(Value::Array(parts)) => Cow::Owned(
-            parts
-                .iter()
-                .filter_map(|part| {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        part.get("text").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => Cow::Borrowed(""),
+        Some(Value::String(text)) => Ok(Cow::Borrowed(text)),
+        Some(Value::Array(parts)) => {
+            let mut text_parts = Vec::with_capacity(parts.len());
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err("unsupported tool result content part".to_owned());
+                }
+                text_parts.push(
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .ok_or("tool result text part is missing `text`")?,
+                );
+            }
+            Ok(Cow::Owned(text_parts.join("\n")))
+        },
+        _ => Err("tool result `content` must be a string or array of text parts".to_owned()),
     }
 }
 
@@ -551,28 +676,23 @@ fn tool_result_content(content: Option<&Value>) -> Cow<'_, str> {
 /// messages, sometimes present on `tool` messages). Falls back to the
 /// nearest preceding assistant `tool_calls` entry with a matching id,
 /// so a reused id from a later round cannot steal an earlier result.
-fn resolve_tool_function_name<'a>(messages: &'a [Value], tool_index: usize, msg: &'a Value) -> &'a str {
+fn resolve_tool_function_name<'a>(messages: &'a [Value], tool_index: usize, msg: &'a Value) -> Result<&'a str, String> {
     if let Some(name) = msg.get("name").and_then(Value::as_str)
         && !name.is_empty()
     {
-        return name;
+        return Ok(name);
     }
 
     let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
-        warn!("tool message has neither name nor tool_call_id");
-        return "unknown";
+        return Err("tool message requires `name` or `tool_call_id`".to_owned());
     };
 
     if let Some(name) = name_from_preceding_tool_call(messages, tool_index, tool_call_id) {
-        return name;
+        return Ok(name);
     }
-
-    warn!(
-        tool_call_id,
-        "tool message tool_call_id has no matching assistant tool_call; \
-         using \"unknown\" as function name"
-    );
-    "unknown"
+    Err(format!(
+        "tool message `tool_call_id` `{tool_call_id}` has no matching function call"
+    ))
 }
 
 /// Scan messages before `tool_index` for the nearest assistant `tool_calls`
@@ -708,21 +828,27 @@ fn convert_response_format(config: &mut Map<String, Value>, obj: &Map<String, Va
 /// OpenAI wraps each tool in `{"type": "function", "function": {...}}`.
 /// Gemini groups all functions under a single `tools` entry with
 /// `functionDeclarations`.
-fn convert_tools(obj: &Map<String, Value>) -> Option<Value> {
-    let Value::Array(tools) = obj.get("tools")? else {
-        return None;
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and maps each tool declaration in one pass"
+)]
+fn convert_tools(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
+    let Some(tools) = obj.get("tools").filter(|tools| !tools.is_null()) else {
+        return Ok(None);
     };
+    let tools = tools.as_array().ok_or("`tools` must be an array")?;
 
     let mut declarations = Vec::new();
 
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("function") {
-            continue;
+            return Err("unsupported tool type for Vertex Gemini translation".to_owned());
         }
 
-        let Some(function) = tool.get("function") else {
-            continue;
-        };
+        let function = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or("function tool requires a `function` object")?;
 
         let mut decl = Map::new();
 
@@ -738,16 +864,25 @@ fn convert_tools(obj: &Map<String, Value>) -> Option<Value> {
             decl.insert("parameters".to_owned(), params.clone());
         }
 
-        if !decl.is_empty() {
-            declarations.push(Value::Object(decl));
+        if function.iter().any(|(key, value)| {
+            !(matches!(key.as_str(), "name" | "description" | "parameters")
+                || value.is_null()
+                || (key == "strict" && value.as_bool() == Some(false)))
+        }) {
+            return Err("unsupported function tool field for Vertex Gemini translation".to_owned());
         }
+
+        if !decl.get("name").is_some_and(Value::is_string) {
+            return Err("function tool requires a string `name`".to_owned());
+        }
+        declarations.push(Value::Object(decl));
     }
 
     if declarations.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(json!([{ "functionDeclarations": declarations }]))
+    Ok(Some(json!([{ "functionDeclarations": declarations }])))
 }
 
 // -----------------------------------------------------------------------------
@@ -760,30 +895,35 @@ fn convert_tools(obj: &Map<String, Value>) -> Option<Value> {
 /// - `"required"` → `ANY` (must call a function)
 /// - `"none"` → `NONE` (no function calls)
 /// - `{"type": "function", "function": {"name": "..."}}` → `ANY` with `allowedFunctionNames`
-fn convert_tool_choice(obj: &Map<String, Value>) -> Option<Value> {
-    let tool_choice = obj.get("tool_choice")?;
+fn convert_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
+    let Some(tool_choice) = obj.get("tool_choice").filter(|choice| !choice.is_null()) else {
+        return Ok(None);
+    };
 
-    match tool_choice {
+    let converted = match tool_choice {
         Value::String(s) => match s.as_str() {
             "none" => Some(json!({ "functionCallingConfig": { "mode": "NONE" } })),
             "required" => Some(json!({ "functionCallingConfig": { "mode": "ANY" } })),
             // "auto" is the Gemini default — no need to send toolConfig.
-            _ => None,
+            "auto" => None,
+            _ => return Err(format!("unsupported tool_choice `{s}`")),
         },
-        Value::Object(tc) => tc
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-            .map(|name| {
-                json!({
-                    "functionCallingConfig": {
-                        "mode": "ANY",
-                        "allowedFunctionNames": [name],
-                    }
-                })
-            }),
-        _ => None,
-    }
+        Value::Object(tc) if tc.get("type").and_then(Value::as_str) == Some("function") => {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .ok_or("function tool_choice requires a string `function.name`")?;
+            Some(json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [name],
+                }
+            }))
+        },
+        _ => return Err("unsupported tool_choice for Vertex Gemini translation".to_owned()),
+    };
+    Ok(converted)
 }
 
 // -----------------------------------------------------------------------------
@@ -933,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_array_content_preserves_text_and_refusal_parts() {
+    fn assistant_refusal_part_is_rejected() {
         let body = br#"{"model":"gemini-1.5-pro","messages":[
             {"role":"assistant","content":[
                 {"type":"text","text":"First"},
@@ -941,18 +1081,21 @@ mod tests {
                 {"type":"text","text":"Second"}
             ]}
         ]}"#;
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("refusal"), "{error}");
+    }
+
+    #[test]
+    fn empty_assistant_content_with_tool_call_is_accepted() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]}
+        ]}"#;
         let result = transform_request(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result.body).unwrap();
-
-        assert_eq!(parsed["contents"][0]["role"], "model");
-        assert_eq!(
-            parsed["contents"][0]["parts"],
-            json!([
-                {"text": "First"},
-                {"text": "Cannot do that"},
-                {"text": "Second"}
-            ])
-        );
+        assert_eq!(parsed["contents"][0]["parts"][0]["functionCall"]["name"], "lookup");
+        assert_eq!(parsed["contents"][0]["parts"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1110,18 +1253,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_unresolvable_falls_back_to_unknown() {
-        // No name, no matching tool_call_id in history → "unknown"
+    fn tool_result_unresolvable_is_rejected() {
+        // No name and no matching tool_call_id cannot become a faithful function response.
         let body = br#"{"model":"gemini-1.5-pro","messages":[
             {"role":"tool","tool_call_id":"call_orphan","content":"data"}
         ]}"#;
-        let result = transform_request(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
-
-        assert_eq!(
-            parsed["contents"][0]["parts"][0]["functionResponse"]["name"], "unknown",
-            "unresolvable tool_call_id should fall back to unknown"
-        );
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("no matching function call"), "{error}");
     }
 
     #[test]
@@ -1172,28 +1310,49 @@ mod tests {
     }
 
     #[test]
-    fn unknown_role_dropped() {
+    fn unknown_role_rejected() {
         let body = br#"{"model":"gemini-1.5-pro","messages":[
             {"role":"custom_role","content":"ignored"},
             {"role":"user","content":"Hi"}
         ]}"#;
-        let result = transform_request(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
-
-        assert_eq!(
-            parsed["contents"].as_array().unwrap().len(),
-            1,
-            "unknown role should be dropped"
-        );
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("custom_role"), "{error}");
     }
 
     #[test]
-    fn message_without_role_skipped() {
+    fn message_without_role_rejected() {
         let body = br#"{"model":"gemini-1.5-pro","messages":[{"content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("role"), "{error}");
+    }
 
-        assert!(parsed["contents"].as_array().unwrap().is_empty());
+    #[test]
+    fn untranslatable_content_and_controls_are_rejected() {
+        for (field, request) in [
+            (
+                "image_url",
+                json!({"model": "gemini-1.5-pro", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]}),
+            ),
+            (
+                "audio",
+                json!({"model": "gemini-1.5-pro", "messages": [{"role": "user", "content": [{"type": "audio", "data": "abc"}]}]}),
+            ),
+            (
+                "tool result",
+                json!({"model": "gemini-1.5-pro", "messages": [{"role": "tool", "name": "lookup", "content": [{"type": "image_url", "image_url": {}}]}]}),
+            ),
+            (
+                "tool",
+                json!({"model": "gemini-1.5-pro", "messages": [{"role": "user", "content": "Hi"}], "tools": [{"type": "web_search"}]}),
+            ),
+            (
+                "temperature",
+                json!({"model": "gemini-1.5-pro", "messages": [{"role": "user", "content": "Hi"}], "response_format": {"type": "unknown"}, "temperature": 0.7}),
+            ),
+        ] {
+            let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+            assert!(!error.is_empty(), "{field}");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1454,17 +1613,32 @@ mod tests {
     }
 
     #[test]
-    fn non_function_tools_skipped() {
+    fn non_function_tools_rejected() {
         let body = br#"{"model":"gemini-1.5-pro","tools":[
             {"type":"code_interpreter"},
             {"type":"function","function":{"name":"search","description":"Search"}}
         ],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("unsupported tool type"), "{error}");
+    }
 
-        let decls = parsed["tools"][0]["functionDeclarations"].as_array().unwrap();
-        assert_eq!(decls.len(), 1, "only function tools should be converted");
-        assert_eq!(decls[0]["name"], "search");
+    #[test]
+    fn default_false_function_strict_is_accepted_but_true_is_rejected() {
+        let body = json!({
+            "model": "gemini-1.5-pro",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object"}, "strict": false
+            }}]
+        });
+        let translated = transform_request(body.to_string().as_bytes()).unwrap();
+        let parsed: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(parsed["tools"][0]["functionDeclarations"][0]["name"], "lookup");
+        assert!(parsed["tools"][0]["functionDeclarations"][0].get("strict").is_none());
+
+        let mut strict = body;
+        strict["tools"][0]["function"]["strict"] = Value::Bool(true);
+        assert!(transform_request(strict.to_string().as_bytes()).is_err());
     }
 
     // -------------------------------------------------------------------------

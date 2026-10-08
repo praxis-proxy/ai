@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Request-head classification of supported OpenAI operations.
+//! Request-head classification of supported AI operations.
 //!
 //! The filter identifies an operation from the HTTP method, normalized path,
 //! and protocol headers alone. No request body is read or buffered, so the
 //! result is available before any body-handling decision is made.
 //!
+//! Every protocol-owned registry is consulted through the shared matcher, so
+//! OpenAI and Anthropic operations are recognized by one filter. The classifier
+//! holds no provider-specific matching logic: a registry is added by listing it
+//! here, not by branching on its provider.
+//!
 //! A matched operation is published three ways: a typed
-//! [`OpenAiOperationMatch`] in request extensions for downstream filters,
+//! [`AiOperationMatch`] in request extensions for downstream filters,
 //! including registry body metadata and allocation-free path-parameter
 //! locations; metadata and filter results for branching; and optional
 //! proxy-owned routing headers applied to the upstream request.
@@ -36,23 +41,24 @@ use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
+    anthropic::routes as anthropic_messages_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        operation::OpenAiOperationSpec, responses::routes as responses_routes,
+        responses::routes as responses_routes,
     },
-    operation::{ApplicationProtocol, PathParameterOffsets, RequestBody, RouteParams, Transport},
+    operation::{ApplicationProtocol, OperationEntry, PathParameterOffsets, RequestBody, RouteParams, Transport},
 };
 
 /// Filter name as configured in a pipeline.
-const FILTER_NAME: &str = "openai_operation";
+const FILTER_NAME: &str = "ai_operation";
 
-/// Classifies supported OpenAI operations from the request head.
-pub struct OpenaiOperationFilter {
+/// Classifies supported AI operations from the request head.
+pub struct AiOperationFilter {
     /// Validated configuration.
     config: ValidatedConfig,
 }
 
-impl OpenaiOperationFilter {
+impl AiOperationFilter {
     /// Create the filter from parsed YAML configuration.
     ///
     /// # Errors
@@ -68,7 +74,7 @@ impl OpenaiOperationFilter {
     ///
     /// Uses set rather than append semantics so a client-supplied value of the
     /// same name cannot survive alongside the classifier's own.
-    fn set_routing_headers(&self, ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) {
+    fn set_routing_headers(&self, ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) {
         if let Some(name) = &self.config.application_protocol_header
             && let Ok(value) = http::HeaderValue::from_str(matched.application_protocol.as_str())
         {
@@ -102,7 +108,7 @@ impl OpenaiOperationFilter {
 /// Every field is `'static`; path parameters are stored as byte offsets into
 /// the immutable request path and can be borrowed again without cloning it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpenAiOperationMatch {
+pub struct AiOperationMatch {
     /// Application protocol that owns the operation, for example
     /// `openai_responses`.
     pub application_protocol: ApplicationProtocol,
@@ -121,9 +127,9 @@ pub struct OpenAiOperationMatch {
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiOperationFilter {
+impl HttpFilter for AiOperationFilter {
     fn name(&self) -> &'static str {
-        "openai_operation"
+        "ai_operation"
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -132,12 +138,7 @@ impl HttpFilter for OpenaiOperationFilter {
         let path = ctx.request.uri.path();
 
         let Some(matched) = classify(method, path, transport) else {
-            debug!(
-                method,
-                path,
-                transport = transport.as_str(),
-                "no OpenAI operation matched"
-            );
+            debug!(method, path, transport = transport.as_str(), "no AI operation matched");
             self.remove_routing_headers(ctx);
             return Ok(FilterAction::Continue);
         };
@@ -148,7 +149,7 @@ impl HttpFilter for OpenaiOperationFilter {
             application_protocol = matched.application_protocol.as_str(),
             operation_id = matched.operation_id,
             transport = matched.transport.as_str(),
-            "classified OpenAI operation"
+            "classified AI operation"
         );
 
         publish_match(ctx, matched)?;
@@ -169,15 +170,28 @@ impl HttpFilter for OpenaiOperationFilter {
 /// in the chain. A Chat Completions request therefore keeps OpenAI-shaped
 /// errors without a Responses filter present, and a request whose body fails
 /// to parse still gets them.
+///
+/// The head is the only place this can be decided for a bodyless operation.
+/// `GET /v1/messages/batches/{id}` carries nothing to classify, so a
+/// body-format filter can never install its formatter; without this, an
+/// unreachable upstream would answer an Anthropic client with RFC 9457 problem
+/// details.
+///
+/// Each protocol family is matched by its identifier prefix rather than an
+/// enumerated list, so adding a registry to an existing family needs no change
+/// here. A vendor protocol that shares neither prefix keeps the default shape.
 fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: ApplicationProtocol) {
-    // Every OpenAI protocol shares one error schema, so membership is derived
-    // from the protocol name rather than an enumerated list that has to be
-    // extended whenever a registry is added. Anthropic Messages and any vendor
-    // protocol keep their own error shape.
     if protocol.as_str().starts_with("openai_") {
         ctx.extensions.insert(ErrorResponseFormatterHandle::new(
             crate::openai::error_response_formatter::OpenAiErrorFormatter,
         ));
+    } else if protocol.as_str().starts_with("anthropic_") {
+        // Built before the insert so the immutable borrow of the request head
+        // ends before `extensions` is borrowed mutably.
+        let formatter = crate::anthropic::error_response_formatter::AnthropicErrorFormatter::from_request_headers(
+            &ctx.request.headers,
+        );
+        ctx.extensions.insert(ErrorResponseFormatterHandle::new(formatter));
     }
 }
 
@@ -186,12 +200,12 @@ fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: Applicatio
 /// The extension carries the generic identity for downstream filters, the
 /// metadata is for logging and tracing, and the filter results are what
 /// `on_result` branch conditions evaluate.
-fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) -> Result<(), FilterError> {
+fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> Result<(), FilterError> {
     let application_protocol = matched.application_protocol.as_str();
 
     ctx.extensions.insert(matched);
-    ctx.set_metadata("openai_operation.application_protocol", application_protocol);
-    ctx.set_metadata("openai_operation.operation_id", matched.operation_id);
+    ctx.set_metadata("ai_operation.application_protocol", application_protocol);
+    ctx.set_metadata("ai_operation.operation_id", matched.operation_id);
 
     let results = ctx.filter_results.entry(FILTER_NAME).or_default();
     results.set("application_protocol", application_protocol)?;
@@ -204,47 +218,63 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 // Classification
 // -----------------------------------------------------------------------------
 
-/// Match a request head against every registered OpenAI protocol.
+/// Match a request head against every registered protocol.
 ///
-/// HTTP-only protocols are consulted from a shared list, so adding one does not
-/// introduce Chat- or Conversations-specific branching here. Responses is
-/// matched separately because transport is part of its operation identity.
-/// Path spaces do not overlap, so at most one match can succeed.
-pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
-    let http_match = (transport == Transport::Http)
-        .then(|| classify_conversation(method, path).or_else(|| classify_chat_completions(method, path)));
+/// HTTP-only registries are consulted in turn, so adding one is a new arm in
+/// this list rather than a provider-specific branch anywhere else. Responses is
+/// matched separately because transport is part of its operation identity: it is
+/// the only protocol reachable over a `WebSocket` upgrade.
+///
+/// Registered path spaces do not overlap — OpenAI serves `/v1/responses`,
+/// `/v1/conversations`, and `/v1/chat/completions` while Anthropic serves
+/// `/v1/messages` — so at most one registry can match one head, and the order
+/// below does not decide between protocols.
+pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
+    let http_match = (transport == Transport::Http).then(|| {
+        classify_conversation(method, path)
+            .or_else(|| classify_chat_completions(method, path))
+            .or_else(|| classify_anthropic_messages(method, path))
+    });
     http_match
         .flatten()
         .or_else(|| classify_responses(method, path, transport))
 }
 
 /// Match one Conversations operation.
-fn classify_conversation(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
-    conversations_routes::match_route(method, path).and_then(|route| {
-        let matched = classified(&route.spec.definition, route.params, path)?;
-        Some(matched)
-    })
+fn classify_conversation(method: &str, path: &str) -> Option<AiOperationMatch> {
+    conversations_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Chat Completions operation.
-fn classify_chat_completions(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
-    chat_completions_routes::match_route(method, path)
-        .and_then(|route| classified(&route.spec.definition, route.params, path))
+fn classify_chat_completions(method: &str, path: &str) -> Option<AiOperationMatch> {
+    chat_completions_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Anthropic Messages operation.
+fn classify_anthropic_messages(method: &str, path: &str) -> Option<AiOperationMatch> {
+    anthropic_messages_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Responses operation.
-fn classify_responses(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
-    responses_routes::match_route(method, path, transport)
-        .and_then(|route| classified(&route.spec.definition, route.params, path))
+fn classify_responses(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
+    responses_routes::match_route(method, path, transport).and_then(|route| classified(route.spec, route.params, path))
 }
 
-/// Build a published match from one typed registry entry and its parameters.
-fn classified(spec: &OpenAiOperationSpec, params: RouteParams<'_>, path: &str) -> Option<OpenAiOperationMatch> {
-    Some(OpenAiOperationMatch {
-        application_protocol: spec.application_protocol(),
-        operation_id: spec.operation_id(),
-        transport: spec.transport(),
-        request_body: spec.request_body(),
+/// Build a published match from one registry entry and its parameters.
+///
+/// Reads the entry through [`OperationEntry`], so every registry — whatever
+/// provider-specific wrapper it uses — is published identically and no provider
+/// type appears in this module.
+fn classified<T>(entry: &T, params: RouteParams<'_>, path: &str) -> Option<AiOperationMatch>
+where
+    T: OperationEntry,
+{
+    let spec = entry.spec();
+    Some(AiOperationMatch {
+        application_protocol: spec.application_protocol,
+        operation_id: spec.operation_id,
+        transport: spec.transport,
+        request_body: spec.request_body,
         path_parameters: params.offsets_in(path)?,
     })
 }

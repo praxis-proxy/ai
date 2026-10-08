@@ -114,7 +114,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// The upstream `openai_responses_request` filter rejects requests that
     /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
@@ -1220,7 +1220,9 @@ fn build_state(
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.splice(0..0, replay);
-    state.provider_compaction_ids.extend(provider_compaction_ids(&stored));
+    state
+        .provider_compaction_ids
+        .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
@@ -1261,14 +1263,6 @@ fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
         .filter_map(canonical_openresponses_replay_item)
         .map(strip_local_compaction_marker)
         .collect()
-}
-
-/// Collect provider-owned compaction IDs from persisted history.
-///
-/// Praxis-generated compaction items carry private provenance metadata in the
-/// store. Only unmarked compaction items are eligible for native replay.
-fn provider_compaction_ids(stored: &[Value]) -> HashSet<String> {
-    ResponsesState::provider_compaction_ids_from_messages(stored)
 }
 
 /// Parse the request body and extract `previous_response_id`.

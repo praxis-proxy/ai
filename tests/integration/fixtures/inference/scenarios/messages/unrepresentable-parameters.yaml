@@ -6,6 +6,7 @@ example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
 features:
   - messages.request.unrepresentable_parameters
+  - messages.request.untranslatable_content
 turns:
   - name: inference_geo
     request:
@@ -48,6 +49,31 @@ turns:
           messages:
             - role: user
               content: What is 2+2? Reply with just the number.
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: thinking-control
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 2048
+          thinking:
+            type: enabled
+            budget_tokens: 1024
+          messages:
+            - role: user
+              content: What is 2+2?
     expect:
       client_status: 400
       client_body_kind: json

@@ -7,6 +7,8 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "openai-responses")]
+use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
 use praxis_core::{
     config::InsecureOptions,
     subrequest::{DEPTH_HEADER, SubRequestClient},
@@ -20,7 +22,7 @@ use praxis_filter::{
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -45,9 +47,15 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// pre-read body as untrusted input and configure an outbound chain whenever
 /// the provider requires destination-bound policy enforcement.
 ///
-/// **Wire format:** Chat Completions only (`messages` on requests,
-/// `choices[].message` on responses). Responses API, Anthropic Messages,
-/// and MCP are not supported yet (see ai#1043).
+/// **Wire format:** client request/response evaluation supports Chat
+/// Completions only (`messages` on requests, `choices[].message` on
+/// responses). `phase.tool_results` separately evaluates canonical local
+/// Responses tool results inside an IRR step. Other Responses content,
+/// Anthropic Messages, and MCP wire bodies are not supported yet (see ai#1043).
+/// For `phase.tool_results`, a provider `modified` verdict fails closed with
+/// `502 guardrail_error`; sanitized text is not forwarded because it cannot
+/// yet be safely mapped back to the canonical tool-result items. Only a
+/// `passed` verdict permits model re-entry.
 ///
 /// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
 /// configurations. When `provider.guardrails` is omitted, the request omits
@@ -69,10 +77,11 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// phase:
 ///   request: true
 ///   response: true
+///   tool_results: false
 /// ```
 pub struct AiGuardrailsFilter {
     /// Guard provider instance.
-    provider: Box<dyn GuardProvider>,
+    provider: nemo::NemoProvider,
     /// Which phases to evaluate.
     phase: PhaseConfig,
     /// Prebuilt outbound filter chain for provider callouts.
@@ -93,11 +102,16 @@ impl AiGuardrailsFilter {
         outbound: Arc<FilterPipeline>,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let (provider, callout_timeout): (Box<dyn GuardProvider>, _) = match config.provider.provider_type {
+        #[cfg(not(feature = "openai-responses"))]
+        if config.phase.tool_results {
+            return Err("ai_guardrails: phase.tool_results requires the openai-responses feature".into());
+        }
+
+        let (provider, callout_timeout) = match config.provider.provider_type {
             ProviderType::Nemo => {
                 let provider = nemo::NemoProvider::from_config(&config.provider.config, client)?;
                 let timeout = provider.callout_timeout();
-                (Box::new(provider), timeout)
+                (provider, timeout)
             },
         };
 
@@ -162,6 +176,24 @@ impl AiGuardrailsFilter {
             outbound: &self.outbound,
         }
     }
+
+    /// Evaluate the local result suffix and leave terminal response ownership
+    /// with `openai_agentic_loop`.
+    #[cfg(feature = "openai-responses")]
+    async fn evaluate_local_tool_results(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        messages: Vec<serde_json::Value>,
+    ) -> Result<FilterAction, FilterError> {
+        let runtime = self.callout_runtime(ctx);
+        match self.provider.evaluate(messages, GuardPhase::Request, &runtime).await {
+            Ok(result) => record_local_tool_verdict(ctx, result),
+            Err(error) => {
+                tracing::error!(%error, phase = "tool_results", "ai_guardrails: evaluation failed");
+                record_local_tool_evaluation_failure(ctx, &error.to_string())
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,12 +246,25 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        if self.phase.request {
+            BodyAccess::ReadWrite
+        } else if self.phase.tool_results {
+            BodyAccess::ReadOnly
+        } else {
+            BodyAccess::None
+        }
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+        if self.phase.request {
+            BodyMode::StreamBuffer {
+                max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+            }
+        } else {
+            // Tool-result evaluation reads canonical Responses state at EOS;
+            // it must not impose the Chat request body's 1 MiB buffer cap on
+            // the surrounding IRR step.
+            BodyMode::Stream
         }
     }
 
@@ -231,6 +276,19 @@ impl HttpFilter for AiGuardrailsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        #[cfg(feature = "openai-responses")]
+        if self.phase.tool_results {
+            match local_tool_guardrail_messages(&ctx.extensions, DEFAULT_MAX_BODY_BYTES) {
+                Ok(messages) if !messages.is_empty() => {
+                    return self.evaluate_local_tool_results(ctx, messages).await;
+                },
+                Err(error) => {
+                    return record_local_tool_evaluation_failure(ctx, &error.to_string());
+                },
+                Ok(_) => {},
+            }
         }
 
         if !self.phase.request {
@@ -318,6 +376,53 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 }
 
+/// Record one completed local tool-result verdict.
+#[cfg(feature = "openai-responses")]
+pub(super) fn record_local_tool_verdict(
+    ctx: &mut HttpFilterContext<'_>,
+    result: GuardResult,
+) -> Result<FilterAction, FilterError> {
+    match result {
+        GuardResult::Pass => {
+            set_verdict(ctx, "passed")?;
+            tracing::debug!(phase = "tool_results", "ai_guardrails: verdict passed");
+        },
+        GuardResult::Block { reason } => {
+            set_verdict(ctx, "blocked")?;
+            let message = format!("Tool result blocked by guardrails: {reason}");
+            tracing::warn!(phase = "tool_results", %reason, "ai_guardrails: verdict blocked");
+            if !record_local_tool_guardrail_failure(&mut ctx.extensions, 403, "content_blocked", message.clone()) {
+                return Ok(FilterAction::Reject(Rejection::status(403).with_body(message)));
+            }
+        },
+        GuardResult::Redact { reason, .. } => {
+            set_verdict(ctx, "redacted")?;
+            let message = format!(
+                "Tool result was modified by guardrails but sanitized content cannot be safely applied: {reason}"
+            );
+            tracing::error!(phase = "tool_results", %reason, "ai_guardrails: modified result rejected");
+            if !record_local_tool_guardrail_failure(&mut ctx.extensions, 502, "guardrail_error", message.clone()) {
+                return Ok(FilterAction::Reject(Rejection::status(502).with_body(message)));
+            }
+        },
+    }
+    Ok(FilterAction::Continue)
+}
+
+/// Fail closed through the Responses loop owner when tool-result evaluation
+/// cannot complete.
+#[cfg(feature = "openai-responses")]
+fn record_local_tool_evaluation_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    reason: &str,
+) -> Result<FilterAction, FilterError> {
+    let message = format!("Tool-result guardrail evaluation failed: {reason}");
+    if record_local_tool_guardrail_failure(&mut ctx.extensions, 502, "guardrail_error", message.clone()) {
+        return Ok(FilterAction::Continue);
+    }
+    Err(message.into())
+}
+
 // -----------------------------------------------------------------------------
 // Private Utilities
 // -----------------------------------------------------------------------------
@@ -361,10 +466,7 @@ fn record_verdict(
 ) -> Result<FilterAction, FilterError> {
     let verdict = result.status_label();
     let phase_label = phase.label();
-    ctx.filter_results
-        .entry("ai_guardrails")
-        .or_default()
-        .set("status", verdict)?;
+    set_verdict(ctx, verdict)?;
 
     match result {
         GuardResult::Pass => {
@@ -377,6 +479,15 @@ fn record_verdict(
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Publish the guardrail verdict for routing and observability.
+fn set_verdict(ctx: &mut HttpFilterContext<'_>, verdict: &'static str) -> Result<(), FilterError> {
+    ctx.filter_results
+        .entry("ai_guardrails")
+        .or_default()
+        .set("status", verdict)?;
+    Ok(())
 }
 
 /// Enforce a `Block` verdict for the given phase.

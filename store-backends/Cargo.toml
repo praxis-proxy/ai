@@ -36,6 +36,7 @@ workspace = true
 async-trait = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-ai-store = { workspace = true, features = ["compression"] }
+praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

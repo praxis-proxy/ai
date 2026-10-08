@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_operation` classifier.
+//! Unit tests for the `ai_operation` classifier.
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
@@ -13,7 +13,7 @@ use crate::test_utils::{make_filter_context, make_request};
 /// Build the filter from YAML, defaulting to an empty mapping.
 fn filter(yaml: &str) -> Box<dyn HttpFilter> {
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-    OpenaiOperationFilter::from_config(&value).unwrap()
+    AiOperationFilter::from_config(&value).unwrap()
 }
 
 /// Build a filter with default configuration.
@@ -51,7 +51,7 @@ async fn classifies_a_conversations_operation() {
     let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(
         matched.application_protocol,
         ApplicationProtocol::new("openai_conversations")
@@ -62,14 +62,12 @@ async fn classifies_a_conversations_operation() {
 
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_operation.application_protocol")
+            .get("ai_operation.application_protocol")
             .map(String::as_str),
         Some("openai_conversations")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_operation.operation_id")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
         Some("getConversation")
     );
 }
@@ -163,7 +161,7 @@ async fn classifies_chat_completions_operations_from_the_request_head() {
         let mut ctx = make_filter_context(&request);
         drop(filter.on_request(&mut ctx).await.unwrap());
 
-        let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied();
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied();
         assert!(matched.is_some(), "{method} {path} must classify");
         let matched = matched.unwrap();
         assert_eq!(
@@ -184,7 +182,7 @@ async fn websocket_handshake_on_chat_completions_does_not_match() {
     let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
     assert!(
-        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
         "Chat Completions is HTTP-only, so a websocket handshake must not classify"
     );
 }
@@ -199,7 +197,7 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     assert!(
-        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
         "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
     );
 }
@@ -254,7 +252,7 @@ async fn classifies_a_responses_operation() {
     let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(
         matched.application_protocol,
         ApplicationProtocol::new("openai_responses")
@@ -316,7 +314,7 @@ async fn client_supplied_headers_are_stripped_when_nothing_matches() {
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    assert!(ctx.extensions.get::<OpenAiOperationMatch>().is_none());
+    assert!(ctx.extensions.get::<AiOperationMatch>().is_none());
     let removed: Vec<&str> = ctx
         .request_headers_to_remove
         .iter()
@@ -336,7 +334,7 @@ async fn websocket_handshake_selects_the_websocket_operation() {
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.transport, Transport::WebSocket);
     assert_eq!(matched.operation_id, "praxis_createResponseWebSocket");
 }
@@ -348,7 +346,7 @@ async fn plain_get_on_the_responses_collection_does_not_match() {
     let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
     assert!(
-        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        ctx.extensions.get::<AiOperationMatch>().is_none(),
         "a GET without upgrade headers is not the websocket operation"
     );
 }
@@ -360,7 +358,7 @@ async fn static_endpoints_are_not_consumed_as_identifiers() {
     let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.operation_id, "Getinputtokencounts");
 }
 
@@ -377,7 +375,7 @@ async fn unsupported_methods_publish_no_operation() {
         let mut ctx = make_filter_context(&request);
         drop(filter.on_request(&mut ctx).await.unwrap());
         assert!(
-            ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+            ctx.extensions.get::<AiOperationMatch>().is_none(),
             "{method} {path} must not classify"
         );
     }
@@ -409,7 +407,7 @@ async fn headers_can_be_disabled_while_metadata_still_publishes() {
     assert!(ctx.request_headers_to_set.is_empty());
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_operation.application_protocol")
+            .get("ai_operation.application_protocol")
             .map(String::as_str),
         Some("openai_responses")
     );
@@ -418,13 +416,13 @@ async fn headers_can_be_disabled_while_metadata_still_publishes() {
 #[test]
 fn invalid_header_name_is_rejected_at_startup() {
     let value: serde_yaml::Value = serde_yaml::from_str("headers:\n  application_protocol: \"bad header\"\n").unwrap();
-    assert!(OpenaiOperationFilter::from_config(&value).is_err());
+    assert!(AiOperationFilter::from_config(&value).is_err());
 }
 
 #[test]
 fn unknown_configuration_fields_are_rejected() {
     let value: serde_yaml::Value = serde_yaml::from_str("nonsense: true\n").unwrap();
-    assert!(OpenaiOperationFilter::from_config(&value).is_err());
+    assert!(AiOperationFilter::from_config(&value).is_err());
 }
 
 #[test]
@@ -441,7 +439,7 @@ fn header_targets_carrying_auth_or_framing_are_rejected() {
         let value: serde_yaml::Value =
             serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
         assert!(
-            OpenaiOperationFilter::from_config(&value).is_err(),
+            AiOperationFilter::from_config(&value).is_err(),
             "{target} must not be an overwritable classifier target"
         );
     }
@@ -459,7 +457,7 @@ fn provider_credential_header_targets_are_rejected() {
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(&format!("headers:\n  operation: {target}\n")).unwrap();
         assert!(
-            OpenaiOperationFilter::from_config(&value).is_err(),
+            AiOperationFilter::from_config(&value).is_err(),
             "{target} carries credentials and must not be overwritten or stripped by the classifier"
         );
     }
@@ -480,7 +478,7 @@ fn unrelated_reserved_namespaces_are_rejected() {
         let value: serde_yaml::Value =
             serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
         assert!(
-            OpenaiOperationFilter::from_config(&value).is_err(),
+            AiOperationFilter::from_config(&value).is_err(),
             "{target} is not this classifier's to own"
         );
     }
@@ -498,7 +496,7 @@ fn dedicated_defaults_and_custom_names_remain_allowed() {
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(config).unwrap();
         assert!(
-            OpenaiOperationFilter::from_config(&value).is_ok(),
+            AiOperationFilter::from_config(&value).is_ok(),
             "configuration should remain valid:\n{config}"
         );
     }
@@ -511,7 +509,7 @@ fn each_field_may_not_claim_the_other_fields_default() {
     let value: serde_yaml::Value =
         serde_yaml::from_str("headers:\n  application_protocol: x-praxis-ai-operation\n").unwrap();
     assert!(
-        OpenaiOperationFilter::from_config(&value).is_err(),
+        AiOperationFilter::from_config(&value).is_err(),
         "one output must not claim the other's dedicated header"
     );
 }
@@ -521,7 +519,7 @@ fn both_outputs_targeting_one_header_is_rejected() {
     let value: serde_yaml::Value =
         serde_yaml::from_str("headers:\n  application_protocol: x-same\n  operation: X-Same\n").unwrap();
     assert!(
-        OpenaiOperationFilter::from_config(&value).is_err(),
+        AiOperationFilter::from_config(&value).is_err(),
         "a shared target would let the operation value replace the application protocol"
     );
 }
@@ -535,7 +533,7 @@ async fn publishes_filter_results_for_branch_conditions() {
 
     let results = ctx
         .filter_results
-        .get("openai_operation")
+        .get("ai_operation")
         .expect("the classifier must publish filter results for on_result branching");
     assert_eq!(results.get("application_protocol"), Some("openai_responses"));
     assert_eq!(results.get("operation_id"), Some("createResponse"));
@@ -552,7 +550,7 @@ async fn upgrade_headers_on_a_non_get_request_still_classify() {
 
     let matched = ctx
         .extensions
-        .get::<OpenAiOperationMatch>()
+        .get::<AiOperationMatch>()
         .copied()
         .expect("upgrade headers must not suppress classification of a non-GET operation");
     assert_eq!(matched.operation_id, "createResponse");
@@ -590,4 +588,258 @@ fn transport_detection_follows_the_opening_handshake() {
     multi.append(http::header::UPGRADE, "websocket".parse().unwrap());
     multi.append(http::header::UPGRADE, "h2c".parse().unwrap());
     assert_eq!(request_transport("GET", &multi), Transport::Http);
+}
+
+// -----------------------------------------------------------------------------
+// Anthropic Messages
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn classifies_an_anthropic_messages_operation() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("anthropic_messages")
+    );
+    assert_eq!(matched.operation_id, "messages_post");
+    assert_eq!(matched.transport, Transport::Http);
+    assert_eq!(matched.request_body, RequestBody::Json { required: true });
+}
+
+/// One classified operation, as a protocol identifier and operation ID.
+type ExpectedOperation = (&'static str, &'static str, &'static str, &'static str);
+
+/// Assert each listed request head classifies to its expected operation.
+async fn assert_classifies(cases: &[ExpectedOperation]) {
+    for &(method, path, protocol, operation_id) in cases {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx
+            .extensions
+            .get::<AiOperationMatch>()
+            .copied()
+            .expect("every listed operation must classify");
+        assert_eq!(matched.application_protocol.as_str(), protocol, "{method} {path}");
+        assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+    }
+}
+
+/// One filter resolves every registered protocol family.
+///
+/// The classifier aggregates each protocol's own registry, so OpenAI and
+/// Anthropic operations are recognized without a provider-specific branch.
+#[tokio::test]
+async fn one_filter_classifies_both_protocol_families() {
+    assert_classifies(&[
+        ("POST", "/v1/responses", "openai_responses", "createResponse"),
+        (
+            "POST",
+            "/v1/chat/completions",
+            "openai_chat_completions",
+            "createChatCompletion",
+        ),
+        (
+            "GET",
+            "/v1/conversations/conv_123",
+            "openai_conversations",
+            "getConversation",
+        ),
+        ("POST", "/v1/messages", "anthropic_messages", "messages_post"),
+        (
+            "GET",
+            "/v1/messages/batches/msgbatch_1",
+            "anthropic_messages",
+            "message_batches_retrieve",
+        ),
+    ])
+    .await;
+}
+
+/// Anthropic operations get the Anthropic error formatter from the head.
+///
+/// A bodyless operation such as `GET /v1/messages/batches/{id}` carries nothing
+/// for a body-format filter to classify, so the head is the only place this can
+/// be decided. Without it an unreachable upstream would answer an Anthropic
+/// client with RFC 9457 problem details.
+#[tokio::test]
+async fn anthropic_operations_install_the_anthropic_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("GET", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1"),
+        ("POST", "/v1/messages/batches/msgbatch_1/cancel"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_some(),
+            "{method} {path} must classify"
+        );
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the Anthropic error formatter"
+        );
+    }
+}
+
+/// The installed formatter produces the Anthropic envelope, not the OpenAI one.
+#[tokio::test]
+async fn an_anthropic_failure_body_uses_the_anthropic_envelope() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/messages/batches/msgbatch_1");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let handle = ctx
+        .extensions
+        .get::<ErrorResponseFormatterHandle>()
+        .expect("a bodyless Anthropic operation must still install a formatter");
+    let context = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
+    let body = handle.format(&context);
+    let parsed: serde_json::Value = serde_json::from_slice(body.body.as_ref()).expect("the formatter must emit JSON");
+
+    assert_eq!(parsed.get("type").and_then(serde_json::Value::as_str), Some("error"));
+    let error = parsed
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .expect("error object");
+    assert!(error.get("type").and_then(serde_json::Value::as_str).is_some());
+    assert!(error.get("message").and_then(serde_json::Value::as_str).is_some());
+    assert!(
+        parsed.get("request_id").and_then(serde_json::Value::as_str).is_some(),
+        "the Anthropic envelope carries a request_id"
+    );
+}
+
+#[tokio::test]
+async fn an_anthropic_batch_path_captures_its_identifier() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/messages/batches/msgbatch_abc123/results");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+    assert_eq!(matched.operation_id, "message_batches_results");
+    assert_eq!(
+        matched.path_parameters.get(request.uri.path(), "message_batch_id"),
+        Some("msgbatch_abc123"),
+        "path parameters are recovered from the immutable request path"
+    );
+}
+
+#[tokio::test]
+async fn publishes_anthropic_metadata_and_filter_results() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("ai_operation.application_protocol")
+            .map(String::as_str),
+        Some("anthropic_messages")
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        Some("messages_post")
+    );
+
+    let results = ctx.filter_results.get("ai_operation").unwrap();
+    assert_eq!(results.get("application_protocol"), Some("anthropic_messages"));
+    assert_eq!(results.get("operation_id"), Some("messages_post"));
+}
+
+#[tokio::test]
+async fn unregistered_anthropic_surfaces_publish_no_match() {
+    for (method, path) in [
+        ("POST", "/v1/complete"),
+        ("GET", "/v1/models"),
+        ("POST", "/v1/files"),
+        ("GET", "/v1/messages"),
+        ("GET", "/v1/messages/msg_123"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_none(),
+            "{method} {path} is outside every registered protocol"
+        );
+    }
+}
+
+/// The request head alone decides the operation.
+///
+/// A Chat Completions-shaped, malformed, empty, or absent body must not change
+/// which operation `POST /v1/messages` resolves to. The body is placed in the
+/// context so the assertion is about the classifier ignoring an available
+/// payload, not merely about one being unavailable.
+#[tokio::test]
+async fn a_request_body_never_changes_the_classified_operation() {
+    let bodies = [
+        None,
+        Some(bytes::Bytes::new()),
+        Some(bytes::Bytes::from_static(b"not json at all")),
+        Some(bytes::Bytes::from_static(br#"{"model":"gpt-4.1","messages":[]}"#)),
+        Some(bytes::Bytes::from_static(br#"{"input":"hi","model":"gpt-4.1"}"#)),
+        Some(bytes::Bytes::from_static(
+            br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[]}"#,
+        )),
+    ];
+
+    for body in bodies {
+        let filter = default_filter();
+        let request = req("POST", "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.buffered_request_body = body.clone();
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
+        assert_eq!(
+            matched.application_protocol.as_str(),
+            "anthropic_messages",
+            "body {body:?} changed the classified protocol"
+        );
+        assert_eq!(
+            matched.operation_id, "messages_post",
+            "body {body:?} changed the classified operation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_anthropic_match_sets_the_configured_routing_headers() {
+    let filter = filter(
+        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n  operation: x-praxis-ai-operation\n",
+    );
+    let request = req("POST", "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let set = ctx
+        .request_headers_to_set
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.to_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert!(
+        set.contains(&("x-praxis-ai-application-protocol", "anthropic_messages")),
+        "{set:?}"
+    );
+    assert!(set.contains(&("x-praxis-ai-operation", "messages_post")), "{set:?}");
 }

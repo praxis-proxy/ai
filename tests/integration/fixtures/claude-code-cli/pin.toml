@@ -11,6 +11,17 @@
 # mode. One vLLM container serves both surfaces (`/v1/messages` natively AND
 # `/v1/chat/completions`), so all four scenarios share this single pinned model.
 #
+# A fifth scenario (issue #1418) drives one read-only PLANNING turn over the
+# native path against the same container, asserting it converges and that no
+# reasoning-channel text reaches the user-visible answer. See
+# `[claude_code.launch.planning]` below for its pins and its scope.
+#
+# A sixth scenario drives the client's built-in WebSearch tool through Praxis's
+# managed `anthropic_web_search` loop against REAL Tavily, over the agentic example
+# config routed onto the Chat Completions backend, proving the search is resolved
+# SERVER-SIDE (the managed tool_use is suppressed) rather than by the client. It is
+# gated additionally on a real TAVILY_API_KEY. See `[claude_code.launch.web_search]`.
+#
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
 # lightweight `pins` job parses this manifest and exports its runtime values.
@@ -77,6 +88,79 @@ flags = [
   "--max-turns", "8",
 ]
 
+# Read-only planning scenario (issue #1418). Keep in sync with
+# PLANNING_LAUNCH_FLAGS and PermissionScenario::ReadOnlyPlanning in
+# claude_code_vllm.rs.
+#
+# SCOPE: this is NOT the interactive plan mode of the report. The pinned
+# executable exposes neither the plan-mode system prompt nor `ExitPlanMode` in
+# any headless transport (`-p`, with or without `--input-format stream-json`),
+# verified against 2.1.278, so plan mode cannot be driven from CI. The scenario
+# reproduces the shape of the turn that broke — a read-only, multi-file planning
+# request answered in prose — and asserts both observable symptoms are absent:
+# the run converges instead of exhausting its turn budget, and no reasoning
+# delimiter reaches the user-visible answer.
+#
+# Only `Read` is exposed, so the request itself carries no tool that could
+# mutate the workspace, and only `Read` is preapproved. The prompt deliberately
+# omits the `/no_think` suffix the coding task uses: that marker would suppress
+# Qwen3 thinking from the user turn and mask the server-side misconfiguration
+# this scenario exists to catch. Thinking must be off because the backend is
+# served with the flags below, not because the prompt asked.
+[claude_code.launch.planning]
+exposed_tools = ["Read"]
+permission_mode = "acceptEdits"
+allowed_tools = ["Read"]
+# Reasoning-channel delimiters asserted absent from user-visible assistant text.
+reasoning_leak_markers = ["<think>", "</think>"]
+flags = [
+  "--tools", "Read",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
+# Server-side web-search scenario. Keep in sync with WEB_SEARCH_LAUNCH_FLAGS and
+# PermissionScenario::WebSearch in claude_code_vllm.rs.
+#
+# Proves the pinned client's built-in `WebSearch` tool is resolved SERVER-SIDE by
+# Praxis's managed `anthropic_web_search` loop against REAL Tavily, over the
+# agentic example config (`examples/configs/anthropic/full-flow-agentic.yaml`),
+# routed by model onto the Chat Completions backend. The full chain is:
+#   Claude Code (--tools WebSearch) -> Praxis /v1/messages
+#     -> anthropic_web_search managed IRR loop -> real Tavily -> text answer -> CLI
+#
+# Only `WebSearch` is exposed, so the request's single tool is the managed one and
+# the only path to an answer is the server-side search. The managed loop SUPPRESSES
+# the `WebSearch` tool_use, so a client-visible WebSearch call is a failure, not a
+# success. `/no_think` is used (like the coding task): this scenario is about the
+# search round-trip, not reasoning.
+#
+# NOT a mock: a loopback capture-relay forwards each request verbatim to real
+# Tavily and returns Tavily's real response, recording the exchange so the test
+# can prove a live search ran — necessary because the managed loop falls back to an
+# `is_error` tool result on provider failure, which a client-only assertion would
+# not catch.
+#
+# Requires a real TAVILY_API_KEY (the search provider key, which Tavily carries in
+# the request body). Gated independently of the vLLM live stack: absent the key the
+# scenario skips unless PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH is set.
+[claude_code.launch.web_search]
+exposed_tools = ["WebSearch"]
+permission_mode = "acceptEdits"
+allowed_tools = ["WebSearch"]
+# The managed tool name the `anthropic_web_search` filter owns and suppresses.
+managed_tool = "WebSearch"
+provider = "tavily"
+flags = [
+  "--tools", "WebSearch",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
 [vllm]
 # Container image pinned by digest for Claude Code acceptance
 # (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
@@ -116,6 +200,12 @@ seed = 0
 # path. Thinking is disabled by default for this deterministic coding task:
 # otherwise Qwen3 can consume the entire Claude Code turn budget reasoning about
 # which tool to call without issuing the call.
+#
+# `--reasoning-parser qwen3` and `--default-chat-template-kwargs` are a PAIR and
+# are the subject of issue #1418: serving Qwen3 with a parser for another family
+# and thinking on made Claude Code loop and render reasoning as its answer. The
+# planning scenario above is the nightly regression guard for exactly that, so
+# changing either flag here is expected to turn it red.
 #
 # `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
 # ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container

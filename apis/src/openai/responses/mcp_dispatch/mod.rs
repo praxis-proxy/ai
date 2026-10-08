@@ -86,9 +86,8 @@ use crate::{
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     json_body::serialized_len,
     mcp_client,
-    service::responses::ResponsesService,
     state_owner::StateOwner,
-    store::{PendingApprovalRecord, ResponseStoreRegistry},
+    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
 };
 
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
@@ -335,8 +334,10 @@ impl McpDispatchFilter {
             return;
         };
         for result in results {
+            let result_start = state.messages.len();
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
+            state.mark_local_tool_results_from(result_start);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
             // lifecycle.
@@ -485,17 +486,16 @@ impl McpDispatchFilter {
         let owner = ctx.extensions.get::<StateOwner>().cloned().ok_or_else(|| {
             responses_error_rejection(401, "missing_state_owner", "trusted state owner assertion is required")
         })?;
-        let service = ctx
+        let store = ctx
             .extensions
             .get::<ResponseStoreRegistry>()
             .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
-            .map(ResponsesService::new)
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
                 responses_error_rejection(500, "server_error", "response store is not available")
             })?;
         let approval_ids: Vec<&str> = inputs.iter().map(|i| i.approval_id.as_str()).collect();
-        let pending_records = service
+        let pending_records = store
             .get_pending_approvals(&previous_response_id, &approval_ids)
             .await
             .map_err(|e| {
@@ -538,7 +538,7 @@ impl McpDispatchFilter {
         // approval was already consumed (replay) rather than never issued.
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
-        consume_batch(&service, &previous_response_id, &claim_ids, consumed_at).await?;
+        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
 
         // Phase 4: apply the decisions to request-scoped state.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -561,12 +561,12 @@ impl McpDispatchFilter {
 /// rejects the whole batch without consuming any id, so a corrected retry can
 /// still resume the legitimately approved calls.
 async fn consume_batch(
-    service: &ResponsesService,
+    store: &OwnerScopedResponseStore,
     response_id: &str,
     approval_ids: &[&str],
     consumed_at: i64,
 ) -> Result<(), Rejection> {
-    match service.consume_approvals(response_id, approval_ids, consumed_at).await {
+    match store.consume_approvals(response_id, approval_ids, consumed_at).await {
         Ok(None) => Ok(()),
         Ok(Some(index)) => {
             let approval_id = approval_ids.get(index).copied().unwrap_or_default();
@@ -753,8 +753,10 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
+        let result_start = state.messages.len();
         state.messages.push(denial.clone());
         state.persisted_messages.push(denial);
+        state.mark_local_tool_results_from(result_start);
     }
 }
 

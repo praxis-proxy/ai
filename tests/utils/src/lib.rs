@@ -29,6 +29,7 @@ pub mod proxy;
 pub mod recording;
 pub mod session_replay;
 pub mod sqlite;
+pub mod tavily_relay;
 pub mod tls_probe;
 
 pub use agentic::{
@@ -63,3 +64,6 @@ pub use session_replay::{
     import_session_replay,
 };
 pub use sqlite::TempSqlite;
+pub use tavily_relay::{
+    TAVILY_UPSTREAM, TavilyRelayGuard, TavilySearchCapture, start_tavily_relay, start_tavily_relay_to,
+};

@@ -424,16 +424,20 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "iterative_request_router"
             | "openai_responses_proxy"
             | "path_rewrite"
+            | "ai_operation"
             | "openai_responses_format"
             | "openai_responses_request"
-            | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
             | "openai_response_store"
             | "openai_responses_rehydrate"
             | "openai_stream_events"
             | "openai_tool_parse"
+            | "openai_chat_completions_to_bedrock_converse"
+            | "openai_chat_completions_to_azureai_chat_completions"
+            | "openai_chat_completions_to_vertexai_gemini"
             | "responses_to_chat_completions"
+            | "aws_sigv4_sign"
             | "router"
             | "load_balancer"
     )
@@ -540,6 +544,7 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 
 /// Contains file-backed fields and one dynamically nested database target.
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
+    contain_sigv4_credentials(mapping);
     if mapping
         .iter()
         .any(|(key, value)| key.as_str().is_some_and(is_file_resource_key) && !matches!(value, serde_yaml::Value::Null))
@@ -566,6 +571,28 @@ fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<
     validate_replay_database_target(backend.as_deref(), database_url)?;
     mapping.insert(database_key, serde_yaml::Value::String("sqlite::memory:".to_owned()));
     Ok(())
+}
+
+/// Redirect `SigV4`'s credential lookups to deterministic, non-secret Cargo
+/// process variables during offline replay. The signer performs no callout;
+/// its output credential headers are removed by fixture header policy.
+fn contain_sigv4_credentials(mapping: &mut serde_yaml::Mapping) {
+    let is_signer = mapping.iter().any(|(key, value)| {
+        key.as_str().is_some_and(|key| key == "filter") && value.as_str().is_some_and(|value| value == "aws_sigv4_sign")
+    });
+    if !is_signer {
+        return;
+    }
+
+    for (field, process_var) in [
+        ("access_key_env_var", "CARGO_PKG_NAME"),
+        ("secret_key_env_var", "CARGO_MANIFEST_DIR"),
+    ] {
+        mapping.insert(
+            serde_yaml::Value::String(field.to_owned()),
+            serde_yaml::Value::String(process_var.to_owned()),
+        );
+    }
 }
 
 /// Recognizes config fields whose values are loaded from the local filesystem.
@@ -1981,13 +2008,7 @@ mod tests {
             model: Some("fixture-model".to_owned()),
             exchange: RecordedExchange {
                 request: scenario.turns[0].request.clone(),
-                response: RecordedResponse {
-                    status: 200,
-                    headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
-                    body: RecordedBody::Json {
-                        value: json!({"scenario": true}),
-                    },
-                },
+                response: chat_response("root answer", "chatcmpl-root"),
             },
         };
 
@@ -2676,7 +2697,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_format\n      - filter: openai_responses_request\n        on_invalid: reject\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: openai_chat_completions_to_azureai_chat_completions\n      - filter: openai_chat_completions_to_vertexai_gemini\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

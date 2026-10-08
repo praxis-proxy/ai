@@ -71,7 +71,7 @@ what is left out and why.
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|
 | `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-credential-types`; the signature is computed by the system OpenSSL |
-| `openai-responses` | `openai_responses_validate`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
+| `openai-responses` | `openai_responses_request`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
 | `openai-file-resolve-filter` | `openai_file_resolve` | none beyond `openai-responses`; uses the shared subrequest client |
 | `store-postgres`, `store-postgres-cert-auth`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL; the certificate-only profile omits password authentication) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |

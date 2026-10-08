@@ -226,7 +226,11 @@ pub enum EventLogStatus {
 /// Variants carry `String` payloads (not typed inner errors) to
 /// avoid coupling the trait to any specific database driver.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StoreError {
+    /// No resource exists in the authorized owner scope.
+    NotFound,
+
     /// Database connection or query failure.
     Database(String),
 
@@ -243,6 +247,7 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotFound => write!(f, "resource not found"),
             Self::Database(msg) => write!(f, "database error: {msg}"),
             Self::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),

@@ -89,6 +89,13 @@ The flags above match what CI serves, and come from the shared
 `--enable-auto-tool-choice`/`--tool-call-parser` are required by the tool-loop
 tests, and `--reasoning-parser` by the reasoning-content tests.
 
+These are test-suite flags, not a template for interactive use. The
+reasoning-content tests need a model that thinks out loud, which makes agentic
+clients misbehave; for driving Codex, Claude Code, or OpenCode through Praxis,
+use the reasoning flags in
+[Run Codex, Claude Code, or OpenCode through Praxis and vLLM](../docs/developing/cli-vllm-through-praxis.md)
+instead.
+
 Additional flags for larger GPUs:
 
 ```console

@@ -1129,7 +1129,11 @@ fn emit_event(output: &mut Vec<u8>, event_type: &str, data: &Value) {
 /// Emit a client-safe terminal error when an upstream tool call cannot be
 /// represented in Anthropic's streaming schema.
 fn emit_upstream_transform_error(output: &mut Vec<u8>) {
-    let body = crate::anthropic::wire::error_body("api_error", "upstream response could not be transformed", None);
+    let body = crate::anthropic::wire::error_body(
+        crate::anthropic::wire::ErrorType::Api,
+        "upstream response could not be transformed",
+        None,
+    );
     output.extend_from_slice(b"event: error\ndata: ");
     output.extend_from_slice(&body);
     output.extend_from_slice(b"\n\n");

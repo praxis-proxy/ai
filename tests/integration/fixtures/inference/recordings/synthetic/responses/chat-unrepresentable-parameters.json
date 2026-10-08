@@ -112,9 +112,71 @@
             "value": {
               "error": {
                 "code": "invalid_request_error",
-                "message": "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
+                "message": "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
                 "param": null,
                 "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "malformed-tools",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-unrepresentable-parameters-model",
+              "input": "Hello",
+              "tools": [
+                42
+              ],
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "unsupported Responses tool type for Chat Completions translation: unknown",
+                "param": null
               }
             }
           }

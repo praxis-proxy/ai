@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, is_private_ip, prepare_url_target};
+use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback, SubRequest, SubrequestRuntime,
@@ -26,6 +26,7 @@ use serde_json::{Value, value::RawValue};
 use crate::{
     callout_identity::CalloutIdentity,
     callout_policy::OnFailure,
+    callout_target::AddressPolicy,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     openai::api_client::resource_url,
     subrequest::SubRequestClient,
@@ -718,12 +719,13 @@ impl FileSearchClient {
         allow_private: bool,
     ) -> Result<PreparedTarget, FileSearchError> {
         let remaining = deadline_remaining(execution_timeout, execution_started, store_id)?;
+        let address_policy = AddressPolicy::from_allow_private(allow_private);
         tokio::time::timeout(
             remaining,
             Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
-                if !allow_private && addresses.iter().any(|address| is_private_ip(&address.ip())) {
+                if addresses.iter().any(|address| address_policy.blocks(&address.ip())) {
                     return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
-                        "vector-store target resolved to a private or reserved address".into(),
+                        "vector-store target resolved to an address blocked by outbound policy".into(),
                     );
                 }
                 Ok(())

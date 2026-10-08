@@ -183,16 +183,10 @@ fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, format: AiRequestFor
         return;
     }
 
-    let request_id = ctx
-        .request
-        .headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(generate_request_id, ToOwned::to_owned);
+    let formatter =
+        crate::anthropic::error_response_formatter::AnthropicErrorFormatter::from_request_headers(&ctx.request.headers);
 
-    ctx.extensions.insert(ErrorResponseFormatterHandle::new(
-        crate::anthropic::error_response_formatter::AnthropicErrorFormatter::new(request_id),
-    ));
+    ctx.extensions.insert(ErrorResponseFormatterHandle::new(formatter));
 }
 
 /// Check whether the format requires rejection.
@@ -269,17 +263,6 @@ fn promote_headers(
     }
 }
 
-/// Generate a request identifier when the client did not send one.
-///
-/// Uses a timestamp-based hex string prefixed with `req_` to match
-/// the Anthropic convention without adding a UUID dependency.
-fn generate_request_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("req_{nanos:032x}")
-}
 
 /// Check whether the path is the Anthropic Messages endpoint,
 /// normalizing a trailing slash.

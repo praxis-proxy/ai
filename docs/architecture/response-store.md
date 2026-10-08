@@ -11,7 +11,7 @@ Persistence is split into explicit dependency layers:
 ```text
 Responses / Conversations filters
   |
-  +-- owner-scoped service APIs
+  +-- owner-scoped store handle and record-assembly helpers
   |
 praxis-ai-store
   |-- SQL-free records, traits, registries, and backend factory contracts
@@ -44,7 +44,7 @@ persistence profiles:
 
 | Profile | Feature selection | SQL backends |
 |---------|-------------------|--------------|
-| Backend-free | `standard,openai-all` | None; contracts, services, and filters only |
+| Backend-free | `standard,openai-all` | None; contracts, record helpers, and filters only |
 | PostgreSQL-only | `standard,openai-all,store-postgres` | PostgreSQL through SQLx native TLS |
 | SQLite-only | `standard,openai-all,store-sqlite` | SQLite |
 | Combined | `standard,openai-all,store-all` | PostgreSQL and SQLite |
@@ -243,7 +243,9 @@ keeps password cryptography off the connection path.
 SSRF protections reject DNS hostnames, localhost,
 loopback, private, link-local, and unspecified
 addresses by default. `allow_private_database_url`
-opts in for development. Host validation is re-run
+opts in for development, but cloud metadata,
+unspecified, and multicast addresses remain blocked.
+Host validation is re-run
 on every connection attempt to guard against DNS
 rebinding.
 
@@ -269,9 +271,9 @@ pass-through traffic is not held.
 ## Key Files
 
 - `apis/src/openai/responses/store/filter.rs`: HTTP filter lifecycle
-- `apis/src/service/responses/`: independently testable Responses service
-- `apis/src/service/conversations/`: independently testable Conversations service
-- `store/`: SQL-free contracts, records, registries, and factory traits
+- `apis/src/service/responses/`: Responses record assembly and input-item listing
+- `apis/src/service/conversations/`: conversation item-record assembly and validation
+- `store/`: SQL-free owner-scoped handle, records, registries, and factory traits
 - `store-lifecycle/`: cache, retry, generation leases, reuse, and retirement
 - `store-backends/`: SQLx implementations, pools, schemas, TLS, and factories
 - `server/src/store_provision.rs`: listener planning, readiness, and serving-runtime provisioning
