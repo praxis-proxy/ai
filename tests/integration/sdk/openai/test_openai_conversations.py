@@ -64,6 +64,19 @@ def _owner_assertion(subject: str) -> str:
     ).encode()
     return "v1." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
+
+def _reasoning_effort(item) -> object:
+    """Read ``reasoning.effort`` across SDK lanes.
+
+    The 2.x ``ConversationItem`` models keep the ``reasoning`` object as a
+    plain dict while the 3.x lane types it. Normalize both so these tests
+    assert the wire contract rather than an SDK typing detail.
+    """
+    reasoning = item.reasoning
+    if isinstance(reasoning, dict):
+        return reasoning.get("effort")
+    return reasoning.effort
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1112,7 +1125,7 @@ class TestOpenAIConversations:
         item = created.data[0]
         assert item.id.startswith("item_")
         assert item.type == "configuration_update"
-        assert item.reasoning.effort == "high"
+        assert _reasoning_effort(item) == "high"
 
         page = openai_client.conversations.items.list(
             conversation.id,
@@ -1121,7 +1134,7 @@ class TestOpenAIConversations:
         listed = page.data[0]
         assert listed.id == item.id
         assert listed.type == "configuration_update"
-        assert listed.reasoning.effort == "high"
+        assert _reasoning_effort(listed) == "high"
 
     def test_item_create_returns_all_items(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -1891,19 +1904,19 @@ class TestConversationTenantIsolation:
         )
         item = created.data[0]
         assert item.type == "configuration_update"
-        assert item.reasoning.effort == "high"
+        assert _reasoning_effort(item) == "high"
 
         page = openai_client.conversations.items.list(conversation.id, order="asc")
         listed = page.data[0]
         assert listed.id == item.id
         assert listed.type == "configuration_update"
-        assert listed.reasoning.effort == "high"
+        assert _reasoning_effort(listed) == "high"
 
         retrieved = openai_client.conversations.items.retrieve(
             item.id, conversation_id=conversation.id
         )
         assert retrieved.type == "configuration_update"
-        assert retrieved.reasoning.effort == "high"
+        assert _reasoning_effort(retrieved) == "high"
 
     def test_nullable_function_output_fields_are_omitted(self, openai_client):
         """name/namespace null on function_call_output normalize to omission, not 400."""

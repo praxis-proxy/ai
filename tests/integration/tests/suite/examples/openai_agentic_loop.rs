@@ -2431,11 +2431,16 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         Some(mcp_id.as_str()),
         "terminal[2] id: {body}"
     );
+    assert_eq!(
+        output[2]["error"]["type"].as_str(),
+        Some("mcp_tool_execution_error"),
+        "terminal[2] must carry the structured MCP error type: {body}"
+    );
     assert!(
-        output[2]["error"]
+        output[2]["error"]["content"]
             .as_str()
             .is_some_and(|error| error.contains("mock failure for get_weather")),
-        "terminal[2] must carry the MCP error: {body}"
+        "terminal[2] must carry the MCP error content: {body}"
     );
     assert_eq!(output[3]["type"], "message", "terminal[3] type: {body}");
     assert_eq!(
