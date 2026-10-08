@@ -29,14 +29,24 @@ listeners:
 filter_chains:
   - name: client-tool-compat
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       # Persisted Responses/Conversations state is scoped to an immutable owner.
       # This single-tenant demo installs a fixed owner directly (no auth gateway

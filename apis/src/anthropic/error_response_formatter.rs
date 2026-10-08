@@ -35,34 +35,39 @@ impl AnthropicErrorFormatter {
     pub(crate) fn new(request_id: String) -> Self {
         Self { request_id }
     }
+
+    /// Create a formatter, deriving the request identifier from the request head.
+    ///
+    /// Shared by every install site so a failure carries the same identifier
+    /// whether the formatter was installed from the classified request head or
+    /// from body-format classification.
+    pub(crate) fn from_request_headers(headers: &http::HeaderMap) -> Self {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map_or_else(generate_request_id, ToOwned::to_owned);
+        Self::new(request_id)
+    }
+}
+
+/// Generate a request identifier when the client did not send one.
+///
+/// Uses a timestamp-based hex string prefixed with `req_` to match
+/// the Anthropic convention without adding a UUID dependency.
+fn generate_request_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("req_{nanos:032x}")
 }
 
 impl ErrorResponseFormatter for AnthropicErrorFormatter {
     fn format(&self, context: &ErrorResponseContext<'_>) -> FormattedErrorResponse {
-        let error_type = anthropic_error_type(context.status);
+        let error_type = wire::ErrorType::from_status(context.status);
         let body = wire::error_body(error_type, context.message, Some(&self.request_id));
 
         FormattedErrorResponse::new(body, http::HeaderValue::from_static("application/json"))
-    }
-}
-
-/// Map an HTTP error status to an Anthropic error type.
-///
-/// The mapping is consistent with the existing `error_type_for_status` in
-/// `messages_to_chat_completions/response.rs`.
-fn anthropic_error_type(status: u16) -> &'static str {
-    match status {
-        401 => "authentication_error",
-        402 => "billing_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        504 => "timeout_error",
-        529 => "overloaded_error",
-        500..=599 => "api_error",
-        _ => "invalid_request_error",
     }
 }
 
@@ -134,8 +139,8 @@ mod tests {
             (402, "billing_error"),
             (403, "permission_error"),
             (404, "not_found_error"),
-            (409, "conflict_error"),
-            (413, "request_too_large"),
+            (409, "invalid_request_error"),
+            (413, "invalid_request_error"),
             (422, "invalid_request_error"),
             (429, "rate_limit_error"),
             (418, "invalid_request_error"),
@@ -186,8 +191,6 @@ mod tests {
             "billing_error",
             "permission_error",
             "not_found_error",
-            "conflict_error",
-            "request_too_large",
             "rate_limit_error",
             "timeout_error",
             "api_error",

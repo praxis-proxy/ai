@@ -1,0 +1,56 @@
+version: 1
+id: vertex/bounded-stream-limits
+description: Reject candidate index and tool-call slot overflows in Vertex Gemini streaming responses.
+protocol: openai_chat_completions
+example_config: vertex/chat-completions-to-gemini.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - vertex.gemini.streaming.candidate_limit
+  - vertex.gemini.streaming.tool_slot_limit
+turns:
+  - name: candidate-index-overflow
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+          stream: true
+          n: 1
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:streamGenerateContent?alt=sse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: tool-slot-overflow
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+          stream: true
+          n: 1
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:streamGenerateContent?alt=sse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

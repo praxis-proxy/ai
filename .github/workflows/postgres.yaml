@@ -8,7 +8,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
@@ -31,7 +35,11 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
@@ -93,7 +101,11 @@ jobs:
         run: |
           CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
                                          "${{ github.event.merge_group.head_sha }}" -- \
+            'store/' \
+            'store-backends/' \
+            'store-lifecycle/' \
             'apis/src/store/' \
+            'apis/src/service/' \
             'apis/src/openai/responses/store/' \
             'apis/src/openai/conversations/' \
             'examples/configs/openai/responses/response-store.yaml' \
@@ -153,7 +165,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: PostgreSQL store unit tests
         run: make test-postgres-unit
@@ -177,7 +189,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Pull PostgreSQL image
         run: docker pull docker.io/library/postgres:17-alpine

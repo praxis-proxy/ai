@@ -14,14 +14,13 @@ Each provider request is executed through the shared filtered-subrequest executo
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
-| `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily, which authenticates via the request body. |
+| `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Supported for every provider: each stages the secret as a destination-bound header credential the executor injects after pinning the provider authority (Brave and You.com under their provider header, Tavily as an `Authorization: Bearer` token). |
 | `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
-| `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
+| `max_body_bytes` | integer | no | Maximum request and response body bytes buffered per loop round. |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `outbound_chain` | string \| object | no | Outbound filter chain the provider callout executes through. A **named** reference resolves against the top-level `filter_chains` map, so it binds only when the filter is placed at the top level of a pipeline (see the `web-search.yaml` example). An **inline** definition embeds the filters directly and always binds — including when the filter runs nested as a step of an `iterative_request_router` (the agentic loop), where the step pipeline's chain map is empty and a named reference cannot resolve. Use an inline chain for any nested/IRR placement; a named reference is available only where top-level `filter_chains` are in scope. The chain carries cross-cutting concerns (observability, security, credential injection) and is bound once at pipeline-build time — a chain that cannot be built fails config validation. Destination authority, DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the executor, gated by `insecure_options.allow_private_upstreams`. Optional. The provider callout always runs through the shared executor; this chain only adds filters along the way. When omitted it defaults to an empty inline chain (pure passthrough) via [`default_outbound_chain`], so every central protection still applies. Provide it only to attach cross-cutting concerns. |
-| `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search` does not accept it. |
 
 ## Examples
 
@@ -49,7 +48,8 @@ max_body_bytes: 67108864
 
 ```yaml
 # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
-# WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
+# WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" VLLM_API_KEY="$VLLM_API_KEY" \
+#   cargo run -p praxis-ai-proxy -- \
 #   -c examples/configs/anthropic/full-flow-agentic.yaml
 # curl http://127.0.0.1:8080/v1/messages \
 #   -H 'content-type: application/json' \

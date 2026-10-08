@@ -26,14 +26,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
+use praxis_ai_apis::promotion::contains_control_chars;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    builtins::http::{
-        payload_processing::json_rpc::{
-            config::JsonRpcConfig,
-            envelope::{JsonRpcEnvelope, JsonRpcIdKind, JsonRpcKind, parse_json_rpc_value},
-        },
-        value_safety::contains_control_chars,
+    builtins::http::payload_processing::json_rpc::{
+        config::JsonRpcConfig,
+        envelope::{JsonRpcEnvelope, JsonRpcIdKind, JsonRpcKind, parse_json_rpc_value},
     },
     parse_filter_config,
 };

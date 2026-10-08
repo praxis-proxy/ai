@@ -14,7 +14,8 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::pipelines::resolve_pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+use crate::pipelines::resolve_pipelines_with_stores;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -52,7 +53,11 @@ pub(crate) fn reload_pipelines(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    store_reload: &crate::StoreReloadHandle,
+    health_slot: &crate::SharedHealthRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    let _ = store_reload;
     info!("building new pipelines from reloaded config");
 
     if let Err(e) = praxis_core::logging::validate_log_overrides(new_config) {
@@ -68,9 +73,61 @@ pub(crate) fn reload_pipelines(
         new_ceiling,
     );
 
-    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client) {
+    // Validate the complete candidate pipeline before provisioning touches a
+    // database. Factory validation alone cannot cover cross-filter contracts or
+    // every filter-owned security check, such as SQLite path traversal.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let prepared_stores = if crate::store_provision::config_uses_store(new_config)
+        || crate::store_provision::config_uses_store(old_config)
+    {
+        let (validation_registries, _service, _reload, _readiness) =
+            crate::store_provision::build_store_wiring(new_config)?;
+        resolve_pipelines_with_stores(
+            new_config,
+            registry,
+            &health_registry,
+            kv_stores,
+            &updated_client,
+            &validation_registries,
+        )?;
+        Some(store_reload.prepare(new_config)?)
+    } else {
+        None
+    };
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let empty_store_registries = crate::StoreRegistries::default();
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let build = resolve_pipelines_with_stores(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        &updated_client,
+        prepared_stores
+            .as_ref()
+            .map_or(&empty_store_registries, |prepared| &prepared.registries),
+    );
+    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    let build = crate::pipelines::resolve_pipelines_with_stores(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        &updated_client,
+        &crate::StoreRegistries::default(),
+    );
+    #[cfg(not(feature = "store"))]
+    let build = crate::pipelines::resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client);
+    let new_pipelines = match build {
         Ok(p) => p,
         Err(e) => {
+            #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+            if let Some(prepared) = prepared_stores
+                && let Err(abort_error) = store_reload.abort(prepared)
+            {
+                error!(error = %abort_error, "failed to release rejected store reload generation");
+            }
             error!(error = %e, "config reload failed: pipeline build error");
             return Err(e);
         },
@@ -78,6 +135,20 @@ pub(crate) fn reload_pipelines(
 
     log_restart_required_changes(old_config, new_config);
     warn_stateful_filter_reset(new_config);
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let old_pipelines = crate::store_provision::store_listener_names(old_config)
+        .into_iter()
+        .filter_map(|name| live.get(&name).map(|slot| Arc::downgrade(&slot.load_full())))
+        .collect();
+
+    // Promotion cannot fail after this acknowledgement, and the ArcSwap stores
+    // below are infallible. Commit before publication so shutdown can never
+    // classify an already-published generation as unattached pending state.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    if let Some(prepared) = prepared_stores {
+        store_reload.commit(prepared, old_pipelines)?;
+    }
 
     let mut swapped = Vec::new();
     let mut skipped = Vec::new();
@@ -95,6 +166,9 @@ pub(crate) fn reload_pipelines(
     }
 
     respawn_health_checks(new_config, &health_registry, health_shutdown);
+    // Publish the freshly built registry so the readiness endpoint reflects the
+    // reloaded cluster health instead of the startup snapshot.
+    *health_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&health_registry);
 
     info!(
         swapped = ?swapped,
@@ -156,7 +230,9 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_protocol_changes(old, new);
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
+    detect_listener_setting_changes(old, new);
     detect_subrequest_connector_changes(old, new);
+    detect_process_limit_changes(old, new);
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -275,6 +351,35 @@ fn detect_tls_toggles(old: &Config, new: &Config) {
     }
 }
 
+/// Detect changes to listener settings the HTTP handler captures once at
+/// startup: connection limits and downstream timeouts.
+fn detect_listener_setting_changes(old: &Config, new: &Config) {
+    for new_l in &new.listeners {
+        let Some(old_l) = old.listeners.iter().find(|l| l.name == new_l.name) else {
+            continue;
+        };
+        for (field, changed) in [
+            ("max_connections", old_l.max_connections != new_l.max_connections),
+            (
+                "downstream_keepalive_timeout_ms",
+                old_l.downstream_keepalive_timeout_ms != new_l.downstream_keepalive_timeout_ms,
+            ),
+            (
+                "downstream_read_timeout_ms",
+                old_l.downstream_read_timeout_ms != new_l.downstream_read_timeout_ms,
+            ),
+        ] {
+            if changed {
+                warn!(
+                    listener = %new_l.name,
+                    field,
+                    "listener setting changed; requires restart (applied when the listener starts)"
+                );
+            }
+        }
+    }
+}
+
 /// Detect changes to sub-request connector parameters.
 fn detect_subrequest_connector_changes(old: &Config, new: &Config) {
     if old.runtime.subrequest_pool_size != new.runtime.subrequest_pool_size {
@@ -292,6 +397,24 @@ fn detect_subrequest_connector_changes(old: &Config, new: &Config) {
         );
     }
     detect_subrequest_circuit_breaker_change(old, new);
+}
+
+/// Detect changes to process limits applied once at startup.
+fn detect_process_limit_changes(old: &Config, new: &Config) {
+    if old.runtime.max_open_files != new.runtime.max_open_files {
+        warn!(
+            old = ?old.runtime.max_open_files,
+            new = ?new.runtime.max_open_files,
+            "runtime.max_open_files changed; requires restart (the open file limit is set once at startup)"
+        );
+    }
+    if old.runtime.shed_on_fd_pressure != new.runtime.shed_on_fd_pressure {
+        warn!(
+            old = old.runtime.shed_on_fd_pressure,
+            new = new.runtime.shed_on_fd_pressure,
+            "runtime.shed_on_fd_pressure changed; requires restart (the descriptor monitor starts once)"
+        );
+    }
 }
 
 /// Detect `runtime.subrequest_circuit_breaker` changes that require a restart.
@@ -369,6 +492,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
+    use crate::pipelines::resolve_pipelines;
 
     #[test]
     fn valid_reload_swaps_pipeline() {
@@ -384,6 +508,8 @@ mod tests {
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         );
 
         assert!(result.is_ok(), "valid reload should succeed");
@@ -418,11 +544,66 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
         let current_ptr = Arc::as_ptr(&live.get("web").unwrap().load());
         assert_eq!(old_ptr, current_ptr, "pipeline should be untouched after failure");
+    }
+
+    #[cfg(feature = "store-sqlite")]
+    #[test]
+    fn invalid_store_candidate_is_rejected_before_provisioning() {
+        let old_config = valid_config();
+        let client = test_client();
+        let registry = crate::build_full_registry(&client);
+        let health_registry: HealthRegistry = Arc::new(HashMap::new());
+        let kv_stores = empty_kv_stores();
+        let live = resolve_pipelines(&old_config, &registry, &health_registry, &kv_stores, &client)
+            .expect("initial pipelines");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = temp.path().join("outside.db");
+        let database_url = format!("sqlite://{}/allowed/../outside.db?mode=rwc", temp.path().display());
+        let new_config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+"#,
+        ))
+        .expect("candidate config");
+
+        let result = reload_pipelines(
+            &new_config,
+            &old_config,
+            &registry,
+            &live,
+            &Arc::new(Mutex::new(CancellationToken::new())),
+            &kv_stores,
+            &client,
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
+        );
+
+        let error = result
+            .expect_err("path traversal must reject the candidate")
+            .to_string();
+        assert!(
+            error.contains("must not contain '..' path traversal"),
+            "unexpected error: {error}"
+        );
+        assert!(!outside.exists(), "rejected reload must not create its SQLite database");
     }
 
     #[test]
@@ -439,6 +620,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
 
@@ -462,6 +645,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
 
@@ -500,6 +685,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(
             !old_token.is_cancelled(),
@@ -537,6 +724,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
         assert!(
@@ -708,6 +897,71 @@ filter_chains:
     }
 
     #[test]
+    fn listener_keepalive_timeout_change_warns() {
+        let old = config_with_listener_line("");
+        let new = config_with_listener_line("    downstream_keepalive_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&old, &new));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one changed listener setting, one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the timeout is applied when the listener starts: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn listener_limit_and_read_timeout_changes_warn() {
+        let old = config_with_listener_line("");
+        let new = config_with_listener_line("    max_connections: 10\n    downstream_read_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&old, &new));
+        assert_eq!(warnings.len(), 2, "each changed setting warns: {warnings:?}");
+    }
+
+    #[test]
+    fn unchanged_listener_settings_do_not_warn() {
+        let config = config_with_listener_line("    downstream_keepalive_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&config, &config));
+        assert!(warnings.is_empty(), "nothing changed: {warnings:?}");
+    }
+
+    #[test]
+    fn max_open_files_change_warns() {
+        let old = config_with_runtime_line("threads: 1");
+        let new = config_with_runtime_line("max_open_files: 4096");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&old, &new));
+        assert_eq!(warnings.len(), 1, "one changed limit, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the open file limit is set once at startup: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn shed_on_fd_pressure_change_warns() {
+        let old = config_with_runtime_line("threads: 1");
+        let new = config_with_runtime_line("shed_on_fd_pressure: false");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&old, &new));
+        assert_eq!(warnings.len(), 1, "one changed setting, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the descriptor monitor starts once: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn unchanged_process_limits_do_not_warn() {
+        let config = config_with_runtime_line("max_open_files: 4096");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&config, &config));
+        assert!(warnings.is_empty(), "nothing changed: {warnings:?}");
+    }
+
+    #[test]
     fn circuit_breaker_unchanged_no_warning() {
         let config = config_with_circuit_breaker(Some(5));
         let warnings = capture_warnings(|| detect_subrequest_circuit_breaker_change(&config, &config));
@@ -765,6 +1019,24 @@ filter_chains:
     fn test_client() -> praxis_core::subrequest::SubRequestClient {
         praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
+
+    fn config_with_listener_line(line: &str) -> Config {
+        Config::from_yaml(&format!(
+            "listeners:\n  - name: web\n    address: \"127.0.0.1:8080\"\n{line}    \
+             filter_chains: [main]\nfilter_chains:\n  - name: main\n    \
+             filters:\n      - filter: static_response\n        status: 200\n"
+        ))
+        .unwrap()
+    }
+
+    fn config_with_runtime_line(line: &str) -> Config {
+        Config::from_yaml(&format!(
+            "listeners:\n  - name: web\n    address: \"127.0.0.1:8080\"\n    \
+             filter_chains: [main]\nruntime:\n  {line}\nfilter_chains:\n  - name: main\n    \
+             filters:\n      - filter: static_response\n        status: 200\n"
+        ))
+        .unwrap()
     }
 
     fn config_with_circuit_breaker(failures: Option<u32>) -> Config {

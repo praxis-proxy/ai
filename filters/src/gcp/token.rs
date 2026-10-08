@@ -14,7 +14,12 @@
 
 use std::{path::Path, time::Duration};
 
+use bytes::Bytes;
 use http::HeaderValue;
+use praxis_ai_apis::{
+    callout_target::AddressPolicy,
+    subrequest::{SubRequest, SubRequestClient, execute_url},
+};
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -67,14 +72,15 @@ struct MetadataTokenResponse {
 /// [`TokenSource::ServiceAccountKey`], always (not implemented).
 #[cfg(test)]
 pub(super) async fn fetch(
-    client: &reqwest::Client,
+    client: &SubRequestClient,
     source: &TokenSource,
     metadata_host: &str,
     scope: &str,
+    timeout: Duration,
 ) -> Result<(HeaderValue, Duration), FilterError> {
     match source {
         TokenSource::Metadata { service_account } => {
-            fetch_metadata_token(client, metadata_host, service_account, scope).await
+            fetch_metadata_token(client, metadata_host, service_account, scope, timeout).await
         },
         TokenSource::ServiceAccountKey => Err(FilterError::from(
             "gcp_adc: token fetch for source key_file is not implemented yet (requires JWT signing); \
@@ -83,13 +89,12 @@ pub(super) async fn fetch(
     }
 }
 
-/// Acquire a token through a proxy-free, redirect-free client pinned to
-/// every validated metadata-server address returned by one DNS lookup.
+/// Acquire a token through `SubRequestClient` targeting the metadata server.
 ///
 /// The metadata protocol intentionally targets a private endpoint. The
-/// configured host is separately restricted to Google's metadata hostname
-/// or a literal loopback test host.
+/// configured host is separately restricted to Google's metadata hostname.
 pub(super) async fn fetch_pinned(
+    client: &SubRequestClient,
     source: &TokenSource,
     metadata_host: &str,
     scope: &str,
@@ -103,26 +108,36 @@ pub(super) async fn fetch_pinned(
     };
 
     let url = metadata_token_url(metadata_host, service_account, scope);
-    let client = crate::pinned_client::build_pinned_reqwest_client(
-        "gcp_adc",
-        &url,
-        praxis_ai_apis::callout_target::AddressPolicy::AllowPrivate,
-        timeout,
-    )
-    .await?;
-    fetch_metadata_token_url(&client, &url).await
+    fetch_metadata_token_url(client, &url, timeout, metadata_address_policy(metadata_host)).await
+}
+
+/// Use the production metadata-only policy except for literal loopback mocks
+/// compiled into this crate's unit tests.
+#[cfg(test)]
+fn metadata_address_policy(metadata_host: &str) -> AddressPolicy {
+    if metadata_host.split(':').next().unwrap_or(metadata_host) == "127.0.0.1" {
+        return AddressPolicy::AllowPrivate;
+    }
+    AddressPolicy::AllowGoogleMetadata
+}
+
+/// Use the metadata-only policy in every production build.
+#[cfg(not(test))]
+fn metadata_address_policy(_metadata_host: &str) -> AddressPolicy {
+    AddressPolicy::AllowGoogleMetadata
 }
 
 /// Acquire a token from the GCE/GKE metadata server.
 #[cfg(test)]
 async fn fetch_metadata_token(
-    client: &reqwest::Client,
+    client: &SubRequestClient,
     metadata_host: &str,
     service_account: &str,
     scope: &str,
+    timeout: Duration,
 ) -> Result<(HeaderValue, Duration), FilterError> {
     let url = metadata_token_url(metadata_host, service_account, scope);
-    fetch_metadata_token_url(client, &url).await
+    fetch_metadata_token_url(client, &url, timeout, AddressPolicy::AllowPrivate).await
 }
 
 /// Build the metadata token URL from already validated components.
@@ -133,25 +148,37 @@ fn metadata_token_url(metadata_host: &str, service_account: &str, scope: &str) -
     url
 }
 
-/// Send one metadata token request with a caller-configured client.
-async fn fetch_metadata_token_url(client: &reqwest::Client, url: &str) -> Result<(HeaderValue, Duration), FilterError> {
-    let response = client
-        .get(url)
-        .header("Metadata-Flavor", "Google")
-        .send()
+/// Send one metadata token request via `SubRequestClient`.
+async fn fetch_metadata_token_url(
+    client: &SubRequestClient,
+    url: &str,
+    timeout: Duration,
+    address_policy: AddressPolicy,
+) -> Result<(HeaderValue, Duration), FilterError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::HeaderName::from_static("metadata-flavor"),
+        HeaderValue::from_static("Google"),
+    );
+    let request = SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers,
+        body: Bytes::new(),
+    };
+
+    let response = execute_url(client, url, request, 65_536, timeout, address_policy)
         .await
         .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
 
-    let status = response.status();
+    let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     if !status.is_success() {
         return Err(FilterError::from(format!(
             "gcp_adc: metadata server returned HTTP status {status}"
         )));
     }
 
-    let token: MetadataTokenResponse = response
-        .json()
-        .await
+    let token: MetadataTokenResponse = serde_json::from_slice(&response.body)
         .map_err(|e| FilterError::from(format!("gcp_adc: failed to parse metadata token response: {e}")))?;
 
     let mut authorization = HeaderValue::from_str(&format!("Bearer {}", token.access_token))
@@ -160,6 +187,7 @@ async fn fetch_metadata_token_url(client: &reqwest::Client, url: &str) -> Result
 
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
+
 
 // -----------------------------------------------------------------------------
 // GoogleApplicationCredentials

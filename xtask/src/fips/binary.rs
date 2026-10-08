@@ -221,11 +221,13 @@ fn backend_symbols(file: &object::File<'_>) -> BTreeMap<&'static str, usize> {
 fn imports(report: &mut Report, file: &object::File<'_>) {
     let count = file.imports().map_or(0, |imports| {
         imports
-            .iter()
+            .filter_map(Result::ok)
             .filter(|import| {
-                OPENSSL_PREFIXES
-                    .iter()
-                    .any(|prefix| import.name().starts_with(prefix.as_bytes()))
+                import.name().name().is_some_and(|name| {
+                    OPENSSL_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix.as_bytes()))
+                })
             })
             .count()
     });

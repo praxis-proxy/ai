@@ -14,6 +14,7 @@
 //!    hoisted into a Chat Completions system message) and the OpenAI response is translated back into an Anthropic
 //!    message.
 //! 3. Client credentials are stripped and the backend's own Bearer token is injected.
+//! 4. Native token counting remains untouched when the backend also serves that endpoint.
 //!
 //! Like the native tests, `credential_injection` and `basic_auth` resolve their
 //! secrets at pipeline-build time. `std::env::set_var` is `unsafe` (and
@@ -21,13 +22,14 @@
 //! `CARGO_PKG_NAME` — always set by Cargo for a test binary — and the gateway
 //! password is inlined instead of mutating the environment.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    StatefulCapturingBackend, StatefulCapturingGuard, basic_auth_header, free_port, http_send, json_post_with_header,
-    parse_body, parse_status, start_proxy,
+    Backend, StatefulCapturingBackend, StatefulCapturingGuard, basic_auth_header, free_port, http_send,
+    json_post_with_header, parse_body, parse_header, parse_status, start_proxy,
 };
+use serde_json::{Value, json};
 
 use super::load_example_config;
 
@@ -189,7 +191,7 @@ fn transform_vllm_rewrites_message_path_and_translates_response() {
     );
 
     assert_eq!(parse_status(&raw), 200, "translated request should return 200");
-    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
     assert_eq!(
         response["type"], "message",
         "the OpenAI Chat Completion must be translated back to an Anthropic message"
@@ -210,6 +212,46 @@ fn transform_vllm_rewrites_message_path_and_translates_response() {
         "POST /v1/messages must be rewritten to /v1/chat/completions, got: {}",
         forwarded.uri
     );
+
+    drop(proxy);
+}
+
+#[test]
+fn transform_vllm_preserves_native_count_tokens_when_backend_supports_it() {
+    let count_response = r#"{"input_tokens":4}"#;
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, count_response.to_owned()),
+        (200, count_response.to_owned()),
+        (200, count_response.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "qwen3-8b",
+        "messages": [{"role": "user", "content": "Count these tokens"}],
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages/count_tokens", &request.to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "native count-tokens response should pass through"
+    );
+    assert_eq!(parse_body(&raw), count_response);
+    let requests = backend.requests();
+    let forwarded = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("backend should receive a POST request");
+    assert_eq!(forwarded.uri, "/v1/messages/count_tokens");
+    let body: Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    assert_eq!(body, request, "count-tokens body must not be translated");
 
     drop(proxy);
 }
@@ -241,7 +283,7 @@ fn transform_vllm_translates_request_body_to_chat_completions() {
         .iter()
         .find(|r| r.method == "POST")
         .expect("backend should receive a POST request");
-    let body: serde_json::Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    let body: Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
 
     assert!(
         body.get("system").is_none(),
@@ -255,6 +297,94 @@ fn transform_vllm_translates_request_body_to_chat_completions() {
             .iter()
             .any(|m| m["role"] == "system" && m["content"] == "You are a coding assistant."),
         "the Anthropic `system` must be hoisted into a Chat Completions system message: {messages:?}"
+    );
+
+    drop(proxy);
+}
+
+// -----------------------------------------------------------------------------
+// Operator-approved degradation
+// -----------------------------------------------------------------------------
+
+#[test]
+fn transform_vllm_degrades_allowlisted_features_and_reports_them() {
+    // The example config enables `allow_lossy_features: [prompt_caching,
+    // extended_thinking]`, so a request carrying both Anthropic-only features
+    // (exactly what an unmodified Claude Code client sends) must succeed: the
+    // wire markers are stripped from the forwarded Chat Completions body, the
+    // prompt content is preserved, and the proxy reports the degradation through
+    // the `x-degraded-features` response header.
+    let backend = start_chat_backend();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "claude-opus-4-8",
+        // `budget_tokens` must be < `max_tokens` per the Anthropic schema, so a
+        // realistic client sends a larger ceiling than the thinking budget.
+        "max_tokens": 2048,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "system": [
+            {"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}}]
+        }],
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request.to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a degraded-but-translatable request still succeeds: {raw}"
+    );
+
+    // The proxy advertises exactly the degraded features it dropped.
+    let degraded = parse_header(&raw, "x-degraded-features").expect("the proxy must advertise the degraded features");
+    assert!(
+        degraded.contains("prompt_caching") && degraded.contains("extended_thinking"),
+        "both degraded features must be reported: {degraded}"
+    );
+
+    // The forwarded Chat Completions body carries neither wire marker, but the
+    // prompt content survives.
+    let requests = backend.requests();
+    let forwarded = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("backend should receive a POST request");
+    assert!(
+        !forwarded.body.contains("cache_control"),
+        "cache_control markers must be stripped before the backend: {}",
+        forwarded.body
+    );
+    let body: Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    assert!(
+        body.get("thinking").is_none(),
+        "the thinking field must be stripped before the backend: {body}"
+    );
+    let messages = body["messages"]
+        .as_array()
+        .expect("translated body should carry a Chat Completions `messages` array");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "system" && m["content"] == "Be brief"),
+        "the system prompt content must survive degradation: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"),
+        "the user message must survive degradation: {messages:?}"
+    );
+    assert!(
+        forwarded.body.contains("Hello"),
+        "the user prompt content must survive degradation: {}",
+        forwarded.body
     );
 
     drop(proxy);
@@ -338,5 +468,117 @@ fn transform_vllm_rejects_unauthenticated_gateway_request() {
         "an unauthenticated caller must be rejected by the gateway"
     );
 
+    drop(proxy);
+}
+
+#[test]
+fn streaming_non2xx_response_yields_single_anthropic_error() {
+    // A streaming request whose upstream returns a non-2xx JSON error must be
+    // normalized to exactly one Anthropic error object. Two 429s cover the
+    // optional Pingora health probe consuming the first response; the streaming
+    // POST still receives a 429 either way.
+    let backend = StatefulCapturingBackend::new(vec![
+        (
+            429,
+            json!({"error": {"message": "rate limited", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})
+                .to_string(),
+        ),
+        (
+            429,
+            json!({"error": {"message": "rate limited", "type": "rate_limit_error", "code": "rate_limit_exceeded"}})
+                .to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request =
+        r#"{"model":"claude-opus-4-8","max_tokens":64,"messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", request, &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        429,
+        "the upstream error status passes through: {raw}"
+    );
+    let body = parse_body(&raw);
+    // `from_str` rejects trailing data: a clean parse proves there is no second,
+    // concatenated JSON object appended after the translated error.
+    let response: Value =
+        serde_json::from_str(&body).unwrap_or_else(|error| panic!("body must be one JSON object ({error}): {body}"));
+    assert_eq!(
+        response["type"], "error",
+        "the client receives an Anthropic error envelope: {body}"
+    );
+    assert_eq!(
+        response["error"]["type"], "rate_limit_error",
+        "the upstream 429 maps to an Anthropic rate_limit_error: {body}"
+    );
+    assert_eq!(
+        response["error"]["message"], "rate limited",
+        "the real upstream message survives translation: {body}"
+    );
+    drop(proxy);
+}
+
+#[test]
+fn streaming_non2xx_split_across_chunks_yields_single_anthropic_error() {
+    // The split-delivery regression: a standalone `stream:true` request whose
+    // upstream returns a JSON error transfer-encoded across multiple chunks. The
+    // translator ratchets the response body into `StreamBuffer` mode, so praxis
+    // presents each raw chunk mid-stream AND re-presents the frozen full body at
+    // end of stream. The filter must transform that buffered body exactly once;
+    // accumulating the chunks itself would append the body twice and degrade to a
+    // generic "upstream request failed", losing the real upstream message.
+    //
+    // `stall_after_first_chunk` forces the proxy to read the first chunk as a
+    // separate frame, guaranteeing the split mid-stream delivery this exercises.
+    let error =
+        json!({"error": {"message": "rate limited: retry in 60 seconds", "type": "rate_limit_error"}}).to_string();
+    let (head, tail) = error.split_at(30);
+    let backend = Backend::chunked(vec![head.to_owned(), tail.to_owned()])
+        .status(429)
+        .header("content-type", "application/json")
+        .stall_after_first_chunk(Duration::from_millis(50))
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request =
+        r#"{"model":"claude-opus-4-8","max_tokens":64,"messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", request, &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        429,
+        "the upstream error status passes through: {raw}"
+    );
+    let body = parse_body(&raw);
+    // `from_str` rejects trailing data: a clean parse proves the split chunks were
+    // not accumulated on top of the framework's buffered body (a doubled body is
+    // invalid JSON).
+    let response: Value =
+        serde_json::from_str(&body).unwrap_or_else(|error| panic!("body must be one JSON object ({error}): {body}"));
+    assert_eq!(
+        response["type"], "error",
+        "the client receives an Anthropic error envelope: {body}"
+    );
+    assert_eq!(
+        response["error"]["type"], "rate_limit_error",
+        "the upstream 429 maps to an Anthropic rate_limit_error: {body}"
+    );
+    assert_eq!(
+        response["error"]["message"], "rate limited: retry in 60 seconds",
+        "the real upstream message survives split delivery, not a doubled-body fallback: {body}"
+    );
     drop(proxy);
 }

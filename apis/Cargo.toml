@@ -19,12 +19,15 @@ default = []
 # extraction, client-tool compatibility, agentic loop, file search and web
 # search dispatch. Adds no crates; gated because of its size and coupling.
 openai-responses = []
-# openai_file_resolve: downloads referenced files (pinned reqwest client).
-openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
-# Response and conversation storage (SQL). Implies the Responses kernel it serves.
-store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
-store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
-store-sqlite = ["store", "sqlx/sqlite"]
+# Generated OpenAPI description and utoipa contract schemas for Responses API.
+openai-responses-openapi = ["openai-responses", "dep:utoipa"]
+# openai_file_resolve: downloads referenced files via SubRequestClient.
+openai-file-resolve-filter = ["openai-responses"]
+# Response and conversation storage. The SQL backends live in praxis-ai-store-backends
+# so a build without a backend carries no SQL client or crypto.
+store = ["openai-responses", "praxis-ai-store/compression"]
+store-postgres = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/postgres"]
+store-sqlite = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the
 # generated implementation OpenAPI document.
@@ -34,7 +37,7 @@ openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
 openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 # Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
 full = ["openai-all", "store-postgres"]
 praxis-main = []
@@ -46,13 +49,20 @@ workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true, optional = true }
+crc32fast = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
+metrics = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
+praxis-ai-store = { workspace = true }
+# Transitional: apis re-exports the SQL backends at crate::store::* so the
+# conversations and responses filters keep compiling. Removed once #1259b and
+# #1262 take those filters off concrete-store construction. default-features off
+# so a per-backend apis build forwards only the backend it selects.
+praxis-ai-store-backends = { path = "../store-backends", optional = true, default-features = false }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,
 # web_search, file_search, MCP callouts). bound-upstream-request-body: provider-
@@ -61,13 +71,12 @@ praxis-core = { workspace = true }
 # off-by-default experimental features in praxis 0.7.0.
 praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
-reqwest = { workspace = true, optional = true }
+regex = { workspace = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sqlx = { workspace = true, optional = true }
 sse-stream = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true, optional = true }
@@ -75,13 +84,16 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+metrics-util = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite", "postgres", "tls-native-tls"] }
 axum = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true }

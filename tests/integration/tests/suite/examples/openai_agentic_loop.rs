@@ -427,6 +427,428 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
+#[test]
+fn agentic_guardrail_blocks_mcp_result_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guarded_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guarded_1",
+            "call_id": "call_guarded_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let forbidden_second_response = serde_json::json!({
+        "id": "resp_guarded_2",
+        "object": "response",
+        "status": "completed",
+        "output": []
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, forbidden_second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"blocked","content":"blocked","rail":"indirect_prompt_injection"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        403,
+        "blocked tool result must terminate the loop: {raw}"
+    );
+    assert!(
+        parse_body(&raw).contains("indirect_prompt_injection"),
+        "the guardrail reason should reach the client: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the assigned MCP call should execute once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "a poisoned local result must never reach a second inference request"
+    );
+
+    let checks = nemo.requests();
+    assert_eq!(
+        checks.len(),
+        1,
+        "the newly produced result should be checked exactly once"
+    );
+    assert_eq!(checks[0].uri, "/v1/checks");
+    let check: serde_json::Value = serde_json::from_str(&checks[0].body).expect("NeMo request should contain JSON");
+    assert_eq!(check["guardrails"]["rail_types"], serde_json::json!(["input"]));
+    assert_eq!(check["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(check["messages"][0]["role"], "user");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("mock result for get_weather")),
+        "NeMo must receive the MCP result rather than the stale IRR request body: {check:#}"
+    );
+}
+
+#[test]
+fn layered_agentic_guardrails_each_check_the_local_mcp_result() {
+    let first_response = serde_json::json!({
+        "id": "resp_layered_guardrails_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_layered_guardrails_1",
+            "call_id": "call_layered_guardrails_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_layered_guardrails_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"safe"}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let first_nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"passed","content":"first policy passed"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let second_nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"passed","content":"second policy passed"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let loop_owner = "              # Sole continuation and terminal-response owner.";
+    assert_eq!(
+        yaml.matches(loop_owner).count(),
+        1,
+        "the example needs one loop-owner anchor"
+    );
+    let second_filter = concat!(
+        "              - filter: ai_guardrails\n",
+        "                provider:\n",
+        "                  type: nemo\n",
+        "                  endpoint: \"http://127.0.0.1:3003/v1/checks\"\n",
+        "                  guardrails:\n",
+        "                    config_ids: [\"second-policy\"]\n",
+        "                  timeout_ms: 5000\n",
+        "                  max_message_checks: 32\n",
+        "                phase:\n",
+        "                  request: false\n",
+        "                  response: false\n",
+        "                  tool_results: true\n\n",
+    );
+    let yaml = yaml.replacen(loop_owner, &format!("{second_filter}{loop_owner}"), 1);
+    let proxy_port = free_port();
+    let config = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", first_nemo.port()),
+            ("127.0.0.1:3003", second_nemo.port()),
+        ]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&config).expect("two-policy config should parse");
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "both guardrails should pass the result: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a result checked by both policies should re-enter inference"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 1);
+    for nemo in [&first_nemo, &second_nemo] {
+        let checks = nemo.requests();
+        assert_eq!(
+            checks.len(),
+            1,
+            "each configured policy must receive one tool-result check"
+        );
+        let check: serde_json::Value = serde_json::from_str(&checks[0].body).expect("NeMo request JSON");
+        assert!(
+            check["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("mock result for get_weather")),
+            "each policy must inspect the newly produced MCP result: {check:#}"
+        );
+    }
+}
+
+#[test]
+fn agentic_guardrail_provider_failure_blocks_mcp_result_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guardrail_error_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guardrail_error_1",
+            "call_id": "call_guardrail_error_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(503, "NeMo unavailable".to_owned())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "a NeMo outage must fail closed: {raw}");
+    assert!(
+        parse_body(&raw).contains("guardrail_error"),
+        "the failure code should be exposed: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the local result must be produced once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "a result that NeMo could not check must not reach another inference request"
+    );
+    assert_eq!(nemo.requests().len(), 1, "NeMo should receive one check request");
+}
+
+#[test]
+fn agentic_guardrail_modified_mcp_result_fails_closed_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guardrail_modified_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guardrail_modified_1",
+            "call_id": "call_guardrail_modified_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"modified","content":"masked tool result","rail":"pii"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "modified tool results must fail closed: {raw}");
+    assert!(
+        parse_body(&raw).contains("guardrail_error"),
+        "the failure code should be exposed: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the MCP result should be produced once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "NeMo's modified text is not yet mapped back to the canonical result, so re-entry must not occur"
+    );
+    assert_eq!(nemo.requests().len(), 1, "NeMo should receive one check request");
+}
+
+#[test]
+fn agentic_guardrail_block_ends_committed_stream_with_sse_error() {
+    let tool_call = serde_json::json!({
+        "type": "function_call",
+        "id": "fc_guardrail_stream_1",
+        "call_id": "call_guardrail_stream_1",
+        "name": "weather__get_weather",
+        "arguments": r#"{"location":"SF"}"#,
+        "status": "completed"
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_guardrail_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_guardrail_stream_1",
+                "output_index": 0,
+                "item": tool_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_guardrail_stream_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [tool_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 2
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response]);
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"blocked","content":"blocked","rail":"indirect_prompt_injection"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model_port, nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+    model_thread.join().expect("streaming model should finish");
+
+    assert_eq!(parse_status(&raw), 200, "the committed stream keeps HTTP 200: {raw}");
+    assert!(
+        body.contains("event: error"),
+        "the blocked result should end the stream with an error: {body}"
+    );
+    assert!(
+        body.contains("content_blocked"),
+        "the SSE error should carry the block code: {body}"
+    );
+    assert!(
+        !body.contains("data: [DONE]"),
+        "the terminal error must close the stream without [DONE]"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 1);
+    assert_eq!(nemo.requests().len(), 1);
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model requests lock should not be poisoned")
+            .len(),
+        1,
+        "a blocked tool result must never reach a second streamed inference"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Issue #1022: successful mcp_list_tools discovery lifecycle (buffered)
 // -----------------------------------------------------------------------------
@@ -1649,7 +2071,6 @@ fn streaming_mcp_two_tool_batch_uses_one_logical_sse_response() {
         "second inference should receive both MCP results"
     );
 }
-
 
 #[test]
 fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
@@ -7464,6 +7885,17 @@ fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_cor
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     load_loopback_mcp_config_inner(proxy_port, model_port, false)
+}
+
+fn load_agentic_guardrails_config(proxy_port: u16, model_port: u16, nemo_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read guarded agentic-loop example");
+    let yaml = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:3002", nemo_port)]),
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse guarded agentic-loop config")
 }
 
 fn load_loopback_mcp_config_inner(

@@ -23,7 +23,9 @@ from test_openai_conversations import (
     _find_binary,
     _free_port,
     _owner_assertion,
+    _proxy_env,
     _wait_for_proxy,
+    _wait_for_store_ready,
 )
 
 
@@ -79,7 +81,7 @@ def conversation_backend(request, tmp_path):
                     "output": output
                     or [
                         {
-                            "id": "msg_regression",
+                            "id": f"msg_regression_{len(captured)}",
                             "type": "message",
                             "role": "assistant",
                             "status": "completed",
@@ -112,10 +114,9 @@ def conversation_backend(request, tmp_path):
     )
     filters = [
         {"filter": "state_owner", "mode": "trusted_owner", "header": OWNER_HEADER},
-        {"filter": "openai_operation"},
+        {"filter": "ai_operation"},
         conversations,
-        {"filter": "openai_responses_format"},
-        {"filter": "openai_responses_validate"},
+        {"filter": "openai_responses_request"},
         store,
         {"filter": "openai_responses_rehydrate"},
     ]
@@ -167,14 +168,17 @@ def conversation_backend(request, tmp_path):
             }
         )
     )
+    readiness_port = _free_port()
     process = subprocess.Popen(
         [_find_binary(), "-c", str(config)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        env=_proxy_env(readiness_port),
     )
     try:
         _wait_for_proxy(port, process)
+        _wait_for_store_ready(readiness_port, process)
         with OpenAI(
             api_key="not-needed",
             base_url=f"http://127.0.0.1:{port}/v1",
@@ -238,7 +242,14 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
 
 
 @pytest.mark.parametrize(
-    "fields", [{"name": None}, {"namespace": None}, {"name": None, "namespace": None}]
+    "fields",
+    [
+        {"name": None},
+        {"namespace": None},
+        {"name": None, "namespace": None},
+        {"call_id": None},
+        {"call_id": None, "name": None, "namespace": None},
+    ],
 )
 def test_nullable_function_output_fields(conversation_backend, fields):
     client, _, _, _ = conversation_backend
@@ -256,7 +267,7 @@ def test_nullable_function_output_fields(conversation_backend, fields):
     )
     item = created.data[0]
     assert item.type == "function_call_output"
-    assert item.call_id == "call_nullable"
+    assert item.call_id == fields.get("call_id", "call_nullable")
     assert item.output == "done"
     retrieved = client.conversations.items.retrieve(
         item.id, conversation_id=conversation.id
@@ -265,6 +276,7 @@ def test_nullable_function_output_fields(conversation_backend, fields):
     for value in [item, retrieved, listed]:
         wire = value.model_dump(exclude_unset=True)
         for field in fields:
+            assert field not in value.model_fields_set
             assert field not in wire
 
 
@@ -283,7 +295,7 @@ def test_structured_mcp_failure_append_back(conversation_backend):
             "status": "failed",
             "error": {
                 "type": "mcp_tool_execution_error",
-                "message": "controlled tool failure",
+                "content": "controlled tool failure",
             },
         }
     )

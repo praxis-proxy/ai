@@ -27,10 +27,10 @@ use serde::Deserialize;
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
 /// static header-value matchers, per-rule algorithm choice, configurable
-/// estimation strategies (M3, see [`EstimationConfig`]), and M4
-/// token-type weights (`default_weights` / per-rule `weights`). CEL
-/// matchers and soft-limit tiers are still out of scope (see the module
-/// doc comment) -- upstream itself defers those.
+/// estimation strategies (M3, see [`EstimationConfig`]), M4
+/// token-type weights (`default_weights` / per-rule `weights`), graduated
+/// soft-limit tiers (S1), and per-rule soft over-quota enforcement
+/// (`ai#1241`). CEL matchers remain deferred (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -44,9 +44,14 @@ use serde::Deserialize;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
-/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before
-///   a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
+///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
+///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
 ///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///
+/// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
+/// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
+/// also use `budget_exhausted`. Admitted reservations use `reserved`.
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
@@ -76,21 +81,51 @@ use serde::Deserialize;
 /// Every previous `praxis_ai_token_rate_limit_*` name has moved to this
 /// prefix; no compatibility aliases are emitted.
 ///
-/// `budget_remaining` is the sum of the latest calculated remaining
-/// balances for the rule's retained keys, and `active_keys` is how many
-/// balances contribute. Window aging and refill are evaluated lazily during
-/// normal backend operations, so both are snapshots rather than
-/// continuously refreshed values. Like all Prometheus gauges they are f64
-/// and saturate at the largest exactly representable integer (2^53 - 1).
+/// `budget_remaining` is the remaining budget for the key of the most recent
+/// admission decision on this replica (admitted or denied), and
+/// `active_keys` is how many keys the backend currently retains. Both are
+/// snapshots taken as decisions happen, not continuously refreshed values.
+/// Like all Prometheus gauges they are f64 and saturate at the largest
+/// exactly representable integer (2^53 - 1).
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend every replica exports the rule-wide value it
-/// last observed from the shared store, so aggregate replicas with `max`;
-/// a replica that stops seeing traffic for a rule keeps exporting its last
-/// observation until it does. Valkey applies expiry incrementally on each
-/// admission, so its counts can briefly include entries that have just
-/// expired.
+/// With the `valkey` backend, `reservations_active` is scoped to the
+/// namespace and algorithm, so summing it over rules double-counts;
+/// aggregate with `max` across replicas and rules. `active_keys` is scoped
+/// per rule, so aggregate with `max` across replicas for each rule.
+/// Each replica exports the value it last observed from the shared store.
+/// `budget_remaining` stays per replica and per
+/// last decision on either backend: it describes whichever key that
+/// replica decided last, so `max` or `sum` across replicas says little
+/// beyond "some key had this much left". A replica that stops seeing
+/// traffic for a rule keeps exporting its last observation until it does.
+///
+/// The `valkey` backend requires Valkey or Redis 7.0+ (`PEXPIRE NX`/`GT`
+/// is used). The `valkey` backend keeps
+/// sliding-window usage in 60 fixed sub-windows per window (one per
+/// second for windows under a minute); usage leaves the window up to one
+/// sub-window late, never early. Changing a window's length changes its
+/// sub-window width and so starts that window's usage from zero. On the
+/// sliding window, concurrent admissions on one key are not serialised,
+/// so they can overshoot the budget by their combined estimates for one
+/// round trip. Usage written is never lost.
+///
+/// The `valkey` token bucket, by contrast, serialises admissions per key
+/// through an optimistic transaction: one key admits at most about one
+/// request per two Valkey round trips across the whole fleet, and
+/// contention shows up first as added latency, up to the 500 ms Valkey
+/// timeout, then as 503s. Use a non-`global` `key` for high-throughput
+/// token-bucket rules so the load spreads over many buckets.
+///
+/// During a rolling upgrade from the earlier scripted `valkey` backend,
+/// replicas on the old and new versions keep separate state, so for one
+/// window (and until old token buckets have drained) combined admissions
+/// can reach about twice the budget. All `valkey` timestamps come from
+/// the proxy replicas' clocks, not Valkey's: skew between replicas can
+/// under-count usage at window edges by up to the skew, and a replica
+/// whose clock runs fast trims other replicas' live reservations and keys
+/// from the caps early.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`
@@ -112,10 +147,38 @@ pub(super) struct TokenRateLimitConfig {
     /// a catch-all budget instead.
     pub rules: Vec<RuleConfig>,
 
-    /// Trusted request identity used to partition each rule's budget.
-    /// The default preserves the historical single global bucket.
+    /// How this filter partitions each matched rule's token budget.
+    ///
+    /// Accepts a scalar (`global`, `authenticated_subject`, `ip`,
+    /// `model`), a list of dimensions (composite keys), a single
+    /// dimension mapping (`header: x-tenant-id`), or a full spec with
+    /// `dimensions` and `missing`. Defaults to one shared global bucket.
+    ///
+    /// Composite dimension *order does not matter*: compiled dimensions
+    /// are sorted into a canonical order so reordering a list cannot
+    /// silently reset live budgets.
+    ///
+    /// `ip` and `model` are as caller-controlled as `header` when they
+    /// come from a forwarding header or a client-supplied model string.
+    /// Pair them with `max_keys` so one client cannot fill the table.
     #[serde(default)]
-    pub key: KeySource,
+    pub key: KeySpec,
+
+    /// Soft cap on distinct budget keys retained at once, **per rule**.
+    ///
+    /// Bounds cardinality from per-header, per-IP, and composite
+    /// keying. Defaults to [`super::MAX_KEYS`]. A new distinct key past
+    /// this cap is denied (429, accounting outcome `key_capacity`)
+    /// rather than growing without bound.
+    ///
+    /// In-process ledgers enforce the cap per rule. Valkey enforces it
+    /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
+    /// or the token-bucket equivalent).
+    /// Idle in-process keys are reaped by ledger cleanup, which walks a
+    /// bounded number of entries per request (including busy ones) so a
+    /// single in-window key cannot pin the table at this cap.
+    #[serde(default = "default_max_keys")]
+    pub max_keys: usize,
 
     /// Where every rule's admission state lives: in-process (default,
     /// one budget per gateway instance) or a shared Valkey backend (one
@@ -137,16 +200,474 @@ pub(super) struct TokenRateLimitConfig {
     pub default_weights: super::weights::TokenTypeWeightsConfig,
 }
 
-/// Trusted source used to partition a rule's token budget.
+/// Serde default for [`TokenRateLimitConfig::max_keys`].
+fn default_max_keys() -> usize {
+    super::MAX_KEYS
+}
+
+/// Policy applied when a key dimension cannot be resolved from the request.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum KeySource {
-    /// Every request matching a rule shares that rule's budget.
+pub(super) enum MissingKeyPolicy {
+    /// Fail closed: reject the request before provider contact.
     #[default]
-    Global,
+    Reject,
+    /// Drop the unresolved dimension. If nothing remains, use the global
+    /// bucket (`__fallback__`) -- the #129 "header absent" behaviour.
+    Fallback,
+}
 
-    /// Partition the rule by Praxis's verified request subject.
+/// One dimension of a token-budget key (proposal M5 / ai#123).
+///
+/// Composite keys are an ordered list of these. A lone `Global` dimension
+/// preserves the historical single-bucket-per-rule behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeyDimension {
+    /// Shared bucket for every request matching the rule.
+    Global,
+    /// Verified [`praxis_filter::AuthenticatedIdentity`] subject.
     AuthenticatedSubject,
+    /// Downstream TCP peer address, or an optional forwarding header.
+    ///
+    /// When `header` is set, the right-most hop after `trusted_hops`
+    /// trusted proxies is used (appending LBs put client-controlled
+    /// values on the left). A missing header falls back to the TCP peer
+    /// so health checks and in-cluster clients are not `missing_ip`.
+    /// A present but unusable header is fail-closed.
+    ///
+    /// The selected address is hashed, so distinct IPs (or models, via
+    /// [`Self::Model`]) can fill `max_keys` the same way a caller-controlled
+    /// header can. Pair high-cardinality dimensions with a tighter cap.
+    Ip {
+        /// Forwarding header (e.g. `x-forwarded-for`). Blank names are
+        /// rejected at compile time.
+        header: Option<String>,
+        /// Trusted proxy hops to skip from the right of the header.
+        /// `0` (default) selects the right-most hop.
+        trusted_hops: u32,
+        /// Optional IPv6 prefix length (1–128). When set, IPv6 addresses
+        /// are masked to this prefix before hashing so a client holding
+        /// a `/64` cannot rotate host bits for a fresh budget. IPv4 is
+        /// unchanged. Unset keeps the historical `/128` (full address).
+        ipv6_prefix: Option<u8>,
+    },
+    /// Model identity from `header` (default `x-model`), then the JSON
+    /// body `model` field when the request is already buffered for
+    /// estimation. Preferring the header keeps `key: model` from forcing
+    /// `StreamBuffer` on every request.
+    ///
+    /// Model strings are caller-controlled; bound cardinality with
+    /// `max_keys`.
+    Model {
+        /// Header consulted before the body `model` field.
+        header: Option<String>,
+    },
+    /// Arbitrary request header value. As trusted as whoever set the
+    /// header -- pair with an upstream auth filter, do not key on a
+    /// caller-controlled identity header.
+    Header {
+        /// Header name (case-insensitive HTTP name).
+        name: String,
+        /// Overrides the spec-level [`KeySpec::missing`] for this header.
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// Filter-level budget key configuration.
+///
+/// YAML shapes (all equivalent for a single subject key):
+///
+/// ```yaml
+/// key: authenticated_subject
+/// key:
+///   - authenticated_subject
+/// key:
+///   missing: reject
+///   dimensions:
+///     - type: authenticated_subject
+/// ```
+///
+/// Other dimension shapes:
+///
+/// ```yaml
+/// key: ip
+/// key:
+///   ip:
+///     header: x-forwarded-for
+///     trusted_hops: 1          # skip the last appending proxy
+///     ipv6_prefix: 64          # optional; IPv4 unchanged
+/// key:
+///   model:
+///     header: x-model          # omit to keep the default
+/// key:
+///   header: x-tenant-id
+///   missing: fallback
+/// key:
+///   - type: header
+///     name: x-api-key
+///     missing: reject
+/// ```
+///
+/// Composite example (subject + model + tenant header). List order is
+/// canonicalized at compile time; reordering does not reset budgets:
+///
+/// ```yaml
+/// key:
+///   - authenticated_subject
+///   - model
+///   - header: x-tenant-id
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeySpec {
+    /// Ordered dimensions joined into one opaque backend key.
+    pub dimensions: Vec<KeyDimension>,
+    /// Default missing-dimension policy. Per-header `missing:` overrides
+    /// this for that header only.
+    pub missing: MissingKeyPolicy,
+}
+
+impl Default for KeySpec {
+    fn default() -> Self {
+        Self {
+            dimensions: vec![KeyDimension::Global],
+            missing: MissingKeyPolicy::Reject,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeySpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = KeySpecDe::deserialize(deserializer)?;
+        Ok(wire.into_spec())
+    }
+}
+
+/// Wire form for [`KeySpec`]: scalar, list, single dimension map, or full spec.
+///
+/// Mapping variants that carry a sibling `missing:` are listed *before*
+/// [`KeySpecDe::Dimension`] so `{ header: x-tenant-id, missing: fallback }`
+/// is not swallowed by a header-only shortcut that would ignore `missing`.
+/// Each of those mappings uses `deny_unknown_fields` so
+/// `{ type: ip, header: x-forwarded-for }` still falls through to the
+/// tagged dimension parser instead of being misread as a header key.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeySpecDe {
+    /// `key: authenticated_subject`
+    Scalar(NamedDimension),
+    /// `key: [authenticated_subject, model]`
+    List(Vec<KeyDimensionDe>),
+    /// `key: { missing, dimensions }`
+    Spec(KeySpecMapping),
+    /// `key: { header: x-tenant-id }` or `{ header: x-tenant-id, missing: fallback }`
+    HeaderKey(HeaderKeyMapping),
+    /// `key: { model: {} }` or `{ model: { header: x-model }, missing: fallback }`
+    ModelKey(ModelKeyMapping),
+    /// `key: { ip: {} }` or `{ ip: { header: x-forwarded-for }, missing: fallback }`
+    IpKey(IpKeyMapping),
+    /// `key: { header: x-tenant-id }` (no sibling fields) or `{ type: ip, header: ... }`
+    Dimension(KeyDimensionDe),
+}
+
+/// Single-header spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderKeyMapping {
+    /// Header name or name+missing spec.
+    header: HeaderRef,
+    /// Spec-level missing policy (per-header `missing` still wins).
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-model spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelKeyMapping {
+    /// Optional model header override.
+    model: ModelRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-IP spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpKeyMapping {
+    /// Optional forwarding-header override.
+    ip: IpRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Mapping form of [`KeySpec`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeySpecMapping {
+    /// Dimension list; empty is rejected at compile time.
+    #[serde(default)]
+    dimensions: Vec<KeyDimensionDe>,
+    /// Default missing-dimension policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+impl KeySpecDe {
+    /// Convert the wire form into a [`KeySpec`].
+    fn into_spec(self) -> KeySpec {
+        match self {
+            Self::Scalar(name) => named_spec(name),
+            Self::List(items) => KeySpec {
+                dimensions: decode_dimensions(items),
+                missing: MissingKeyPolicy::Reject,
+            },
+            Self::Spec(spec) => KeySpec {
+                dimensions: decode_dimensions(spec.dimensions),
+                missing: spec.missing,
+            },
+            Self::HeaderKey(map) => KeySpec {
+                dimensions: vec![header_dimension(map.header)],
+                missing: map.missing,
+            },
+            Self::ModelKey(map) => KeySpec {
+                dimensions: vec![KeyDimension::Model {
+                    header: map.model.header,
+                }],
+                missing: map.missing,
+            },
+            Self::IpKey(map) => KeySpec {
+                dimensions: vec![ip_dimension(map.ip)],
+                missing: map.missing,
+            },
+            Self::Dimension(item) => KeySpec {
+                dimensions: vec![item.into_dimension()],
+                missing: MissingKeyPolicy::Reject,
+            },
+        }
+    }
+}
+
+/// Closed set of scalar dimension names. Enumerated so unknown strings
+/// fail at parse time (see `docs/developing/type-design.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NamedDimension {
+    /// Shared bucket for every matching request.
+    Global,
+    /// Verified authenticated subject.
+    AuthenticatedSubject,
+    /// Client IP (peer address; no forwarding header).
+    Ip,
+    /// Model identity from the default `x-model` header, then the body.
+    Model,
+}
+
+impl NamedDimension {
+    /// Convert a scalar name into its dimension (no header overrides).
+    fn into_dimension(self) -> KeyDimension {
+        match self {
+            Self::Global => KeyDimension::Global,
+            Self::AuthenticatedSubject => KeyDimension::AuthenticatedSubject,
+            Self::Ip => ip_dimension(IpRef::default()),
+            Self::Model => KeyDimension::Model { header: None },
+        }
+    }
+}
+
+/// One-dimension spec from a scalar name.
+fn named_spec(name: NamedDimension) -> KeySpec {
+    KeySpec {
+        dimensions: vec![name.into_dimension()],
+        missing: MissingKeyPolicy::Reject,
+    }
+}
+
+/// Decode a list of wire dimensions.
+fn decode_dimensions(items: Vec<KeyDimensionDe>) -> Vec<KeyDimension> {
+    items.into_iter().map(KeyDimensionDe::into_dimension).collect()
+}
+
+/// Wire form for one [`KeyDimension`].
+///
+/// Struct variants use `deny_unknown_fields` so a list item like
+/// `{ ip: {}, header: x-forwarded-for }` cannot silently parse as a
+/// header dimension, and `{ header: x-tenant-id, missing: fallback }`
+/// cannot drop `missing`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyDimensionDe {
+    /// Scalar name (`global`, `authenticated_subject`, `ip`, `model`).
+    Name(NamedDimension),
+    /// Internally tagged `{ type: ..., ... }`.
+    Tagged(TaggedDimension),
+    /// `{ header: x-tenant-id }` or `{ header: x-tenant-id, missing: fallback }`.
+    HeaderShortcut(HeaderShortcutMapping),
+    /// `{ model: {} }` or `{ model: { header } }`.
+    ModelShortcut(ModelShortcutMapping),
+    /// `{ ip: {} }` or `{ ip: { header, trusted_hops, ipv6_prefix } }`.
+    IpShortcut(IpShortcutMapping),
+}
+
+/// List-item `{ header: NAME, missing?: ... }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderShortcutMapping {
+    /// Header name or name+missing spec.
+    header: HeaderRef,
+    /// Optional per-header missing policy (sibling of `header:`).
+    #[serde(default)]
+    missing: Option<MissingKeyPolicy>,
+}
+
+/// List-item `{ model: { header?: ... } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelShortcutMapping {
+    /// Optional model header override.
+    model: ModelRef,
+}
+
+/// List-item `{ ip: { header?, trusted_hops?, ipv6_prefix? } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpShortcutMapping {
+    /// Optional forwarding-header override.
+    ip: IpRef,
+}
+
+/// Header shortcut value: a name, or a name plus missing policy.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderRef {
+    /// `header: x-tenant-id`
+    Name(String),
+    /// `header: { name: x-tenant-id, missing: fallback }`
+    Spec {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// `{ model: {} }` or `{ model: { header: x-model } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRef {
+    /// Header consulted when the body has no `model` field.
+    #[serde(default)]
+    header: Option<String>,
+}
+
+/// `{ ip: {} }` or `{ ip: { header: x-forwarded-for, trusted_hops: 1 } }`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpRef {
+    /// Forwarding header, when set.
+    #[serde(default)]
+    header: Option<String>,
+    /// Trusted hops skipped from the right. Default `0` (right-most).
+    #[serde(default)]
+    trusted_hops: u32,
+    /// Optional IPv6 prefix mask applied before hashing.
+    #[serde(default)]
+    ipv6_prefix: Option<u8>,
+}
+
+/// Internally tagged dimension (`type: ...`).
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TaggedDimension {
+    /// Shared bucket for every matching request.
+    Global,
+    /// Verified authenticated subject.
+    AuthenticatedSubject,
+    /// Client IP.
+    Ip {
+        /// Optional forwarding header.
+        #[serde(default)]
+        header: Option<String>,
+        /// Trusted hops skipped from the right.
+        #[serde(default)]
+        trusted_hops: u32,
+        /// Optional IPv6 prefix mask.
+        #[serde(default)]
+        ipv6_prefix: Option<u8>,
+    },
+    /// Model identity.
+    Model {
+        /// Optional model header override.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    /// Named request header.
+    Header {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+impl KeyDimensionDe {
+    /// Convert the wire form into a [`KeyDimension`].
+    fn into_dimension(self) -> KeyDimension {
+        match self {
+            Self::Name(name) => name.into_dimension(),
+            Self::HeaderShortcut(HeaderShortcutMapping { header, missing }) => {
+                header_dimension_with_missing(header, missing)
+            },
+            Self::ModelShortcut(ModelShortcutMapping { model }) => KeyDimension::Model { header: model.header },
+            Self::IpShortcut(IpShortcutMapping { ip }) => ip_dimension(ip),
+            Self::Tagged(tagged) => match tagged {
+                TaggedDimension::Global => KeyDimension::Global,
+                TaggedDimension::AuthenticatedSubject => KeyDimension::AuthenticatedSubject,
+                TaggedDimension::Ip {
+                    header,
+                    trusted_hops,
+                    ipv6_prefix,
+                } => ip_dimension(IpRef {
+                    header,
+                    trusted_hops,
+                    ipv6_prefix,
+                }),
+                TaggedDimension::Model { header } => KeyDimension::Model { header },
+                TaggedDimension::Header { name, missing } => KeyDimension::Header { name, missing },
+            },
+        }
+    }
+}
+
+/// Convert a header shortcut into a [`KeyDimension`].
+fn header_dimension(header: HeaderRef) -> KeyDimension {
+    header_dimension_with_missing(header, None)
+}
+
+/// Convert a header shortcut, applying an optional sibling `missing:`.
+fn header_dimension_with_missing(header: HeaderRef, sibling_missing: Option<MissingKeyPolicy>) -> KeyDimension {
+    match header {
+        HeaderRef::Name(name) => KeyDimension::Header {
+            name,
+            missing: sibling_missing,
+        },
+        HeaderRef::Spec { name, missing } => KeyDimension::Header {
+            name,
+            missing: missing.or(sibling_missing),
+        },
+    }
+}
+
+/// Convert an IP mapping into a [`KeyDimension`].
+fn ip_dimension(ip: IpRef) -> KeyDimension {
+    KeyDimension::Ip {
+        header: ip.header,
+        trusted_hops: ip.trusted_hops,
+        ipv6_prefix: ip.ipv6_prefix,
+    }
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -247,6 +768,66 @@ pub(super) struct RuleConfig {
     /// the algorithm's `capacity`.
     #[serde(default)]
     pub tiers: Option<Vec<TierConfig>>,
+
+    /// What happens when the algorithm denies a reservation because the
+    /// token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`]
+    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation.
+    #[serde(default)]
+    pub enforcement: EnforcementMode,
+
+    /// Request-header annotation applied when [`enforcement`](Self::enforcement)
+    /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
+    /// for budget exhaustion. Required for `soft` (at least one static header
+    /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
+    #[serde(default)]
+    pub over_quota: Option<OverQuotaConfig>,
+}
+
+/// Per-rule action when the admission algorithm denies a reservation.
+///
+/// Distinct from graduated S1 `tiers` (which annotate admitted traffic
+/// below capacity): this chooses hard 429 vs soft annotate when the
+/// request is *over* the algorithm's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EnforcementMode {
+    /// Reject with 429 and token-denominated rate-limit response headers.
+    #[default]
+    Hard,
+    /// Forward the request and annotate it for downstream handling (`ai#1241`).
+    Soft,
+}
+
+/// Annotation surface for soft over-quota forwarding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OverQuotaConfig {
+    /// Static headers set on the upstream request when over quota.
+    /// Required to be non-empty unless `include_remaining` or
+    /// `include_used` is true.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// When true, also set the remaining-quota header from the backend
+    /// snapshot at denial time (tokens still available in the window /
+    /// bucket — often `0` when the estimate no longer fits).
+    #[serde(default)]
+    pub include_remaining: bool,
+
+    /// When true, also set a used-quota header as `limit - remaining`
+    /// from the same denial-time backend snapshot.
+    #[serde(default)]
+    pub include_used: bool,
+
+    /// Header name for remaining tokens when `include_remaining` is true.
+    /// Defaults to `X-RateLimit-Remaining-Tokens`.
+    #[serde(default)]
+    pub remaining_header: Option<String>,
+
+    /// Header name for used tokens when `include_used` is true.
+    /// Defaults to `X-Token-Quota-Used`.
+    #[serde(default)]
+    pub used_header: Option<String>,
 }
 
 /// One graduated enforcement tier (proposal S1).
@@ -429,6 +1010,7 @@ pub(super) struct EstimationConfig {
     clippy::panic,
     clippy::indexing_slicing,
     clippy::match_wildcard_for_single_variants,
+    clippy::too_many_lines,
     reason = "tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
@@ -436,6 +1018,22 @@ mod tests {
 
     fn parse(yaml: &str) -> Result<TokenRateLimitConfig, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
+    }
+
+    /// One catch-all sliding-window rule, so tests can focus on `key:`.
+    fn key_yaml(key: &str) -> String {
+        format!(
+            "{key}\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n"
+        )
+    }
+
+    fn ip_dim(header: Option<&str>) -> KeyDimension {
+        KeyDimension::Ip {
+            header: header.map(str::to_owned),
+            trusted_hops: 0,
+            ipv6_prefix: None,
+        }
     }
 
     #[test]
@@ -454,17 +1052,110 @@ mod tests {
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
         assert_eq!(rule.reserved_tokens, Some(50));
-        assert_eq!(cfg.key, KeySource::Global);
+        assert_eq!(cfg.key, KeySpec::default());
     }
 
     #[test]
     fn parses_authenticated_subject_key_source() {
-        let cfg = parse(
-            "key: authenticated_subject\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
-        )
-        .unwrap();
+        let cfg = parse(&key_yaml("key: authenticated_subject")).unwrap();
+        assert_eq!(cfg.key.dimensions, vec![KeyDimension::AuthenticatedSubject]);
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
+    }
 
-        assert_eq!(cfg.key, KeySource::AuthenticatedSubject);
+    #[test]
+    fn parses_a_composite_subject_model_and_header_list() {
+        let cfg = parse(&key_yaml(
+            "key:\n  - authenticated_subject\n  - model\n  - header: x-tenant-id",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::AuthenticatedSubject,
+                KeyDimension::Model { header: None },
+                KeyDimension::Header {
+                    name: "x-tenant-id".into(),
+                    missing: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_dimensions_with_per_header_missing_override() {
+        let cfg = parse(&key_yaml(
+            "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key\n      missing: reject\n    - type: ip\n      header: x-forwarded-for",
+        ))
+        .unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::Header {
+                    name: "x-api-key".into(),
+                    missing: Some(MissingKeyPolicy::Reject),
+                },
+                ip_dim(Some("x-forwarded-for")),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_header_mapping_with_spec_level_missing_fallback() {
+        let cfg = parse(&key_yaml("key:\n  header: x-tenant-id\n  missing: fallback")).unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Header {
+                name: "x-tenant-id".into(),
+                missing: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_ip_with_forwarding_header() {
+        let cfg = parse(&key_yaml("key:\n  type: ip\n  header: x-forwarded-for")).unwrap();
+        assert_eq!(cfg.key.dimensions, vec![ip_dim(Some("x-forwarded-for"))]);
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
+    }
+
+    #[test]
+    fn list_item_header_honours_sibling_missing() {
+        let cfg = parse(&key_yaml("key:\n  - header: x-tenant-id\n    missing: fallback")).unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Header {
+                name: "x-tenant-id".into(),
+                missing: Some(MissingKeyPolicy::Fallback),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_shortcut_list_item_with_extra_keys() {
+        let err = parse(&key_yaml("key:\n  - ip: {}\n    header: x-forwarded-for")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("did not match"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_ip_trusted_hops_and_ipv6_prefix() {
+        let cfg = parse(&key_yaml(
+            "key:\n  ip:\n    header: x-forwarded-for\n    trusted_hops: 1\n    ipv6_prefix: 64",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Ip {
+                header: Some("x-forwarded-for".into()),
+                trusted_hops: 1,
+                ipv6_prefix: Some(64),
+            }]
+        );
     }
 
     #[test]

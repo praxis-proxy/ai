@@ -36,7 +36,10 @@ use crate::{
         openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
-    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},
+    store::{
+        PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore,
+    },
     test_utils::{make_filter_context, make_owned_filter_context, make_request},
 };
 
@@ -1985,7 +1988,7 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.set_metadata("responses.response_id", "resp_deferred_listing_failure");
 
     let body_json = json!({
@@ -2384,7 +2387,7 @@ async fn seed_weather_approval_for_owner(
 }
 
 /// A fresh in-memory SQLite store for the approval-consumption path.
-async fn make_approval_store() -> Arc<dyn ResponseStore> {
+async fn make_approval_store() -> Arc<dyn PersistedStateBackend> {
     Arc::new(
         SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None, None)
             .await
@@ -2393,7 +2396,7 @@ async fn make_approval_store() -> Arc<dyn ResponseStore> {
 }
 
 /// Insert a registry exposing `store` under the default name into `ctx`.
-fn register_store(ctx: &mut praxis_filter::HttpFilterContext<'_>, store: Arc<dyn ResponseStore>) {
+fn register_store(ctx: &mut praxis_filter::HttpFilterContext<'_>, store: Arc<dyn PersistedStateBackend>) {
     let registry = ResponseStoreRegistry::new();
     registry
         .register(&Arc::from("default"), store)
@@ -2543,6 +2546,16 @@ async fn resume_approval_deny_resumes_without_tool_call() {
         .iter()
         .find(|m| m["type"] == "function_call_output")
         .expect("denial should append a function_call_output");
+    let denial_index = state
+        .messages
+        .iter()
+        .position(|m| m["type"] == "function_call_output")
+        .expect("denial should append a function_call_output");
+    assert_eq!(
+        state.pending_local_tool_guardrail_start,
+        Some(denial_index),
+        "the denied approval result should be marked for guardrail evaluation"
+    );
     assert_eq!(denial["call_id"], "call_1", "denial correlates to the original call id");
     let output = denial["output"].as_str().unwrap();
     assert!(

@@ -327,11 +327,6 @@ pub(crate) fn build_config(cfg: A2aConfig) -> Result<A2aConfig, FilterError> {
     Ok(cfg)
 }
 
-/// Validate an A2A body-derived promotion header.
-fn validate_a2a_promotion_header(field: &str, name: Option<&str>, dedicated: &str) -> Result<(), FilterError> {
-    praxis_ai_apis::promotion::validate_dedicated_promotion_header("a2a", field, name, &[dedicated])
-}
-
 /// Validate dedicated names and reject collisions across A2A header fields.
 fn validate_a2a_headers(headers: &A2aHeaders) -> Result<(), FilterError> {
     for (field, name, dedicated) in [
@@ -343,7 +338,7 @@ fn validate_a2a_headers(headers: &A2aHeaders) -> Result<(), FilterError> {
         ("streaming", headers.streaming.as_deref(), "x-praxis-a2a-streaming"),
         ("version", headers.version.as_deref(), "x-praxis-a2a-version"),
     ] {
-        validate_a2a_promotion_header(field, name, dedicated)?;
+        praxis_ai_apis::promotion::validate_dedicated_promotion_header("a2a", field, name, &[dedicated])?;
     }
     praxis_ai_apis::promotion::reject_duplicate_promotion_fields(
         "a2a",

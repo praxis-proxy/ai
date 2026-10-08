@@ -69,6 +69,7 @@ def error_proxy_ports():
     slow_port = free_port()
     refused_port = free_port()
     timeout_port = free_port()
+    classifier_only_port = free_port()
 
     slow_server = HTTPServer(("127.0.0.1", slow_port), SlowHandler)
     server_thread = threading.Thread(target=slow_server.serve_forever, daemon=True)
@@ -82,11 +83,16 @@ listeners:
   - name: timeout_listener
     address: "127.0.0.1:{timeout_port}"
     filter_chains: [classify_timeout]
+  - name: classifier_only_listener
+    address: "127.0.0.1:{classifier_only_port}"
+    filter_chains: [classify_from_head]
 
 filter_chains:
   - name: classify_refused
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: anthropic_messages_format
         on_invalid: continue
@@ -102,7 +108,9 @@ filter_chains:
 
   - name: classify_timeout
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: anthropic_messages_format
         on_invalid: continue
@@ -116,6 +124,21 @@ filter_chains:
             read_timeout_ms: 200
             endpoints:
               - "127.0.0.1:{slow_port}"
+
+  # No body-format filter at all. Error formatting has to come from the
+  # operation classifier, which resolves the protocol from the request head.
+  - name: classify_from_head
+    filters:
+      - filter: ai_operation
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: dead_upstream
+      - filter: load_balancer
+        clusters:
+          - name: dead_upstream
+            endpoints:
+              - "127.0.0.1:{dead_port}"
 
 insecure_options:
   allow_private_endpoints: true
@@ -134,7 +157,12 @@ insecure_options:
     try:
         wait_for_proxy(refused_port)
         wait_for_proxy(timeout_port)
-        yield {"refused_port": refused_port, "timeout_port": timeout_port}
+        wait_for_proxy(classifier_only_port)
+        yield {
+            "refused_port": refused_port,
+            "timeout_port": timeout_port,
+            "classifier_only_port": classifier_only_port,
+        }
     finally:
         proc.send_signal(signal.SIGINT)
         try:

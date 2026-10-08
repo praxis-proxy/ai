@@ -10,8 +10,8 @@
 # round (#1046).
 #
 # Request order (forward):
-#   1. openai_responses_format classifies the client request.
-#   2. openai_responses_validate creates canonical ResponsesState.
+#   1. openai_responses_request (facts) classifies the client request.
+#   2. openai_responses_request creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
 #   4. openai_file_search_callout dispatches the owner's pending hosted
 #      search assignments at request-body EOS on IRR re-entry.
@@ -40,14 +40,24 @@ listeners:
 filter_chains:
   - name: responses-file-search-chat
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: iterative_request_router
         initial_step: inference
@@ -66,12 +76,12 @@ filter_chains:
               # the response body and never decides whether another round runs.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:8001
-                # Every vector-store sub-request runs through this chain. It
-                # must be inline ({ name, filters }): this filter runs inside an
-                # iterative_request_router step, whose pipeline is built with an
-                # empty named-chain map, so a top-level filter_chains reference
-                # cannot resolve here. The destination comes from
-                # vector_store_url, so the chain never selects an upstream.
+                # Every vector-store sub-request runs through this chain. It may
+                # be inline ({ name, filters }) or a named top-level
+                # filter_chains reference; the chain-aware production builder
+                # resolves both forms inside iterative_request_router steps. The
+                # destination comes from vector_store_url, so the chain never
+                # selects an upstream.
                 outbound_chain:
                   name: vector-store-outbound
                   filters:

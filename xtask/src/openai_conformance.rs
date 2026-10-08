@@ -56,9 +56,6 @@ use spec::{load_reference_source, project_reference};
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Default local source for OpenAI's published `OpenAPI` spec.
-const DEFAULT_OPENAI_SPEC: &str = OPENAI_REFERENCE_SPEC;
-
 /// HTTP method keys that may appear under an `OpenAPI` path item.
 const HTTP_METHODS: &[&str] = &["delete", "get", "head", "options", "patch", "post", "put", "trace"];
 
@@ -70,10 +67,6 @@ const HTTP_METHODS: &[&str] = &["delete", "get", "head", "options", "patch", "po
 #[expect(clippy::struct_excessive_bools, reason = "independent CLI flags")]
 #[derive(Parser)]
 pub(crate) struct Args {
-    /// Local OpenAI `OpenAPI` spec path.
-    #[arg(long, default_value = DEFAULT_OPENAI_SPEC)]
-    openai_spec: String,
-
     /// Select one registered area. Repeat for multiple areas; defaults to all.
     #[arg(long = "area", value_name = "AREA")]
     areas: Vec<String>,
@@ -209,13 +202,10 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
     let mut operations = Vec::new();
     let mut supported_operations = Vec::new();
     let mut reference_projections = BTreeMap::new();
-    let reference_override = reference_spec_override(args);
-    let reference_spec = reference_override.unwrap_or(OPENAI_REFERENCE_SPEC);
-    let manifest = reference_override.is_none().then_some(OPENAI_REFERENCE_MANIFEST);
-    let reference = load_reference_source(reference_spec, manifest)?;
-    if reference_override.is_none() && areas.iter().any(|area| area.scope.id == "conversations") {
-        let source =
-            std::fs::read(reference_spec).map_err(|error| format!("failed to read {reference_spec}: {error}"))?;
+    let reference = load_reference_source(OPENAI_REFERENCE_SPEC, Some(OPENAI_REFERENCE_MANIFEST))?;
+    if areas.iter().any(|area| area.scope.id == "conversations") {
+        let source = std::fs::read(OPENAI_REFERENCE_SPEC)
+            .map_err(|error| format!("failed to read {OPENAI_REFERENCE_SPEC}: {error}"))?;
         let generated = generate_item_contracts(&source)?;
         verify_item_contracts(std::path::Path::new(ITEM_CONTRACTS_ARTIFACT), &generated)?;
     }
@@ -345,14 +335,5 @@ fn parse_percent(value: &str) -> Result<f64, String> {
         Ok(percent)
     } else {
         Err("percentage must be a finite value between 0 and 100".to_owned())
-    }
-}
-
-/// Return the explicit reference override, if the CLI provided one.
-fn reference_spec_override(args: &Args) -> Option<&str> {
-    if args.openai_spec == DEFAULT_OPENAI_SPEC {
-        None
-    } else {
-        Some(&args.openai_spec)
     }
 }

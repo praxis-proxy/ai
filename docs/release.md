@@ -28,6 +28,8 @@ Before tagging a release:
 - [ ] `Cargo.lock` is regenerated with the new version
 - [ ] `.github/SECURITY.md` lists the new minor version
 - [ ] Pull request labels produce useful generated release notes
+- [ ] If native GPU qualification is desired, dispatch the existing vLLM
+      workflow on the final release commit/tag and inspect its report
 
 ## Tagging a Release
 
@@ -88,6 +90,12 @@ workflow creates each release with generated notes. Review pull request
 labels before tagging so entries fall into the categories configured in
 `.github/release.yml`. There is no separate `CHANGELOG.md` file.
 
+Every release includes an exact-commit native vLLM qualification section and
+an attached `qualification.json` status report. Missing or unverifiable GPU
+evidence is stated as unavailable; it does not block the release. See
+[native vLLM qualification](developing/vllm-qualification.md) for the report
+schema, selection policy, and final-tag dispatch procedure.
+
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 
 ## Release Branches
@@ -110,7 +118,12 @@ The production image is a minimal Alpine container:
 - Exposes ports `8080` (proxy) and `9901` (admin)
 - Built-in health check at
   `http://127.0.0.1:9901/healthy`
-- Config directory and working directory: `/etc/praxis`
+- Config directory and working directory: `/etc/praxis` (root-owned; mount the
+  configuration read-only)
+- Writable state directory: `/var/lib/praxis`, owned by the `praxis` user, for
+  backends that keep local files such as the SQLite response store
+- Cargo features: `full,store-sqlite` — `full` plus the SQLite store backend so
+  the SQLite-backed examples run without rebuilding the image
 
 The `-fips` image is the same binary's FIPS feature set on
 `ubi9/ubi-minimal`, built with Red Hat's `rust-toolset` and linked against

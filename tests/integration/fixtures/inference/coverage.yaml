@@ -1,12 +1,33 @@
 version: 1
 scope:
+  - chat_completions_to_bedrock_converse
   - messages_to_chat_completions
   - messages_native_passthrough
   - responses_agentic_loop
   - responses_native_passthrough
   - responses_to_chat_completions
   - responses_client_tool_compat
+  - openai_chat_completions_to_azureai_chat_completions
+  - openai_chat_completions_to_vertexai_gemini
 features:
+  - id: bedrock.converse.request.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.response.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.minimal
     scopes:
       - messages_to_chat_completions
@@ -25,6 +46,15 @@ features:
     status: synthetic_only
     scenarios:
       - messages/typed-server-tools
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.tool_input_presence
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-input-presence
     providers:
       synthetic:
         status: synthetic_only
@@ -75,6 +105,7 @@ features:
     status: synthetic_only
     scenarios:
       - messages/upstream-error
+      - messages/upstream-error-unknown-type
     providers:
       synthetic:
         status: synthetic_only
@@ -96,12 +127,39 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.system_history
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.unrepresentable_parameters
     scopes:
       - messages_to_chat_completions
     status: synthetic_only
     scenarios:
       - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.degrade_prompt_caching
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.degrade_extended_thinking
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
     providers:
       synthetic:
         status: synthetic_only
@@ -206,6 +264,15 @@ features:
     scenarios:
       - responses/chat-basic-nonstream
       - responses/chat-basic-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.shared_controls
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
     providers:
       synthetic:
         status: synthetic_only
@@ -328,6 +395,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.tools.text_output
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-tool-text-output
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.null_tool_choice
     scopes:
       - responses_to_chat_completions
@@ -374,6 +450,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.mcp_namespace_lower_restore
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-mcp-namespace
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.stream_restore
     scopes:
       - responses_client_tool_compat
@@ -413,3 +498,129 @@ features:
     providers:
       vllm:
         status: live_covered
+  - id: messages.error.upstream_stream
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/upstream-error-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.tool_results
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.invalid_types
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.streaming.malformed_event
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: azure.chat.response.annotation_stream
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/annotation-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.request.invalid_content
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/invalid-content
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.invalid_content
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.untranslatable_content
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.invalid_tools
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.empty_citations
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.response.text_metadata
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/invalid-content
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.streaming.candidate_limit
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/bounded-stream-limits
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.streaming.tool_slot_limit
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/bounded-stream-limits
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.error.malformed_success_status
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-success
+    providers:
+      synthetic:
+        status: synthetic_only

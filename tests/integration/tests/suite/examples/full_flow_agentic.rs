@@ -151,8 +151,8 @@ fn full_flow_validates_before_parsing_tools() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let validate = yaml
-        .find("      - filter: openai_responses_validate")
-        .expect("full-flow config should validate managed requests");
+        .find("      - filter: openai_responses_request")
+        .expect("full-flow config should process managed create requests");
     let tool_parse = yaml
         .find("      - filter: openai_tool_parse")
         .expect("full-flow config should parse tools for managed requests");
@@ -486,16 +486,23 @@ fn full_flow_managed_chat_backend_translates_after_binding() {
 }
 
 #[test]
-fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
+    // #1602: a matched `POST /v1/responses` keeps the application protocol and
+    // operation ID published by `ai_operation`, regardless of body shape. A
+    // Chat Completions-shaped body is therefore still classified
+    // `openai_responses`, so it routes by model through the Responses catch-all
+    // to the shared inference backend instead of missing the format-constrained
+    // route (the pre-#1602 404).
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_chat_body","created_at":1000,"model":"gpt-4","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_chat_body_404");
+    let db = TempSqlite::new("full_flow_chat_body_as_responses");
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
-    );
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -506,34 +513,43 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         ),
     );
 
-    // The bypass carrier's `unless` gate is a positive allow-list of one
-    // format: a Chat Completions body is not classified openai_responses, so it
-    // runs the carrier and hits the bypass route-miss (no WebSocket Upgrade
-    // header on POST /v1/responses) rather than reaching the IRR.
     assert_eq!(
         parse_status(&raw),
-        404,
-        "a Chat Completions body must not match the format-constrained route"
+        200,
+        "a Chat Completions body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_chat_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 
 #[test]
-fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses() {
+    // #1602: body shape does not override operation identity. An Anthropic
+    // Messages-shaped body on `POST /v1/responses` is still the matched
+    // Responses create, so it routes by model through the catch-all to the
+    // shared inference backend rather than falling off the format-constrained
+    // route.
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_anthropic_body","created_at":1000,"model":"claude-3-5-sonnet","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_anthropic_body_404");
+    let db = TempSqlite::new("full_flow_anthropic_body_as_responses");
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
-    );
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
-    // An Anthropic Messages body posted to /v1/responses is classified
-    // anthropic_messages, not openai_responses. The same allow-list gate that
-    // rejects a Chat Completions body must reject this one — the catch-all is
-    // structural (allow only openai_responses), not a per-format reject rule.
     let raw = http_send(
         proxy.addr(),
         &json_post(
@@ -544,8 +560,19 @@ fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() 
 
     assert_eq!(
         parse_status(&raw),
-        404,
-        "an Anthropic Messages body must not match the format-constrained route"
+        200,
+        "an Anthropic Messages body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_anthropic_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 
@@ -643,6 +670,258 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
     drop(proxy);
 }
 
+/// A completed stream updates the local Conversation even with `store:false`.
+/// A later turn must rehydrate those items from the same on-disk store.
+#[test]
+fn full_flow_streaming_conversation_updates_history() {
+    let stream = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"completed\",\"output\":[{\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Sure\"}]}]}}\n\n",
+    );
+    let terminal_start = stream.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stream.split_at(terminal_start);
+    let backend_guard = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_streaming_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+
+    let first = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "streamed question"}],
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&raw), 200, "streamed turn failed: {raw}");
+    assert!(parse_body(&raw).contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 2, "streamed input and output must be appended once");
+    assert_eq!(items[0]["content"][0]["text"], "streamed question");
+    assert_eq!(items[1]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(backend_guard);
+    let stored_sse = stream.replace("resp_conversation_stream", "resp_conversation_store");
+    let terminal_start = stored_sse.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stored_sse.split_at(terminal_start);
+    let stored_backend = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", stored_backend.port())]),
+    ));
+
+    let stored_turn = json!({
+        "model": "gpt-4.1",
+        "input": "stored question",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": true,
+    });
+    let stored_raw = http_send(proxy.addr(), &json_post("/v1/responses", &stored_turn.to_string()));
+    assert_eq!(parse_status(&stored_raw), 200, "stored stream failed: {stored_raw}");
+    let stored_stream = parse_body(&stored_raw);
+    assert!(
+        stored_stream.contains("event: response.completed"),
+        "stored stream lacked completion: {stored_stream}"
+    );
+    let (status, stored_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store", None);
+    assert_eq!(status, 200, "stored stream should be retrievable: {stored_body}");
+    let (status, replay_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store?stream=true", None);
+    assert_eq!(status, 200, "stored stream should be replayable: {replay_body}");
+    assert!(replay_body.contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "second item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 4, "both streamed turns must append once");
+    assert_eq!(items[2]["content"][0]["text"], "stored question");
+    assert_eq!(items[3]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(stored_backend);
+    let echo_backend = start_echo_backend();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", echo_backend.port())]),
+    ));
+    let second = json!({
+        "model": "gpt-4.1",
+        "input": "next question",
+        "conversation": conversation_id,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &second.to_string()));
+    assert_eq!(parse_status(&raw), 200, "next turn failed: {raw}");
+    let outbound: Value = serde_json::from_str(&parse_body(&raw)).expect("echoed request JSON");
+    assert!(
+        outbound.get("conversation").is_none(),
+        "local selector must be stripped"
+    );
+    let input = outbound["input"].as_array().expect("rehydrated input array");
+    let input_text = serde_json::to_string(input).expect("input serialization");
+    assert!(
+        input_text.contains("streamed question"),
+        "missing streamed input: {input_text}"
+    );
+    assert!(input_text.contains("Sure"), "missing streamed output: {input_text}");
+    assert!(input_text.contains("next question"), "missing next input: {input_text}");
+}
+
+/// A tool-limit completion arrives as a local IRR chunk before the empty EOS.
+/// Its terminal must still commit the streamed turn to the Conversation.
+#[test]
+fn full_flow_local_stream_completion_updates_conversation() {
+    let search_call = json!({
+        "type": "web_search_call",
+        "id": "ws_conversation_local",
+        "status": "completed",
+        "action": {"type": "search", "query": "weather"},
+    });
+    let created = json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "in_progress",
+            "output": [],
+        },
+    });
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [search_call],
+        },
+    });
+    let backend = Backend::chunked(vec![
+        format!("event: response.created\ndata: {created}\n\n"),
+        format!("event: response.completed\ndata: {completed}\n\n"),
+    ])
+    .header("content-type", "text/event-stream")
+    .start_with_shutdown();
+    // The full-flow config screens new local tool results through NeMo before
+    // model re-entry. With `max_tool_calls: 0` the web_search result resolves as
+    // `failed`, which is still a model-facing output and is therefore checked, so
+    // the guardrail phase needs a reachable endpoint that approves it.
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"ok"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_local_stream_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend.port()), ("127.0.0.1:3003", nemo.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+    let turn = json!({
+        "model": "gpt-4.1",
+        "input": "search the weather",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+        "max_tool_calls": 0,
+        "tools": [{"type": "web_search_preview"}],
+    });
+    let request =
+        json_post("/v1/responses", &turn.to_string()).replacen("\r\n\r\n", "\r\nx-user-brave-key: test-key\r\n\r\n", 1);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "local completion failed: {raw}");
+    assert!(
+        parse_body(&raw).contains("event: response.completed"),
+        "missing local terminal: {raw}"
+    );
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(
+        items.len(),
+        2,
+        "local terminal and EOS must append exactly once: {items_body}"
+    );
+    assert_eq!(items[0]["content"][0]["text"], "search the weather");
+    assert_eq!(items[1]["type"], "web_search_call");
+
+    // The guardrail phase must actually screen the failed web-search result
+    // before it re-enters the model; a test that never asserts the NeMo call
+    // would still pass if that phase were removed.
+    let nemo_requests = nemo.requests();
+    assert_eq!(
+        nemo_requests.len(),
+        1,
+        "NeMo must screen the failed web-search result exactly once",
+    );
+    let screened = &nemo_requests[0];
+    assert_eq!(screened.method, "POST", "guardrail callout must POST to NeMo");
+    assert_eq!(screened.uri, "/v1/checks", "guardrail callout must target /v1/checks");
+    assert!(
+        screened.body.contains("max_tool_calls was exhausted"),
+        "NeMo request must carry the failed web-search result: {}",
+        screened.body,
+    );
+}
+
 /// A chunked non-streaming Responses body must remain buffered until the
 /// response store sees EOS. `openai_conversations` is composed in this example
 /// but append-back is unarmed without a conversation request; it must not
@@ -651,7 +930,8 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
 fn full_flow_chunked_response_is_persisted_and_retrievable() {
     let response = FIRST_RESPONSE_JSON;
     let split_at = response.len() / 2;
-    let backend_guard = Backend::chunked(vec![response[..split_at].to_owned(), response[split_at..].to_owned()])
+    let (first_chunk, second_chunk) = response.split_at(split_at);
+    let backend_guard = Backend::chunked(vec![first_chunk.to_owned(), second_chunk.to_owned()])
         .header("content-type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();
@@ -1417,6 +1697,121 @@ fn full_flow_agentic_single_pass_completes() {
 }
 
 #[test]
+fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
+    let first_model_response = json!({
+        "id": "resp_web_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_full_flow",
+            "status": "completed",
+            "action": {"type": "search", "query": "Praxis proxy"}
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let final_model_response = json!({
+        "id": "resp_web_search_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_web_search_final",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Praxis is a proxy.", "annotations": []}]
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_model_response.to_string()),
+        (200, final_model_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search = StatefulCapturingBackend::new(vec![(
+        200,
+        json!({
+            "web": {"results": [{
+                "title": "Praxis proxy",
+                "url": "https://praxis-proxy.github.io/",
+                "description": "A secure programmable proxy."
+            }]}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_agentic_web_search_guardrail");
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
+        "api_key: ${WEB_SEARCH_API_KEY}",
+        &format!(
+            "api_key: test-key\n                base_url: http://127.0.0.1:{}",
+            search.port()
+        ),
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3003", nemo.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search for Praxis proxy",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let request = json_post("/v1/responses", &request.to_string()).replacen(
+        "Content-Type: application/json",
+        "x-user-brave-key: test-key\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "web-search round trip failed: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(response["id"], "resp_web_search_final");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing web-search result should reach inference round two"
+    );
+    let second_input = serde_json::from_str::<Value>(&model.requests()[1].body).expect("second inference JSON");
+    assert!(
+        second_input["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("praxis-proxy.github.io"))
+            })),
+        "the checked web-search result should reach inference round two: {second_input:#}"
+    );
+
+    let search_requests = search.requests();
+    assert_eq!(search_requests.len(), 1, "the web-search dispatcher should run once");
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the new web-search result once"
+    );
+    let check: Value = serde_json::from_str(&nemo.requests()[0].body).expect("NeMo request JSON");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("praxis-proxy.github.io")),
+        "NeMo should receive the newly produced web-search result: {check:#}"
+    );
+}
+
+#[test]
 fn full_flow_agentic_file_search_round_trip() {
     let first_model_response = json!({
         "id": "resp_search",
@@ -1462,10 +1857,16 @@ fn full_flow_agentic_file_search_round_trip() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -1487,6 +1888,23 @@ fn full_flow_agentic_file_search_round_trip() {
     assert_eq!(response["output"][0]["type"], "file_search_call");
     assert_eq!(response["output"][0]["status"], "completed");
     assert_eq!(response["output"][1]["type"], "message");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing file-search result should reach inference round two"
+    );
+
+    let checks = nemo.requests();
+    assert_eq!(checks.len(), 1, "the local file-search result should be checked once");
+    assert_eq!(checks[0].uri, "/v1/checks");
+    let check: Value = serde_json::from_str(&checks[0].body).expect("NeMo request should contain JSON");
+    assert_eq!(check["messages"][0]["role"], "user");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Q4 revenue was $42 million")),
+        "NeMo should receive the newly produced file-search result: {check:#}"
+    );
 
     for request in model.requests() {
         let headers = request.headers.to_lowercase();
@@ -1782,10 +2200,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -1802,6 +2226,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
     let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the checked result should re-enter inference"
+    );
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the file-search result once"
+    );
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");

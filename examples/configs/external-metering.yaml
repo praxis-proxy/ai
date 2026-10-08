@@ -48,6 +48,8 @@ filter_chains:
         timeout_seconds: 5
         feature_key: "inference-tokens"
         source: "ai-gateway"
+        # Static provider attributed to emitted CloudEvents
+        provider: "openai"
         fail_open: true
         identity_header_prefix: "x-tenant-"
         # Namespace the identity_header_guard filter writes captured headers

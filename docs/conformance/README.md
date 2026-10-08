@@ -6,7 +6,8 @@ surfaces. The current scope is Conversations only.
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json` as a **review reference only**. It is
 read by the automated PR review prompt (`.github/prompts/automated-review.md`)
-when a change touches Anthropic surfaces. It is not consumed by
+when a change touches Anthropic surfaces, and the Anthropic Messages operation
+registry is transcribed from it by hand. It is not consumed by
 `cargo xtask openai-conformance`, and there is no `oasdiff`, capability, or CI
 gate for Anthropic. See [Anthropic Messages Reference Spec](#anthropic-messages-reference-spec).
 
@@ -169,14 +170,23 @@ cargo xtask openai-conversation-item-contracts
 cargo xtask openai-conversation-item-contracts --check
 ```
 
-Normal conformance generation performs the check before comparing schemas, so
-the runtime validator and generated implementation document cannot silently
-drift from the pinned item union.
+When Conversations is selected, conformance generation performs the check
+before comparing schemas, so the runtime validator and generated implementation
+document cannot silently drift from the pinned item union.
 
 ## Reference Refresh
 
-Normal conformance runs do not fetch upstream. They read the complete vendored
-spec and create area projections in memory. To pin an intentional upstream
+`cargo xtask openai-conformance` does not fetch upstream. It always uses the
+checked-in complete OpenAI reference at
+`docs/conformance/specs/openai-openapi.yaml` and verifies its provenance against
+`docs/conformance/specs/openai-openapi-source.json` before comparison, then
+creates area projections in memory. The report retains the reference revision
+and SHA-256. There is no alternate reference-path option; `--openai-spec` is
+rejected.
+`--implementation-spec` remains available to override the local implementation
+document for exactly one selected area, without changing the pinned reference.
+
+Reference refresh is an independent command. To pin an intentional upstream
 update and replace the complete spec:
 
 ```console
@@ -329,6 +339,16 @@ platform or console surfaces (agents, deployments, environments, memory stores,
 organizations, sessions, tunnels, vaults, skills, user profiles) are always out
 of scope — Praxis does not implement them, so their absence in Praxis is never
 a finding.
+
+### Relationship to the Anthropic Messages operation registry
+
+The Anthropic Messages operation registry in `apis/src/anthropic/routes.rs`
+transcribes its methods, paths, operation IDs, and request-body shapes from this
+pinned document, covering the non-beta `/v1/messages` surface named above. The
+transcription is not machine-checked: nothing compares the registry against the
+spec at build or CI time, so the registry makes no specification-conformance
+claim and a refresh of the pinned document will not flag a registry that has
+fallen behind. Wiring that gate is tracked separately.
 
 ### Refresh
 

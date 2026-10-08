@@ -44,7 +44,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::{
-    error::responses_error_rejection,
+    error::{responses_error_rejection, responses_error_rejection_with_code},
     state::{
         DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
         current_round_tool_call_admissions,
@@ -294,6 +294,7 @@ impl WebSearchFilter {
         ctx: &mut HttpFilterContext<'_>,
         prepared: PreparedCall<'_>,
         context_size: SearchContextSize,
+        country: Option<&str>,
         identity: &CalloutIdentity,
         query_cap: usize,
     ) -> usize {
@@ -309,7 +310,7 @@ impl WebSearchFilter {
             let callout = CalloutContext::from_filter_context(ctx);
             match self
                 .search_client
-                .search(&self.outbound, callout, query, Some(context_size), identity)
+                .search(&self.outbound, callout, query, Some(context_size), country, identity)
                 .await
             {
                 SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
@@ -349,6 +350,92 @@ impl WebSearchFilter {
                 &format!("web search requires the '{slot}' per-user credential, which was not provided"),
             )),
         }
+    }
+
+    /// Fail closed with a 400 when the initial request's web-search `user_location`
+    /// carries fields the configured provider cannot honor.
+    ///
+    /// The canonical web-search state preserves every `user_location` member, but
+    /// the dispatcher forwards only a supported ISO `country` to the provider
+    /// (issue #1548). Rather than silently drop `city`/`region`/`timezone` — or a
+    /// `country` a provider cannot map from an ISO code — this rejects the request
+    /// explicitly so a location-sensitive search never runs with location
+    /// semantics the caller did not actually get.
+    ///
+    /// A request may declare more than one web-search tool (e.g. `web_search`
+    /// alongside `web_search_preview`), so every declared tool's `user_location` is
+    /// inspected: an unsupported field on any of them is rejected. Because dispatch
+    /// forwards a single country, tools that declare *different* countries are also
+    /// rejected — honoring only the first would silently drop the others.
+    fn preflight_location_support(&self, state: &ResponsesState) -> Result<(), Rejection> {
+        let mut countries: Vec<&str> = Vec::new();
+        for user_location in web_search_user_locations_from_state(state) {
+            self.reject_unsupported_location_fields(user_location)?;
+            if let Some(country) = user_location
+                .get("country")
+                .and_then(Value::as_str)
+                .filter(|country| !country.is_empty())
+                && !countries.contains(&country)
+            {
+                countries.push(country);
+            }
+        }
+        if countries.len() > 1 {
+            return Err(responses_error_rejection_with_code(
+                400,
+                "invalid_request_error",
+                "invalid_value",
+                "web-search tools declare conflicting user_location.country values; \
+                 dispatch forwards a single country, so declare the same country on every tool.",
+            ));
+        }
+        if let Some(country) = countries.first() {
+            self.reject_unrepresentable_country(country)?;
+        }
+        Ok(())
+    }
+
+    /// Reject `user_location` fields the configured provider cannot honor at all
+    /// (e.g. `city`/`region`/`timezone`, or `country` for Tavily).
+    fn reject_unsupported_location_fields(&self, user_location: &Value) -> Result<(), Rejection> {
+        let unsupported = self.search_client.unsupported_location_fields(user_location);
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        let message = format!(
+            "web search provider '{provider}' cannot honor user_location field(s): {fields}. \
+             Remove them or omit user_location.",
+            provider = self.search_client.provider_name(),
+            fields = unsupported.join(", "),
+        );
+        Err(responses_error_rejection_with_code(
+            400,
+            "invalid_request_error",
+            "unsupported_parameter",
+            &message,
+        ))
+    }
+
+    /// Reject a supported `country` the provider cannot represent in its forwarding
+    /// channel (e.g. Brave's `X-Loc-Country` header rejects control characters, and
+    /// You.com's JSON enum requires a well-formed ISO alpha-2 code), rather than
+    /// letting the dispatcher silently drop it and search without the caller's
+    /// location (issue #1548).
+    fn reject_unrepresentable_country(&self, country: &str) -> Result<(), Rejection> {
+        if self.search_client.country_is_representable(country) {
+            return Ok(());
+        }
+        let message = format!(
+            "web search provider '{provider}' cannot represent the user_location.country value; \
+             it must be a plain ISO 3166-1 alpha-2 code with no control characters.",
+            provider = self.search_client.provider_name(),
+        );
+        Err(responses_error_rejection_with_code(
+            400,
+            "invalid_request_error",
+            "invalid_value",
+            &message,
+        ))
     }
 
     /// Resolve the caller's identity once for the whole batch, recording a fail-closed
@@ -410,7 +497,7 @@ impl WebSearchFilter {
                 continue;
             };
             let dispatched = self
-                .execute_single_search(ctx, prepared, batch.context_size, &identity, query_cap)
+                .execute_single_search(ctx, prepared, batch.context_size, batch.country, &identity, query_cap)
                 .await;
             if dispatched > 0 {
                 calls_dispatched = calls_dispatched.saturating_add(1);
@@ -492,6 +579,18 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // Round-0 location preflight. The canonical web-search state preserves the
+        // full `user_location`, but the dispatcher only forwards a supported ISO
+        // `country` to the provider. Reject unsupported location use explicitly
+        // rather than silently changing location-sensitive search semantics by
+        // dropping fields the provider cannot honor (issue #1548).
+        if is_initial_request(ctx)
+            && request_declares_eligible_web_search(state)
+            && let Err(rejection) = self.preflight_location_support(state)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
+
         // Round-0 credential preflight. When the initial request declares a hosted
         // web-search tool that could run under the effective `tool_choice` and a
         // per-user credential slot is configured, resolve it now so a missing
@@ -516,6 +615,12 @@ impl HttpFilter for WebSearchFilter {
             .get_metadata("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
+
+        // Capture the supported ISO country code (owned) while the shared immutable
+        // borrow is still live; threading it through the batch after `mem::take`
+        // takes a mutable borrow of state would otherwise conflict. The code is a
+        // short alpha-2 string, so this owns the minimum needed across the boundary.
+        let country: Option<String> = web_search_country_from_state(state).map(str::to_owned);
 
         // Compute the remaining budget while the shared immutable borrow is
         // still live, then move the web search calls out instead of cloning
@@ -550,6 +655,7 @@ impl HttpFilter for WebSearchFilter {
                     call_budget,
                     query_budget: MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION,
                     context_size,
+                    country: country.as_deref(),
                 },
             )
             .await;
@@ -576,32 +682,172 @@ fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
 }
 
 /// Whether the initial request declares a hosted web-search tool that could run
-/// under the effective `tool_choice`, so a per-user credential preflight applies.
+/// at any point this turn, so the round-0 location and credential preflights apply.
 fn request_declares_eligible_web_search(state: &ResponsesState) -> bool {
     let declares = state.tools.iter().any(|tool| {
         tool.get("type")
             .and_then(Value::as_str)
             .is_some_and(is_web_search_tool_type)
     });
-    declares && tool_choice_permits_web_search(&state.tool_choice)
+    declares && {
+        // Build the MCP-name test once per request; the predicates below reuse it
+        // to recognize a resolved MCP tool that was rewritten to a plain `function`.
+        let is_mcp_function = mcp_function_membership(&state.mcp_tool_map);
+        // A `tool_choice`/`allowed_tools` entry is a short *selector*; the `execution`
+        // mode that decides whether a `tool_search` drives a continuation lives on the
+        // matching *declaration* in `state.tools`, so resolve it there once (#1548).
+        let server_tool_search = declares_server_executed_tool_search(&state.tools);
+        tool_choice_permits_web_search(&state.tool_choice, &is_mcp_function, server_tool_search)
+    }
+}
+
+/// Whether `state.tools` declares a server-executed `tool_search`. Its hosted
+/// discovery drives an agentic continuation that reopens web search, whereas a
+/// client-executed one (the default) returns to the API client. A `tool_choice`
+/// selector only names the tool by type, so the authoritative `execution` mode must
+/// be read from the declaration here rather than from the selector (issue #1548).
+fn declares_server_executed_tool_search(tools: &[Value]) -> bool {
+    tools.iter().any(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some("tool_search") && !tool_search_is_client_executed(tool)
+    })
+}
+
+/// Whether a hosted tool `type` string names a tool whose server-side dispatch
+/// drives an agentic continuation.
+///
+/// When one of these runs, `openai_agentic_loop::prepare_iteration` resets
+/// `tool_choice` to `"auto"` for the next model round while retaining the declared
+/// `tools`. So permitting any continuation-driving tool makes a declared
+/// web-search tool reachable on a later round regardless of the *initial*
+/// `tool_choice` — the round-0 preflight must treat it as eligible (issue #1548).
+///
+/// `tool_search` is deliberately absent here: it drives a continuation only when
+/// server-executed (hosted MCP connector discovery), and its `execution` mode lives
+/// on the *declaration* in `state.tools` — not on the `tool_choice` selector that
+/// names it — so [`declares_server_executed_tool_search`] resolves it, threaded into
+/// [`tool_entry_drives_web_search_continuation`]. A client `function` never drives a
+/// server continuation (its result returns to the client), so permitting only client
+/// functions leaves web search unreachable.
+fn tool_type_drives_web_search_continuation(tool_type: &str) -> bool {
+    is_web_search_tool_type(tool_type) || matches!(tool_type, "file_search" | "mcp")
+}
+
+/// Whether one tool or forced-`tool_choice` selector keeps a declared web-search
+/// tool reachable this turn.
+///
+/// Recognizes the continuation-driving hosted tool *types* directly (see
+/// [`tool_type_drives_web_search_continuation`]); a `tool_search` only when the
+/// request declares a server-executed one (`server_tool_search`, resolved from
+/// `state.tools` because the selector carries no `execution`); and, additionally, a
+/// `function` entry that is actually a resolved MCP tool. `openai_mcp_tool_resolve`
+/// rewrites every MCP selector to a plain `{"type":"function","name":"<label>__<tool>"}`
+/// and overwrites `ResponsesState.tools`/`tool_choice`, erasing the `"mcp"` type;
+/// `mcp_tool_map` is the only surviving provenance. Such a function still drives an
+/// MCP continuation that re-opens `tool_choice`, so web search stays reachable
+/// (issue #1548). A malformed entry with no `type` is conservatively eligible.
+fn tool_entry_drives_web_search_continuation(
+    tool: &Value,
+    is_mcp_function: &impl Fn(&str) -> bool,
+    server_tool_search: bool,
+) -> bool {
+    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+        return true;
+    };
+    // A `tool_search` selector names the tool by type only; whether it drives a
+    // continuation depends on the declaration's `execution` mode, pre-resolved into
+    // `server_tool_search`. A client-executed tool search (the default) returns its
+    // call to the API client without an IRR round (issue #1548).
+    if tool_type == "tool_search" {
+        return server_tool_search;
+    }
+    if tool_type_drives_web_search_continuation(tool_type) {
+        return true;
+    }
+    // A resolved MCP tool reads as a plain `function`; recover its provenance by name.
+    match tool.get("name").and_then(Value::as_str) {
+        Some(name) if tool_type == "function" => is_mcp_function(name),
+        _ => false,
+    }
+}
+
+/// Whether a `tool_search` *declaration* is client-executed — the default. A client
+/// tool search returns its call to the API client without driving a server-side
+/// discovery round, so it cannot make a declared web-search tool reachable this
+/// response (issue #1548). Mirrors `openai_client_tool_compat::tool_search_is_client`:
+/// `execution` absent or `"client"` is client; `"server"` (or any other value) is
+/// server-executed and conservatively treated as continuation-driving.
+fn tool_search_is_client_executed(tool: &Value) -> bool {
+    matches!(tool.get("execution").and_then(Value::as_str), None | Some("client"))
+}
+
+/// A reusable test for whether an outbound `function` name belongs to a resolved
+/// MCP tool, built once per request from `mcp_tool_map` (issue #1548).
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_function_membership(
+    mcp_tool_map: &std::collections::HashMap<(String, String), Value>,
+) -> impl Fn(&str) -> bool + '_ {
+    let index = super::openai_mcp_tool_resolve::McpToolIndex::new(mcp_tool_map);
+    move |name: &str| index.contains(name)
+}
+
+/// Without MCP tool support no `function` can be MCP-owned, so none is ever treated
+/// as continuation-driving.
+#[cfg(not(feature = "openai-mcp-tools"))]
+fn mcp_function_membership(
+    _mcp_tool_map: &std::collections::HashMap<(String, String), Value>,
+) -> impl Fn(&str) -> bool {
+    |_name: &str| false
 }
 
 /// Whether `tool_choice` leaves a hosted web-search tool eligible to run this turn.
 ///
-/// `"none"` forbids all tools; an object forcing a single non-web-search tool
-/// (e.g. `{"type": "function", ...}`) also excludes it. Every other shape —
-/// `"auto"`, `"required"`, an object forcing a web-search tool, `allowed_tools`,
-/// or an absent/unknown choice — keeps web search eligible. Being conservatively
-/// eligible is safe: the re-entry check still fails closed if the callout runs.
-fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
+/// `"none"` forbids all tools; an object forcing a single client `function` also
+/// excludes it. An object forcing a web-search tool — or any other hosted tool, or
+/// a resolved MCP `function`, whose continuation re-opens `tool_choice` (see
+/// [`tool_entry_drives_web_search_continuation`]) — keeps it eligible. An
+/// `allowed_tools` object constrains the callable set, so web search is eligible
+/// only when its `tools` list names web search or another continuation-driving
+/// tool (a list that allows only a client function excludes it). Every other
+/// shape — `"auto"`, `"required"`, or an absent/unknown choice — keeps web search
+/// eligible. Being conservatively eligible is safe: the re-entry check still fails
+/// closed if the callout runs.
+fn tool_choice_permits_web_search(
+    tool_choice: &Value,
+    is_mcp_function: &impl Fn(&str) -> bool,
+    server_tool_search: bool,
+) -> bool {
     match tool_choice {
         Value::String(keyword) => keyword != "none",
         Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-            Some(kind) if is_web_search_tool_type(kind) => true,
-            Some("allowed_tools") | None => true,
-            Some(_) => false,
+            Some("allowed_tools") => allowed_tools_permit_web_search(choice, is_mcp_function, server_tool_search),
+            None => true,
+            Some(_) => tool_entry_drives_web_search_continuation(tool_choice, is_mcp_function, server_tool_search),
         },
         _ => true,
+    }
+}
+
+/// Whether an `allowed_tools` choice leaves web search reachable via its list.
+///
+/// The `tools` array constrains which tools the model may call. Web search is
+/// reachable when the list names web search directly or any other
+/// continuation-driving tool (`file_search`, `mcp`, a server-executed `tool_search`,
+/// or a resolved MCP `function`), because that tool's continuation resets
+/// `tool_choice` to `"auto"` and re-admits the retained web-search tool (issue
+/// #1548). A list naming only client functions, or only a client-executed
+/// `tool_search`, leaves it unreachable. A missing or malformed `tools` field is
+/// treated as conservatively reachable — the re-entry check still fails closed if a
+/// callout actually runs.
+fn allowed_tools_permit_web_search(
+    choice: &serde_json::Map<String, Value>,
+    is_mcp_function: &impl Fn(&str) -> bool,
+    server_tool_search: bool,
+) -> bool {
+    match choice.get("tools").and_then(Value::as_array) {
+        Some(tools) => tools
+            .iter()
+            .any(|tool| tool_entry_drives_web_search_continuation(tool, is_mcp_function, server_tool_search)),
+        None => true,
     }
 }
 
@@ -617,6 +863,9 @@ struct PendingSearchBatch<'a> {
     query_budget: usize,
     /// Search result size requested for this response.
     context_size: SearchContextSize,
+    /// Supported ISO country code forwarded to the provider, when the request's
+    /// `user_location` set one (issue #1548). `None` leaves location unset.
+    country: Option<&'a str>,
 }
 
 /// Public and bridge identifiers for one appended web-search result.
@@ -757,6 +1006,50 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     })
 }
 
+/// Recover the first web-search tool's `user_location` object from request state.
+///
+/// The canonical state preserves the full `user_location` the client sent; the
+/// dispatcher and preflight read it from here after IRR resets step-local
+/// metadata.
+fn web_search_user_location_from_state(state: &ResponsesState) -> Option<&Value> {
+    state.tools.iter().find_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        if is_web_search_tool_type(tool_type) {
+            tool.get("user_location")
+        } else {
+            None
+        }
+    })
+}
+
+/// Every web-search tool's `user_location` object from request state, in
+/// declaration order.
+///
+/// A request may declare more than one web-search tool, so the round-0 preflight
+/// inspects them all rather than only the first — an unsupported field or a
+/// conflicting country on a later tool must not slip past
+/// [`web_search_user_location_from_state`]'s first-match lookup.
+fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
+    state.tools.iter().filter_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        is_web_search_tool_type(tool_type)
+            .then(|| tool.get("user_location"))
+            .flatten()
+    })
+}
+
+/// Extract the supported ISO `country` code from the request's `user_location`.
+///
+/// Only `country` is forwarded to providers (issue #1548); the round-0 preflight
+/// already rejected any unsupported field, so a value returned here is known to
+/// be provider-supported. A null or empty `country` is a canonical "unset".
+fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
+    web_search_user_location_from_state(state)?
+        .get("country")
+        .and_then(Value::as_str)
+        .filter(|country| !country.is_empty())
+}
+
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
 /// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
 fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> Option<PreparedCall<'a>> {
@@ -871,8 +1164,10 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// place, never duplicated.
 fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        let result_start = state.messages.len();
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
+        state.mark_local_tool_results_from(result_start);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into

@@ -1,19 +1,25 @@
 # Response Store
 # Requires `--features store-sqlite` because these filters are opt-in.
 #
-# Persists non-streaming Responses API responses to a database
-# and serves stored data via GET endpoints and handles
-# DELETE /v1/responses/{id} locally. Supports SQLite
-# (file-backed or in-memory) and PostgreSQL backends:
+# Persists streaming and non-streaming Responses API responses to a database,
+# serves stored data via GET endpoints, and handles DELETE /v1/responses/{id}
+# locally. Supports SQLite (file-backed or in-memory) and PostgreSQL backends:
 #
 #   POST /v1/responses          — proxied to backend, response persisted
 #   GET  /v1/responses/{id}     — served from local store (200 or 404)
 #   GET  /v1/responses/{id}/input_items — paginated input items
 #   DELETE /v1/responses/{id}   — deleted from local store (200 or 404)
 #
-# The `openai_responses_format` filter must run before the store to classify
-# the request body — `openai_response_store` reads its metadata to decide
-# whether to persist POST responses.
+# Request order:
+#   1. openai_responses_request classifies the create body, publishes the
+#      classification metadata `openai_response_store` reads, and creates the
+#      `ResponsesState` the streaming accumulator needs.
+#   2. state_owner assigns the persisted-state owner.
+#   3. openai_response_store initializes the store before inference and, on the
+#      response path, persists the finished response.
+#   4. iterative_request_router runs one inference step (max_iterations: 1) that
+#      selects the response transport and, for a `stream: true` request, composes
+#      the backend SSE into one logical stream the accumulator captures.
 #
 # Persisted state always requires an explicit owner source. This standalone
 # example uses `single_tenant`, which deliberately shares one owner and
@@ -21,12 +27,16 @@
 # boundary and the versioned assertion format.
 #
 # POST persistence:
-#   The `openai_responses_format` filter must run before the store to
-#   classify the request body — `openai_response_store` reads its
-#   metadata to decide whether to persist. Streaming responses
-#   (`stream: true`) are skipped; streaming persistence will be
-#   handled by a separate filter. Non-2xx responses and non-JSON
-#   content types are also skipped.
+#   `openai_responses_proxy` always advertises the streaming capability and
+#   selects Praxis's typed streaming transport for an effective `stream: true`
+#   request; otherwise it selects the buffered transport. For a streaming
+#   request, `openai_stream_events` (inside the IRR step, after `load_balancer`)
+#   parses each backend SSE chunk and accumulates the terminal `ResponsesState`;
+#   response body filters run in reverse config order, so the pre-IRR
+#   `openai_response_store` persists the accumulated response once the logical
+#   stream terminates. A finite request is persisted from its buffered JSON
+#   body instead. Non-2xx responses and content types other than JSON or
+#   event-stream are skipped.
 #
 # DELETE handling:
 #   DELETE /v1/responses/{id} is intercepted during `on_request`
@@ -47,7 +57,11 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        on_invalid: reject
 
       - filter: state_owner
         mode: single_tenant
@@ -81,9 +95,9 @@ filter_chains:
         #     algorithm: zstd          # none (default) or zstd
         #     level: 3                 # optional zstd level (default: 3)
         #
-        #   Upgrading an existing database: schema version 3 stores these
-        #   responses columns as binary. Databases created under version 2
-        #   (TEXT columns) must be migrated before the proxy will start — see
+        #   Upgrading an existing database: schema version 3 and later store
+        #   these responses columns as binary. Databases created under an older
+        #   schema version must be migrated before the proxy will start — see
         #   docs/store/schema-migration.md.
         #
         # PostgreSQL backend:
@@ -95,16 +109,45 @@ filter_chains:
         #   ssl_mode: verify-full      # disable, prefer, require, verify-ca, verify-full (default: verify-full)
         #   ssl_root_cert: /path/to/ca.pem  # optional, for verify-ca / verify-full
 
-      - filter: router
-        routes:
-          - path: "/v1/responses"
-            cluster: "inference-backend"
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        # The IRR's default 30s end-to-end deadline is too short for model
+        # inference. This single step inherits a 6-minute total deadline for
+        # time-to-first-byte plus response streaming.
+        timeout_ms: 360000
+        steps:
+          - name: inference
+            filters:
+              # Selects the response transport per request: Praxis's typed
+              # streaming transport for an effective `stream: true`, otherwise the
+              # buffered transport. Named `inference` so branch chains can rejoin.
+              - filter: openai_responses_proxy
 
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:8000"
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    # Cluster ceiling. openai_stream_events caps the live body
+                    # at leftover timeout_secs after the first SSE chunk.
+                    read_timeout_ms: 300000
+                    endpoints:
+                      - "127.0.0.1:8000"
+
+              # After load_balancer so IRR body hooks see the selected peer.
+              # openai_responses_proxy buffers the request body, so IRR runs that
+              # phase before load balancing; an earlier placement never sees
+              # ctx.upstream. It arms only for a streaming request and passes a
+              # finite response through untouched. timeout_secs is an absolute
+              # deadline from the first SSE chunk (default 300).
+              - filter: openai_stream_events
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

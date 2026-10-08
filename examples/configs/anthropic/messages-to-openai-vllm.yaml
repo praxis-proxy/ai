@@ -3,10 +3,15 @@
 # Translates native Anthropic Messages API traffic into OpenAI Chat Completions
 # for a vLLM backend that serves `/v1/chat/completions`, with the same
 # three-boundary credential isolation as the native passthrough config. This is
-# the config a real Claude Code client uses to reach a Chat-Completions-only
-# vLLM backend through Praxis: the client speaks the Anthropic wire format,
-# Praxis rewrites both the request and the response, and vLLM only ever sees
-# OpenAI Chat Completions.
+# a config an unmodified Claude Code client can drive end to end. It enables
+# operator-approved degradation (`allow_lossy_features` on the translation
+# filter) so the Anthropic-only features Claude Code sends by default — prompt
+# caching (`cache_control` markers) and extended thinking (`thinking`) — are
+# stripped and reported instead of rejected. Without that allowlist such
+# requests fail closed with a 400 (the strict default of
+# `messages-to-openai.yaml`). The client speaks the Anthropic wire format;
+# Praxis rewrites both the request and the response, and vLLM only sees Chat
+# Completions.
 #
 # Contrast with `messages-native-vllm.yaml`, which passes the Anthropic wire
 # format through UNCHANGED to a vLLM backend that serves `/v1/messages`
@@ -37,10 +42,10 @@
 # The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
 # build time; set it (and `VLLM_API_KEY`) in the proxy's environment.
 #
-# Note: `/v1/messages/count_tokens` has no Chat Completions equivalent, so it is
-# NOT rewritten (the `path_rewrite` pattern is anchored to `^/v1/messages$`) and
-# reaches the OpenAI backend as an unknown path. A Chat-Completions-only vLLM
-# returns 404 for it; Claude Code treats native token counting as best-effort
+# Note: `/v1/messages/count_tokens` has no Chat Completions equivalent, so
+# neither body translation nor path rewriting applies to it. A backend that
+# also serves the native endpoint can count tokens; a Chat-Completions-only
+# backend returns 404. Claude Code treats native token counting as best-effort
 # and degrades gracefully.
 
 listeners:
@@ -80,6 +85,26 @@ filter_chains:
       # non-streaming response body back into Anthropic Messages.
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
+        # Operator-approved degradation. Chat Completions cannot represent these
+        # Anthropic features, so the translator strips their wire markers and
+        # reports the loss (one WARN log per request, the
+        # praxis_anthropic_messages_to_chat_completions_degraded_total counter,
+        # and an x-degraded-features response header) instead of
+        # rejecting an unmodified Claude Code client with a 400. Remove an entry
+        # to make that feature fail closed again; malformed markers and every
+        # feature not listed here are still rejected.
+        #   - prompt_caching:    drop `cache_control` markers. Prompt and tool
+        #     content are preserved; explicit cache breakpoints are not honored,
+        #     so cost and latency may differ.
+        #   - extended_thinking: drop `thinking` and thinking-only
+        #     `context_management` edits. The translated response carries no
+        #     thinking blocks.
+        allow_lossy_features:
+          - prompt_caching
+          - extended_thinking
+        conditions:
+          - when:
+              path: "/v1/messages"
 
       # Convert streaming Chat Completions SSE back into Anthropic SSE. Gated to
       # `text/event-stream` so buffered JSON responses stay on the non-streaming

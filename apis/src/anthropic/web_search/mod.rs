@@ -15,10 +15,15 @@ use praxis_filter::{
     HttpFilterContext, IterationState, NextIterationBody, Rejection, StreamTerminationCause, SubRequestResponseMode,
     parse_filter_config,
 };
-use serde::{Deserialize, de::IgnoredAny};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Value, json};
 
+use super::wire;
 use crate::{
+    anthropic::messages_to_chat_completions::RESPONSE_RAW_BYTES_KEY,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     web_search::{
         CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
@@ -159,7 +164,7 @@ impl TextField<'_> {
     }
 }
 
-/// Borrowed input object for a candidate managed search.
+/// Borrowed input fields for a candidate managed search.
 #[derive(Deserialize)]
 struct SearchInput<'a> {
     /// Candidate search query.
@@ -167,13 +172,13 @@ struct SearchInput<'a> {
     query: Option<TextField<'a>>,
 }
 
-/// A search input object or an ignored value of another type.
+/// A parsed search input or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum InputField<'a> {
-    /// Parsed input object.
+    /// Parsed search input.
     Input(#[serde(borrow)] SearchInput<'a>),
-    /// Input with a non-object value.
+    /// Input that could not be parsed as a search input.
     Other(IgnoredAny),
 }
 
@@ -194,13 +199,13 @@ struct ResponseBlock<'a> {
     input: Option<InputField<'a>>,
 }
 
-/// A response content object or an ignored value of another type.
+/// A parsed response content block or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ContentField<'a> {
     /// Parsed content block.
     Block(#[serde(borrow)] ResponseBlock<'a>),
-    /// Non-object content value.
+    /// Content value that could not be parsed as a response block.
     Other(IgnoredAny),
 }
 
@@ -219,6 +224,198 @@ struct ResponseEnvelope<'a> {
     /// Message content blocks.
     #[serde(borrow)]
     content: Option<Vec<ContentField<'a>>>,
+}
+
+/// Re-entry needs owned content. Deserialize it once while retaining the
+/// duplicate-field behavior of the borrowed classifier.
+#[derive(Deserialize)]
+struct ReentryResponseEnvelope<'a> {
+    /// Anthropic object type.
+    #[serde(rename = "type", borrow)]
+    kind: Option<TextField<'a>>,
+    /// Message role.
+    #[serde(borrow)]
+    role: Option<TextField<'a>>,
+    /// Stop reason.
+    #[serde(borrow)]
+    stop_reason: Option<TextField<'a>>,
+    /// Owned content blocks that can be moved into the next request.
+    content: Option<Vec<TrackedContentValue>>,
+}
+
+/// Owned content block with the two validity gates of the borrowed deserializer.
+struct TrackedContentValue {
+    /// Complete owned JSON value, including fields the classifier ignores.
+    value: Value,
+    /// A duplicate recognized block field makes `ContentField::Block` fail,
+    /// leaving the block ignored by the classifier.
+    valid: bool,
+    /// A duplicate input query makes `InputField::Input` fail, so a selected
+    /// managed call has no valid query.
+    input_valid: bool,
+}
+
+impl<'de> Deserialize<'de> for TrackedContentValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        TrackedValueSeed {
+            scope: TrackedScope::Block,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+/// The known fields whose duplication changes typed classification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackedScope {
+    /// A response content block.
+    Block,
+    /// Its `input` object, if present.
+    Input,
+}
+
+impl TrackedScope {
+    /// Return the bit assigned to a field the typed classifier would reject
+    /// when duplicated. Unknown fields may still use JSON's last-value rule.
+    fn duplicate_mask(self, key: &str) -> u8 {
+        match self {
+            Self::Block => match key {
+                "type" => 1,
+                "name" => 2,
+                "id" => 4,
+                "input" => 8,
+                _ => 0,
+            },
+            Self::Input => u8::from(key == "query"),
+        }
+    }
+}
+
+/// Pass the duplicate-field scope to serde's nested value deserializer.
+struct TrackedValueSeed {
+    /// The current object's known fields.
+    scope: TrackedScope,
+}
+
+impl<'de> DeserializeSeed<'de> for TrackedValueSeed {
+    type Value = TrackedContentValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(TrackedValueVisitor { scope: self.scope })
+    }
+}
+
+/// Build an owned JSON value and track duplicates in one pass.
+struct TrackedValueVisitor {
+    /// The current object's known fields.
+    scope: TrackedScope,
+}
+
+impl TrackedValueVisitor {
+    /// Wrap a non-object JSON value with valid duplicate-field gates.
+    fn plain(value: Value) -> TrackedContentValue {
+        TrackedContentValue {
+            value,
+            valid: true,
+            input_valid: true,
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for TrackedValueVisitor {
+    type Value = TrackedContentValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value in response content")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Bool(v)))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::from(v)))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::from(v)))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        let number = serde_json::Number::from_f64(v).ok_or_else(|| E::custom("non-finite JSON number"))?;
+        Ok(Self::plain(Value::Number(number)))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::String(v.to_owned())))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::String(v)))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Null))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Self::plain(Value::Null))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        let mut input_valid = true;
+        loop {
+            if self.scope == TrackedScope::Block && values.len() == 3 {
+                let Some(input) = seq.next_element_seed(TrackedValueSeed {
+                    scope: TrackedScope::Input,
+                })?
+                else {
+                    break;
+                };
+                input_valid &= input.valid;
+                values.push(input.value);
+            } else {
+                let Some(value) = seq.next_element()? else {
+                    break;
+                };
+                values.push(value);
+            }
+        }
+        Ok(TrackedContentValue {
+            value: Value::Array(values),
+            valid: true,
+            input_valid,
+        })
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = serde_json::Map::new();
+        let mut seen = 0_u8;
+        let mut valid = true;
+        let mut input_valid = true;
+        while let Some(key) = map.next_key::<String>()? {
+            let mask = self.scope.duplicate_mask(&key);
+            if mask != 0 {
+                valid &= seen & mask == 0;
+                seen |= mask;
+            }
+            let value = if self.scope == TrackedScope::Block && key == "input" {
+                let input = map.next_value_seed(TrackedValueSeed {
+                    scope: TrackedScope::Input,
+                })?;
+                input_valid &= input.valid;
+                input.value
+            } else {
+                map.next_value::<Value>()?
+            };
+            values.insert(key, value);
+        }
+        Ok(TrackedContentValue {
+            value: Value::Object(values),
+            valid,
+            input_valid,
+        })
+    }
 }
 
 /// Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
@@ -251,12 +448,19 @@ struct ResponseEnvelope<'a> {
 ///
 /// # Live demo YAML
 ///
-/// The unified example serves both buffered (`stream: false`) and streaming
-/// (`stream: true`) clients from one pipeline via `terminal_streaming: true`.
+/// One pipeline serves both buffered (`stream: false`) and streaming
+/// (`stream: true`) clients: the filter selects the transport per request from
+/// the client's `stream` field, with no operator opt-in.
+///
+/// The protocol-adaptive example also declares a Chat Completions backend whose
+/// `credential_injection` resolves `VLLM_API_KEY` at pipeline-build time, so both
+/// `WEB_SEARCH_API_KEY` and `VLLM_API_KEY` must be set for the proxy to start —
+/// even for this native-backend demo, which never dials the Chat cluster.
 ///
 /// ```yaml
 /// # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
-/// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
+/// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" VLLM_API_KEY="$VLLM_API_KEY" \
+/// #   cargo run -p praxis-ai-proxy -- \
 /// #   -c examples/configs/anthropic/full-flow-agentic.yaml
 /// # curl http://127.0.0.1:8080/v1/messages \
 /// #   -H 'content-type: application/json' \
@@ -267,10 +471,6 @@ pub struct AnthropicWebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum request and response body size buffered by the loop.
     max_body_bytes: usize,
-    /// Whether an effective `stream: true` Messages request may use Praxis's
-    /// streaming subrequest transport to deliver the terminal response
-    /// incrementally across IRR rounds.
-    terminal_streaming: bool,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
     /// Prebuilt outbound filter chain each provider request executes through.
@@ -340,7 +540,6 @@ impl AnthropicWebSearchFilter {
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
-            terminal_streaming: validated.terminal_streaming,
             search_client,
             outbound,
             user_credential_slot: validated.user_credential,
@@ -383,15 +582,13 @@ impl AnthropicWebSearchFilter {
 
     /// Align the Praxis subrequest response transport with the outbound body.
     ///
-    /// Only meaningful under `terminal_streaming`: an effective `stream: true`
-    /// request selects the streaming transport so the terminal Messages
-    /// response reaches the client incrementally, while a non-streaming request
-    /// keeps the buffered transport. The buffered loop leaves the default mode
-    /// untouched.
-    fn apply_streaming_transport(&self, ctx: &mut HttpFilterContext<'_>, streaming: bool) {
-        if !self.terminal_streaming {
-            return;
-        }
+    /// An effective `stream: true` request selects the streaming transport so the
+    /// terminal Messages response reaches the client incrementally as one coherent
+    /// SSE lifecycle, while an absent or `false` `stream` keeps the buffered
+    /// transport that accumulates each round and returns one final JSON object.
+    /// The choice is captured once here and preserved across web-search re-entry
+    /// by the router-owned `IterationState`.
+    fn apply_streaming_transport(ctx: &mut HttpFilterContext<'_>, streaming: bool) {
         let mode = if streaming {
             SubRequestResponseMode::Streaming
         } else {
@@ -412,9 +609,9 @@ impl AnthropicWebSearchFilter {
     fn resolve_callout_identity(&self, ctx: &HttpFilterContext<'_>) -> Result<CalloutIdentity, Rejection> {
         stage_callout_identity(ctx, self.user_credential_slot.as_deref()).map_err(
             |CalloutContextMissing::Credential { slot }| {
-                anthropic_rejection(
+                wire::error_rejection(
                     401,
-                    "authentication_error",
+                    wire::ErrorType::Authentication,
                     &format!("web search requires the '{slot}' per-user credential, which was not provided"),
                 )
             },
@@ -478,6 +675,9 @@ impl AnthropicWebSearchFilter {
                 callout,
                 &pending.query,
                 Some(self.default_context_size),
+                // Anthropic web-search location translation is out of scope for
+                // issue #1548; preserve the current location-free behavior.
+                None,
                 identity,
             )
             .await
@@ -536,9 +736,9 @@ impl AnthropicWebSearchFilter {
             },
         };
         if request.get("messages").and_then(Value::as_array).is_none() {
-            return Ok(FilterAction::Reject(anthropic_rejection(
+            return Ok(FilterAction::Reject(wire::error_rejection(
                 400,
-                "invalid_request_error",
+                wire::ErrorType::InvalidRequest,
                 "messages must be an array for web search re-entry",
             )));
         }
@@ -560,18 +760,18 @@ impl AnthropicWebSearchFilter {
         }
         let rebuilt = serde_json::to_vec(&request)
             .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))?;
+        // Resolve the caller's original transport intent from the retained request
+        // BEFORE the size check. At re-entry `ctx.subrequest_response_mode()` is
+        // still Buffered (it is applied below), so branching the oversize rejection
+        // on it would misclassify a streaming request whose SSE lifecycle is already
+        // committed. Every round talks to the backend with this intent so the
+        // terminal round can be streamed the moment it arrives.
+        let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
         if rebuilt.len() > self.max_body_bytes {
-            return Ok(FilterAction::Reject(anthropic_rejection(
-                413,
-                "invalid_request_error",
-                "web search request exceeds configured max_body_bytes",
-            )));
+            return Ok(Self::reject_oversized_reentry(ctx, streaming));
         }
         let rebuilt = Bytes::from(rebuilt);
-        // Every round talks to the backend with the caller's original transport
-        // intent so the terminal round can be streamed the moment it arrives.
-        let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-        self.apply_streaming_transport(ctx, streaming);
+        Self::apply_streaming_transport(ctx, streaming);
         let iteration_state = ctx.extensions.get_mut::<IterationState>().ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: IRR iteration state unavailable while retaining request"
@@ -586,6 +786,118 @@ impl AnthropicWebSearchFilter {
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
         *body = Some(rebuilt);
+        Ok(FilterAction::Continue)
+    }
+
+    /// Reject a re-entry whose rebuilt request exceeds `max_body_bytes`, matching
+    /// the client's response transport.
+    ///
+    /// A buffered request is not yet committed, so it fails closed with a JSON
+    /// `413 invalid_request_error` the client can act on. A streaming request has
+    /// already committed a `200 text/event-stream` lifecycle (round 0 forwarded
+    /// `message_start`), so a JSON body cannot replace it: this request-phase
+    /// rejection makes the re-entry step complete, and the IRR streaming session
+    /// drains the rejection's body verbatim as the terminal chunk of the open
+    /// stream. Emit one coherent Anthropic `error` SSE event so the client sees a
+    /// clean terminal instead of a raw JSON object appended to the SSE stream. The
+    /// rejection status is inert once the stream is committed; `Reject` skips the
+    /// response phase, so the loop ends without emitting anything further.
+    fn reject_oversized_reentry(ctx: &mut HttpFilterContext<'_>, streaming: bool) -> FilterAction {
+        if !streaming {
+            return FilterAction::Reject(wire::error_rejection(
+                413,
+                wire::ErrorType::InvalidRequest,
+                "web search request exceeds configured max_body_bytes",
+            ));
+        }
+        // Poison the logical stream so any later read observes the terminal state;
+        // the committed SSE headers already fix the content type, so the inert 413
+        // status only records the payload-too-large intent.
+        if let Some(logical) = ctx.extensions.get_mut::<streaming::LogicalStream>() {
+            logical.fail();
+        }
+        FilterAction::Reject(
+            Rejection::status(413)
+                .with_header("content-type", "text/event-stream")
+                .with_body(Bytes::from(streaming::error_event_bytes(
+                    &streaming::StreamError::ReentryTooLarge,
+                ))),
+        )
+    }
+
+    /// Accumulate-then-classify a buffered (`stream: false`) round.
+    ///
+    /// The buffered subrequest transport delivers the whole model response in one
+    /// call at `end_of_stream`, so the round is classified from the complete body.
+    fn on_buffered_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        // Re-apply the response byte ceiling that the static `StreamBuffer`
+        // response mode used to enforce. `response_body_mode()` now advertises
+        // `Stream` so this filter can compose in a streaming-capable step, which
+        // drops the executor's per-filter response cap — only the router's larger
+        // ceiling would otherwise bound a buffered round. Reject an oversized
+        // model response here instead of buffering it; the streaming path enforces
+        // the same ceiling through `streaming::LogicalStream`.
+        //
+        // Enforce the ceiling on BOTH the raw upstream size and the body observed
+        // here, because a translation filter composed below this loop runs first on
+        // the response path and can change the size in either direction:
+        //   * it can SHRINK an oversized upstream error into a small Anthropic envelope, hiding a raw round that
+        //     exceeds the limit — so measure the pre-transform byte count the translator records; and
+        //   * it can EXPAND a Chat Completions response into a larger Anthropic message, so the body actually buffered
+        //     here can exceed the limit even when the raw round did not — so measure the observed length too.
+        // With no translator (a native Anthropic backend delivers the raw body here)
+        // the metadata is absent and both fall back to the same observed length.
+        let observed_len = body.as_ref().map_or(0, Bytes::len);
+        let raw_len = ctx
+            .get_metadata(RESPONSE_RAW_BYTES_KEY)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(observed_len);
+        if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
+            return Ok(FilterAction::Reject(wire::error_rejection(
+                502,
+                wire::ErrorType::Api,
+                "web-search upstream response exceeded the configured max_body_bytes",
+            )));
+        }
+        Self::classify_buffered_round(ctx, body)
+    }
+
+    /// Map a fully-buffered round body to its loop decision and matching action.
+    fn classify_buffered_round(
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        if !is_success_response(ctx) {
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        }
+        match body.as_deref().map_or(ResponseDecision::Done, classify_response) {
+            ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
+            ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
+            ResponseDecision::InvalidManagedCall => {
+                return Ok(FilterAction::Reject(wire::error_rejection(
+                    400,
+                    wire::ErrorType::InvalidRequest,
+                    "WebSearch tool use requires a non-empty id and input.query",
+                )));
+            },
+            ResponseDecision::QueryTooLong => {
+                return Ok(FilterAction::Reject(wire::error_rejection(
+                    400,
+                    wire::ErrorType::InvalidRequest,
+                    "WebSearch input.query must not exceed 8192 bytes",
+                )));
+            },
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -686,29 +998,28 @@ impl HttpFilter for AnthropicWebSearchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        // Terminal streaming rewrites the SSE body incrementally; the buffered
-        // loop only inspects the accumulated response.
-        if self.terminal_streaming {
-            BodyAccess::ReadWrite
-        } else {
-            BodyAccess::ReadOnly
-        }
+        // The streaming path rewrites the SSE body incrementally; the buffered
+        // path inspects the accumulated response. Both need write access to the
+        // response body, so the access is declared unconditionally — the transport
+        // is chosen per request, not by config.
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        // A streaming-capable response pipeline may not use `StreamBuffer`; the
-        // terminal serializer delivers chunks as they arrive.
-        if self.terminal_streaming {
-            BodyMode::Stream
-        } else {
-            BodyMode::StreamBuffer {
-                max_bytes: Some(self.max_body_bytes),
-            }
-        }
+        // Always advertise incremental delivery so this filter can compose in a
+        // streaming-capable step: a streaming-capable response pipeline may not
+        // statically declare `StreamBuffer`. A non-streaming request instead
+        // selects the buffered subrequest transport per request (see
+        // `apply_streaming_transport`), which accumulates each round's response.
+        BodyMode::Stream
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
-        self.terminal_streaming
+        // Always advertise the capability: the transport follows the client's
+        // effective `stream` field, chosen per request. There is no operator
+        // opt-in. A runtime guard in Praxis still validates the actual streaming
+        // terminal action.
+        true
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -742,17 +1053,10 @@ impl HttpFilter for AnthropicWebSearchFilter {
             Err(_) => return Ok(FilterAction::Continue),
         };
         let streaming = request.stream == Some(true);
-        if streaming && !self.terminal_streaming {
-            return Ok(FilterAction::Reject(anthropic_rejection(
-                400,
-                "invalid_request_error",
-                "streaming is not supported with anthropic_web_search",
-            )));
-        }
         if let Err(rejection) = self.preflight_managed_credential(ctx, &request) {
             return Ok(FilterAction::Reject(rejection));
         }
-        self.apply_streaming_transport(ctx, streaming);
+        Self::apply_streaming_transport(ctx, streaming);
 
         Ok(FilterAction::Continue)
     }
@@ -764,13 +1068,13 @@ impl HttpFilter for AnthropicWebSearchFilter {
         // Messages SSE lifecycle so the body phase — which no longer sees the
         // status or encoding — declines an untransformable round instead of
         // parsing non-SSE bytes as events. The marker is re-evaluated every
-        // round, so a success round clears any marker left by a prior one.
-        if self.terminal_streaming {
-            if !is_success_response(ctx) || response_is_encoded(ctx) {
-                ctx.extensions.insert(UntransformableRound);
-            } else {
-                ctx.extensions.remove::<UntransformableRound>();
-            }
+        // round, so a success round clears any marker left by a prior one. Only
+        // the streaming body phase reads this marker; a buffered round reads the
+        // response status directly and ignores it.
+        if !is_success_response(ctx) || response_is_encoded(ctx) {
+            ctx.extensions.insert(UntransformableRound);
+        } else {
+            ctx.extensions.remove::<UntransformableRound>();
         }
         Ok(FilterAction::Continue)
     }
@@ -781,43 +1085,13 @@ impl HttpFilter for AnthropicWebSearchFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        // A streamed round (effective `stream: true` under `terminal_streaming`)
-        // is transformed incrementally; a buffered round keeps the accumulate-
-        // then-classify path below.
-        if self.terminal_streaming && ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+        // A streamed round (effective `stream: true`) is transformed
+        // incrementally; a buffered round keeps the accumulate-then-classify path.
+        // The transport was selected per request in `on_request_body`.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
             return self.on_streaming_response_body(ctx, body, end_of_stream);
         }
-
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
-        if !is_success_response(ctx) {
-            set_action(ctx, ACTION_DONE)?;
-            return Ok(FilterAction::Continue);
-        }
-
-        let decision = body.as_deref().map_or(ResponseDecision::Done, classify_response);
-
-        match decision {
-            ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
-            ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
-            ResponseDecision::InvalidManagedCall => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
-                    400,
-                    "invalid_request_error",
-                    "WebSearch tool use requires a non-empty id and input.query",
-                )));
-            },
-            ResponseDecision::QueryTooLong => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
-                    400,
-                    "invalid_request_error",
-                    "WebSearch input.query must not exceed 8192 bytes",
-                )));
-            },
-        }
-        Ok(FilterAction::Continue)
+        self.on_buffered_response_body(ctx, body, end_of_stream)
     }
 }
 
@@ -1071,59 +1345,73 @@ fn finish_streaming_round(logical: &mut streaming::LogicalStream, reentry: Reent
 }
 
 /// Select a sole, well-formed server-owned search call.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validates one small external JSON envelope linearly"
-)]
 fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
     let Ok(response) = serde_json::from_slice::<ResponseEnvelope<'_>>(response_bytes) else {
         return ResponseDecision::Done;
     };
-    let stop_reason = response.stop_reason.as_ref().and_then(TextField::as_str);
-    if response.kind.as_ref().and_then(TextField::as_str) != Some("message")
-        || response.role.as_ref().and_then(TextField::as_str) != Some("assistant")
+    let tools = response.content.as_deref().into_iter().flatten().filter_map(|field| {
+        let ContentField::Block(block) = field else {
+            return None;
+        };
+        if block.kind.as_ref().and_then(TextField::as_str) != Some("tool_use") {
+            return None;
+        }
+        Some(ToolCall {
+            name: block.name.as_ref().and_then(TextField::as_str),
+            id: block.id.as_ref().and_then(TextField::as_str),
+            query: block.input.as_ref().and_then(|input| match input {
+                InputField::Input(input) => input.query.as_ref().and_then(TextField::as_str),
+                InputField::Other(_) => None,
+            }),
+        })
+    });
+    classify_tool_calls(
+        response.kind.as_ref().and_then(TextField::as_str),
+        response.role.as_ref().and_then(TextField::as_str),
+        response.stop_reason.as_ref().and_then(TextField::as_str),
+        tools,
+    )
+}
+
+/// Candidate `tool_use` fields borrowed from either response representation.
+struct ToolCall<'a> {
+    /// Candidate tool name.
+    name: Option<&'a str>,
+    /// Candidate tool-use ID.
+    id: Option<&'a str>,
+    /// Candidate query if its input object is valid.
+    query: Option<&'a str>,
+}
+
+/// Apply the same managed-search decision to borrowed and owned responses.
+fn classify_tool_calls<'a>(
+    kind: Option<&'a str>,
+    role: Option<&'a str>,
+    stop_reason: Option<&'a str>,
+    tools: impl Iterator<Item = ToolCall<'a>>,
+) -> ResponseDecision {
+    if kind != Some("message")
+        || role != Some("assistant")
         // vLLM's Messages-compatible endpoint currently labels otherwise
         // valid tool-use responses as `end_turn`.
         || !matches!(stop_reason, Some("tool_use" | "end_turn"))
     {
         return ResponseDecision::Done;
     }
-    let Some(content) = response.content.as_deref() else {
-        return ResponseDecision::Done;
-    };
-    let mut tools = content.iter().filter_map(|field| match field {
-        ContentField::Block(block) if block.kind.as_ref().and_then(TextField::as_str) == Some("tool_use") => {
-            Some(block)
-        },
-        ContentField::Block(_) | ContentField::Other(_) => None,
-    });
+    let mut tools = tools;
     let Some(tool) = tools.next() else {
         return ResponseDecision::Done;
     };
     if tools.next().is_some() {
         return ResponseDecision::Done;
     }
-    if tool.name.as_ref().and_then(TextField::as_str) != Some(MANAGED_TOOL_NAME) {
+    if tool.name != Some(MANAGED_TOOL_NAME) {
         return ResponseDecision::Done;
     }
-    let Some(id) = tool
-        .id
-        .as_ref()
-        .and_then(TextField::as_str)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(id) = tool.id.filter(|value| !value.is_empty()) else {
         return ResponseDecision::InvalidManagedCall;
     };
-    let Some(query) = tool
-        .input
-        .as_ref()
-        .and_then(|input| match input {
-            InputField::Input(input) => input.query.as_ref().and_then(TextField::as_str),
-            InputField::Other(_) => None,
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(query) = tool.query.map(str::trim).filter(|value| !value.is_empty()) else {
         return ResponseDecision::InvalidManagedCall;
     };
     if query.len() > MAX_SEARCH_QUERY_BYTES {
@@ -1136,26 +1424,76 @@ fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
 
 /// Recover the managed call and complete content from the accounted response.
 fn managed_search_from_response(response_bytes: &[u8]) -> Result<(PendingSearch, Vec<Value>), FilterError> {
-    let ResponseDecision::Managed(pending) = classify_response(response_bytes) else {
+    let response: ReentryResponseEnvelope<'_> = serde_json::from_slice(response_bytes).map_err(|_error| {
+        FilterError::from(format!(
+            "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
+        ))
+    })?;
+    let tools = response
+        .content
+        .as_deref()
+        .into_iter()
+        .flatten()
+        .filter_map(reentry_tool_call);
+    let ResponseDecision::Managed(pending) = classify_tool_calls(
+        response.kind.as_ref().and_then(TextField::as_str),
+        response.role.as_ref().and_then(TextField::as_str),
+        response.stop_reason.as_ref().and_then(TextField::as_str),
+        tools,
+    ) else {
         return Err(FilterError::from(format!(
             "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
         )));
     };
-    let mut response: Value = serde_json::from_slice(response_bytes).map_err(|error| {
-        FilterError::from(format!(
-            "{FILTER_NAME}: previous response parsing failed during re-entry: {error}"
-        ))
-    })?;
     let assistant_content = response
-        .get_mut("content")
-        .and_then(Value::as_array_mut)
-        .map(std::mem::take)
+        .content
+        .map(|content| content.into_iter().map(|field| field.value).collect())
         .ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: previous response content unavailable during re-entry"
             ))
         })?;
     Ok((pending, assistant_content))
+}
+
+/// Borrow tool fields from the owned content only when the typed classifier
+/// would have accepted this block.
+fn reentry_tool_call(field: &TrackedContentValue) -> Option<ToolCall<'_>> {
+    if !field.valid {
+        return None;
+    }
+    let (kind, name, id, input) = match &field.value {
+        Value::Object(block) => (
+            block.get("type").and_then(Value::as_str),
+            block.get("name").and_then(Value::as_str),
+            block.get("id").and_then(Value::as_str),
+            block.get("input"),
+        ),
+        Value::Array(block) => {
+            let [kind, name, id, input] = block.as_slice() else {
+                return None;
+            };
+            (kind.as_str(), name.as_str(), id.as_str(), Some(input))
+        },
+        _ => return None,
+    };
+    if kind != Some("tool_use") {
+        return None;
+    }
+    let query = if field.input_valid { reentry_query(input) } else { None };
+    Some(ToolCall { name, id, query })
+}
+
+/// Read a query from either map or sequence form of Serde's `SearchInput`.
+fn reentry_query(input: Option<&Value>) -> Option<&str> {
+    match input? {
+        Value::Object(input) => input.get("query").and_then(Value::as_str),
+        Value::Array(input) => match input.as_slice() {
+            [query] => query.as_str(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Append the assistant tool call and matching user result block.
@@ -1166,9 +1504,9 @@ fn append_search_turns(
     outcome: &SearchOutcome,
 ) -> Result<(), Rejection> {
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
-        return Err(anthropic_rejection(
+        return Err(wire::error_rejection(
             400,
-            "invalid_request_error",
+            wire::ErrorType::InvalidRequest,
             "messages must be an array for web search re-entry",
         ));
     };
@@ -1216,13 +1554,6 @@ fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(
         .or_default()
         .set("action", action)?;
     Ok(())
-}
-
-/// Build an Anthropic JSON error response.
-fn anthropic_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
-    Rejection::status(status)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(super::wire::error_body(error_type, message, None)))
 }
 
 #[cfg(test)]

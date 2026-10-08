@@ -10,6 +10,7 @@ pub use test_utils::load_example_config;
 
 mod agentic_routing;
 mod anthropic_full_flow_agentic;
+mod anthropic_full_flow_agentic_chat;
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
 mod anthropic_messages_to_openai_vllm;
@@ -18,15 +19,19 @@ mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
 mod azure_translation;
+mod bedrock;
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]
 mod compact;
 mod credential_injection;
 mod external_metering;
+#[cfg(target_os = "linux")]
+mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
+mod format_routing;
 #[cfg(feature = "store-sqlite")]
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
@@ -37,6 +42,7 @@ mod identity_header_guard;
 mod inference_fallback;
 mod intelligent_route_hardening;
 mod intelligent_route_management_skip;
+mod intelligent_route_projected_credentials;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
@@ -73,12 +79,11 @@ mod openai_response_store;
 mod openai_response_store_postgres;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres_mtls;
-#[cfg(feature = "openai-file-resolve-filter")]
+#[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
-mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
-mod openai_responses_validate;
+mod openai_responses_request;
 // The state-ownership example selects the SQLite store backend.
 #[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
@@ -101,6 +106,8 @@ mod responses_to_chat_completions_reasoning;
 mod session_replay;
 mod stream_usage_inject;
 mod time_to_first_token;
+#[cfg(feature = "token-ceiling-filter")]
+mod token_ceiling;
 mod token_count;
 mod token_counting;
 #[cfg(feature = "token-rate-limit-filter")]

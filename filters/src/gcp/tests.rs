@@ -6,6 +6,7 @@
 use std::io::{Read as _, Write as _};
 
 use http::{HeaderValue, Method, header};
+use praxis_ai_apis::subrequest::SubRequestClient;
 use praxis_filter::FilterAction;
 use tempfile::NamedTempFile;
 
@@ -15,6 +16,10 @@ use super::{
     token::{self, TokenSource, resolve_token_source},
 };
 use crate::test_utils::{make_filter_context, make_request};
+
+fn test_client() -> SubRequestClient {
+    crate::isolated_subrequest_client(4)
+}
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -299,12 +304,12 @@ fn explicit_metadata_ignores_credentials_path() {
 #[tokio::test]
 async fn fetch_parses_bearer_and_ttl_for_metadata_source() {
     let (host, server) = mock_metadata_endpoint(r#"{"access_token":"abc123","expires_in":3600}"#);
-    let client = reqwest::Client::new();
+    let client = test_client();
     let source = TokenSource::Metadata {
         service_account: "default".to_owned(),
     };
 
-    let (authorization, ttl) = token::fetch(&client, &source, &host, "scope")
+    let (authorization, ttl) = token::fetch(&client, &source, &host, "scope", std::time::Duration::from_secs(5))
         .await
         .expect("mock metadata fetch must succeed");
 
@@ -316,10 +321,16 @@ async fn fetch_parses_bearer_and_ttl_for_metadata_source() {
 
 #[tokio::test]
 async fn fetch_errors_for_service_account_key_source() {
-    let client = reqwest::Client::new();
-    let err = token::fetch(&client, &TokenSource::ServiceAccountKey, "unused", "scope")
-        .await
-        .expect_err("key_file fetch is not implemented and must error, not hang or silently fail closed forever");
+    let client = test_client();
+    let err = token::fetch(
+        &client,
+        &TokenSource::ServiceAccountKey,
+        "unused",
+        "scope",
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect_err("key_file fetch is not implemented and must error, not hang or silently fail closed forever");
     assert!(
         err.to_string().contains("not implemented"),
         "error must explain why, got: {err}"

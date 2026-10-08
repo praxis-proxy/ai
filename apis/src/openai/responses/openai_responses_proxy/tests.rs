@@ -3,8 +3,6 @@
 
 //! Unit tests for the Responses proxy filter.
 
-use std::fmt::Write as _;
-
 use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
@@ -69,7 +67,7 @@ fn body_mode_is_stream_buffer() {
             assert_eq!(
                 max_bytes,
                 Some(67_108_864),
-                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+                "StreamBuffer should default to the 64 MiB ceiling; the pipeline clamps it to body_limits"
             );
         },
         other => panic!("openai_responses_proxy must use StreamBuffer, got {other:?}"),
@@ -110,7 +108,7 @@ async fn selects_streaming_from_effective_passthrough_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_request.stream", "false");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
@@ -165,7 +163,7 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -199,7 +197,7 @@ async fn selects_streaming_for_rebuilt_effective_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_request.stream", "false");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -263,339 +261,62 @@ async fn passthrough_without_state() {
 }
 
 #[tokio::test]
-async fn prompt_template_is_rejected_without_selected_openai_upstream() {
-    let filter = make_filter();
+async fn native_openai_backend_preserves_provider_compaction_in_rebuilt_state() {
+    let pipeline = make_native_responses_pipeline();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#);
-    let mut body = Some(original.clone());
-
-    let action = filter
-        .on_selected_upstream_request_body(&mut ctx, &mut body)
-        .await
-        .unwrap();
-
-    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
-        panic!("a prompt template must fail closed for a backend without the capability");
-    };
-    assert_eq!(rejection.status, 400, "unsupported prompt must return HTTP 400");
-    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        error["error"]["type"], "invalid_request_error",
-        "unsupported prompt must use the Responses invalid-request error type"
-    );
-    assert_eq!(
-        error["error"]["message"],
-        "prompt templates are supported only when the selected upstream declares application_protocol: openai_responses and application_provider: openai",
-        "unsupported prompt must explain the protocol and provider declaration requirement"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original.as_ref()),
-        "rejection must not mutate the request"
-    );
-}
-
-#[tokio::test]
-async fn prompt_template_in_canonical_state_is_rejected_by_default() {
-    let filter = make_filter();
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    ctx.extensions.insert(ResponsesState::from_request_body(json!({
-        "model": "gpt-4.1",
-        "prompt": {"id": "pmpt_123"}
-    })));
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"rewritten"}"#));
-
-    let action = filter
-        .on_selected_upstream_request_body(&mut ctx, &mut body)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 400),
-        "canonical state must remain authoritative even when the current bytes omit prompt"
-    );
-}
-
-#[tokio::test]
-async fn null_prompt_is_allowed_by_default() {
-    let filter = make_filter();
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello","prompt":null}"#);
-    let mut body = Some(original.clone());
-
-    let action = filter
-        .on_selected_upstream_request_body(&mut ctx, &mut body)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(action, SelectedUpstreamBodyOutcome::Continue),
-        "a null prompt should remain a valid passthrough request"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original.as_ref()),
-        "null prompt passthrough must preserve request bytes"
-    );
-}
-
-#[test]
-fn prompt_probe_validates_deep_values_without_retaining_them() {
-    let prompt_body = deeply_nested_request("prompt", true);
-    assert!(
-        super::raw_request_has_prompt(&prompt_body),
-        "a valid non-null prompt nested 256 levels deep must be detected"
-    );
-
-    let unrelated_body = deeply_nested_request("metadata", true);
-    assert!(
-        !super::raw_request_has_prompt(&unrelated_body),
-        "a valid request with an unrelated 256-level value must prove prompt absence"
-    );
-}
-
-#[test]
-fn prompt_probe_ignores_malformed_json() {
-    // A body that is not valid JSON cannot carry a prompt that a strict
-    // OpenAI-compatible backend would parse and honor. It is not attributed to
-    // prompt templates; normal request validation rejects the malformed body.
-    let truncated = deeply_nested_request("metadata", false);
-    assert!(
-        !super::raw_request_has_prompt(&truncated),
-        "truncated JSON must not be reported as a prompt template"
-    );
-
-    assert!(
-        !super::raw_request_has_prompt(b"{not-json"),
-        "syntactically invalid JSON must not be reported as a prompt template"
-    );
-
-    assert!(
-        !super::raw_request_has_prompt(br#"{"prompt":{"id":"x"} trailing garbage"#),
-        "a prompt smuggled behind trailing garbage is not valid JSON and must not be attributed here"
-    );
-}
-
-#[test]
-fn prompt_probe_detects_prompt_beyond_serde_recursion_limit() {
-    // serde_json's `IgnoredAny` skip is iterative, so a valid non-null prompt is
-    // detected far past the recursion limit that a `Value` parse would hit.
-    let mut body = br#"{"metadata":"#.to_vec();
-    for _ in 0..5_000 {
-        body.extend_from_slice(br#"{"nested":"#);
-    }
-    body.extend_from_slice(b"null");
-    body.resize(body.len() + 5_000, b'}');
-    body.extend_from_slice(br#","prompt":{"id":"pmpt_deep"}}"#);
-    assert!(
-        super::raw_request_has_prompt(&body),
-        "a valid prompt after 5000 levels of unrelated nesting must still be detected"
-    );
-}
-
-#[test]
-fn prompt_probe_allocation_is_independent_of_prompt_payload_size() {
-    let small_body = br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"file":"x"}}}"#;
-    let small_allocations = allocation_counter::measure(|| {
-        std::hint::black_box(super::raw_request_has_prompt(small_body));
+    let provider_compaction = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
     });
-    let payload = "x".repeat(1024 * 1024);
-    let body = format!(r#"{{"model":"gpt-4.1","prompt":{{"id":"pmpt_123","variables":{{"file":"{payload}"}}}}}}"#);
-    assert!(
-        super::raw_request_has_prompt(body.as_bytes()),
-        "the warm-up probe must detect the large prompt object"
-    );
-    let mut detected = false;
-
-    let allocations = allocation_counter::measure(|| {
-        detected = std::hint::black_box(super::raw_request_has_prompt(body.as_bytes()));
-    });
-
-    assert!(detected, "the large prompt object must be detected");
-    assert_eq!(
-        allocations.count_total, small_allocations.count_total,
-        "allocation count must not grow with prompt payload size: small={small_allocations:?}, large={allocations:?}"
-    );
-    assert_eq!(
-        allocations.bytes_total, small_allocations.bytes_total,
-        "allocated bytes must not grow with prompt payload size: small={small_allocations:?}, large={allocations:?}"
-    );
-    assert!(
-        allocations.bytes_max <= 8,
-        "the visitor may use only serde_json's fixed traversal scratch, never prompt storage: {allocations:?}"
-    );
-}
-
-#[tokio::test]
-async fn openai_responses_metadata_preserves_prompt_template_passthrough_body() {
-    let pipeline = make_prompt_pipeline(Some("openai_responses"), Some("openai"), "127.0.0.1:443");
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    let original = Bytes::from_static(
-        br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","version":"2","variables":{"name":"Ada"}}}"#,
-    );
-    let mut body = Some(original.clone());
-
-    assert!(
-        matches!(
-            pipeline.execute_http_request(&mut ctx).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "an upstream declared as OpenAI Responses must allow prompt templates"
-    );
-    assert_eq!(
-        ctx.selected_application_protocol(),
-        Some("openai_responses"),
-        "the load balancer must publish the Responses protocol"
-    );
-    assert_eq!(
-        ctx.selected_application_provider(),
-        Some("openai"),
-        "the load balancer must publish the OpenAI provider"
-    );
-    assert_eq!(
-        ctx.upstream.as_ref().unwrap().address.as_ref(),
-        "127.0.0.1:443",
-        "endpoint identity remains independent from application capability"
-    );
-    let action = pipeline
-        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
-        .await
-        .unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "an upstream declared as OpenAI Responses must allow prompt templates"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original.as_ref()),
-        "OpenAI prompt object must be byte-exact"
-    );
-}
-
-#[tokio::test]
-async fn openai_responses_metadata_preserves_prompt_template_in_rebuilt_state() {
-    let pipeline = make_prompt_pipeline(Some("openai_responses"), Some("openai"), "127.0.0.1:443");
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
-        "input": "hello",
-        "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}}
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+        "previous_response_id": "resp_provider"
     }));
-    state.mark_request_body_for_rebuild();
+    state.history_rehydrated = true;
+    state.messages = vec![
+        provider_compaction.clone(),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }),
+    ];
+    state.provider_compaction_ids.insert("cmp_provider".to_owned());
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"hello","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#,
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"continue"}],"previous_response_id":"resp_provider"}"#,
     ));
 
-    assert!(
-        matches!(
-            pipeline.execute_http_request(&mut ctx).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "an upstream declared as OpenAI Responses must allow a rebuilt prompt request"
-    );
-    let action = pipeline
+    let body_action = pipeline
+        .execute_http_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(body_action, FilterAction::Continue));
+    let mut downstream_body: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    downstream_body["model"] = json!("rewritten-model");
+    body = Some(Bytes::from(serde_json::to_vec(&downstream_body).unwrap()));
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let selected_action = pipeline
         .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
         .await
         .unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "state-backed OpenAI prompt processing should continue"
-    );
+    assert!(matches!(selected_action, FilterAction::Continue));
+
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
-        rebuilt["prompt"]["id"], "pmpt_123",
-        "rebuilt request must preserve the prompt ID"
+        rebuilt["model"], "rewritten-model",
+        "selected serialization must retain downstream body changes"
     );
-    assert_eq!(
-        rebuilt["prompt"]["variables"]["name"], "Ada",
-        "rebuilt request must preserve prompt variables"
-    );
-}
-
-#[tokio::test]
-async fn prompt_template_requires_openai_responses_protocol_and_provider() {
-    for (protocol, provider) in [
-        (None, Some("openai")),
-        (Some("openai_chat_completions"), Some("openai")),
-        (Some("openai_responses"), None),
-        (Some("openai_responses"), Some("vllm")),
-    ] {
-        let pipeline = make_prompt_pipeline(protocol, provider, "api.openai.com:443");
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
-        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#));
-
-        assert!(
-            matches!(
-                pipeline.execute_http_request(&mut ctx).await.unwrap(),
-                FilterAction::Continue
-            ),
-            "routing should select the declared backend"
-        );
-        assert!(
-            matches!(
-                pipeline
-                    .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
-                    .await
-                    .unwrap(),
-                FilterAction::Reject(_)
-            ),
-            "prompt templates require exact OpenAI Responses protocol and provider metadata"
-        );
-    }
-}
-
-#[tokio::test]
-async fn routed_openai_responses_pipeline_allows_prompt_template_for_non_openai_endpoint() {
-    let pipeline = make_prompt_pipeline(Some("openai_responses"), Some("openai"), "127.0.0.1:443");
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#);
-    let mut body = Some(original.clone());
-
-    let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(request_action, FilterAction::Continue),
-        "the proxy must observe and trust exact OpenAI Responses application metadata selected earlier in the real pipeline"
-    );
-    let upstream = ctx
-        .upstream
-        .as_ref()
-        .expect("the load balancer must select an upstream");
-    assert_eq!(
-        upstream.address.as_ref(),
-        "127.0.0.1:443",
-        "endpoint identity must not participate in the prompt capability decision"
-    );
-    assert_eq!(
-        ctx.selected_application_protocol(),
-        Some("openai_responses"),
-        "the selected cluster must declare the Responses protocol"
-    );
-    assert_eq!(
-        ctx.selected_application_provider(),
-        Some("openai"),
-        "the selected cluster must declare the OpenAI provider"
-    );
-    let body_action = pipeline
-        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
-        .await
-        .unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "the selected-upstream body phase must allow the OpenAI prompt"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original.as_ref()),
-        "the allowed pipeline path must preserve the prompt request byte-for-byte"
-    );
+    assert_eq!(rebuilt["input"][0], provider_compaction);
+    assert_eq!(rebuilt["input"][1]["content"], "continue");
+    assert!(rebuilt.get("previous_response_id").is_none());
 }
 
 #[tokio::test]
@@ -624,6 +345,243 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
     assert!(
         ctx.request_headers_to_set.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_projects_state_owned_tools_and_tool_choice() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "tools": [{"type": "custom", "name": "apply_patch"}]
+    }));
+    state.request_body["tools"] = json!([{"type": "function", "name": "apply_patch"}]);
+    state.request_body["tool_choice"] = json!("auto");
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","tools":[{"type":"custom","name":"apply_patch"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after projecting state-owned tools"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["tools"][0]["type"], "function",
+        "selected backend should receive the state-owned function tool"
+    );
+    assert_eq!(
+        rebuilt["tool_choice"], "auto",
+        "selected backend should receive the state-owned tool choice"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_settings() {
+    for (live_reasoning, expected) in [
+        (None, json!({"effort": "high"})),
+        (
+            Some(json!({"summary": "auto"})),
+            json!({"summary": "auto", "effort": "high"}),
+        ),
+        (
+            Some(json!({"effort": "low", "summary": "detailed"})),
+            json!({"effort": "low", "summary": "detailed"}),
+        ),
+        (Some(json!({"effort": null})), json!({"effort": null})),
+        (Some(json!(null)), json!(null)),
+    ] {
+        let filter = make_filter();
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "before-filter",
+            "input": "original",
+            "conversation": "conv_configuration",
+            "reasoning": {"effort": "high", "summary": "old"}
+        }));
+        state.history_rehydrated = true;
+        ctx.extensions.insert(state);
+        let mut live = json!({
+            "model": "after-filter",
+            "input": "edited",
+            "conversation": "conv_configuration",
+            "metadata": {"changed": true}
+        });
+        if let Some(reasoning) = live_reasoning {
+            live["reasoning"] = reasoning;
+        }
+        let mut body = Some(Bytes::from(serde_json::to_vec(&live).unwrap()));
+        let action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+        let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            rebuilt["reasoning"], expected,
+            "live effort wins; only omitted effort inherits"
+        );
+        assert_eq!(rebuilt["model"], "after-filter", "later model edits must survive");
+        assert_eq!(
+            rebuilt["input"][0]["content"], "edited",
+            "later input edits must survive"
+        );
+        assert_eq!(
+            rebuilt["metadata"], live["metadata"],
+            "unrelated live fields must survive"
+        );
+        assert!(
+            rebuilt.get("conversation").is_none(),
+            "locally consumed selector must be removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_rebuild_does_not_inject_reasoning_without_local_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1", "input": "hello", "reasoning": {"effort": "high"}
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("reasoning").is_none(),
+        "non-rehydrated requests retain live reasoning absence"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_later_input_filter_edit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "before filter"}]
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    // Simulate a later body filter changing the live input after the state
+    // snapshot was created.
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"after filter"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after preserving the filtered input"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"], "after filter",
+        "selected backend must receive the live input produced by the later body filter"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_later_input_edit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "before filter"}]
+    }));
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "tool result"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"after filter"}]}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after preserving the filtered input and tool result"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"], "after filter",
+        "selected backend must receive the live input edit"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["type"], "function_call_output",
+        "selected backend must retain the accumulated agentic tool result"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_keeps_selector_only_body_valid_when_adding_state_fields() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "previous_response_id": "resp_previous",
+        "tools": [{"type": "function", "name": "lookup"}],
+        "tool_choice": "auto"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role": "user", "content": "continue"})];
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"previous_response_id":"resp_previous"}"#));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selector-only rebuild should produce a valid backend request"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["input"][0]["content"], "continue",
+        "selector-only rebuild should add the current input"
+    );
+    assert_eq!(
+        rebuilt["tools"][0]["name"], "lookup",
+        "selector-only rebuild should add state-owned tools"
+    );
+    assert_eq!(
+        rebuilt["tool_choice"], "auto",
+        "selector-only rebuild should add the state-owned tool choice"
     );
 }
 
@@ -867,6 +825,70 @@ async fn rejects_oversized_rebuilt_body_with_413() {
         matches!(&action, SelectedUpstreamBodyOutcome::Reject(r) if r.status == 413),
         "should reject with 413 when rebuilt body exceeds max_rewritten_body_bytes"
     );
+}
+
+#[tokio::test]
+async fn rejects_selected_rebuild_above_effective_request_body_limit() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_rewritten_body_bytes: 4096").unwrap();
+    let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.request_body_mode = BodyMode::StreamBuffer { max_bytes: Some(128) };
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "previous_response_id": "resp_abc123"
+    }));
+    state.messages.push(json!({
+        "role": "user",
+        "content": "x".repeat(512)
+    }));
+    state.history_rehydrated = true;
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+
+    let original = Bytes::from_static(br#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123"}"#);
+    let mut body = Some(original.clone());
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 413),
+        "selected rebuilds must reject projections above the effective request body limit"
+    );
+    assert_eq!(
+        body.as_ref(),
+        Some(&original),
+        "an oversized selected projection must not be committed to the upstream body"
+    );
+}
+
+#[test]
+fn serialized_body_cap_uses_conservative_native_projection() {
+    let opaque_state = "opaque-provider-state".repeat(512);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "continue",
+        "previous_response_id": "resp_provider"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": opaque_state
+    })];
+    state.provider_compaction_ids.insert("cmp_provider".to_owned());
+
+    let translated = super::serialize_outbound_body(&state, false).unwrap().len();
+    let native = super::serialize_outbound_body(&state, true).unwrap().len();
+    assert!(
+        native > translated,
+        "native opaque state should exceed translated summary size"
+    );
+    assert_eq!(super::serialized_outbound_body_len(&state).unwrap(), native);
 }
 
 #[tokio::test]
@@ -1168,7 +1190,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
         json!({"role": "user", "content": "hello"}),
         json!({"role": "assistant", "content": "hi"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert!(
         matches!(result, std::borrow::Cow::Borrowed(_)),
         "should borrow when no compaction items"
@@ -1180,7 +1202,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
 fn messages_for_backend_translates_compaction_item() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
     let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert!(
         matches!(result, std::borrow::Cow::Owned(_)),
         "summary insertion must return an owned input array"
@@ -1200,10 +1222,62 @@ fn messages_for_backend_mixed_items() {
         json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
         json!({"role": "user", "content": "hello"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert_eq!(result.len(), 2);
     assert_eq!(result[0]["role"], "assistant");
     assert_eq!(result[1]["role"], "user");
+}
+
+#[test]
+fn messages_for_native_backend_preserves_provider_compaction_item() {
+    let item = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
+    });
+    let msgs = vec![item.clone(), json!({"role": "user", "content": "continue"})];
+    let provider_ids = std::collections::HashSet::from(["cmp_provider".to_owned()]);
+    let result = super::messages_for_backend(&msgs, true, &provider_ids);
+
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "native Responses backends must receive the original item array"
+    );
+    assert_eq!(
+        result[0], item,
+        "provider compaction state must remain byte-equivalent as JSON"
+    );
+}
+
+#[test]
+fn messages_for_native_backend_preserves_idless_provider_compaction_item() {
+    let item = json!({
+        "type": "compaction",
+        "encrypted_content": "provider-opaque-state"
+    });
+    let messages = [item.clone()];
+    let result = super::messages_for_backend(&messages, true, &std::collections::HashSet::new());
+
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "native Responses backends must preserve valid ID-less compaction items"
+    );
+    assert_eq!(result[0], item);
+}
+
+#[test]
+fn messages_for_native_backend_translates_local_compaction_item() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("local summary");
+    let msgs = vec![json!({
+        "type": "compaction",
+        "id": "compact_local",
+        "encrypted_content": encoded
+    })];
+    let result = super::messages_for_backend(&msgs, true, &std::collections::HashSet::new());
+
+    assert_eq!(result[0]["role"], "assistant");
+    assert_eq!(result[0]["content"], "[Previous conversation summary]\n\nlocal summary");
 }
 
 #[tokio::test]
@@ -1294,49 +1368,13 @@ fn compaction_to_assistant_message_handles_invalid_base64() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a request whose selected top-level field contains 256 alternating
-/// object and array levels. When `complete` is false, omit the root close.
-fn deeply_nested_request(field: &str, complete: bool) -> Vec<u8> {
-    let mut body = format!(r#"{{"{field}":"#).into_bytes();
-    for depth in 0..256 {
-        if depth % 2 == 0 {
-            body.extend_from_slice(br#"{"nested":"#);
-        } else {
-            body.push(b'[');
-        }
-    }
-    body.extend_from_slice(b"null");
-    for depth in (0..256).rev() {
-        body.push(if depth % 2 == 0 { b'}' } else { b']' });
-    }
-    if complete {
-        body.push(b'}');
-    }
-    body
-}
-
 fn make_filter() -> Box<dyn HttpFilter> {
     super::ResponsesProxyFilter::from_config(&serde_yaml::Value::Null).unwrap()
 }
 
-/// Build a real routing pipeline so application metadata is selected by core.
-fn make_prompt_pipeline(
-    application_protocol: Option<&str>,
-    application_provider: Option<&str>,
-    endpoint: &str,
-) -> FilterPipeline {
-    let mut application = String::new();
-    if application_protocol.is_some() || application_provider.is_some() {
-        application.push_str("      http:\n");
-    }
-    if let Some(protocol) = application_protocol {
-        writeln!(application, "        application_protocol: \"{protocol}\"").unwrap();
-    }
-    if let Some(provider) = application_provider {
-        writeln!(application, "        application_provider: \"{provider}\"").unwrap();
-    }
-    let yaml = format!(
-        r#"
+/// Build a real routing pipeline for native Responses compaction coverage.
+fn make_native_responses_pipeline() -> FilterPipeline {
+    let yaml = r#"
 - filter: router
   routes:
     - path: /v1/responses
@@ -1344,16 +1382,18 @@ fn make_prompt_pipeline(
 - filter: load_balancer
   clusters:
     - name: target
-{application}      endpoints:
-        - "{endpoint}"
+      http:
+        application_protocol: openai_responses
+        application_provider: openai
+      endpoints:
+        - "127.0.0.1:443"
 - filter: openai_responses_proxy
-"#
-    );
+"#;
     let mut registry = FilterRegistry::with_builtins();
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_proxy" => super::ResponsesProxyFilter::from_config
     );
-    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&yaml).unwrap();
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(yaml).unwrap();
     FilterPipeline::build(&mut entries, &registry).unwrap()
 }

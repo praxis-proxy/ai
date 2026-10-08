@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_responses_format` mode routing.
+//! Integration tests for the `openai_responses_request` mode routing.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -33,10 +33,6 @@ fn mode_branch_routes_stateful_conditions_to_stateful_path() {
             "conversation present",
             r#"{"model":"gpt-4.1","input":"Hello","store":false,"conversation":{"id":"conv_123"}}"#,
         ),
-        (
-            "prompt.id present",
-            r#"{"model":"gpt-4.1","input":"Hello","store":false,"prompt":{"id":"pmpt_123"}}"#,
-        ),
     ];
 
     for (label, body) in cases {
@@ -63,6 +59,30 @@ fn mode_branch_rejects_background_before_upstream() {
     assert_eq!(parse_status(&raw), 400);
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(response["error"]["message"], "background mode is not supported");
+}
+
+#[test]
+fn mode_branch_rejects_prompt_before_upstream() {
+    let stateful_guard = start_backend_with_shutdown("unexpected-stateful-request");
+    let default_guard = start_backend_with_shutdown("unexpected-default-request");
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&mode_branch_yaml(
+        proxy_port,
+        stateful_guard.port(),
+        default_guard.port(),
+    ))
+    .unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false,"prompt":{"id":"pmpt_123"}}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 400);
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        response["error"]["message"],
+        "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
+    );
 }
 
 #[test]
@@ -174,12 +194,14 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         branch_chains:
           - name: stateful_branch
             on_result:
-              filter: openai_responses_format
+              filter: openai_responses_request
               key: mode
               result: stateful
             rejoin: shared_load_balancer
@@ -191,8 +213,14 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "stateful"
       # Classification preserves provider-owned fields. The managed-path
-      # validator owns rejection of unsupported background execution.
-      - filter: openai_responses_validate
+      # request filter owns rejection of unsupported background execution.
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: router
         routes:
           - path_prefix: "/"

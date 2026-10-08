@@ -4,13 +4,14 @@
 //! Configuration types for the conversations filter.
 
 use percent_encoding::percent_decode_str;
-use praxis_filter::{FilterError, has_dot_dot_traversal};
+use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
+use praxis_filter::{FilterError, has_dot_dot_traversal, parse_filter_config};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
-use crate::store::{PoolConfig, SslMode, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_conversations";
@@ -28,6 +29,47 @@ pub(crate) enum StorageBackend {
 
     /// `PostgreSQL` backend. Enabled by default through `store-postgres`.
     Postgres,
+}
+
+impl StorageBackend {
+    /// The provisioning factory id this backend maps to.
+    fn factory_id(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+/// Build the persisted-state backend id and config for the conversations store
+/// from a filter-chain entry's config.
+///
+/// The serving-runtime provisioner reads this so it can register the
+/// conversations store into the per-listener registry the filter resolves at
+/// request time. The parsed `ConversationsConfig` is the single source of the
+/// table defaults and the generated (unused) responses-table name the combined
+/// backend requires; the connection URL and TLS material pass through from the
+/// original config so no secret is round-tripped.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the config does not parse or cannot be mapped to
+/// JSON.
+pub fn store_ref_config(filter_config: &serde_yaml::Value) -> Result<(String, Value), FilterError> {
+    let cfg: ConversationsConfig = parse_filter_config(FILTER_NAME, filter_config)?;
+    let mut config = serde_json::to_value(filter_config)
+        .map_err(|e| FilterError::from(format!("{FILTER_NAME}: config is not representable as JSON: {e}")))?;
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| FilterError::from(format!("{FILTER_NAME}: config must be a mapping")))?;
+    obj.remove("backend");
+    // The parsed config is authoritative for the table set: it applies the same
+    // defaults the filter uses and generates the unused responses table the
+    // combined backend's DDL requires.
+    obj.insert("responses_table".to_owned(), Value::String(cfg.responses_table()));
+    obj.insert("conversations_table".to_owned(), Value::String(cfg.conversations_table));
+    obj.insert("items_table".to_owned(), Value::String(cfg.items_table));
+    Ok((cfg.backend.factory_id().to_owned(), config))
 }
 
 // -----------------------------------------------------------------------------
@@ -114,8 +156,9 @@ pub(crate) struct ConversationsConfig {
     ///
     /// By default, DNS names, localhost, loopback, private,
     /// link-local, cloud metadata, unspecified, and Unix socket
-    /// targets are rejected. This opt-in is intended for local
-    /// development and tests.
+    /// targets are rejected. This opt-in is intended for local development
+    /// and tests; cloud metadata, unspecified, and multicast addresses remain
+    /// blocked when it is enabled.
     #[serde(default)]
     pub allow_private_database_url: bool,
 
@@ -255,14 +298,6 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Re-validate only the `PostgreSQL` host/IP portions of the
-/// connection URL immediately before `SQLx` resolves and connects.
-#[cfg(feature = "store-postgres")]
-pub(crate) fn revalidate_postgres_host(cfg: &ConversationsConfig) -> Result<(), FilterError> {
-    let database_url = cfg.database_url.expose_secret();
-    postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
-}
-
 /// Validate `PostgreSQL` TLS options.
 #[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ConversationsConfig, database_url: &str) -> Result<(), FilterError> {
@@ -299,14 +334,21 @@ fn reject_postgres_fields(cfg: &ConversationsConfig) -> Result<(), FilterError> 
 
 /// Return whether a SQLite URL targets an in-memory database.
 fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    url.split_once('?')
-        .map_or("", |(_, query)| query)
-        .split('&')
-        .any(|param| param == "mode=memory")
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Extract the file path component from a SQLite URL.

@@ -4,29 +4,35 @@
 //! Unit tests for the `openai_response_store` filter.
 
 use std::{
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, HttpFilter as _, HttpFilterContext,
-    parse_filter_config,
+    StreamingTerminalResponse, parse_filter_config,
 };
 use serde_json::json;
 
 use super::{
-    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
-    config::{ResponseStoreConfig, revalidate_postgres_host, validate_config},
-    input_items::DEFAULT_PAGE_LIMIT,
-    list_input_items,
+    ResponseStoreFilter,
+    config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
     openai::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore},
+    service::responses::{
+        InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items,
+    },
+    store::{
+        DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
+        SqliteResponseStore,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -302,8 +308,9 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "false");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -322,93 +329,16 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_without_format_metadata() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue when format metadata is absent"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize before request classification is available"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_for_non_responses_format() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue for non-responses format"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize for non-Responses traffic"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_when_store_is_false() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue when store is false"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize when persistence and rehydrate are both unnecessary"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_streaming_requests() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue for streaming requests"
-    );
-    assert!(
-        filter.store.get().is_some(),
-        "store should initialize for streaming requests to enable persistence at EOS"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_request_skips_for_get_to_unrelated_path() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
         "should skip for GET to unrelated path"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not be initialized for non-responses GET paths"
     );
 }
 
@@ -423,131 +353,40 @@ async fn on_request_skips_delete_on_unrelated_path() {
         matches!(action, FilterAction::Continue),
         "DELETE to unrelated path should continue"
     );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not be initialized for unrelated DELETE"
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_rejects_persistable_request_when_store_not_provisioned() {
+    // The filter resolves the provisioned store from the context registry. A
+    // persistable Responses create with no store provisioned fails fast with a
+    // 500 rather than running inference it cannot persist.
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "a persistable request without a provisioned store must reject with 500"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_openai_responses_format() {
+async fn on_request_continues_for_previous_response_id_with_store_provisioned() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
+    ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "should continue after initializing store"
-    );
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(
-        store_opt.is_some(),
-        "store should be Some for valid sqlite::memory: config"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_previous_response_id_even_when_store_false() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue after initializing the store for rehydrate"
-    );
-    assert!(
-        filter.store.get().and_then(Option::as_ref).is_some(),
-        "store should initialize when previous_response_id requires rehydrate"
-    );
-}
-
-// -----------------------------------------------------------------------------
-// on_request Registry
-// -----------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_registers_store_in_response_stores() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue after registering store"
-    );
-    assert!(
-        registry.contains("default"),
-        "store should be registered as 'default' in response_stores"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_skips_registration_when_no_registry() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue even without registry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_registers_store_for_previous_response_id_even_when_store_false() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"Hi","store":false,"previous_response_id":"resp_prev"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "request body phase should continue after registering the store"
-    );
-    assert!(
-        registry.contains("default"),
-        "store should register so rehydrate can fetch previous_response_id"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_does_not_initialize_store_for_store_false_without_previous_response() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "request body phase should continue for store=false without rehydrate"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize when neither persistence nor rehydrate needs it"
+        "rehydrate with a provisioned store should continue"
     );
 }
 
@@ -564,10 +403,10 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponseStoreRegistry::new());
-    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    install_store(&mut ctx).await;
+    // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -590,8 +429,8 @@ async fn on_request_body_does_not_arm_persistence_when_store_false() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -607,19 +446,18 @@ async fn on_request_body_does_not_arm_persistence_when_store_false() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
-    // A store=false request with previous_response_id registers the store so
-    // rehydrate can read history, but it will not persist a new response, so it
-    // must not arm persistence. Arming on registration alone would resurrect the
+    // A store=false request with previous_response_id needs the store so rehydrate
+    // can read history, but it will not persist a new response, so it must not arm
+    // persistence. Arming on store presence alone would resurrect the
     // pipeline-scoped bug this marker exists to fix.
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
+    install_store(&mut ctx).await;
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
+    ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"Hi","store":false,"previous_response_id":"resp_prev"}"#,
     ));
@@ -628,10 +466,6 @@ async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
     assert!(
         matches!(action, FilterAction::Continue),
         "request body phase should continue"
-    );
-    assert!(
-        registry.contains("default"),
-        "rehydrate still needs the store registered"
     );
     assert!(
         !ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
@@ -666,7 +500,7 @@ async fn on_response_sets_skip_persist_for_non_2xx() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -687,7 +521,7 @@ async fn on_response_sets_skip_persist_for_non_json_content_type() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -712,7 +546,7 @@ async fn on_response_continues_for_json_200() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -729,7 +563,7 @@ async fn on_response_accepts_mixed_case_json_content_type() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -751,8 +585,8 @@ async fn on_response_continues_for_event_stream_200() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -771,32 +605,6 @@ async fn on_response_continues_for_event_stream_200() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_rejects_when_store_unavailable_for_persist() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "should reject with 500 when store is unavailable for a persistable request"
-    );
-}
-
 // -----------------------------------------------------------------------------
 // on_response_body
 // -----------------------------------------------------------------------------
@@ -806,7 +614,7 @@ fn on_response_body_releases_skipped_non_end_of_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(b"partial"));
 
     let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
@@ -821,8 +629,8 @@ async fn on_response_body_skips_streaming_persist_on_parse_error() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     ctx.set_metadata("responses.stream_parse_error", "true");
@@ -844,8 +652,8 @@ async fn on_response_body_skips_streaming_persist_on_incomplete_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     ctx.set_metadata("responses.stream_incomplete", "true");
@@ -863,8 +671,8 @@ async fn on_response_body_skips_streaming_persist_when_no_state() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut body: Option<Bytes> = None;
@@ -882,12 +690,10 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let owner = crate::StateOwner::from_trusted_parts("tenant-stream", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
-
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized for streaming");
 
     let response_json = json!({
         "id": "resp_stream_unit",
@@ -909,7 +715,6 @@ async fn on_response_body_persists_streaming_response_at_eos() {
         "should continue after persisting streaming response"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&owner, "resp_stream_unit")
         .await
@@ -946,38 +751,16 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     );
 }
 
-#[test]
-fn build_record_from_state_returns_none_for_null_response_object() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState::default());
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(result.is_none(), "should return None when response_object is null");
-}
-
-#[test]
-fn build_record_from_state_returns_none_for_missing_fields() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        response_object: json!({"id": "resp_1"}),
-        ..Default::default()
-    });
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(
-        result.is_none(),
-        "should return None when required fields (created_at, model) are missing"
-    );
-}
+// Record-assembly unit tests (null / missing-field / streaming-history cases)
+// moved to the service layer: `crate::service::responses` tests, where they run
+// against plain values with no pipeline or database.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_releases_when_skip_persist_is_true() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     ctx.set_metadata("responses.skip_persist", "true");
     let mut body = Some(Bytes::from_static(b"{}"));
@@ -994,8 +777,9 @@ async fn on_response_body_releases_streaming_request_before_eos() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     let request_action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(request_action, FilterAction::Continue),
@@ -1025,6 +809,12 @@ struct RecordingResponseStore {
     upserts: std::sync::atomic::AtomicUsize,
     fail: bool,
     records: std::sync::Mutex<std::collections::HashMap<String, ResponseRecord>>,
+    /// In-memory replay logs keyed by response id, kept ordered by
+    /// `sequence_number`. Mirrors the real backend's owner-gated, insert-if-absent
+    /// semantics so replay seam tests observe truthful behavior.
+    events: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::store::ResponseEventRecord>>>,
+    /// When true, `append_events` fails to prove the terminal seam fails closed.
+    fail_events: bool,
 }
 
 impl RecordingResponseStore {
@@ -1033,14 +823,38 @@ impl RecordingResponseStore {
             upserts: std::sync::atomic::AtomicUsize::new(0),
             fail,
             records: std::sync::Mutex::new(std::collections::HashMap::new()),
+            events: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fail_events: false,
+        }
+    }
+
+    /// A store whose response upserts succeed but whose event-log appends fail,
+    /// used to prove the replay flush fails closed after the record is durable.
+    fn new_failing_events() -> Self {
+        Self {
+            fail_events: true,
+            ..Self::new(false)
         }
     }
 
     fn upsert_count(&self) -> usize {
         self.upserts.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Number of persisted replay events for a response.
+    fn event_count(&self, response_id: &str) -> usize {
+        self.events
+            .lock()
+            .expect("events mutex should not be poisoned")
+            .get(response_id)
+            .map_or(0, Vec::len)
+    }
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "each mock method is one short mutex-guarded critical section; holding the guard is what keeps the multi-step ops atomic"
+)]
 #[async_trait::async_trait]
 impl crate::store::ResponseStore for RecordingResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), crate::store::StoreError> {
@@ -1111,16 +925,94 @@ impl crate::store::ResponseStore for RecordingResponseStore {
     ) -> Result<Option<usize>, crate::store::StoreError> {
         Ok(None)
     }
+
+    async fn append_events(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        events: &[crate::store::ResponseEventRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        if self.fail_events {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced event-log failure".to_owned(),
+            ));
+        }
+        // Emulate the backend's EXISTS gate: silently drop rows whose parent
+        // response does not exist under the same owner.
+        let parent_exists = self
+            .records
+            .lock()
+            .expect("records mutex should not be poisoned")
+            .get(response_id)
+            .is_some_and(|record| record.owner == *owner);
+        if !parent_exists {
+            return Ok(());
+        }
+        let mut logs = self.events.lock().expect("events mutex should not be poisoned");
+        let log = logs.entry(response_id.to_owned()).or_default();
+        for event in events {
+            if event.owner != *owner {
+                continue;
+            }
+            // Insert-if-absent by sequence_number.
+            if log.iter().any(|e| e.sequence_number == event.sequence_number) {
+                continue;
+            }
+            log.push(event.clone());
+        }
+        log.sort_by_key(|e| e.sequence_number);
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::ResponseEventRecord>, crate::store::StoreError> {
+        let logs = self.events.lock().expect("events mutex should not be poisoned");
+        let Some(log) = logs.get(response_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(log
+            .iter()
+            .filter(|e| e.owner == *owner)
+            .filter(|e| after.is_none_or(|n| e.sequence_number > n))
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn event_log_status(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+    ) -> Result<crate::store::EventLogStatus, crate::store::StoreError> {
+        let logs = self.events.lock().expect("events mutex should not be poisoned");
+        let Some(log) = logs.get(response_id) else {
+            return Ok(crate::store::EventLogStatus::Absent);
+        };
+        let owned: Vec<&crate::store::ResponseEventRecord> = log.iter().filter(|e| e.owner == *owner).collect();
+        let Some(max_sequence) = owned.iter().map(|e| e.sequence_number).max() else {
+            return Ok(crate::store::EventLogStatus::Absent);
+        };
+        if owned.iter().any(|e| e.terminal) {
+            Ok(crate::store::EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(crate::store::EventLogStatus::Incomplete { max_sequence })
+        }
+    }
 }
 
-/// Install a [`RecordingResponseStore`] before the request phase so
-/// `get_or_init_store` keeps it instead of building a real backend.
-fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<RecordingResponseStore>) {
-    let dyn_store: std::sync::Arc<dyn crate::store::ResponseStore> = store;
-    assert!(
-        filter.store.set(Some(dyn_store)).is_ok(),
-        "store OnceCell should be empty before the request phase"
-    );
+/// Register a store as the default store in the request context so the filter
+/// resolves it instead of a real backend.
+fn install_recording_store(ctx: &mut HttpFilterContext<'_>, store: Arc<dyn PersistedStateBackend>) {
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), store)
+        .expect("recording store should register");
+    ctx.extensions.insert(registry);
 }
 
 /// Build a streaming request context whose accumulated state carries a canonical
@@ -1137,12 +1029,14 @@ fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<R
 async fn armed_streaming_ctx<'a>(
     filter: &ResponseStoreFilter,
     req: &'a praxis_filter::Request,
+    store: Arc<dyn PersistedStateBackend>,
     response_id: &str,
     terminal_emitted: bool,
 ) -> HttpFilterContext<'a> {
     let mut ctx = crate::test_utils::make_owned_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    install_recording_store(&mut ctx, store);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(filter, &mut ctx).await;
 
     ctx.extensions.insert(ResponsesState {
@@ -1163,11 +1057,11 @@ async fn armed_streaming_ctx<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persists_before_eos_release() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_terminal", true).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_terminal", true).await;
 
     // The deferred terminal `response.completed` frame arrives as a
     // non-end-of-stream chunk. It must be persisted BEFORE it is released.
@@ -1208,13 +1102,114 @@ async fn streaming_terminal_frame_persists_before_eos_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_persists_before_release_and_only_once() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "local completion must be durable before release"
+    );
+
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "EOS must not repeat the local completion write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_at_eos_still_persists() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local_eos", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, true).unwrap());
+    assert_eq!(store.upsert_count(), 1, "an EOS terminal must still be durable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_at_eos_does_not_persist_completed_upstream_snapshot() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_failed_irr", false).await;
+
+    // IRR can retain an upstream `status: completed` snapshot while replacing
+    // its deferred response.completed with a client-visible SSE error. The
+    // inner step's error metadata does not reach this outer filter.
+    let mut error = Some(Bytes::from_static(b"event: error\ndata: {\"type\":\"error\"}\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut error, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(store.upsert_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_after_replay_decoder_overflow_does_not_persist() {
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(64).unwrap(), NonZeroU64::new(1).unwrap());
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_overflow_error", false).await;
+
+    // The first client-visible frame exceeds the replay decoder's byte limit.
+    // Its poisoned decoder cannot decode the later error, which can also be
+    // split across response-body callbacks.
+    let created = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"sequence_number\":0,\"padding\":\"{}\"}}\n\n",
+        "x".repeat(3072)
+    );
+    let mut body = Some(Bytes::from(created));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Release
+    ));
+    for part in [b"event: er".as_slice(), b"ror\ndata: {\"type\":\"error\"}\n\n"] {
+        let mut body = Some(Bytes::copy_from_slice(part));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Release
+        ));
+    }
+    drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        0,
+        "the hidden completed snapshot must not be persisted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persist_failure_fails_closed() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(true));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_failclosed", true).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_failclosed", true).await;
 
     let mut terminal = Some(Bytes::from_static(
         b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -1232,6 +1227,24 @@ async fn streaming_terminal_frame_persist_failure_fails_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_fail_open_error_is_not_retried_at_eos() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_open", true).await;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    assert!(filter.on_response_body(&mut ctx, &mut terminal, false).is_err());
+    // A failure_mode: open pipeline suppresses the error above and delivers
+    // the chunk. EOS must not retry state already consumed by that write.
+    let mut eos_body = None;
+    let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
+    assert!(matches!(eos_action, FilterAction::Continue));
+    assert_eq!(store.upsert_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_propagates_persist_rejection() {
     // #937 (latest-main integration): `persist_from_streaming_state` returns
     // `Ok(FilterAction::Reject(_))` when the immutable owner/request state was
@@ -1239,15 +1252,16 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
     // rejection instead of unconditionally releasing `response.completed`, so a
     // client never observes completion for a record that was refused persistence.
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
 
     // Deliberately skip the request phase so no `ResponseStoreRequestState`
     // (owner + input) is captured; streaming persistence then fails closed.
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    install_recording_store(&mut ctx, store_dyn);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         response_object: json!({
             "id": "resp_937_reject",
@@ -1279,13 +1293,13 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_without_terminal_signal_persists_only_at_eos() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     // No terminal frame observed through this filter (e.g. a plain single-round
     // stream): the signal stays unset and the EOS fallback still persists.
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_fallback", false).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_fallback", false).await;
 
     let mut chunk = Some(Bytes::from_static(b"event: response.output_text.delta\n\n"));
     let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
@@ -1312,12 +1326,228 @@ async fn streaming_without_terminal_signal_persists_only_at_eos() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Replay event-log capture → terminal-seam flush
+// -----------------------------------------------------------------------------
+
+/// Three canonical SSE events (created, one delta, completed) in one chunk, the
+/// terminal event last. Each carries the numeric `sequence_number` capture keys
+/// on.
+const SEAM_EVENTS_CHUNK: &[u8] = b"event: response.created\n\
+data: {\"type\":\"response.created\",\"sequence_number\":0}\n\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_persist_at_terminal_seam() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam", true).await;
+
+    // The deferred terminal frame arrives with the captured events; the seam
+    // persists the record and then flushes the whole log before release.
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the terminal chunk is released after the record and log persist"
+    );
+    assert_eq!(store.upsert_count(), 1, "the JSON record persists exactly once");
+    assert_eq!(
+        store.event_count("resp_seam"),
+        3,
+        "all captured events flush together at the terminal seam"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_seam", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "events persist in ascending sequence order"
+    );
+    assert!(
+        events.last().unwrap().terminal,
+        "the terminal event must be marked terminal so the log is replayable"
+    );
+    assert!(
+        events.iter().take(2).all(|e| !e.terminal),
+        "non-terminal events must not be flagged terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_event_flush_failure_fails_closed() {
+    let filter = make_filter();
+    // Record upserts succeed; the event-log append fails.
+    let store = Arc::new(RecordingResponseStore::new_failing_events());
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam_fail", true).await;
+
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let result = filter.on_response_body(&mut ctx, &mut chunk, false);
+    assert!(
+        result.is_err(),
+        "a replay-log append failure must fail closed so the client never observes response.completed"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the record persists before the failing event flush is attempted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_events_over_budget_are_not_persisted() {
+    // A one-event count bound: the second event trips the bound, abandoning the
+    // whole log so the response stays retrievable as JSON but is not replayable.
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1).unwrap(), super::config::DEFAULT_MAX_EVENT_BYTES);
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_seam_budget", true).await;
+
+    let mut chunk = Some(Bytes::from_static(SEAM_EVENTS_CHUNK));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "an over-budget capture never withholds the client bytes"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the JSON record still persists when the log is abandoned"
+    );
+    assert_eq!(
+        store.event_count("resp_seam_budget"),
+        0,
+        "an over-budget log is dropped entirely so no partial replay is served"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_single_event_over_line_default_is_captured() {
+    // A single terminal event larger than the SSE decoder's 1 MiB default
+    // per-line cap but well within the 16 MiB replay byte budget. Before the
+    // capture decoder raised `max_line_bytes` alongside `max_record_bytes`, a
+    // >1 MiB `data:` line poisoned the decoder and abandoned the whole log; the
+    // event must now be captured and remain replayable.
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_big_event", true).await;
+
+    // ~2 MiB single-line terminal event: one `data: <json>` line whose padding
+    // pushes it past the 1 MiB default per-line limit but under 16 MiB.
+    let pad = "x".repeat(2 * 1024 * 1024);
+    let big_event = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":0,\"pad\":\"{pad}\"}}\n\n"
+    );
+    let mut chunk = Some(Bytes::from(big_event));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a within-budget large event is captured and released at the terminal seam"
+    );
+    assert_eq!(
+        store.event_count("resp_big_event"),
+        1,
+        "a >1 MiB event under the byte budget must be captured, not dropped by a stale 1 MiB line cap"
+    );
+
+    let events = store
+        .list_events_after(&crate::test_utils::test_owner("default"), "resp_big_event", None, 10)
+        .await
+        .unwrap();
+    assert!(
+        events.last().is_some_and(|e| e.terminal),
+        "the large terminal event must remain marked terminal so the log is replayable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_event_within_budget_but_over_raw_framing_is_captured() {
+    // The configured `max_event_bytes` bounds the JSON `data` payload only, but
+    // the SSE decoder additionally counts framing: `max_record_bytes` sums the
+    // `event:` type value alongside the payload. Sizing the decoder to exactly
+    // the budget rejected a within-budget payload once framing pushed the record
+    // past it -- poisoning the decoder and abandoning the whole log so a
+    // completed response returned 400 on replay. The framing headroom must let
+    // the event decode and reach the authoritative payload check.
+    let budget: u64 = 100;
+    let filter =
+        ResponseStoreFilter::with_bounds(super::config::DEFAULT_MAX_EVENT_COUNT, NonZeroU64::new(budget).unwrap());
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_framing_boundary", true).await;
+
+    // A `data` payload within the byte budget whose SSE record (payload plus the
+    // `event: response.completed` type value) exceeds the raw budget. A decoder
+    // sized to exactly `max_event_bytes` reports `RecordTooLarge` here.
+    let event_type = "response.completed";
+    let prefix = r#"{"type":"response.completed","sequence_number":0,"p":""#;
+    let suffix = r#""}"#;
+    let target_data_len = 90_usize;
+    let pad_len = target_data_len - prefix.len() - suffix.len();
+    let data = format!("{prefix}{}{suffix}", "x".repeat(pad_len));
+    assert_eq!(data.len(), target_data_len, "test payload is the intended size");
+    assert!(
+        data.len() as u64 <= budget,
+        "the JSON payload must be within the configured byte budget"
+    );
+    assert!(
+        (event_type.len() + data.len()) as u64 > budget,
+        "the SSE record framing must exceed the raw budget so it exercises the headroom"
+    );
+
+    let event = format!("event: {event_type}\ndata: {data}\n\n");
+    let mut chunk = Some(Bytes::from(event));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a within-budget event is captured and released at the terminal seam"
+    );
+    assert_eq!(
+        store.event_count("resp_framing_boundary"),
+        1,
+        "an event within the payload budget must survive SSE framing, not be dropped as RecordTooLarge"
+    );
+
+    let events = store
+        .list_events_after(
+            &crate::test_utils::test_owner("default"),
+            "resp_framing_boundary",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(
+        events.last().is_some_and(|e| e.terminal),
+        "the terminal event must remain terminal so the log is replayable"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_buffers_persistable_non_end_of_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut body = Some(Bytes::from_static(b"{\"id\":\"resp_partial\""));
@@ -1333,7 +1563,7 @@ async fn on_response_body_skips_when_body_is_none() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body: Option<Bytes> = None;
 
@@ -1349,7 +1579,8 @@ async fn on_response_body_continues_when_terminal_body_is_none() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1372,7 +1603,7 @@ async fn on_response_body_skips_when_body_is_empty() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body = Some(Bytes::new());
 
@@ -1388,7 +1619,7 @@ async fn on_response_body_skips_when_body_is_invalid_json() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body = Some(Bytes::from_static(b"not json {{{"));
 
@@ -1404,7 +1635,7 @@ async fn on_response_body_skips_when_id_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"created_at": 1000, "model": "gpt-4.1"});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1421,7 +1652,7 @@ async fn on_response_body_skips_when_created_at_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"id": "resp_test", "model": "gpt-4.1"});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1438,7 +1669,7 @@ async fn on_response_body_skips_when_model_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"id": "resp_test", "created_at": 1000});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1455,12 +1686,11 @@ async fn on_response_body_persists_valid_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let body_json = json!({
         "id": "resp_test123",
@@ -1478,7 +1708,6 @@ async fn on_response_body_persists_valid_response() {
         "should continue after spawning persist task"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_test123")
         .await
@@ -1516,12 +1745,11 @@ async fn on_response_body_persists_string_input_as_message_item() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let body_json = json!({
         "id": "resp_string_input",
@@ -1539,7 +1767,6 @@ async fn on_response_body_persists_string_input_as_message_item() {
         "should continue after spawning persist task"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_string_input")
         .await
@@ -1565,7 +1792,8 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.current_filter_id = Some(7);
 
     let request_input = json!([{"role": "user", "content": "Captured request input"}]);
@@ -1580,8 +1808,6 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
         "request body phase should capture input and continue"
     );
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let response_json = json!({
         "id": "resp_no_echoed_input",
@@ -1599,7 +1825,6 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
         "response body phase should persist and continue"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_no_echoed_input")
         .await
@@ -1624,98 +1849,10 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
-#[test]
-fn streaming_record_uses_request_input_when_state_messages_are_empty() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let request_input = json!([{"role": "user", "content": "Captured streaming input"}]);
-    let response_json = json!({
-        "id": "resp_stream_no_state_messages",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "content": "Stored streaming output"}]
-    });
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json.clone(),
-        ..Default::default()
-    });
-
-    let record = super::filter::build_record_from_state(
-        &ctx,
-        crate::test_utils::test_owner("default"),
-        Some(request_input.clone()),
-    )
-    .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.input, request_input,
-        "stored input should come from the original streaming request"
-    );
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Captured streaming input"},
-            {"type": "message", "content": "Stored streaming output"}
-        ]),
-        "empty default ResponsesState messages should not hide request input"
-    );
-}
-
-#[test]
-fn streaming_record_preserves_mcp_metadata_from_persisted_messages() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let mcp_item = json!({
-        "id": "mcpl_1",
-        "type": "mcp_list_tools",
-        "server_label": "weather",
-        "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]
-    });
-    let response_json = json!({
-        "id": "resp_stream_mcp",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "role": "assistant", "content": "Next answer"}]
-    });
-
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json,
-        messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        persisted_messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            mcp_item.clone(),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        ..Default::default()
-    });
-
-    let request_input = json!([{"role": "user", "content": "What next?"}]);
-    let record =
-        super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), Some(request_input))
-            .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Hello"},
-            {"id": "mcpl_1", "type": "mcp_list_tools", "server_label": "weather",
-             "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]},
-            {"type": "message", "role": "assistant", "content": "Tools loaded"},
-            {"role": "user", "content": "What next?"},
-            {"type": "message", "role": "assistant", "content": "Next answer"}
-        ]),
-        "streaming record should preserve MCP metadata from persisted_messages, not drop it via messages"
-    );
-}
+// `streaming_record_uses_request_input_when_state_messages_are_empty` and
+// `streaming_record_preserves_mcp_metadata_from_persisted_messages` moved to the
+// service layer: `crate::service::responses` tests exercise `build_record`
+// directly against plain values.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_after_format_request_body_classification() {
@@ -1723,7 +1860,9 @@ async fn pipeline_persists_after_format_request_body_classification() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -1746,6 +1885,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
 
     let request_json = json!({
         "model": "gpt-4.1",
@@ -1761,7 +1901,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "format classifier should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.format"),
+        ctx.get_metadata("openai_responses_request.format"),
         Some("openai_responses"),
         "format classifier should write metadata before store filter runs"
     );
@@ -1830,7 +1970,9 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
@@ -1853,6 +1995,8 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    // Provision the store the registry-only filter resolves at request time.
+    ctx.extensions.insert(file_store_registry(&db_url).await);
     let request_json = json!({
         "model": "gpt-4.1",
         "input": [{"role": "user", "content": "Hello"}]
@@ -1936,7 +2080,9 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -1959,6 +2105,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
 
     let request_json = json!({
         "model": "gpt-4.1",
@@ -1975,7 +2122,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "format classifier should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.stream"),
+        ctx.get_metadata("openai_responses_request.stream"),
         Some("true"),
         "format classifier should detect stream=true"
     );
@@ -2062,7 +2209,9 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2097,12 +2246,14 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
         .unwrap();
     assert!(
         matches!(request_body_action, FilterAction::Release),
-        "format classifier should release the buffered request body"
+        "the fact publisher should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.format"),
-        Some("openai_chat_completions"),
-        "format classifier should mark Chat Completions traffic"
+        ctx.get_metadata("openai_responses_request.format"),
+        None,
+        "a /v1/chat/completions POST is not a body-bearing Responses operation, \
+         so the fact publisher classifies nothing and publishes no Responses \
+         format fact (head-based protocol identity is ai_operation's job)"
     );
     ctx.buffered_request_body = request_body.clone();
 
@@ -2151,7 +2302,9 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2172,7 +2325,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    pipeline.add_pipeline_extension(Box::new(file_store_registry(&db_url).await));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -2291,7 +2444,9 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2312,7 +2467,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    pipeline.add_pipeline_extension(Box::new(file_store_registry(&db_url).await));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -2395,166 +2550,6 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     drop(store);
     drop(pipeline);
     cleanup_sqlite_file(&db_path);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn store_init_failure_is_permanent() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(rejection.status, 500, "first request should reject with 500");
-
-    let store_opt = filter
-        .store
-        .get()
-        .expect("store OnceCell should be initialized after first attempt");
-    assert!(store_opt.is_none(), "store should be None after failed init");
-
-    let mut ctx2 = crate::test_utils::make_owned_filter_context(&req);
-    ctx2.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action2 = filter.on_request(&mut ctx2).await.unwrap();
-    let rejection2 = expect_reject(action2);
-    assert_eq!(rejection2.status, 500, "second request should also reject with 500");
-
-    let store_opt2 = filter.store.get().expect("store OnceCell should still be initialized");
-    assert!(
-        store_opt2.is_none(),
-        "store should remain None on second request (failure is permanent)"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "failed postgres initialization should reject with 500"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization should leave OnceCell unset for retry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached_on_get() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_test123");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    drop(filter.on_request(&mut ctx).await.unwrap());
-
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization on GET should leave OnceCell unset for retry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached_on_delete() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_test123");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "DELETE with failed postgres init should reject with 500"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization on DELETE should leave OnceCell unset for retry"
-    );
 }
 
 // -----------------------------------------------------------------------------
@@ -2930,7 +2925,7 @@ fn postgres_config_allows_private_with_private_database_url_opt_in() {
 }
 
 #[test]
-fn postgres_config_allows_unspecified_with_private_database_url_opt_in() {
+fn postgres_config_rejects_unspecified_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
@@ -2943,8 +2938,8 @@ allow_private_database_url: true
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_ok(),
-        "explicit private database URL opt-in should allow unspecified hosts"
+        result.is_err(),
+        "unspecified database hosts must remain blocked after the private-target opt-in"
     );
 }
 
@@ -3727,16 +3722,11 @@ fn postgres_config_rejects_empty_host() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_returns_200_when_found() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_found",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_found", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_found");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3753,10 +3743,11 @@ async fn get_response_returns_200_when_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_returns_404_when_not_found() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nonexistent");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3773,10 +3764,11 @@ async fn get_response_returns_404_when_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_tenant_isolation() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant", "tenant_a", json!([])).await;
+    let registry = init_store_and_seed("resp_tenant", "tenant_a", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_tenant");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3791,8 +3783,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
     let filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
-    init_store_and_seed_owner(
-        &filter,
+    let registry = init_store_and_seed_owner(
         "resp_owner_private",
         owner.clone(),
         json!([{"id": "item_private", "type": "message"}]),
@@ -3807,6 +3798,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
         let req = crate::test_utils::make_request(method, path);
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.extensions.insert(other.clone());
+        ctx.extensions.insert(registry.clone());
         let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
         assert_eq!(rejection.status, 404, "wrong-owner access must look absent: {path}");
     }
@@ -3814,6 +3806,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_owner_private");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(owner);
+    ctx.extensions.insert(registry);
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(rejection.status, 200, "wrong-owner delete must not mutate the response");
 }
@@ -3821,9 +3814,10 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_state_access_fails_closed_without_an_owner() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_private");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
 
@@ -3838,15 +3832,17 @@ async fn unauthorized_and_missing_responses_are_externally_identical() {
     let empty_filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
-    init_store_and_seed_owner(&owned_filter, "resp_indistinguishable", owner, json!([])).await;
-    init_store(&empty_filter).await;
+    let seeded = init_store_and_seed_owner("resp_indistinguishable", owner, json!([])).await;
+    let empty = store_registry().await;
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_indistinguishable");
 
     let mut unauthorized_ctx = crate::test_utils::make_filter_context(&req);
     unauthorized_ctx.extensions.insert(other.clone());
+    unauthorized_ctx.extensions.insert(seeded);
     let unauthorized = expect_reject(owned_filter.on_request(&mut unauthorized_ctx).await.unwrap());
     let mut missing_ctx = crate::test_utils::make_filter_context(&req);
     missing_ctx.extensions.insert(other);
+    missing_ctx.extensions.insert(empty);
     let missing = expect_reject(empty_filter.on_request(&mut missing_ctx).await.unwrap());
 
     assert_eq!(unauthorized.status, missing.status);
@@ -3857,10 +3853,11 @@ async fn unauthorized_and_missing_responses_are_externally_identical() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_trailing_slash_handled() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_slash", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_slash", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_slash/");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3885,30 +3882,41 @@ async fn get_unrelated_path_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_response_rejects_stream_true() {
+async fn get_response_stream_true_without_log_returns_400() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+    // Seeded with no replay event log (a legacy or non-streamed record), so a
+    // replay request is a client error, not a 200 empty stream.
+    let registry = init_store_and_seed("resp_stream", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
-    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    assert_eq!(rejection.status, 400, "replay without an event log should return 400");
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no replayable event stream"),
+        "message should explain the response is not replayable: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_rejects_include() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_inc", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3920,16 +3928,11 @@ async fn get_response_rejects_include() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_accepts_stream_false() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_sf",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_sf", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3940,20 +3943,326 @@ async fn get_response_accepts_stream_false() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_no_query_still_returns_200() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_nq",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_nq", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
+// -----------------------------------------------------------------------------
+// GET /v1/responses/{id}?stream=true — SSE replay
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_returns_events_in_order_ending_with_terminal() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay",
+        owner.clone(),
+        vec![
+            event_record("resp_replay", &owner, 0, "response.created", false),
+            event_record("resp_replay", &owner, 1, "response.output_text.delta", false),
+            event_record("resp_replay", &owner, 2, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_replay?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(streaming.status, 200, "a replayable log streams with 200");
+    assert_eq!(
+        streaming.headers.get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream",
+        "replay uses the SSE content type"
+    );
+    assert_eq!(
+        streaming.headers.get(http::header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "replay must not be cached"
+    );
+
+    let body = drain_replay_body(streaming).await;
+    let text = String::from_utf8(body).unwrap();
+    let types: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("event: ")).collect();
+    assert_eq!(
+        types,
+        vec!["response.created", "response.output_text.delta", "response.completed"],
+        "events replay in original order, terminal last: {text}"
+    );
+    assert!(
+        text.contains("\"sequence_number\":2"),
+        "the terminal event payload is replayed verbatim: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_in_legacy_responses_format_pipeline_streams_not_buffers() {
+    // A classifier-only `openai_responses_request` pipeline marks the request
+    // Responses-format with `stream=false` (the flag is read from a POST body the
+    // GET never carries). Without forcing streaming mode for replay GETs, the
+    // buffered-mode override would run and the runtime would reject the streaming
+    // replay body with a 500. The replay must still stream and the response body
+    // mode must stay `Stream`.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_legacy_replay",
+        owner.clone(),
+        vec![
+            event_record("resp_legacy_replay", &owner, 0, "response.created", false),
+            event_record("resp_legacy_replay", &owner, 1, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_legacy_replay?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    // The legacy classifier promotes these facts before the store filter runs.
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "false");
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(
+        streaming.status, 200,
+        "the replay still streams under a legacy classifier pipeline"
+    );
+    assert_eq!(
+        streaming.headers.get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream",
+        "replay uses the SSE content type"
+    );
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::Stream,
+        "a replay GET must force streaming mode instead of the buffered Responses-format override"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_starting_after_skips_earlier_events() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay_cursor",
+        owner.clone(),
+        vec![
+            event_record("resp_replay_cursor", &owner, 0, "response.created", false),
+            event_record("resp_replay_cursor", &owner, 1, "response.output_text.delta", false),
+            event_record("resp_replay_cursor", &owner, 2, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_replay_cursor?stream=true&starting_after=1",
+    );
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    let text = String::from_utf8(drain_replay_body(streaming).await).unwrap();
+    let types: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("event: ")).collect();
+    assert_eq!(
+        types,
+        vec!["response.completed"],
+        "starting_after=1 returns only events with sequence_number > 1: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_missing_response_returns_404() {
+    let filter = make_filter();
+    let registry = store_registry().await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_absent?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 404, "replay of a missing response is a 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_incomplete_log_returns_400() {
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    // Events exist but none is terminal: the log is incomplete, so it must never
+    // be served as a complete replay.
+    let registry = seed_response_with_events(
+        "resp_incomplete",
+        owner.clone(),
+        vec![
+            event_record("resp_incomplete", &owner, 0, "response.created", false),
+            event_record("resp_incomplete", &owner, 1, "response.output_text.delta", false),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_incomplete?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 400, "an incomplete log is not replayable");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no replayable event stream"),
+        "message should explain the log is not replayable: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_cross_owner_returns_404() {
+    let filter = make_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let registry = seed_response_with_events(
+        "resp_private_replay",
+        owner.clone(),
+        vec![event_record(
+            "resp_private_replay",
+            &owner,
+            0,
+            "response.completed",
+            true,
+        )],
+    )
+    .await;
+
+    // A different owner in the same tenant must not see the response or its log.
+    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_private_replay?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(other);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 404, "another owner's replay log must look absent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_truncated_by_concurrent_delete_errors() {
+    // A concurrent DELETE can remove the event log after the first page streams but
+    // before the terminal event is reached. The replay must surface an error rather
+    // than a clean EOF that would hide the missing terminal frame from the client.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let (registry, store) = empty_registry().await;
+
+    let record = ResponseRecord {
+        id: "resp_truncated".to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({"status": "completed"}),
+        input: json!([]),
+        messages: json!([{"role": "user", "content": "hello"}]),
+    };
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed response should succeed");
+
+    // Put the terminal event on a later page so the first page is non-terminal and
+    // a second read is required to reach the terminal boundary.
+    let total = u64::from(super::filter::REPLAY_PAGE_LIMIT) + 50;
+    let terminal = total - 1;
+    let events: Vec<_> = (0..total)
+        .map(|seq| {
+            let is_terminal = seq == terminal;
+            let event_type = if is_terminal {
+                "response.completed"
+            } else {
+                "response.output_text.delta"
+            };
+            event_record("resp_truncated", &owner, seq, event_type, is_terminal)
+        })
+        .collect();
+    store
+        .append_events(&owner, "resp_truncated", &events)
+        .await
+        .expect("seed replay events should succeed");
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_truncated?stream=true");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let mut streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+
+    // The first page streams non-terminal events; the terminal is still ahead.
+    let first = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("first page should not error")
+        .expect("first page should carry events");
+    assert!(
+        !std::str::from_utf8(&first).unwrap().contains("response.completed"),
+        "the terminal event must not be on the first page"
+    );
+
+    // A concurrent DELETE removes the whole log before the terminal is reached.
+    let deleted = store
+        .delete_response(&owner, "resp_truncated")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "the seeded response is deleted");
+
+    // The next read must error rather than ending cleanly without the terminal.
+    let error = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect_err("a log truncated before its terminal must error, not EOF");
+    assert!(
+        error.to_string().contains("truncated before its terminal event"),
+        "the error explains the mid-replay truncation: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_starting_after_terminal_returns_empty_body() {
+    // A cursor at or beyond the terminal is a legitimate empty tail, not a
+    // truncation: the replay ends cleanly with an empty body, never an error.
+    let filter = make_filter();
+    let owner = crate::test_utils::test_owner("default");
+    let registry = seed_response_with_events(
+        "resp_replay_tail",
+        owner.clone(),
+        vec![
+            event_record("resp_replay_tail", &owner, 0, "response.created", false),
+            event_record("resp_replay_tail", &owner, 1, "response.completed", true),
+        ],
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_replay_tail?stream=true&starting_after=1",
+    );
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let mut streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
+    let chunk = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("a cursor beyond the terminal returns an empty body, not an error");
+    assert!(chunk.is_none(), "no events remain after the terminal: {chunk:?}");
 }
 
 // -----------------------------------------------------------------------------
@@ -3963,8 +4272,7 @@ async fn get_response_no_query_still_returns_200() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_returns_200_when_found() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_items",
         "default",
         json!([
@@ -3976,6 +4284,7 @@ async fn get_input_items_returns_200_when_found() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_items/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3991,10 +4300,11 @@ async fn get_input_items_returns_200_when_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_returns_404_when_not_found() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_missing/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4007,10 +4317,11 @@ async fn get_input_items_returns_404_when_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_invalid_query_params() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_qp", "default", json!(["hello"])).await;
+    let registry = init_store_and_seed("resp_qp", "default", json!(["hello"])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_qp/input_items?limit=abc");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4022,10 +4333,11 @@ async fn get_input_items_rejects_invalid_query_params() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_key_only_query_param() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_ko", "default", json!(["hello"])).await;
+    let registry = init_store_and_seed("resp_ko", "default", json!(["hello"])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_ko/input_items?limit");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4037,8 +4349,7 @@ async fn get_input_items_rejects_key_only_query_param() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_limit_and_order() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_page",
         "default",
         json!([
@@ -4055,6 +4366,7 @@ async fn get_input_items_with_limit_and_order() {
         "/v1/responses/resp_page/input_items?limit=2&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4073,8 +4385,7 @@ async fn get_input_items_with_limit_and_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_cursor() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_cursor",
         "default",
         json!([
@@ -4091,6 +4402,7 @@ async fn get_input_items_with_cursor() {
         "/v1/responses/resp_cursor/input_items?after=item_2&limit=2&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4105,10 +4417,78 @@ async fn get_input_items_with_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_duplicate_ids_paginate_to_later_items() {
+    let filter = make_filter();
+    let registry = init_store_and_seed(
+        "resp_duplicate_cursor",
+        "default",
+        json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": "c", "type": "item_reference"}
+        ]),
+    )
+    .await;
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for expected_has_more in [true, true, false] {
+        let after = cursor
+            .as_ref()
+            .map_or_else(String::new, |value| format!("&after={value}"));
+        let req = crate::test_utils::make_request(
+            http::Method::GET,
+            &format!("/v1/responses/resp_duplicate_cursor/input_items?limit=1&order=asc{after}"),
+        );
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 200, "every valid duplicate-ID page must return 200");
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let item_id = body["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .and_then(|item| item["id"].as_str())
+            .unwrap();
+        let last_id = body["last_id"].as_str().unwrap();
+        assert_eq!(last_id, item_id, "last_id must project the final data item ID");
+        assert_eq!(
+            body["has_more"], expected_has_more,
+            "has_more must track whether another input occurrence remains"
+        );
+        let next_cursor = body["next_cursor"].as_str();
+        if expected_has_more {
+            assert_ne!(
+                next_cursor,
+                Some(item_id),
+                "duplicate reference targets need a separate HTTP continuation cursor"
+            );
+        }
+        ids.push(item_id.to_owned());
+        cursor = next_cursor.map(str::to_owned);
+    }
+
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("dup"),
+        "the first reference target must remain unchanged"
+    );
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("dup"),
+        "the second reference must retain the same target ID"
+    );
+    assert_eq!(
+        ids.get(2).map(String::as_str),
+        Some("c"),
+        "the position cursor must make the later unique item reachable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_malformed_cursor_returns_400() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_bad_cursor",
         "default",
         json!([
@@ -4123,6 +4503,7 @@ async fn get_input_items_with_malformed_cursor_returns_400() {
         "/v1/responses/resp_bad_cursor/input_items?after=not-a-cursor",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4148,13 +4529,14 @@ async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_ite
     // Plain string entries can't carry a synthetic `id` (there's no
     // object to attach it to), so `last_id` must fall back to the
     // page's numeric cursor instead of staying `null`.
-    init_store_and_seed(&filter, "resp_non_object", "default", json!(["first", "second"])).await;
+    let registry = init_store_and_seed("resp_non_object", "default", json!(["first", "second"])).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_non_object/input_items?limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4170,8 +4552,7 @@ async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_ite
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_pagination_usable_for_id_less_array_items() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_no_ids",
         "default",
         json!([
@@ -4186,6 +4567,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
         "/v1/responses/resp_no_ids/input_items?limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4201,6 +4583,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
         &format!("/v1/responses/resp_no_ids/input_items?limit=1&order=asc&after={last_id}"),
     );
     let mut follow_up_ctx = crate::test_utils::make_owned_filter_context(&follow_up);
+    follow_up_ctx.extensions.insert(registry);
     let follow_up_action = filter.on_request(&mut follow_up_ctx).await.unwrap();
     let follow_up_rejection = expect_reject(follow_up_action);
     assert_eq!(follow_up_rejection.status, 200);
@@ -4216,8 +4599,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_hides_compaction_items() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_compact_hidden",
         "default",
         json!([
@@ -4232,6 +4614,7 @@ async fn get_input_items_hides_compaction_items() {
         "/v1/responses/resp_compact_hidden/input_items?order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4255,10 +4638,11 @@ async fn get_input_items_hides_compaction_items() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_existing_response_returns_200() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_del1", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_del1", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_del1");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4278,10 +4662,11 @@ async fn delete_existing_response_returns_200() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_nonexistent_response_returns_404() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_exists", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_exists", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_missing");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4305,15 +4690,17 @@ async fn delete_nonexistent_response_returns_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_is_idempotent() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_idem", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_idem", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_idem");
     let mut ctx1 = crate::test_utils::make_owned_filter_context(&req);
+    ctx1.extensions.insert(registry.clone());
     let action1 = filter.on_request(&mut ctx1).await.unwrap();
     let r1 = expect_reject(action1);
     assert_eq!(r1.status, 200, "first delete should return 200");
 
     let mut ctx2 = crate::test_utils::make_owned_filter_context(&req);
+    ctx2.extensions.insert(registry);
     let action2 = filter.on_request(&mut ctx2).await.unwrap();
     let r2 = expect_reject(action2);
     assert_eq!(r2.status, 404, "second delete should return 404");
@@ -4322,10 +4709,11 @@ async fn delete_is_idempotent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_cross_tenant_returns_404() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant", "tenant_a", json!([])).await;
+    let registry = init_store_and_seed("resp_tenant", "tenant_a", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_tenant");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4335,10 +4723,11 @@ async fn delete_cross_tenant_returns_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_uses_trusted_owner_context() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tmeta", "tenant_x", json!([])).await;
+    let registry = init_store_and_seed("resp_tmeta", "tenant_x", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_tmeta");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     ctx.extensions.insert(crate::test_utils::test_owner("tenant_x"));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -4348,18 +4737,7 @@ async fn delete_uses_trusted_owner_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_rejects_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_gone");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -4374,22 +4752,11 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_abc/cancel");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -4411,22 +4778,11 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn input_tokens_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -4448,22 +4804,11 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -4486,10 +4831,11 @@ conversations_table: conversations
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_response_has_json_content_type() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_ct", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_ct", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_ct");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4670,45 +5016,38 @@ fn parse_query_params_key_only_unknown_ignored() {
 }
 
 // -----------------------------------------------------------------------------
-// validate_get_response_query_params
+// parse_get_response_query
 // -----------------------------------------------------------------------------
 
 #[test]
-fn validate_get_response_query_params_no_query() {
-    assert!(
-        super::filter::validate_get_response_query_params(None).is_ok(),
-        "no query string should be valid"
-    );
+fn parse_get_response_query_no_query() {
+    let parsed = super::filter::parse_get_response_query(None).unwrap();
+    assert!(!parsed.stream, "no query string should default to non-stream");
+    assert_eq!(parsed.starting_after, None, "no query string should have no cursor");
 }
 
 #[test]
-fn validate_get_response_query_params_empty_query() {
-    assert!(
-        super::filter::validate_get_response_query_params(Some("")).is_ok(),
-        "empty query string should be valid"
-    );
+fn parse_get_response_query_empty_query() {
+    let parsed = super::filter::parse_get_response_query(Some("")).unwrap();
+    assert!(!parsed.stream, "empty query string should default to non-stream");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_false_accepted() {
-    assert!(
-        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
-        "stream=false should be accepted"
-    );
+fn parse_get_response_query_stream_false_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=false")).unwrap();
+    assert!(!parsed.stream, "stream=false should parse as non-stream");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_true_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
-    assert!(
-        err.contains("'stream' parameter is not supported"),
-        "stream=true should be rejected: {err}"
-    );
+fn parse_get_response_query_stream_true_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=true")).unwrap();
+    assert!(parsed.stream, "stream=true should now be accepted as a replay request");
+    assert_eq!(parsed.starting_after, None, "no cursor without starting_after");
 }
 
 #[test]
-fn validate_get_response_query_params_stream_invalid_value_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+fn parse_get_response_query_stream_invalid_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=maybe")).unwrap_err();
     assert!(
         err.contains("must be 'true' or 'false'"),
         "stream=maybe should be rejected as invalid boolean: {err}"
@@ -4716,9 +5055,66 @@ fn validate_get_response_query_params_stream_invalid_value_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_bracket_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
-        .unwrap_err();
+fn parse_get_response_query_starting_after_with_stream_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=true&starting_after=5")).unwrap();
+    assert!(parsed.stream, "stream=true should be set");
+    assert_eq!(
+        parsed.starting_after,
+        Some(5),
+        "starting_after=5 should parse as cursor 5"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_order_independent() {
+    let parsed = super::filter::parse_get_response_query(Some("starting_after=9&stream=true")).unwrap();
+    assert!(parsed.stream, "stream=true should be set regardless of order");
+    assert_eq!(
+        parsed.starting_after,
+        Some(9),
+        "cursor should parse regardless of order"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_without_stream_rejected() {
+    let err = super::filter::parse_get_response_query(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("requires 'stream=true'"),
+        "starting_after without stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_with_stream_false_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=false&starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("requires 'stream=true'"),
+        "starting_after with stream=false should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_empty_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=true&starting_after=")).unwrap_err();
+    assert!(
+        err.contains("cursor must not be empty"),
+        "empty starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_starting_after_non_numeric_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=true&starting_after=abc")).unwrap_err();
+    assert!(
+        err.contains("not a valid integer"),
+        "non-numeric starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn parse_get_response_query_include_bracket_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include[]=file_search_call_results.results")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "include[] should be rejected: {err}"
@@ -4726,8 +5122,8 @@ fn validate_get_response_query_params_include_bracket_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_percent_encoded_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+fn parse_get_response_query_include_percent_encoded_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include%5B%5D=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "percent-encoded include[] should be rejected: {err}"
@@ -4735,8 +5131,8 @@ fn validate_get_response_query_params_include_percent_encoded_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_include_bare_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+fn parse_get_response_query_include_bare_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "bare include should be rejected: {err}"
@@ -4744,17 +5140,8 @@ fn validate_get_response_query_params_include_bare_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_starting_after_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
-    assert!(
-        err.contains("'starting_after' parameter is not supported"),
-        "starting_after should be rejected: {err}"
-    );
-}
-
-#[test]
-fn validate_get_response_query_params_include_obfuscation_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
+fn parse_get_response_query_include_obfuscation_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include_obfuscation=true")).unwrap_err();
     assert!(
         err.contains("'include_obfuscation' parameter is not supported"),
         "include_obfuscation should be rejected: {err}"
@@ -4762,8 +5149,8 @@ fn validate_get_response_query_params_include_obfuscation_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_unknown_param_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+fn parse_get_response_query_unknown_param_rejected() {
+    let err = super::filter::parse_get_response_query(Some("foo=bar")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "unknown param should be rejected: {err}"
@@ -4771,8 +5158,8 @@ fn validate_get_response_query_params_unknown_param_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_known_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+fn parse_get_response_query_key_only_known_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only known param should be rejected: {err}"
@@ -4780,8 +5167,8 @@ fn validate_get_response_query_params_key_only_known_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_include_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+fn parse_get_response_query_key_only_include_rejected() {
+    let err = super::filter::parse_get_response_query(Some("include")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only include should be rejected: {err}"
@@ -4789,8 +5176,8 @@ fn validate_get_response_query_params_key_only_include_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_key_only_unknown_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+fn parse_get_response_query_key_only_unknown_rejected() {
+    let err = super::filter::parse_get_response_query(Some("foo")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "key-only unknown param should be rejected: {err}"
@@ -4798,16 +5185,17 @@ fn validate_get_response_query_params_key_only_unknown_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+fn parse_get_response_query_percent_encoded_stream_false_accepted() {
+    let parsed = super::filter::parse_get_response_query(Some("stream=%66alse")).unwrap();
     assert!(
-        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
-        "percent-encoded stream=false should be accepted"
+        !parsed.stream,
+        "percent-encoded stream=false should parse as non-stream"
     );
 }
 
 #[test]
-fn validate_get_response_query_params_invalid_utf8_key_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+fn parse_get_response_query_invalid_utf8_key_rejected() {
+    let err = super::filter::parse_get_response_query(Some("%FF=x")).unwrap_err();
     assert!(
         err.contains("Invalid percent-encoding in query parameter key"),
         "invalid UTF-8 key should be rejected: {err}"
@@ -4815,8 +5203,8 @@ fn validate_get_response_query_params_invalid_utf8_key_rejected() {
 }
 
 #[test]
-fn validate_get_response_query_params_invalid_utf8_value_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+fn parse_get_response_query_invalid_utf8_value_rejected() {
+    let err = super::filter::parse_get_response_query(Some("stream=%FF")).unwrap_err();
     assert!(
         err.contains("Invalid percent-encoding in value"),
         "invalid UTF-8 value should be rejected: {err}"
@@ -4824,17 +5212,21 @@ fn validate_get_response_query_params_invalid_utf8_value_rejected() {
 }
 
 #[test]
-fn known_params_and_validator_match_arms_in_sync() {
+fn known_params_and_parser_match_arms_in_sync() {
     for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
-        let result = super::filter::validate_get_response_param(param, "__probe__");
-        assert!(
-            result.is_err(),
-            "known param '{param}' should be handled by validate_get_response_param"
-        );
-        assert!(
-            !result.unwrap_err().contains("Unknown"),
-            "known param '{param}' should not produce an 'Unknown' error"
-        );
+        let mut parsed = super::filter::GetResponseQuery::default();
+        let result = super::filter::apply_get_response_param(&mut parsed, param, "__probe__");
+        // Every known param is handled by an explicit match arm, so the probe
+        // never falls through to the "Unknown query parameter" catch-all.
+        // `stream`/`starting_after` reject the non-boolean/non-numeric probe;
+        // the unsupported params reject with their own message. Either way the
+        // error must not be the unknown-parameter fallthrough.
+        if let Err(err) = result {
+            assert!(
+                !err.contains("Unknown"),
+                "known param '{param}' should not produce an 'Unknown' error: {err}"
+            );
+        }
     }
 }
 
@@ -5257,17 +5649,13 @@ async fn on_request_body_non_end_of_stream_does_not_process() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
         "non-EOS request body should just continue"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize before end of stream"
     );
 }
 
@@ -5283,7 +5671,6 @@ async fn on_request_body_non_post_at_eos_does_not_extract_input() {
         matches!(action, FilterAction::Continue),
         "non-POST request body at EOS should continue"
     );
-    assert!(filter.store.get().is_none(), "store should not initialize for non-POST");
 }
 
 // -----------------------------------------------------------------------------
@@ -5295,7 +5682,8 @@ async fn on_response_body_persists_response_with_null_output() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5310,7 +5698,6 @@ async fn on_response_body_persists_response_with_null_output() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_null_output")
         .await
@@ -5328,7 +5715,8 @@ async fn on_response_body_persists_response_with_no_output_field() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5342,7 +5730,6 @@ async fn on_response_body_persists_response_with_no_output_field() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_no_output")
         .await
@@ -5360,7 +5747,8 @@ async fn on_response_body_persists_response_with_non_array_output() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5375,7 +5763,6 @@ async fn on_response_body_persists_response_with_non_array_output() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_object_output")
         .await
@@ -5396,7 +5783,8 @@ async fn on_response_body_persists_response_with_object_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5411,7 +5799,6 @@ async fn on_response_body_persists_response_with_object_input() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_object_input")
         .await
@@ -5432,7 +5819,8 @@ async fn on_response_body_persists_response_with_null_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5447,7 +5835,6 @@ async fn on_response_body_persists_response_with_null_input() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_null_input")
         .await
@@ -5465,7 +5852,8 @@ async fn on_response_body_persists_response_with_no_input_field() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5479,7 +5867,6 @@ async fn on_response_body_persists_response_with_no_input_field() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_missing_input")
         .await
@@ -5498,7 +5885,8 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let owner = crate::StateOwner::from_trusted_parts("custom_tenant", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
     drop(filter.on_request(&mut ctx).await.unwrap());
@@ -5517,7 +5905,6 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&owner, "resp_tenant_body")
         .await
@@ -5542,8 +5929,7 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_trailing_slash_handled() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_slash_items",
         "default",
         json!([{"id": "item_1", "type": "message"}]),
@@ -5552,6 +5938,7 @@ async fn get_input_items_trailing_slash_handled() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_slash_items/input_items/");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5561,10 +5948,11 @@ async fn get_input_items_trailing_slash_handled() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_scalar_input() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_scalar", "default", json!("hello world")).await;
+    let registry = init_store_and_seed("resp_scalar", "default", json!("hello world")).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_scalar/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5599,8 +5987,7 @@ async fn get_input_items_with_scalar_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_default_descending_order() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_desc",
         "default",
         json!([
@@ -5613,6 +6000,7 @@ async fn get_input_items_default_descending_order() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_desc/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5628,10 +6016,11 @@ async fn get_input_items_default_descending_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_empty_input() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_empty_input", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_empty_input", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_empty_input/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5647,10 +6036,11 @@ async fn get_input_items_with_empty_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_tenant_isolation() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant_items", "tenant_a", json!([{"id": "item_1"}])).await;
+    let registry = init_store_and_seed("resp_tenant_items", "tenant_a", json!([{"id": "item_1"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_tenant_items/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5689,13 +6079,14 @@ fn include_fixture_input() -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_omits_include_gated_fields_when_not_requested() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_default", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_default", "default", include_fixture_input()).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_include_default/input_items?order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5721,7 +6112,7 @@ async fn get_input_items_omits_include_gated_fields_when_not_requested() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_reveal", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_reveal", "default", include_fixture_input()).await;
 
     for query in [
         "include=reasoning.encrypted_content&order=asc",
@@ -5730,6 +6121,7 @@ async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings(
         let path = format!("/v1/responses/resp_include_reveal/input_items?{query}");
         let req = crate::test_utils::make_request(http::Method::GET, &path);
         let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         let rejection = expect_reject(action);
@@ -5751,13 +6143,14 @@ async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_include_applies_to_paginated_window() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_page", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_page", "default", include_fixture_input()).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_include_page/input_items?include=reasoning.encrypted_content&limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5784,7 +6177,7 @@ async fn get_input_items_include_applies_to_paginated_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_malformed_include_values() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_bad", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_bad", "default", include_fixture_input()).await;
 
     for (query, expected) in [
         ("include=future.secret_field", "unsupported include value"),
@@ -5794,6 +6187,7 @@ async fn get_input_items_rejects_malformed_include_values() {
         let path = format!("/v1/responses/resp_include_bad/input_items?{query}");
         let req = crate::test_utils::make_request(http::Method::GET, &path);
         let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         let rejection = expect_reject(action);
@@ -5996,95 +6390,6 @@ conversations_table: conversations
 }
 
 #[test]
-fn revalidate_postgres_host_accepts_non_postgres_url() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite::memory:"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_ok(),
-        "revalidate_postgres_host should return Ok for non-postgres URLs"
-    );
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_loopback_host() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@127.0.0.1:5432/praxis"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(result.is_err(), "revalidate_postgres_host should reject loopback host");
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_hostaddr_query_param() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_err(),
-        "revalidate_postgres_host should reject loopback hostaddr query param"
-    );
-}
-
-#[test]
-fn revalidate_postgres_host_accepts_public_ip() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(result.is_ok(), "revalidate_postgres_host should accept public IP");
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_host_query_param_loopback() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_err(),
-        "revalidate_postgres_host should reject loopback host query param"
-    );
-}
-
-#[test]
 fn postgres_config_rejects_hostaddr_with_invalid_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -6121,21 +6426,54 @@ fn postgres_config_rejects_ipv6_link_local() {
 // -----------------------------------------------------------------------------
 
 fn make_filter() -> ResponseStoreFilter {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite::memory:"
-responses_table: test_responses
-conversations_table: test_conversations
-"#,
+    ResponseStoreFilter::with_bounds(
+        super::config::DEFAULT_MAX_EVENT_COUNT,
+        super::config::DEFAULT_MAX_EVENT_BYTES,
     )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    ResponseStoreFilter::new(cfg)
+}
+
+/// Build an in-memory default store plus a registry holding it, without touching
+/// a context. The filter resolves the same backend once the registry is
+/// installed into a request context, mirroring serving-runtime provisioning.
+async fn empty_registry() -> (ResponseStoreRegistry, Arc<dyn PersistedStateBackend>) {
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("in-memory sqlite store should build"),
+    );
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), Arc::clone(&store))
+        .expect("default store should register");
+    (registry, store)
+}
+
+/// A registry holding an empty in-memory default store.
+async fn store_registry() -> ResponseStoreRegistry {
+    empty_registry().await.0
+}
+
+/// Install an empty in-memory default store into the context, returning the
+/// backing store for direct seeding.
+async fn install_store(ctx: &mut HttpFilterContext<'_>) -> Arc<dyn PersistedStateBackend> {
+    let (registry, store) = empty_registry().await;
+    ctx.extensions.insert(registry);
+    store
 }
 
 async fn run_request_phase(filter: &ResponseStoreFilter, ctx: &mut HttpFilterContext<'_>) {
+    // The happy path needs a provisioned store; install an empty one unless the
+    // test already installed (and possibly seeded) its own.
+    if ctx.extensions.get::<ResponseStoreRegistry>().is_none() {
+        install_store(ctx).await;
+    }
     let action = filter.on_request(ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
@@ -6158,28 +6496,34 @@ fn cleanup_sqlite_file(db_path: &PathBuf) {
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }
 
-async fn init_store(filter: &ResponseStoreFilter) {
-    filter
-        .store
-        .get_or_init(|| async { Box::pin(filter.build_store()).await.ok() })
-        .await;
+/// A registry whose default store is backed by the file at `db_url`, matching a
+/// pipeline test's `test_responses`/`test_conversations` tables so a store opened
+/// separately for verification observes the same rows.
+async fn file_store_registry(db_url: &str) -> ResponseStoreRegistry {
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(
+        SqliteResponseStore::new(db_url, "test_responses", "test_conversations", None, None, None)
+            .await
+            .expect("file-backed sqlite store should build"),
+    );
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), store)
+        .expect("default store should register");
+    registry
 }
 
-async fn init_store_and_seed(filter: &ResponseStoreFilter, id: &str, tenant_id: &str, input: serde_json::Value) {
-    init_store_and_seed_owner(filter, id, crate::test_utils::test_owner(tenant_id), input).await;
+/// A registry whose default store is seeded with one completed response owned by
+/// `tenant_id`. Install it into a request context to expose the record.
+async fn init_store_and_seed(id: &str, tenant_id: &str, input: serde_json::Value) -> ResponseStoreRegistry {
+    init_store_and_seed_owner(id, crate::test_utils::test_owner(tenant_id), input).await
 }
 
 async fn init_store_and_seed_owner(
-    filter: &ResponseStoreFilter,
     id: &str,
     owner: crate::StateOwner,
     input: serde_json::Value,
-) {
-    let store_opt = filter
-        .store
-        .get_or_init(|| async { Box::pin(filter.build_store()).await.ok() })
-        .await;
-    let store = store_opt.as_ref().expect("store should be initialized");
+) -> ResponseStoreRegistry {
+    let (registry, store) = empty_registry().await;
     let record = ResponseRecord {
         id: id.to_owned(),
         owner,
@@ -6193,6 +6537,55 @@ async fn init_store_and_seed_owner(
         .upsert_response(&record)
         .await
         .expect("seed response should succeed");
+    registry
+}
+
+/// Build one replay event-log row for seeding a store directly.
+fn event_record(
+    response_id: &str,
+    owner: &crate::StateOwner,
+    sequence_number: u64,
+    event_type: &str,
+    terminal: bool,
+) -> crate::store::ResponseEventRecord {
+    crate::store::ResponseEventRecord {
+        response_id: response_id.to_owned(),
+        owner: owner.clone(),
+        sequence_number,
+        event_type: event_type.to_owned(),
+        payload: serde_json::to_vec(&json!({"type": event_type, "sequence_number": sequence_number}))
+            .expect("event payload serializes"),
+        terminal,
+        created_at: 1000,
+    }
+}
+
+/// A registry whose default store holds one completed response owned by `owner`
+/// plus the given replay event log. Backs the `?stream=true` replay tests.
+async fn seed_response_with_events(
+    id: &str,
+    owner: crate::StateOwner,
+    events: Vec<crate::store::ResponseEventRecord>,
+) -> ResponseStoreRegistry {
+    let (registry, store) = empty_registry().await;
+    let record = ResponseRecord {
+        id: id.to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({"status": "completed"}),
+        input: json!([]),
+        messages: json!([{"role": "user", "content": "hello"}]),
+    };
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed response should succeed");
+    store
+        .append_events(&owner, id, &events)
+        .await
+        .expect("seed replay events should succeed");
+    registry
 }
 
 fn expect_reject(action: FilterAction) -> praxis_filter::Rejection {
@@ -6200,6 +6593,28 @@ fn expect_reject(action: FilterAction) -> praxis_filter::Rejection {
         FilterAction::Reject(r) => r,
         other => panic!("expected Reject, got {other:?}"),
     }
+}
+
+/// Extract the boxed streaming terminal response from a replay action.
+fn expect_streaming(action: FilterAction) -> Box<StreamingTerminalResponse> {
+    match action {
+        FilterAction::StreamingTerminalResponse(s) => s,
+        other => panic!("expected StreamingTerminalResponse, got {other:?}"),
+    }
+}
+
+/// Drive a replay body to completion, concatenating every chunk into one buffer.
+async fn drain_replay_body(mut streaming: Box<StreamingTerminalResponse>) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(chunk) = streaming
+        .body
+        .next_chunk()
+        .await
+        .expect("replay chunk should not error")
+    {
+        out.extend_from_slice(&chunk);
+    }
+    out
 }
 
 fn assert_has_json_content_type(rejection: &praxis_filter::Rejection) {
@@ -6315,4 +6730,376 @@ conversations_table: openai_conversations
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
     );
+}
+
+// -----------------------------------------------------------------------------
+// InputItemPage serialization & allocation tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn input_item_page_serialization_empty_page() {
+    let page = InputItemPage {
+        data: vec![],
+        next_cursor: None,
+        has_more: false,
+    };
+    let json_str = serde_json::to_string(&page).expect("empty page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": [],
+            "has_more": false,
+            "first_id": null,
+            "last_id": null
+        }),
+        "empty page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_full_page() {
+    let items: Vec<serde_json::Value> = (0..20)
+        .map(|i| {
+            json!({
+                "id": format!("msg_item_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": format!("content {i}")
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_item_19".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("full page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_item_0",
+            "last_id": "msg_item_19"
+        }),
+        "full page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_maximum_size_100_items() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_max_{i}"),
+                "type": "message",
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i} with additional metadata and details.")
+                    }
+                ],
+                "metadata": {
+                    "index": i,
+                    "tag": "max_page_test"
+                }
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_max_99".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("100-item page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_max_0",
+            "last_id": "msg_max_99"
+        }),
+        "maximum size 100-item page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_non_object_and_cursor_fallback() {
+    let page = InputItemPage {
+        data: vec![json!("plain string input"), json!(12345)],
+        next_cursor: Some("2".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("non-object page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": ["plain string input", 12345],
+            "has_more": true,
+            "first_id": null,
+            "last_id": "2"
+        }),
+        "non-object page serialization must fall back last_id to next_cursor"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_100_item_nontrivial_allocation_evidence() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_nontrivial_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i}: {}", "x".repeat(200))
+                    }
+                ],
+                "metadata": {
+                    "item_index": i,
+                    "nested_info": {
+                        "key_a": "value_a",
+                        "key_b": 42
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let page = InputItemPage {
+        data: items,
+        next_cursor: Some("msg_nontrivial_99".to_owned()),
+        has_more: true,
+    };
+
+    // Legacy pattern: serde_json::json! deep-copies page.data into a second Value tree
+    let legacy_fn = |p: &InputItemPage| -> Vec<u8> {
+        let first_id = p.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+        let last_id = p
+            .data
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or(p.next_cursor.as_deref());
+
+        let body = serde_json::json!({
+            "object": "list",
+            "data": p.data,
+            "has_more": p.has_more,
+            "first_id": first_id,
+            "last_id": last_id,
+        });
+        serde_json::to_vec(&body).unwrap()
+    };
+
+    // New pattern: direct serialization from &page without second Value or Vec<Value> tree
+    let direct_fn = |p: &InputItemPage| -> Vec<u8> { serde_json::to_vec(p).unwrap() };
+
+    let legacy_bytes = legacy_fn(&page);
+    let direct_bytes = direct_fn(&page);
+
+    assert_eq!(
+        legacy_bytes, direct_bytes,
+        "direct serialization output must match legacy json! output byte-for-byte"
+    );
+
+    let legacy_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(legacy_fn(&page));
+    });
+
+    let direct_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(direct_fn(&page));
+    });
+
+    assert!(
+        direct_allocs.count_total < legacy_allocs.count_total,
+        "direct serialization must perform fewer allocations: direct={} legacy={}",
+        direct_allocs.count_total,
+        legacy_allocs.count_total
+    );
+
+    assert!(
+        direct_allocs.bytes_total < legacy_allocs.bytes_total,
+        "direct serialization must allocate fewer bytes: direct={} legacy={}",
+        direct_allocs.bytes_total,
+        legacy_allocs.bytes_total
+    );
+}
+
+/// The response-store filter only exercises the response half, so this recording
+/// double leaves the conversation-item surface unsupported.
+#[async_trait::async_trait]
+impl crate::store::ConversationItemStore for RecordingResponseStore {
+    async fn upsert_conversation(
+        &self,
+        _record: &crate::store::ConversationRecord,
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &serde_json::Value,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(
+        &self,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<i64, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
 }

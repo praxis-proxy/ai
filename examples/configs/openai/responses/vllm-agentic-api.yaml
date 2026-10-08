@@ -9,6 +9,10 @@
 # This pipeline intentionally does not include openai_response_store,
 # openai_responses_rehydrate, responses_proxy, openai_web_search,
 # openai_tool_parse, or openai_stream_events.
+#
+# `initialize_state: false` follows from that: with no filter here consuming
+# Responses state, initializing it would parse the body, mint identifiers, and
+# resolve a conversation whose results nothing reads.
 
 listeners:
   - name: agentic-api-gateway
@@ -18,7 +22,11 @@ listeners:
 filter_chains:
   - name: agentic-api-passthrough
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
 
       - filter: router

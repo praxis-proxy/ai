@@ -55,19 +55,18 @@ pub(crate) struct FileSearchFilterConfig {
     /// registration time via [`ChainBindingContext::bind_chain`]. The
     /// destination is supplied by `vector_store_url`, so the chain never needs
     /// an upstream-selecting filter. Private-address gating is centralized in
-    /// `insecure_options.allow_private_upstreams`.
+    /// `insecure_options.allow_private_upstreams`. Cloud metadata,
+    /// unspecified, and multicast addresses remain blocked by that opt-in.
     ///
     /// Optional. Callouts always run through the shared sub-request executor;
     /// this chain only adds filters along the way. When omitted it defaults to
     /// an empty inline chain (pure passthrough) via `default_outbound_chain`.
     /// Provide it only to attach cross-cutting concerns.
     ///
-    /// When provided, it must be defined **inline** (`outbound_chain: { name:
-    /// ..., filters: [...] }`). A `Named` reference to a top-level `filter_chains`
-    /// entry is rejected at construction by [`require_inline_outbound_chain`]: this
-    /// filter runs nested inside an `iterative_request_router` step, whose pipeline
-    /// is built with an empty named-chain map, so a named reference could never
-    /// resolve there.
+    /// When provided, it may be defined inline (`outbound_chain: { name: ...,
+    /// filters: [...] }`) or as a named reference to a top-level `filter_chains`
+    /// entry. The production pipeline builder carries the chain-binding context
+    /// into `iterative_request_router` steps, so both forms resolve consistently.
     ///
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
     #[serde(default = "default_outbound_chain")]
@@ -202,31 +201,6 @@ pub(crate) fn build_config_with_client(
     })
 }
 
-/// Reject a `Named` outbound-chain reference, requiring an inline chain.
-///
-/// `openai_file_search_callout` runs nested inside an `iterative_request_router`
-/// step, and IRR builds each step's pipeline with an empty top-level named-chain
-/// map. A `Named` reference (`outbound_chain: my-chain`) therefore can never
-/// resolve inside a step and would fail pipeline construction with a confusing
-/// "unknown chain" error. Require the chain inline instead
-/// (`outbound_chain: { name: ..., filters: [...] }`), which embeds its filters
-/// directly and needs no lookup.
-///
-/// # Errors
-///
-/// Returns [`FilterError`] when `outbound_chain` is a [`ChainRef::Named`].
-pub(crate) fn require_inline_outbound_chain(outbound_chain: &ChainRef) -> Result<(), FilterError> {
-    if let ChainRef::Named(name) = outbound_chain {
-        return Err(format!(
-            "openai_file_search_callout: outbound_chain must be defined inline \
-             ({{ name, filters }}); a named reference ('{name}') cannot resolve \
-             inside the iterative_request_router step this filter runs in"
-        )
-        .into());
-    }
-    Ok(())
-}
-
 // -----------------------------------------------------------------------------
 // Private helpers
 // -----------------------------------------------------------------------------
@@ -297,10 +271,11 @@ fn validated_timeout(configured: Option<u64>) -> Result<u64, FilterError> {
 ///
 /// Structural validation always rejects a non-`http(s)` scheme, embedded
 /// userinfo, and a query or fragment. Private-address gating is *not* decided
-/// here: `allow_private = true` defers every private/loopback decision — for
-/// both literal IPs and resolved DNS names — to the connect-time
+/// here: `allow_private = true` defers permitted private/loopback decisions to
+/// the connect-time
 /// `prepare_url_target` hook, which is the sole SSRF gate and honours the
-/// outbound pipeline's `insecure_options.allow_private_upstreams`. Deciding it
+/// outbound pipeline's `insecure_options.allow_private_upstreams`. Cloud
+/// metadata, unspecified, and multicast targets remain blocked. Deciding it
 /// at startup would be unable to see that flag (it is applied later via
 /// `apply_insecure_options`), so a literal private target could never be
 /// permitted even with the central opt-in set.
@@ -326,25 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_named_outbound_chain() {
-        let named = ChainRef::Named("vector-store-outbound".to_owned());
-        let error = require_inline_outbound_chain(&named).unwrap_err();
-        assert!(
-            error.to_string().contains("must be defined inline"),
-            "error should explain the inline requirement: {error}"
-        );
-    }
-
-    #[test]
-    fn config_accepts_inline_outbound_chain() {
-        let inline = ChainRef::Inline {
-            name: "vector-store-outbound".to_owned(),
-            filters: Vec::new(),
-        };
-        require_inline_outbound_chain(&inline).unwrap();
-    }
-
-    #[test]
     fn config_defaults_omitted_outbound_chain_to_empty_inline() {
         // `outbound_chain` is optional: omitting it yields an empty inline chain
         // (pure passthrough) rather than a config error.
@@ -353,8 +309,6 @@ mod tests {
             matches!(&cfg.outbound_chain, ChainRef::Inline { filters, .. } if filters.is_empty()),
             "omitted outbound_chain should default to an empty inline chain"
         );
-        // The default must satisfy the inline-only requirement enforced at build.
-        require_inline_outbound_chain(&cfg.outbound_chain).unwrap();
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use clap::Parser as _;
 use serde_json::{Value, json};
 
 use super::{
@@ -121,7 +122,6 @@ fn registered_supported_operations() -> Vec<SupportedOperation> {
 
 fn test_args() -> Args {
     Args {
-        openai_spec: "openai-test".to_owned(),
         areas: Vec::new(),
         include_deprecated: false,
         include_beta: false,
@@ -133,6 +133,22 @@ fn test_args() -> Args {
         fail_under: None,
         fail_oasdiff_under: None,
     }
+}
+
+#[test]
+fn rejects_openai_spec_override() {
+    let error = Args::try_parse_from(["openai-conformance", "--openai-spec", "openai-test"])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::UnknownArgument,
+        "alternate reference paths must be rejected as unknown arguments"
+    );
+    assert!(
+        error.to_string().contains("--openai-spec"),
+        "rejected argument should be identified: {error}"
+    );
 }
 
 #[test]
@@ -398,6 +414,7 @@ fn oasdiff_report_counts_missing_and_drifted_as_nonconformant() {
 fn missing_rate_limit_responses_remain_actionable_for_every_conversation_operation() {
     let operations = registered_supported_operations()
         .into_iter()
+        .filter(|operation| operation.area == CONVERSATIONS_SCOPE.label)
         .map(|operation| SpecOperation {
             key: OperationKey::new(&operation.method, &operation.path),
             operation_id: None,
@@ -407,15 +424,32 @@ fn missing_rate_limit_responses_remain_actionable_for_every_conversation_operati
             beta: false,
         })
         .collect::<Vec<_>>();
-    assert_eq!(operations.len(), 8);
+    assert_eq!(
+        operations.len(),
+        8,
+        "all eight Conversations operations must be registered"
+    );
     let drifted = operations
         .iter()
         .map(|operation| {
             let drift = operation_drift_from_diff(operation.key.clone(), &json!({"responses": {"deleted": ["429"]}}))
                 .expect("missing 429 must produce response drift");
-            assert_eq!(drift.response_details, ["responses.deleted"]);
-            assert!(drift.request_details.is_empty());
-            assert!(drift.other_details.is_empty());
+            assert_eq!(
+                drift.response_details,
+                ["responses.deleted"],
+                "missing 429 must be response drift for {:?}",
+                operation.key
+            );
+            assert!(
+                drift.request_details.is_empty(),
+                "missing 429 must not be request drift for {:?}",
+                operation.key
+            );
+            assert!(
+                drift.other_details.is_empty(),
+                "missing 429 must not be other drift for {:?}",
+                operation.key
+            );
             (operation.key.clone(), drift)
         })
         .collect();
@@ -427,9 +461,20 @@ fn missing_rate_limit_responses_remain_actionable_for_every_conversation_operati
         Vec::new(),
         Vec::new(),
     );
-    assert_eq!(report.response_drift_count(), 8);
-    assert_eq!(report.conformant, 0);
-    assert_eq!(report.drifted.len(), 8);
+    assert_eq!(
+        report.response_drift_count(),
+        8,
+        "every Conversations operation must report response drift"
+    );
+    assert_eq!(
+        report.conformant, 0,
+        "no operation with a missing 429 response should be conformant"
+    );
+    assert_eq!(
+        report.drifted.len(),
+        8,
+        "all eight operations must remain actionable drift"
+    );
 }
 
 #[test]

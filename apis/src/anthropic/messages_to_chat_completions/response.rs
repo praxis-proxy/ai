@@ -19,21 +19,6 @@ const RESPONSE_TYPE: &str = "message";
 /// Default response role.
 const RESPONSE_ROLE: &str = "assistant";
 
-/// Anthropic error types that may be preserved from an upstream response.
-const ANTHROPIC_ERROR_TYPES: &[&str] = &[
-    "invalid_request_error",
-    "authentication_error",
-    "billing_error",
-    "permission_error",
-    "not_found_error",
-    "conflict_error",
-    "request_too_large",
-    "rate_limit_error",
-    "timeout_error",
-    "api_error",
-    "overloaded_error",
-];
-
 /// Minimal upstream error fields needed for Anthropic normalization.
 #[derive(Deserialize)]
 struct UpstreamError {
@@ -43,9 +28,6 @@ struct UpstreamError {
     message: Option<Value>,
     /// Upstream request identifier, when present.
     request_id: Option<Value>,
-    /// Top-level response discriminator, when present.
-    #[serde(rename = "type")]
-    r#type: Option<Value>,
 }
 
 // -----------------------------------------------------------------------------
@@ -72,6 +54,7 @@ pub(crate) fn transform_response(
     let Some(obj) = value.as_object() else {
         return Err("response body is not a JSON object".to_owned());
     };
+    validate_translatable_response(obj)?;
 
     let id = match obj.get("id").and_then(Value::as_str) {
         Some(id) => format!("msg_{id}"),
@@ -101,14 +84,52 @@ pub(crate) fn transform_response(
     })
 }
 
+/// Refuse a successful Chat response whose output would be silently lost.
+#[expect(clippy::too_many_lines, reason = "sequential response shape validation")]
+fn validate_translatable_response(obj: &Map<String, Value>) -> Result<(), String> {
+    let choices = obj
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or("Chat response requires `choices` array")?;
+    let [choice] = choices.as_slice() else {
+        return Err("Chat response must contain exactly one choice".to_owned());
+    };
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or("Chat choice requires a `message` object")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err("Chat choice requires an assistant message".to_owned());
+    }
+    if !matches!(message.get("content"), None | Some(Value::Null | Value::String(_))) {
+        return Err("Chat assistant `content` cannot be translated to Anthropic Messages".to_owned());
+    }
+    if message
+        .get("tool_calls")
+        .is_some_and(|value| !value.is_null() && !value.is_array())
+    {
+        return Err("Chat assistant `tool_calls` must be an array".to_owned());
+    }
+    if message.get("refusal").is_some_and(|value| !value.is_null())
+        || message.get("audio").is_some_and(|value| !value.is_null())
+        || message.get("function_call").is_some_and(|value| !value.is_null())
+        || message
+            .get("annotations")
+            .is_some_and(|value| !value.is_null() && value.as_array().is_none_or(|annotations| !annotations.is_empty()))
+        || choice.get("logprobs").is_some_and(|value| !value.is_null())
+    {
+        return Err("Chat response field cannot be translated to Anthropic Messages".to_owned());
+    }
+    match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("stop" | "length" | "tool_calls") => {},
+        _ => return Err("Chat finish_reason cannot be translated to Anthropic Messages".to_owned()),
+    }
+    Ok(())
+}
+
 /// Transform an upstream 4xx or 5xx response into Anthropic error format.
 pub(crate) fn transform_error_response(body: &[u8], status: StatusCode, header_request_id: Option<&str>) -> Vec<u8> {
     let parsed = serde_json::from_slice::<UpstreamError>(body).ok();
-    let is_anthropic_error = parsed
-        .as_ref()
-        .and_then(|value| value.r#type.as_ref())
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == "error");
     let message = parsed
         .as_ref()
         .and_then(|value| value.error.as_ref())
@@ -121,32 +142,15 @@ pub(crate) fn transform_error_response(body: &[u8], status: StatusCode, header_r
         .and_then(|value| value.error.as_ref())
         .and_then(|error| error.get("type"))
         .and_then(Value::as_str)
-        .filter(|error_type| is_anthropic_error || ANTHROPIC_ERROR_TYPES.contains(error_type));
+        .and_then(wire::ErrorType::parse);
     let request_id = parsed
         .as_ref()
         .and_then(|value| value.request_id.as_ref())
         .and_then(Value::as_str)
         .or(header_request_id);
-    let error_type = upstream_error_type.unwrap_or_else(|| error_type_for_status(status));
+    let error_type = upstream_error_type.unwrap_or_else(|| wire::ErrorType::from_status(status.as_u16()));
 
     wire::error_body(error_type, message, request_id)
-}
-
-/// Map an HTTP error status to its Anthropic error type.
-fn error_type_for_status(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        401 => "authentication_error",
-        402 => "billing_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        504 => "timeout_error",
-        529 => "overloaded_error",
-        500..=599 => "api_error",
-        _ => "invalid_request_error",
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -314,6 +318,22 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn semantic_chat_response_losses_are_rejected() {
+        for (message, finish_reason) in [
+            (
+                json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
+                "stop",
+            ),
+            (json!({"role": "assistant", "content": null, "refusal": "no"}), "stop"),
+            (json!({"role": "assistant", "content": "partial"}), "content_filter"),
+        ] {
+            let body = json!({"choices": [{"message": message, "finish_reason": finish_reason}]});
+            let error = transform_response(body.to_string().as_bytes(), "m", &[]).err().unwrap();
+            assert!(!error.is_empty());
+        }
+    }
+
     fn assert_null_fields(value: &Value, fields: &[&str]) {
         for field in fields {
             assert!(value.get(*field).is_some(), "expected {field} to be present");
@@ -334,12 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn future_anthropic_error_type_is_preserved() {
+    fn future_anthropic_error_type_uses_status_fallback() {
         let body = br#"{"type":"error","error":{"type":"future_error","message":"new failure"}}"#;
         let output = transform_error_response(body, StatusCode::INTERNAL_SERVER_ERROR, None);
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "future_error");
+        assert_eq!(parsed["error"]["type"], "api_error");
         assert_eq!(parsed["error"]["message"], "new failure");
     }
 
@@ -418,8 +438,8 @@ mod tests {
             (StatusCode::PAYMENT_REQUIRED, "billing_error"),
             (StatusCode::FORBIDDEN, "permission_error"),
             (StatusCode::NOT_FOUND, "not_found_error"),
-            (StatusCode::CONFLICT, "conflict_error"),
-            (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+            (StatusCode::CONFLICT, "invalid_request_error"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
             (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
             (StatusCode::from_u16(529).unwrap(), "overloaded_error"),
@@ -616,16 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_choices_produces_empty_content() {
+    fn empty_choices_are_rejected() {
         let body =
             br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
-        let tr = transform_response(body, "gpt-4", &[]).unwrap();
-        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
-
-        assert!(
-            parsed["content"].as_array().unwrap().is_empty(),
-            "empty choices should produce empty content"
-        );
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
+        assert!(error.contains("exactly one choice"), "{error}");
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! Provides [`execute_url`], which preserves the URL authority for
 //! HTTP virtual hosting, resolves every address for fallback, and
 //! bounds DNS plus the HTTP exchange with one overall deadline.
+//! [`execute_configured_url`] does the same for operator-configured
+//! targets, resolving through the proxy's shared DNS cache.
 //!
 //! Types ([`SubRequestClient`], [`SubRequest`], [`SubResponse`],
 //! [`SubRequestError`]) are re-exported from [`praxis_core::subrequest`].
@@ -43,6 +45,25 @@ struct ParsedUrl {
     authority: http::HeaderValue,
     /// Path and query sent to the upstream.
     uri: http::Uri,
+    /// Path with query values replaced by `[REDACTED]`, safe for logging.
+    redacted_uri: String,
+}
+
+/// Build a log-safe version of a path-and-query string by replacing each
+/// query-parameter value with `[REDACTED]`. Returns the path unchanged
+/// when there is no query string.
+fn redact_path_query(pq: &str) -> String {
+    let Some((path, query)) = pq.split_once('?') else {
+        return pq.to_owned();
+    };
+    let redacted: Vec<_> = query
+        .split('&')
+        .map(|pair| {
+            pair.split_once('=')
+                .map_or_else(|| pair.to_owned(), |(key, _)| format!("{key}=[REDACTED]"))
+        })
+        .collect();
+    format!("{path}?{}", redacted.join("&"))
 }
 
 /// Extract scheme, TLS flag, host, port, SNI, authority, and path.
@@ -72,6 +93,7 @@ fn parse_url_components(url: &str) -> Result<ParsedUrl, SubRequestError> {
         .map_err(|e| SubRequestError::InvalidRequest(format!("invalid authority: {e}")))?;
 
     let path_and_query = parsed.path_and_query().map_or("/", |pq| pq.as_str());
+    let redacted_uri = redact_path_query(path_and_query);
     let uri: http::Uri = path_and_query
         .parse()
         .map_err(|e| SubRequestError::InvalidRequest(format!("bad path: {e}")))?;
@@ -83,15 +105,41 @@ fn parse_url_components(url: &str) -> Result<ParsedUrl, SubRequestError> {
         sni,
         authority,
         uri,
+        redacted_uri,
     })
 }
 
+/// How a sub-request target's hostname is resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Resolution {
+    /// Resolve on every call. Required for URLs a client can choose, so
+    /// arbitrary hostnames never fill the shared, bounded cache.
+    PerCall,
+    /// Resolve through the proxy's upstream DNS cache: single-flight,
+    /// answers kept for 60 seconds, and the last good answer served when
+    /// resolution fails only for lack of descriptors or memory.
+    Shared,
+}
+
 /// Resolve every address so callers can fall back across address families.
-async fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, SubRequestError> {
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| SubRequestError::Connect(format!("DNS resolution failed for {host}: {e}")))?
-        .collect::<Vec<_>>();
+async fn resolve_addrs(host: &str, port: u16, resolution: Resolution) -> Result<Vec<SocketAddr>, SubRequestError> {
+    let addrs = match resolution {
+        Resolution::PerCall => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| SubRequestError::Connect(format!("DNS resolution failed for {host}: {e}")))?
+            .collect::<Vec<_>>(),
+        Resolution::Shared => {
+            let target = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            praxis_core::connectivity::peer::resolve_addresses(&target)
+                .await
+                .map_err(|e| SubRequestError::Connect(format!("DNS resolution failed for {host}: {e}")))?
+                .to_vec()
+        },
+    };
 
     if addrs.is_empty() {
         return Err(SubRequestError::Connect(format!("no addresses resolved for {host}")));
@@ -138,6 +186,46 @@ pub async fn execute_url(
     execute_url_with_framework(client, url, request, max_response_bytes, timeout, address_policy, None).await
 }
 
+/// [`execute_url`] for a target the operator configured, resolved through
+/// the proxy's shared DNS cache instead of on every call.
+///
+/// Callouts made on every request (metering balance checks and usage
+/// reports) would otherwise run a blocking lookup, and hold its sockets,
+/// per request. Never pass a URL a client can choose: arbitrary hostnames
+/// would crowd upstream entries out of the bounded cache. Address-policy
+/// validation still runs on every call.
+///
+/// # Errors
+///
+/// Same as [`execute_url`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's transport policy and execution bounds remain explicit"
+)]
+pub async fn execute_configured_url(
+    client: &SubRequestClient,
+    url: &str,
+    request: SubRequest,
+    max_response_bytes: usize,
+    timeout: Duration,
+    address_policy: AddressPolicy,
+) -> Result<SubResponse, SubRequestError> {
+    with_deadline(
+        timeout,
+        Box::pin(resolve_and_execute_url(
+            client,
+            url,
+            request,
+            max_response_bytes,
+            timeout,
+            address_policy,
+            None,
+            Resolution::Shared,
+        )),
+    )
+    .await
+}
+
 /// Parse and execute a full-URL sub-request carrying framework headers.
 ///
 /// This is used by the generic callout filter to retain depth propagation
@@ -171,6 +259,7 @@ pub async fn execute_url_with_framework(
             timeout,
             address_policy,
             framework_headers,
+            Resolution::PerCall,
         )),
     )
     .await
@@ -189,10 +278,11 @@ async fn resolve_and_execute_url(
     timeout: Duration,
     address_policy: AddressPolicy,
     framework_headers: Option<&FrameworkHeaders>,
+    resolution: Resolution,
 ) -> Result<SubResponse, SubRequestError> {
     validate_http_target("sub-request", url).map_err(|error| SubRequestError::InvalidRequest(error.to_string()))?;
     let parsed = parse_url_components(url)?;
-    let addrs = resolve_addrs(&parsed.host, parsed.port).await?;
+    let addrs = resolve_addrs(&parsed.host, parsed.port, resolution).await?;
     execute_with_addresses(
         client,
         parsed,
@@ -227,6 +317,12 @@ async fn execute_with_addresses(
     let addrs = validate_resolved_addrs("sub-request", &addrs, address_policy)
         .map_err(|error| SubRequestError::Connect(error.to_string()))?;
     let mut request = request;
+    debug!(
+        host = %parsed.host,
+        uri = %parsed.redacted_uri,
+        method = %request.method,
+        "sub-request: dispatching"
+    );
     request.uri = parsed.uri;
     request.headers.insert(http::header::HOST, parsed.authority);
 
@@ -386,10 +482,106 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_addrs_unresolvable_host_returns_connect_error() {
-        let result = resolve_addrs("this-host-does-not-exist.invalid", 443).await;
+        let result = resolve_addrs("this-host-does-not-exist.invalid", 443, Resolution::PerCall).await;
         assert!(
             matches!(result, Err(SubRequestError::Connect(_))),
             "unresolvable host should return Connect error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_resolution_reuses_a_cached_failure_and_per_call_does_not() {
+        let host = "praxis-ai-subrequest-shared-resolution.invalid";
+
+        let first = resolve_addrs(host, 443, Resolution::Shared).await;
+        assert!(
+            matches!(&first, Err(SubRequestError::Connect(_))),
+            "unresolvable host should return Connect error: {first:?}"
+        );
+        let second = resolve_addrs(host, 443, Resolution::Shared).await;
+        assert!(
+            matches!(&second, Err(SubRequestError::Connect(detail)) if detail.contains("recently failed")),
+            "a repeat lookup must come from the shared cache: {second:?}"
+        );
+        let per_call = resolve_addrs(host, 443, Resolution::PerCall).await;
+        assert!(
+            matches!(&per_call, Err(SubRequestError::Connect(detail)) if !detail.contains("recently failed")),
+            "per-call resolution must never consult the shared cache: {per_call:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_resolution_resolves_hostnames() {
+        let addrs = resolve_addrs("localhost", 8080, Resolution::Shared).await.unwrap();
+        assert!(
+            addrs.iter().all(|addr| addr.ip().is_loopback() && addr.port() == 8080),
+            "localhost should resolve to loopback on the requested port: {addrs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_resolution_accepts_ip_literals() {
+        let v4 = resolve_addrs("127.0.0.1", 8080, Resolution::Shared).await.unwrap();
+        assert_eq!(v4, vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
+
+        let v6 = resolve_addrs("::1", 8080, Resolution::Shared).await.unwrap();
+        assert_eq!(
+            v6,
+            vec!["[::1]:8080".parse::<SocketAddr>().unwrap()],
+            "a bracket-stripped IPv6 host must be rebracketed for the shared resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_url_resolves_and_keeps_the_authority() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = capture_raw_request(listener);
+
+        let response = execute_configured_url(
+            &test_client(),
+            &format!("http://localhost:{port}/test"),
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        let wire = captured.join().unwrap().to_lowercase();
+        assert!(
+            wire.contains(&format!("host: localhost:{port}")),
+            "Host header should use the configured authority: {wire}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_url_enforces_address_policy_after_cached_resolution() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://localhost:{port}/test");
+
+        let _warm = resolve_addrs("localhost", port, Resolution::Shared).await.unwrap();
+        let result = execute_configured_url(
+            &test_client(),
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::PublicOnly,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(SubRequestError::Connect(detail)) if detail.contains("blocked non-public address")),
+            "a cached answer must still pass address policy: {result:?}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a rejected address set must not be dialed"
         );
     }
 
@@ -529,5 +721,141 @@ mod tests {
             [format!("host: {authority}").as_str()],
             "only the URL authority should be sent as Host: {wire}"
         );
+    }
+
+    #[test]
+    fn redact_path_query_preserves_path_without_query() {
+        assert_eq!(redact_path_query("/v1/files"), "/v1/files");
+    }
+
+    #[test]
+    fn redact_path_query_replaces_values() {
+        assert_eq!(
+            redact_path_query("/blob?sig=SECRET&se=2026-01-01"),
+            "/blob?sig=[REDACTED]&se=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_path_query_preserves_valueless_keys() {
+        assert_eq!(redact_path_query("/path?flag"), "/path?flag");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(clippy::too_many_lines, reason = "inline tracing capture layer and assertions")]
+    async fn dispatch_log_event_redacts_query_values() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone)]
+        struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                struct FieldCollector {
+                    message: Option<String>,
+                    uri: Option<String>,
+                }
+                impl tracing::field::Visit for FieldCollector {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        // `{value:?}` quotes strings; strip so message matching works
+                        // whether the field arrives via `record_str` or `record_debug`.
+                        let rendered = format!("{value:?}");
+                        let normalized = rendered
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(rendered.as_str())
+                            .to_owned();
+                        match field.name() {
+                            "message" => self.message = Some(normalized),
+                            "uri" => self.uri = Some(normalized),
+                            _ => {},
+                        }
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "message" => self.message = Some(value.to_owned()),
+                            "uri" => self.uri = Some(value.to_owned()),
+                            _ => {},
+                        }
+                    }
+                }
+                let mut collector = FieldCollector {
+                    message: None,
+                    uri: None,
+                };
+                event.record(&mut collector);
+                if collector.message.as_deref() == Some("sub-request: dispatching")
+                    && let Some(uri) = collector.uri
+                {
+                    self.0.lock().unwrap().push(uri);
+                }
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = EventCapture(Arc::clone(&events));
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _captured = capture_raw_request(listener);
+
+        let client = test_client();
+        let url = format!("http://example.test:{}/blob?sig=SECRET&token=s3cret", addr.port());
+
+        // Callsite interest is cached process-wide, and while this is the only
+        // scoped dispatcher, a callsite first reached from another test's
+        // thread caches that thread's "nobody listening" answer. Register the
+        // callsite before capturing (creating the dispatcher raises the max
+        // level so it can register), then recompute interest with the capture
+        // installed.
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let _warm_up = Box::pin(execute_url_with_test_addresses(
+            &client,
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![refused],
+        ))
+        .await;
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let _result = Box::pin(execute_url_with_test_addresses(
+            &client,
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![addr],
+        ))
+        .await;
+
+        let logged_uris = events.lock().unwrap();
+        assert!(
+            !logged_uris.is_empty(),
+            "dispatch event with uri field should be emitted"
+        );
+        for uri in logged_uris.iter() {
+            assert!(
+                !uri.contains("SECRET") && !uri.contains("s3cret"),
+                "signed URL secrets must not appear in logged URI: {uri}"
+            );
+            assert!(
+                uri.contains("[REDACTED]"),
+                "query values should be replaced with [REDACTED]: {uri}"
+            );
+        }
     }
 }

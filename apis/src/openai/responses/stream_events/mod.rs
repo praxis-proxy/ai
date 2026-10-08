@@ -144,8 +144,8 @@ pub(super) struct StreamEventsState {
 /// elsewhere is a misconfiguration and fails closed at request time.
 /// Place it after `load_balancer` so IRR body hooks run with a selected
 /// peer when needed. `timeout_secs` is an absolute deadline from the first
-/// SSE chunk; each chunk recaps the remaining time onto the live body through
-/// [`praxis_filter::HttpFilterContext::cap_stream_read_timeout`].
+/// SSE chunk; each chunk recaps that absolute cutoff onto the live body through
+/// [`praxis_filter::HttpFilterContext::cap_stream_deadline`].
 ///
 /// # YAML
 ///
@@ -347,7 +347,7 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 ///
 /// The `iterative_request_router` runner moves request extensions into each
 /// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
-/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
+/// filters (e.g. `openai_responses_request`) is not visible here. `ResponsesState`
 /// is created pre-IRR and travels through extensions, so fall back to it for
 /// format and stream detection — mirroring how `responses_to_chat_completions`
 /// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
@@ -371,10 +371,10 @@ fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
         .unwrap_or(false);
     let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && (typed_streaming
-            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+            || ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
             || has_responses_state);
     let is_streaming =
-        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        typed_streaming || ctx.get_metadata("openai_responses_request.stream") == Some("true") || body_stream;
     let inside_irr = ctx.extensions.get::<IterationState>().is_some();
     arm_decision(is_responses && is_streaming, inside_irr)
 }
@@ -505,7 +505,7 @@ fn stream_deadline_at(state: &StreamEventsState) -> Option<Instant> {
 /// Publish the absolute stream cutoff for the streaming executor to copy onto
 /// the live body after this body-filter pass.
 fn recap_stream_deadline(ctx: &mut HttpFilterContext<'_>, deadline: Instant) {
-    ctx.cap_stream_read_timeout(deadline.saturating_duration_since(Instant::now()));
+    ctx.cap_stream_deadline(deadline);
 }
 
 /// Whether an `Io` termination is the stream deadline, not a reset.
@@ -2080,12 +2080,6 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
-    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
-    // Unlike `emit_deferred_terminal`, this local completion is returned to the
-    // store as a buffered `TerminalResponse` at end-of-stream (see
-    // `finish_deferred_local_response`), where the store already persists before
-    // the body is written. Marking the flag would make the store skip that
-    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -2094,6 +2088,11 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
+    // IRR can surface the local terminal body to outer filters as a non-EOS
+    // chunk. Mark it only after encoding succeeded so they persist before
+    // releasing that chunk; the store retains an EOS fallback if no such chunk
+    // arrives.
+    state.local_stream_terminal_emitted = true;
     Some(Bytes::from(output))
 }
 

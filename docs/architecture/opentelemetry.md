@@ -89,9 +89,10 @@ request-scoped `token_rate_limit` span. It records these bounded fields:
 - `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
 - `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
 - `token_rate_limit.decision`: `admitted` (reservation made), `denied` (429,
-  budget exhausted), `unauthenticated` (401, no trusted subject to key the
-  budget on), or `error` (503, the backend failed and the filter failed
-  closed).
+  budget exhausted), `soft_over_quota` (soft mode forwarded over budget with
+  annotation), `unauthenticated` (401, no trusted subject to key the budget
+  on), or `error` (503, the backend failed and the filter failed closed).
+  Soft decisions align with `praxis_trl_requests_total{result=…}`.
 - `token_rate_limit.actual_cost`: provider-reported weighted usage, recorded
   when the response body ends. Absent when the decision was not `admitted`
   or no usage metadata was produced.

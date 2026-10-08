@@ -56,7 +56,11 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
+use super::{
+    error::responses_error_rejection,
+    is_explicit_compact_request,
+    state::{ResponsesState, mark_local_compaction_item},
+};
 use crate::{
     callout_policy::OnFailure,
     state_owner::{StateOwner, require_state_owner},
@@ -289,7 +293,7 @@ impl CompactFilter {
         };
         replace_messages(
             state,
-            build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
+            &build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
         );
     }
 
@@ -537,7 +541,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------
@@ -557,13 +561,19 @@ struct ExplicitCompactRequest {
 }
 
 /// Parse and validate the `POST /v1/responses/compact` body.
+///
+/// Fields are validated for type before any summarization callout or store
+/// write, so a wrong-typed `input` or `instructions` is rejected with HTTP 400
+/// rather than silently dropped to absence/empty (see issue #1403). The scalar
+/// fields are moved out of the parsed body (rather than cloned) so the
+/// potentially large `input` array is never copied just to own it.
 #[expect(clippy::too_many_lines, reason = "linear field parsing and validation")]
 fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactRequest, FilterAction> {
     let bytes = body
         .as_ref()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "request body is empty"))?;
-    let parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
+    let mut parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
         debug!(error = %e, "compact request body parse failed");
         reject_compact(400, "invalid_request_error", "invalid JSON body")
     })?;
@@ -573,12 +583,10 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         .filter(|s| !s.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "missing required field: model"))?
         .to_owned();
-    let input = parse_compact_input(parsed.get("input"));
-    let previous_response_id = parsed
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
+    let instructions = parse_compact_instructions(parsed.get_mut("instructions").map(Value::take))?;
+    let previous_response_id =
+        parse_compact_previous_response_id(parsed.get_mut("previous_response_id").map(Value::take))?;
+    let input = parse_compact_input(parsed.get_mut("input").map(Value::take))?;
     if input.is_empty() && previous_response_id.is_none() {
         return Err(reject_compact(
             400,
@@ -590,24 +598,317 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         model,
         input,
         previous_response_id,
-        instructions: parsed
-            .get("instructions")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        instructions,
     })
 }
 
-/// Normalize the `input` field into a list of conversation items.
+/// Validate and own the optional `instructions` field.
 ///
-/// A bare string is coerced into a single `user` message, matching the
-/// contract where a string is equivalent to a text user input.
-fn parse_compact_input(input: Option<&Value>) -> Vec<Value> {
+/// Absent or explicit `null` yields `None` (legitimate omission). A string is
+/// kept as-is. Any other JSON type is a wrong-typed field and is rejected with
+/// HTTP 400 rather than silently treated as absent (issue #1403).
+fn parse_compact_instructions(instructions: Option<Value>) -> Result<Option<String>, FilterAction> {
+    match instructions {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "instructions must be a string",
+        )),
+    }
+}
+
+/// Validate and own the optional `previous_response_id` field.
+///
+/// Absent, explicit `null`, or an empty string yields `None`. A non-empty
+/// string is kept. Any other JSON type is rejected with HTTP 400. In the
+/// recommended pipeline `rehydrate` already rejects a wrong-typed prior id
+/// ahead of compact; this is defense-in-depth for chains without it.
+fn parse_compact_previous_response_id(previous_response_id: Option<Value>) -> Result<Option<String>, FilterAction> {
+    match previous_response_id {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok((!s.is_empty()).then_some(s)),
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "previous_response_id must be a string",
+        )),
+    }
+}
+
+/// Normalize and validate the `input` field into a list of conversation items.
+///
+/// Accepts:
+/// - absent or explicit `null`: an empty list (the caller still enforces the `input` or `previous_response_id`
+///   requirement),
+/// - a non-empty string: coerced into a single `user` message (an empty string contributes no content, matching the
+///   prior behavior),
+/// - an array: each item must be a JSON object whose consumed fields are well-typed (see
+///   [`validate_compact_input_item`]).
+///
+/// Any other JSON type (number, bool, object) is rejected with HTTP 400, and a
+/// malformed array item (e.g. `[123]`, or a message whose `content` is a number)
+/// is rejected rather than accepted into the list where it would be silently
+/// formatted into empty text and summarized/stored anyway (issue #1403).
+/// Whether a schema-valid but empty input should itself be rejected is tracked
+/// separately in #1139.
+fn parse_compact_input(input: Option<Value>) -> Result<Vec<Value>, FilterAction> {
     match input {
-        Some(Value::String(s)) if !s.is_empty() => {
-            vec![serde_json::json!({"role": "user", "content": s})]
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![serde_json::json!({"role": "user", "content": s})])
+            }
         },
-        Some(Value::Array(arr)) => arr.clone(),
-        _ => Vec::new(),
+        Some(Value::Array(arr)) => {
+            for (idx, item) in arr.iter().enumerate() {
+                validate_compact_input_item(idx, item)?;
+            }
+            Ok(arr)
+        },
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "input must be a string or an array of items",
+        )),
+    }
+}
+
+/// Validate the fields that [`append_item`] consumes from one inline `input`
+/// item, so a wrong-typed field is rejected with HTTP 400 rather than silently
+/// formatted into empty text and summarized/stored anyway (issue #1403).
+///
+/// The discriminant mirrors [`append_item`] exactly: a `function_call`,
+/// `function_call_output`, or `compaction` item consumes its own named fields,
+/// and every other kind — an explicit or untyped `message`, an `item_reference`,
+/// or any unrecognized type — reaches the catch-all arm that reads `role` and
+/// `content` (see [`validate_compact_message_like`]). A message's `content` and
+/// a function output's `output` are required `string | content-list` values, so
+/// absent/null/scalar values are rejected; an empty string or empty array is
+/// schema-valid emptiness and is left for the separate #1139 question. The
+/// schema-required string fields are required here too, since the formatter would
+/// otherwise silently default them: `name`/`arguments` on a function call,
+/// `encrypted_content` on a compaction, and `role` on a message. The optional
+/// item `type`, when present, must be a concrete string, except that a null
+/// `type` is tolerated for a reference-shaped item (see
+/// [`validate_item_type_field`]).
+fn validate_compact_input_item(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    if !item.is_object() {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}] must be an object"),
+        ));
+    }
+    // A non-string `type` would be ignored by `append_item` and the item
+    // silently reinterpreted as a message, so reject it up front. A `null` is
+    // tolerated only for a reference-shaped item (see `validate_item_type_field`).
+    validate_item_type_field(idx, item)?;
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            // `name` and `arguments` are required strings in the Responses schema;
+            // `append_item` would otherwise silently default them ("unknown"/""),
+            // losing the call identity, so require a well-typed value (issue #1403).
+            require_string_item_field(idx, item, "name")?;
+            require_string_item_field(idx, item, "arguments")?;
+        },
+        Some("function_call_output") => {
+            // `output` is a required `string | content-list` in the Responses
+            // API; a missing, null, or scalar value would be summarized as empty
+            // text, so require a well-typed value here.
+            validate_required_text_field(idx, "output", item.get("output"))?;
+        },
+        Some("compaction") => {
+            // `encrypted_content` is a required string in the Responses compaction
+            // item; a missing or null value would be summarized as empty text and
+            // persisted as an empty compaction, so require it (issue #1403).
+            require_string_item_field(idx, item, "encrypted_content")?;
+        },
+        // Every other item — an explicit `message`, an untyped message, an
+        // `item_reference`, or any unrecognized type — is formatted by
+        // `append_item`'s catch-all arm, which reads `role` and `content`. Validate
+        // those consumed fields so a malformed value is rejected rather than
+        // silently dropped into an empty summary (issue #1403).
+        _ => validate_compact_message_like(idx, item)?,
+    }
+    Ok(())
+}
+
+/// Validate the `role`/`content` fields that [`append_item`]'s catch-all arm
+/// consumes for every item that is not a function call, function-call output, or
+/// compaction.
+///
+/// A genuine message — an explicit `type: "message"` or the untyped
+/// `EasyInputMessage` shorthand (no `type`, but a `role`) — requires a string
+/// `role` and a `string | content-list` `content`; a missing, null, or
+/// wrong-typed value for either would otherwise be silently defaulted (`role` to
+/// "unknown", `content` to empty text) and summarized/stored (issue #1403). An
+/// explicitly typed non-message item (`additional_tools`, `item_reference`,
+/// reasoning, …) is NOT a message even when it carries a `role`: it has no
+/// required `content`, and `append_item` emits nothing for it when `content` is
+/// empty, so it passes through. A `content` field present on any such item must
+/// still be well-typed, since `append_item` would drop a malformed value just the
+/// same.
+fn validate_compact_message_like(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    let type_str = item.get("type").and_then(Value::as_str);
+    let is_message = matches!(type_str, Some("message")) || (type_str.is_none() && item.get("role").is_some());
+    if is_message {
+        // A message's `role` is a required string; `append_item` would otherwise
+        // default it to "unknown", losing the speaker (issue #1403).
+        require_string_item_field(idx, item, "role")?;
+    }
+    match item.get("content") {
+        Some(content) => validate_text_field_value(idx, "content", content),
+        None if is_message => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].content must be a string or an array"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Validate the item-level `type` discriminator against the two shapes the
+/// Responses schema allows it to be absent or null for. A non-string, non-null
+/// value is always rejected. An absent `type` is the untyped-message /
+/// item-reference shorthand and is tolerated. A `null` `type` is tolerated only
+/// for a reference-shaped item: one that carries a string `id` and neither
+/// `role` nor `content` (`ItemReferenceParam` requires a string `id` and allows
+/// `type` to be `anyOf: [enum "item_reference", null]`). A null `type` on
+/// anything else — a message-shaped item (one with a `role` or `content`) or an
+/// item with no `id` — is rejected, since the message type must be a string when
+/// present and `append_item` would otherwise read the null as absent and
+/// silently reinterpret the item as a defaulted, empty message (issue #1403).
+fn validate_item_type_field(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    match item.get("type") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(Value::Null)
+            if item.get("id").and_then(Value::as_str).is_some()
+                && item.get("role").is_none()
+                && item.get("content").is_none() =>
+        {
+            Ok(())
+        },
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].type must be a string"),
+        )),
+    }
+}
+
+/// Reject with HTTP 400 unless `field` is present on `item` as a string. Unlike
+/// [`validate_item_type_field`], which tolerates an absent (and, for a reference
+/// shape, null) `type`, a missing or null value is also rejected here, for a
+/// field the Responses schema requires and that `append_item` would otherwise
+/// silently replace with a default (issue #1403).
+fn require_string_item_field(idx: usize, item: &Value, field: &str) -> Result<(), FilterAction> {
+    match item.get(field) {
+        Some(Value::String(_)) => Ok(()),
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string"),
+        )),
+    }
+}
+
+/// Validate a required `content`/`output` field against what the formatter
+/// reads: it must be present and be a string or a content-list (array of part
+/// objects), never absent or null. Both fields are required `string |
+/// content-list` in the Responses schema, so a missing or null value would
+/// otherwise be silently formatted into empty text and summarized/stored
+/// (issue #1403). An empty string or empty array is schema-valid emptiness and
+/// is left for the separate #1139 question.
+fn validate_required_text_field(idx: usize, field: &str, value: Option<&Value>) -> Result<(), FilterAction> {
+    match value {
+        Some(value) => validate_text_field_value(idx, field, value),
+        None => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string or an array"),
+        )),
+    }
+}
+
+/// Validate that a present `content`/`output` value is a string or a content-list
+/// (array of part objects). An explicit `null` or any scalar is rejected, since
+/// `append_item` would otherwise collapse it to empty text (issue #1403).
+fn validate_text_field_value(idx: usize, field: &str, value: &Value) -> Result<(), FilterAction> {
+    match value {
+        Value::String(_) => Ok(()),
+        Value::Array(parts) => validate_content_parts(idx, field, parts),
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string or an array"),
+        )),
+    }
+}
+
+/// Validate the parts of a `content`/`output` array: each part must be an object,
+/// and a text part (`input_text` / `output_text` / `text`) must carry a string `text`,
+/// since the Responses schema requires it and `append_item` would otherwise
+/// silently drop a missing, null, or wrong-typed value to empty (issue #1403). A
+/// part of any other kind (image, file, refusal) carries no `text` and is left
+/// alone, matching the formatter; a stray `text` on such a part must still be a
+/// string if present.
+fn validate_content_parts(idx: usize, field: &str, parts: &[Value]) -> Result<(), FilterAction> {
+    for (part_idx, part) in parts.iter().enumerate() {
+        validate_content_part(idx, field, part_idx, part)?;
+    }
+    Ok(())
+}
+
+/// Validate a single content/output part. See [`validate_content_parts`].
+fn validate_content_part(idx: usize, field: &str, part_idx: usize, part: &Value) -> Result<(), FilterAction> {
+    if !part.is_object() {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}] must be an object"),
+        ));
+    }
+    // A content part's `type` discriminator is required and must be a concrete
+    // string. Without it (absent, null, or non-string) a text part's required
+    // `text` escapes validation and is silently dropped, and the translator would
+    // fail the part closed anyway (issue #1403).
+    if !matches!(part.get("type"), Some(Value::String(_))) {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}].type must be a string"),
+        ));
+    }
+    validate_part_text(idx, field, part_idx, part)
+}
+
+/// Validate a content part's `text` against its kind: the text kinds the
+/// translator collapses (`input_text` / `output_text` / `text`) require a string,
+/// other kinds may omit it, and a present non-string is always malformed
+/// (issue #1403). Keep the text-kind set in sync with
+/// `ConvertedContentParts::push` in the Chat translator.
+fn validate_part_text(idx: usize, field: &str, part_idx: usize, part: &Value) -> Result<(), FilterAction> {
+    let text_required = matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("input_text" | "output_text" | "text")
+    );
+    let text_ok = match part.get("text") {
+        Some(Value::String(_)) => true,
+        None | Some(Value::Null) => !text_required,
+        Some(_) => false,
+    };
+    if text_ok {
+        Ok(())
+    } else {
+        Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}].text must be a string"),
+        ))
     }
 }
 
@@ -671,7 +972,7 @@ struct CompactionWriter<'a> {
     filter: &'a CompactFilter,
     /// Request context, used for id and timestamp generation.
     ctx: &'a HttpFilterContext<'a>,
-    /// Response store the compaction record is persisted to.
+    /// Responses store the compaction record is persisted through.
     store: &'a OwnerScopedResponseStore,
     /// Immutable owner the record is scoped to.
     owner: &'a StateOwner,
@@ -687,13 +988,11 @@ impl CompactionWriter<'_> {
     /// compaction item.
     async fn persist_compacted(&self, summary: &Summarization) -> Result<Value, FilterAction> {
         let compaction_id = format!("compact_{}", self.ctx.id_generator.generate(self.ctx.time_source));
-        let item = Value::Array(vec![build_compaction_item(
-            &compaction_id,
-            &summary.content,
-            &self.filter.config.summary_prefix,
-        )]);
+        let item = build_compaction_item(&compaction_id, &summary.content, &self.filter.config.summary_prefix);
+        let stored_item = mark_local_compaction_item(&item);
         let usage = build_compaction_usage(self.messages, Some(summary), &self.filter.config.tiktoken_encoding);
-        self.persist_response(item.clone(), item, usage).await
+        self.persist_response(Value::Array(vec![item]), Value::Array(vec![stored_item]), usage)
+            .await
     }
 
     /// Persist an uncompacted no-op when the summarization callout fails under
@@ -1001,17 +1300,18 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 /// matches `state.input`. File resolution and document extraction
 /// rewrite that tail in place and leave `state.input` as the original
 /// client payload, so compaction must not rebuild from `state.input`.
-fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
+fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
     let message_tail = split_current_turn(&mut state.messages, input_len);
     let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let persisted_compaction_item = mark_local_compaction_item(compaction_item);
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
     state.messages.extend(message_tail);
 
     state.persisted_messages.clear();
-    state.persisted_messages.push(compaction_item);
+    state.persisted_messages.push(persisted_compaction_item);
     state.persisted_messages.extend(persisted_tail);
 }
 
@@ -1064,9 +1364,11 @@ fn append_item(buf: &mut String, msg: &Value) {
             append_function_call(buf, name, args);
         },
         Some("function_call_output") => {
-            let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
+            // `output` is `string | content-list`; join the parts' text the same
+            // way message content is handled so an array output is not dropped.
+            let output = extract_text_parts(msg.get("output"));
             if !output.is_empty() {
-                append_line(buf, "function_call_output", output);
+                append_line(buf, "function_call_output", &output);
             }
         },
         _ => {
@@ -1120,26 +1422,35 @@ fn append_function_call(buf: &mut String, name: &str, args: &str) {
 }
 
 /// Extract text content from a message's `content` field.
+fn extract_content(msg: &Value) -> Cow<'_, str> {
+    extract_text_parts(msg.get("content"))
+}
+
+/// Extract text from a `content` or `output` field value.
 ///
-/// Content can be a plain string, an array of content parts
+/// The value can be a plain string, an array of content parts
 /// (each with a `"text"` field), or absent/null.
 ///
-/// Returns `Cow::Borrowed` for plain strings (zero-copy) and
-/// `Cow::Owned` for array content that must be joined.
-fn extract_content(msg: &Value) -> Cow<'_, str> {
-    let Some(content) = msg.get("content") else {
+/// Returns `Cow::Borrowed` for plain strings (zero-copy) and `Cow::Owned` for
+/// array content that must be joined. Adjacent text parts are concatenated with
+/// no separator, matching how the Responses-to-Chat translation joins text
+/// (`convert_function_call_output` and the text-only content collapse, both
+/// joined with no separator), so `"pass"` + `"word"` reads as `"password"` just
+/// as the backend would see it. Non-text parts (images, files) are dropped
+/// because the summarizer input is text-only; the backend instead preserves a
+/// mixed-content message as a parts array, so such a message is rendered lossily
+/// here by design.
+fn extract_text_parts(value: Option<&Value>) -> Cow<'_, str> {
+    let Some(value) = value else {
         return Cow::Borrowed("");
     };
-    if let Some(s) = content.as_str() {
+    if let Some(s) = value.as_str() {
         return Cow::Borrowed(s);
     }
-    if let Some(arr) = content.as_array() {
+    if let Some(arr) = value.as_array() {
         let mut joined = String::new();
         for part in arr {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !joined.is_empty() {
-                    joined.push(' ');
-                }
                 joined.push_str(text);
             }
         }

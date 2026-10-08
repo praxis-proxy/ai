@@ -1,0 +1,42 @@
+name: Build vLLM GPU image
+description: Build the model-baked GPU image used by the container and full-suite workflows.
+inputs:
+  model:
+    description: Hugging Face model ID to bake into the image.
+    required: true
+  image:
+    description: Tag for the locally built image.
+    required: true
+  revision:
+    description: Optional pinned Hugging Face model revision.
+    required: false
+  runtime:
+    description: Container runtime binary (docker or podman).
+    required: true
+  hugging-face-token:
+    description: Optional token for gated models.
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Build image
+      shell: bash
+      env:
+        DOCKER_BUILDKIT: "1"
+        INFERENCE_MODEL: ${{ inputs.model }}
+        INFERENCE_REVISION: ${{ inputs.revision }}
+        IMAGE: ${{ inputs.image }}
+        CONTAINER_RUNTIME: ${{ inputs.runtime }}
+        HF_TOKEN: ${{ inputs.hugging-face-token }}
+      run: |
+        set -euo pipefail
+        build_args=(
+          --build-arg "INFERENCE_MODEL=${INFERENCE_MODEL}"
+          --build-arg "INFERENCE_REVISION=${INFERENCE_REVISION}"
+          --tag "$IMAGE"
+          --file vllm/Containerfile
+        )
+        if [ -n "$HF_TOKEN" ]; then
+          build_args+=(--secret "id=hf_token,env=HF_TOKEN")
+        fi
+        "$CONTAINER_RUNTIME" build "${build_args[@]}" .

@@ -4,11 +4,18 @@
 # listener handles Anthropic Messages, OpenAI Chat Completions,
 # and OpenAI Responses requests.
 #
-# `openai_operation` classifies Chat Completions from the request head
-# without reading the body. `anthropic_messages_format` classifies every
-# request body and promotes `x-praxis-ai-format` for router-based cluster
-# selection. `openai_responses_format` runs for its own filter results
-# but does not promote a format header (avoids overwriting).
+# `ai_operation` classifies both Anthropic Messages and OpenAI Chat
+# Completions from the request head, without reading the body, and both
+# branch on its published filter results. One filter covers both protocol
+# families: each protocol declares its own operation registry, and the
+# classifier aggregates them.
+#
+# Responses still routes on a body fact. `openai_responses_request`
+# classifies the body for its own filter results but does not promote a
+# format header (avoids overwriting), and `anthropic_messages_format`
+# promotes `x-praxis-ai-format` and `x-praxis-ai-model` for the requests
+# that reach it. `/v1/messages` no longer needs a body-format router rule:
+# the head already identified it.
 
 listeners:
   - name: unified-gateway
@@ -18,11 +25,24 @@ listeners:
 filter_chains:
   - name: unified-routing
     filters:
-      - filter: openai_operation
+      - filter: ai_operation
         branch_chains:
+          - name: anthropic-messages
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: anthropic_messages
+            chains:
+              - name: anthropic-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "anthropic-backend"
+            rejoin: shared_load_balancer
           - name: chat-completions
             on_result:
-              filter: openai_operation
+              filter: ai_operation
               key: application_protocol
               result: openai_chat_completions
             chains:
@@ -41,7 +61,8 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: ~
@@ -51,10 +72,6 @@ filter_chains:
       - name: body_classifiers
         filter: router
         routes:
-          - path: "/v1/messages"
-            headers:
-              x-praxis-ai-format: "anthropic_messages"
-            cluster: "anthropic-backend"
           - path: "/v1/responses"
             headers:
               x-praxis-ai-format: "openai_responses"

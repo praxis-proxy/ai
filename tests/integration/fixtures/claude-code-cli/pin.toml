@@ -11,6 +11,17 @@
 # mode. One vLLM container serves both surfaces (`/v1/messages` natively AND
 # `/v1/chat/completions`), so all four scenarios share this single pinned model.
 #
+# A fifth scenario (issue #1418) drives one read-only PLANNING turn over the
+# native path against the same container, asserting it converges and that no
+# reasoning-channel text reaches the user-visible answer. See
+# `[claude_code.launch.planning]` below for its pins and its scope.
+#
+# A sixth scenario drives the client's built-in WebSearch tool through Praxis's
+# managed `anthropic_web_search` loop against REAL Tavily, over the agentic example
+# config routed onto the Chat Completions backend, proving the search is resolved
+# SERVER-SIDE (the managed tool_use is suppressed) rather than by the client. It is
+# gated additionally on a real TAVILY_API_KEY. See `[claude_code.launch.web_search]`.
+#
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
 # lightweight `pins` job parses this manifest and exports its runtime values.
@@ -77,9 +88,127 @@ flags = [
   "--max-turns", "8",
 ]
 
+# Read-only planning scenario (issue #1418). Keep in sync with
+# PLANNING_LAUNCH_FLAGS and PermissionScenario::ReadOnlyPlanning in
+# claude_code_vllm.rs.
+#
+# SCOPE: this is NOT the interactive plan mode of the report. The pinned
+# executable exposes neither the plan-mode system prompt nor `ExitPlanMode` in
+# any headless transport (`-p`, with or without `--input-format stream-json`),
+# verified against 2.1.278, so plan mode cannot be driven from CI. The scenario
+# reproduces the shape of the turn that broke — a read-only, multi-file planning
+# request answered in prose — and asserts both observable symptoms are absent:
+# the run converges instead of exhausting its turn budget, and no reasoning
+# delimiter reaches the user-visible answer.
+#
+# Only `Read` is exposed, so the request itself carries no tool that could
+# mutate the workspace, and only `Read` is preapproved. The prompt deliberately
+# omits the `/no_think` suffix the coding task uses: that marker would suppress
+# Qwen3 thinking from the user turn and mask the server-side misconfiguration
+# this scenario exists to catch. Thinking must be off because the backend is
+# served with the flags below, not because the prompt asked.
+[claude_code.launch.planning]
+exposed_tools = ["Read"]
+permission_mode = "acceptEdits"
+allowed_tools = ["Read"]
+# Reasoning-channel delimiters asserted absent from user-visible assistant text.
+reasoning_leak_markers = ["<think>", "</think>"]
+flags = [
+  "--tools", "Read",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
+# Server-side web-search scenario. Keep in sync with WEB_SEARCH_LAUNCH_FLAGS and
+# PermissionScenario::WebSearch in claude_code_vllm.rs.
+#
+# Proves the pinned client's built-in `WebSearch` tool is resolved SERVER-SIDE by
+# Praxis's managed `anthropic_web_search` loop against REAL Tavily, over the
+# agentic example config (`examples/configs/anthropic/full-flow-agentic.yaml`),
+# routed by model onto the Chat Completions backend. The full chain is:
+#   Claude Code (--tools WebSearch) -> Praxis /v1/messages
+#     -> anthropic_web_search managed IRR loop -> real Tavily -> text answer -> CLI
+#
+# Only `WebSearch` is exposed, so the request's single tool is the managed one and
+# the only path to an answer is the server-side search. The managed loop SUPPRESSES
+# the `WebSearch` tool_use, so a client-visible WebSearch call is a failure, not a
+# success. `/no_think` is used (like the coding task): this scenario is about the
+# search round-trip, not reasoning.
+#
+# NOT a mock: a loopback capture-relay forwards each request verbatim to real
+# Tavily and returns Tavily's real response, recording the exchange so the test
+# can prove a live search ran — necessary because the managed loop falls back to an
+# `is_error` tool result on provider failure, which a client-only assertion would
+# not catch.
+#
+# Requires a real TAVILY_API_KEY (the search provider key, which Tavily carries in
+# the request body). Gated independently of the vLLM live stack: absent the key the
+# scenario skips unless PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH is set.
+[claude_code.launch.web_search]
+exposed_tools = ["WebSearch"]
+permission_mode = "acceptEdits"
+allowed_tools = ["WebSearch"]
+# The managed tool name the `anthropic_web_search` filter owns and suppresses.
+managed_tool = "WebSearch"
+provider = "tavily"
+flags = [
+  "--tools", "WebSearch",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
+# Compaction scenario. Keep in sync with COMPACTION_LAUNCH_FLAGS,
+# CLAUDE_CODE_COMPACTION_CONTEXT_TOKENS, COMPACTION_BALLAST_CHAPTERS, and
+# COMPACTION_BALLAST_BYTES in claude_code_vllm.rs.
+#
+# SCOPE: proves the PINNED client's OWN auto-compaction, not Praxis's. The test
+# deliberately LOWERS the client's context window below the real backend window
+# (unlike the coding scenario, which aligns them to avoid compaction) so that
+# reading the enumerated ballast files one per turn grows accepted context past
+# the threshold mid-task. Claude Code then emits a
+# `compact_boundary(trigger="auto")` stream-json event — the definite,
+# client-emitted signal — summarizes through ANTHROPIC_BASE_URL, and issues a
+# further tool call that lands an Edit using the pre-compaction marker. The
+# acceptance job's enforced egress isolation makes Praxis the client's only
+# route, so every post-compaction request necessarily traversed the proxy.
+#
+# max_context_tokens here is INTENTIONALLY below vllm.context_length and is set
+# per-run via CLAUDE_CODE_MAX_CONTEXT_TOKENS; it does not relax the primary
+# [claude_code.launch] window the pins job validates against the backend.
+[claude_code.launch.compaction]
+exposed_tools = ["Read", "Edit", "Bash"]
+permission_mode = "acceptEdits"
+allowed_tools = ["Read", "Edit", "Bash"]
+# Lowered client window that forces the client to auto-compact mid-task. Must be
+# > 0 and < vllm.context_length (the pins job asserts both). Pinned Claude Code
+# 2.1.267 reserves 2,048 output + 13,000 compaction tokens, so the usable
+# auto-compaction threshold is `max_context_tokens - 15048` (~14,952 here). A
+# single ballast read must stay well under that headroom or one post-compaction
+# read re-crosses the threshold and the client's rapid-refill breaker aborts.
+max_context_tokens = 30000
+# Ballast seeded into the workspace and read one file per turn to grow context.
+# Total (~17.6k tokens) exceeds the ~14,952 threshold so compaction fires
+# mid-task; each chapter (~1.1k tokens) is far below the post-compaction headroom.
+ballast_chapters = 16
+ballast_bytes = 4500
+flags = [
+  "--tools", "Read,Edit,Bash",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "32",
+]
+
 [vllm]
-# Container image pinned by digest — the SAME CUDA image the GPU full suite runs
-# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). vLLM v0.29.0
+# Container image pinned by digest for Claude Code acceptance
+# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
+# Responses suite builds the model-baked image from vllm/Containerfile instead.
+# vLLM v0.29.0
 # serves the native Anthropic Messages surface (`/v1/messages`,
 # `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
 # so one container backs both the native and transformed acceptance paths with no
@@ -114,6 +243,12 @@ seed = 0
 # path. Thinking is disabled by default for this deterministic coding task:
 # otherwise Qwen3 can consume the entire Claude Code turn budget reasoning about
 # which tool to call without issuing the call.
+#
+# `--reasoning-parser qwen3` and `--default-chat-template-kwargs` are a PAIR and
+# are the subject of issue #1418: serving Qwen3 with a parser for another family
+# and thinking on made Claude Code loop and render reasoning as its answer. The
+# planning scenario above is the nightly regression guard for exactly that, so
+# changing either flag here is expected to turn it red.
 #
 # `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
 # ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container

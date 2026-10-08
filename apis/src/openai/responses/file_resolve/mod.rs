@@ -198,8 +198,8 @@ impl FileResolveFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// size of 4. Production registration uses [`Self::from_config_with_outbound`]
+    /// with the selected client and a bound outbound chain.
     ///
     /// # Errors
     ///
@@ -207,28 +207,9 @@ impl FileResolveFilter {
     /// callout client cannot be constructed.
     ///
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client = crate::subrequest::isolated_client(4);
-        Self::build(config, client, None)
-    }
-
-    /// Create a filter using the shared [`SubRequestClient`].
-    ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// callout client cannot be constructed.
-    ///
-    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
-        config: &serde_yaml::Value,
-        client: SubRequestClient,
-    ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client, None)
+        Self::build(config, &client, None)
     }
 
     /// Create a filter with a pre-bound outbound filter chain.
@@ -246,7 +227,7 @@ impl FileResolveFilter {
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
     pub fn from_config_with_outbound(
         config: &serde_yaml::Value,
-        client: SubRequestClient,
+        client: &SubRequestClient,
         outbound: Arc<FilterPipeline>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         Self::build(config, client, Some(outbound))
@@ -276,7 +257,7 @@ impl FileResolveFilter {
     #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     fn build(
         config: &serde_yaml::Value,
-        subrequest_client: SubRequestClient,
+        subrequest_client: &SubRequestClient,
         outbound: Option<Arc<FilterPipeline>>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
@@ -292,7 +273,7 @@ impl FileResolveFilter {
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            client: subrequest_client,
+            client: subrequest_client.clone(),
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
@@ -321,6 +302,7 @@ impl FileResolveFilter {
                 .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
             Some(FileUrlResolver {
                 allowed_private_origins: origins,
+                client: subrequest_client.clone(),
             })
         } else {
             None
@@ -389,7 +371,7 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }

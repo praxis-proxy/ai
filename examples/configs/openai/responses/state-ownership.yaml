@@ -38,7 +38,7 @@ filter_chains:
         header: x-authenticated-state-owner
 
       # Publishes the typed operation consumed by openai_conversations.
-      - filter: openai_operation
+      - filter: ai_operation
 
       - filter: openai_responses_request
         # Only POST /v1/responses reaches this filter, so Conversations API

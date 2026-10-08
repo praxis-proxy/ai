@@ -22,6 +22,21 @@
 # config order, so the store persists after the step composes the
 # terminal event.
 #
+# Because the store sits after `openai_stream_events` on the response
+# path, it also captures each normalized SSE event (with its stamped
+# sequence number) into a per-response replay log. A completed response
+# created with `stream: true` can then be replayed verbatim with
+# `GET /v1/responses/{id}?stream=true`: the stored events are streamed
+# back in original order, terminating in the same terminal event, with
+# no delta reconstruction. `starting_after=N` resumes after a cursor,
+# returning only events whose `sequence_number > N`. The replay log is
+# bounded by `max_event_count` and `max_event_bytes` (defaults below); a
+# stream that exceeds either bound stops capture, so its terminal event
+# is never recorded and it becomes non-replayable (a subsequent
+# `?stream=true` retrieval returns 400 invalid_request_error). Responses
+# created without `stream: true` have no replay log and return the same
+# 400. The plain JSON `GET /v1/responses/{id}` retrieval is unchanged.
+#
 # `openai_responses_proxy` automatically selects Praxis's
 # typed streaming transport for the effective `stream: true` request, so
 # each SSE chunk reaches `openai_stream_events` incrementally.
@@ -55,8 +70,16 @@
 #     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}" \
 #     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello"}'
 #
-#   # Retrieve stored response
+#   # Retrieve stored response (plain JSON)
 #   curl http://localhost:8080/v1/responses/<response-id> \
+#     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}"
+#
+#   # Replay the stored SSE event log for a stream:true response
+#   curl -N "http://localhost:8080/v1/responses/<response-id>?stream=true" \
+#     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}"
+#
+#   # Resume replay after sequence number 5
+#   curl -N "http://localhost:8080/v1/responses/<response-id>?stream=true&starting_after=5" \
 #     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}"
 #
 # Requires the ai-inference feature:
@@ -74,6 +97,9 @@ filter_chains:
         mode: trusted_owner
         header: x-authenticated-state-owner
 
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -87,6 +113,11 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
+        # Replay-log bounds for `stream: true` responses. A stream that exceeds
+        # either bound stops event capture, so its terminal event is never
+        # recorded and it becomes non-replayable. Defaults shown.
+        # max_event_count: 10000
+        # max_event_bytes: 16777216
 
       - filter: iterative_request_router
         initial_step: inference
@@ -123,8 +154,8 @@ filter_chains:
               # openai_responses_proxy buffers the request body, so IRR runs
               # that phase before load balancing; an earlier placement never
               # sees ctx.upstream. timeout_secs is an absolute deadline from
-              # the first SSE chunk (default 300). Each chunk recaps leftover
-              # budget onto the live body through cap_stream_read_timeout.
+              # the first SSE chunk (default 300). Each chunk recaps that
+              # absolute cutoff onto the live body through cap_stream_deadline.
               - filter: openai_stream_events
                 # max_tool_call_argument_bytes: 1048576
                 # Aggregate accumulation budget bounding total process memory even

@@ -8,14 +8,13 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig,
-    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig,
-    StoreError,
-    trait_def::{ConversationItemStore, ResponseStore},
+    CompressionAlgorithm, ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
+    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+    SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
-use crate::openai::{
-    include::IncludeFields,
-    responses::store::{ListParams, Order, list_input_items},
+use crate::{
+    openai::include::IncludeFields,
+    service::responses::{ListParams, Order, list_input_items},
 };
 
 /// Default issuing-response scope for pending-approval tests that do not
@@ -2359,13 +2358,9 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
 }
 
 #[tokio::test]
-async fn create_items_and_sync_messages_empty_batch_is_noop() {
+async fn create_items_and_sync_messages_empty_batch_requires_parent() {
     let store = make_store_with_items().await;
-    let empty: [ConversationItemRecord; 0] = [];
-    store
-        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &empty)
-        .await
-        .expect("empty batch should succeed");
+    assert_empty_batch_requires_parent(&store).await;
 }
 
 #[tokio::test]
@@ -2378,10 +2373,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_gone", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -2483,10 +2475,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -2687,8 +2676,8 @@ async fn sqlite_rejects_table_with_incompatible_primary_key() {
         "error should mention the expected id key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2739,8 +2728,8 @@ async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2783,7 +2772,7 @@ async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -2828,7 +2817,7 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
         msg.to_ascii_lowercase().contains("affinity"),
         "error should explain the affinity is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -2855,7 +2844,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 3, "fresh store should stamp version 3");
+    assert_eq!(version, 5, "fresh store should stamp version 5");
 }
 
 #[tokio::test]
@@ -2893,8 +2882,8 @@ async fn sqlite_rejects_schema_version_mismatch() {
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
     assert!(
-        msg.contains("migration required"),
-        "error should mention migration: {msg}"
+        msg.contains("recreation required"),
+        "error should mention recreation: {msg}"
     );
 }
 
@@ -2957,15 +2946,18 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
         "store must refuse a version-2 database"
     );
 
-    // Apply the documented operator migration: CAST the responses payload
-    // columns to BLOB storage class and bump the schema version.
+    // Apply the documented operator migrations: CAST the responses payload
+    // columns to BLOB storage class and stamp the current schema version. Later
+    // schema versions only add tables (e.g. the v5 replay event log), which the
+    // idempotent startup DDL creates, so migrating this fixture requires only the
+    // version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 3",
+        "UPDATE mr_schema_version SET version = 5",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2977,7 +2969,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-3 database");
+        .expect("store should start on a migrated version-5 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3142,7 +3134,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 #[tokio::test]
 async fn registry_register_and_get_scoped() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry
         .register(&Arc::from("primary"), Arc::clone(&store))
         .expect("register should succeed");
@@ -3155,7 +3147,7 @@ async fn registry_register_and_get_scoped() {
 #[tokio::test]
 async fn registry_scoped_handle_rejects_a_record_from_another_owner() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry.register(&Arc::from("primary"), store).unwrap();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
@@ -3182,7 +3174,7 @@ fn registry_get_missing_returns_none() {
 #[tokio::test]
 async fn registry_duplicate_registration_fails() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     let name = Arc::from("dup");
     registry
         .register(&name, Arc::clone(&store))
@@ -3378,24 +3370,26 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
+    use super::to_pg_ssl_mode;
+
     assert!(
-        matches!(PgSslMode::from(SslMode::Disable), PgSslMode::Disable),
+        matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),
         "Disable should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Prefer), PgSslMode::Prefer),
+        matches!(to_pg_ssl_mode(SslMode::Prefer), PgSslMode::Prefer),
         "Prefer should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Require), PgSslMode::Require),
+        matches!(to_pg_ssl_mode(SslMode::Require), PgSslMode::Require),
         "Require should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyCa), PgSslMode::VerifyCa),
+        matches!(to_pg_ssl_mode(SslMode::VerifyCa), PgSslMode::VerifyCa),
         "VerifyCa should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyFull), PgSslMode::VerifyFull),
+        matches!(to_pg_ssl_mode(SslMode::VerifyFull), PgSslMode::VerifyFull),
         "VerifyFull should map"
     );
 }
@@ -3482,8 +3476,8 @@ async fn pg_rejects_table_with_incompatible_primary_key() {
         "error should mention the primary key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3517,8 +3511,8 @@ async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3551,7 +3545,7 @@ async fn pg_rejects_table_with_deferrable_primary_key() {
         msg.to_ascii_lowercase().contains("deferrable"),
         "error should explain the constraint is deferrable: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3585,7 +3579,7 @@ async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation folds comparisons: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3617,7 +3611,7 @@ async fn pg_rejects_table_with_citext_key() {
         msg.to_ascii_lowercase().contains("citext"),
         "error should name the case-insensitive type: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3676,7 +3670,7 @@ async fn pg_rejects_schema_version_mismatch() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
+async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
     let fx = PgSchemaFixture::new("mig");
 
     let legacy_v2 = [
@@ -3719,14 +3713,14 @@ async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 3", fx.version),
+        format!("UPDATE {} SET version = 5", fx.version),
     ];
-    let migrated_v3: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v5: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v3, &[]).await;
+    let result = fx.init(&migrated_v5, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-3 database: {:?}",
+        "store should start on a migrated version-5 database: {:?}",
         result.err()
     );
 }
@@ -4033,6 +4027,15 @@ async fn pg_response_id_collision_cannot_transfer_ownership() {
 #[ignore]
 async fn postgres_passes_shared_ownership_contract() {
     ownership_contract(&make_pg_store_with_items().await).await;
+}
+
+/// The `PostgreSQL` backend satisfies the shared persisted-state contract suite,
+/// including the replay event-log contract. Mirrors
+/// [`sqlite_backend_satisfies_the_store_contract`] for the live PG backend.
+#[tokio::test]
+#[ignore]
+async fn postgres_backend_satisfies_the_store_contract() {
+    praxis_ai_store::contract_tests::run_contract_suite(&make_pg_store_with_items().await).await;
 }
 
 #[tokio::test]
@@ -4558,6 +4561,20 @@ async fn pg_conversation_item_tenant_isolation() {
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
+
+    let same_id_for_tenant_b = make_conversation_item("item_1", "tenant_b", "conv_2", 1);
+    store
+        .create_test_items(&[same_id_for_tenant_b])
+        .await
+        .expect("the same item ID should be accepted for another tenant");
+
+    for (tenant_id, conversation_id) in [("tenant_a", "conv_1"), ("tenant_b", "conv_2")] {
+        let fetched = store
+            .get_conversation_item(&crate::test_utils::test_owner(tenant_id), conversation_id, "item_1")
+            .await
+            .expect("tenant-scoped get should succeed");
+        assert!(fetched.is_some(), "{tenant_id} should see its own item");
+    }
 }
 
 #[tokio::test]
@@ -4843,6 +4860,13 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
 
 #[tokio::test]
 #[ignore]
+async fn pg_create_items_and_sync_messages_empty_batch_requires_parent() {
+    let store = make_pg_store_with_items().await;
+    assert_empty_batch_requires_parent(&store).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
     let store = make_pg_store_with_items().await;
     // No conversation row exists — mirrors a conversation deleted between the
@@ -4852,10 +4876,7 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_missing", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -4899,10 +4920,7 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -5186,6 +5204,71 @@ async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &
         .expect("seeding pending approvals should succeed");
 }
 
+async fn assert_empty_batch_requires_parent(store: &impl ConversationItemStore) {
+    let owner = crate::test_utils::test_owner("tenant_a");
+    let empty: [ConversationItemRecord; 0] = [];
+    let err = store
+        .create_items_and_sync_messages(&owner, "conv_empty", &empty)
+        .await
+        .expect_err("an empty batch must not bypass a missing parent");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+
+    let conversation = ConversationRecord {
+        conversation_id: "conv_empty".to_owned(),
+        owner,
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([{"role": "user", "content": "preserve cached history"}]),
+    };
+    store
+        .upsert_conversation(&conversation)
+        .await
+        .expect("upsert should succeed");
+    store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect("an empty batch for an existing parent should succeed");
+
+    for other_owner in [
+        crate::test_utils::test_owner("tenant_b"),
+        crate::StateOwner::from_trusted_parts(
+            conversation.owner.tenant_id(),
+            conversation.owner.issuer(),
+            "another_subject",
+        )
+        .expect("owner should be valid"),
+    ] {
+        let err = store
+            .create_items_and_sync_messages(&other_owner, &conversation.conversation_id, &empty)
+            .await
+            .expect_err("an empty batch must not bypass parent ownership");
+        assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+    }
+
+    let fetched = store
+        .get_conversation(&conversation.owner, &conversation.conversation_id)
+        .await
+        .expect("get should succeed")
+        .expect("conversation should still exist");
+    assert_eq!(
+        fetched.messages, conversation.messages,
+        "empty batches must leave the cache untouched"
+    );
+
+    assert!(
+        store
+            .delete_conversation(&conversation.owner, &conversation.conversation_id)
+            .await
+            .expect("delete should succeed"),
+        "the parent should be deleted"
+    );
+    let err = store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect_err("an empty batch must fail after the parent is deleted");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+}
+
 fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseRecord {
     ResponseRecord {
         id: id.to_owned(),
@@ -5196,4 +5279,21 @@ fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseR
         input: json!("test input"),
         messages: json!([{"role": "user", "content": "hello"}]),
     }
+}
+
+/// The SQLite backend satisfies the shared persisted-state contract suite,
+/// proving it adopted the praxis-ai-store traits (the #1258 SQL-adopt check).
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }

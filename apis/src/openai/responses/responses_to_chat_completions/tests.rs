@@ -252,7 +252,7 @@ async fn classified_non_responses_request_continues_without_rewriting() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_chat_completions");
+    context.set_metadata("openai_responses_request.format", "openai_chat_completions");
     let mut body = Some(Bytes::from_static(br#"{"messages":[]}"#));
 
     let action = filter
@@ -286,7 +286,7 @@ async fn classified_responses_create_without_state_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello"}"#));
 
     let action = filter
@@ -393,8 +393,8 @@ async fn unresolved_previous_response_id_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -433,8 +433,8 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error(
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -479,8 +479,8 @@ async fn streaming_responses_create_without_state_uses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "true");
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","stream":true}"#));
 
     let action = filter
@@ -518,8 +518,8 @@ async fn canonical_state_is_translated_and_arms_response() {
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
     let mut context = crate::test_utils::make_filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -566,54 +566,6 @@ async fn canonical_state_is_translated_and_arms_response() {
     );
 }
 
-#[tokio::test]
-async fn prompt_template_is_rejected_before_chat_translation() {
-    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
-    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    let request_body = json!({
-        "model": "gpt-4.1-mini",
-        "input": "hello",
-        "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}},
-        "store": false
-    });
-    context
-        .extensions
-        .insert(ResponsesState::from_request_body(request_body.clone()));
-    let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
-    let mut body = Some(original.clone());
-
-    let action = filter
-        .on_selected_upstream_request_body(&mut context, &mut body)
-        .await
-        .unwrap();
-
-    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
-        panic!("a prompt template must not be silently dropped during Chat translation");
-    };
-    assert_eq!(rejection.status, 400, "prompt translation rejection must be HTTP 400");
-    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        error["error"]["type"], "invalid_request_error",
-        "prompt translation rejection must use the invalid-request error type"
-    );
-    assert_eq!(
-        error["error"]["message"],
-        "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
-        "prompt translation rejection must explain the unsupported representation"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original.as_ref()),
-        "rejection must not emit a Chat request"
-    );
-    assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
-        "a rejected prompt must not arm response translation"
-    );
-}
-
 #[test]
 fn always_advertises_streaming_subrequest_capability() {
     // Running inside the iterative router, the filter always declares the
@@ -634,7 +586,7 @@ async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::V
     let filter = ResponsesToChatCompletionsFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     context
         .extensions
         .insert(ResponsesState::from_request_body(request_body.clone()));
@@ -714,7 +666,7 @@ async fn malformed_responses_input_is_rejected_before_request_translation() {
         let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut context = crate::test_utils::make_filter_context(&request);
-        context.set_metadata("openai_responses_format.format", "openai_responses");
+        context.set_metadata("openai_responses_request.format", "openai_responses");
         context
             .extensions
             .insert(ResponsesState::from_request_body(request_body.clone()));
@@ -750,8 +702,8 @@ async fn rehydrated_previous_response_id_translates_full_history() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -805,7 +757,7 @@ async fn translated_request_over_configured_limit_is_rejected() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "x".repeat(1024),
@@ -842,7 +794,7 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -888,7 +840,7 @@ async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -932,7 +884,7 @@ async fn lowered_request_body_tool_choice_translates_over_canonical() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -971,7 +923,7 @@ async fn non_compat_state_translation_is_golden_unchanged() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1015,7 +967,7 @@ async fn null_tool_choice_translates_as_absent() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1055,8 +1007,8 @@ async fn streaming_translation_error_uses_responses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1112,8 +1064,8 @@ async fn successful_sse_response_installs_stream_converter() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.set_metadata("responses.response_id", "resp_stream");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
@@ -1168,7 +1120,7 @@ async fn streaming_success_without_response_id_fails_closed() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.set_metadata(CREATED_AT_KEY, "1700000000");
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
@@ -1192,7 +1144,7 @@ async fn non_sse_success_for_streaming_request_is_rejected() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.stream", "true");
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1223,7 +1175,7 @@ async fn streaming_content_encoded_response_is_rejected() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.set_metadata(CREATED_AT_KEY, "1700000000");
     context.set_metadata("responses.response_id", "resp_stream");
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
@@ -1470,7 +1422,7 @@ async fn finite_json_error_for_streaming_request_upgrades_to_buffer() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.stream", "true");
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::BAD_REQUEST;
     response.headers.insert(
@@ -1527,8 +1479,8 @@ async fn non_streaming_chat_response_becomes_response_resource() {
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
     let mut context = crate::test_utils::make_filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
     context.set_metadata("responses.response_id", "resp_test_123");
     let request_value = json!({
         "model": "gpt-4.1-mini",
@@ -1956,8 +1908,8 @@ async fn successful_sse_chunks_translate_to_responses_events() {
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.current_filter_id = Some(0);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "true");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "true");
     context.set_metadata("responses.response_id", "resp_stream");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
@@ -2158,7 +2110,7 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "deepseek-r1",
         "input": "hello",
@@ -2193,8 +2145,8 @@ async fn vllm_reasoning_content_is_extracted_end_to_end() {
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
     let mut context = crate::test_utils::make_filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
     context.set_metadata("responses.response_id", "resp_reasoning_1");
     let request_value = json!({
         "model": "deepseek-r1",

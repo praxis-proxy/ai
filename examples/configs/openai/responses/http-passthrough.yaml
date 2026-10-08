@@ -6,10 +6,15 @@
 # client may probe. This pipeline does the minimum work required
 # to classify and route the traffic:
 #
-#   1. `openai_responses_format` classifies the request and
+#   1. `openai_responses_request` classifies the request and
 #      promotes `x-praxis-ai-format: openai_responses` for the
 #      router. `on_invalid: continue` lets non-Responses traffic
 #      reach the router without being rejected.
+#
+#      `initialize_state: false` because nothing here consumes
+#      Responses state. Leaving it on would parse the body, mint
+#      identifiers, and resolve a conversation for a chain that
+#      forwards the request untouched.
 #   2. The router sends every `/v1/responses*` request to the
 #      `inference-backend` cluster.
 #   3. The load balancer points at the test backend (and any
@@ -40,7 +45,11 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

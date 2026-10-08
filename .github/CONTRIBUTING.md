@@ -339,6 +339,31 @@ Leaving praxis-bot comments unresolved blocks merge.
 Do not dismiss or ignore findings without an explicit
 response.
 
+### CodeRabbit review
+
+CodeRabbit runs automated review on pull requests. Its
+configuration is split in two, and both halves are
+reviewed like any other change to the project: the
+review policy and the conventions shared across the
+organization live in
+[praxis-proxy/coderabbit](https://github.com/praxis-proxy/coderabbit),
+and the instructions specific to this repository live in
+[.coderabbit.yaml](../.coderabbit.yaml), which inherits
+from it.
+
+CodeRabbit is advisory. It does not approve or block a
+PR, and it is configured not to author code — the
+project does not accept code from a bot or tool, and
+your `Signed-off-by` asserts that you reviewed and
+understand every line you submit.
+
+Findings still deserve a reply. Fix them or explain why
+they do not apply, the same as any other review comment.
+A finding that contradicts a convention documented here
+is a configuration bug: please open an issue against
+whichever repository holds the relevant instructions so
+they can be corrected.
+
 ## Community Interactions
 
 Contributors interact with each other through issues,

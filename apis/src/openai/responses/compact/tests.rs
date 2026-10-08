@@ -446,7 +446,8 @@ fn conversation_text_array_content() {
         ]
     })];
     let text = build_conversation_text(&messages);
-    assert!(text.contains("user: Part one Part two"));
+    // Parts join with no separator, matching the translation layer.
+    assert!(text.contains("user: Part onePart two"), "{text}");
 }
 
 // =============================================================================
@@ -461,8 +462,10 @@ fn extract_content_string() {
 
 #[test]
 fn extract_content_array() {
+    // Parts are concatenated with no separator, matching the Responses-to-Chat
+    // translation (so "pass" + "word" stays "password", not "pass word").
     let msg = json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]});
-    assert_eq!(extract_content(&msg), "a b");
+    assert_eq!(extract_content(&msg), "ab");
 }
 
 #[test]
@@ -533,7 +536,7 @@ fn replace_messages_preserves_current_input() {
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
     let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
-    replace_messages(&mut state, compaction_item);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
     assert_eq!(state.messages[0]["type"], "compaction");
@@ -545,6 +548,10 @@ fn replace_messages_preserves_current_input() {
     );
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+    assert_eq!(
+        state.persisted_messages[0]["_praxis_local_compaction"], true,
+        "private persisted history must retain local compaction provenance"
+    );
     assert_eq!(
         state.persisted_messages[1]["content"], "What's next?",
         "current-turn tail from persisted_messages must be kept"
@@ -567,7 +574,8 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
         json!({"role": "user", "content": "from-persisted"}),
     ];
 
-    replace_messages(&mut state, build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX));
+    let compaction_item = build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[1]["content"], "from-messages");
@@ -612,10 +620,8 @@ fn compaction_preserves_resolved_file_data_instead_of_file_url() {
         "state.input stays the original client payload"
     );
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages[0]["type"], "compaction");
     let current = &state.messages[1];
@@ -664,10 +670,8 @@ fn compaction_preserves_extracted_input_text_instead_of_input_file() {
     state.messages[tail] = extracted_item.clone();
     state.persisted_messages[tail] = extracted_item;
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     let current = &state.messages[1];
     assert_eq!(
@@ -726,6 +730,27 @@ fn conversation_text_includes_function_call_output() {
     let messages = vec![json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"temp\":72}"})];
     let text = build_conversation_text(&messages);
     assert!(text.contains("function_call_output: {\"temp\":72}"));
+}
+
+#[test]
+fn conversation_text_includes_function_call_output_content_list() {
+    // An array `output` (content-list) must contribute its text to the summary,
+    // not be dropped the way an `as_str()`-only read would drop it. Parts are
+    // joined with no separator, matching the translation layer ("pass" + "word"
+    // stays "password", preserving the fact the backend would see).
+    let messages = vec![json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [
+            {"type": "input_text", "text": "pass"},
+            {"type": "input_text", "text": "word"}
+        ]
+    })];
+    let text = build_conversation_text(&messages);
+    assert!(
+        text.contains("function_call_output: password"),
+        "parts join without a separator: {text}"
+    );
 }
 
 #[test]
@@ -985,7 +1010,7 @@ fn parse_compact_request_body_with_previous_response_id() {
 #[tokio::test]
 #[cfg(feature = "store-sqlite")]
 async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
-    let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
         crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
             .await
             .unwrap(),
@@ -1085,6 +1110,507 @@ fn parse_compact_request_body_missing_content() {
 }
 
 // =============================================================================
+// Malformed-field validation (issue #1403)
+// =============================================================================
+
+// --- instructions ---
+
+#[test]
+fn parse_compact_instructions_accepts_string() {
+    assert_eq!(
+        parse_compact_instructions(Some(json!("Be concise")))
+            .unwrap()
+            .as_deref(),
+        Some("Be concise")
+    );
+}
+
+#[test]
+fn parse_compact_instructions_absent_and_null_are_none() {
+    assert!(parse_compact_instructions(None).unwrap().is_none());
+    assert!(parse_compact_instructions(Some(Value::Null)).unwrap().is_none());
+}
+
+#[test]
+fn parse_compact_instructions_wrong_type_is_rejected() {
+    // Issue #1403 case 1: a numeric `instructions` must 400, not be dropped.
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(&json!({
+            "model": "gpt-4o",
+            "input": "INLINE-CONTENT",
+            "instructions": 123
+        })))),
+        "instructions must be a string",
+    );
+}
+
+// --- input ---
+
+#[test]
+fn parse_compact_input_wrong_type_is_rejected() {
+    // Issue #1403: a wrong-typed input must 400 rather than becoming an empty list.
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(&json!({"model": "gpt-4o", "input": 123})))),
+        "input must be a string or an array of items",
+    );
+}
+
+#[test]
+fn parse_compact_input_non_object_array_item_is_rejected() {
+    // Issue #1403 case 2: `[123]` must 400 rather than contributing empty content.
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(&json!({"model": "gpt-4o", "input": [123]})))),
+        "input[0] must be an object",
+    );
+}
+
+#[test]
+fn parse_compact_input_absent_and_null_are_empty_list() {
+    assert!(parse_compact_input(None).unwrap().is_empty());
+    assert!(parse_compact_input(Some(Value::Null)).unwrap().is_empty());
+}
+
+#[test]
+fn parse_compact_input_empty_string_is_empty_list() {
+    // An empty-content string is distinct from a wrong type; it is schema-valid
+    // emptiness (tracked by #1139), not a 400.
+    assert!(parse_compact_input(Some(json!(""))).unwrap().is_empty());
+}
+
+#[test]
+fn parse_compact_input_object_array_items_are_accepted() {
+    let items = parse_compact_input(Some(json!([
+        {"role": "user", "content": "Hi"},
+        {"type": "function_call", "name": "f", "arguments": "{}"}
+    ])))
+    .unwrap();
+    assert_eq!(items.len(), 2, "well-formed object items pass validation");
+}
+
+#[test]
+fn parse_compact_input_message_with_wrong_typed_content_is_rejected() {
+    // Issue #1403 follow-up: an object item is not enough — a message whose
+    // `content` is a number would be silently dropped to empty by the formatter,
+    // so it must 400 before any callout or store write.
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(&json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": 123}]
+        })))),
+        "input[0].content must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_content_part_non_object_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": "user", "content": [123]}]))),
+        "input[0].content[0] must be an object",
+    );
+}
+
+#[test]
+fn parse_compact_input_content_part_wrong_typed_text_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{
+            "role": "user",
+            "content": [{"type": "input_text", "text": 123}]
+        }]))),
+        "input[0].content[0].text must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_text_part_with_null_or_absent_text_is_rejected() {
+    // Issue #1403 follow-up: `input_text` / `output_text` require a string `text`;
+    // a null or missing value would be silently dropped to empty by the formatter.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{
+            "role": "user",
+            "content": [{"type": "input_text", "text": null}]
+        }]))),
+        "input[0].content[0].text must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{
+            "role": "user",
+            "content": [{"type": "input_text"}]
+        }]))),
+        "input[0].content[0].text must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{
+            "type": "function_call_output",
+            "output": [{"type": "output_text", "text": null}]
+        }]))),
+        "input[0].output[0].text must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_multimodal_part_without_text_is_accepted() {
+    // An image/file part legitimately carries no `text`; the formatter ignores
+    // it, so validation must not reject it as malformed.
+    let items = parse_compact_input(Some(json!([{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": "https://example.test/x.png"}
+        ]
+    }])))
+    .unwrap();
+    assert_eq!(items.len(), 1, "a text+image content list is well-formed");
+}
+
+#[test]
+fn parse_compact_input_wrong_typed_item_type_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": 123, "content": "hi"}]))),
+        "input[0].type must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_null_item_type_is_rejected() {
+    // Issue #1403 follow-up: an explicit null `type` must not be read as "omitted"
+    // and silently reinterpreted as a message; the item `type`, when present, must
+    // be a concrete string.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": null, "content": "hi"}]))),
+        "input[0].type must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_null_type_item_reference_is_accepted() {
+    // Issue #1403 follow-up: `ItemReferenceParam.type` is nullable in the schema
+    // (`anyOf: [enum "item_reference", null]`), so a reference-shaped item that
+    // carries an `id` but neither `role` nor `content` must be accepted with an
+    // explicit null `type`, matching the already-accepted type-omitted form.
+    let items = parse_compact_input(Some(json!([{"type": null, "id": "resp_123"}]))).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "a null-typed item_reference carries no field compact consumes"
+    );
+}
+
+#[test]
+fn parse_compact_input_null_type_without_id_is_rejected() {
+    // Issue #1403 follow-up: the null-`type` tolerance is only for the item_reference
+    // shape, which the schema requires to carry a string `id`. A null `type` with no
+    // `id` is a malformed item, not a reference, and must 400 before any callout or
+    // store write rather than fall through as an empty defaulted message.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": null}]))),
+        "input[0].type must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_null_content_part_type_is_rejected() {
+    // Issue #1403 follow-up: a content part's `type` discriminator, when present,
+    // must be a concrete string; a null type would escape the text-part check and
+    // its null `text` would be silently dropped to empty.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(
+            json!([{"role": "user", "content": [{"type": null, "text": null}]}]),
+        )),
+        "input[0].content[0].type must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_content_part_without_type_is_rejected() {
+    // Issue #1403 follow-up: the content-part union requires a `type` discriminator;
+    // a part with no type and a null `text` would escape the text-part check and be
+    // dropped to empty, so the missing discriminator must 400.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": "user", "content": [{"text": null}]}]))),
+        "input[0].content[0].type must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_text_kind_part_with_null_text_is_rejected() {
+    // Issue #1403 follow-up: the translator collapses the `text` kind (not just
+    // `input_text`/`output_text`) and requires a string `text`, so a null value
+    // must 400 rather than be dropped to empty.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(
+            json!([{"role": "user", "content": [{"type": "text", "text": null}]}]),
+        )),
+        "input[0].content[0].text must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_additional_tools_item_without_content_is_accepted() {
+    // Issue #1403 follow-up: an `additional_tools` item is explicitly typed and
+    // carries a `role` but no `content`; it is NOT a message, so it must pass
+    // through rather than be rejected for a missing required `content`.
+    let items = parse_compact_input(Some(json!([
+        {"type": "additional_tools", "role": "developer", "tools": []},
+        {"role": "user", "content": "Hi"}
+    ])))
+    .unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "a typed non-message item + a message are both well-formed"
+    );
+}
+
+#[test]
+fn parse_compact_input_message_with_wrong_typed_role_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": 123, "content": "hi"}]))),
+        "input[0].role must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_function_call_wrong_typed_fields_are_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call", "name": 1, "arguments": "{}"}]))),
+        "input[0].name must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call", "name": "f", "arguments": 2}]))),
+        "input[0].arguments must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_function_call_null_or_absent_name_and_arguments_are_rejected() {
+    // Issue #1403 follow-up: `name` and `arguments` are required strings; a null or
+    // missing value would be silently defaulted ("unknown"/""), losing the call.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(
+            json!([{"type": "function_call", "name": null, "arguments": "{}"}]),
+        )),
+        "input[0].name must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call", "arguments": "{}"}]))),
+        "input[0].name must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call", "name": "f", "arguments": null}]))),
+        "input[0].arguments must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call", "name": "f"}]))),
+        "input[0].arguments must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_message_with_null_or_absent_role_is_rejected() {
+    // Issue #1403 follow-up: a message `role` is a required string; a null or
+    // absent value would be silently defaulted to "unknown", losing the speaker,
+    // so it must 400 before any callout or store write.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": null, "content": "hello"}]))),
+        "input[0].role must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "message", "content": "hello"}]))),
+        "input[0].role must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_compaction_null_or_absent_encrypted_content_is_rejected() {
+    // Issue #1403 follow-up: a compaction item's `encrypted_content` is a required
+    // string; a null or absent value would be summarized as empty text and stored
+    // as an empty compaction, so it must 400.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "compaction", "encrypted_content": null}]))),
+        "input[0].encrypted_content must be a string",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "compaction"}]))),
+        "input[0].encrypted_content must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_function_call_output_wrong_typed_output_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call_output", "output": 7}]))),
+        "input[0].output must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_function_call_output_content_list_is_accepted() {
+    // `output` is `string | content-list`; an array of input_text parts is a
+    // valid Responses shape and must not be rejected (it is formatted, not
+    // dropped).
+    let items = parse_compact_input(Some(json!([{
+        "type": "function_call_output",
+        "call_id": "c1",
+        "output": [{"type": "input_text", "text": "result"}]
+    }])))
+    .unwrap();
+    assert_eq!(items.len(), 1, "a content-list output is well-formed");
+}
+
+#[test]
+fn parse_compact_input_function_call_output_wrong_typed_part_text_is_rejected() {
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{
+            "type": "function_call_output",
+            "output": [{"type": "input_text", "text": 7}]
+        }]))),
+        "input[0].output[0].text must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_input_unknown_item_kind_without_consumed_fields_is_accepted() {
+    // An item compact does not format (no role/content it reads) is not malformed
+    // and must pass through untouched rather than be rejected.
+    let items = parse_compact_input(Some(json!([{"type": "item_reference", "id": "resp_123"}]))).unwrap();
+    assert_eq!(items.len(), 1, "an item_reference carries no field compact consumes");
+}
+
+#[test]
+fn parse_compact_input_message_with_null_content_is_rejected() {
+    // Issue #1403 follow-up: a message `content` is a required `string |
+    // content-list`, so an explicit null must 400 before the callout/store
+    // rather than be summarized as empty text.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": "user", "content": null}]))),
+        "input[0].content must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_message_without_content_is_rejected() {
+    // A message with no `content` field is the same silent-drop as a null one.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"role": "user"}]))),
+        "input[0].content must be a string or an array",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "message", "role": "user"}]))),
+        "input[0].content must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_message_with_empty_content_is_accepted() {
+    // Schema-valid emptiness (#1139) must not be rejected: an empty string and
+    // an empty content list are both well-formed.
+    assert_eq!(
+        parse_compact_input(Some(json!([{"role": "user", "content": ""}])))
+            .unwrap()
+            .len(),
+        1,
+    );
+    assert_eq!(
+        parse_compact_input(Some(json!([{"role": "user", "content": []}])))
+            .unwrap()
+            .len(),
+        1,
+    );
+}
+
+#[test]
+fn parse_compact_input_function_call_output_null_or_absent_output_is_rejected() {
+    // `output` is a required `string | content-list`; null or absent must 400.
+    assert_compact_rejected_400(
+        parse_compact_input(Some(
+            json!([{"type": "function_call_output", "call_id": "c1", "output": null}]),
+        )),
+        "input[0].output must be a string or an array",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "function_call_output", "call_id": "c1"}]))),
+        "input[0].output must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_untyped_item_reference_without_role_is_accepted() {
+    // An untyped item with an `id` but no `role` is an item_reference, not a
+    // message, so it must not acquire a required-content check.
+    let items = parse_compact_input(Some(json!([{"id": "resp_123"}]))).unwrap();
+    assert_eq!(items.len(), 1, "an untyped item without a role consumes nothing");
+}
+
+#[test]
+fn parse_compact_input_untyped_item_with_wrong_typed_content_is_rejected() {
+    // `append_item`'s catch-all reads `content` even from an untyped, role-less
+    // item, so a wrong-typed `content` would be silently dropped to empty text.
+    // It must 400 like any other consumed malformed field (issue #1403).
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"content": 123}]))),
+        "input[0].content must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_unrecognized_type_with_malformed_content_is_rejected() {
+    // An unrecognized `type` still reaches the message catch-all in `append_item`,
+    // so its `content` is consumed. A null content on a role-bearing item and a
+    // wrong-typed content on a role-less item must both 400 (issue #1403).
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "reasoning", "role": "user", "content": null}]))),
+        "input[0].content must be a string or an array",
+    );
+    assert_compact_rejected_400(
+        parse_compact_input(Some(json!([{"type": "reasoning", "content": 123}]))),
+        "input[0].content must be a string or an array",
+    );
+}
+
+#[test]
+fn parse_compact_input_unrecognized_type_without_content_is_accepted() {
+    // An unrecognized kind that carries neither a role nor a `content` field
+    // consumes nothing and must pass through without a required-content check.
+    let items = parse_compact_input(Some(json!([{"type": "reasoning"}]))).unwrap();
+    assert_eq!(items.len(), 1, "an item that consumes no content is left alone");
+}
+
+// --- previous_response_id ---
+
+#[test]
+fn parse_compact_previous_response_id_wrong_type_is_rejected() {
+    // Defense-in-depth: compact itself rejects a non-string prior id even when
+    // rehydrate is absent from the chain.
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(
+            &json!({"model": "gpt-4o", "previous_response_id": 123}),
+        ))),
+        "previous_response_id must be a string",
+    );
+}
+
+#[test]
+fn parse_compact_previous_response_id_empty_and_null_are_none() {
+    assert!(parse_compact_previous_response_id(Some(json!(""))).unwrap().is_none());
+    assert!(parse_compact_previous_response_id(Some(Value::Null)).unwrap().is_none());
+    assert!(parse_compact_previous_response_id(None).unwrap().is_none());
+}
+
+#[test]
+fn parse_compact_wrong_typed_input_rejected_even_with_previous_response_id() {
+    // Issue #1403 case 3: wrong-typed input must 400 even when a valid
+    // previous_response_id is present (it must never silently become empty).
+    assert_compact_rejected_400(
+        parse_compact_request_body(&Some(compact_body(&json!({
+            "model": "gpt-4o",
+            "input": 123,
+            "previous_response_id": "resp_abc"
+        })))),
+        "input must be a string or an array of items",
+    );
+}
+
+// =============================================================================
 // stored_message_array
 // =============================================================================
 
@@ -1171,4 +1697,35 @@ fn is_compactable_returns_false_with_non_compaction_config() {
         "context_management": [{"type": "truncation", "max_tokens": 4096}]
     }));
     assert!(!is_compactable(Some(&state)));
+}
+
+// =============================================================================
+// Test Utilities
+// =============================================================================
+
+/// Assert a parse result is an HTTP 400 `invalid_request_error` whose message
+/// contains `needle`. Generic over the success type so it covers both whole-body
+/// parses and individual field parsers (e.g. `parse_compact_input`).
+#[track_caller]
+fn assert_compact_rejected_400<T>(result: Result<T, FilterAction>, needle: &str) {
+    let Err(FilterAction::Reject(rejection)) = result else {
+        panic!("expected a FilterAction::Reject, got a parsed request");
+    };
+    assert_eq!(rejection.status, 400, "malformed compact field must be HTTP 400");
+    let body = rejection.body.as_ref().expect("rejection must carry an error body");
+    let err: Value = serde_json::from_slice(body).expect("rejection body should be JSON");
+    assert_eq!(
+        err["error"]["type"], "invalid_request_error",
+        "error type should be invalid_request_error: {err}"
+    );
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(needle),
+        "error message {message:?} should contain {needle:?}"
+    );
+}
+
+/// Serialize a JSON value into request-body bytes.
+fn compact_body(value: &Value) -> Bytes {
+    Bytes::from(serde_json::to_vec(value).unwrap())
 }

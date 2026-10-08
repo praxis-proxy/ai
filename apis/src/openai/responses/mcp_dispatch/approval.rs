@@ -22,12 +22,10 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use praxis_ai_store::PendingApprovalRecord;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::{
-    StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name,
-    store::PendingApprovalRecord,
-};
+use crate::{StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name};
 
 // -----------------------------------------------------------------------------
 // Approval Response Round Trip

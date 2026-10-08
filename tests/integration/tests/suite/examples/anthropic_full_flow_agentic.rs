@@ -5,7 +5,7 @@
 //! (`anthropic/full-flow-agentic.yaml`).
 //!
 //! A single example config serves the server-owned web-search loop in BOTH
-//! modes via `terminal_streaming: true`, selected per request from the client's
+//! modes with no operator opt-in, selected per request from the client's
 //! `stream` flag:
 //!
 //!   * `stream: true`  — the managed `WebSearch` tool-use block is suppressed, intermediate rounds stay internal, and
@@ -33,8 +33,6 @@ use serde_json::{Value, json};
 
 const EXAMPLE: &str = "anthropic/full-flow-agentic.yaml";
 const TOOL_USE_ID: &str = "toolu_web_search_01";
-const USER_SEARCH_HEADER: &str = "x-user-you-key";
-const USER_SEARCH_CREDENTIAL: &str = "test-user-search-key";
 
 // -----------------------------------------------------------------------------
 // SSE builders (native Anthropic Messages lifecycle)
@@ -159,11 +157,17 @@ fn answer_round(id: &str, text: &str, output_tokens: u64) -> String {
 
 /// The buffered non-streaming web-search fixture (initial request, model rounds,
 /// and search response).
+///
+/// The shared fixture carries a You.com-shaped `search_response` consumed by other
+/// suites; this example runs the Tavily provider, so override that field with the
+/// Tavily wire shape without mutating the shared JSON on disk.
 fn fixture() -> Value {
-    serde_json::from_str(include_str!(
+    let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/anthropic/messages/web_search_nonstreaming.json"
     ))
-    .expect("parse web-search fixture")
+    .expect("parse web-search fixture");
+    fixture["search_response"] = search_results();
+    fixture
 }
 
 /// The initial client request with a `WebSearch` tool and `stream: true`.
@@ -182,17 +186,14 @@ fn streaming_request() -> String {
     .to_string()
 }
 
-/// A You.com-shaped search response body.
+/// A Tavily-shaped search response body (`results[].{title,url,content}`).
 fn search_results() -> Value {
     json!({
-        "results": {
-            "web": [{
-                "title": "Potato - Wikipedia",
-                "url": "https://en.wikipedia.org/wiki/Potato",
-                "description": "The potato is a starchy tuber native to the Americas."
-            }],
-            "news": []
-        }
+        "results": [{
+            "title": "Potato - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/Potato",
+            "content": "The potato is a starchy tuber native to the Americas."
+        }]
     })
 }
 
@@ -209,6 +210,10 @@ fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> Stri
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
+    // `credential_injection` resolves its secret at pipeline-build time; repoint the
+    // Chat Completions backend Bearer to a Cargo-provided var so the build succeeds
+    // without `unsafe` `set_var`. The native path never injects it.
+    let yaml = yaml.replace("env_var: VLLM_API_KEY", "env_var: CARGO_PKG_NAME");
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.
     yaml.replace(
@@ -283,7 +288,7 @@ fn load_config_with_limits(
 }
 
 // -----------------------------------------------------------------------------
-// You.com search stub (serves ordered responses, captures each request)
+// Tavily search stub (serves ordered responses, captures each request)
 // -----------------------------------------------------------------------------
 
 struct SearchStub {
@@ -522,12 +527,6 @@ fn messages_web_search_round_trip_re_enters_the_model() {
 
     let requests = model.requests();
     assert_eq!(requests.len(), 2, "model should receive two Messages requests");
-    assert!(
-        requests
-            .iter()
-            .all(|request| !request.headers.to_ascii_lowercase().contains(USER_SEARCH_HEADER)),
-        "the trusted credential source header must be stripped before inference"
-    );
     assert_eq!(requests[0].uri, "/v1/messages");
     assert_eq!(requests[1].uri, "/v1/messages");
     let second: Value = serde_json::from_str(&requests[1].body).expect("second model request JSON");
@@ -547,9 +546,19 @@ fn messages_web_search_round_trip_re_enters_the_model() {
     );
     assert_eq!(search.request_count(), 1);
     assert_eq!(search.last_json()["query"], "potato");
-    let search_request = search.last_request().to_ascii_lowercase();
-    assert!(search_request.contains("x-api-key: test-user-search-key"));
-    assert!(!search_request.contains("x-api-key: test-key"));
+    // Issue #1389: the Tavily key travels as an `Authorization: Bearer` header
+    // injected at the pinned provider, never in the request body the outbound
+    // chain can read.
+    let raw_search = search.last_request().to_ascii_lowercase();
+    assert!(
+        raw_search.contains("authorization: bearer test-key"),
+        "the Tavily key must travel in the Authorization header: {raw_search}"
+    );
+    assert!(
+        search.last_json().get("api_key").is_none(),
+        "the Tavily key must not appear in the request body: {}",
+        search.last_json()
+    );
 }
 
 #[test]
@@ -622,7 +631,6 @@ fn caller_anthropic_headers_are_preserved_across_model_reentry() {
         "/v1/messages",
         &body,
         &[
-            (USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL),
             ("anthropic-version", "2024-01-01"),
             ("anthropic-beta", "test-beta-2026-01-01"),
         ],
@@ -698,11 +706,11 @@ fn two_sequential_web_searches_retain_ordered_tool_history() {
     ])
     .start_with_shutdown();
     let second_search_response = json!({
-        "results":{"web":[{
+        "results":[{
             "title":"Growing potatoes",
             "url":"https://example.com/growing-potatoes",
-            "description":"Potatoes prefer cool weather and loose soil."
-        }],"news":[]}
+            "content":"Potatoes prefer cool weather and loose soil."
+        }]
     });
     let search = SearchStub::start_many(&[fixture["search_response"].clone(), second_search_response]);
     let proxy_port = free_port();
@@ -731,8 +739,8 @@ fn two_sequential_web_searches_retain_ordered_tool_history() {
 
 #[test]
 fn stream_false_preserves_buffered_loop() {
-    // With terminal_streaming enabled but stream:false, the buffered loop is
-    // unchanged: the backend serves JSON and the client receives one JSON body.
+    // With stream:false the filter selects the buffered transport automatically:
+    // the backend serves JSON and the client receives one JSON body.
     let first = json!({
         "id": "msg_1", "type": "message", "role": "assistant", "model": "openai/gpt-oss-20b",
         "content": [{"type": "tool_use", "id": TOOL_USE_ID, "name": "WebSearch", "input": {"query": "potato"}}],
@@ -772,7 +780,7 @@ fn state_limit_rejects_before_large_search_result_reenters_model() {
     ])
     .start_with_shutdown();
     let mut large_search_response = fixture["search_response"].clone();
-    large_search_response["results"]["web"][0]["description"] = Value::String("x".repeat(40_000));
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
     let search = SearchStub::start(&large_search_response);
     let proxy_port = free_port();
     let proxy = start_proxy(&load_config_with_max_state_bytes(
@@ -809,7 +817,7 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
     ])
     .start_with_shutdown();
     let mut large_search_response = fixture["search_response"].clone();
-    large_search_response["results"]["web"][0]["description"] = Value::String("x".repeat(40_000));
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
     let search = SearchStub::start(&large_search_response);
     let proxy_port = free_port();
     let proxy = start_proxy(&load_config_with_limits(
@@ -826,12 +834,71 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
     );
 
     assert_eq!(parse_status(&raw), 413);
+    // The 413 status must use the pinned Anthropic invalid-request type;
+    // `request_too_large` is not part of Anthropic's error vocabulary.
+    let body: Value = serde_json::from_str(&parse_body(&raw)).expect("rejection body must be JSON");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "a 413 buffered re-entry rejection must use invalid_request_error: {body}"
+    );
     assert_eq!(
         model.requests().len(),
         1,
         "oversized rebuilt body must halt before model re-entry"
     );
     assert_eq!(search.request_count(), 1, "the result must trigger rebuilt-body growth");
+}
+
+#[test]
+fn buffered_oversized_model_response_is_rejected_before_search() {
+    // Regression: `response_body_mode()` advertises `Stream` so the filter composes
+    // in a streaming-capable step, which drops the executor's per-filter response
+    // cap — only the router's much larger ceiling would otherwise bound a buffered
+    // round. A model response between the two limits (~40 KiB here, above the 20 KiB
+    // `max_body_bytes` and well below the router ceiling) must be rejected by the
+    // filter itself instead of being buffered and processed.
+    let fixture = fixture();
+    let mut oversized_model_response = fixture["first_model_response"].clone();
+    let tool_use = oversized_model_response["content"][0].clone();
+    oversized_model_response["content"] = json!([
+        {"type":"text","text":"x".repeat(40_000)},
+        tool_use
+    ]);
+    let model = StatefulCapturingBackend::new(vec![
+        (200, oversized_model_response.to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let search = SearchStub::start(&fixture["search_response"]);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config_with_limits(
+        proxy_port,
+        model.port(),
+        search.port(),
+        None,
+        Some(20_000),
+    ));
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "an oversized buffered model response must be rejected, not processed: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "the oversized round must halt before model re-entry"
+    );
+    assert_eq!(
+        search.request_count(),
+        0,
+        "the filter rejects the oversized response before dispatching the managed search"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1301,6 +1368,72 @@ fn later_round_non_success_fails_closed_with_error_event() {
 }
 
 #[test]
+fn streaming_reentry_body_limit_streams_terminal_error_event() {
+    // Round 0 streams a managed WebSearch call, committing a 200 SSE lifecycle
+    // (message_start forwarded). The search result is large enough that the
+    // rebuilt re-entry request exceeds the web-search `max_body_bytes`. On the
+    // buffered path that overflow is a request-phase 413 JSON rejection
+    // (`body_limit_rejects_before_large_rebuilt_request_reenters_model`), but the
+    // client stream is already committed here, so a JSON `Reject` cannot cleanly
+    // replace it. The loop must fail closed to one coherent terminal `error`
+    // event instead of truncating or corrupting the open stream.
+    let model = StreamingModel::start(vec![search_round("msg_1", TOOL_USE_ID, "potato", 8)]);
+    let mut large_search_response = search_results();
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
+    let search = SearchStub::start(&large_search_response);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config_with_limits(
+        proxy_port,
+        model.port(),
+        search.port(),
+        None,
+        Some(20_000),
+    ));
+
+    let raw = read_response_to_end(proxy.addr(), &streaming_request());
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "headers are committed on round 0 before the oversized re-entry: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert_eq!(
+        body.matches("event: message_start").count(),
+        1,
+        "the first round's message_start is forwarded exactly once: {body}"
+    );
+    assert!(
+        body.contains("event: error"),
+        "an oversized streaming re-entry fails closed to a terminal error event, not a truncated stream: {body}"
+    );
+    assert_eq!(
+        body.matches("event: error").count(),
+        1,
+        "exactly one terminal error event reaches the client: {body}"
+    );
+    assert!(
+        body.contains("\"type\":\"api_error\""),
+        "an oversized re-entry maps to api_error: {body}"
+    );
+    assert!(
+        !body.contains("WebSearch") && !body.contains("\"type\":\"tool_use\""),
+        "the managed search block stays suppressed even on overflow: {body}"
+    );
+    assert!(!body.contains(TOOL_USE_ID), "the managed tool id never leaks: {body}");
+    assert_eq!(
+        model.request_count(),
+        1,
+        "the oversized rebuilt request halts before model re-entry"
+    );
+    assert_eq!(
+        search.request_count(),
+        1,
+        "the search runs -- its large result triggers the overflow -- before the re-entry is rejected"
+    );
+}
+
+#[test]
 fn mid_stream_termination_fails_closed_with_error_event() {
     // Round 0 forwards message_start, then the backend stalls without ever
     // completing the round. A short IRR timeout expires the round mid-stream,
@@ -1619,5 +1752,5 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
 }
 
 fn json_post(path: &str, body: &str) -> String {
-    json_post_with_headers(path, body, &[(USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL)])
+    json_post_with_headers(path, body, &[])
 }

@@ -1,0 +1,60 @@
+# Anthropic Messages to Chat Completions (operator-approved degradation)
+#
+# Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching
+# and extended thinking into operator-approved degradation. The translator
+# validates and strips `cache_control` and `thinking` markers so an unmodified
+# client (for example Claude Code) can still drive a Chat Completions backend,
+# and reports each degradation. See `messages-to-openai.yaml` for the strict
+# (reject) variant and `docs/anthropic-messages.md` for the trade-offs.
+#
+# This config exists to back the `messages/degrade-features` inference fixture
+# (`tests/integration/fixtures/inference/`). It intentionally omits the gateway
+# authentication and credential-injection filters so the deterministic fixture
+# runner can replay it without secrets.
+
+listeners:
+  - name: anthropic-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [anthropic-transform]
+
+filter_chains:
+  - name: anthropic-transform
+    filters:
+      - filter: anthropic_messages_format
+        on_invalid: continue
+
+      - filter: anthropic_messages_to_chat_completions
+        max_body_bytes: 1048576
+        allow_lossy_features:
+          - prompt_caching
+          - extended_thinking
+
+      - filter: anthropic_messages_to_chat_completions_stream
+        max_partial_event_bytes: 10485760
+        max_tool_blocks: 10000
+        response_conditions:
+          - when:
+              headers:
+                content-type: "text/event-stream"
+
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/messages$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "chat-completions-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "chat-completions-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

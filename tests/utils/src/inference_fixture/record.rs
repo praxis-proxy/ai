@@ -373,6 +373,7 @@ pub(super) async fn record_live(
     debug_assert_eq!(released_port, listener_port);
     let mut proxy = start_proxy_no_wait(&config);
     wait_for_tcp(proxy.addr());
+    proxy.wait_for_store_ready();
 
     let scenario_id = bound.id;
     let protocol = bound.protocol;
@@ -1068,7 +1069,7 @@ fn generate_recorder_capability() -> Result<HeaderValue, FixtureError> {
     Ok(capability)
 }
 
-/// Builds a redirect-free Reqwest client pinned to the Rustls backend.
+/// Builds a redirect-free Reqwest client pinned to the active TLS backend.
 fn build_provider_client(root: Option<reqwest::Certificate>) -> Result<reqwest::Client, FixtureError> {
     build_provider_client_with_timeout(root, PROVIDER_REQUEST_TIMEOUT)
 }
@@ -1080,7 +1081,6 @@ fn build_provider_client_with_timeout(
 ) -> Result<reqwest::Client, FixtureError> {
     let mut builder = crate::inference_fixture::http_client_builder()
         .no_proxy()
-        .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none());
@@ -1361,7 +1361,6 @@ fn add_structure(current: DocumentResourceUsage, next: DocumentResourceUsage) ->
         max_depth: current.max_depth.max(next.max_depth),
     }
 }
-
 
 /// Marks one body EOF and completes the attempt if the connection also succeeded.
 fn mark_body_delivered(shared: &RecorderShared, slot: usize) -> bool {

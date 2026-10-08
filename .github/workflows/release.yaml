@@ -72,7 +72,7 @@ jobs:
 
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Run all tests
         run: make test
@@ -104,7 +104,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Publish container image
-        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           image-name: ${{ github.repository }}
 
@@ -135,7 +135,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust (for the Red Hat image verification)
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           # The restored target/ would otherwise be swept into the build context.
           cache-target: "false"
@@ -363,13 +363,56 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Generate release notes
+      - name: Generate and verify exact-commit qualification evidence
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse 'HEAD^{commit}')
+          mkdir -p "$RUNNER_TEMP/release-qualification"
+          python3 .github/scripts/vllm_qualification.py release-evidence \
+            --repo "$GH_REPO" --sha "$sha" \
+            --output-dir "$RUNNER_TEMP/release-qualification"
+
+          if gh release view "$TAG" --repo "$GH_REPO" --json body \
+            --jq .body > "$RUNNER_TEMP/release-qualification/base-notes.md" 2>/dev/null; then
+            existing=true
+          else
+            existing=false
+            gh api -X POST "repos/$GH_REPO/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$sha" \
+              --jq .body > "$RUNNER_TEMP/release-qualification/base-notes.md"
+          fi
+          python3 .github/scripts/vllm_qualification.py compose \
+            --existing "$RUNNER_TEMP/release-qualification/base-notes.md" \
+            --section "$RUNNER_TEMP/release-qualification/qualification-section.md" \
+            --output "$RUNNER_TEMP/release-qualification/release-notes.md"
+          if [ "$existing" = true ]; then
+            gh release edit "$TAG" --repo "$GH_REPO" \
+              --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
+          else
+            gh release create "$TAG" --repo "$GH_REPO" \
+              --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
+          fi
+          gh release upload "$TAG" "$RUNNER_TEMP/release-qualification/qualification.json" \
+            --repo "$GH_REPO" --clobber
+          gh release view "$TAG" --repo "$GH_REPO" --json body,assets \
+            > "$RUNNER_TEMP/release-qualification/published.json"
+          python3 - "$RUNNER_TEMP/release-qualification/published.json" <<'PY'
+          import json, pathlib, sys
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          body = release.get("body") or ""
+          names = {asset["name"] for asset in release.get("assets", [])}
+          if body.count("<!-- praxis:native-vllm-qualification:start -->") != 1 \
+                  or body.count("<!-- praxis:native-vllm-qualification:end -->") != 1 \
+                  or "qualification.json" not in names:
+              raise SystemExit("release is missing its unique qualification section or report asset")
+          PY

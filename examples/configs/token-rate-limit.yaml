@@ -28,13 +28,17 @@
 # defaults to in-process; set a filter-level `backend: {kind: valkey,
 # url: ..., namespace: ...}` (a sibling of `rules:`, not per-rule) to
 # share every rule's budget across every gateway instance/replica over
-# one shared connection.
+# one shared connection. The Valkey backend uses plain commands; two
+# admissions racing on one key may briefly overshoot the budget by
+# their estimates.
 #
-# Set `key: authenticated_subject` on token_rate_limit to give every
-# verified Praxis subject an independent budget within each matching
-# rule. It fails closed when no authenticated identity is present and
-# hashes the subject before using it as a backend key. The default is
-# `key: global`, preserving one shared budget per rule.
+# Set `key:` to partition each matching rule's budget. Scalars
+# (`global`, `authenticated_subject`, `ip`, `model`), a header mapping
+# (`header: x-tenant-id`), or a list of those (composite, e.g. subject
+# + model) are accepted. Missing dimensions reject by default; set
+# `missing: fallback` to drop an absent dimension (header-absent traffic
+# then shares the global bucket). Values are hashed before storage.
+# The default is `key: global`, one shared budget per rule.
 #
 # `default_weights` (M4) scale provider-reported token types when the
 # reservation is reconciled. Cache read/write are a breakdown of
@@ -44,9 +48,9 @@
 #
 # Observability requires no filter configuration. Metrics use bounded
 # rule/algorithm/result/backend labels and never identify a user. The
-# budget_remaining gauge is the sum of the latest calculated balances
-# across retained keys in a rule; active_keys shows how many balances
-# contribute. Window aging/refill is lazy, so this is a snapshot. Build
+# budget_remaining is the remaining budget for the key of the most
+# recent admission decision on this replica; active_keys shows how
+# many keys the backend currently retains. Both are snapshots. Build
 # with `opentelemetry` to add the request-scoped decision span. Structured
 # best-effort audit records use the dedicated
 # `praxis_ai::token_rate_limit::accounting` log target at INFO (one line
@@ -54,7 +58,7 @@
 # `runtime.log_overrides: {"praxis_ai::token_rate_limit::accounting": "warn"}`.
 #
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
-# for the full rationale): arbitrary CEL/composite bucket keys and
+# for the full rationale): CEL-expression matchers/keys, and
 # billing-grade metering (S3).
 #
 # token_rate_limit is declared *before* token_count: response hooks
