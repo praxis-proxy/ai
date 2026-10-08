@@ -377,9 +377,9 @@ fn clear_thinking_keep_is_recognized(keep: Option<&Value>) -> bool {
 fn degrade_prompt_caching(body: &mut Map<String, Value>) -> Result<bool, String> {
     let mut degraded = false;
 
-    // A top-level `cache_control` applies a marker to the last cacheable block;
-    // it is Anthropic cache metadata, not a mapped field, so strip a recognized
-    // one here and let a malformed one fall through to the strict rejection.
+    // The top-level `cache_control` is request-wide Anthropic cache metadata
+    // with no Chat Completions equivalent, so it needs its own strip here rather
+    // than riding a content block like the per-position markers below.
     strip_map_cache_control(body, &mut degraded)?;
 
     if let Some(Value::Array(blocks)) = body.get_mut("system") {
