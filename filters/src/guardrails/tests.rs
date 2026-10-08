@@ -3,13 +3,13 @@
 
 use praxis_filter::{HttpFilter, HttpFilterContext};
 
+#[cfg(feature = "openai-responses")]
+use super::filter::record_local_tool_verdict;
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
     filter::AiGuardrailsFilter,
     providers::GuardResult,
 };
-#[cfg(feature = "openai-responses")]
-use super::filter::record_local_tool_verdict;
 
 // =============================================================================
 // Test helpers
