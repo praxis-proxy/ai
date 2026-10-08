@@ -169,7 +169,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+    #[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
     #[cfg_attr(
         not(feature = "store-sqlite"),
         allow(

@@ -132,6 +132,9 @@ pub(super) enum BackendError {
     /// The backend responded, but not in the expected shape.
     #[error("shared quota backend returned an invalid response")]
     InvalidResponse,
+    /// Existing shared state belongs to a different accounting configuration.
+    #[error("shared quota backend accounting configuration does not match existing state")]
+    ConfigurationMismatch,
 }
 
 /// Where sliding-window admission state lives: in-process or shared.
@@ -497,7 +500,7 @@ pub(super) fn record_completed_reconciliation(
 /// Count and log one reconciliation given up after its retries; the
 /// reservation still expires and is charged at its estimate.
 pub(super) fn record_abandoned_reconciliation(backend: &impl TokenRateLimitStateBackend, error: &BackendError) {
-    super::record_backend_error_metric(backend.rule_name(), backend.backend_name());
+    super::record_backend_error_metric(backend.rule_name(), backend.backend_name(), error);
     tracing::warn!(
         target: "praxis_ai::token_rate_limit::accounting",
         phase = "reconciliation",

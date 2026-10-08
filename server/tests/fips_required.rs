@@ -8,11 +8,12 @@
 //! Runs the real binary as a subprocess because the check ends in
 //! `process::exit`. The expectation depends on the host: on a host that is
 //! not in FIPS mode the binary must refuse to start and say why; on a FIPS
-//! host it must start normally, unless it carries the policy engine or the
-//! response store, whose dependencies do their own cryptography, in which
-//! case it must refuse and name the filters. Every branch is asserted, so
-//! the test is meaningful wherever it runs, and a control run without the
-//! variable proves the variable is what changes the outcome.
+//! host it must start normally, unless it carries the policy engine or a
+//! response-store profile whose dependencies do their own cryptography, in
+//! which case it must refuse and name the filters. The isolated
+//! certificate-authentication store profile is allowed. Every branch is
+//! asserted, so the test is meaningful wherever it runs, and a control run
+//! without the variable proves the variable is what changes the outcome.
 
 use std::process::Command;
 
@@ -21,6 +22,15 @@ use std::process::Command;
 fn host_is_fips() -> bool {
     praxis_tls::provider::install();
     praxis_tls::provider::status().unmet().is_empty()
+}
+
+/// The blocker's result for the filters this test binary compiled.
+fn compiled_fips_blocker() -> Option<String> {
+    praxis_tls::provider::install();
+    let client =
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None));
+    let registry = praxis_ai::build_full_registry(&client);
+    praxis_ai::fips_blocker(&registry)
 }
 
 /// Run `praxis-ai --validate` on the built-in default config with the given
@@ -48,7 +58,7 @@ fn validate_with(env: &[(&str, &str)]) -> (bool, String) {
 /// binary registers a filter whose dependencies carry their own
 /// cryptography, which must be refused by name.
 fn assert_fips_host_outcome(ok: bool, stderr: &str) {
-    if cfg!(any(feature = "policy-engine", feature = "store")) {
+    if let Some(reason) = compiled_fips_blocker() {
         assert!(
             !ok,
             "on a FIPS host a binary carrying non-FIPS filters must refuse to start"
@@ -57,16 +67,11 @@ fn assert_fips_host_outcome(ok: bool, stderr: &str) {
             stderr.contains("PRAXIS_REQUIRE_FIPS"),
             "the refusal must name the variable, got: {stderr}"
         );
-        if cfg!(feature = "policy-engine") {
-            assert!(
-                stderr.contains("`policy` filter"),
-                "the refusal must name the policy filter, got: {stderr}"
-            );
-        }
-        if cfg!(feature = "store") {
-            assert!(
-                stderr.contains("`openai_response_store` filter"),
-                "the refusal must name the store filter, got: {stderr}"
+        for filter in ["`policy` filter", "`openai_response_store` filter"] {
+            assert_eq!(
+                stderr.contains(filter),
+                reason.contains(filter),
+                "the subprocess refusal and compiled blocker disagree about {filter}: blocker={reason}; stderr={stderr}"
             );
         }
     } else {

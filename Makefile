@@ -30,6 +30,7 @@ LEAN_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
 LEAN_GRAPH_BUDGET ?= 434
 STORE_BACKEND_FREE_FEATURES := standard,openai-all
 STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
+STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth
 STORE_SQLITE_FEATURES := standard,openai-all,store-sqlite
 STORE_COMBINED_FEATURES := standard,openai-all,store-all
 STORE_ALL_WORKSPACE_FEATURES := praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
@@ -53,7 +54,7 @@ endif
 	patch-praxis unpatch-praxis \
 	require-podman require-go require-oc \
 	build-fips release-fips check-fips lint-fips test-fips test-fips-provider \
-	test-integration-fips test-schema-fips test-fips-host fips-toolchain fips-host-facts \
+	test-integration-fips test-schema-fips test-fips-host test-postgres-fips-host fips-toolchain fips-host-facts \
 	fips-host-check fips-runtime-probe fips-image-save fips-image-load fips-image-tag fips-version \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
@@ -128,6 +129,7 @@ test-store-features:
 	cargo check -p praxis-ai-proxy
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_BACKEND_FREE_FEATURES)
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_POSTGRES_FEATURES)
+	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_POSTGRES_CERT_AUTH_FEATURES)
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_SQLITE_FEATURES)
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_COMBINED_FEATURES)
 	@set -eu; \
@@ -135,12 +137,15 @@ test-store-features:
 	assert_lacks() { if printf '%s\n' "$$1" | grep -q "^$$2 v"; then echo "ERROR: $$3 graph contains $$2"; exit 1; fi; }; \
 	backend_free="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $(STORE_BACKEND_FREE_FEATURES) --edges normal --prefix none --format '{p}')"; \
 	postgres="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $(STORE_POSTGRES_FEATURES) --edges normal --prefix none --format '{p}')"; \
+	postgres_cert_auth="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $(STORE_POSTGRES_CERT_AUTH_FEATURES) --edges normal --prefix none --format '{p}')"; \
 	sqlite="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $(STORE_SQLITE_FEATURES) --edges normal --prefix none --format '{p}')"; \
 	combined="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $(STORE_COMBINED_FEATURES) --edges normal --prefix none --format '{p}')"; \
 	default="$$(cargo tree -p praxis-ai-proxy --edges normal --prefix none --format '{p}')"; \
 	for crate in sqlx sqlx-core sqlx-postgres sqlx-sqlite libsqlite3-sys native-tls; do assert_lacks "$$backend_free" "$$crate" backend-free; done; \
 	for crate in sqlx sqlx-postgres native-tls; do assert_has "$$postgres" "$$crate" PostgreSQL-only; done; \
 	for crate in sqlx-sqlite libsqlite3-sys; do assert_lacks "$$postgres" "$$crate" PostgreSQL-only; done; \
+	for crate in sqlx sqlx-postgres native-tls; do assert_has "$$postgres_cert_auth" "$$crate" PostgreSQL-certificate-only; done; \
+	for crate in sqlx-sqlite libsqlite3-sys; do assert_lacks "$$postgres_cert_auth" "$$crate" PostgreSQL-certificate-only; done; \
 	for crate in sqlx sqlx-sqlite libsqlite3-sys; do assert_has "$$sqlite" "$$crate" SQLite-only; done; \
 	for crate in sqlx-postgres native-tls; do assert_lacks "$$sqlite" "$$crate" SQLite-only; done; \
 	for crate in sqlx sqlx-postgres sqlx-sqlite libsqlite3-sys native-tls; do assert_has "$$combined" "$$crate" combined; done; \
@@ -148,7 +153,7 @@ test-store-features:
 	for crate in sqlx-sqlite libsqlite3-sys; do assert_lacks "$$default" "$$crate" default; done
 	@# Lint each opt-in group on its own so a gate leak in a partial feature set
 	@# cannot hide behind the lean and full builds that other targets cover.
-	@for group in openai-responses openai-file-resolve-filter store store-postgres store-sqlite \
+	@for group in openai-responses openai-file-resolve-filter store store-postgres store-postgres-cert-auth store-sqlite \
 		openai-conversations openai-compact openai-mcp-tools; do \
 		echo "clippy: standard + $$group"; \
 		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
@@ -366,10 +371,11 @@ coverage-check:
 #   policy-engine        praxis-policy carries its own cryptography (sha2,
 #                        hmac, jsonwebtoken on aws-lc-rs)
 #   store, store-sqlite, store-postgres, openai-conversations, openai-compact
-#                        sqlx enables sqlx-core's `migrate` feature with its
-#                        tokio runtime, and that pulls sha2; store-postgres
-#                        adds sqlx-postgres' md-5/hmac/sha2/rsa (SCRAM)
-#   openai-mcp-tools     depends on store, which pulls sha2 through sqlx
+#                        the general-purpose SQLx profile carries migration,
+#                        advisory-lock, and password-authentication crypto;
+#                        FIPS selects store-postgres-cert-auth instead
+#   openai-mcp-tools     depends on store functionality not included in the
+#                        current FIPS profile
 #   azure-ad-filter, gcp-adc-filter
 #                        experimental; off for the same reasons they are off
 #                        in the standard build
@@ -377,8 +383,8 @@ coverage-check:
 # The remaining non-experimental groups compile cleanly: openai-responses
 # (the Responses kernel, no crates), openai-file-resolve-filter (migrated
 # to SubRequestClient, no reqwest/aws-lc-rs), and aws-sigv4-filter (signs
-# through system OpenSSL). FIPS_FEATURES is the single place this is
-# defined;
+# through system OpenSSL), and store-postgres-cert-auth (certificate-only
+# PostgreSQL storage). FIPS_FEATURES is the single place this is defined;
 # Containerfile.fips (CARGO_FEATURES) mirrors it and must be kept in sync.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
@@ -415,7 +421,7 @@ coverage-check:
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           := openai-responses,openai-file-resolve-filter,aws-sigv4-filter
+FIPS_FEATURES           := openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
@@ -565,6 +571,20 @@ test-integration-fips: build-fips
 test-schema-fips:
 	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-schema \
 		--no-default-features --features $(FIPS_FEATURES) $(FIPS_CARGO_EXTRA) $(_NOCAPTURE)
+
+# The certificate-authenticated PostgreSQL boundary on the actual FIPS host.
+# This runs outside the toolchain container because the test starts a sibling
+# PostgreSQL container through the host's rootless podman. It still resolves
+# exactly the shipped FIPS feature set, fails closed unless the host and
+# provider report FIPS mode, and exercises a write/read round trip with a
+# password-less URL against a server whose only TCP rule is `hostssl ... cert`.
+# A second peer selects SCRAM and must receive the fork's explicit
+# password-authentication-disabled refusal before any exchange begins.
+test-postgres-fips-host: | require-podman
+	PRAXIS_FIPS_HOST=1 PRAXIS_REQUIRE_FIPS=1 PRAXIS_TEST_FIPS_PROVIDER=1 \
+	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
+		--no-default-features --features $(FIPS_FEATURES) \
+		--test suite -- --ignored openai_response_store_postgres_mtls $(if $(V),--nocapture)
 
 # The same unit tests with the RHEL FIPS provider active in every test
 # process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file

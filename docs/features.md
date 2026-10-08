@@ -63,16 +63,17 @@ library crates keep `standard` as their lean default, and explicit
 PostgreSQL-only, or combined persistence profiles described below. The
 published container image builds `full,store-sqlite`, while `make release`
 builds `full`. The FIPS build
-(`make release-fips`, the `-fips` image) compiles only `openai-responses` and
-`aws-sigv4-filter` on top of the always-on filters; [FIPS 140-3](fips.md)
-lists what is left out and why.
+(`make release-fips`, the `-fips` image) compiles `openai-responses`,
+`openai-file-resolve-filter`, `aws-sigv4-filter`, and the certificate-only
+PostgreSQL store on top of the always-on filters; [FIPS 140-3](fips.md) lists
+what is left out and why.
 
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|
 | `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-credential-types`; the signature is computed by the system OpenSSL |
 | `openai-responses` | `openai_responses_request`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
-| `openai-file-resolve-filter` | `openai_file_resolve` | `reqwest` |
-| `store-postgres`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL) |
+| `openai-file-resolve-filter` | `openai_file_resolve` | none beyond `openai-responses`; uses the shared subrequest client |
+| `store-postgres`, `store-postgres-cert-auth`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL; the certificate-only profile omits password authentication) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
 | `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
 | `openai-mcp-tools` | `openai_mcp_tool_resolve`, `openai_mcp_dispatch`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
@@ -80,7 +81,7 @@ lists what is left out and why.
 | `full` | `standard`, `openai-all`, and `store-postgres` | |
 
 The store-backed groups need a backend at runtime, so pair them with
-`store-postgres` or `store-sqlite` (for example
+`store-postgres`, `store-postgres-cert-auth`, or `store-sqlite` (for example
 `--features openai-all,store-sqlite`). The experimental `http-callout-filter`,
 `azure-ad-filter`, `gcp-adc-filter`, `token-rate-limit-filter`, and
 `basic-auth-filter` features, and the `llmd-ext-proc` and `opentelemetry`
