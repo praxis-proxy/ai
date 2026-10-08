@@ -187,6 +187,26 @@ const COMPACTION_BALLAST_BYTES: usize = 4_500;
 /// needs more wall-clock than the single-shot coding task's [`CHILD_TIMEOUT`].
 const COMPACTION_CHILD_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Shorter deadline for the compaction lane on the known-limited Qwen3-8B model.
+/// Real self-compaction fires within the first couple of minutes (the lowered
+/// window forces it after the early ballast reads), so this is ample to capture
+/// the client's own `compact_boundary` event and a post-compaction request
+/// through Praxis while bounding the time wasted when the 8B model then loops
+/// re-reading ballast instead of finishing the downstream write. The unfinished
+/// write is treated as an expected (XFAIL) model limitation — see
+/// [`Workspace::assert_compaction_task_trace`].
+const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Model identifier (case-insensitive substring) whose self-compaction is proven
+/// but whose downstream task completion is an accepted XFAIL. Qwen3-8B reliably
+/// self-compacts through Praxis but cannot reliably finish the post-compaction
+/// marker write: it drops the high-entropy marker across its own lossy summary,
+/// or loops re-reading ballast until the deadline. The compaction + continuation
+/// proofs stay hard assertions; only task completion is downgraded on this model.
+/// Mirrors the Codex lane's `COMPACTION_XFAIL_MODEL`. See
+/// docs/developing/gpu-nightly-suite.md.
+const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
+
 /// Claude Code switch between its server-side and client-initiated auto-mode
 /// classifier paths.
 const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
@@ -780,6 +800,13 @@ enum Expectation {
 /// observed from its stream-json `compact_boundary` event. Nothing calls an SDK
 /// compact endpoint, injects a canned summary, or enables a Praxis compaction
 /// filter.
+///
+/// The self-compaction and post-compaction continuation through Praxis are always
+/// hard assertions. Downstream task completion (the correct post-compaction marker
+/// write) is enforced only on a capable model; on [`COMPACTION_XFAIL_MODEL`]
+/// (Qwen3-8B) it is an accepted XFAIL — see
+/// [`Workspace::assert_compaction_task_trace`] and
+/// docs/developing/gpu-nightly-suite.md.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_claude_code_compaction_crosses_context_window_on_native_vllm() {
     let Some(live) = LiveConfig::from_env() else {
@@ -948,6 +975,8 @@ async fn run_compaction_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u1
     assert_pinned_version(&live.claude_bin).await;
     live.require_egress_isolation_if_demanded();
 
+    let compaction_is_xfail = live.model.to_ascii_lowercase().contains(COMPACTION_XFAIL_MODEL);
+
     let (proxy, _admin_address) = start_isolated_proxy(live, build_config);
     let proxy_base_url = format!("http://{}", proxy.addr());
 
@@ -959,19 +988,49 @@ async fn run_compaction_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u1
     );
 
     let started = SystemTime::now();
-    let output = launch_claude_code(
-        live,
-        &proxy_base_url,
-        workspace.project.path(),
-        Turn::compaction(&prompt),
-    )
-    .await;
-    assert_child_completed(&output, "compaction task");
+    let mut turn = Turn::compaction(&prompt);
+    if compaction_is_xfail {
+        // The 8B model loops past the full deadline once it cannot finish the
+        // write; the wire compaction proof lands well before this, so bound the
+        // wasted wall-clock.
+        turn.timeout = COMPACTION_XFAIL_CHILD_TIMEOUT;
+    }
+    let output = launch_claude_code(live, &proxy_base_url, workspace.project.path(), turn).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The compaction signal and the post-compaction Praxis traversal are proven
-    // from the client's own stream-json trace; the end-state check proves the
+    // HARD, always enforced (independent of model capability): the pinned client
+    // self-compacted on its own (`compact_boundary` event), the pre-compaction
+    // Read carried the per-run marker through Praxis, and at least one tool call
+    // followed the boundary — a post-compaction request that necessarily traversed
+    // Praxis. These are proven from the client's own stream-json trace and do not
+    // depend on the model finishing the downstream task, so they gate the XFAIL
+    // path too.
+    workspace.assert_compaction_task_trace(&stdout, compaction_is_xfail);
+
+    // XFAIL on the known-limited model: self-compaction is proven above, but
+    // Qwen3-8B cannot reliably complete the post-compaction marker write. Record
+    // the expected limitation and stop before the completion assertions rather
+    // than failing the job. A capable model falls through to the full oracle.
+    if compaction_is_xfail {
+        eprintln!(
+            "XFAIL (model `{model}`, documented Qwen3-8B limitation): verified the pinned Claude \
+             Code client self-compacted and a post-compaction request traversed Praxis, but \
+             skipping the downstream task-completion assertions. The 8B model drops the marker \
+             across its own lossy summary or loops re-reading ballast past the \
+             {timeout:?} deadline (timed_out={timed_out}, exit={exit:?}). See \
+             docs/developing/gpu-nightly-suite.md.",
+            model = live.model,
+            timeout = COMPACTION_XFAIL_CHILD_TIMEOUT,
+            timed_out = output.timed_out,
+            exit = output.status.code(),
+        );
+        return;
+    }
+
+    // Capable model: enforce the full downstream completion oracle. The child must
+    // have run to completion inside the deadline and the end-state check proves the
     // marker was used correctly across the boundary.
-    workspace.assert_compaction_task_trace(&String::from_utf8_lossy(&output.stdout));
+    assert_child_completed(&output, "compaction task");
     workspace.assert_task_completed(started);
 }
 
@@ -1512,15 +1571,19 @@ impl Workspace {
     /// turn — and the final answer it produces from that tool's result — are
     /// requests that necessarily traversed Praxis after compaction.
     ///
-    /// The oracle is: (a) the client self-compacted (boundary event), (b) at least
-    /// one tool call followed the boundary (continuation through Praxis), and
-    /// (c) the post-compaction write is CORRECT (uppercase marker into
+    /// The oracle has two tiers. ALWAYS hard (independent of model capability):
+    /// (a) the client self-compacted (boundary event), (b) the pre-compaction Read
+    /// carried the per-run marker through Praxis, and (c) at least one tool call
+    /// followed the boundary (continuation through Praxis). On `compaction_is_xfail`
+    /// (the Qwen3-8B lane) the assertion stops there — the model self-compacts
+    /// reliably but cannot reliably finish the write. On a capable model it also
+    /// enforces (d) the post-compaction write is CORRECT (uppercase marker into
     /// `result/value.txt`, then a passing `./verify.sh`). The marker stays on disk
     /// and the prompt steers a post-compaction re-read to recover it, but the oracle
     /// does not mandate that re-read — a capable model may carry the token across its
-    /// own summary. Unlike the Codex lane, this lane keeps full completion as a hard
-    /// assertion rather than an XFAIL; see docs/developing/gpu-nightly-suite.md.
-    fn assert_compaction_task_trace(&self, stdout: &str) {
+    /// own summary. Mirrors the Codex lane's XFAIL; see
+    /// docs/developing/gpu-nightly-suite.md.
+    fn assert_compaction_task_trace(&self, stdout: &str, compaction_is_xfail: bool) {
         let trace = ToolTrace::parse(stdout);
 
         let compaction = trace.auto_compaction().unwrap_or_else(|| {
@@ -1581,6 +1644,14 @@ impl Workspace {
             post.seq,
             compaction.seq,
         );
+
+        // XFAIL on the known-limited model: self-compaction and post-compaction
+        // continuation through Praxis are proven above. Qwen3-8B cannot reliably
+        // finish the downstream write, so stop before the completion oracle; the
+        // caller logs the expected limitation. A capable model falls through.
+        if compaction_is_xfail {
+            return;
+        }
 
         // The marker is used correctly after compaction: a SUCCESSFUL Edit writes
         // the uppercase transform after the boundary, and verification runs AFTER
