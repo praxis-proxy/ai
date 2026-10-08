@@ -82,6 +82,16 @@ on:
         required: false
         default: false
         type: boolean
+      run_compaction_only:
+        description: >-
+          Debug fast path: run ONLY the two self-compaction acceptance tests
+          (Claude Code and Codex) on a GPU runner. Skips the complete Responses
+          SDK suite and every other acceptance step so iterations are quick.
+          Implies both acceptance jobs regardless of run_claude_acceptance and
+          run_codex_acceptance.
+        required: false
+        default: false
+        type: boolean
       gpu_instance_type:
         description: >-
           Optional EC2 GPU instance-type override for transient capacity
@@ -654,7 +664,7 @@ jobs:
       (
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance)
+          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -926,9 +936,10 @@ jobs:
       - name: Run Claude Code native-vLLM acceptance test (once, no retry)
         id: claude_native_edits
         # Keep the original success()-gating (run only when setup succeeded) and
-        # additionally skip on a focused degradation-only dispatch; the two
-        # translated steps below carry that run.
-        if: ${{ success() && env.DEGRADE_ONLY != 'true' }}
+        # additionally skip on a focused degradation-only or compaction-only
+        # dispatch; the two translated steps below carry the degradation run, and
+        # the compaction steps carry the compaction-only run.
+        if: ${{ success() && env.DEGRADE_ONLY != 'true' && !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -953,7 +964,7 @@ jobs:
 
       - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_edits
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -975,7 +986,7 @@ jobs:
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
         id: claude_native_auto
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -996,7 +1007,7 @@ jobs:
 
       - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_auto
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1016,7 +1027,7 @@ jobs:
 
       - name: Run Claude Code planning-turn regression (once, no retry)
         id: claude_planning
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1102,7 +1113,7 @@ jobs:
 
       - name: Run Anthropic SDK Messages against real vLLM
         id: anthropic_messages
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1116,7 +1127,7 @@ jobs:
 
       - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
         id: anthropic_stubbed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1132,7 +1143,7 @@ jobs:
 
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1292,7 +1303,7 @@ jobs:
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_codex_acceptance)
+          (inputs.run_live_vllm || inputs.run_codex_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -1522,6 +1533,7 @@ jobs:
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
         id: codex_native
+        if: ${{ !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1540,7 +1552,7 @@ jobs:
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
-        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1687,7 +1699,7 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
       ) ||
       (
         github.event_name == 'pull_request' &&
