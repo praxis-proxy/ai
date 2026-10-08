@@ -52,10 +52,15 @@ const META_ACTIVE: &str = "time_to_first_token.active";
 /// a Prometheus histogram and deactivates for the remainder of the
 /// response.
 ///
-/// The histogram's `model` label is read from metadata set by an upstream format
-/// filter (`openai_responses_format`, `anthropic_messages_format`, or
-/// `anthropic_messages_to_chat_completions`). If no format filter runs before this filter,
-/// all TTFT samples are labeled `unknown`.
+/// The histogram's `model` label is read from metadata set by an upstream
+/// request fact filter: `openai_responses_request` (Responses create bodies),
+/// `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies),
+/// `anthropic_messages_format`, or `anthropic_messages_to_chat_completions`
+/// (Anthropic, including Anthropic-to-Chat translation). If none runs before this
+/// filter, all TTFT samples are labeled `unknown`.
+///
+/// Chat traffic that originates as a Responses or Anthropic request and is
+/// translated downstream keeps the model its originating classifier promoted.
 ///
 /// # YAML
 ///
@@ -136,13 +141,18 @@ impl HttpFilter for TimeToFirstTokenFilter {
     }
 }
 
-/// Resolve the model label from format-filter metadata with fallback.
+/// Resolve the model label from request metadata with fallback.
+///
+/// Reads the model a Responses, native Chat Completions, or Anthropic filter
+/// promoted on the request path. When no filter published a model, the label
+/// falls back to `unknown`.
 ///
 /// Values containing control characters or exceeding the promotion length
 /// cap are treated as unsafe and replaced with `"unknown"` to prevent
 /// malformed Prometheus labels or cardinality pressure.
 fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
-    ctx.get_metadata("openai_responses_format.model")
+    ctx.get_metadata("openai_responses_request.model")
+        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_format.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
         .filter(|v| is_promotable_value(v))

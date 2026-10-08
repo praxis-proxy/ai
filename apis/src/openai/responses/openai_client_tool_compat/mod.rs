@@ -718,7 +718,7 @@ fn restore_request_tools_and_choice(state: &mut ResponsesState, tools: Vec<Value
 /// Return the client's stream preference: the classifier metadata first, falling
 /// back to the request body's `stream` flag.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+    ctx.get_metadata("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()

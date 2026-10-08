@@ -528,7 +528,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
         return Some(SelectedUpstreamBodyOutcome::Continue);
     }
-    match ctx.get_metadata("openai_responses_format.format") {
+    match ctx.get_metadata("openai_responses_request.format") {
         Some("openai_responses") => None,
         Some(format) => {
             trace!(
@@ -547,7 +547,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
         },
         None => {
             warn!(
-                prerequisite = "openai_responses_format",
+                prerequisite = "openai_responses_request",
                 "request pipeline state is unavailable"
             );
             Some(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()))
@@ -624,7 +624,7 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), Sel
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+    ctx.get_metadata("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()

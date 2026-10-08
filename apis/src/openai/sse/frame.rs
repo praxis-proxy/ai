@@ -5,6 +5,18 @@
 
 use std::{fmt, time::Duration};
 
+/// UTF-8 byte order mark permitted once at the start of an SSE stream.
+const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
+
+/// Recognition state for the optional leading UTF-8 BOM.
+#[derive(Clone, Copy)]
+enum StreamStart {
+    /// The stream may still begin with a BOM, with this many bytes matched.
+    CheckingBom(u8),
+    /// At least one non-BOM byte or a complete leading BOM has been consumed.
+    Past,
+}
+
 /// A completed SSE frame: one event boundary's worth of data.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SseFrame {
@@ -19,6 +31,8 @@ pub(crate) struct SseFrame {
 /// Buffers partial lines across chunk boundaries and yields
 /// complete [`SseFrame`] values on each blank-line event boundary.
 pub(crate) struct SseFrameParser {
+    /// Recognition state for a possible BOM at the start of the byte stream.
+    stream_start: StreamStart,
     /// Accumulates the current line being parsed.
     line_buf: Vec<u8>,
     /// The `event:` value for the current frame, if any.
@@ -39,6 +53,7 @@ impl SseFrameParser {
     /// Create a new parser with the given buffer byte limit.
     pub fn new(max_buffer_bytes: usize) -> Self {
         Self {
+            stream_start: StreamStart::CheckingBom(0),
             line_buf: Vec::new(),
             event_type: None,
             data_buf: Vec::new(),
@@ -98,6 +113,27 @@ impl SseFrameParser {
         self.prev_cr = false;
 
         while let Some(&b) = chunk.get(i) {
+            if let StreamStart::CheckingBom(matched) = self.stream_start {
+                let prefix_len = usize::from(matched);
+                if UTF8_BOM.get(prefix_len) == Some(&b) {
+                    let matched = matched.saturating_add(1);
+                    self.stream_start = if usize::from(matched) == UTF8_BOM.len() {
+                        StreamStart::Past
+                    } else {
+                        StreamStart::CheckingBom(matched)
+                    };
+                    i += 1;
+                    self.scratch_bytes = self.buffered_bytes();
+                    self.check_buffer_limit()?;
+                    continue;
+                }
+
+                self.stream_start = StreamStart::Past;
+                self.line_buf
+                    .extend_from_slice(UTF8_BOM.get(..prefix_len).unwrap_or_default());
+                self.scratch_bytes = self.buffered_bytes();
+            }
+
             if b == b'\n' || b == b'\r' {
                 if let Some(frame) = self.process_line() {
                     if count_frame(&frame) {
@@ -140,13 +176,21 @@ impl SseFrameParser {
     /// line terminator (the parser resolves it at the next push or treats it as
     /// the final line ending), so it does not signal a truncated frame.
     pub fn has_incomplete_frame(&self) -> bool {
-        !self.line_buf.is_empty() || self.has_data || self.event_type.is_some()
+        self.bom_prefix_len() != 0 || !self.line_buf.is_empty() || self.has_data || self.event_type.is_some()
+    }
+
+    /// Return the number of retained bytes matching the start of a possible BOM.
+    fn bom_prefix_len(&self) -> usize {
+        match self.stream_start {
+            StreamStart::CheckingBom(matched) => usize::from(matched),
+            StreamStart::Past => 0,
+        }
     }
 
     /// Return the number of bytes currently retained by the parser.
     fn buffered_bytes(&self) -> usize {
-        self.line_buf
-            .len()
+        self.bom_prefix_len()
+            .saturating_add(self.line_buf.len())
             .saturating_add(self.data_buf.len())
             .saturating_add(self.event_type.as_ref().map_or(0, String::len))
     }
@@ -399,6 +443,118 @@ mod tests {
         assert_eq!(frames.len(), 1, "single complete frame should dispatch");
         assert_eq!(frames[0].data, b"hello", "frame data should match");
         assert_eq!(frames[0].event_type, None, "frame should not have event type");
+    }
+
+    #[test]
+    fn leading_utf8_bom_is_ignored() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser.parse_chunk(b"\xEF\xBB\xBFdata: hello\n\n").unwrap();
+
+        assert_eq!(frames.len(), 1, "a leading UTF-8 BOM must not hide the first frame");
+        assert_eq!(frames[0].data, b"hello", "data after a leading BOM should be preserved");
+    }
+
+    #[test]
+    fn leading_utf8_bom_split_across_chunks_is_ignored() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+
+        assert!(
+            parser.parse_chunk(b"\xEF").unwrap().is_empty(),
+            "the first BOM byte must wait for the remaining prefix"
+        );
+        assert!(
+            parser.parse_chunk(b"").unwrap().is_empty(),
+            "an empty chunk must preserve partial BOM recognition"
+        );
+        assert!(
+            parser.parse_chunk(b"\xBB").unwrap().is_empty(),
+            "the second BOM byte must wait for the final prefix byte"
+        );
+        let frames = parser.parse_chunk(b"\xBFdata: hello\n\n").unwrap();
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a chunk-split leading BOM must not hide the first frame"
+        );
+        assert_eq!(frames[0].data, b"hello", "data after a split BOM should be preserved");
+    }
+
+    #[test]
+    fn split_utf8_bom_prefix_respects_buffer_limit() {
+        let mut parser = SseFrameParser::new(1);
+
+        assert!(
+            parser.parse_chunk(b"\xEF").unwrap().is_empty(),
+            "one retained BOM-prefix byte should fit the configured limit"
+        );
+        let result = parser.parse_chunk(b"\xBB");
+
+        assert!(
+            matches!(
+                result,
+                Err(SseParseError::BufferOverflow {
+                    buffered_bytes: 2,
+                    limit: 1
+                })
+            ),
+            "a matching split BOM prefix must not bypass the retained-byte limit"
+        );
+    }
+
+    #[test]
+    fn malformed_leading_utf8_bom_prefix_is_preserved() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+
+        assert!(
+            parser.parse_chunk(b"\xEF\xBB").unwrap().is_empty(),
+            "a partial BOM prefix must wait for the next byte"
+        );
+        let frames = parser.parse_chunk(b"Xdata: hidden\n\ndata: visible\n\n").unwrap();
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a malformed BOM prefix must not expose the prefixed data field"
+        );
+        assert_eq!(
+            frames[0].data, b"visible",
+            "parsing must continue with the subsequent valid frame"
+        );
+    }
+
+    #[test]
+    fn only_one_leading_utf8_bom_is_ignored() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser
+            .parse_chunk(b"\xEF\xBB\xBF\xEF\xBB\xBFdata: hidden\n\ndata: visible\n\n")
+            .unwrap();
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a second leading BOM must remain part of the first field name"
+        );
+        assert_eq!(frames[0].data, b"visible", "later valid frames should still be parsed");
+    }
+
+    #[test]
+    fn non_leading_utf8_bom_is_not_ignored() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser
+            .parse_chunk(b"data: first\n\n\xEF\xBB\xBFdata: hidden\n\ndata: third\n\n")
+            .unwrap();
+
+        assert_eq!(
+            frames.len(),
+            2,
+            "a BOM after stream start must not make an invalid field valid"
+        );
+        assert_eq!(frames[0].data, b"first", "the first frame should be preserved");
+        assert_eq!(
+            frames[1].data, b"third",
+            "parsing should continue after a non-leading BOM"
+        );
     }
 
     #[test]

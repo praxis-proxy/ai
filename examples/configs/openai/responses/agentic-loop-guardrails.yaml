@@ -25,7 +25,16 @@ listeners:
 filter_chains:
   - name: guarded-agentic-pipeline
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      # Pure fact publisher: classifies the body and promotes format/model/stream
+      # for the guardrail and agentic filters downstream. No managed owner
+      # (initialize_state: true) runs in this focused example, so the parse it
+      # caches is never reused — it is a request-scoped entry released, unused,
+      # when the request ends.
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format

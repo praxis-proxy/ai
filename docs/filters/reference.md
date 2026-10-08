@@ -41,6 +41,7 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`openai_agentic_loop`](openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
+| [`openai_chat_completions_request`](openai_chat_completions_request.md) | Publishes body facts for native Chat Completions create requests to durable metadata and filter results. |
 | [`openai_client_tool_compat`](openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
@@ -50,7 +51,6 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
-| [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
 | [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |

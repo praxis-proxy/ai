@@ -3,6 +3,8 @@
 
 //! Input item pagination for the `OpenAI` Responses API.
 
+use std::collections::HashSet;
+
 use serde::{Serialize, Serializer};
 
 use crate::{
@@ -19,6 +21,9 @@ pub(crate) const DEFAULT_PAGE_LIMIT: u32 = 20;
 
 /// Maximum page size for input item list operations (matches `OpenAI` maximum).
 pub(crate) const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Prefix for a position-bearing cursor used when an item ID is ambiguous.
+const POSITION_CURSOR_PREFIX: &str = "praxis_input_items_offset:";
 
 // -----------------------------------------------------------------------------
 // Order
@@ -108,6 +113,13 @@ impl InputItemPage {
             .and_then(|v| v.as_str())
             .or(self.next_cursor.as_deref())
     }
+
+    /// Keep an ambiguous item ID separate from its occurrence cursor so direct
+    /// HTTP clients can paginate without changing a reference target.
+    fn continuation_cursor(&self) -> Option<&str> {
+        let cursor = self.next_cursor.as_deref()?;
+        (Some(cursor) != self.last_id()).then_some(cursor)
+    }
 }
 
 impl Serialize for InputItemPage {
@@ -121,6 +133,7 @@ impl Serialize for InputItemPage {
             has_more: self.has_more,
             first_id: self.first_id(),
             last_id: self.last_id(),
+            next_cursor: self.continuation_cursor(),
         }
         .serialize(serializer)
     }
@@ -143,6 +156,10 @@ struct InputItemPageView<'a> {
 
     /// Last item ID cursor (or fallback cursor) in the page window.
     last_id: Option<&'a str>,
+
+    /// Praxis continuation cursor for pages whose item ID is ambiguous.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<&'a str>,
 }
 
 // -----------------------------------------------------------------------------
@@ -187,6 +204,7 @@ pub(crate) fn list_input_items(
         .ok_or_else(|| StoreError::InvalidInput("input_items cursor offset overflow".to_owned()))?
         .min(items.len());
     let has_more = end < items.len();
+    let next_cursor = page_next_cursor(&items, end, has_more);
 
     let data: Vec<serde_json::Value> = items
         .into_iter()
@@ -197,8 +215,6 @@ pub(crate) fn list_input_items(
             item
         })
         .collect();
-
-    let next_cursor = page_next_cursor(&data, end, has_more);
 
     Ok(InputItemPage {
         data,
@@ -215,9 +231,9 @@ pub(crate) fn list_input_items(
 /// `ItemResource[]`, so this function applies the same
 /// resource shape as the public API: string input becomes a
 /// synthetic user message resource, null input yields an empty list,
-/// and arrays/objects pass through with a stable synthetic `id`
-/// assigned to any item that doesn't already have one (see
-/// [`ensure_stable_ids`]).
+/// and arrays/objects pass through with a stable, collision-safe synthetic `id`
+/// assigned to any item that lacks one (see [`ensure_stable_ids`]). Existing
+/// IDs are preserved because an `item_reference.id` identifies its target.
 fn normalize_input_items(record: &ResponseRecord) -> Vec<serde_json::Value> {
     let items = match &record.input {
         serde_json::Value::Null => vec![],
@@ -234,26 +250,29 @@ fn is_compaction_item(item: &serde_json::Value) -> bool {
     item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
 }
 
-/// Assign a stable synthetic ID (`msg_{response_id}_input_{index}`) to
-/// any item missing one, keyed by its position in the original stored
-/// input order (before any order-based reversal).
+/// Ensure every object item has a stable ID keyed by its position in the
+/// original stored input order (before any order-based reversal).
 ///
 /// Plain content-part objects — the common shape for array `input` —
 /// carry no `id` field. Without a synthetic one, `first_id`/`last_id`
 /// in the list response stay `null` and clients have no `after` value
 /// to resume pagination past the first page, even though `has_more`
-/// reports `true`.
+/// reports `true`. Synthetic IDs avoid every explicit ID but repeated explicit
+/// IDs remain unchanged because they can be semantic reference targets.
 fn ensure_stable_ids(response_id: &str, items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut reserved_ids: HashSet<String> = items.iter().filter_map(item_id).map(str::to_owned).collect();
+
     items
         .into_iter()
         .enumerate()
         .map(|(index, mut item)| {
-            let has_string_id = item.get("id").and_then(serde_json::Value::as_str).is_some();
-            if !has_string_id && let Some(obj) = item.as_object_mut() {
-                obj.insert(
-                    "id".to_owned(),
-                    serde_json::Value::String(format!("msg_{response_id}_input_{index}")),
-                );
+            let needs_synthetic_id = item.get("id").and_then(serde_json::Value::as_str).is_none();
+            if needs_synthetic_id && let Some(obj) = item.as_object_mut() {
+                let mut id = format!("msg_{response_id}_input_{index}");
+                while !reserved_ids.insert(id.clone()) {
+                    id.push('_');
+                }
+                obj.insert("id".to_owned(), serde_json::Value::String(id));
             }
             item
         })
@@ -277,10 +296,15 @@ fn scalar_input_item(response_id: &str, text: &str) -> serde_json::Value {
 
 /// Resolve an `after` cursor to the offset where the next page starts.
 /// ID-based lookup takes precedence: if an item's `id` field matches
-/// the cursor string, the offset is the position after that item.
-/// Numeric parsing is a fallback for inputs without item IDs.
+/// the cursor string, the offset is the position after its final occurrence.
+/// Position-bearing cursors preserve access to each duplicate occurrence;
+/// numeric parsing is a fallback for inputs without item IDs.
 fn cursor_offset(items: &[serde_json::Value], cursor: &str) -> Result<usize, StoreError> {
     if let Some(offset) = cursor_id_offset(items, cursor) {
+        return Ok(offset);
+    }
+
+    if let Some(offset) = position_cursor_offset(cursor)? {
         return Ok(offset);
     }
 
@@ -289,11 +313,16 @@ fn cursor_offset(items: &[serde_json::Value], cursor: &str) -> Result<usize, Sto
         .map_err(|e| StoreError::InvalidInput(format!("invalid input_items cursor: {e}")))
 }
 
-/// Return the offset after the item whose `id` matches the cursor.
+/// Return the offset after the final item whose `id` matches the cursor.
+///
+/// Official SDKs derive `after` only from the returned item ID, so repeated IDs
+/// produce indistinguishable requests. Selecting the final duplicate keeps
+/// retries deterministic and prevents SDK iteration from repeating forever;
+/// lossless callers use the separate position-bearing continuation cursor.
 fn cursor_id_offset(items: &[serde_json::Value], cursor: &str) -> Option<usize> {
     items
         .iter()
-        .position(|item| item_id(item) == Some(cursor))
+        .rposition(|item| item_id(item) == Some(cursor))
         .map(|index| index + 1)
 }
 
@@ -303,13 +332,52 @@ fn item_id(item: &serde_json::Value) -> Option<&str> {
 }
 
 /// Return the cursor clients should use to fetch the next page.
-fn page_next_cursor(data: &[serde_json::Value], end: usize, has_more: bool) -> Option<String> {
+fn page_next_cursor(items: &[serde_json::Value], end: usize, has_more: bool) -> Option<String> {
     if !has_more {
         return None;
     }
 
-    data.last()
-        .and_then(item_id)
-        .map(str::to_owned)
-        .or_else(|| Some(end.to_string()))
+    let last_item = items.get(end.checked_sub(1)?)?;
+    let Some(id) = item_id(last_item) else {
+        return Some(end.to_string());
+    };
+
+    if items.iter().filter(|item| item_id(item) == Some(id)).take(2).count() == 1 {
+        Some(id.to_owned())
+    } else {
+        Some(unique_position_cursor(items, end))
+    }
+}
+
+/// Create a position cursor that cannot be mistaken for an item ID.
+fn unique_position_cursor(items: &[serde_json::Value], offset: usize) -> String {
+    let mut candidate = format!("{POSITION_CURSOR_PREFIX}{offset}:");
+    loop {
+        candidate.push('x');
+        if !items.iter().any(|item| item_id(item) == Some(candidate.as_str())) {
+            return candidate;
+        }
+    }
+}
+
+/// Accept position cursors because a repeated reference target cannot identify
+/// which occurrence produced the continuation on its own.
+fn position_cursor_offset(cursor: &str) -> Result<Option<usize>, StoreError> {
+    let Some(encoded) = cursor.strip_prefix(POSITION_CURSOR_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((offset, discriminator)) = encoded.split_once(':') else {
+        return Err(StoreError::InvalidInput(
+            "invalid input_items position cursor".to_owned(),
+        ));
+    };
+    let offset = offset
+        .parse::<usize>()
+        .map_err(|e| StoreError::InvalidInput(format!("invalid input_items position cursor: {e}")))?;
+    if discriminator.is_empty() || !discriminator.bytes().all(|byte| byte == b'x') {
+        return Err(StoreError::InvalidInput(
+            "invalid input_items position cursor discriminator".to_owned(),
+        ));
+    }
+    Ok(Some(offset))
 }

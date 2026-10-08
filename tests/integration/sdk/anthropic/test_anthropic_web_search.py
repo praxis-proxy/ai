@@ -338,11 +338,12 @@ class _ModelHandler(BaseHTTPRequestHandler):
 
 
 class _SearchHandler(BaseHTTPRequestHandler):
-    """Tavily-shaped body-authenticated search provider returning one web result.
+    """Tavily-shaped header-authenticated search provider returning one web result.
 
-    Tavily takes a POST with the key in the JSON body (`api_key`), so the handler
-    captures the parsed request body and returns the Tavily response shape
-    (`{"results": [{"title", "url", "content"}]}`).
+    Tavily authenticates with an ``Authorization: Bearer`` header (issue #1389),
+    so the handler captures both that header and the parsed request body as
+    ``{"authorization": <str|None>, "body": {...}}`` and returns the Tavily
+    response shape (``{"results": [{"title", "url", "content"}]}``).
     """
 
     protocol_version = "HTTP/1.1"
@@ -350,10 +351,12 @@ class _SearchHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b""
+        authorization = self.headers.get("Authorization")
         try:
-            self.server.captured.append(json.loads(raw))
+            body = json.loads(raw)
         except json.JSONDecodeError:
-            self.server.captured.append({})
+            body = {}
+        self.server.captured.append({"authorization": authorization, "body": body})
         body = json.dumps(
             {
                 "results": [
@@ -585,9 +588,11 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "buffered loop re-enters the model"
         assert len(search.requests) == 1, "buffered loop dispatches one search"
         assert model.requests[0].get("stream") is not True
-        # Tavily is body-authenticated: the configured key travels in the request
-        # body, not a header.
-        assert search.requests[0].get("api_key") == "test-key", search.requests[0]
+        # Issue #1389: Tavily is header-authenticated. The configured key travels
+        # in the Authorization bearer header injected at the pinned provider, and
+        # never in the request body the outbound chain can read.
+        assert search.requests[0]["authorization"] == "Bearer test-key", search.requests[0]
+        assert "api_key" not in search.requests[0]["body"], search.requests[0]
 
     def test_buffered_large_assistant_content_reenters_complete(
         self, anthropic_client, web_search_stack
@@ -633,7 +638,7 @@ class TestAnthropicWebSearch:
         assert response.content[0].text == FINAL_TEXT
         assert len(model.requests) == 2
         assert len(search.requests) == 1
-        assert search.requests[0]["query"] == "potato"
+        assert search.requests[0]["body"]["query"] == "potato"
         assistant_turns = [
             message for message in model.requests[1]["messages"] if message["role"] == "assistant"
         ]

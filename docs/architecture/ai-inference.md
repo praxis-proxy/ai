@@ -6,24 +6,42 @@ pipeline and StreamBuffer body access pattern.
 
 ## Overview
 
-AI inference filters classify request bodies to
-determine the API format (OpenAI Responses, Anthropic
-Messages, Chat Completions), extract routing signals
-(model, stream mode, store flag), and promote them to
-headers, metadata, and filter results for downstream
-routing via branch chains.
+AI inference filters identify the operation from the
+request head, then — for operations that carry one —
+extract routing signals from the body (model, stream
+mode, store flag) and promote them to headers,
+metadata, and filter results for downstream routing via
+branch chains.
+
+Protocol and operation identity come from the request
+head, not the body shape. The `ai_operation` filter
+reads the HTTP method, normalized path, and protocol
+headers alone and publishes a typed match (OpenAI
+Responses, Conversations, Chat Completions, or Anthropic
+Messages, plus the specific operation) before any body
+is read. A matched operation is authoritative over body
+shape: a Chat-Completions-shaped body posted to
+`POST /v1/responses` is still a Responses request.
+
+`openai_responses_request` then runs for matched
+Responses operations. It reads the body only to extract
+facts (model, stream, store, background, mode) and,
+when configured as the managed owner, to initialize
+state. Bodyless operations (fetch, delete, cancel) and
+operations whose body the specification marks optional
+promote operation identity without reading a body.
 
 ```text
-Request Body
+Request Head (method, path, protocol headers)
   |
   v
-Classifier (pure function)
+ai_operation (publishes typed operation match; no body read)
   |
   v
-Format Filter (promotes facts to headers/metadata/results)
+Request Body (only for operations that carry one)
   |
   v
-Validate Filter (JSON parsing, metadata enrichment, ID generation)
+openai_responses_request (body facts; optional state + ID generation)
   |
   v
 Branch Chains / Router (routing decisions)
@@ -34,17 +52,39 @@ Upstream
 
 ## Classification Pipeline
 
-### Format Detection
+### Operation Identity (request head)
 
-The classifier (`classifier/mod.rs`) is a pure
-function with no I/O. It parses the request body
-JSON once and returns a `ClassifiedRequest` struct
-with extracted facts.
+The `ai_operation` filter
+(`operation_classifier/mod.rs`) identifies the operation
+from the HTTP method, normalized path, and protocol
+headers alone — the body is never read. Every
+protocol-owned registry (OpenAI Responses,
+Conversations, Chat Completions, Anthropic Messages) is
+consulted through one shared matcher, so a single filter
+recognizes all providers. It publishes a typed
+`AiOperationMatch` in request extensions, plus metadata
+and filter results for branching, before any body-reading
+filter runs. Sub-resource endpoints that lack a body
+(`GET /v1/responses/{id}`,
+`POST /v1/responses/{id}/cancel`, etc.) are matched here
+from the path.
 
-Detection precedence:
+### Body Facts
 
-1. `input` field present or path-based responses
-   endpoint: **Responses API**
+The classifier (`classifier/mod.rs`) is a pure function
+with no I/O. For a matched Responses operation,
+`openai_responses_request` parses the request body JSON
+once and returns a `ClassifiedRequest` with the extracted
+facts. The matched operation is authoritative: the format
+fact is forced to Responses regardless of body shape, so
+a Chat-Completions-shaped body on `POST /v1/responses` is
+classified as a Responses request.
+
+When no operation forces the format — a request routed on
+body shape alone — the pure classifier falls back to
+shape-based detection precedence:
+
+1. `input` field present: **Responses API**
 2. `messages` + `max_tokens` + Anthropic signals
    (`system` or typed content blocks):
    **Anthropic Messages API**
@@ -54,18 +94,13 @@ Detection precedence:
 5. Invalid JSON: **InvalidJson**
 6. Non-JSON content type: **NonJson**
 
-Path-based classification handles sub-resource
-endpoints (`GET /v1/responses/{id}`,
-`POST /v1/responses/{id}/cancel`, etc.) that lack
-a request body.
-
 ### Metadata Propagation
 
-The format filter promotes classified facts using
-three channels:
+The `openai_responses_request` filter promotes classified
+facts using three channels:
 
 - **Filter metadata**: durable key-value pairs
-  (e.g. `openai_responses_format.model`) that
+  (e.g. `openai_responses_request.model`) that
   persist across Pingora phases. Used for
   cross-filter communication.
 - **Extra request headers**: added to the upstream
@@ -138,6 +173,20 @@ modifies the messages array).
 
 ## Filters
 
+### `ai_operation`
+
+Identifies the operation from the request head — HTTP
+method, normalized path, and protocol headers — without
+reading the body. Publishes a typed `AiOperationMatch`
+in request extensions plus metadata and filter results
+for branching, so downstream filters know the protocol
+and operation before any body-reading filter runs. Runs
+in both the header and body phases: the body-phase hook
+inspects only the head and publishes once, guaranteeing
+the match is available before a downstream filter's
+buffered body pre-read. A matched operation is
+authoritative over body shape.
+
 ### `model_to_header`
 
 Extracts the `model` field from JSON request bodies
@@ -145,20 +194,26 @@ and promotes it to a configurable header (default
 `X-Model`). Enables header-based routing to
 provider-specific clusters.
 
-### `openai_responses_format`
-
-Classifies AI API request bodies and promotes format,
-model, stream, store, background, and mode to
-headers, metadata, and filter results.
-
 ### `openai_responses_request`
 
-Parses Responses API request JSON once, enriches filter metadata,
-and generates cryptographically random response and
-conversation IDs with `resp_` and `conv_` prefixes.
-Provider-owned parameter combinations pass through unchanged.
-Offers both the pre-read and bound-upstream body phases, so a
-chain can defer it until a logical provider is bound.
+Runs for the Responses operations `ai_operation`
+matched. Reads the request body to extract and promote
+format, model, stream, store, background, and mode to
+headers, metadata, and filter results, parsing the JSON
+once. As the managed owner it also generates
+cryptographically random response and conversation IDs
+with `resp_` and `conv_` prefixes and initializes state.
+Provider-owned parameter combinations pass through
+unchanged. Offers both the pre-read and bound-upstream
+body phases, so a chain can defer it until a logical
+provider is bound, and `initialize_state: false` lets a
+pure routing chain classify without building state. A
+pre-routing facts pass (`initialize_state: false`) always
+caches its one parse for a later managed owner, which
+re-validates the cached body before reuse so an
+intervening body rewrite is never reused stale; on a chain
+with no managed owner that request-scoped cache is simply
+released, unused, when the request ends.
 
 ### `anthropic_messages_format`
 
@@ -185,10 +240,12 @@ Persists non-streaming Responses API responses. See
 
 ## Key Files
 
+- `apis/src/operation_classifier/mod.rs`:
+  `AiOperationFilter` (request-head operation identity)
 - `apis/src/classifier/mod.rs`:
   pure format classifier
-- `apis/src/openai/responses/mod.rs`:
-  `ResponsesFormatFilter`
+- `apis/src/openai/responses/request/mod.rs`:
+  `OpenaiResponsesRequestFilter`
 - `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
 - `filters/src/prompt_enrich/`:

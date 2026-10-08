@@ -55,7 +55,7 @@ fn start() -> Harness {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_responses_format_routing_example_routes_responses_input() {
+fn format_routing_example_routes_responses_input() {
     let h = start();
 
     let body = r#"{"model":"gpt-4.1-mini","input":"Hello, world!"}"#;
@@ -70,7 +70,7 @@ fn openai_responses_format_routing_example_routes_responses_input() {
 }
 
 #[test]
-fn openai_responses_format_routing_example_routes_chat_completions() {
+fn format_routing_example_routes_chat_completions() {
     let h = start();
 
     let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
@@ -85,7 +85,7 @@ fn openai_responses_format_routing_example_routes_chat_completions() {
 }
 
 #[test]
-fn openai_responses_format_routing_example_chat_identity_ignores_the_body() {
+fn format_routing_example_chat_identity_ignores_the_body() {
     let h = start();
 
     for (name, request) in [
@@ -116,7 +116,7 @@ fn openai_responses_format_routing_example_chat_identity_ignores_the_body() {
 }
 
 #[test]
-fn openai_responses_format_routing_example_unsupported_chat_method_falls_to_default() {
+fn format_routing_example_unsupported_chat_method_falls_to_default() {
     let h = start();
 
     let raw = http_send(
@@ -133,7 +133,7 @@ fn openai_responses_format_routing_example_unsupported_chat_method_falls_to_defa
 }
 
 #[test]
-fn openai_responses_format_routing_example_unknown_falls_to_default() {
+fn format_routing_example_unknown_falls_to_default() {
     let h = start();
 
     let body = r#"{"prompt":"hello"}"#;

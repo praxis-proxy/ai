@@ -1095,30 +1095,49 @@ pub(super) fn error_event_bytes(error: &StreamError) -> Vec<u8> {
 }
 
 /// Map a [`StreamError`] to an Anthropic error type and client-safe message.
-fn anthropic_error(error: &StreamError) -> (&'static str, &'static str) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "each stream failure has an explicit client-safe message"
+)]
+fn anthropic_error(error: &StreamError) -> (super::super::wire::ErrorType, &'static str) {
     match error {
         StreamError::InvalidManagedCall => (
-            "invalid_request_error",
+            super::super::wire::ErrorType::InvalidRequest,
             "WebSearch tool use requires a non-empty id and input.query",
         ),
         StreamError::QueryTooLong => (
-            "invalid_request_error",
+            super::super::wire::ErrorType::InvalidRequest,
             "WebSearch input.query must not exceed 8192 bytes",
         ),
         StreamError::IterationLimit => (
-            "api_error",
+            super::super::wire::ErrorType::Api,
             "web search exceeded the maximum number of search iterations",
         ),
-        StreamError::DeadlineExceeded => ("api_error", "web search exceeded the configured deadline"),
-        StreamError::ReentryTooLarge => ("api_error", "web search request exceeds configured max_body_bytes"),
-        StreamError::IncompleteStream => ("api_error", "web search response stream ended before completion"),
-        StreamError::UpstreamTerminated => ("api_error", "web search stream terminated before completion"),
+        StreamError::DeadlineExceeded => (
+            super::super::wire::ErrorType::Api,
+            "web search exceeded the configured deadline",
+        ),
+        StreamError::ReentryTooLarge => (
+            super::super::wire::ErrorType::Api,
+            "web search request exceeds configured max_body_bytes",
+        ),
+        StreamError::IncompleteStream => (
+            super::super::wire::ErrorType::Api,
+            "web search response stream ended before completion",
+        ),
+        StreamError::UpstreamTerminated => (
+            super::super::wire::ErrorType::Api,
+            "web search stream terminated before completion",
+        ),
         StreamError::MalformedUtf8
         | StreamError::MalformedEvent
         | StreamError::OversizedPartialEvent
         | StreamError::Oversized
         | StreamError::SuppressionMismatch
-        | StreamError::UpstreamUnprocessable => ("api_error", "web search stream could not be processed"),
+        | StreamError::UpstreamUnprocessable => (
+            super::super::wire::ErrorType::Api,
+            "web search stream could not be processed",
+        ),
     }
 }
 

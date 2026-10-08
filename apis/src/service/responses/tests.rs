@@ -862,3 +862,110 @@ fn non_agentic_dedup_remaps_late_reasoning_after_dropping_echoed_prefix() {
     );
     assert_eq!(items[2]["content"], "answer");
 }
+#[test]
+fn list_input_items_duplicate_ids_reach_later_items() {
+    let alice = owner("alice");
+    let record = ResponseRecord {
+        input: json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": "c", "type": "item_reference"}
+        ]),
+        ..sample_record(&alice, "resp_duplicate_ids")
+    };
+    let page_params = |cursor| ListParams {
+        cursor,
+        limit: 1,
+        order: Order::Ascending,
+    };
+
+    let first = list_input_items(&record, &page_params(None), IncludeFields::default()).unwrap();
+    assert_eq!(
+        first.data.first().unwrap()["id"],
+        "dup",
+        "the first reference target must remain unchanged"
+    );
+    assert!(
+        first.has_more,
+        "the first duplicate must not hide remaining input items"
+    );
+    let first_cursor = first
+        .next_cursor
+        .clone()
+        .expect("a non-final duplicate page must expose a position cursor");
+
+    let second = list_input_items(
+        &record,
+        &page_params(Some(first_cursor.clone())),
+        IncludeFields::default(),
+    )
+    .unwrap();
+    let second_cursor = second
+        .next_cursor
+        .clone()
+        .expect("the second non-final duplicate page must expose a position cursor");
+    assert_ne!(
+        second_cursor, first_cursor,
+        "each duplicate occurrence must have a distinct continuation cursor"
+    );
+    assert_eq!(
+        second.data.first().unwrap()["id"],
+        "dup",
+        "pagination must not rewrite the repeated reference target"
+    );
+    assert!(second.has_more, "the later unique item must remain reachable");
+
+    let third = list_input_items(
+        &record,
+        &page_params(Some(second_cursor.clone())),
+        IncludeFields::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        third.data.first().unwrap()["id"],
+        "c",
+        "pagination must reach the later unique item"
+    );
+    assert_eq!(
+        third.last_id(),
+        Some("c"),
+        "the final list ID must match the final item"
+    );
+    assert!(!third.has_more, "pagination must terminate after the later unique item");
+    assert_ne!(
+        second_cursor, "c",
+        "the position cursor must remain separate from item IDs"
+    );
+}
+
+#[test]
+fn list_input_items_duplicate_cursor_avoids_explicit_id_collision() {
+    let alice = owner("alice");
+    let colliding_id = "praxis_input_items_offset:1:x";
+    let record = ResponseRecord {
+        input: json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": colliding_id, "type": "item_reference"}
+        ]),
+        ..sample_record(&alice, "resp_cursor_collision")
+    };
+    let first = list_input_items(
+        &record,
+        &ListParams {
+            cursor: None,
+            limit: 1,
+            order: Order::Ascending,
+        },
+        IncludeFields::default(),
+    )
+    .unwrap();
+    let cursor = first
+        .next_cursor
+        .expect("a non-final duplicate page must expose a position cursor");
+
+    assert_ne!(
+        cursor, colliding_id,
+        "a position cursor must not collide with any explicit reference ID"
+    );
+}

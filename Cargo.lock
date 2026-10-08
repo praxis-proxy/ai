@@ -3532,6 +3532,8 @@ dependencies = [
  "futures",
  "http",
  "jsonschema",
+ "metrics",
+ "metrics-util",
  "openssl",
  "percent-encoding",
  "praxis-ai-store",

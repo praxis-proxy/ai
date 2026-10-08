@@ -31,6 +31,7 @@ mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
+mod format_routing;
 #[cfg(feature = "store-sqlite")]
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
@@ -80,7 +81,6 @@ mod openai_response_store_postgres;
 mod openai_response_store_postgres_mtls;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
-mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
 mod openai_responses_request;

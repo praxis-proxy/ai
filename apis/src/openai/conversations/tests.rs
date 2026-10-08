@@ -3595,7 +3595,7 @@ async fn patch_on_conversation_path_continues() {
 // -----------------------------------------------------------------------------
 
 fn set_append_back_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", "conv_test_123");
 }
 
@@ -3639,10 +3639,10 @@ async fn streaming_terminal_appends_once_without_buffering_sse() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     ctx.response_body_mode = filter.response_body_mode();
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
-    ctx.set_metadata("openai_responses_format.stream", "true");
-    ctx.set_metadata("openai_responses_format.store", "false");
+    ctx.set_metadata("openai_responses_request.stream", "true");
+    ctx.set_metadata("openai_responses_request.store", "false");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"role":"user","content":"streamed question"})],
         response_object: serde_json::json!({
@@ -3697,9 +3697,9 @@ async fn local_stream_completion_appends_before_eos() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})],
         response_object: serde_json::json!({
@@ -3753,9 +3753,9 @@ async fn stream_without_completed_terminal_does_not_append_conversation_items() 
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = conv_ctx(&store, &req);
         ctx.current_filter_id = Some(0);
-        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("openai_responses_request.has_conversation", "true");
         ctx.set_metadata("responses.conversation_id", &conv_id);
-        ctx.set_metadata("openai_responses_format.stream", "true");
+        ctx.set_metadata("openai_responses_request.stream", "true");
         ctx.extensions.insert(ResponsesState {
             input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})],
             response_object: serde_json::json!({"status":status,"output":[]}),
@@ -3795,7 +3795,7 @@ async fn on_response_not_armed_when_background() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_format.background", "true");
+    ctx.set_metadata("openai_responses_request.background", "true");
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
@@ -4007,7 +4007,7 @@ async fn on_response_body_appends_completed_response() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
 
     let input_items = vec![serde_json::json!({
@@ -4086,7 +4086,7 @@ async fn append_back_cannot_write_another_owners_conversation() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     ctx.extensions.insert(other_subject);
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conversation_id);
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})],
@@ -4177,7 +4177,7 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
         response_object: serde_json::json!({"status":"completed","output":[]}),

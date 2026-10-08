@@ -7,27 +7,25 @@ Processes a Responses request body once and initializes state.
 
 ## Configuration Notes
 
-Configuration matches `openai_responses_format`, so a chain keeps the same `on_invalid` and `headers` settings wherever this filter is placed.
-
 The operation is recognized from the request head, and the registry decides which operations carry a body worth parsing: create, compact, and input token counts. Bodyless operations — fetch, delete, cancel, list input items, and the `WebSocket` handshake — are released untouched, as is Conversations API traffic. `on_invalid` governs only bodies that fail to parse.
 
 Rejects `background=true` and non-null `prompt` with a 400, the managed-path policy this filter now owns. A non-null `prompt` is the deprecated OpenAI reusable prompt object (`{ id, version, variables }`); OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients should move its content into `input` rather than rely on the gateway to resolve the saved object. Prefer `input` over top-level `instructions`, which managed-path content-policy extraction does not screen.
 
-Promotes `openai_responses_format.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
+Promotes `openai_responses_request.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
 
-Extends the shared classification settings with the one option that only this filter honours, so the classifier it replaces does not advertise an option it ignores.
+Extends the shared classification settings with the one option that gates the managed-path lifecycle, so a pre-routing fact publisher and the managed owner can be configured from the same filter.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
-| `headers` | ResponsesFormatHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
+| `headers` | ResponsesClassificationHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
 | `headers.format` | string | no | Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-format` remains allowed. |
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |
 | `headers.mode` | string | no | Header name for the computed mode (`stateless` or `stateful`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-responses-mode` remains allowed. |
-| `initialize_state` | bool | no | Whether to initialize `ResponsesState` for a create request. On by default, because the stateful Responses filters read it. A passthrough chain that only classifies and routes consumes none of it, and building it there costs an identifier, a conversation resolution, and retaining the parsed body for the rest of the request. Classification metadata, headers, and filter results are published either way, so routing is unaffected. |
+| `initialize_state` | bool | no | Whether this entry owns the managed-path request lifecycle. On by default, because the stateful Responses filters read the state it builds. When enabled the filter is the managed owner: it initializes `ResponsesState` and enforces the managed-path policy that rejects provider-owned `background`/`prompt` and conflicting history selectors. The owner reuses the parse a pre-routing publisher cached, so a managed create body is deserialized exactly once across the two phases. A pre-routing fact publisher sets this to `false`: it classifies the body, promotes the routing facts, and caches its single parse in request extensions for a later managed owner to reuse, but mints no identifiers, resolves no conversation, and enforces no managed-path policy — so provider-owned traffic that the router may still bind to a direct upstream keeps its fields intact. On a chain with no managed owner the cached parse is released, unconsumed, when the request ends. Classification metadata, headers, and filter results are published either way, so routing is unaffected. |
 
 ## Example
 

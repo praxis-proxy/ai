@@ -105,6 +105,7 @@ features:
     status: synthetic_only
     scenarios:
       - messages/upstream-error
+      - messages/upstream-error-unknown-type
     providers:
       synthetic:
         status: synthetic_only
@@ -141,6 +142,24 @@ features:
     status: synthetic_only
     scenarios:
       - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.degrade_prompt_caching
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.degrade_extended_thinking
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
     providers:
       synthetic:
         status: synthetic_only

@@ -65,8 +65,6 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
         "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
     });
     let model = start_stateful_backend(vec![
-        // `start_proxy` probes `/` before returning the guard.
-        (200, r#"{"status":"ready"}"#.to_owned()),
         (200, first_model_response.to_string()),
         (200, final_model_response.to_string()),
     ]);
@@ -155,7 +153,7 @@ fn reused_file_search_ids_do_not_restore_response_wide_budget() {
             "queries": [query]
         })
     };
-    let mut responses = vec![(200, r#"{"status":"ready"}"#.to_owned())];
+    let mut responses = Vec::new();
     responses.extend(
         ["first", "second", "must not run"]
             .into_iter()
@@ -299,10 +297,7 @@ fn file_search_callout_example_rejects_parallel_client_function_call() {
             }
         ]
     });
-    let model = start_stateful_backend(vec![
-        (200, r#"{"status":"ready"}"#.to_owned()),
-        (200, mixed_response.to_string()),
-    ]);
+    let model = start_stateful_backend(vec![(200, mixed_response.to_string())]);
     let search = start_capturing_backend(&json!({"data": []}).to_string());
     let proxy_port = free_port();
     let config = load_file_search_callout_config(
@@ -355,7 +350,6 @@ fn file_search_callout_example_rejects_non_success_search_response() {
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
     });
     let model = start_stateful_backend(vec![
-        (200, r#"{"status":"ready"}"#.to_owned()),
         (200, first_model_response.to_string()),
         (200, r#"{"id":"resp_should_not_run"}"#.to_owned()),
     ]);
@@ -426,7 +420,6 @@ fn file_search_callout_example_rejects_oversized_search_response_with_413() {
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
     });
     let model = start_stateful_backend(vec![
-        (200, r#"{"status":"ready"}"#.to_owned()),
         (200, first_model_response.to_string()),
         (200, r#"{"id":"resp_should_not_run"}"#.to_owned()),
     ]);

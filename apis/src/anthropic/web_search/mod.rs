@@ -611,7 +611,7 @@ impl AnthropicWebSearchFilter {
             |CalloutContextMissing::Credential { slot }| {
                 wire::error_rejection(
                     401,
-                    "authentication_error",
+                    wire::ErrorType::Authentication,
                     &format!("web search requires the '{slot}' per-user credential, which was not provided"),
                 )
             },
@@ -738,7 +738,7 @@ impl AnthropicWebSearchFilter {
         if request.get("messages").and_then(Value::as_array).is_none() {
             return Ok(FilterAction::Reject(wire::error_rejection(
                 400,
-                "invalid_request_error",
+                wire::ErrorType::InvalidRequest,
                 "messages must be an array for web search re-entry",
             )));
         }
@@ -793,7 +793,7 @@ impl AnthropicWebSearchFilter {
     /// the client's response transport.
     ///
     /// A buffered request is not yet committed, so it fails closed with a JSON
-    /// `413 request_too_large` the client can act on. A streaming request has
+    /// `413 invalid_request_error` the client can act on. A streaming request has
     /// already committed a `200 text/event-stream` lifecycle (round 0 forwarded
     /// `message_start`), so a JSON body cannot replace it: this request-phase
     /// rejection makes the re-entry step complete, and the IRR streaming session
@@ -806,7 +806,7 @@ impl AnthropicWebSearchFilter {
         if !streaming {
             return FilterAction::Reject(wire::error_rejection(
                 413,
-                "request_too_large",
+                wire::ErrorType::InvalidRequest,
                 "web search request exceeds configured max_body_bytes",
             ));
         }
@@ -864,7 +864,7 @@ impl AnthropicWebSearchFilter {
         if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
             return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
-                "api_error",
+                wire::ErrorType::Api,
                 "web-search upstream response exceeded the configured max_body_bytes",
             )));
         }
@@ -886,14 +886,14 @@ impl AnthropicWebSearchFilter {
             ResponseDecision::InvalidManagedCall => {
                 return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
-                    "invalid_request_error",
+                    wire::ErrorType::InvalidRequest,
                     "WebSearch tool use requires a non-empty id and input.query",
                 )));
             },
             ResponseDecision::QueryTooLong => {
                 return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
-                    "invalid_request_error",
+                    wire::ErrorType::InvalidRequest,
                     "WebSearch input.query must not exceed 8192 bytes",
                 )));
             },
@@ -1506,7 +1506,7 @@ fn append_search_turns(
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
         return Err(wire::error_rejection(
             400,
-            "invalid_request_error",
+            wire::ErrorType::InvalidRequest,
             "messages must be an array for web search re-entry",
         ));
     };
