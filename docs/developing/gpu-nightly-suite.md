@@ -90,9 +90,11 @@ covers the Anthropic SDK image/vision path against `Qwen3-VL-4B-Instruct`.
 The self-compaction tests prove two things independently of model capability,
 and these are **always hard assertions**:
 
-1. The pinned CLI performed its **own** self-compaction (Codex: the summarization
-   request observed on the wire; Claude Code: the `compact_boundary {trigger: auto}`
-   event), and that traffic **traversed Praxis**.
+1. The pinned CLI performed its **own** self-compaction. Codex's summarization
+   request is observed **traversing Praxis** on the wire. Claude Code's
+   `compact_boundary {trigger: auto}` is a client-side stream-json event that is
+   local to the CLI (it does not itself cross Praxis); the test observes that event
+   and separately verifies post-boundary requests continue **through Praxis**.
 2. The session **continued after the boundary** — at least one more successful
    tool call flowed through Praxis post-compaction.
 

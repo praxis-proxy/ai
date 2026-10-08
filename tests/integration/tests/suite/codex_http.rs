@@ -407,12 +407,13 @@ Do not run a different command and do not answer before it succeeds. Then summar
 /// Drive a pinned-Codex coding task whose growing context forces the client's own
 /// inline auto-compaction mid-run, then assert compaction traversed Praxis.
 ///
-/// The oracle is tiered. Real self-compaction crossing Praxis
-/// ([`HttpTransportObserver::assert_compaction_traversed_praxis`]) is ALWAYS a
-/// hard assertion — it is proven on the client->upstream wire and is independent
-/// of how capable the model is. The downstream task completion (the marker write,
-/// its wire ordering after compaction, the ordered JSONL trace, and the on-disk
-/// result) is enforced only on a capable model. On [`COMPACTION_XFAIL_MODEL`]
+/// The oracle is tiered. The wire proofs are ALWAYS hard assertions, independent
+/// of how capable the model is: real self-compaction crossing Praxis
+/// ([`HttpTransportObserver::assert_compaction_traversed_praxis`]) and the
+/// ordering guarantee that `result.txt` was still empty at the compaction boundary
+/// ([`HttpTransportObserver::assert_compaction_preceded_result_write`]). The
+/// downstream task completion (the marker write, the ordered JSONL trace, and the
+/// on-disk result) is enforced only on a capable model. On [`COMPACTION_XFAIL_MODEL`]
 /// (Qwen3-8B) completion is an accepted XFAIL: the model self-compacts reliably
 /// but cannot reliably finish the post-compaction write — it loops re-reading
 /// ballast past the deadline, or drops the high-entropy marker across its own
@@ -476,11 +477,16 @@ async fn run_live_codex_compaction_workflow(
     )
     .await;
 
-    // HARD, always enforced: the pinned client performed its own inline
-    // auto-compaction and that traffic crossed Praxis. This is proven on the wire
-    // and does not depend on the model finishing the downstream task.
+    // HARD, always enforced (independent of model capability): the pinned client
+    // performed its own inline auto-compaction, a post-compaction request carrying
+    // the compacted summary then traversed Praxis, and `result.txt` was still empty
+    // at the compaction boundary — so any later marker write necessarily crosses
+    // compaction mid-flight rather than being a batched pre-compaction write. All
+    // three are proven on the wire and do not depend on the model finishing the
+    // downstream task, so they gate the XFAIL path too.
     observer.assert_http_only();
     observer.assert_compaction_traversed_praxis();
+    observer.assert_compaction_preceded_result_write();
 
     // XFAIL on the known-limited model: self-compaction is proven above, but
     // Qwen3-8B cannot reliably complete the post-compaction marker write. Record
@@ -514,7 +520,6 @@ async fn run_live_codex_compaction_workflow(
         stdout = output.stdout,
         stderr = output.stderr
     );
-    observer.assert_compaction_preceded_result_write();
     assert_live_compaction_codex_jsonl(&output.stdout, CODEX_COMPACTION_BALLAST_CHAPTERS);
     workspace.assert_successful_completion();
 }

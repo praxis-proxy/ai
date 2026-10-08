@@ -198,6 +198,7 @@ ballast_bytes = 4500
 flags = [
   "--tools", "Read,Edit,Bash",
   "--strict-mcp-config",
+  "--no-session-persistence",
   "--output-format", "stream-json",
   "--verbose",
   "--max-turns", "32",
