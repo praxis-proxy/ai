@@ -975,7 +975,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // the opaque provider state back instead of translating it
                 // into an assistant summary.
                 state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1137,7 +1137,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // in both state projections before moving the item into the
                 // public streamed output accumulator.
                 state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(

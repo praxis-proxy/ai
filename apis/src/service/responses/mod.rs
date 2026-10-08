@@ -5,7 +5,7 @@
 //!
 //! Store operations use the already owner-scoped handle resolved by each caller.
 
-use std::ops::RangeInclusive;
+use std::{borrow::Cow, ops::RangeInclusive};
 
 pub(crate) mod input_items;
 
@@ -143,10 +143,13 @@ fn assemble_stored_messages(input: Value, output: Option<&Value>, plan: StoredOu
     let mut history = Vec::new();
     append_stored_input_items(&mut history, input);
 
-    let output_items: Vec<Value> = match output {
-        Some(Value::Array(items)) => items.clone(),
-        Some(item) if !item.is_null() => vec![item.clone()],
-        Some(_) | None => Vec::new(),
+    // Borrow the response output; only the rare single-object form owns a one-item
+    // vec. The array form (the hot path) is not copied here — the append or rebuild
+    // below clones only the items it keeps.
+    let output_items: Cow<'_, [Value]> = match output {
+        Some(Value::Array(items)) => Cow::Borrowed(items.as_slice()),
+        Some(item) if !item.is_null() => Cow::Owned(vec![item.clone()]),
+        Some(_) | None => Cow::Owned(Vec::new()),
     };
 
     if plan.collected_rounds.is_empty() {
@@ -168,30 +171,62 @@ fn assemble_stored_messages(input: Value, output: Option<&Value>, plan: StoredOu
 /// those (and a replayed compaction) are stored only once.
 fn append_deduped_output(history: &mut Vec<Value>, output_items: &[Value], reasoning_replay: &[RangeInclusive<usize>]) {
     let output_start = history.len();
+    let overlap = leading_overlap(history, output_items);
 
-    let overlap = (0..=history.len().min(output_items.len()))
+    // Append each surviving item, recording the appended-slice position of its
+    // original output index (or `None` when dropped) so replay ranges can be
+    // remapped afterward. An item is dropped in the echoed overlap prefix, or when
+    // it is a compaction already present in the prior history.
+    let mut appended_position: Vec<Option<usize>> = Vec::with_capacity(output_items.len());
+    for (index, item) in output_items.iter().enumerate() {
+        let duplicate_compaction = item.get("type").and_then(Value::as_str) == Some("compaction")
+            && history
+                .get(..output_start)
+                .is_some_and(|prior| prior.iter().any(|message| message == item));
+        if index < overlap || duplicate_compaction {
+            appended_position.push(None);
+        } else {
+            appended_position.push(Some(history.len() - output_start));
+            history.push(item.clone());
+        }
+    }
+
+    let remapped = remap_replay_ranges(reasoning_replay, &appended_position);
+    if let Some(appended) = history.get_mut(output_start..) {
+        rotate_trailing_reasoning(appended, &remapped);
+    }
+}
+
+/// Largest count of leading `output_items` that duplicate the tail of `prior`.
+///
+/// A streamed or rehydrated response can echo state-owned input items back as the
+/// start of its output; this overlap is dropped so each item is stored once.
+fn leading_overlap(prior: &[Value], output_items: &[Value]) -> usize {
+    (0..=prior.len().min(output_items.len()))
         .rev()
         .find(|&length| {
-            history
-                .get(history.len() - length..)
+            prior
+                .get(prior.len() - length..)
                 .zip(output_items.get(..length))
-                .is_some_and(|(history_suffix, output_prefix)| history_suffix == output_prefix)
+                .is_some_and(|(prior_suffix, output_prefix)| prior_suffix == output_prefix)
         })
-        .unwrap_or(0);
-    let new_items = output_items
-        .iter()
-        .skip(overlap)
-        .filter(|item| {
-            item.get("type").and_then(Value::as_str) != Some("compaction")
-                || !history.iter().any(|message| message == *item)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    history.extend(new_items);
+        .unwrap_or(0)
+}
 
-    if let Some(appended) = history.get_mut(output_start..) {
-        rotate_trailing_reasoning(appended, reasoning_replay);
-    }
+/// Remap replay ranges from original output indices to their appended-slice
+/// positions, dropping any range whose start or end item a dedup removed.
+fn remap_replay_ranges(
+    reasoning_replay: &[RangeInclusive<usize>],
+    appended_position: &[Option<usize>],
+) -> Vec<RangeInclusive<usize>> {
+    reasoning_replay
+        .iter()
+        .filter_map(|range| {
+            let start = (*appended_position.get(*range.start())?)?;
+            let end = (*appended_position.get(*range.end())?)?;
+            Some(start..=end)
+        })
+        .collect()
 }
 
 /// Rotate a turn's late reasoning to its front within the freshly appended output

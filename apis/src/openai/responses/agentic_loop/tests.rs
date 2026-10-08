@@ -109,6 +109,67 @@ fn streaming_collector_provenance_reconciles_stored_rounds() {
     assert_collected_rounds_reconcile(true);
 }
 
+/// A provider compaction item enters both `accumulated_output` and
+/// `persisted_messages`. The collector must record its provenance so storage
+/// assembly refreshes it in place rather than appending a second copy.
+fn assert_collected_compaction_stored_once(streaming: bool) {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
+    let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "provider-state"});
+    let response = json!({"output": [
+        compaction.clone(),
+        {"type": "message", "id": "msg_1", "role": "assistant", "content": "answer"}
+    ]});
+    if streaming {
+        state.response_object = response;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&response, &mut state, &[]);
+    }
+    assert!(
+        state
+            .collected_output_provenance
+            .iter()
+            .any(|&(output_index, _)| output_index == 0),
+        "the compaction output item must be recorded as collected"
+    );
+
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let response = json!({
+        "id": "resp_compaction", "created_at": 1, "model": "m",
+        "output": state.accumulated_output
+    });
+    let record = build_record(
+        response,
+        owner,
+        Some(json!([{"role": "user", "content": "question"}])),
+        Some(state.persisted_messages),
+        StoredOutputPlan {
+            reasoning_replay: &[],
+            collected_rounds: &state.collected_rounds,
+            collected_provenance: &state.collected_output_provenance,
+        },
+    )
+    .unwrap();
+    let compactions = record
+        .messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .count();
+    assert_eq!(compactions, 1, "the provider compaction must be stored exactly once");
+}
+
+#[test]
+fn buffered_collector_stores_compaction_once() {
+    assert_collected_compaction_stored_once(false);
+}
+
+#[test]
+fn streaming_collector_stores_compaction_once() {
+    assert_collected_compaction_stored_once(true);
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------

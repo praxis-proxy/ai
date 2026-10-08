@@ -838,3 +838,27 @@ fn agentic_reorder_is_a_noop_when_named_item_is_not_reasoning() {
     let stored = assemble_stored_messages(history, Some(&output), agentic_plan(&[0..=1], &rounds, &provenance));
     assert_eq!(types_of(&stored), ["message", "message", "function_call"]);
 }
+
+#[test]
+fn non_agentic_dedup_remaps_late_reasoning_after_dropping_echoed_prefix() {
+    // The output echoes a state item as its prefix, which the overlap dedup drops.
+    // Late-reasoning ranges index the full output, so they must be remapped onto
+    // the shorter appended slice; otherwise the rotation targets the wrong items
+    // (or falls out of bounds and never runs).
+    let echoed = json!({"type": "message", "role": "user", "content": "echo"});
+    let output = json!([
+        echoed.clone(),
+        {"type": "message", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "late"}]},
+    ]);
+    // Range 1..=2 spans the assistant message and its late reasoning in the output.
+    let stored = assemble_stored_messages(json!([echoed]), Some(&output), replay_plan(&[1..=2]));
+    assert_eq!(types_of(&stored), ["message", "reasoning", "message"]);
+    let items = stored.as_array().unwrap();
+    assert_eq!(items[0]["content"], "echo", "echoed prefix is stored once");
+    assert_eq!(
+        items[1]["content"][0]["text"], "late",
+        "late reasoning rotated to the front of its turn"
+    );
+    assert_eq!(items[2]["content"], "answer");
+}
