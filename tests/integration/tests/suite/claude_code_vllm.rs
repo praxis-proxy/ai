@@ -621,6 +621,18 @@ async fn pinned_claude_code_planning_turn_converges_without_reasoning_leakage_on
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_claude_code_resolves_server_side_web_search_through_tavily() {
     let Some(live) = LiveConfig::from_env() else {
+        // `from_env` only guards against `REQUIRE_LIVE_ENV`, so a web-search run
+        // required solely through `REQUIRE_LIVE_WEB_SEARCH_ENV` would otherwise
+        // report an incomplete live stack as a PASSED skip here, before
+        // `live_tavily_key` ever runs. This gate requires the FULL live stack,
+        // not only the Tavily key.
+        assert!(
+            !env_is_truthy(REQUIRE_LIVE_WEB_SEARCH_ENV),
+            "{REQUIRE_LIVE_WEB_SEARCH_ENV} is set but the live stack is incomplete; the server-side \
+             web-search acceptance run requires all of {CLAUDE_CODE_BIN_ENV}, {VLLM_BASE_URL_ENV}, \
+             {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV} — not only {TAVILY_API_KEY_ENV} — and must not \
+             be skipped when a live web-search run is required"
+        );
         return;
     };
     let Some(tavily_key) = live_tavily_key() else {
@@ -1941,57 +1953,63 @@ fn check_server_side_web_search(
     }
 
     // Ground truth: a real Tavily search actually ran through the relay.
-    let Some(exchange) = captures.first() else {
+    if captures.is_empty() {
         return Err(
             "no Tavily exchange was observed; the model never called WebSearch so the managed loop \
              dispatched no server-side search"
                 .to_owned(),
         );
-    };
-    if exchange.status != 200 {
-        return Err(format!(
-            "real Tavily must return HTTP 200; the relay observed status {} with body {}",
-            exchange.status, exchange.response,
-        ));
     }
-    if exchange.request.get("api_key").and_then(Value::as_str) != Some(tavily_key) {
-        return Err(format!(
-            "the resolved Tavily key must travel in the forwarded request body; request was {}",
-            redact_api_key(&exchange.request),
-        ));
-    }
-    let query = exchange
-        .request
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if query.trim().is_empty() {
-        return Err(format!(
-            "the reconstructed search query must be populated; request was {}",
-            redact_api_key(&exchange.request),
-        ));
-    }
-    let results = exchange.response.get("results").and_then(Value::as_array);
-    match results {
-        Some(results) if !results.is_empty() => {
-            let all_absolute = results.iter().all(|result| {
-                result
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
-            });
-            if !all_absolute {
-                return Err(format!(
-                    "every real Tavily source must carry an absolute URL; results were {results:?}"
-                ));
-            }
-        },
-        _ => {
+    // Validate EVERY exchange, not just the first: the managed loop can dispatch
+    // more than one search per turn (a retry or a second model search), and the
+    // answer could rest on an `is_error` fallback after a later exchange failed.
+    // Checking only the first would let that broken integration pass.
+    for exchange in captures {
+        if exchange.status != 200 {
             return Err(format!(
-                "real Tavily must return a non-empty results array; response was {}",
-                exchange.response,
+                "real Tavily must return HTTP 200; the relay observed status {} with body {}",
+                exchange.status, exchange.response,
             ));
-        },
+        }
+        if exchange.request.get("api_key").and_then(Value::as_str) != Some(tavily_key) {
+            return Err(format!(
+                "the resolved Tavily key must travel in the forwarded request body; request was {}",
+                redact_api_key(&exchange.request),
+            ));
+        }
+        let query = exchange
+            .request
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if query.trim().is_empty() {
+            return Err(format!(
+                "the reconstructed search query must be populated; request was {}",
+                redact_api_key(&exchange.request),
+            ));
+        }
+        let results = exchange.response.get("results").and_then(Value::as_array);
+        match results {
+            Some(results) if !results.is_empty() => {
+                let all_absolute = results.iter().all(|result| {
+                    result
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
+                });
+                if !all_absolute {
+                    return Err(format!(
+                        "every real Tavily source must carry an absolute URL; results were {results:?}"
+                    ));
+                }
+            },
+            _ => {
+                return Err(format!(
+                    "real Tavily must return a non-empty results array; response was {}",
+                    exchange.response,
+                ));
+            },
+        }
     }
 
     Ok(())
@@ -2219,6 +2237,25 @@ fn web_search_check_rejects_empty_results_array() {
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("an empty results array must fail");
     assert!(error.contains("non-empty results array"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_a_later_failed_exchange_behind_a_valid_first() {
+    // The managed loop dispatched two searches: the first succeeded, but the
+    // second came back non-200. The turn still converged (an `is_error` tool
+    // result "gets an answer"), so checking only the first capture would wrongly
+    // pass. Every exchange must hold.
+    let captures = [
+        tavily_capture("tvly-key", "fifa world cup", "https://fifa.com"),
+        TavilySearchCapture {
+            request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup final score" }),
+            status: 502,
+            response: serde_json::json!({ "error": "bad gateway" }),
+        },
+    ];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("a later failed exchange must fail even behind a valid first");
+    assert!(error.contains("must return HTTP 200"), "unexpected reason: {error}");
 }
 
 #[test]

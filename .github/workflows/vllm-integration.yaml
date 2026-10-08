@@ -1004,7 +1004,7 @@ jobs:
 
       - name: Run Claude Code server-side web-search acceptance test (once, no retry)
         id: claude_web_search
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
