@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -240,7 +241,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
     return path
 
 
-def _start_client(allow_lossy: bool):
+def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
     """Start a backend + proxy and yield an Anthropic client plus the proxy port.
 
     `allow_lossy` selects the strict example config (the default) or the same
