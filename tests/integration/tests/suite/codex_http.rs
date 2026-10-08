@@ -1648,12 +1648,12 @@ fn compaction_jsonl_rejects_reads_redirected_to_devnull() {
 #[should_panic(expected = "read the marker source")]
 fn compaction_jsonl_rejects_a_run_that_never_reads_the_marker_source() {
     // The task must read secret.txt at least once to acquire the marker.
-    let without_secret = COMPACTION_JSONL_OK
+    let without_marker = COMPACTION_JSONL_OK
         .lines()
         .filter(|line| !line.contains("secret.txt"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert_live_compaction_codex_jsonl(&without_secret, COMPACTION_JSONL_OK_CHAPTERS);
+    assert_live_compaction_codex_jsonl(&without_marker, COMPACTION_JSONL_OK_CHAPTERS);
 }
 
 /// Parse the opening HTTP head and recognize valid WebSocket header spacing.
