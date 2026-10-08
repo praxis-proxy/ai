@@ -4403,6 +4403,75 @@ async fn get_input_items_with_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_duplicate_ids_paginate_to_later_items() {
+    let filter = make_filter();
+    let registry = init_store_and_seed(
+        "resp_duplicate_cursor",
+        "default",
+        json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": "c", "type": "item_reference"}
+        ]),
+    )
+    .await;
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for expected_has_more in [true, true, false] {
+        let after = cursor
+            .as_ref()
+            .map_or_else(String::new, |value| format!("&after={value}"));
+        let req = crate::test_utils::make_request(
+            http::Method::GET,
+            &format!("/v1/responses/resp_duplicate_cursor/input_items?limit=1&order=asc{after}"),
+        );
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 200, "every valid duplicate-ID page must return 200");
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let item_id = body["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .and_then(|item| item["id"].as_str())
+            .unwrap();
+        let last_id = body["last_id"].as_str().unwrap();
+        assert_eq!(last_id, item_id, "last_id must project the final data item ID");
+        assert_eq!(
+            body["has_more"], expected_has_more,
+            "has_more must track whether another input occurrence remains"
+        );
+        let next_cursor = body["next_cursor"].as_str();
+        if expected_has_more {
+            assert_ne!(
+                next_cursor,
+                Some(item_id),
+                "duplicate reference targets need a separate HTTP continuation cursor"
+            );
+        }
+        ids.push(item_id.to_owned());
+        cursor = next_cursor.map(str::to_owned);
+    }
+
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("dup"),
+        "the first reference target must remain unchanged"
+    );
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("dup"),
+        "the second reference must retain the same target ID"
+    );
+    assert_eq!(
+        ids.get(2).map(String::as_str),
+        Some("c"),
+        "the position cursor must make the later unique item reachable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_malformed_cursor_returns_400() {
     let filter = make_filter();
     let registry = init_store_and_seed(

@@ -24,6 +24,7 @@ Usage:
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import os
 import signal
@@ -2390,6 +2391,42 @@ class TestOpenAIResponsesVLLM:
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(response.id)
         assert exc_info.value.status_code == 404
+
+    def test_duplicate_input_item_ids_auto_paginate(self, witness_backend_client):
+        client, _forwarded = witness_backend_client
+        response = client.responses.create(
+            model="sdk-conversation-stream",
+            input=[
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "c"},
+            ],
+            store=True,
+            max_output_tokens=16,
+        )
+
+        first = client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="asc",
+        )
+        pages = list(islice(first.iter_pages(), 3))
+        assert len(pages) == 2, (
+            "SDK pagination must advance past an ambiguous duplicate target and terminate"
+        )
+        assert all(len(page.data) == 1 for page in pages), (
+            "the requested one-item page size must remain stable during SDK iteration"
+        )
+        ids = [page.data[0].id for page in pages]
+        assert ids == ["dup", "c"], (
+            "SDK-derived after=dup must reach the later unique item without rewriting the reference target"
+        )
+        assert all(page.last_id == page.data[-1].id for page in pages), (
+            "the documented last_id field must remain the final returned item ID"
+        )
+        assert pages[-1].has_more is False, (
+            "SDK pagination must terminate after reaching the final unique item"
+        )
 
     def test_response_resource_not_found_errors(self, openai_client):
         missing_id = "resp_missing_sdk_integration"
