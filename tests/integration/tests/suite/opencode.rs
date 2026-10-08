@@ -20,12 +20,11 @@
 //!
 //! Two lanes, matching the two documented recipes:
 //!
-//! * **plugin** — the `praxis-auth.ts` `config` hook attaches the gateway
-//!   Basic credential at runtime. This is the primary lane; the plugin under
-//!   test is the fixture that [`documented_plugin_matches_fixture`] pins
-//!   byte-for-byte to the code block in the guide.
-//! * **headers** — the schema-native per-model `headers` map does the same
-//!   thing declaratively, with `--pure` so no plugin loads at all.
+//! * **plugin** — the `praxis-auth.ts` `config` hook attaches the gateway Basic credential at runtime. This is the
+//!   primary lane; the plugin under test is the fixture that [`documented_plugin_matches_fixture`] pins byte-for-byte
+//!   to the code block in the guide.
+//! * **headers** — the schema-native per-model `headers` map does the same thing declaratively, with `--pure` so no
+//!   plugin loads at all.
 //!
 //! # Exit status is not an auth oracle
 //!
@@ -408,7 +407,6 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
         .env("OPENCODE_DISABLE_SHARE", "1")
         .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "1")
-        //
         // Deliberately NOT setting HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to a dead
         // port, which is how `claude_code.rs` fences its client in. Plugin
         // loading honors those variables, so against a refused proxy it retries
