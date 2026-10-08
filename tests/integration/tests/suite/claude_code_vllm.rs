@@ -615,6 +615,8 @@ impl Turn<'static> {
         prompt: WEB_SEARCH_PROMPT,
         launch_flags: WEB_SEARCH_LAUNCH_FLAGS,
         permission_scenario: PermissionScenario::WebSearch,
+        max_context_tokens: CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+        timeout: CHILD_TIMEOUT,
     };
 
     /// The deterministic coding task under one of its permission scenarios.
