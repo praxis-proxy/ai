@@ -223,13 +223,26 @@ class _TavilyRelay:
         captured = self.captured
         context = ssl.create_default_context()
 
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            # Never follow redirects: urllib copies non-content headers (including
+            # Authorization) onto the redirected request, which would leak the real
+            # Tavily key to another authority or an http:// URL. A 3xx instead
+            # surfaces as an HTTPError and fails the run loudly.
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(
+            _NoRedirect,
+            urllib.request.HTTPSHandler(context=context),
+        )
+
         def relay(raw: bytes, authorization: str | None) -> tuple[int, bytes]:
             headers = {"Content-Type": "application/json"}
             if authorization:
                 headers["Authorization"] = authorization
             request = urllib.request.Request(TAVILY_UPSTREAM, data=raw, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(request, timeout=20, context=context) as response:
+                with opener.open(request, timeout=20) as response:
                     return response.status, response.read()
             except urllib.error.HTTPError as exc:
                 # Surface the real upstream status (e.g. 401/429) so a broken
