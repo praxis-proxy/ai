@@ -31,9 +31,9 @@ filter_chains:
       - filter: ai_operation
 
       # Pure fact publisher: it classifies the body to route by mode, but no
-      # managed owner (initialize_state: true) runs on either branch, so it does
-      # not cache its parse — caching here would retain a request-sized JSON tree
-      # that nothing consumes for the rest of the forward.
+      # managed owner (initialize_state: true) runs on either branch, so the parse
+      # it caches is never reused — it is a request-scoped entry released, unused,
+      # when the request ends.
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject

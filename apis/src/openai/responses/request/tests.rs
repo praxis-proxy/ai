@@ -391,12 +391,13 @@ async fn initialize_state_false_classifies_without_building_state() {
     );
 }
 
-/// A facts publisher retains no parse unless the chain opts in. Without a
-/// managed owner to consume it, a cached parse would sit in request extensions
-/// alongside the original body for the whole forward — a request-sized copy
-/// nothing reads.
+/// A facts publisher caches its single parse for a later managed owner.
+///
+/// It promotes the routing facts but mints no state, and holds the parse in
+/// request extensions so the managed owner reuses it rather than deserializing
+/// the body a second time.
 #[tokio::test]
-async fn a_facts_publisher_retains_no_parse_by_default() {
+async fn a_facts_publisher_caches_its_parse_for_a_managed_owner() {
     let filter = filter("initialize_state: false\n");
     let request = create_request();
     let mut ctx = classified_context(&request).await;
@@ -412,33 +413,15 @@ async fn a_facts_publisher_retains_no_parse_by_default() {
             .get("openai_responses_request.format")
             .map(String::as_str),
         Some("openai_responses"),
-        "routing facts are still published without the opt-in"
+        "a facts publisher still promotes routing facts"
     );
-    assert!(
-        ctx.extensions.get::<CachedRequestParse>().is_none(),
-        "no parse is retained when cache_parse_for_owner is off"
-    );
-}
-
-/// The opt-in makes the facts publisher cache its parse for a managed owner.
-#[tokio::test]
-async fn cache_parse_for_owner_retains_the_parse() {
-    let filter = filter("initialize_state: false\ncache_parse_for_owner: true\n");
-    let request = create_request();
-    let mut ctx = classified_context(&request).await;
-    let mut body = Some(Bytes::from(
-        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
-    ));
-
-    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
-
     assert!(
         ctx.extensions.get::<CachedRequestParse>().is_some(),
-        "the opt-in hands the parse to a later managed pass"
+        "a facts publisher caches its parse for a later managed owner"
     );
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
-        "a facts publisher still mints no state even when it caches"
+        "a facts publisher mints no state"
     );
 }
 
@@ -457,7 +440,7 @@ async fn the_managed_owner_reuses_the_cached_parse_deserializing_once() {
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
 
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
     // Isolate the re-parse signal: only a re-parse would restore this fact.
@@ -484,79 +467,29 @@ async fn the_managed_owner_reuses_the_cached_parse_deserializing_once() {
     );
 }
 
-/// A direct-route discard instance frees the cache at the header phase.
+/// The header phase does not touch a cached parse.
 ///
-/// The facts pass caches a parse for a managed owner. On a route the router binds
-/// direct, the managed owner never runs, so an `openai_responses_request` with
-/// `discard_cached_parse: true` drops the cache at `on_request` — which runs after
-/// binding — leaving nothing for the direct forward to retain.
+/// Parsing and caching happen in the body phase; `on_request` is a no-op, so a
+/// parse a pre-routing pass cached survives the header phase for the managed owner
+/// to consume after binding. On a chain with no managed owner the request-scoped
+/// extension is released when the request ends.
 #[tokio::test]
-async fn discard_cached_parse_frees_the_cache_at_the_header_phase() {
+async fn the_header_phase_leaves_the_cache_intact() {
     let request = create_request();
     let mut ctx = classified_context(&request).await;
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
 
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
-
-    let discard = filter("initialize_state: false\ndiscard_cached_parse: true\n");
-    let action = discard.on_request(&mut ctx).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Continue));
-    assert!(
-        ctx.extensions.get::<CachedRequestParse>().is_none(),
-        "the direct-route discard frees the cache after binding"
-    );
-}
-
-/// Without the discard flag the header phase leaves a cached parse intact.
-#[tokio::test]
-async fn without_discard_the_header_phase_leaves_the_cache() {
-    let request = create_request();
-    let mut ctx = classified_context(&request).await;
-    let mut body = Some(Bytes::from(
-        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
-    ));
-
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
-    drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
     drop(default_filter().on_request(&mut ctx).await.unwrap());
 
     assert!(
         ctx.extensions.get::<CachedRequestParse>().is_some(),
-        "a header phase without the discard flag must not drop the cache"
-    );
-}
-
-/// `from_config` rejects `discard_cached_parse` on a managed owner.
-#[test]
-fn discard_cached_parse_is_rejected_on_the_managed_owner() {
-    let value: serde_yaml::Value = serde_yaml::from_str("discard_cached_parse: true\n").unwrap();
-    let err = OpenaiResponsesRequestFilter::from_config(&value)
-        .err()
-        .expect("managed owner + discard must be rejected");
-    assert!(
-        err.to_string().contains("initialize_state: false"),
-        "the managed owner consumes its own parse and cannot discard: {err}"
-    );
-}
-
-/// `from_config` rejects discarding and caching on the same entry.
-#[test]
-fn discard_cached_parse_and_caching_are_mutually_exclusive() {
-    let value: serde_yaml::Value =
-        serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\ndiscard_cached_parse: true\n")
-            .unwrap();
-    let err = OpenaiResponsesRequestFilter::from_config(&value)
-        .err()
-        .expect("caching + discard must be rejected");
-    assert!(
-        err.to_string().contains("mutually exclusive"),
-        "an entry caches a parse or discards one, not both: {err}"
+        "the header phase must not drop a cached parse"
     );
 }
 
@@ -587,7 +520,7 @@ async fn a_model_rewrite_invalidates_the_cached_parse_so_the_owner_reparses() {
     ));
 
     // The pre-routing facts pass caches the parse of the body as received.
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
 
@@ -643,7 +576,7 @@ async fn an_intervening_body_rewrite_makes_the_owner_reparse_without_explicit_in
     ));
 
     // The pre-routing facts pass caches the parse of the body as received.
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     drop(facts.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert!(ctx.extensions.get::<CachedRequestParse>().is_some());
 
@@ -694,7 +627,7 @@ async fn a_facts_only_instance_does_not_consume_the_cache_or_apply_managed_polic
 
     // A pre-routing facts pass caches the parse; a facts-only pass enforces no
     // managed policy, so the cache carries a background body intact.
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     let first = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(first, FilterAction::Release),
@@ -1045,21 +978,6 @@ fn the_filter_declares_bounded_buffering() {
     ));
 }
 
-/// A discard-only instance does no body work, so it can live on a terminal branch.
-///
-/// Pipeline validation rejects a branch filter that declares body access, because
-/// body hooks never run inside a branch. The discard instance acts only at the
-/// header phase, so it must declare none.
-#[test]
-fn a_discard_instance_declares_no_body_access() {
-    let filter = filter("initialize_state: false\ndiscard_cached_parse: true\n");
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::None,
-        "a discard-only instance must be placeable on a terminal branch"
-    );
-}
-
 // -----------------------------------------------------------------------------
 // Bound-upstream phase and response teardown
 // -----------------------------------------------------------------------------
@@ -1144,7 +1062,7 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
 
     // The pre-routing publisher opts in to the handoff, so its one parse carries
     // to the managed pass rather than being dropped and re-parsed after binding.
-    let facts = filter("initialize_state: false\ncache_parse_for_owner: true\n");
+    let facts = filter("initialize_state: false\n");
     let managed = default_filter();
     let request = create_request();
     let mut ctx = classified_context(&request).await;

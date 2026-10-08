@@ -18,9 +18,9 @@
 //!
 //! - A pre-routing fact publisher (`initialize_state: false`) classifies the body and promotes the model, stream,
 //!   store, and stateful/stateless mode facts the router needs. It mints no identifiers and enforces no managed-path
-//!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. When the
-//!   chain also sets `cache_parse_for_owner`, it hands its one parse to a later managed pass; otherwise it retains
-//!   nothing once the facts are promoted.
+//!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. It
+//!   caches its one parse in request extensions for a later managed pass to reuse; on a chain with no managed owner
+//!   that cache is released, unconsumed, when the request ends.
 //! - The managed owner (`initialize_state: true`, the default) additionally rejects `background=true` and non-null
 //!   `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When a
 //!   pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
@@ -55,7 +55,7 @@ use tracing::{debug, trace};
 
 use super::{
     bound_body_outcome,
-    config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config, validate_request_config},
+    config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
@@ -104,7 +104,6 @@ impl OpenaiResponsesRequestFilter {
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
-        validate_request_config(FILTER_NAME, &cfg)?;
         let shared = build_config(FILTER_NAME, cfg.shared)?;
         Ok(Box::new(Self {
             config: ResponsesRequestConfig { shared, ..cfg },
@@ -199,14 +198,11 @@ impl OpenaiResponsesRequestFilter {
             // managed-path policy, so provider-owned traffic the router may still
             // bind to a direct upstream keeps its fields intact.
             //
-            // Its parse is handed to a later managed pass only when the chain
-            // opts in: a facts-only chain with no managed owner would otherwise
-            // retain this request-sized parse alongside the original body for the
-            // whole forward, a copy nothing consumes. When opted out the parse is
-            // dropped here and the managed owner, if any, re-parses after binding.
-            if self.config.cache_parse_for_owner {
-                ctx.extensions.insert(cached);
-            }
+            // Its single parse is cached in request extensions for a later managed
+            // pass to reuse, so a managed create body is deserialized exactly once
+            // across both phases. On a chain with no managed owner nothing consumes
+            // it and the request-scoped extension is released when the request ends.
+            ctx.extensions.insert(cached);
             return Ok(FilterAction::Release);
         }
 
@@ -221,20 +217,11 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         "openai_responses_request"
     }
 
-    /// A discard-only instance works entirely at the header phase, so it declares
-    /// no body access.
-    ///
-    /// `discard_cached_parse` drops a parse an earlier publisher cached, at
-    /// `on_request` — which runs after routing. Such an instance is placed on a
-    /// direct-upstream terminal branch, where body hooks never run; declaring body
-    /// access there fails pipeline validation. It neither classifies nor initializes
-    /// state, so it needs the body in no phase.
+    /// Both roles read the request body at the pre-read phase: the fact publisher
+    /// to classify and cache, the managed owner to classify when no pre-routing
+    /// pass ran.
     fn request_body_access(&self) -> BodyAccess {
-        if self.config.discard_cached_parse {
-            BodyAccess::None
-        } else {
-            BodyAccess::ReadOnly
-        }
+        BodyAccess::ReadOnly
     }
 
     /// The managed owner also offers the bound-upstream phase, so a chain can
@@ -292,18 +279,8 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         BodyMode::Stream
     }
 
-    /// On a direct route, drop a parse an earlier publisher cached for a managed
-    /// owner this route never reaches.
-    ///
-    /// The header phase runs after the router has bound the route, so a facts
-    /// publisher placed on a direct-upstream branch (`initialize_state: false`,
-    /// `discard_cached_parse: true`) frees the cached parse here: managed routes
-    /// keep it for their single deserialization while the direct path forwards the
-    /// original body without a copy nothing consumes. A no-op otherwise.
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if self.config.discard_cached_parse {
-            invalidate_cached_request_parse(ctx);
-        }
+    /// All work happens in the body phases; the header phase is a no-op.
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
@@ -435,12 +412,12 @@ fn reject_unsupported_managed_fields(
 
 /// One deserialization carried from the pre-routing pass to the managed pass.
 ///
-/// Publishing routing facts requires parsing the body before the router runs,
-/// and the managed owner needs the same parse after binding. When the pre-routing
-/// publisher opts in with `cache_parse_for_owner`, holding the parse here, keyed
-/// in request extensions, means a managed create body is deserialized exactly
-/// once across both phases rather than re-parsed per entry. Without the opt-in no
-/// entry caches, so this value is simply never inserted.
+/// Publishing routing facts requires parsing the body before the router runs, and
+/// the managed owner needs the same parse after binding. The pre-routing publisher
+/// holds the parse here, keyed in request extensions, so a managed create body is
+/// deserialized exactly once across both phases rather than re-parsed per entry.
+/// On a chain with no managed owner nothing consumes it and the request-scoped
+/// extension is released when the request ends.
 struct CachedRequestParse {
     /// The parsed request body, moved into state initialization.
     parsed: serde_json::Value,
@@ -471,23 +448,18 @@ impl CachedRequestParse {
     }
 }
 
-/// Drop any cached pre-routing parse, used by two callers.
+/// Drop any cached pre-routing parse after an intervening body rewrite.
 ///
-/// The pre-routing fact publisher may hand its parse to the managed owner through
+/// The pre-routing fact publisher hands its parse to the managed owner through
 /// [`CachedRequestParse`]. That parse is taken from the body as received.
 ///
-/// Correctness against an intervening body rewrite does not rest here: the owner
-/// compares the cached body against the one in flight ([`CachedRequestParse::matches_body`])
-/// and re-parses on a mismatch, so a stale parse is never consumed even if nothing
+/// Correctness against a body rewrite does not rest here: the owner compares the
+/// cached body against the one in flight ([`CachedRequestParse::matches_body`]) and
+/// re-parses on a mismatch, so a stale parse is never consumed even if nothing
 /// invalidated it. `openai_responses_model_rewrite` still calls this right after it
 /// remaps the model, as an early free of a parse known to be stale rather than the
 /// sole safeguard — without it the owner would detect the mismatch and re-parse
 /// anyway.
-///
-/// A direct route that the router bound to a provider-owned upstream never reaches
-/// the managed owner, so an `openai_responses_request` placed on that branch with
-/// `discard_cached_parse` calls this at the header phase to free the cache the
-/// managed path would otherwise have consumed.
 pub(crate) fn invalidate_cached_request_parse(ctx: &mut HttpFilterContext<'_>) {
     if ctx.extensions.remove::<CachedRequestParse>().is_some() {
         trace!("dropped cached request parse");

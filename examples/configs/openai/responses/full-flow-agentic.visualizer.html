@@ -3126,18 +3126,6 @@ const PIPELINE = {
                 "name": "direct-openai-dispatch",
                 "filters": [
                   {
-                    "filter": "openai_responses_request",
-                    "failure_mode": "closed",
-                    "headers": {
-                      "format": null,
-                      "model": null,
-                      "stream": null,
-                      "mode": null
-                    },
-                    "initialize_state": false,
-                    "discard_cached_parse": true
-                  },
-                  {
                     "filter": "load_balancer",
                     "failure_mode": "closed",
                     "clusters": [

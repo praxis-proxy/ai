@@ -208,10 +208,12 @@ unchanged. Offers both the pre-read and bound-upstream
 body phases, so a chain can defer it until a logical
 provider is bound, and `initialize_state: false` lets a
 pure routing chain classify without building state. A
-pre-routing facts pass may cache its one parse
-(`cache_parse_for_owner`) for the managed owner, which
+pre-routing facts pass (`initialize_state: false`) always
+caches its one parse for a later managed owner, which
 re-validates the cached body before reuse so an
-intervening body rewrite is never reused stale.
+intervening body rewrite is never reused stale; on a chain
+with no managed owner that request-scoped cache is simply
+released, unused, when the request ends.
 
 ### `anthropic_messages_format`
 

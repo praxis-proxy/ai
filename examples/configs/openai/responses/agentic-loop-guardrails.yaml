@@ -30,9 +30,9 @@ filter_chains:
 
       # Pure fact publisher: classifies the body and promotes format/model/stream
       # for the guardrail and agentic filters downstream. No managed owner
-      # (initialize_state: true) runs in this focused example, so it does not
-      # cache its parse — caching would retain a request-sized JSON tree that
-      # nothing consumes for the rest of the forward.
+      # (initialize_state: true) runs in this focused example, so the parse it
+      # caches is never reused — it is a request-scoped entry released, unused,
+      # when the request ends.
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject

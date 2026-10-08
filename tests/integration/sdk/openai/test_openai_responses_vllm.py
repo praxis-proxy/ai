@@ -7665,10 +7665,10 @@ filter_chains:
     filters:
       - filter: ai_operation
       - filter: openai_responses_request
+        # A facts pass (initialize_state: false) always caches its single parse,
+        # so the managed owner below reuses it and the create body deserializes
+        # exactly once across both passes (#1602).
         initialize_state: false
-        # Hand this facts pass's single parse to the managed owner below so the
-        # create body deserializes exactly once across both passes (#1602).
-        cache_parse_for_owner: true
       - filter: openai_responses_request
         on_invalid: reject
         headers:

@@ -59,13 +59,12 @@
 #
 #   2. A pre-routing openai_responses_request (initialize_state: false)
 #      classifies the request and promotes format, model, stream, and mode to
-#      internal routing headers. It caches its single parse (cache_parse_for_owner:
-#      true) so the managed owner below reuses it after binding and a managed
-#      create body is deserialized exactly once across both phases. This gateway
-#      mixes direct and managed routes, and the direct-OpenAI branch rejoins at
-#      `terminal` before the managed owner runs; that branch carries its own
-#      openai_responses_request (discard_cached_parse: true) to free the cache
-#      after binding so the direct forward retains no copy nothing consumes.
+#      internal routing headers. It always caches its single parse so the managed
+#      owner below reuses it after binding and a managed create body is
+#      deserialized exactly once across both phases. This gateway mixes direct and
+#      managed routes, and the direct-OpenAI branch rejoins at `terminal` before
+#      the managed owner runs; on that branch nothing consumes the cache, so the
+#      request-scoped parse is simply released, unused, when the request ends.
 #      on_invalid is left at the default (passthrough) so that Conversations API
 #      traffic is not rejected before the conversations filter can handle it in
 #      the body phase.
@@ -377,15 +376,13 @@ filter_chains:
       # create body promotes the trusted format/model/stream/mode routing facts.
       # `initialize_state: false` keeps it from minting state or enforcing
       # managed-path policy, so provider-owned traffic the router binds direct
-      # keeps its fields intact. `cache_parse_for_owner: true` hands this single
-      # parse to the managed owner below, so a managed create body is deserialized
-      # exactly once across the two phases. The direct-OpenAI branch rejoins at
-      # `terminal` before that owner runs, so its own openai_responses_request
-      # (`discard_cached_parse: true`) frees the cache after binding — see that
-      # branch below.
+      # keeps its fields intact. It always caches this single parse, so the managed
+      # owner below reuses it and a managed create body is deserialized exactly once
+      # across the two phases. The direct-OpenAI branch rejoins at `terminal` before
+      # that owner runs; nothing there consumes the cache, so the request-scoped
+      # parse is released, unused, when the request ends.
       - filter: openai_responses_request
         initialize_state: false
-        cache_parse_for_owner: true
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -464,25 +461,12 @@ filter_chains:
             chains:
               - name: direct-openai-dispatch
                 filters:
-                  # Drop the parse the pre-routing publisher cached for the
-                  # managed owner. This direct route rejoins at `terminal` and
-                  # never reaches that owner, so without this the cache would sit
-                  # in request extensions for the whole forward with nothing to
-                  # consume it. The header phase runs after the router has bound
-                  # this route, so `discard_cached_parse` frees it here while
-                  # managed routes keep it for their single deserialization.
-                  # `initialize_state: false` means this instance mints no state;
-                  # its body hook never runs inside a branch, so it classifies and
-                  # promotes nothing (headers nulled to make that explicit) and
-                  # only discards at the header phase.
-                  - filter: openai_responses_request
-                    initialize_state: false
-                    discard_cached_parse: true
-                    headers:
-                      format: ~
-                      model: ~
-                      stream: ~
-                      mode: ~
+                  # The pre-routing publisher cached its parse for the managed
+                  # owner, but this direct route rejoins at `terminal` and never
+                  # reaches that owner. Nothing here consumes the cache; it is a
+                  # request-scoped entry in request extensions that is released,
+                  # unused, when the request ends, so the direct forward carries
+                  # no extra copy and needs no explicit discard step.
                   - filter: load_balancer
                     # Reuse the cluster already chosen by the router. This must
                     # not perform another routing decision based on a rewritten

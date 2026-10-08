@@ -134,10 +134,6 @@ pub(crate) struct ResponsesClassificationConfig {
 /// owner can be configured from the same filter.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent managed-path lifecycle gates: owner, parse-cache, parse-discard"
-)]
 pub(crate) struct ResponsesRequestConfig {
     /// Classification and promotion settings, shared with the classifier.
     #[serde(flatten)]
@@ -149,52 +145,21 @@ pub(crate) struct ResponsesRequestConfig {
     /// builds. When enabled the filter is the managed owner: it initializes
     /// `ResponsesState` and enforces the managed-path policy that rejects
     /// provider-owned `background`/`prompt` and conflicting history selectors.
+    /// The owner reuses the parse a pre-routing publisher cached, so a managed
+    /// create body is deserialized exactly once across the two phases.
     ///
     /// A pre-routing fact publisher sets this to `false`: it classifies the
-    /// body, promotes the routing facts, and — when [`Self::cache_parse_for_owner`]
-    /// is also set — hands its parse to a later managed entry, but mints no
-    /// identifiers, resolves no conversation, and enforces no managed-path
-    /// policy — so provider-owned traffic that the router may still bind to a
-    /// direct upstream keeps its fields intact.
+    /// body, promotes the routing facts, and caches its single parse in request
+    /// extensions for a later managed owner to reuse, but mints no identifiers,
+    /// resolves no conversation, and enforces no managed-path policy — so
+    /// provider-owned traffic that the router may still bind to a direct upstream
+    /// keeps its fields intact. On a chain with no managed owner the cached parse
+    /// is released, unconsumed, when the request ends.
     ///
     /// Classification metadata, headers, and filter results are published
     /// either way, so routing is unaffected.
     #[serde(default = "default_initialize_state")]
     pub initialize_state: bool,
-
-    /// Whether a pre-routing fact publisher retains its single parse for a later
-    /// managed owner.
-    ///
-    /// Off by default, so a facts publisher drops its parse once the routing
-    /// facts are promoted and retains nothing request-sized while the original
-    /// body is forwarded. A facts-only chain with no managed owner — a pure
-    /// routing gateway, say — keeps this default and leaks no parse.
-    ///
-    /// Set this to `true` on a pre-routing fact publisher (`initialize_state:
-    /// false`) that is followed by the managed owner (`initialize_state: true`)
-    /// in the same chain: the publisher then caches its parse in request
-    /// extensions and the owner reuses it after binding, so a managed create
-    /// body is deserialized exactly once across both phases rather than parsed
-    /// again. It has no effect on a managed owner, which consumes its own parse
-    /// directly and never publishes one for another entry.
-    #[serde(default)]
-    pub cache_parse_for_owner: bool,
-
-    /// Whether this entry drops a parse an earlier publisher cached, after binding.
-    ///
-    /// Off by default. Set this to `true` on an `initialize_state: false` instance
-    /// placed on a provider-owned (direct) route whose managed owner never runs —
-    /// for example inside a direct-upstream terminal branch. A pre-routing publisher
-    /// that set [`Self::cache_parse_for_owner`] hands its single parse to the managed
-    /// owner, which consumes it after binding; but a request the router binds direct
-    /// skips that owner, so the cached parse would otherwise sit in request
-    /// extensions for the whole forward with nothing to consume it. Discarding it at
-    /// the header phase — which runs after the route is bound — frees it on the
-    /// direct path while managed routes keep the parse for their single
-    /// deserialization. Rejected together with `initialize_state: true` (the owner
-    /// consumes its own parse) or with `cache_parse_for_owner` on the same entry.
-    #[serde(default)]
-    pub discard_cached_parse: bool,
 }
 
 /// The filter owns the managed-path lifecycle unless a chain opts out.
@@ -216,28 +181,6 @@ pub(crate) fn build_config(
 ) -> Result<ResponsesClassificationConfig, FilterError> {
     validate_classification_headers(filter, &cfg.headers)?;
     Ok(cfg)
-}
-
-/// Reject `discard_cached_parse` combinations that can never be correct.
-///
-/// Discarding a cached parse only makes sense on a pre-routing publisher
-/// (`initialize_state: false`) that itself does not cache — it drops a parse an
-/// *earlier* publisher left for a managed owner the direct route never reaches.
-/// A managed owner (`initialize_state: true`) consumes its own cache, and a
-/// publisher that caches (`cache_parse_for_owner: true`) is the producer, not the
-/// discarder; combining either with discard is a configuration error.
-pub(crate) fn validate_request_config(filter: &str, cfg: &ResponsesRequestConfig) -> Result<(), FilterError> {
-    if cfg.discard_cached_parse && cfg.initialize_state {
-        return Err(FilterError::from(format!(
-            "{filter}: discard_cached_parse requires initialize_state: false; a managed owner consumes its own parse"
-        )));
-    }
-    if cfg.discard_cached_parse && cfg.cache_parse_for_owner {
-        return Err(FilterError::from(format!(
-            "{filter}: discard_cached_parse and cache_parse_for_owner are mutually exclusive; an entry caches a parse or discards one, not both"
-        )));
-    }
-    Ok(())
 }
 
 /// Validate dedicated names and reject collisions across header fields.
@@ -287,65 +230,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_parse_for_owner_defaults_off() {
+    fn initialize_state_defaults_on() {
         let cfg: ResponsesRequestConfig = serde_yaml::from_str("{}").unwrap();
         assert!(
-            !cfg.cache_parse_for_owner,
-            "a facts publisher must retain no parse unless a chain opts in"
-        );
-        assert!(cfg.initialize_state, "the managed owner default is unchanged");
-    }
-
-    #[test]
-    fn cache_parse_for_owner_opt_in_parses() {
-        let cfg: ResponsesRequestConfig =
-            serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\n").unwrap();
-        assert!(!cfg.initialize_state);
-        assert!(
-            cfg.cache_parse_for_owner,
-            "a pre-routing publisher can opt in to the deserialize-once handoff"
+            cfg.initialize_state,
+            "an entry owns the managed-path lifecycle unless a chain opts out"
         );
     }
 
     #[test]
-    fn discard_cached_parse_defaults_off() {
-        let cfg: ResponsesRequestConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(
-            !cfg.discard_cached_parse,
-            "an entry must not discard a cached parse unless a chain opts in"
-        );
-    }
-
-    #[test]
-    fn validate_request_config_accepts_discard_on_a_facts_publisher() {
-        let cfg: ResponsesRequestConfig =
-            serde_yaml::from_str("initialize_state: false\ndiscard_cached_parse: true\n").unwrap();
-        assert!(
-            validate_request_config("openai_responses_request", &cfg).is_ok(),
-            "a direct-route publisher may discard an earlier cached parse"
-        );
-    }
-
-    #[test]
-    fn validate_request_config_rejects_discard_on_the_managed_owner() {
-        let cfg: ResponsesRequestConfig = serde_yaml::from_str("discard_cached_parse: true\n").unwrap();
-        let err = validate_request_config("openai_responses_request", &cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("initialize_state: false"),
-            "the managed owner consumes its own parse and cannot discard: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_request_config_rejects_discard_with_caching() {
-        let cfg: ResponsesRequestConfig =
-            serde_yaml::from_str("initialize_state: false\ncache_parse_for_owner: true\ndiscard_cached_parse: true\n")
-                .unwrap();
-        let err = validate_request_config("openai_responses_request", &cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "caching and discarding on one entry must be rejected: {err}"
-        );
+    fn initialize_state_opts_out_for_a_facts_publisher() {
+        let cfg: ResponsesRequestConfig = serde_yaml::from_str("initialize_state: false\n").unwrap();
+        assert!(!cfg.initialize_state, "a pre-routing publisher mints no state");
     }
 
     #[test]
