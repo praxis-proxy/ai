@@ -150,14 +150,23 @@ cargo xtask openai-conversation-item-contracts
 cargo xtask openai-conversation-item-contracts --check
 ```
 
-Normal conformance generation performs the check before comparing schemas, so
-the runtime validator and generated implementation document cannot silently
-drift from the pinned item union.
+When Conversations is selected, conformance generation performs the check
+before comparing schemas, so the runtime validator and generated implementation
+document cannot silently drift from the pinned item union.
 
 ## Reference Refresh
 
-Normal conformance runs do not fetch upstream. They read the complete vendored
-spec and create area projections in memory. To pin an intentional upstream
+`cargo xtask openai-conformance` does not fetch upstream. It always uses the
+checked-in complete OpenAI reference at
+`docs/conformance/specs/openai-openapi.yaml` and verifies its provenance against
+`docs/conformance/specs/openai-openapi-source.json` before comparison, then
+creates area projections in memory. The report retains the reference revision
+and SHA-256. There is no alternate reference-path option; `--openai-spec` is
+rejected.
+`--implementation-spec` remains available to override the local implementation
+document for exactly one selected area, without changing the pinned reference.
+
+Reference refresh is an independent command. To pin an intentional upstream
 update and replace the complete spec:
 
 ```console
