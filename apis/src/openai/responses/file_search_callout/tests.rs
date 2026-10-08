@@ -30,7 +30,7 @@ use super::{
 use crate::{
     CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
-    openai::responses::state::{FileSearchAssignment, SynthesisKind},
+    openai::responses::state::{CollectedRound, FileSearchAssignment, SynthesisKind},
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
 // -----------------------------------------------------------------------------
@@ -2236,6 +2236,31 @@ fn continuation_state_charges_provider_streamed_terminal_ids() {
     assert!(
         !continuation_state_fits(0, &state, 64, 0),
         "a large observation set is charged and overflows the ceiling (P1 DoS bound)"
+    );
+}
+
+// The agentic collector grows `collected_rounds` per round and
+// `collected_output_provenance` per collected item. Both are request-scoped
+// bookkeeping and must be charged against max_state_bytes like every other field.
+#[test]
+fn continuation_state_charges_collected_round_bookkeeping() {
+    let mut state = ResponsesState::default();
+    assert!(
+        continuation_state_fits(0, &state, 64, 0),
+        "empty round bookkeeping fits a tiny ceiling"
+    );
+
+    state.collected_rounds = vec![CollectedRound::default(); 100];
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "collected_rounds must be charged against the continuation ceiling"
+    );
+
+    state.collected_rounds.clear();
+    state.collected_output_provenance = vec![(0, 0); 100];
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "collected_output_provenance must be charged against the continuation ceiling"
     );
 }
 

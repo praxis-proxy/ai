@@ -680,7 +680,9 @@ fn continuation_state_fits(
 ) -> bool {
     let mut used = framework_bytes
         .saturating_add(incoming_bytes)
-        .saturating_add(size_of_val(state.translated_reasoning_replay.as_slice()));
+        .saturating_add(size_of_val(state.translated_reasoning_replay.as_slice()))
+        .saturating_add(size_of_val(state.collected_rounds.as_slice()))
+        .saturating_add(size_of_val(state.collected_output_provenance.as_slice()));
     for value in [
         &state.request_body,
         &state.response_object,
