@@ -1002,6 +1002,40 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-planning.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run Claude Code server-side web-search acceptance test (once, no retry)
+        id: claude_web_search
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          # The real search-provider key. Praxis inlines it into the agentic
+          # config at runtime and points the managed web-search callout at a
+          # loopback capture-relay that forwards to real Tavily; the secret is
+          # never written to disk or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real Tavily path. Labeled fork PRs do not receive secrets, so they
+          # retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          # Proves the client's built-in WebSearch tool is resolved SERVER-SIDE by
+          # Praxis's managed anthropic_web_search loop against real Tavily, over the
+          # agentic config routed onto the Chat Completions backend. The capture
+          # relay runs on the host (where Praxis runs its outbound calls), so client
+          # egress isolation is unaffected. Shares the same vLLM container and
+          # namespace, sequentially after the other acceptance runs. Runs once, no
+          # retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,TAVILY_API_KEY,PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_resolves_server_side_web_search_through_tavily \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-web-search.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Run Anthropic SDK Messages against real vLLM
         id: anthropic_messages
         if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
@@ -1060,7 +1094,7 @@ jobs:
           # Interleaved client and Praxis diagnostics for each run. The gateway
           # and native secrets are test constants, and Praxis does not emit auth
           # headers at the default log level, so these logs are safe to surface.
-          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed acceptance-planning; do
+          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed acceptance-planning acceptance-web-search; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || echo "no $log log captured"
           done
@@ -1086,6 +1120,7 @@ jobs:
             ${{ runner.temp }}/acceptance-auto-native.log
             ${{ runner.temp }}/acceptance-auto-transformed.log
             ${{ runner.temp }}/acceptance-planning.log
+            ${{ runner.temp }}/acceptance-web-search.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
           retention-days: 30
@@ -1099,6 +1134,7 @@ jobs:
           CLAUDE_NATIVE_AUTO: ${{ steps.claude_native_auto.outcome }}
           CLAUDE_TRANSLATED_AUTO: ${{ steps.claude_translated_auto.outcome }}
           CLAUDE_PLANNING: ${{ steps.claude_planning.outcome }}
+          CLAUDE_WEB_SEARCH: ${{ steps.claude_web_search.outcome }}
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
@@ -1106,8 +1142,9 @@ jobs:
           python3 - "$RUNNER_TEMP/claude-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
           names = ("CLAUDE_NATIVE_EDITS", "CLAUDE_TRANSLATED_EDITS", "CLAUDE_NATIVE_AUTO",
-                   "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "ANTHROPIC_MESSAGES",
-                   "ANTHROPIC_STUBBED_WEB_SEARCH", "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
+                   "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
+                   "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
+                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
           for case, filename in (
               ("anthropic_messages", "anthropic-messages-cases.json"),

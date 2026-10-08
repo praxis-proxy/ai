@@ -72,8 +72,8 @@ use std::{
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    CapturedChildOutput, ProxyGuard, basic_auth_header, capture_child_output, configure_isolated_process_group,
-    example_config_path, free_port, http_get, start_proxy,
+    CapturedChildOutput, ProxyGuard, TavilySearchCapture, basic_auth_header, capture_child_output,
+    configure_isolated_process_group, example_config_path, free_port, http_get, start_proxy, start_tavily_relay,
 };
 use serde_json::Value;
 
@@ -114,6 +114,17 @@ const REQUIRE_LIVE_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE";
 /// loopback, and the namespaced client can then reach only Praxis. Defaults to
 /// `127.0.0.1`.
 const LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_LISTEN_ADDRESS";
+
+/// Environment variable holding the real Tavily API key for the managed
+/// `anthropic_web_search` loop. Shared with the Anthropic SDK web-search suite.
+const TAVILY_API_KEY_ENV: &str = "TAVILY_API_KEY";
+/// Optional environment variable demanding a real live web-search run.
+///
+/// Like [`REQUIRE_LIVE_ENV`] for the coding paths: when truthy (`1`/`true`), a
+/// missing [`TAVILY_API_KEY_ENV`] is a hard failure instead of a skip, so a CI
+/// nightly that is supposed to exercise the real Tavily path cannot pass by
+/// silently skipping it.
+const REQUIRE_LIVE_WEB_SEARCH_ENV: &str = "PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH";
 
 /// Pinned Claude Code version substring expected from `claude --version`.
 ///
@@ -160,13 +171,18 @@ enum PermissionScenario {
     /// the instruction not to. Paired with [`PLANNING_LAUNCH_FLAGS`], which also
     /// withholds every mutating tool from the request in the first place.
     ReadOnlyPlanning,
+    /// Server-side web search: `acceptEdits` with only `WebSearch` preapproved.
+    /// The managed `anthropic_web_search` loop resolves the search in Praxis and
+    /// suppresses the `WebSearch` tool_use, so the client never actually executes
+    /// it; preapproving the one exposed tool keeps the command well-formed.
+    WebSearch,
 }
 
 impl PermissionScenario {
     /// The value accepted by Claude Code's `--permission-mode` flag.
     const fn cli_value(self) -> &'static str {
         match self {
-            Self::AcceptEdits | Self::ReadOnlyPlanning => "acceptEdits",
+            Self::AcceptEdits | Self::ReadOnlyPlanning | Self::WebSearch => "acceptEdits",
             Self::AutoClientClassifier => "auto",
         }
     }
@@ -186,6 +202,12 @@ impl PermissionScenario {
             },
             Self::ReadOnlyPlanning => {
                 command.arg("--allowedTools").arg("Read");
+            },
+            // The managed loop resolves WebSearch server-side and suppresses the
+            // tool_use, so the client never runs it; preapproving the one exposed
+            // tool keeps the command honest about what it exposes.
+            Self::WebSearch => {
+                command.arg("--allowedTools").arg("WebSearch");
             },
             // Auto mode deliberately preapproves nothing; see
             // [`Self::configure_environment`].
@@ -213,7 +235,7 @@ fn permission_scenarios_keep_auto_mode_unapproved_and_client_classified() {
         command
     }
 
-    for flags in [LAUNCH_FLAGS, PLANNING_LAUNCH_FLAGS] {
+    for flags in [LAUNCH_FLAGS, PLANNING_LAUNCH_FLAGS, WEB_SEARCH_LAUNCH_FLAGS] {
         assert!(!flags.contains(&"--permission-mode"));
         assert!(!flags.contains(&"--allowedTools"));
     }
@@ -265,6 +287,20 @@ fn permission_scenarios_keep_auto_mode_unapproved_and_client_classified() {
         ["--permission-mode", "acceptEdits", "--allowedTools", "Read"]
     );
     assert!(planning.as_std().get_envs().next().is_none());
+
+    // The web-search scenario preapproves only WebSearch, the single tool it
+    // exposes; the managed loop resolves it server-side so it is never run.
+    let web_search = configured_command(PermissionScenario::WebSearch);
+    let web_search_args = web_search
+        .as_std()
+        .get_args()
+        .map(|value| value.to_str().expect("test arguments should be UTF-8"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        web_search_args,
+        ["--permission-mode", "acceptEdits", "--allowedTools", "WebSearch"]
+    );
+    assert!(web_search.as_std().get_envs().next().is_none());
 }
 
 #[test]
@@ -291,6 +327,11 @@ const CONFIG_NATIVE: &str = "anthropic/messages-native-vllm.yaml";
 /// The transformed-vLLM example config under test: Anthropic Messages is
 /// translated to OpenAI Chat Completions for a Chat-Completions-only backend.
 const CONFIG_TRANSFORMED: &str = "anthropic/messages-to-openai-vllm.yaml";
+
+/// The agentic example config exercising the managed `anthropic_web_search`
+/// loop. It routes the model to the Chat Completions backend and runs a
+/// server-side web search through the configured provider during the IRR loop.
+const CONFIG_WEB_SEARCH: &str = "anthropic/full-flow-agentic.yaml";
 
 /// The client's native Anthropic `x-api-key`. Distinct from the gateway
 /// credential; the config's `headers` filter must strip it before vLLM.
@@ -394,6 +435,43 @@ const MUTATING_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "Bash"];
 /// which is how issue #1418 surfaced: reasoning rendered as the answer.
 const REASONING_LEAK_MARKERS: &[&str] = &["<think>", "</think>"];
 
+/// The managed web-search tool name the `anthropic_web_search` filter owns.
+///
+/// Claude Code's `--tools WebSearch` emits a plain tool named exactly this, which
+/// is the name the filter matches to take over the search server-side. It must
+/// never appear as a client-visible `tool_use`: the managed loop resolves and
+/// suppresses it.
+const MANAGED_WEB_SEARCH_TOOL: &str = "WebSearch";
+
+/// The server-side web-search prompt.
+///
+/// Directs the client to call `WebSearch` exactly once for a current, factual
+/// question it cannot answer from memory, so the managed loop in Praxis is
+/// exercised against real Tavily. `/no_think` suppresses Qwen3 thinking, matching
+/// [`PROMPT`]; this scenario is about the search round-trip, not reasoning.
+const WEB_SEARCH_PROMPT: &str = "Use the WebSearch tool to answer. \
+     You MUST call the WebSearch tool exactly once before answering; do not answer from memory. \
+     Search the web for: who won the most recent FIFA World Cup, and in what year. \
+     After you receive the search results, reply with a single concise sentence citing the winner \
+     and the year. /no_think";
+
+/// Pinned launch flags for the server-side web-search scenario.
+///
+/// PIN: keep in sync with `[claude_code.launch.web_search]` in the manifest.
+/// Exposing only `WebSearch` keeps the request's single tool the managed one, so
+/// the trace cannot be satisfied by any other tool and the only path to an answer
+/// is through the server-side search loop.
+const WEB_SEARCH_LAUNCH_FLAGS: &[&str] = &[
+    "--tools",
+    "WebSearch",
+    "--strict-mcp-config",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--max-turns",
+    "8",
+];
+
 /// What one scenario asks the client to do, and with which capabilities.
 ///
 /// The three travel together: a prompt is only meaningful alongside the tools
@@ -415,6 +493,12 @@ impl Turn {
         prompt: PLANNING_PROMPT,
         launch_flags: PLANNING_LAUNCH_FLAGS,
         permission_scenario: PermissionScenario::ReadOnlyPlanning,
+    };
+    /// The server-side web-search turn (real Tavily through the managed loop).
+    const WEB_SEARCH: Self = Self {
+        prompt: WEB_SEARCH_PROMPT,
+        launch_flags: WEB_SEARCH_LAUNCH_FLAGS,
+        permission_scenario: PermissionScenario::WebSearch,
     };
 
     /// The deterministic coding task under one of its permission scenarios.
@@ -510,6 +594,39 @@ async fn pinned_claude_code_planning_turn_converges_without_reasoning_leakage_on
         return;
     };
     run_planning_flow(&live, native_vllm_config).await;
+}
+
+/// Prove the pinned Claude Code client's built-in `WebSearch` tool is resolved
+/// SERVER-SIDE by the managed `anthropic_web_search` loop against real Tavily.
+///
+/// This closes a coverage gap: the other scenarios exercise no web search at all,
+/// and Tavily is otherwise only driven through the raw Anthropic SDK, never the
+/// real CLI harness. The full chain under test is:
+///
+/// ```text
+/// Claude Code (--tools WebSearch) -> Praxis /v1/messages
+///   -> anthropic_web_search managed IRR loop -> real Tavily -> text answer -> CLI
+/// ```
+///
+/// A loopback capture-relay sits between Praxis and Tavily. It is NOT a mock: it
+/// forwards every request verbatim to real Tavily and returns Tavily's real
+/// response, recording the exchange so the test can prove a live search actually
+/// ran. That ground truth is necessary because the managed loop suppresses the
+/// `WebSearch` tool_use and falls back to an `is_error` tool result on provider
+/// failure, so a client-only "got an answer" assertion would pass even against a
+/// broken integration.
+///
+/// Gated on the full live stack AND a real [`TAVILY_API_KEY_ENV`]; skips cleanly
+/// when either is absent unless the matching require-live variable is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_claude_code_resolves_server_side_web_search_through_tavily() {
+    let Some(live) = LiveConfig::from_env() else {
+        return;
+    };
+    let Some(tavily_key) = live_tavily_key() else {
+        return;
+    };
+    run_web_search_flow(&live, &tavily_key).await;
 }
 
 /// What a given acceptance path must prove beyond task completion.
@@ -644,6 +761,39 @@ async fn run_planning_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16)
     assert_child_completed(&output, "planning turn");
 }
 
+/// Drives one web-search turn and asserts the search was resolved server-side
+/// against real Tavily, observed through the capture-relay.
+///
+/// The relay runs on the host (where Praxis runs and makes its outbound calls),
+/// not inside the client's network namespace, so egress isolation is unaffected:
+/// the client still reaches only Praxis, and Praxis reaches the loopback relay
+/// which reaches real Tavily.
+async fn run_web_search_flow(live: &LiveConfig, tavily_key: &str) {
+    assert_pinned_version(&live.claude_bin).await;
+    live.require_egress_isolation_if_demanded();
+
+    let relay = start_tavily_relay();
+    let relay_port = relay.port();
+    let (proxy, _admin_address) = start_isolated_proxy(live, |live, proxy_port| {
+        web_search_config(live, proxy_port, relay_port, tavily_key)
+    });
+    let proxy_base_url = format!("http://{}", proxy.addr());
+
+    let project = tempfile::tempdir().expect("temporary web-search project directory should be created");
+    let output = launch_claude_code(live, &proxy_base_url, project.path(), Turn::WEB_SEARCH).await;
+    assert_not_timed_out(&output, "web-search turn");
+
+    // Diagnose from the trace and the observed Tavily exchange BEFORE asserting
+    // the exit status: a backend that never calls WebSearch, or a managed loop
+    // that silently fell back to the `is_error` tool result, still exits cleanly,
+    // so a bare status assertion would miss the real failure.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Err(reason) = check_server_side_web_search(&stdout, &relay.captures(), tavily_key) {
+        panic!("{reason}\nstdout:\n{stdout}");
+    }
+    assert_child_completed(&output, "web-search turn");
+}
+
 /// Starts Praxis for one live run, proving the client cannot bypass it.
 ///
 /// Praxis binds the configured address and forwards Anthropic Messages traffic
@@ -656,7 +806,7 @@ async fn run_planning_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16)
 /// `ANTHROPIC_BASE_URL` that a client is free to ignore.
 fn start_isolated_proxy(
     live: &LiveConfig,
-    build_config: fn(&LiveConfig, u16) -> Config,
+    build_config: impl FnOnce(&LiveConfig, u16) -> Config,
 ) -> (ProxyGuard, Option<String>) {
     let proxy_port = free_port();
     let config = build_config(live, proxy_port);
@@ -786,6 +936,30 @@ fn env_is_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads the real Tavily API key, returning `None` (with a skip message) when it
+/// is unset — unless [`REQUIRE_LIVE_WEB_SEARCH_ENV`] is truthy, in which case a
+/// missing key is a hard failure so a CI nightly cannot pass by skipping the
+/// real-Tavily path.
+fn live_tavily_key() -> Option<String> {
+    if let Some(key) = std::env::var(TAVILY_API_KEY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(key);
+    }
+    assert!(
+        !env_is_truthy(REQUIRE_LIVE_WEB_SEARCH_ENV),
+        "{REQUIRE_LIVE_WEB_SEARCH_ENV} is set but {TAVILY_API_KEY_ENV} is missing or empty; \
+         the server-side web-search acceptance run must not be skipped when a live \
+         web-search run is required"
+    );
+    eprintln!(
+        "skipping Claude Code server-side web-search acceptance test; \
+         set {TAVILY_API_KEY_ENV} (and the full live stack) to run it"
+    );
+    None
+}
+
 /// Extracts a `host:port` authority from a base URL or an already-bare authority.
 fn authority_of(base: &str) -> String {
     base.trim()
@@ -839,6 +1013,84 @@ fn live_vllm_config(config: &str, live: &LiveConfig, proxy_port: u16) -> Config 
             &format!("password: {}", gateway_password()),
         );
     Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse {config}: {error}"))
+}
+
+/// Build the agentic web-search config for a live run against real Tavily.
+///
+/// Patches [`CONFIG_WEB_SEARCH`] so that:
+///   * the listener binds [`LiveConfig::listen_address`] on the free proxy port;
+///   * the model route marker becomes the live served model, so Claude Code's requests route to the Chat Completions
+///     backend;
+///   * the Chat Completions backend endpoint repoints at the real vLLM authority;
+///   * the `anthropic_web_search` provider key is inlined (the env var cannot be set from the test; see
+///     [`live_vllm_config`]) and its `base_url` points at the loopback capture-relay, which forwards to real Tavily;
+///     and
+///   * `allow_private_upstreams` is enabled so the executor permits the loopback relay callout (SSRF is enforced at
+///     connect time, gated by this flag).
+///
+/// Each replacement is checked so the test fails loudly if the example drifts out
+/// from under it rather than silently building an unpatched config.
+fn web_search_config(live: &LiveConfig, proxy_port: u16, relay_port: u16, tavily_key: &str) -> Config {
+    let path = example_config_path(CONFIG_WEB_SEARCH);
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let listener = format!("{}:{proxy_port}", live.listen_address);
+
+    // Quote the anchor (like the `8001` backend anchor below) so it matches only
+    // the listener `address:`, not the two curl-example comment URLs.
+    let patched = replace_once(
+        &yaml,
+        "\"127.0.0.1:8080\"",
+        &format!("\"{listener}\""),
+        "listener address",
+    );
+    let patched = replace_once(
+        &patched,
+        "x-praxis-ai-model: \"Qwen/Qwen3-8B\"",
+        &format!("x-praxis-ai-model: \"{}\"", live.model),
+        "chat-route model marker",
+    );
+    let patched = replace_once(
+        &patched,
+        "\"127.0.0.1:8001\"",
+        &format!("\"{}\"", live.vllm_authority),
+        "chat-completions backend endpoint",
+    );
+    // The provider key is inlined (not an env var the test cannot set) and the
+    // callout is pointed at the loopback relay. `base_url` must align with the
+    // 16-space-indented `api_key` key it follows, or the YAML scanner rejects it.
+    let patched = replace_once(
+        &patched,
+        "api_key: ${WEB_SEARCH_API_KEY}",
+        &format!("api_key: {tavily_key}\n                base_url: http://127.0.0.1:{relay_port}"),
+        "web-search provider key",
+    );
+    let patched = replace_once(
+        &patched,
+        "  allow_private_endpoints: true # example proxies to local backends",
+        "  allow_private_endpoints: true # example proxies to local backends\n  allow_private_upstreams: true",
+        "insecure_options private-upstream opt-in",
+    );
+
+    Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse {CONFIG_WEB_SEARCH}: {error}"))
+}
+
+/// Replaces the single occurrence of `from` with `to`, asserting the example
+/// contains `from` exactly once.
+///
+/// A silent no-op replacement would build a config that still carries a
+/// placeholder (an env-var token, the wrong backend, or the shipped listener),
+/// so every patch the live run depends on is checked against example drift. The
+/// exactly-once assertion additionally guards against an anchor that drift has
+/// made ambiguous: were a second occurrence to appear, `str::replace` would
+/// silently rewrite both, so the count is pinned here instead.
+fn replace_once(haystack: &str, from: &str, to: &str, what: &str) -> String {
+    let count = haystack.matches(from).count();
+    assert_eq!(
+        count, 1,
+        "{CONFIG_WEB_SEARCH} must contain the {what} anchor `{from}` exactly once, found {count}; \
+         update the test and the example together",
+    );
+    haystack.replace(from, to)
 }
 
 // -----------------------------------------------------------------------------
@@ -1621,6 +1873,130 @@ fn flatten_content(content: Option<&Value>) -> String {
     }
 }
 
+/// Returns a copy of a forwarded Tavily request with the secret `api_key`
+/// masked. Failure messages below are printed to stdout and, in CI, teed into a
+/// log that is uploaded as a build artifact — GitHub scrubs secrets from the
+/// live log stream but NOT from uploaded artifacts, so the real key must never
+/// reach a panic or `Err` string. The small clone is on a cold failure path and
+/// is necessary: the borrowed capture must not be mutated.
+fn redact_api_key(request: &Value) -> Value {
+    let mut redacted = request.clone();
+    if let Some(api_key) = redacted.get_mut("api_key") {
+        *api_key = Value::String("<redacted>".to_owned());
+    }
+    redacted
+}
+
+/// Asserts a web-search turn was resolved server-side against real Tavily.
+///
+/// Returns `Err(reason)` naming the first failure so the caller can attach the
+/// full stdout. Two independent kinds of evidence must agree:
+///
+///   * CLIENT TRACE — the turn converged on a text answer (`result` subtype `success`, not an error) with a non-empty
+///     final summary, and no `WebSearch` `tool_use` leaked to the client (the managed loop resolves and suppresses it;
+///     a leak means Praxis did not take over the tool); and
+///   * GROUND TRUTH — the capture-relay observed at least one real Tavily exchange: HTTP 200, the resolved API key
+///     carried in the request body, a non-empty reconstructed query, and a non-empty `results` array whose every source
+///     has an absolute URL. This is what a client-only assertion cannot prove, because the managed loop falls back to
+///     an `is_error` tool result on provider failure and the client would still "get an answer".
+fn check_server_side_web_search(
+    stdout: &str,
+    captures: &[TavilySearchCapture],
+    tavily_key: &str,
+) -> Result<(), String> {
+    let trace = ToolTrace::parse(stdout);
+
+    if trace.result_subtype.as_deref() != Some("success") {
+        return Err(format!(
+            "the web-search turn must converge on an answer; the client reported subtype {:?} after {:?} turns",
+            trace.result_subtype, trace.num_turns,
+        ));
+    }
+    if trace.result_is_error {
+        return Err("the web-search turn must not end in a client-reported error".to_owned());
+    }
+
+    // The managed loop owns WebSearch and suppresses its tool_use; a leaked
+    // WebSearch call means the client ran the search, not Praxis.
+    let leaked = trace
+        .tool_use_names()
+        .into_iter()
+        .filter(|name| *name == MANAGED_WEB_SEARCH_TOOL)
+        .count();
+    if leaked != 0 {
+        return Err(format!(
+            "the managed loop must resolve WebSearch server-side and suppress its tool_use, but {leaked} \
+             WebSearch tool_use block(s) reached the client; observed tool calls: {:?}",
+            trace.tool_use_names(),
+        ));
+    }
+
+    match trace.final_summary.as_deref() {
+        Some(summary) if summary.trim().len() >= 20 => {},
+        other => {
+            return Err(format!(
+                "the web-search turn must emit a non-empty final answer; got {other:?}"
+            ));
+        },
+    }
+
+    // Ground truth: a real Tavily search actually ran through the relay.
+    let Some(exchange) = captures.first() else {
+        return Err(
+            "no Tavily exchange was observed; the model never called WebSearch so the managed loop \
+             dispatched no server-side search"
+                .to_owned(),
+        );
+    };
+    if exchange.status != 200 {
+        return Err(format!(
+            "real Tavily must return HTTP 200; the relay observed status {} with body {}",
+            exchange.status, exchange.response,
+        ));
+    }
+    if exchange.request.get("api_key").and_then(Value::as_str) != Some(tavily_key) {
+        return Err(format!(
+            "the resolved Tavily key must travel in the forwarded request body; request was {}",
+            redact_api_key(&exchange.request),
+        ));
+    }
+    let query = exchange
+        .request
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query.trim().is_empty() {
+        return Err(format!(
+            "the reconstructed search query must be populated; request was {}",
+            redact_api_key(&exchange.request),
+        ));
+    }
+    let results = exchange.response.get("results").and_then(Value::as_array);
+    match results {
+        Some(results) if !results.is_empty() => {
+            let all_absolute = results.iter().all(|result| {
+                result
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
+            });
+            if !all_absolute {
+                return Err(format!(
+                    "every real Tavily source must carry an absolute URL; results were {results:?}"
+                ));
+            }
+        },
+        _ => {
+            return Err(format!(
+                "real Tavily must return a non-empty results array; response was {}",
+                exchange.response,
+            ));
+        },
+    }
+
+    Ok(())
+}
+
 #[test]
 fn tool_trace_selects_successful_verify_call_after_setup_call() {
     let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"setup","name":"Bash","input":{"command":"chmod +x ./verify.sh"}}]}}
@@ -1689,4 +2065,176 @@ fn tool_trace_reports_turn_budget_exhaustion_as_the_headless_loop_symptom() {
         trace.final_summary.is_none(),
         "an exhausted run carries no answer to mistake for one"
     );
+}
+
+/// A suppressed-and-resolved web-search transcript: the client converged on a
+/// text answer and NO `WebSearch` tool_use is present (the managed loop owns it).
+const SUPPRESSED_WEB_SEARCH_STDOUT: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Argentina won the most recent FIFA World Cup, in 2022."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Argentina won the most recent FIFA World Cup, in 2022."}"#;
+
+/// Builds one observed Tavily exchange for the checker's ground-truth assertions.
+fn tavily_capture(api_key: &str, query: &str, result_url: &str) -> TavilySearchCapture {
+    TavilySearchCapture {
+        request: serde_json::json!({ "api_key": api_key, "query": query }),
+        status: 200,
+        response: serde_json::json!({ "results": [{ "url": result_url }] }),
+    }
+}
+
+#[test]
+fn web_search_check_accepts_suppressed_resolution_with_real_exchange() {
+    let captures = [tavily_capture(
+        "tvly-key",
+        "most recent FIFA World Cup winner",
+        "https://fifa.com/worldcup",
+    )];
+    assert_eq!(
+        check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key"),
+        Ok(())
+    );
+}
+
+#[test]
+fn web_search_check_rejects_leaked_client_side_tool_use() {
+    // The failure the relay exists to catch would still "get an answer", but a
+    // WebSearch tool_use reaching the client means Praxis did NOT take over.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ws","name":"WebSearch","input":{"query":"fifa world cup"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ws","content":"Argentina, 2022"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Argentina won the most recent World Cup, in 2022."}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Argentina won the most recent World Cup, in 2022."}"#;
+    let captures = [tavily_capture("tvly-key", "fifa world cup", "https://fifa.com")];
+
+    let error = check_server_side_web_search(stdout, &captures, "tvly-key").expect_err("a leaked WebSearch must fail");
+    assert!(error.contains("suppress its tool_use"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_missing_tavily_exchange() {
+    // The model converged without ever searching: no exchange was observed.
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &[], "tvly-key")
+        .expect_err("a converged turn with no search must fail");
+    assert!(error.contains("no Tavily exchange"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_mismatched_provider_key() {
+    let captures = [tavily_capture("wrong-key", "fifa world cup", "https://fifa.com")];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("a mismatched provider key must fail");
+    assert!(
+        error.contains("must travel in the forwarded request body"),
+        "unexpected reason: {error}"
+    );
+}
+
+#[test]
+fn web_search_check_rejects_relative_source_url() {
+    let captures = [tavily_capture("tvly-key", "fifa world cup", "/relative/path")];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("a relative source URL must fail");
+    assert!(error.contains("absolute URL"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_nonconvergent_subtype() {
+    // The turn burned its budget without answering: a non-`success` subtype must
+    // fail even though the relay did observe a real exchange.
+    let stdout = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":8,"result":null}"#;
+    let captures = [tavily_capture("tvly-key", "fifa world cup", "https://fifa.com")];
+    let error =
+        check_server_side_web_search(stdout, &captures, "tvly-key").expect_err("a non-success subtype must fail");
+    assert!(
+        error.contains("must converge on an answer"),
+        "unexpected reason: {error}"
+    );
+}
+
+#[test]
+fn web_search_check_rejects_client_reported_error() {
+    // A `success` subtype that still carries `is_error` must fail: the client
+    // flagged the turn as errored.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Argentina won the most recent FIFA World Cup, in 2022."}]}}
+{"type":"result","subtype":"success","is_error":true,"num_turns":2,"result":"Argentina won the most recent FIFA World Cup, in 2022."}"#;
+    let captures = [tavily_capture("tvly-key", "fifa world cup", "https://fifa.com")];
+    let error =
+        check_server_side_web_search(stdout, &captures, "tvly-key").expect_err("a client-reported error must fail");
+    assert!(
+        error.contains("must not end in a client-reported error"),
+        "unexpected reason: {error}"
+    );
+}
+
+#[test]
+fn web_search_check_rejects_short_final_summary() {
+    // A converged, suppressed turn whose answer is too short to be a real one
+    // must fail the non-empty-answer threshold.
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Argentina"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Argentina"}"#;
+    let captures = [tavily_capture("tvly-key", "fifa world cup", "https://fifa.com")];
+    let error =
+        check_server_side_web_search(stdout, &captures, "tvly-key").expect_err("a too-short final answer must fail");
+    assert!(
+        error.contains("must emit a non-empty final answer"),
+        "unexpected reason: {error}"
+    );
+}
+
+#[test]
+fn web_search_check_rejects_non_200_tavily_status() {
+    // The managed loop converged (an `is_error` tool result still "gets an
+    // answer"), but the relay saw real Tavily reject the call: ground truth fails.
+    let captures = [TavilySearchCapture {
+        request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup" }),
+        status: 401,
+        response: serde_json::json!({ "error": "unauthorized" }),
+    }];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("a non-200 Tavily status must fail");
+    assert!(error.contains("must return HTTP 200"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_empty_search_query() {
+    // A 200 with the right key but no reconstructed query means no real search
+    // was dispatched.
+    let captures = [TavilySearchCapture {
+        request: serde_json::json!({ "api_key": "tvly-key", "query": "   " }),
+        status: 200,
+        response: serde_json::json!({ "results": [{ "url": "https://fifa.com" }] }),
+    }];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("an empty search query must fail");
+    assert!(error.contains("query must be populated"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_check_rejects_empty_results_array() {
+    // A 200 with the right key and a query but no results means Tavily returned
+    // nothing to ground the answer on.
+    let captures = [TavilySearchCapture {
+        request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup" }),
+        status: 200,
+        response: serde_json::json!({ "results": [] }),
+    }];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("an empty results array must fail");
+    assert!(error.contains("non-empty results array"), "unexpected reason: {error}");
+}
+
+#[test]
+fn web_search_config_patches_the_example_into_a_valid_config() {
+    // Validates offline that every anchor still exists and that the inlined key
+    // plus loopback `base_url` produce YAML that parses — the 16-space `base_url`
+    // must align with the `api_key` key it follows, or the scanner rejects it.
+    let live = LiveConfig {
+        claude_bin: OsString::from("/usr/bin/claude"),
+        vllm_authority: "127.0.0.1:9000".to_owned(),
+        model: "qwen3-8b".to_owned(),
+        listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        netns: None,
+    };
+
+    // Building the config must not panic: replace_once asserts each anchor and
+    // Config::from_yaml asserts the patched YAML parses.
+    let _config = web_search_config(&live, 18080, 19090, "tvly-test-key");
 }

@@ -16,6 +16,12 @@
 # reasoning-channel text reaches the user-visible answer. See
 # `[claude_code.launch.planning]` below for its pins and its scope.
 #
+# A sixth scenario drives the client's built-in WebSearch tool through Praxis's
+# managed `anthropic_web_search` loop against REAL Tavily, over the agentic example
+# config routed onto the Chat Completions backend, proving the search is resolved
+# SERVER-SIDE (the managed tool_use is suppressed) rather than by the client. It is
+# gated additionally on a real TAVILY_API_KEY. See `[claude_code.launch.web_search]`.
+#
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
 # lightweight `pins` job parses this manifest and exports its runtime values.
@@ -109,6 +115,46 @@ allowed_tools = ["Read"]
 reasoning_leak_markers = ["<think>", "</think>"]
 flags = [
   "--tools", "Read",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
+# Server-side web-search scenario. Keep in sync with WEB_SEARCH_LAUNCH_FLAGS and
+# PermissionScenario::WebSearch in claude_code_vllm.rs.
+#
+# Proves the pinned client's built-in `WebSearch` tool is resolved SERVER-SIDE by
+# Praxis's managed `anthropic_web_search` loop against REAL Tavily, over the
+# agentic example config (`examples/configs/anthropic/full-flow-agentic.yaml`),
+# routed by model onto the Chat Completions backend. The full chain is:
+#   Claude Code (--tools WebSearch) -> Praxis /v1/messages
+#     -> anthropic_web_search managed IRR loop -> real Tavily -> text answer -> CLI
+#
+# Only `WebSearch` is exposed, so the request's single tool is the managed one and
+# the only path to an answer is the server-side search. The managed loop SUPPRESSES
+# the `WebSearch` tool_use, so a client-visible WebSearch call is a failure, not a
+# success. `/no_think` is used (like the coding task): this scenario is about the
+# search round-trip, not reasoning.
+#
+# NOT a mock: a loopback capture-relay forwards each request verbatim to real
+# Tavily and returns Tavily's real response, recording the exchange so the test
+# can prove a live search ran — necessary because the managed loop falls back to an
+# `is_error` tool result on provider failure, which a client-only assertion would
+# not catch.
+#
+# Requires a real TAVILY_API_KEY (the search provider key, which Tavily carries in
+# the request body). Gated independently of the vLLM live stack: absent the key the
+# scenario skips unless PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH is set.
+[claude_code.launch.web_search]
+exposed_tools = ["WebSearch"]
+permission_mode = "acceptEdits"
+allowed_tools = ["WebSearch"]
+# The managed tool name the `anthropic_web_search` filter owns and suppresses.
+managed_tool = "WebSearch"
+provider = "tavily"
+flags = [
+  "--tools", "WebSearch",
   "--strict-mcp-config",
   "--output-format", "stream-json",
   "--verbose",
