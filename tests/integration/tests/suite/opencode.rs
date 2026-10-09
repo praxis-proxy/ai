@@ -277,8 +277,14 @@ fn model_object(headers: Option<Value>) -> Value {
 
 /// The full client configuration for a lane.
 ///
-/// `plugin` is only set for the plugin lane; the entry is a path relative to
-/// the configuration directory the caller seeded.
+/// The `plugin` array is declared whenever the plugin file is seeded on disk —
+/// every lane except `ModelHeaders` — so the `PureIgnoresPlugin` inversion lane
+/// has a DECLARED plugin for `--pure` to ignore. OpenCode loads plugins only
+/// from this array (there is no config-dir auto-discovery), so an undeclared
+/// plugin never loads with or without `--pure`; declaring it only for the
+/// non-pure lane would make `--pure` a no-op and the inversion prove nothing.
+/// The entry is a path relative to the configuration directory the caller
+/// seeded.
 pub(super) fn client_config(base_url: &str, model: &str, lane: AuthLane) -> Value {
     let headers = (lane == AuthLane::ModelHeaders).then(|| json!({"Authorization": gateway_credential()}));
     let mut config = json!({
@@ -293,7 +299,10 @@ pub(super) fn client_config(base_url: &str, model: &str, lane: AuthLane) -> Valu
             },
         },
     });
-    if !lane.is_pure() {
+    // Declare the plugin on every lane that seeds it (mirrors `seed_config_dir`),
+    // NOT only the non-pure lanes: `PureIgnoresPlugin` must declare it so `--pure`
+    // has a plugin to ignore, otherwise the inversion lane is vacuous.
+    if lane != AuthLane::ModelHeaders {
         config["plugin"] = json!(["./praxis-auth.ts"]);
     }
     config
@@ -941,6 +950,31 @@ fn pure_lanes_pass_the_pure_flag() {
             .iter()
             .any(|arg| arg == "--pure"),
         "the plugin lane must load the plugin"
+    );
+}
+
+#[test]
+fn pure_inversion_lane_declares_a_plugin_for_pure_to_ignore() {
+    // The inversion lane's whole purpose is proving `--pure` ignores a DECLARED
+    // plugin. OpenCode loads plugins only from the config `plugin` array, so if
+    // this lane omitted the declaration the 401 would come from the plugin never
+    // loading rather than from `--pure` ignoring it, and the lane would prove
+    // nothing. Guard the declaration (and the still-present `--pure`) offline.
+    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::PureIgnoresPlugin);
+    assert_eq!(
+        config["plugin"],
+        json!(["./praxis-auth.ts"]),
+        "the inversion lane must declare the plugin so --pure has something to ignore"
+    );
+    assert!(
+        run_args(AuthLane::PureIgnoresPlugin, MODEL_ID, PROMPT)
+            .iter()
+            .any(|arg| arg == "--pure"),
+        "the inversion lane must still pass --pure"
+    );
+    assert!(
+        config["provider"][PROVIDER_ID]["models"][MODEL_ID]["headers"].is_null(),
+        "the inversion lane must rely on the ignored plugin alone, with no declarative header"
     );
 }
 

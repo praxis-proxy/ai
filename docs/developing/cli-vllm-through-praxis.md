@@ -152,8 +152,8 @@ cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
 
 OpenCode was tested with the
 [native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
-Its catch-all route forwards `/v1/chat/completions` to vLLM without body
-translation, and Anthropic validation is scoped to `/v1/messages`.
+It declares an explicit `/v1/chat/completions` route that forwards to vLLM
+without body translation, and Anthropic validation is scoped to `/v1/messages`.
 The same gateway can serve both Claude Code and OpenCode, provided vLLM
 supports their respective endpoints.
 
