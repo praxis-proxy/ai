@@ -51,9 +51,9 @@ const ASSERTION_LIFETIME: Duration = Duration::from_secs(600);
 /// keys.
 const ASSERTION_HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
 
-/// The only non-loopback token-endpoint host accepted for
-/// [`TokenSource::ServiceAccountKey`]: Google's `OAuth2` token endpoint.
-const GOOGLE_TOKEN_HOST: &str = "oauth2.googleapis.com";
+/// The only token endpoint a key file's `token_uri` may name: Google's
+/// `OAuth2` token endpoint.
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 // -----------------------------------------------------------------------------
 // TokenSource
@@ -87,14 +87,9 @@ pub(super) struct ServiceAccountKey {
     /// file's PEM.
     pub private_key: PKey<Private>,
 
-    /// Fully validated token endpoint URL (`token_uri`).
+    /// Validated token endpoint URL (`token_uri`): [`GOOGLE_TOKEN_URL`]
+    /// outside this crate's unit tests.
     pub token_url: String,
-
-    /// Whether [`Self::token_url`] targets the loopback address. Only
-    /// true for test fixtures; production key files carry
-    /// [`GOOGLE_TOKEN_HOST`]. Selects the address policy of the pinned
-    /// client, mirroring how `metadata_host` accepts loopback for tests.
-    pub loopback_test: bool,
 }
 
 impl fmt::Debug for ServiceAccountKey {
@@ -102,7 +97,6 @@ impl fmt::Debug for ServiceAccountKey {
         f.debug_struct("ServiceAccountKey")
             .field("client_email", &self.client_email)
             .field("token_url", &self.token_url)
-            .field("loopback_test", &self.loopback_test)
             .finish_non_exhaustive()
     }
 }
@@ -146,7 +140,7 @@ pub(super) async fn fetch(
             fetch_metadata_token(client, metadata_host, service_account, scope, timeout).await
         },
         TokenSource::ServiceAccountKey(key) => {
-            fetch_service_account_token(client, key, scope, timeout, service_account_address_policy(key)).await
+            fetch_service_account_token(client, key, scope, timeout, token_address_policy(&key.token_url)).await
         },
     }
 }
@@ -156,10 +150,8 @@ pub(super) async fn fetch(
 /// The metadata protocol intentionally targets a private endpoint. The
 /// configured host is separately restricted to Google's metadata hostname.
 ///
-/// The service-account key source's address policy follows the key file's
-/// validated `token_uri`: public-only for [`GOOGLE_TOKEN_HOST`],
-/// loopback-allowed only for the loopback test fixture the config
-/// validators admit.
+/// The service-account key source only reaches Google's public token
+/// endpoint, so it is public-only.
 pub(super) async fn fetch_pinned(
     client: &SubRequestClient,
     source: &TokenSource,
@@ -173,7 +165,7 @@ pub(super) async fn fetch_pinned(
             fetch_metadata_token_url(client, &url, timeout, metadata_address_policy(metadata_host)).await
         },
         TokenSource::ServiceAccountKey(key) => {
-            fetch_service_account_token(client, key, scope, timeout, service_account_address_policy(key)).await
+            fetch_service_account_token(client, key, scope, timeout, token_address_policy(&key.token_url)).await
         },
     }
 }
@@ -194,14 +186,20 @@ fn metadata_address_policy(_metadata_host: &str) -> AddressPolicy {
     AddressPolicy::AllowGoogleMetadata
 }
 
-/// Public-only for Google's token endpoint; loopback-allowed only for the
-/// loopback test fixture [`validate_token_uri`] admits.
-fn service_account_address_policy(key: &ServiceAccountKey) -> AddressPolicy {
-    if key.loopback_test {
-        AddressPolicy::AllowPrivate
-    } else {
-        AddressPolicy::PublicOnly
+/// Use the production public-only policy except for the loopback mocks
+/// [`validate_token_uri`] admits in this crate's unit tests.
+#[cfg(test)]
+fn token_address_policy(token_url: &str) -> AddressPolicy {
+    if token_url == GOOGLE_TOKEN_URL {
+        return AddressPolicy::PublicOnly;
     }
+    AddressPolicy::AllowPrivate
+}
+
+/// Google's token endpoint is public; production builds reach nothing else.
+#[cfg(not(test))]
+fn token_address_policy(_token_url: &str) -> AddressPolicy {
+    AddressPolicy::PublicOnly
 }
 
 /// Acquire a token from the GCE/GKE metadata server.
@@ -476,12 +474,10 @@ fn service_account_source(parsed: GoogleApplicationCredentials) -> Result<TokenS
         .filter(|uri| !uri.is_empty())
         .ok_or_else(|| FilterError::from("gcp_adc: credentials file is missing token_uri"))?;
     let token_url = validate_token_uri(&token_uri)?;
-    let loopback_test = token_url.starts_with("http://127.0.0.1");
     Ok(TokenSource::ServiceAccountKey(ServiceAccountKey {
         client_email,
         private_key: parse_private_key(&private_key)?,
         token_url,
-        loopback_test,
     }))
 }
 
@@ -504,40 +500,37 @@ fn parse_private_key(pem: &str) -> Result<PKey<Private>, FilterError> {
     Ok(key)
 }
 
-/// Validate a key file's `token_uri` to the exact set of endpoints this
-/// filter may call: Google's `OAuth2` token endpoint over `HTTPS`, or a
-/// `127.0.0.1` `HTTP` address (test fixtures only, same convention as
-/// `metadata_host`). Everything else — any other host, any other scheme,
-/// embedded credentials, query or fragment — is invalid configuration,
-/// so a tampered key file can never point the signed assertion at an
-/// attacker's endpoint.
+/// Accept only Google's `OAuth2` token endpoint as a key file's
+/// `token_uri`, compared after URL normalization, so a tampered key file can
+/// never send the signed assertion anywhere else: any other scheme, host,
+/// port, path, userinfo, query, or fragment is invalid configuration.
+/// Unit-test builds additionally accept a plain `http` literal IPv4 loopback
+/// endpoint so the mint can run against an in-process mock.
+///
+/// Errors never echo the value: a malformed URL may carry credentials.
 fn validate_token_uri(raw: &str) -> Result<String, FilterError> {
-    let parsed = url::Url::parse(raw).map_err(|e| {
-        FilterError::from(format!(
-            "gcp_adc: credentials file token_uri '{raw}' is not a valid URL: {e}"
-        ))
-    })?;
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| FilterError::from(format!("gcp_adc: credentials file token_uri is not a valid URL: {e}")))?;
+    let is_allowed = parsed.as_str() == GOOGLE_TOKEN_URL;
+    #[cfg(test)]
+    let is_allowed = is_allowed || is_loopback_test_endpoint(&parsed);
+    if !is_allowed {
         return Err(FilterError::from(format!(
-            "gcp_adc: credentials file token_uri '{raw}' must not contain credentials, a query, or a fragment"
-        )));
-    }
-    let host = parsed.host_str().ok_or_else(|| {
-        FilterError::from(format!(
-            "gcp_adc: credentials file token_uri '{raw}' must include a host"
-        ))
-    })?;
-    let allowed =
-        (parsed.scheme() == "https" && host == GOOGLE_TOKEN_HOST) || (parsed.scheme() == "http" && host == "127.0.0.1");
-    if !allowed {
-        return Err(FilterError::from(format!(
-            "gcp_adc: credentials file token_uri '{raw}' is not allowed: only 'https://{GOOGLE_TOKEN_HOST}' \
-             (or an http://127.0.0.1 test fixture) may be used as the token endpoint"
+            "gcp_adc: credentials file token_uri must be '{GOOGLE_TOKEN_URL}'; no other token endpoint may \
+             receive the signed assertion"
         )));
     }
     Ok(parsed.into())
+}
+
+/// A plain `http` endpoint on literal `127.0.0.1` with no userinfo, query,
+/// or fragment: the in-process token endpoint mock of this crate's tests.
+#[cfg(test)]
+fn is_loopback_test_endpoint(url: &url::Url) -> bool {
+    url.scheme() == "http"
+        && url.host() == Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }

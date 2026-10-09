@@ -453,7 +453,7 @@ fn adc_with_service_account_json_selects_key_file() {
         matches!(
             &source,
             TokenSource::ServiceAccountKey(key)
-                if key.client_email == TEST_SA_EMAIL && key.token_url == GOOGLE_TOKEN_URL && !key.loopback_test
+                if key.client_email == TEST_SA_EMAIL && key.token_url == GOOGLE_TOKEN_URL
         ),
         "identity and token endpoint must come from the file, got {source:?}"
     );
@@ -548,15 +548,24 @@ fn key_file_rejects_incomplete_credentials() {
 #[test]
 fn key_file_rejects_untrusted_token_uri() {
     // The token endpoint is where the signed assertion goes; only
-    // Google's HTTPS endpoint (or a loopback test fixture) may be used.
+    // Google's exact HTTPS endpoint (or a loopback test fixture) may be used.
     for token_uri in [
         "https://evil.example.com/token",
         "https://oauth2.googleapis.com.evil.test/token",
         "http://oauth2.googleapis.com/token",
         "http://169.254.169.254/token",
         "https://oauth2.googleapis.com/token?redirect=evil",
+        "https://oauth2.googleapis.com/token#fragment",
         "https://user:pass@oauth2.googleapis.com/token",
+        "https://oauth2.googleapis.com:8443/token",
+        "https://oauth2.googleapis.com/token/",
+        "https://oauth2.googleapis.com/v4/token",
         "ftp://oauth2.googleapis.com/token",
+        "http://localhost:9/token",
+        "https://127.0.0.1:9/token",
+        "http://user@127.0.0.1:9/token",
+        "http://127.0.0.1:9/token?x=1",
+        "not a url",
     ] {
         let file = write_service_account_key_file(token_uri);
         let config = parse_gcp_adc_config(&yaml(&format!(
@@ -576,9 +585,45 @@ fn key_file_rejects_untrusted_token_uri() {
 fn key_file_accepts_loopback_token_uri_as_test_fixture() {
     let source = service_account_key_source("http://127.0.0.1:9/token");
     assert!(
-        matches!(&source, TokenSource::ServiceAccountKey(key) if key.loopback_test),
-        "loopback fixture must be flagged, got {source:?}"
+        matches!(&source, TokenSource::ServiceAccountKey(key) if key.token_url == "http://127.0.0.1:9/token"),
+        "unit-test builds must admit the loopback mock endpoint, got {source:?}"
     );
+}
+
+#[test]
+fn key_file_accepts_normalized_google_token_uri() {
+    for token_uri in [
+        "https://oauth2.googleapis.com:443/token",
+        "HTTPS://OAUTH2.GOOGLEAPIS.COM/token",
+    ] {
+        let source = service_account_key_source(token_uri);
+        assert!(
+            matches!(&source, TokenSource::ServiceAccountKey(key) if key.token_url == GOOGLE_TOKEN_URL),
+            "{token_uri} is Google's endpoint and must normalize to it, got {source:?}"
+        );
+    }
+}
+
+#[test]
+fn token_uri_errors_do_not_echo_credentials() {
+    for token_uri in [
+        "https://user:hunter2@oauth2.googleapis.com/token",
+        "https://user:hunter2@evil.example.com/token",
+        "https://user:hunter2@[bad/token",
+    ] {
+        let file = write_service_account_key_file(token_uri);
+        let message = resolve_key_file(&file)
+            .expect_err("a token_uri with credentials must be rejected")
+            .to_string();
+        assert!(
+            message.contains("token_uri"),
+            "error should name token_uri, got: {message}"
+        );
+        assert!(
+            !message.contains("hunter2"),
+            "error must not echo URL credentials, got: {message}"
+        );
+    }
 }
 
 #[test]
