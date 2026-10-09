@@ -9,7 +9,7 @@ Maps stable client-facing model IDs to an internal provider selector and provide
 
 An exact model/path match sets `x-praxis-ai-provider` for the `router`, rewrites the JSON body model, and records the client ID in filter metadata for provider response adapters. Unknown models and paths pass through. Configuration is pipeline-local: the filter performs no Kubernetes or other control-plane lookups.
 
-The filter does not restore the client-facing model ID in responses, so a provider that echoes the model it served returns `target_model` to the client. A provider response adapter that needs the client-facing ID must read it from the `model_to_provider.client_model` metadata key.
+The filter does not restore the client-facing model ID in responses, so a provider that echoes the model it served returns `target_model` to the client unless a provider response adapter reads the client-facing ID back from the `model_to_provider.client_model` metadata key, as the `anthropic_messages_to_vertexai_anthropic` translation does.
 
 ## Configuration
 

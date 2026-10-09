@@ -7,6 +7,8 @@ Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex resp
 
 ## Configuration Notes
 
+Responses carry the model id the client sent: the prefixed Vertex target, or the public id that `model_to_provider` recorded in the `model_to_provider.client_model` metadata when it mapped the request onto that target earlier in the chain.
+
 Experimental: requires the `vertex-anthropic-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
 
 ## Configuration

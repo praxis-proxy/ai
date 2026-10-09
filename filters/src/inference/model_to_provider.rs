@@ -101,8 +101,9 @@ struct ModelProviderMapping {
 ///
 /// The filter does not restore the client-facing model ID in responses, so a
 /// provider that echoes the model it served returns `target_model` to the
-/// client. A provider response adapter that needs the client-facing ID must
-/// read it from the `model_to_provider.client_model` metadata key.
+/// client unless a provider response adapter reads the client-facing ID back
+/// from the `model_to_provider.client_model` metadata key, as the
+/// `anthropic_messages_to_vertexai_anthropic` translation does.
 ///
 /// # YAML configuration
 ///

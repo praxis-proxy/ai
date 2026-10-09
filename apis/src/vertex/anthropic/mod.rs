@@ -53,9 +53,10 @@ use tracing::debug;
 
 use self::{
     config::{FILTER_NAME, VertexAnthropicConfig, build_config},
-    request::{classify, transform_request},
+    request::{Operation, TransformedRequest, classify, transform_request},
 };
 use crate::{
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     anthropic::{ErrorType, error_rejection, invalid_request_rejection},
     openai::sse::SseFrameParser,
 };
@@ -92,6 +93,11 @@ const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 
 /// Translates Anthropic Messages requests to Vertex AI `rawPredict` and
 /// Vertex responses back to the Anthropic dialect.
+///
+/// Responses carry the model id the client sent: the prefixed Vertex target,
+/// or the public id that `model_to_provider` recorded in the
+/// `model_to_provider.client_model` metadata when it mapped the request onto
+/// that target earlier in the chain.
 ///
 /// Experimental: requires the `vertex-anthropic-filter` cargo feature,
 /// which is off by default and activates the `experimental` marker. This
@@ -171,6 +177,40 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
             queue_header_set(ctx, ANTHROPIC_BETA, joined);
         }
     }
+
+    /// Install a translated request: header hygiene, the route marker, the
+    /// metadata the response side keys on, and the rewritten body.
+    fn apply_transformed(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        operation: Operation,
+        transformed: TransformedRequest,
+    ) {
+        self.filter_beta_flags(ctx);
+        // Responses are patched in place, so Vertex must answer uncompressed.
+        queue_header_removal(ctx, http::header::ACCEPT_ENCODING);
+        queue_header_removal(ctx, X_API_KEY);
+        // When model_to_provider mapped a public model id onto the Vertex
+        // target earlier in the chain, the client sent that public id, so it
+        // is the one responses must carry back.
+        let user_model = ctx
+            .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+            .map_or(transformed.user_model, str::to_owned);
+        debug!(
+            model = %user_model,
+            path = %transformed.path,
+            "translated Anthropic request to Vertex rawPredict"
+        );
+        ctx.rewritten_path = Some(transformed.path);
+        queue_header_set(ctx, ROUTE_HEADER, ROUTE_VALUE);
+        // Marks "this request was transformed"; response-side transforms only
+        // run for marked requests. Set here (not in on_request) because the
+        // pre-read body phase may run before the request phase.
+        ctx.set_metadata(OPERATION_KEY, operation.as_str());
+        ctx.set_metadata(MODEL_KEY, user_model);
+        *body = Some(Bytes::from(transformed.body));
+    }
 }
 
 #[async_trait]
@@ -226,30 +266,12 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         };
         match transform_request(bytes, operation, &self.config) {
             Ok(Some(transformed)) => {
-                self.filter_beta_flags(ctx);
-                // Responses are patched in place, so Vertex must answer
-                // uncompressed.
-                queue_header_removal(ctx, http::header::ACCEPT_ENCODING);
-                queue_header_removal(ctx, X_API_KEY);
-                debug!(
-                    model = %transformed.user_model,
-                    path = %transformed.path,
-                    "translated Anthropic request to Vertex rawPredict"
-                );
-                ctx.rewritten_path = Some(transformed.path);
-                queue_header_set(ctx, ROUTE_HEADER, ROUTE_VALUE);
-                // Marks "this request was transformed"; response-side
-                // transforms only run for marked requests. Set here (not
-                // in on_request) because the pre-read body phase may run
-                // before the request phase.
-                ctx.set_metadata(OPERATION_KEY, operation.as_str());
-                ctx.set_metadata(MODEL_KEY, transformed.user_model);
-                *body = Some(Bytes::from(transformed.body));
+                self.apply_transformed(ctx, body, operation, transformed);
+                Ok(FilterAction::Continue)
             },
-            Ok(None) => return Ok(FilterAction::Continue),
-            Err(error) => return Ok(FilterAction::Reject(invalid_request_rejection(&error.to_string()))),
+            Ok(None) => Ok(FilterAction::Continue),
+            Err(error) => Ok(FilterAction::Reject(invalid_request_rejection(&error.to_string()))),
         }
-        Ok(FilterAction::Continue)
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -991,6 +1013,43 @@ mod tests {
         let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
         assert_eq!(out["model"], "vertex/claude-sonnet-4-5");
         assert_eq!(out["usage"]["input_tokens"], 2, "metering payload preserved");
+    }
+
+    #[tokio::test]
+    async fn model_to_provider_client_model_is_restored_instead_of_the_target() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        // model_to_provider mapped the public id onto the prefixed target
+        // before this filter ran.
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.rewritten_path.as_deref(),
+            Some("/v1/projects/demo/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict"),
+            "the prefixed target still selects the publisher model"
+        );
+        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("claude-sonnet-4-5"));
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        ctx.response_header = Some(&mut response);
+        filter.on_response(&mut ctx).await.unwrap();
+
+        let mut body = Some(Bytes::from_static(
+            br#"{"id":"msg_vrtx_2","type":"message","model":"claude-sonnet-4-5-20250929"}"#,
+        ));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
+        assert_eq!(
+            out["model"], "claude-sonnet-4-5",
+            "the client's public id must come back, not the Vertex target"
+        );
     }
 
     #[tokio::test]
