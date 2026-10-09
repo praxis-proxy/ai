@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use serde_json::{Value, json, value::RawValue};
 
 use super::{ResponsesState, equal, reconcile};
-use crate::openai::responses::openai_responses_proxy::{SelectedMessages, scan_top_level_object};
+use crate::openai::responses::responses_proxy::{SelectedMessages, scan_top_level_object};
 
 #[test]
 fn unchanged_complete_history_borrows_every_payload() {

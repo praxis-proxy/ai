@@ -47,10 +47,10 @@ pub use responses::FileResolveFilter;
 pub use responses::implementation_openapi_json as responses_openapi_json;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
-    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchCalloutFilter, OpenaiResponsesRequestFilter,
-    WebSearchFilter, local_tool_guardrail_messages, openai_responses_proxy::ResponsesProxyFilter,
-    record_local_tool_guardrail_failure, responses_to_chat_completions::ResponsesToChatCompletionsFilter,
-    stream_events::OpenaiStreamEventsFilter,
+    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter,
+    OpenaiResponsesRequestFilter, WebSearchDispatchFilter, local_tool_guardrail_messages,
+    record_local_tool_guardrail_failure, responses_proxy::ResponsesProxyFilter,
+    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::StreamEventsFilter,
 };
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};

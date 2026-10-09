@@ -44,7 +44,7 @@ handled by a separate per-frame path; see the `stream` row). The backend itself
 is always driven statelessly.
 
 > **Out of scope — Chat-translation profile.** The
-> `responses_to_chat_completions` translation filter is a *separate* deployment
+> `openai_responses_to_chat_completions` translation filter is a *separate* deployment
 > for Chat-native backends. It rewrites/rejects many flags
 > (`max_output_tokens`→`max_completion_tokens`, `reasoning.effort`→
 > `reasoning_effort`, `instructions`→system message, `text.format`→

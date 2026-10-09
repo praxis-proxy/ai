@@ -21,7 +21,7 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
 use super::{
-    bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response,
+    bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response,
     history::MessageHistory,
 };
 
@@ -66,7 +66,7 @@ pub(crate) enum SynthesisKind {
 }
 
 /// One `file_search_call` the parse owner (`openai_agentic_loop`) accumulated
-/// this round and handed to `openai_file_search_callout` for execution.
+/// this round and handed to `openai_file_search_dispatch` for execution.
 ///
 /// The owner is the sole parser: it appends the canonical `file_search_call`
 /// output item to [`ResponsesState::accumulated_output`] and records its
@@ -88,7 +88,7 @@ pub(crate) struct FileSearchAssignment {
 
 /// A terminal failure a request-phase dispatcher recorded in shared state.
 ///
-/// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
+/// A dispatcher (e.g. `openai_file_search_dispatch`) never rejects or rewrites a
 /// response itself — that would make it a second terminal-response owner. Instead
 /// it records the failure here and returns `Continue`; the parse owner
 /// (`openai_agentic_loop`), which runs next in the same request phase, converts it
@@ -365,7 +365,7 @@ pub(crate) struct ResponsesState {
     /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
     ///
     /// #937: `openai_stream_events` defers the terminal frame until the inner
-    /// IRR stream ends, then surfaces it to the pre-IRR `openai_response_store`
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_responses_store`
     /// as an ordinary non-end-of-stream chunk — ahead of the empty
     /// end-of-stream callback where streaming persistence historically ran. Left
     /// uncoordinated, a client could observe `response.completed` for a record a
@@ -541,7 +541,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the store filter armed persistence for this exchange.
     ///
-    /// Set by `openai_response_store` during the request phase only after it
+    /// Set by `openai_responses_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
     /// whose response will be persisted. `mcp_dispatch` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
@@ -649,7 +649,7 @@ pub(crate) struct ResponsesState {
 
     /// Absolute indices into [`Self::accumulated_output`] (+ synthesis origin)
     /// of the `file_search_call` items `openai_agentic_loop` accumulated this
-    /// round for `openai_file_search_callout` to execute.
+    /// round for `openai_file_search_dispatch` to execute.
     ///
     /// The parse owner records one [`FileSearchAssignment`] per hosted file-search
     /// call it appended to `accumulated_output` (including private
@@ -738,7 +738,7 @@ pub(crate) struct ResponsesState {
     pub locally_executed_output_items: HashSet<String>,
 
     /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
-    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// items `openai_file_search_dispatch` reconciled this round on the streaming
     /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
     /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
     pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,
@@ -1167,7 +1167,7 @@ impl ResponsesState {
     /// `openai_client_tool_compat` lowers rich client tools into
     /// `request_body["tools"]` **only**, leaving canonical [`Self::tools`] holding
     /// the original rich types for response-side restore. Provider-body consumers
-    /// (`openai_responses_proxy`, `responses_to_chat_completions`) must read the
+    /// (`openai_responses_proxy`, `openai_responses_to_chat_completions`) must read the
     /// outbound tools through this accessor so they translate the lowered view, not
     /// the canonical rich tools that a function-only backend cannot accept.
     ///
@@ -1258,7 +1258,7 @@ impl ResponsesState {
 
     /// Move the file-search assignment queue out, leaving it empty.
     ///
-    /// `openai_file_search_callout` drains this exactly once at request-body EOS
+    /// `openai_file_search_dispatch` drains this exactly once at request-body EOS
     /// so each assigned `file_search_call` is executed and reconciled a single
     /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
@@ -2325,7 +2325,7 @@ mod tests {
         // `openai_client_tool_compat` lowers rich client tools into
         // `request_body["tools"]` only, leaving canonical `state.tools` rich. The
         // accessor must return the lowered outbound view so downstream translation
-        // (`responses_to_chat_completions`) sees valid `function` tools.
+        // (`openai_responses_to_chat_completions`) sees valid `function` tools.
         let mut state = ResponsesState::from_request_body(json!({
             "model": "m",
             "tools": [{"type": "custom", "name": "apply_patch"}],

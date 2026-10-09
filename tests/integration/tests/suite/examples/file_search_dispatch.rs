@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the file-search-callout example config.
+//! Integration tests for the file-search-dispatch example config.
 
 use std::collections::HashMap;
 
@@ -18,10 +18,10 @@ use serde_json::{Value, json};
 
 /// Load the example with its environment reference replaced by a test key.
 fn load_file_search_callout_config(proxy_port: u16, port_map: &HashMap<&str, u16>) -> Config {
-    let path = praxis_test_utils::example_config_path("openai/responses/file-search-callout.yaml");
+    let path = praxis_test_utils::example_config_path("openai/responses/file-search-dispatch.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let patched = patch_yaml(&yaml, proxy_port, port_map);
-    Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse file-search-callout.yaml: {e}"))
+    Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse file-search-dispatch.yaml: {e}"))
 }
 
 /// Start a proxy whose test pipeline includes the Pingora subrequest connector.
@@ -243,7 +243,7 @@ fn file_search_callout_example_without_tools_passthrough() {
     );
 }
 
-// #313 §7.1 / #1046: the buffered file-search-callout example fails closed on
+// #313 §7.1 / #1046: the buffered file-search-dispatch example fails closed on
 // `stream:true`. The proxy auto-derives the streaming transport from the
 // client's `stream:true`, so `openai_responses_proxy` runs a Streaming
 // sub-request. Because this buffered pipeline has no `openai_stream_events` in
@@ -381,7 +381,7 @@ fn file_search_callout_example_rejects_non_success_search_response() {
     assert_eq!(response["error"]["type"], "server_error");
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("openai_file_search_callout"),
+        message.contains("openai_file_search_dispatch"),
         "closed failure should keep the existing filter error: {response}"
     );
     assert!(
@@ -439,7 +439,7 @@ fn file_search_callout_example_rejects_oversized_search_response_with_413() {
 
     // Shrink only the dispatcher's per-callout ceiling; the enclosing router keeps
     // its 67108864-byte limit, so the unique literal targets the filter alone.
-    let path = praxis_test_utils::example_config_path("openai/responses/file-search-callout.yaml");
+    let path = praxis_test_utils::example_config_path("openai/responses/file-search-dispatch.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml.replace("max_response_bytes: 10485760", "max_response_bytes: 512");
     let patched = patch_yaml(
@@ -447,7 +447,7 @@ fn file_search_callout_example_rejects_oversized_search_response_with_413() {
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
     );
-    let config = Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse file-search-callout.yaml: {e}"));
+    let config = Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse file-search-dispatch.yaml: {e}"));
     let proxy = start_file_search_proxy(&config);
 
     let request = json!({
@@ -466,7 +466,7 @@ fn file_search_callout_example_rejects_oversized_search_response_with_413() {
     assert_eq!(response["error"]["type"], "invalid_request_error");
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("openai_file_search_callout"),
+        message.contains("openai_file_search_dispatch"),
         "413 should carry the dispatcher's filter error: {response}"
     );
     assert!(

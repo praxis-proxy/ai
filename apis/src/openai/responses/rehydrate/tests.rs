@@ -484,7 +484,7 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses

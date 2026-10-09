@@ -24,7 +24,7 @@ which features to pick:
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
 | Cargo features | `full` (`full,store-sqlite` in the image) | `openai-responses`, `openai-file-resolve-filter`, `aws-sigv4-filter`, `store-postgres-cert-auth` |
-| Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
+| Responses API kernel (`openai_responses_*`, `openai_responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
 | PostgreSQL Responses store | yes | yes: certificate-only SQLx profile through system OpenSSL |

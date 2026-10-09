@@ -127,10 +127,10 @@ filter in `filters/src/`. Representative filters:
 `openai_responses_request`,
 `openai_responses_proxy`, `openai_responses_rehydrate`,
 `openai_responses_model_rewrite`,
-`openai_responses_compact`, `openai_response_store`,
-`responses_to_chat_completions`, `openai_conversations`,
+`openai_responses_compact`, `openai_responses_store`,
+`openai_responses_to_chat_completions`, `openai_conversations`,
 `openai_stream_events`, `openai_tool_parse`,
-`openai_web_search`, `openai_agentic_loop`, and
+`openai_web_search_dispatch`, `openai_agentic_loop`, and
 `openai_mcp_dispatch`.
 
 Source of truth:

@@ -1,7 +1,7 @@
 # Web Search Filter
 # Requires `--features openai-responses` because these filters are opt-in.
 #
-# Demonstrates the `openai_web_search` filter configuration. The filter
+# Demonstrates the `openai_web_search_dispatch` filter configuration. The filter
 # validates its configuration (provider, API key, timeouts), binds its
 # outbound chain, and constructs a search client at startup, then handles
 # model-driven `web_search_call` dispatch in the agentic loop.
@@ -31,7 +31,7 @@ filter_chains:
   - name: web-search-pipeline
     filters:
       - filter: openai_tool_parse
-      - filter: openai_web_search
+      - filter: openai_web_search_dispatch
         provider: brave
         api_key: ${WEB_SEARCH_API_KEY}
         default_context_size: medium

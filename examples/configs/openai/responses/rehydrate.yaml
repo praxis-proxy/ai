@@ -10,7 +10,7 @@
 # Pipeline ordering:
 #   1. openai_responses_request — parses the create body once, promotes
 #      classification metadata, enriches it, and generates IDs
-#   2. openai_response_store — initializes store, registers in ctx
+#   2. openai_responses_store — initializes store, registers in ctx
 #   3. openai_responses_rehydrate — validates previous response, sets metadata
 #
 # The response_store filter must appear before openai_responses_rehydrate so its
@@ -49,7 +49,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses

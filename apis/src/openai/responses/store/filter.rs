@@ -120,7 +120,7 @@ const NO_REPLAY_LOG_MESSAGE: &str = "This response has no replayable event strea
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_response_store
+/// filter: openai_responses_store
 /// backend: postgres
 /// database_url: postgres://praxis:password@db.example.com/praxis
 /// responses_table: openai_responses
@@ -163,7 +163,7 @@ impl ResponseStoreFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", config)?;
+        let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", config)?;
         validate_config(&cfg)?;
         Ok(Box::new(Self::with_bounds(cfg.max_event_count, cfg.max_event_bytes)))
     }
@@ -182,7 +182,7 @@ impl ResponseStoreFilter {
         let deleted = store
             .delete_response(id)
             .await
-            .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
+            .map_err(|e| FilterError::from(format!("openai_responses_store: delete failed: {e}")))?;
 
         if deleted {
             debug!(id, "response deleted");
@@ -695,7 +695,7 @@ fn delete_success_rejection(id: &str) -> Result<Rejection, FilterError> {
         "object": "response.deleted",
         "deleted": true,
     }))
-    .map_err(|e| FilterError::from(format!("openai_response_store: serialize failed: {e}")))?;
+    .map_err(|e| FilterError::from(format!("openai_responses_store: serialize failed: {e}")))?;
 
     Ok(Rejection::status(200)
         .with_header("content-type", "application/json")
@@ -991,7 +991,7 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 #[async_trait]
 impl HttpFilter for ResponseStoreFilter {
     fn name(&self) -> &'static str {
-        "openai_response_store"
+        "openai_responses_store"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -1723,7 +1723,7 @@ impl StreamingResponseBody for ReplayStreamBody {
                 return Ok(None);
             }
             return Err(FilterError::from(format!(
-                "openai_response_store: replay log for {} was truncated before its terminal event",
+                "openai_responses_store: replay log for {} was truncated before its terminal event",
                 self.response_id
             )));
         }

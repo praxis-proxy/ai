@@ -72,7 +72,7 @@ fn web_search_scoped_credentials_example_builds() {
 fn per_user_credential_arrives_at_provider_and_ingress_header_is_stripped() {
     // The core proof: a per-user credential captured in the outer chain is staged
     // into the in-IRR-step web-search callout, proving the ordering is correct
-    // (outer callout_credentials runs before the in-IRR-step openai_web_search
+    // (outer callout_credentials runs before the in-IRR-step openai_web_search_dispatch
     // reads the slot). The test passes at all only if ordering is correct; wrong
     // ordering would 401.
     let first_response = json!({

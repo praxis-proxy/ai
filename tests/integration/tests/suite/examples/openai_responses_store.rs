@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional tests for the `openai_response_store` example config.
+//! Functional tests for the `openai_responses_store` example config.
 
 use std::collections::HashMap;
 

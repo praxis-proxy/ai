@@ -99,27 +99,27 @@ const FULL_FLOW_KNOBS: &[KnobCheck] = &[
     },
     KnobCheck {
         knob: "file_search.timeout_ms",
-        source: KnobSource::Filter("openai_file_search_callout"),
+        source: KnobSource::Filter("openai_file_search_dispatch"),
         key: "timeout_ms",
     },
     KnobCheck {
         knob: "file_search.max_response_bytes",
-        source: KnobSource::Filter("openai_file_search_callout"),
+        source: KnobSource::Filter("openai_file_search_dispatch"),
         key: "max_response_bytes",
     },
     KnobCheck {
         knob: "file_search.max_total_response_bytes",
-        source: KnobSource::Filter("openai_file_search_callout"),
+        source: KnobSource::Filter("openai_file_search_dispatch"),
         key: "max_total_response_bytes",
     },
     KnobCheck {
         knob: "file_search.max_state_bytes",
-        source: KnobSource::Filter("openai_file_search_callout"),
+        source: KnobSource::Filter("openai_file_search_dispatch"),
         key: "max_state_bytes",
     },
     KnobCheck {
         knob: "file_search.on_failure",
-        source: KnobSource::Filter("openai_file_search_callout"),
+        source: KnobSource::Filter("openai_file_search_dispatch"),
         key: "on_failure",
     },
     KnobCheck {
@@ -144,7 +144,7 @@ const FULL_FLOW_KNOBS: &[KnobCheck] = &[
     },
     KnobCheck {
         knob: "web_search.max_calls_per_round",
-        source: KnobSource::Filter("openai_web_search"),
+        source: KnobSource::Filter("openai_web_search_dispatch"),
         key: "max_calls_per_round",
     },
     KnobCheck {

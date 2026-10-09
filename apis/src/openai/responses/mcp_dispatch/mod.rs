@@ -75,7 +75,7 @@ use super::{
     DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
-    openai_mcp_tool_resolve::{
+    mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },

@@ -235,7 +235,7 @@ Per-cluster API key injection with client credential
 stripping. Supports inline values and environment
 variable sources.
 
-### `openai_response_store`
+### `openai_responses_store`
 
 Persists non-streaming Responses API responses. See
 [Response Store](response-store.md) for details.

@@ -88,7 +88,7 @@ use self::{
 };
 use super::{
     body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts,
-    history::MessageHistory, openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    history::MessageHistory, responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,

@@ -12,7 +12,7 @@
 //! # Pipeline dependencies
 //!
 //! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
-//!   then `openai_web_search`.
+//!   then `openai_web_search_dispatch`.
 //! - The IRR transition must match `openai_agentic_loop.action = "loop"` and target the same inference step.
 //!
 //! [`ResponsesState::web_search_calls`]: super::state::ResponsesState
@@ -98,7 +98,7 @@ const PARTIAL_UNAVAILABLE_OUTPUT: &str = "Web search was performed partially bef
 const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before reaching the maximum query cap.";
 
 // -----------------------------------------------------------------------------
-// WebSearchFilter
+// WebSearchDispatchFilter
 // -----------------------------------------------------------------------------
 
 /// Web search filter for model-driven `web_search_call` dispatch.
@@ -117,7 +117,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_web_search
+/// filter: openai_web_search_dispatch
 /// provider: brave
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// ```
@@ -125,7 +125,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_web_search
+/// filter: openai_web_search_dispatch
 /// provider: brave
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// outbound_chain: web_search_outbound
@@ -133,7 +133,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// timeout_ms: 10000
 /// max_calls_per_round: 32
 /// ```
-pub struct WebSearchFilter {
+pub struct WebSearchDispatchFilter {
     /// The search client for executing queries.
     search_client: SearchClient,
     /// Default search context size.
@@ -148,7 +148,7 @@ pub struct WebSearchFilter {
     user_credential_slot: Option<String>,
 }
 
-impl WebSearchFilter {
+impl WebSearchDispatchFilter {
     /// Create a filter, binding its configured outbound chain through `ctx`.
     ///
     /// Uses an isolated [`SubRequestClient`] with a default pool size of 4.
@@ -203,7 +203,7 @@ impl WebSearchFilter {
         subrequest_client: crate::subrequest::SubRequestClient,
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search_dispatch", config)?;
         // Bind the operator-configured outbound chain before `into_shared`
         // consumes `cfg`. A `Named` reference resolves against the top-level
         // `filter_chains` map; an `Inline` reference embeds directly. The
@@ -222,13 +222,14 @@ impl WebSearchFilter {
         outbound: Arc<FilterPipeline>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
-            return Err(
-                format!("openai_web_search: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}").into(),
-            );
+            return Err(format!(
+                "openai_web_search_dispatch: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}"
+            )
+            .into());
         }
         let max_calls_per_round = cfg.max_calls_per_round;
-        let validated = build_config("openai_web_search", &cfg.into_shared())?;
-        let search_client = SearchClient::from_config("openai_web_search", &validated, subrequest_client)?;
+        let validated = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
+        let search_client = SearchClient::from_config("openai_web_search_dispatch", &validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
             default_context_size: validated.default_context_size,
@@ -240,7 +241,7 @@ impl WebSearchFilter {
 
     /// Test-only convenience constructor binding a minimal outbound chain.
     ///
-    /// Production registers `openai_web_search` as a chain-binding filter and
+    /// Production registers `openai_web_search_dispatch` as a chain-binding filter and
     /// supplies the operator-configured outbound chain (see
     /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
     /// exercise dispatch logic bind a minimal builtin-only chain, since the
@@ -267,7 +268,7 @@ impl WebSearchFilter {
         // default. Bind a minimal builtin-only pipeline for tests (the executor
         // still enforces SSRF/TLS/Host regardless of chain contents); private
         // upstreams are permitted so tests can dial loopback mocks.
-        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search_dispatch", config)?;
         let outbound = crate::web_search::test_outbound_pipeline()?;
         Self::assemble(cfg, client, Arc::new(outbound))
     }
@@ -511,9 +512,9 @@ impl WebSearchFilter {
 }
 
 #[async_trait]
-impl HttpFilter for WebSearchFilter {
+impl HttpFilter for WebSearchDispatchFilter {
     fn name(&self) -> &'static str {
-        "openai_web_search"
+        "openai_web_search_dispatch"
     }
 
     fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
@@ -522,7 +523,7 @@ impl HttpFilter for WebSearchFilter {
         } else {
             debug_assert!(
                 false,
-                "openai_web_search outbound pipeline must be uniquely owned during configuration"
+                "openai_web_search_dispatch outbound pipeline must be uniquely owned during configuration"
             );
         }
     }
@@ -786,7 +787,7 @@ fn tool_search_is_client_executed(tool: &Value) -> bool {
 fn mcp_function_membership(
     mcp_tool_map: &std::collections::HashMap<(String, String), Value>,
 ) -> impl Fn(&str) -> bool + '_ {
-    let index = super::openai_mcp_tool_resolve::McpToolIndex::new(mcp_tool_map);
+    let index = super::mcp_tool_resolve::McpToolIndex::new(mcp_tool_map);
     move |name: &str| index.contains(name)
 }
 
@@ -1209,7 +1210,7 @@ fn upsert_output_item(accumulated: &mut Vec<Value>, round_start: usize, index: u
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved for per-call status tracking"))]
 pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str) {
     let key = format!("web_search_call_{call_id}");
-    let results = ctx.filter_results.entry("openai_web_search").or_default();
+    let results = ctx.filter_results.entry("openai_web_search_dispatch").or_default();
     if results.set(key, status.to_owned()).is_ok() {
         debug!(call_id, status, "emitted web_search_call status");
     }
@@ -1254,7 +1255,7 @@ pub(crate) fn build_output_item(
 /// A hosted `web_search_call` item is not a valid `OpenResponses` `input`
 /// type (see issue #808), so the model-facing history bridges the result
 /// through a synthetic `function_call` + `function_call_output` pair —
-/// mirroring [`file_search_callout`](super::file_search_callout). The
+/// mirroring [`file_search_dispatch`](super::file_search_dispatch). The
 /// public `web_search_call` output item is emitted separately by
 /// [`build_output_item`] and only reaches `accumulated_output`.
 ///
@@ -1338,7 +1339,7 @@ const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
 /// `function_call` `call_id` must stay within the `OpenResponses`
 /// 64-character limit or a conforming backend rejects the continuation
 /// (issue #808) — mirroring the bounded ids in
-/// [`file_search_callout`](super::file_search_callout).
+/// [`file_search_dispatch`](super::file_search_dispatch).
 ///
 /// `index` is the call's position in the pending queue, guaranteeing distinct
 /// ids even when `source_id` values collide or are absent — otherwise multiple

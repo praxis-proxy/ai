@@ -29,7 +29,7 @@ fn load_test_config(
 }
 
 #[test]
-fn responses_to_chat_completions_translates_request_and_response() {
+fn openai_responses_to_chat_completions_translates_request_and_response() {
     let chat_response = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -83,7 +83,7 @@ fn responses_to_chat_completions_translates_request_and_response() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_malformed_input_before_upstream() {
+fn openai_responses_to_chat_completions_rejects_malformed_input_before_upstream() {
     let backend = StatefulCapturingBackend::new(vec![(200, r#"{}"#.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
@@ -151,7 +151,7 @@ fn responses_validator_rejects_prompt_template_before_chat_upstream() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_malformed_compaction_before_upstream() {
+fn openai_responses_to_chat_completions_rejects_malformed_compaction_before_upstream() {
     let backend = StatefulCapturingBackend::new(vec![(200, r#"{}"#.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
@@ -186,7 +186,7 @@ fn responses_to_chat_completions_rejects_malformed_compaction_before_upstream() 
 }
 
 #[test]
-fn responses_to_chat_completions_normalizes_finite_provider_error() {
+fn openai_responses_to_chat_completions_normalizes_finite_provider_error() {
     let backend = Backend::status(429, r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -209,7 +209,7 @@ fn responses_to_chat_completions_normalizes_finite_provider_error() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_malformed_finite_success() {
+fn openai_responses_to_chat_completions_rejects_malformed_finite_success() {
     let backend = Backend::fixed("{}")
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -246,7 +246,7 @@ fn responses_to_chat_completions_rejects_malformed_finite_success() {
 }
 
 #[test]
-fn responses_to_chat_completions_translates_streaming_sse() {
+fn openai_responses_to_chat_completions_translates_streaming_sse() {
     let chunks = vec![
         "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n".to_owned(),
         "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned(),
@@ -303,7 +303,7 @@ fn responses_to_chat_completions_translates_streaming_sse() {
 }
 
 #[test]
-fn responses_to_chat_completions_persists_streaming_terminal_when_stored() {
+fn openai_responses_to_chat_completions_persists_streaming_terminal_when_stored() {
     let chunks = vec![
         "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Stored\"}}]}\n\n".to_owned(),
         "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned(),
@@ -351,7 +351,7 @@ fn responses_to_chat_completions_persists_streaming_terminal_when_stored() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_non_ok_sse_error_stream() {
+fn openai_responses_to_chat_completions_rejects_non_ok_sse_error_stream() {
     // A non-`200` SSE body is a provider-side error stream in Chat Completions
     // framing. Forwarding it verbatim would leak that framing to a Responses
     // client, so the proxy must fail closed rather than pass the stream through.
@@ -389,7 +389,7 @@ fn responses_to_chat_completions_rejects_non_ok_sse_error_stream() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_sse_for_non_streaming_request() {
+fn openai_responses_to_chat_completions_rejects_sse_for_non_streaming_request() {
     // The client asked for a finite (`stream:false`) response, so a backend that
     // replies with an SSE body violates the contract. The proxy must not install
     // streaming conversion and emit a Responses event stream the client never
@@ -435,7 +435,7 @@ fn responses_to_chat_completions_rejects_sse_for_non_streaming_request() {
 }
 
 #[test]
-fn responses_to_chat_completions_translates_streaming_request_body() {
+fn openai_responses_to_chat_completions_translates_streaming_request_body() {
     let chat_response = serde_json::json!({
         "id": "chatcmpl_stream_fallback",
         "object": "chat.completion",
@@ -475,7 +475,7 @@ fn responses_to_chat_completions_translates_streaming_request_body() {
 }
 
 #[test]
-fn responses_to_chat_completions_rehydrates_finite_continuation() {
+fn openai_responses_to_chat_completions_rehydrates_finite_continuation() {
     let first_chat_response = serde_json::json!({
         "id": "chatcmpl_first",
         "object": "chat.completion",
@@ -571,7 +571,7 @@ fn responses_to_chat_completions_rehydrates_finite_continuation() {
 }
 
 #[test]
-fn responses_to_chat_completions_rejects_unknown_previous_response() {
+fn openai_responses_to_chat_completions_rejects_unknown_previous_response() {
     let backend = StatefulCapturingBackend::new(vec![(
         200,
         serde_json::json!({
@@ -609,7 +609,7 @@ fn responses_to_chat_completions_rejects_unknown_previous_response() {
 }
 
 #[test]
-fn responses_to_chat_completions_preserves_nonzero_zero_and_absent_cache_write_counts() {
+fn openai_responses_to_chat_completions_preserves_nonzero_zero_and_absent_cache_write_counts() {
     let chat_response_nonzero = serde_json::json!({
         "id": "chatcmpl_nonzero",
         "object": "chat.completion",

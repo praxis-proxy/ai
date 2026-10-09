@@ -358,7 +358,7 @@ def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict
 
     conversations = {"filter": "openai_conversations", **store, **tables}
     response_store = {
-        "filter": "openai_response_store",
+        "filter": "openai_responses_store",
         **store,
         "responses_table": f"chunked_{port}_responses",
         "conversations_table": tables["conversations_table"],

@@ -302,7 +302,7 @@ fails with HTTP 500 and `unable to open database file`. Point `database_url` at
 `/var/lib/praxis`, the writable state directory owned by the container user:
 
 ```yaml
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "sqlite:///var/lib/praxis/responses.db?mode=rwc"
 ```

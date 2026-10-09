@@ -5286,7 +5286,7 @@ fn streaming_failure_snapshot_drops_oversized_options() {
 }
 
 /// Building the terminal failure must publish the failed snapshot directly into
-/// `ResponsesState.response_object`, the field `openai_response_store` reads to
+/// `ResponsesState.response_object`, the field `openai_responses_store` reads to
 /// persist streaming responses. In `agentic-loop.yaml` `openai_stream_events`
 /// runs *after* this filter (nested in the `iterative_request_router`), so the
 /// short-circuiting `TerminalResponse` means `stream_events` never accumulates the
@@ -5322,7 +5322,7 @@ fn build_failure_populates_response_object_state() {
 }
 
 /// When no `ResponsesState` exists yet -- a valid pipeline of
-/// `openai_response_store` + this filter *without*
+/// `openai_responses_store` + this filter *without*
 /// `openai_responses_request`/`openai_responses_rehydrate` to build state up
 /// front -- the terminal-failure build must still CREATE the state and populate
 /// `response_object`, or the store would have nothing to persist and the failure

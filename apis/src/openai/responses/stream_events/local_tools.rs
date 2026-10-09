@@ -234,7 +234,7 @@ pub(crate) fn synthesize_incomplete_tail(item: &Value, output_index: u64, privat
 ///
 /// The parse owner (`openai_agentic_loop`) queues each `file_search_call` by its
 /// absolute `accumulated_output` index during the round it *parses* the call, but
-/// the request-phase dispatcher (`openai_file_search_callout`) does not execute
+/// the request-phase dispatcher (`openai_file_search_dispatch`) does not execute
 /// and reconcile that call until the *next* IRR re-entry's request-body EOS. So at
 /// the round-N finalize where the owner first queued it, the indexed item is still
 /// pending and its lifecycle cannot be synthesized. This finalizer runs at every

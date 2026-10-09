@@ -207,7 +207,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
 // mcp_tool_resolve). A streaming `tools/list` runtime failure is emitted as a
 // 200 SSE lifecycle; because it is a `TerminalResponse` (not a `Reject`), the
 // response phase runs `openai_stream_events` (which accumulates the terminal
-// `response.failed`) and `openai_response_store` (which persists it) so a caller
+// `response.failed`) and `openai_responses_store` (which persists it) so a caller
 // can later retrieve the failed response -- all without contacting the backend.
 // =============================================================================
 
@@ -487,7 +487,7 @@ async fn streaming_list_failure_persists_when_stream_events_after_resolve() {
 /// Regression for a persistence gap in the store-without-validate/rehydrate
 /// configuration: when no filter builds a `ResponsesState` before the resolver,
 /// the terminal-failure build must CREATE the state (not just mutate an existing
-/// one) so `openai_response_store` has a `response_object` to persist. With a
+/// one) so `openai_responses_store` has a `response_object` to persist. With a
 /// `get_mut`-only write this GET would 404 despite `store` defaulting to enabled;
 /// `get_or_insert_with` makes the failed response retrievable regardless of which
 /// upstream filters ran.
@@ -1531,13 +1531,13 @@ fn with_private_upstreams(yaml: String) -> String {
 }
 
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
-/// store retrieval: `openai_response_store` runs pre-IRR, before
+/// store retrieval: `openai_responses_store` runs pre-IRR, before
 /// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
 /// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
 /// and in the shipped `full-flow-agentic.yaml` it lives inside the IRR that follows the
 /// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
 /// resolver self-delivers the 200 SSE failure lifecycle and writes
-/// `ResponsesState.response_object` directly, so `openai_response_store` persists
+/// `ResponsesState.response_object` directly, so `openai_responses_store` persists
 /// the synthesized failure without any stream_events involvement.
 fn resolve_yaml_full_flow_store(proxy_port: u16, backend_port: u16, db_url: &str, timeout_ms: u64) -> String {
     format!(
@@ -1567,7 +1567,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1630,7 +1630,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1655,7 +1655,7 @@ insecure_options:
     )
 }
 
-/// Minimal store pipeline with `openai_response_store` + `openai_mcp_tool_resolve`
+/// Minimal store pipeline with `openai_responses_store` + `openai_mcp_tool_resolve`
 /// but WITHOUT `openai_responses_request`/`openai_responses_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
@@ -1690,7 +1690,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses

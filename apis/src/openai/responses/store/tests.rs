@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_response_store` filter.
+//! Unit tests for the `openai_responses_store` filter.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -53,7 +53,7 @@ conversations_table: conversations
     let filter = ResponseStoreFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
+        "openai_responses_store",
         "filter should parse successfully"
     );
 }
@@ -72,7 +72,7 @@ compression:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).expect("valid zstd compression config should validate");
     let compression = cfg.compression.expect("compression should be present");
     assert_eq!(compression.level, Some(5), "configured level should round-trip");
@@ -92,7 +92,7 @@ compression:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     let err = validate_config(&cfg).expect_err("level with algorithm none should be rejected");
     assert!(
         format!("{err}").contains("level"),
@@ -267,12 +267,12 @@ unknown_extra_field: true
 // -----------------------------------------------------------------------------
 
 #[test]
-fn name_returns_openai_response_store() {
+fn name_returns_openai_responses_store() {
     let filter = make_filter();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
-        "name should be openai_response_store"
+        "openai_responses_store",
+        "name should be openai_responses_store"
     );
 }
 
@@ -1867,7 +1867,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -1973,7 +1973,7 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 - filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2087,7 +2087,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2216,7 +2216,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2309,7 +2309,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2451,7 +2451,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2583,7 +2583,7 @@ conversations_table: conversations
     let filter = ResponseStoreFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
+        "openai_responses_store",
         "postgres config should parse successfully"
     );
 }
@@ -6645,7 +6645,7 @@ pool:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
 
     let pool = cfg.pool.expect("pool config should be present");
@@ -6668,7 +6668,7 @@ pool:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
 
     let pool = cfg.pool.expect("pool config should be present");
@@ -6689,7 +6689,7 @@ conversations_table: conversations
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
     assert!(cfg.pool.is_none(), "omitted pool should be None");
 }

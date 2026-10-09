@@ -970,7 +970,7 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
     assert_eq!(
         ctx.extensions.get::<ResponsesState>().unwrap().web_search_calls.len(),
         1,
-        "streamed web-search calls must be visible to openai_web_search"
+        "streamed web-search calls must be visible to openai_web_search_dispatch"
     );
     assert!(
         !ctx.extensions

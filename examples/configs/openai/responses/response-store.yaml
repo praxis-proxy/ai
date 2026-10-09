@@ -12,10 +12,10 @@
 #
 # Request order:
 #   1. openai_responses_request classifies the create body, publishes the
-#      classification metadata `openai_response_store` reads, and creates the
+#      classification metadata `openai_responses_store` reads, and creates the
 #      `ResponsesState` the streaming accumulator needs.
 #   2. state_owner assigns the persisted-state owner.
-#   3. openai_response_store initializes the store before inference and, on the
+#   3. openai_responses_store initializes the store before inference and, on the
 #      response path, persists the finished response.
 #   4. iterative_request_router runs one inference step (max_iterations: 1) that
 #      selects the response transport and, for a `stream: true` request, composes
@@ -33,7 +33,7 @@
 #   request, `openai_stream_events` (inside the IRR step, after `load_balancer`)
 #   parses each backend SSE chunk and accumulates the terminal `ResponsesState`;
 #   response body filters run in reverse config order, so the pre-IRR
-#   `openai_response_store` persists the accumulated response once the logical
+#   `openai_responses_store` persists the accumulated response once the logical
 #   stream terminates. A finite request is persisted from its buffered JSON
 #   body instead. Non-2xx responses and content types other than JSON or
 #   event-stream are skipped.
@@ -67,7 +67,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"

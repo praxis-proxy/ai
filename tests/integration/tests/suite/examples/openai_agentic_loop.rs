@@ -6514,7 +6514,7 @@ fn approval_round_trip_approve_executes_tool_once() {
 
 // A continuation turn (one carrying `previous_response_id`) that emits a *fresh*
 // approval-gated call must still surface the `mcp_approval_request` rather than
-// failing closed. `openai_response_store` arms exchange-scoped persistence during
+// failing closed. `openai_responses_store` arms exchange-scoped persistence during
 // the request phase, but `openai_responses_rehydrate` runs afterward and replaces
 // `ResponsesState` to splice in the prior turn's history. Rehydrate must carry the
 // persistence-armed marker across that replacement; otherwise `mcp_dispatch` reads
@@ -7982,7 +7982,7 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
-/// Like [`load_approval_config`] but with the `openai_response_store` backend
+/// Like [`load_approval_config`] but with the `openai_responses_store` backend
 /// removed, so the pipeline runs with an empty `ResponseStoreRegistry` (the
 /// registry extension is always injected by the server). Models a deployment
 /// that wired the MCP approval flow but forgot to configure persistence.
@@ -7991,11 +7991,11 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
+    let store_block = "      - filter: openai_responses_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(
         without_store, yaml,
-        "expected to remove the openai_response_store block from agentic-loop.yaml; its config may have changed"
+        "expected to remove the openai_responses_store block from agentic-loop.yaml; its config may have changed"
     );
     praxis_core::config::Config::from_yaml(&without_store).expect("parse store-less approval config")
 }

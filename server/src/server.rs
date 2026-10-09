@@ -600,10 +600,10 @@ const FIPS_SAFE_STORE_PROFILE: bool = cfg!(all(
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
 ///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
+/// - `openai_responses_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
 ///   bring cryptography outside the system `OpenSSL`; the isolated `store-postgres-cert-auth` profile does not, so
 ///   [`fips_blocker`] excludes this name only for that exact profile.
-const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_responses_store"];
 
 /// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
 ///
@@ -617,7 +617,7 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
     let registered: Vec<String> = NON_FIPS_FILTERS
         .iter()
         .copied()
-        .filter(|name| *name != "openai_response_store" || !FIPS_SAFE_STORE_PROFILE)
+        .filter(|name| *name != "openai_responses_store" || !FIPS_SAFE_STORE_PROFILE)
         .filter(|name| available.contains(name))
         .map(|name| format!("`{name}` filter"))
         .collect();
@@ -791,9 +791,9 @@ mod tests {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
             if store_is_blocked {
-                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(reason.contains("`openai_responses_store` filter"), "{reason}");
             } else {
-                assert!(!reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(!reason.contains("`openai_responses_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");

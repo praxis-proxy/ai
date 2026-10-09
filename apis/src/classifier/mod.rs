@@ -83,7 +83,7 @@ pub(crate) struct ClassifiedRequest {
     /// [`openai_tool_parse`] applies stricter per-entry classification and
     /// may disagree on malformed arrays.
     ///
-    /// [`openai_tool_parse`]: crate::openai::responses::openai_tool_parse
+    /// [`openai_tool_parse`]: crate::openai::responses::tool_parse
     pub has_tools: bool,
     /// Extracted `max_output_tokens` field value (Responses API), if present.
     #[cfg_attr(

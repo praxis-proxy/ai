@@ -25,7 +25,7 @@ use std::{
 use praxis_ai_store::PendingApprovalRecord;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::{StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name};
+use crate::{StateOwner, hash::Sha256, openai::responses::mcp_tool_resolve::encode_function_name};
 
 // -----------------------------------------------------------------------------
 // Approval Response Round Trip

@@ -167,12 +167,12 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{first_url}"
         responses_table: responses
         conversations_table: conversations
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{second_url}"
         responses_table: responses
@@ -228,7 +228,7 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{database_url}"
 {backend_options}        responses_table: responses

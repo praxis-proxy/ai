@@ -67,7 +67,7 @@ use super::{
     bound_body_outcome,
     content_parts::{content_parts, content_parts_mut},
     history::MessageHistory,
-    openai_responses_proxy::serialized_outbound_body_len,
+    responses_proxy::serialized_outbound_body_len,
     state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};

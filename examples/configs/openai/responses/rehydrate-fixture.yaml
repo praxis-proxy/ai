@@ -9,14 +9,14 @@
 # store -> rehydrate -> proxy path deterministically.
 #
 # Pipeline ordering:
-#   1. openai_responses_request  — parses the create body once, promotes
+#   1. openai_responses_request — parses the create body once, promotes
 #      classification metadata, enriches it, and generates IDs
-#   2. openai_response_store     — initializes store, registers in ctx
-#   3. openai_responses_rehydrate — resolves previous_response_id into
+#   2. openai_responses_store              — initializes store, registers in ctx
+#   3. openai_responses_rehydrate          — resolves previous_response_id into
 #      the message history and, on the response path, restores the
 #      caller's previous_response_id into the client body — both native
 #      JSON responses and streaming SSE lifecycle frames (issue #932)
-#   5. openai_responses_proxy    — rebuilds the outbound body from the
+#   4. openai_responses_proxy              — rebuilds the outbound body from the
 #      resolved history and strips previous_response_id upstream
 #
 # The response_store filter must appear before openai_responses_rehydrate
@@ -44,7 +44,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses

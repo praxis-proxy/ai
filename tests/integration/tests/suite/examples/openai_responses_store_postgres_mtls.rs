@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional tests for the `openai_response_store` example config with a
+//! Functional tests for the `openai_responses_store` example config with a
 //! PostgreSQL backend that authenticates over verified TLS with a client
 //! certificate (the `require_certificate_authentication` compliance
 //! profile).

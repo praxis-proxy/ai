@@ -34,7 +34,7 @@ filter_chains:
           stream: ~
           mode: ~
 
-      - filter: responses_to_chat_completions
+      - filter: openai_responses_to_chat_completions
         max_rewritten_body_bytes: 67108864
 
       - filter: path_rewrite

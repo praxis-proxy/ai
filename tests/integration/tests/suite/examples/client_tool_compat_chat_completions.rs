@@ -7,7 +7,7 @@
 //! These tests drive the composed pipeline end to end: a rich Codex-style
 //! Responses client talks to a **function-only Chat Completions backend** through
 //! `POST /v1/responses`. The inference step chains
-//! `openai_client_tool_compat -> responses_to_chat_completions -> path_rewrite`,
+//! `openai_client_tool_compat -> openai_responses_to_chat_completions -> path_rewrite`,
 //! so the mock backend receives `POST /v1/chat/completions` with Chat-shaped
 //! `function` tools only, while the client keeps talking rich Responses.
 //!
@@ -17,7 +17,7 @@
 //!   lowered to private Chat `function` tools (`{"type":"function","function":{"name":..}}`) on the wire the Chat
 //!   backend receives — no rich type and no `/v1/responses` path leaks downstream;
 //! - response phase: the backend's Chat Completions `tool_calls` are translated back to Responses `function_call` items
-//!   by `responses_to_chat_completions` and then restored to their canonical typed items (`custom_tool_call`,
+//!   by `openai_responses_to_chat_completions` and then restored to their canonical typed items (`custom_tool_call`,
 //!   namespaced `function_call`, `shell_call`, `tool_search_call`) by `openai_client_tool_compat`, with the original
 //!   rich `tools` echoed back and no private lowered name leaked.
 //!
@@ -713,7 +713,7 @@ fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
 
 /// A streaming request that declares a rich `custom` client tool has the tool
 /// lowered to a Chat `function` on the wire; the Chat backend streams a
-/// `chat.completion.chunk` tool-call lifecycle that `responses_to_chat_completions`
+/// `chat.completion.chunk` tool-call lifecycle that `openai_responses_to_chat_completions`
 /// translates into a Responses SSE lifecycle, which `openai_stream_events` restores
 /// live to a `custom_tool_call` with the single string parameter unwrapped into the
 /// plain-string `input` (#1159). No raw Chat framing and no bare un-restored
@@ -780,7 +780,7 @@ fn streaming_custom_tool_restores_over_chat_backend() {
 
 /// A streaming request that declares a `namespace` member has the member lowered to
 /// a flat private Chat `function` name; the Chat backend streams a tool-call for
-/// that private name, `responses_to_chat_completions` translates it, and
+/// that private name, `openai_responses_to_chat_completions` translates it, and
 /// `openai_stream_events` restores it in place to the bare member name with its
 /// `namespace` re-added. The private lowered name must never appear in the streamed
 /// body (#1159).

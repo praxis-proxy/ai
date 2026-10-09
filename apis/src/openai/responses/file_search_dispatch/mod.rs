@@ -91,7 +91,7 @@ const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 /// citation-annotated `file_search` lifecycle frames at EOS. Search queries are
 /// forwarded unchanged; model context and citation marker formatting are
 /// internal.
-pub struct FileSearchCalloutFilter {
+pub struct FileSearchDispatchFilter {
     /// Callout client for the vector store API.
     client: FileSearchClient,
 
@@ -111,7 +111,7 @@ pub struct FileSearchCalloutFilter {
     user_credential_slot: Option<String>,
 }
 
-impl FileSearchCalloutFilter {
+impl FileSearchDispatchFilter {
     /// Create a filter, binding its configured `outbound_chain` into a prebuilt
     /// pipeline through the chain-binding context.
     ///
@@ -131,7 +131,7 @@ impl FileSearchCalloutFilter {
         client: SubRequestClient,
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
+        let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_dispatch", config)?;
         let outbound = ctx.bind_chain(&cfg.outbound_chain)?;
         let validated = build_config_with_client(&cfg, client)?;
         Ok(Self::build(validated, Arc::new(outbound)))
@@ -241,7 +241,7 @@ impl FileSearchCalloutFilter {
             return Err(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "openai_file_search_callout: continuation output exceeds the JSON response byte limit"
+                message: "openai_file_search_dispatch: continuation output exceeds the JSON response byte limit"
                     .to_owned(),
             });
         }
@@ -335,7 +335,7 @@ impl FileSearchCalloutFilter {
         Some(DispatchFailure {
             status,
             code,
-            message: format!("openai_file_search_callout: {}", failure.error),
+            message: format!("openai_file_search_dispatch: {}", failure.error),
         })
     }
 
@@ -440,9 +440,9 @@ fn record_missing_callout_context(ctx: &mut HttpFilterContext<'_>, slot: &str) -
 }
 
 #[async_trait]
-impl HttpFilter for FileSearchCalloutFilter {
+impl HttpFilter for FileSearchDispatchFilter {
     fn name(&self) -> &'static str {
-        "openai_file_search_callout"
+        "openai_file_search_dispatch"
     }
 
     /// Propagate server-provided runtime resources into the bound outbound
@@ -795,7 +795,7 @@ fn continuation_state_dispatch_failure() -> DispatchFailure {
     DispatchFailure {
         status: 413,
         code: "invalid_request_error",
-        message: "openai_file_search_callout: continuation state exceeds max_state_bytes".to_owned(),
+        message: "openai_file_search_dispatch: continuation state exceeds max_state_bytes".to_owned(),
     }
 }
 
@@ -1190,7 +1190,7 @@ fn join_queries_bounded(queries: &[String]) -> (String, bool) {
 
 /// Return whether one output item still requires local file-search execution.
 ///
-/// Shared with `openai_web_search`, which must exclude these pending
+/// Shared with `openai_web_search_dispatch`, which must exclude these pending
 /// placeholders when counting non-web built-in calls against the shared
 /// `max_tool_calls` budget during the owner's ordered admission pass.
 pub(crate) fn is_pending_file_search_call(item: &Value) -> bool {

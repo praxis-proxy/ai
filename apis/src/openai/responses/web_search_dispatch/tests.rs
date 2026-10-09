@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Tests for the `openai_web_search` filter.
+//! Tests for the `openai_web_search_dispatch` filter.
 
 use super::*;
 
@@ -28,14 +28,14 @@ timeout_ms: 5000
 #[test]
 fn from_config_brave() {
     let yaml = make_filter_yaml("brave", "brave-test-key");
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_ok(), "should build filter from valid brave config");
 }
 
 #[test]
 fn from_config_tavily() {
     let yaml = make_filter_yaml("tavily", "tvly-test-key");
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_ok(), "should build filter from valid tavily config");
 }
 
@@ -47,7 +47,7 @@ api_key: "test-key"
 "#,
     )
     .unwrap();
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_err(), "should reject config without provider");
 }
 
@@ -59,14 +59,14 @@ provider: brave
 "#,
     )
     .unwrap();
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_err(), "should reject config without api_key");
 }
 
 #[test]
 fn from_config_empty_api_key() {
     let yaml = make_filter_yaml("brave", "");
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_err(), "should reject empty api_key");
 }
 
@@ -79,7 +79,7 @@ api_key: "test-key"
 "#,
     )
     .unwrap();
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_err(), "should reject unknown provider");
 }
 
@@ -93,7 +93,7 @@ unknown_field: true
 "#,
     )
     .unwrap();
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(filter.is_err(), "should reject unknown config fields");
 }
 
@@ -104,18 +104,18 @@ fn from_config_validates_max_calls_per_round() {
             "provider: brave\napi_key: test-key\nmax_calls_per_round: {max_calls}"
         ))
         .unwrap();
-        assert!(WebSearchFilter::from_config(&yaml).is_err());
+        assert!(WebSearchDispatchFilter::from_config(&yaml).is_err());
     }
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         "provider: brave\napi_key: test-key\nmax_calls_per_round: {MAX_CALLS_PER_ROUND}"
     ))
     .unwrap();
-    assert!(WebSearchFilter::from_config(&yaml).is_ok());
+    assert!(WebSearchDispatchFilter::from_config(&yaml).is_ok());
 }
 
 #[test]
 fn from_config_rejects_max_body_bytes() {
-    // openai_web_search is a read-only reader that produces no request body,
+    // openai_web_search_dispatch is a read-only reader that produces no request body,
     // so it carries no per-filter raw-body cap: raw request size is governed
     // by the pipeline's body_limits. A stale `max_body_bytes` is a hard error
     // rather than a silently bypassable knob (the core merges sibling buffer
@@ -128,10 +128,10 @@ max_body_bytes: 1024
 "#,
     )
     .unwrap();
-    let filter = WebSearchFilter::from_config(&yaml);
+    let filter = WebSearchDispatchFilter::from_config(&yaml);
     assert!(
         filter.is_err(),
-        "openai_web_search must reject max_body_bytes; raw body size is governed by the pipeline's body_limits"
+        "openai_web_search_dispatch must reject max_body_bytes; raw body size is governed by the pipeline's body_limits"
     );
 }
 
@@ -142,14 +142,14 @@ max_body_bytes: 1024
 #[test]
 fn filter_name() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_web_search");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_web_search_dispatch");
 }
 
 #[tokio::test]
 async fn on_request_is_noop() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -172,7 +172,7 @@ fn emit_status_uses_valid_key() {
 
     emit_status(&mut ctx, "ws_proactive", "searching");
 
-    let results = ctx.filter_results.get("openai_web_search").unwrap();
+    let results = ctx.filter_results.get("openai_web_search_dispatch").unwrap();
     assert_eq!(
         results.get("web_search_call_ws_proactive"),
         Some("searching"),
@@ -238,7 +238,7 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
 #[test]
 fn response_hook_is_execution_only_noop() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(ResponsesState {
@@ -270,7 +270,7 @@ fn response_hook_is_execution_only_noop() {
 #[test]
 fn filter_response_body_access_is_read_only() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
 }
@@ -282,7 +282,7 @@ fn filter_response_body_access_is_read_only() {
 #[tokio::test]
 async fn on_request_body_passthrough_without_state() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -294,7 +294,7 @@ async fn on_request_body_passthrough_without_state() {
 #[tokio::test]
 async fn on_request_body_passthrough_when_no_web_search_calls() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -313,7 +313,7 @@ async fn on_request_body_passthrough_when_no_web_search_calls() {
 #[tokio::test]
 async fn on_request_body_passthrough_on_non_end_of_stream() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -411,7 +411,7 @@ async fn on_request_body_executes_search_and_populates_state() {
     spawn_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -466,7 +466,7 @@ async fn on_request_body_executes_current_queries_without_duplicating_legacy_que
     spawn_search_responses(listener, vec![(200, brave_ok_body()), (200, brave_ok_body())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -517,7 +517,7 @@ async fn on_request_body_falls_back_to_legacy_query_when_queries_is_empty() {
     spawn_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -555,7 +555,7 @@ async fn on_request_body_omits_sources_without_include() {
     spawn_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -584,7 +584,7 @@ async fn on_request_body_omits_sources_without_include() {
 #[tokio::test]
 async fn on_request_body_missing_query_produces_incomplete_status() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -637,7 +637,7 @@ async fn on_request_body_provider_failure_produces_failed_item_and_truthful_inpu
     spawn_search_responses(listener, vec![(503, String::new())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -711,7 +711,7 @@ async fn on_request_body_empty_results_remain_completed() {
     spawn_search_responses(listener, vec![(200, empty_body)]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -746,7 +746,7 @@ async fn on_request_body_mixed_batch_preserves_completed_and_failed() {
     spawn_search_responses(listener, vec![(200, brave_ok_body()), (503, String::new())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -827,7 +827,7 @@ async fn on_request_body_enforces_shared_max_tool_calls_across_web_search_batch(
     spawn_search_responses(listener, vec![(200, brave_ok_body())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let calls = vec![
@@ -876,7 +876,7 @@ async fn on_request_body_appends_backend_valid_continuation() {
     spawn_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -956,14 +956,14 @@ async fn on_request_body_appends_backend_valid_continuation() {
 async fn web_search_continuation_serializes_backend_valid_input() {
     use praxis_filter::SelectedUpstreamBodyOutcome;
 
-    use crate::openai::responses::{AgenticLoopFilter, openai_responses_proxy::ResponsesProxyFilter};
+    use crate::openai::responses::{AgenticLoopFilter, responses_proxy::ResponsesProxyFilter};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     spawn_brave_mock(listener);
 
     let agentic_loop = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
-    let web_search = WebSearchFilter::from_config(&make_filter_yaml_with_base_url(
+    let web_search = WebSearchDispatchFilter::from_config(&make_filter_yaml_with_base_url(
         "brave",
         "test-key",
         &format!("http://{addr}"),
@@ -1529,7 +1529,7 @@ async fn on_request_body_honors_client_max_tool_calls() {
     let count = spawn_counting_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1599,7 +1599,7 @@ async fn on_request_body_budget_spans_iterations() {
     let count = spawn_counting_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1640,7 +1640,7 @@ async fn on_request_body_budget_spans_iterations() {
 #[tokio::test]
 async fn incomplete_prior_call_still_exhausts_later_round_budget() {
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1677,7 +1677,7 @@ async fn incomplete_prior_call_still_exhausts_later_round_budget() {
 async fn on_request_body_exhausted_budget_dispatches_nothing() {
     // Budget is already spent, so no live provider is contacted.
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1714,7 +1714,7 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
     let count = spawn_counting_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1749,7 +1749,7 @@ async fn missing_required_credential_records_security_failure() {
     // Filter requires the caller's per-user "brave" slot; ctx has NO credentials.
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(ResponsesState {
@@ -1785,7 +1785,7 @@ async fn missing_required_credential_records_security_failure() {
 fn scoped_web_search_filter() -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
-    WebSearchFilter::from_config(&yaml).unwrap()
+    WebSearchDispatchFilter::from_config(&yaml).unwrap()
 }
 
 /// Run `on_request_body` for a fresh initial request built from `body`, with no
@@ -1985,7 +1985,7 @@ async fn preflight_rejects_location_field_the_provider_cannot_honor() {
     // Brave supports only `country`; a `city` it cannot forward must be rejected
     // explicitly rather than silently dropped (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({"type": "approximate", "city": "Paris"})),
@@ -2010,7 +2010,7 @@ async fn preflight_rejects_country_for_a_provider_that_cannot_map_it() {
     // Tavily's `country` is a full-name enum the canonical ISO code cannot map to,
     // so even a country is unsupported and must be rejected rather than dropped.
     let yaml = make_filter_yaml("tavily", "tvly-test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR"})),
@@ -2031,7 +2031,7 @@ async fn preflight_allows_a_supported_country() {
     // Brave accepts an ISO country directly, so a country-only location passes the
     // preflight; with no pending calls the filter simply continues.
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR"})),
@@ -2048,7 +2048,7 @@ async fn preflight_ignores_null_and_empty_location_members() {
     // Null/empty members are canonical "unset" and must never trip the preflight,
     // even for a provider that honors no location field.
     let yaml = make_filter_yaml("tavily", "tvly-test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({
@@ -2069,7 +2069,7 @@ async fn preflight_skips_when_no_user_location_is_declared() {
     // No `user_location` means nothing to translate or reject, even for Tavily.
     let filter = {
         let yaml = make_filter_yaml("tavily", "tvly-test-key");
-        WebSearchFilter::from_config(&yaml).unwrap()
+        WebSearchDispatchFilter::from_config(&yaml).unwrap()
     };
     let action = run_initial_request(
         filter.as_ref(),
@@ -2089,7 +2089,7 @@ async fn preflight_skips_when_allowed_tools_excludes_web_search() {
     // function, web search cannot run this turn, so an unsupported location on the
     // (ineligible) web-search tool must not trigger a rejection (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         serde_json::json!({
@@ -2111,7 +2111,7 @@ async fn preflight_rejects_when_allowed_tools_includes_web_search() {
     // When `allowed_tools` does name web search, an unsupported location on it must
     // still be rejected, matching the default-eligible behavior.
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         serde_json::json!({
@@ -2138,7 +2138,7 @@ async fn preflight_rejects_when_allowed_tools_names_another_continuation_tool() 
     // tool, so web search becomes reachable and its unsupported location must be
     // rejected at round 0 rather than silently dropped later (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         serde_json::json!({
@@ -2164,7 +2164,7 @@ async fn preflight_rejects_when_tool_choice_forces_another_continuation_tool() {
     // tool_choice, so a declared web-search tool is reachable and its unsupported
     // location must be rejected at round 0.
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         serde_json::json!({
@@ -2189,7 +2189,7 @@ async fn preflight_rejects_a_country_the_provider_cannot_represent() {
     // control character passes the field-support check but cannot be encoded, so it
     // must be rejected here rather than silently dropped at dispatch (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "FR\n"})),
@@ -2215,7 +2215,7 @@ async fn preflight_inspects_every_declared_web_search_tool() {
     // The preflight must inspect every tool rather than only the first, or the
     // unsupported field slips past (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let request = serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2240,7 +2240,7 @@ async fn preflight_rejects_web_search_tools_with_conflicting_countries() {
     // different countries cannot both be honored. Honoring only the first would
     // silently drop the other, so the request is rejected (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let request = serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2264,7 +2264,7 @@ async fn preflight_allows_web_search_tools_repeating_the_same_country() {
     // Two web-search tools naming the *same* country agree with the single country
     // dispatch forwards, so the request passes the preflight and continues.
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let request = serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2286,7 +2286,7 @@ async fn preflight_rejects_a_malformed_country_for_you_com() {
     // the field-support check but is not a well-formed alpha-2 code, so it must be
     // rejected here rather than forwarded for You.com to 400 on (issue #1548).
     let yaml = make_filter_yaml("you", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let action = run_initial_request(
         filter.as_ref(),
         web_search_request_with_location(&serde_json::json!({"type": "approximate", "country": "France"})),
@@ -2327,7 +2327,7 @@ async fn preflight_rejects_when_tool_choice_forces_a_server_executed_discovery_t
     // rejected at round 0 — resolving `execution` from the declaration, not the selector
     // (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut request = web_search_with_declared_tool_search(Some("server"));
     request["tool_choice"] = serde_json::json!({"type": "tool_search"});
     let action = run_initial_request(filter.as_ref(), request).await;
@@ -2348,7 +2348,7 @@ async fn preflight_rejects_when_allowed_tools_names_a_server_executed_discovery_
     // web-search tool, so web search becomes reachable and its unsupported location must
     // be rejected at round 0 (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut request = web_search_with_declared_tool_search(Some("server"));
     request["tool_choice"] = serde_json::json!({
         "type": "allowed_tools",
@@ -2372,7 +2372,7 @@ async fn preflight_rejects_from_declaration_even_when_selector_claims_client_exe
     // tool by type; `execution` is a declaration property, so the server declaration
     // wins and web search is reachable — reject at round 0 (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut request = web_search_with_declared_tool_search(Some("server"));
     request["tool_choice"] = serde_json::json!({
         "type": "allowed_tools",
@@ -2397,7 +2397,7 @@ async fn preflight_skips_when_allowed_tools_names_a_default_client_discovery_too
     // unsupported location must NOT be rejected (issue #1548 — a client round trip can
     // never enable web search this response).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut request = web_search_with_declared_tool_search(None);
     request["tool_choice"] = serde_json::json!({
         "type": "allowed_tools",
@@ -2417,7 +2417,7 @@ async fn preflight_skips_when_allowed_tools_names_an_explicit_client_discovery_t
     // client round trip — so it cannot make the excluded web-search tool reachable and
     // its unsupported location must NOT be rejected (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut request = web_search_with_declared_tool_search(Some("client"));
     request["tool_choice"] = serde_json::json!({
         "type": "allowed_tools",
@@ -2451,7 +2451,7 @@ async fn preflight_rejects_when_allowed_tools_names_a_resolved_mcp_function() {
     // web search is reachable and its unsupported location must be rejected at round 0
     // rather than silently dropped later (issue #1548).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2484,7 +2484,7 @@ async fn preflight_skips_when_allowed_tools_names_a_non_mcp_function() {
     // server continuation, so web search stays unreachable and its unsupported
     // location must NOT be rejected (issue #1548 — preserves the client-function case).
     let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let mut state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2546,7 +2546,7 @@ async fn multi_query_call_costs_one_tool_call_unit() {
     let count = spawn_counting_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2603,7 +2603,7 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
     let count = spawn_counting_brave_mock(listener);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2680,7 +2680,7 @@ async fn query_cap_boundary_keeps_zero_result_successes_truthful() {
         let count = spawn_counting_body_mock(listener, empty_body);
 
         let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-        let filter = WebSearchFilter::from_config(&yaml).unwrap();
+        let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2726,7 +2726,7 @@ async fn provider_failure_after_success_keeps_partial_results() {
     spawn_search_responses(listener, vec![(200, brave_ok_body()), (503, String::new())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2771,7 +2771,7 @@ async fn all_queries_failing_reports_failed_call() {
     spawn_search_responses(listener, vec![(503, String::new()), (200, brave_ok_body())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2812,7 +2812,7 @@ async fn zero_result_success_before_failure_is_not_reported_as_failed() {
     spawn_search_responses(listener, vec![(200, empty_body), (503, String::new())]);
 
     let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
-    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
