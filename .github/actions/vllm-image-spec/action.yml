@@ -1,0 +1,83 @@
+name: Read vLLM GPU image spec
+description: >-
+  Expose one entry of vllm/images.json as step outputs, so a consuming workflow
+  never carries its own copy of the image tag, model ID, or pinned model
+  revision. Those three are what resolve-vllm-gpu-image compares against the
+  published image's provenance labels; a divergent local copy would quietly
+  force a from-source rebuild on every run.
+inputs:
+  key:
+    description: Key under `images` in vllm/images.json (for example "text" or "vision").
+    required: true
+outputs:
+  image:
+    description: Fully qualified image reference (registry plus tag).
+    value: ${{ steps.spec.outputs.image }}
+  tag:
+    description: Image tag.
+    value: ${{ steps.spec.outputs.tag }}
+  model:
+    description: Hugging Face model ID baked into the image.
+    value: ${{ steps.spec.outputs.model }}
+  revision:
+    description: Pinned Hugging Face model revision, empty when unpinned.
+    value: ${{ steps.spec.outputs.revision }}
+  model-path:
+    description: Path to the baked weights inside the image.
+    value: ${{ steps.spec.outputs.model-path }}
+  served-model-name:
+    description: Name the model is served under.
+    value: ${{ steps.spec.outputs.served-model-name }}
+  max-model-len:
+    description: Maximum served context length.
+    value: ${{ steps.spec.outputs.max-model-len }}
+  gpu-memory-utilization:
+    description: Value for vLLM's --gpu-memory-utilization flag.
+    value: ${{ steps.spec.outputs.gpu-memory-utilization }}
+  tool-call-parser:
+    description: vLLM tool-call parser, empty when tool calling is not served.
+    value: ${{ steps.spec.outputs.tool-call-parser }}
+  reasoning-parser:
+    description: vLLM reasoning parser, empty when none applies.
+    value: ${{ steps.spec.outputs.reasoning-parser }}
+  extra-serve-args:
+    description: Additional `vllm serve` flags.
+    value: ${{ steps.spec.outputs.extra-serve-args }}
+  require-api-key:
+    description: '"true" when the backend must be served behind a bearer token.'
+    value: ${{ steps.spec.outputs.require-api-key }}
+runs:
+  using: composite
+  steps:
+    - name: Read image spec
+      id: spec
+      shell: bash
+      env:
+        SPEC_KEY: ${{ inputs.key }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY' >> "$GITHUB_OUTPUT"
+        import json, os, sys
+
+        key = os.environ["SPEC_KEY"]
+        manifest = json.load(open("vllm/images.json", encoding="utf-8"))
+        try:
+            spec = manifest["images"][key]
+        except KeyError:
+            sys.exit(f"vllm/images.json has no image '{key}'")
+
+        registry = manifest["registry"]
+        print(f"image={registry}:{spec['tag']}")
+        print(f"tag={spec['tag']}")
+        print(f"model={spec['model']}")
+        print(f"revision={spec['revision']}")
+        # The Containerfile bakes weights to $MODEL_CACHE_DIR/$INFERENCE_MODEL.
+        print(f"model-path=/opt/vllm/models/{spec['model']}")
+        print(f"served-model-name={spec['served_model_name']}")
+        print(f"max-model-len={spec['max_model_len']}")
+        print(f"gpu-memory-utilization={spec['gpu_memory_utilization']}")
+        print(f"tool-call-parser={spec['tool_call_parser']}")
+        print(f"reasoning-parser={spec['reasoning_parser']}")
+        print(f"extra-serve-args={spec['extra_serve_args']}")
+        print(f"require-api-key={str(spec['require_api_key']).lower()}")
+        PY

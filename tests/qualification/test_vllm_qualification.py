@@ -277,6 +277,25 @@ class QualificationTest(unittest.TestCase):
         self.assertIn("OpenAI Python `2.9.0`", notes)
         self.assertIn("Credentialed Tools: skipped", notes)
 
+    def test_backend_image_provenance_is_reported_only_when_recorded(self):
+        # The suite reuses the published GPU image when it matches the checkout
+        # and builds otherwise, so the note has to say which happened -- and a
+        # report captured without the provenance must not claim either.
+        pulled = report()
+        pulled["backend"].update(
+            {"image_source": "registry",
+             "registry_digest": "ghcr.io/praxis-proxy/vllm-gpu@sha256:" + "e" * 64})
+        self.assertIn("(registry, digest `ghcr.io/praxis-proxy/vllm-gpu@sha256:"
+                      + "e" * 64 + "`)", qualification.render(pulled))
+
+        built = report()
+        built["backend"].update({"image_source": "local-build", "registry_digest": None})
+        rendered = qualification.render(built)
+        self.assertIn("(local-build)", rendered)
+        self.assertNotIn("digest", rendered)
+
+        self.assertNotIn("local-build", qualification.render(report()))
+
     def test_qualification_plugin_merges_lanes_and_fails_on_corrupt_results(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "qualification.json"

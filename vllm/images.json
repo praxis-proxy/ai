@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "Single source of truth for every model-baked vLLM GPU image published to",
+    "ghcr.io/praxis-proxy/vllm-gpu. vllm-gpu-container.yaml expands this file",
+    "into its build matrix; the consuming workflows read one entry each through",
+    "the vllm-image-spec action.",
+    "",
+    "These pins MUST stay single-sourced. resolve-vllm-gpu-image decides whether",
+    "a consumer can reuse the published image by comparing the image's provenance",
+    "labels against the model and revision it was asked for, so a consumer that",
+    "carried its own copy of a pin would silently rebuild from source every run",
+    "the moment the two drifted."
+  ],
+  "registry": "ghcr.io/praxis-proxy/vllm-gpu",
+  "images": {
+    "text": {
+      "$comment": [
+        "Default image. Qwen3-8B is the model the full GPU Responses suite and the",
+        "Claude Code / Codex acceptance jobs qualify against: the 0.6B CPU model",
+        "cannot drive reliable tool calling. The 8.19B bf16 checkpoint is ~15.3 GiB",
+        "and fits the g5.xlarge A10G (24 GiB) with room for a KV cache.",
+        "Deliberately unpinned by revision, matching how the suite has always",
+        "served it; set `revision` to freeze it."
+      ],
+      "tag": "Qwen3-8B",
+      "model": "Qwen/Qwen3-8B",
+      "revision": "",
+      "served_model_name": "Qwen/Qwen3-8B",
+      "max_model_len": "4096",
+      "gpu_memory_utilization": "0.9",
+      "tool_call_parser": "hermes",
+      "reasoning_parser": "deepseek_r1",
+      "extra_serve_args": "",
+      "require_api_key": false,
+      "validation": "responses",
+      "praxis_build_args": "--no-default-features --features standard,openai-all,store-sqlite",
+      "publish_latest": true
+    },
+    "vision": {
+      "$comment": [
+        "Vision companion. A separate model is required because Qwen3-8B above is",
+        "text-only. Revision-pinned so the nightly compares image requests against",
+        "fixed weights. Served without tool-call or reasoning parsers: those are",
+        "text-model specific and the vision tests do not drive tool use."
+      ],
+      "tag": "Qwen3-VL-4B-Instruct",
+      "model": "Qwen/Qwen3-VL-4B-Instruct",
+      "revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17",
+      "served_model_name": "qwen3-vl-4b",
+      "max_model_len": "8192",
+      "gpu_memory_utilization": "0.90",
+      "tool_call_parser": "",
+      "reasoning_parser": "",
+      "extra_serve_args": "--enforce-eager",
+      "require_api_key": true,
+      "validation": "vision",
+      "praxis_build_args": "",
+      "publish_latest": false
+    }
+  }
+}

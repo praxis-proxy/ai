@@ -1,15 +1,31 @@
 name: vLLM GPU Container
 
 # ------------------------------------------------------------------------------
-# Build the model-baked vLLM GPU image, prove it serves Praxis traffic on a real
-# GPU, and only then publish it.
+# Build every model-baked vLLM GPU image described by vllm/images.json, prove
+# each one serves Praxis traffic on a real GPU, and only then publish it.
 #
-# The gate is the repository's own live-vLLM coverage -- the `critical_vllm`
-# subset of tests/integration/sdk/openai/test_openai_responses_vllm.py, run with
-# VLLM_TEST_BACKEND=live, exactly as the vllm-live-cpu job in
-# vllm-integration.yaml runs it against the CPU image. That drives real
-# Responses API traffic through Praxis into this image (including the OGX
-# file_search / file_resolve paths), rather than curling the backend directly.
+# This workflow is the sole publisher of ghcr.io/praxis-proxy/vllm-gpu. The
+# consuming workflows (vllm-integration.yaml, anthropic-vllm-vision.yaml) reuse
+# what it publishes and only fall back to building when the registry does not
+# already hold an image matching their checkout -- so this is also where a
+# Containerfile or model-pin change gets its live coverage.
+#
+# The gate is the repository's own live coverage, run against the freshly built
+# image, and it is model-appropriate:
+#
+#   text   -- the `critical_vllm` subset of
+#             tests/integration/sdk/openai/test_openai_responses_vllm.py with
+#             VLLM_TEST_BACKEND=live, exactly as the vllm-live-cpu job in
+#             vllm-integration.yaml runs it against the CPU image. That drives
+#             real Responses API traffic through Praxis into the image
+#             (including the OGX file_search / file_resolve paths), rather than
+#             curling the backend directly.
+#   vision -- the official Anthropic SDK image requests in
+#             tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py,
+#             which are the only tests that exercise a vision model at all.
+#
+# Legs run one at a time: a single self-hosted agent is registered on the
+# ephemeral instance, and each leg wants the whole GPU and most of the disk.
 # ------------------------------------------------------------------------------
 
 on:
@@ -17,7 +33,10 @@ on:
     branches: [main]
     paths:
       - "vllm/Containerfile"
+      - "vllm/images.json"
       - ".github/actions/build-vllm-gpu/**"
+      - ".github/actions/resolve-vllm-gpu-image/**"
+      - ".github/actions/vllm-image-spec/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/actions/start-ec2-runner/**"
@@ -28,7 +47,10 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - "vllm/Containerfile"
+      - "vllm/images.json"
       - ".github/actions/build-vllm-gpu/**"
+      - ".github/actions/resolve-vllm-gpu-image/**"
+      - ".github/actions/vllm-image-spec/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/actions/start-ec2-runner/**"
@@ -38,9 +60,17 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      inference_model:
-        description: "Inference model (HuggingFace ID) — default is Qwen/Qwen3-8B"
-        type: string
+      images:
+        description: >-
+          Which image(s) from vllm/images.json to build and publish. Target a
+          single one to republish it without paying for the other.
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - text
+          - vision
       gpu_instance_type:
         description: >-
           Optional EC2 GPU instance-type override for transient capacity
@@ -59,16 +89,10 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/praxis-proxy/vllm-gpu
-  # Same model the GPU jobs in vllm-integration.yaml serve (VLLM_GPU_MODEL), so
-  # the image this workflow publishes is the one that coverage is qualified on.
-  INFERENCE_MODEL: ${{ inputs.inference_model || 'Qwen/Qwen3-8B' }}
   # Instance type for the ephemeral GPU runner, matching vllm-integration.yaml.
   # g5.xlarge = A10G (24 GiB, compute capability 8.6), which holds the 15.3 GiB
   # bf16 Qwen3-8B checkpoint with room for a KV cache and has FlashAttention-2.
   GPU_INSTANCE_TYPE: "g5.xlarge"
-  # The CPU job runs at 0.5; 0.9 here matches what the GPU jobs in
-  # vllm-integration.yaml give vLLM on the same card.
-  GPU_MEMORY_UTILIZATION: "0.9"
   # OGX + transformers pins live in tests/integration/ogx-constraints.txt (with
   # the rationale for each pin), single-sourced so the uv download cache key
   # depends only on the pins. Same file the vllm-integration jobs install from.
@@ -96,7 +120,10 @@ jobs:
         run: |
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             'vllm/Containerfile' \
+            'vllm/images.json' \
             '.github/actions/build-vllm-gpu/' \
+            '.github/actions/resolve-vllm-gpu-image/' \
+            '.github/actions/vllm-image-spec/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/actions/start-ec2-runner/' \
@@ -109,13 +136,14 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # No GPU runner is standing by for this workflow, so provision an ephemeral
-  # EC2 instance for the run and tear it down unconditionally afterwards --
-  # the same pattern the nightly GPU jobs in vllm-integration.yaml use.
+  # Expand vllm/images.json into the build matrix. This has to be a job rather
+  # than a static `strategy.matrix`: a job-level `if` cannot see the `matrix`
+  # context, so selecting a subset of images on dispatch is only expressible by
+  # computing the matrix up front.
   # ----------------------------------------------------------------------------
 
-  gpu-start-runner:
-    name: Start ephemeral EC2 GPU runner
+  plan:
+    name: Select images to build
     needs: [changes]
     if: |
       always() &&
@@ -123,6 +151,81 @@ jobs:
       (github.event_name != 'pull_request' ||
         (github.event.pull_request.head.repo.full_name == github.repository &&
          github.event.pull_request.user.login != 'dependabot[bot]'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Expand image manifest into a build matrix
+        id: select
+        env:
+          SELECTION: ${{ inputs.images || 'both' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+
+          selection = os.environ["SELECTION"]
+          manifest = json.load(open("vllm/images.json", encoding="utf-8"))
+          images, registry = manifest["images"], manifest["registry"]
+
+          keys = list(images) if selection == "both" else [selection]
+          unknown = [key for key in keys if key not in images]
+          if unknown:
+              sys.exit(f"vllm/images.json has no image(s): {', '.join(unknown)}")
+
+          include = [{
+              "key": key,
+              "image": f"{registry}:{images[key]['tag']}",
+              "tag": images[key]["tag"],
+              "model": images[key]["model"],
+              "revision": images[key]["revision"],
+              # The Containerfile bakes weights to $MODEL_CACHE_DIR/$INFERENCE_MODEL.
+              "model_path": f"/opt/vllm/models/{images[key]['model']}",
+              "served_model_name": images[key]["served_model_name"],
+              "max_model_len": images[key]["max_model_len"],
+              "gpu_memory_utilization": images[key]["gpu_memory_utilization"],
+              "tool_call_parser": images[key]["tool_call_parser"],
+              "reasoning_parser": images[key]["reasoning_parser"],
+              "extra_serve_args": images[key]["extra_serve_args"],
+              "require_api_key": images[key]["require_api_key"],
+              "validation": images[key]["validation"],
+              "praxis_build_args": images[key]["praxis_build_args"],
+              "publish_latest": images[key]["publish_latest"],
+          } for key in keys]
+
+          print("matrix=" + json.dumps({"include": include}))
+          PY
+
+      - name: Summarize selection
+        env:
+          MATRIX: ${{ steps.select.outputs.matrix }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          legs = json.loads(os.environ["MATRIX"])["include"]
+          print("### vLLM GPU images selected\n")
+          print("| key | image | model | revision |")
+          print("| --- | --- | --- | --- |")
+          for leg in legs:
+              print(f"| {leg['key']} | `{leg['image']}` | `{leg['model']}` "
+                    f"| `{leg['revision'] or 'unpinned'}` |")
+          PY
+
+  # ----------------------------------------------------------------------------
+  # No GPU runner is standing by for this workflow, so provision an ephemeral
+  # EC2 instance for the run and tear it down unconditionally afterwards --
+  # the same pattern the nightly GPU jobs in vllm-integration.yaml use.
+  # ----------------------------------------------------------------------------
+
+  gpu-start-runner:
+    name: Start ephemeral EC2 GPU runner
+    needs: [plan]
+    if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -147,24 +250,34 @@ jobs:
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
 
   build-test:
-    needs: [changes, gpu-start-runner]
+    name: Build, test and publish ${{ matrix.tag }}
+    needs: [plan, gpu-start-runner]
+    # The plan guard is not redundant with the runner guard: `strategy.matrix`
+    # reads needs.plan.outputs.matrix, which is empty unless plan succeeded.
     if: |
-      !cancelled() && needs.gpu-start-runner.result == 'success'
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.gpu-start-runner.result == 'success'
+    strategy:
+      # Publish whichever image passes; one model's failure must not withhold
+      # the other's build.
+      fail-fast: false
+      # One self-hosted agent runs one job at a time, so legs already serialize.
+      # Stating it keeps the GPU and disk contention explicit.
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     # The dynamically generated label of the instance provisioned above; there
     # is no statically registered GPU runner to fall back to.
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
-    # Covers the CUDA base image pull, the ~16 GiB bf16 checkpoint baked into
-    # the build, the OGX dependency closure, a debug Praxis build, the live
-    # suite, and the GHCR push of the resulting image.
+    # Covers the CUDA base image pull, the multi-GiB checkpoint baked into the
+    # build, the OGX dependency closure, a debug Praxis build, the live suite,
+    # and the GHCR push of the resulting image.
     timeout-minutes: 120
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set image tag
-        run: echo "IMAGE_TAG=${INFERENCE_MODEL#*/}" >> "$GITHUB_ENV"
 
       - name: Verify GPU and select container runtime
         run: |
@@ -185,10 +298,11 @@ jobs:
 
       - name: Free disk space
         run: |
-          # The CUDA base image plus the baked model weights need tens of GiB.
+          # The CUDA base image plus the baked model weights need tens of GiB,
+          # and a previous matrix leg on this instance has already filled it.
           # The instance is ephemeral and the runner agent is a host service,
-          # not a container, so reclaiming every cached image on the AMI is
-          # safe -- nothing here outlives the job.
+          # not a container, so reclaiming every cached image is safe -- an
+          # earlier leg's image is already in the registry by this point.
           "$CONTAINER_RUNTIME" system prune -af || true
           df -h /
 
@@ -212,26 +326,38 @@ jobs:
       - name: Build image
         uses: ./.github/actions/build-vllm-gpu
         with:
-          model: ${{ env.INFERENCE_MODEL }}
-          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          model: ${{ matrix.model }}
+          revision: ${{ matrix.revision }}
+          image: ${{ matrix.image }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+
+      - name: Generate backend credential
+        if: matrix.require_api_key
+        run: |
+          token="praxis-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$token"
+          echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Start vLLM on GPU
         uses: ./.github/actions/start-vllm
         with:
-          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          # Serve under the full HuggingFace id so the test harness's VLLM_MODEL
-          # matches the CPU job's. The short form is only the image tag.
-          model: ${{ env.INFERENCE_MODEL }}
-          model-path: /opt/vllm/models/${{ env.INFERENCE_MODEL }}
+          image: ${{ matrix.image }}
+          model: ${{ matrix.served_model_name }}
+          model-path: ${{ matrix.model_path }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
           # Built locally in the step above; there is nothing to pull.
           pull: "false"
           device-args: ${{ env.GPU_DEVICE_ARGS }}
-          gpu-memory-utilization: ${{ env.GPU_MEMORY_UTILIZATION }}
+          gpu-memory-utilization: ${{ matrix.gpu_memory_utilization }}
+          max-model-len: ${{ matrix.max_model_len }}
+          tool-call-parser: ${{ matrix.tool_call_parser }}
+          reasoning-parser: ${{ matrix.reasoning_parser }}
+          extra-args: ${{ matrix.extra_serve_args }}
+          api-key: ${{ matrix.require_api_key && env.VLLM_API_KEY || '' }}
 
       - name: Pre-install OGX dependencies
+        if: matrix.validation == 'responses'
         run: |
           # Resolve + download the full OGX closure synchronously and OFF the
           # readiness clock, so it never races the "Wait for OGX readiness"
@@ -239,12 +365,13 @@ jobs:
           uv run --with-requirements "$OGX_CONSTRAINTS" ogx --help > /dev/null
 
       - name: Start OGX
+        if: matrix.validation == 'responses'
         run: |
           uv run --with-requirements "$OGX_CONSTRAINTS" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+        run: cargo build -p praxis-ai-proxy ${{ matrix.praxis_build_args }}
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
@@ -252,8 +379,10 @@ jobs:
           runtime: ${{ env.CONTAINER_RUNTIME }}
           # No pull window to absorb: only the GPU model load.
           timeout: "600"
+          api-key: ${{ matrix.require_api_key && env.VLLM_API_KEY || '' }}
 
       - name: Wait for OGX readiness
+        if: matrix.validation == 'responses'
         run: |
           dump_ogx_log() {
             echo "----- /tmp/ogx.log (tail -n 200) -----"
@@ -277,12 +406,21 @@ jobs:
           echo "OGX is ready"
 
       - name: Run critical live vLLM tests against the GPU image
+        if: matrix.validation == 'responses'
         env:
           VLLM_TEST_BACKEND: live
-          VLLM_MODEL: ${{ env.INFERENCE_MODEL }}
+          VLLM_MODEL: ${{ matrix.served_model_name }}
         run: |
           uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py \
             -s -m "critical_vllm" --sdk-version=3.x
+
+      - name: Run official Anthropic SDK image tests against the GPU image
+        if: matrix.validation == 'vision'
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ matrix.served_model_name }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k image
 
       - name: vLLM container logs
         if: failure()
@@ -290,7 +428,7 @@ jobs:
           "$CONTAINER_RUNTIME" logs vllm 2>&1 || echo "(no vllm container)"
 
       - name: OGX logs
-        if: failure()
+        if: failure() && matrix.validation == 'responses'
         run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
 
       - name: Stop vLLM
@@ -303,6 +441,7 @@ jobs:
         run: |
           if [ -f /tmp/ogx.pid ]; then
             kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+            rm -f /tmp/ogx.pid
           fi
 
       # Publishing runs only after the live suite passed: these steps carry the
@@ -329,18 +468,38 @@ jobs:
 
       - name: Push image
         if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+        env:
+          TAG: ${{ matrix.tag }}
+          PUBLISH_LATEST: ${{ matrix.publish_latest }}
         run: |
           set -euo pipefail
-          "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:${IMAGE_TAG}"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            "$CONTAINER_RUNTIME" tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+          # Three coordinates, same strategy for every image in the manifest:
+          #
+          #   :<tag>            moving pointer at the newest validated build.
+          #                     What the consuming workflows resolve.
+          #   :<tag>-<sha>      immutable, so a specific build stays addressable
+          #                     after :<tag> moves -- qualification evidence and
+          #                     bisects need to name one exact image.
+          #   :latest           only the manifest's default image claims it, so
+          #                     two models cannot race to clobber it.
+          "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:${TAG}"
+          "$CONTAINER_RUNTIME" tag "${IMAGE_NAME}:${TAG}" "${IMAGE_NAME}:${TAG}-${GITHUB_SHA}"
+          "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:${TAG}-${GITHUB_SHA}"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$PUBLISH_LATEST" = "true" ]; then
+            "$CONTAINER_RUNTIME" tag "${IMAGE_NAME}:${TAG}" "${IMAGE_NAME}:latest"
             "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:latest"
           fi
+          {
+            echo "### Published \`${TAG}\`"
+            echo
+            echo "- \`${IMAGE_NAME}:${TAG}\`"
+            echo "- \`${IMAGE_NAME}:${TAG}-${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   gpu-stop-runner:
     name: Stop ephemeral EC2 GPU runner
     # MUST depend on every job that runs on the instance; otherwise the runner
-    # could be deregistered while build-test is still queued/running.
+    # could be deregistered while a build-test leg is still queued/running.
     needs: [gpu-start-runner, build-test]
     # Always tear down the instance, even on failure/cancel, but skip when the
     # runner was never started.

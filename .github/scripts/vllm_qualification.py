@@ -15,7 +15,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 
-VERSION = 2
+VERSION = 3
 PROFILE = "responses-gateway-live-vllm-gpu"
 ARTIFACT = "vllm-qualification"
 # Keep the existing note delimiters so release reruns replace earlier sections.
@@ -125,6 +125,18 @@ def suite(name, path, profile=None):
             "started_at": result.get("started_at"), "finished_at": result.get("finished_at")}
 
 
+def image_inspect(runtime, image, template):
+    if not image:
+        return None
+    value = command(runtime, "image", "inspect", image, f"--format={template}")
+    # podman renders a missing value as "<no value>" where docker renders "".
+    return value or None if value != "<no value>" else None
+
+
+def image_label(runtime, image, key):
+    return image_inspect(runtime, image, '{{index .Config.Labels "%s"}}' % key)
+
+
 def capture(args):
     runtime = os.environ.get("CONTAINER_RUNTIME", "docker")
     image = os.environ.get("VLLM_BUILT_GPU_IMAGE")
@@ -163,7 +175,18 @@ def capture(args):
                         status, reason = "incomplete", f"{label}: {group['reason']}"
                         break
     gpu = command("nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total", "--format=csv,noheader")
-    image_id = command(runtime, "image", "inspect", image, "--format={{.Id}}") if image else None
+    image_id = image_inspect(runtime, image, "{{.Id}}")
+    # Read the backend's provenance off the image itself rather than off the
+    # working tree. The suite reuses the build vllm-gpu-container.yaml published
+    # whenever it matches this checkout, so "what the image was built from" is
+    # the honest claim; hashing the checked-out Containerfile would describe a
+    # build that may never have happened on this runner. A registry digest is
+    # present only when the image was pulled, absent when it was built here.
+    registry_digest = image_inspect(
+        runtime, image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}")
+    containerfile_sha256 = (image_label(runtime, image, "praxis.vllm.containerfile-sha256")
+                            or file_hash("vllm/Containerfile"))
+    base_image = image_label(runtime, image, "praxis.vllm.base-image")
     resolved_revision = model_revision(runtime, model)
     report = {
         "schema_version": VERSION,
@@ -182,10 +205,12 @@ def capture(args):
                     "praxis_filter_version": locked_version("praxis-proxy-filter")},
         "backend": {"mode": "real-vllm-gpu", "version": command(runtime, "exec", "vllm", "python", "-c", "import vllm; print(vllm.__version__)"),
                     "image_tag": image, "local_image_id": image_id,
-                    "registry_digest": None,
-                    "containerfile_sha256": file_hash("vllm/Containerfile"),
-                    "base_image": "docker.io/vllm/vllm-openai:v0.30.0",
-                    "base_image_id": command(runtime, "image", "inspect", "docker.io/vllm/vllm-openai:v0.30.0", "--format={{.Id}}")},
+                    "registry_digest": registry_digest,
+                    "image_source": "registry" if registry_digest else "local-build",
+                    "built_from_commit": image_label(runtime, image, "org.opencontainers.image.revision"),
+                    "containerfile_sha256": containerfile_sha256,
+                    "base_image": base_image,
+                    "base_image_id": image_inspect(runtime, base_image, "{{.Id}}")},
         "model": {"identifier": model, "resolved_revision": resolved_revision,
                   "revision_note": None if resolved_revision else "HF snapshot revision unavailable from local build metadata"},
         "configuration": {"reference_path": config, "sha256": file_hash(config),
@@ -332,8 +357,15 @@ def render(report, detailed=False):
         lines.append(f"vLLM Responses gateway qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
     gateway, backend, model = (report.get(key, {}) for key in ("gateway", "backend", "model"))
     if status not in ("unavailable", "not_requested"):
+        # Whether the backend image was pulled from the registry or built on the
+        # runner, and its digest when published. Appended only when recorded, so
+        # a report captured without the provenance renders exactly as before.
+        image = f"local image `{backend.get('local_image_id') or 'unavailable'}`"
+        if backend.get("image_source"):
+            digest = backend.get("registry_digest")
+            image += f" ({backend['image_source']}" + (f", digest `{digest}`" if digest else "") + ")"
         lines += ["", f"Tested checkout: `{gateway.get('checkout_sha') or 'unavailable'}`; locally built gateway binary `{gateway.get('binary_sha256') or 'unavailable'}` (debug/full); Praxis core `{gateway.get('praxis_version') or 'unavailable'}`.",
-                  f"Backend: vLLM `{backend.get('version') or 'unavailable'}`, local image `{backend.get('local_image_id') or 'unavailable'}`; model `{model.get('identifier') or 'unavailable'}` (revision `{model.get('resolved_revision') or 'unavailable'}`)."]
+                  f"Backend: vLLM `{backend.get('version') or 'unavailable'}`, {image}; model `{model.get('identifier') or 'unavailable'}` (revision `{model.get('resolved_revision') or 'unavailable'}`)."]
         config = report.get("configuration", {})
         deps = report.get("suites", {}).get("native_responses", {}).get("dependencies", {})
         lines.append(f"SDK: OpenAI Python `{deps.get('openai') or 'unavailable'}`; config `{config.get('reference_path') or 'unavailable'}` (`{config.get('sha256') or 'unavailable'}`); storage `{config.get('storage_backend') or 'unavailable'}`.")
