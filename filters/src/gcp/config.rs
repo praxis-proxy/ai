@@ -39,7 +39,7 @@ pub(super) enum GcpAdcSource {
 /// filter: gcp_adc
 /// source: adc
 /// scope: https://www.googleapis.com/auth/cloud-platform
-/// clusters: [vertex] # optional; only inject credentials after routing to these clusters
+/// clusters: [vertex] # optional; only after the router, which selects the cluster
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,8 +68,10 @@ pub(super) struct GcpAdcConfig {
 
     /// Optional logical upstream clusters that receive GCP credentials.
     /// When omitted or empty, the filter applies to every request in its
-    /// chain. Use this after a router in a multi-provider chain so a GCP
-    /// bearer token is not sent to non-GCP providers.
+    /// chain. Use this in a multi-provider chain so a GCP bearer token is
+    /// not sent to non-GCP providers; the filter must then come after the
+    /// router, since before it no cluster is selected and nothing is
+    /// injected.
     #[serde(default)]
     pub clusters: Vec<String>,
 

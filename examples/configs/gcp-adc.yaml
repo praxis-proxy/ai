@@ -9,10 +9,15 @@
 #
 # source: key_file signs a JWT assertion with a service-account key
 # JSON file (client_email, private_key, token_uri) and exchanges it at
-# Google's OAuth2 token endpoint. The token_uri is validated to
-# https://oauth2.googleapis.com so a tampered key file cannot redirect
-# the signed assertion elsewhere; mount the file from a Secret and
-# never commit it.
+# Google's OAuth2 token endpoint. The key file's token_uri must be
+# https://oauth2.googleapis.com/token so a tampered key file cannot
+# redirect the signed assertion elsewhere; mount the file from a Secret
+# and never commit it.
+#
+# clusters: [...] limits token injection to requests routed to those
+# clusters, so a chain that routes to several providers never sends the
+# GCP token to the others. It only works with gcp_adc placed after the
+# router, as below: before it, no cluster has been selected yet.
 #
 # This filter only injects Authorization — it does NOT set Host
 # or path. Point the cluster at your Vertex regional endpoint
@@ -46,8 +51,10 @@ filter_chains:
       - filter: gcp_adc
         # source: adc   # default: GOOGLE_APPLICATION_CREDENTIALS, else GKE metadata
         # scope: https://www.googleapis.com/auth/cloud-platform
-        # Metadata authentication uses only the fixed metadata endpoint;
-        # redirects and ambient HTTP proxies are disabled.
+        # clusters: [vertex]   # optional; inject only for these clusters
+        # Token requests go only to the fixed metadata endpoint or to
+        # Google's token endpoint; redirects and ambient HTTP proxies
+        # are disabled.
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local backend
