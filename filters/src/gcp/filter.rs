@@ -27,7 +27,8 @@ use super::{
 /// flight. Passed to [`TokenCache::new`] as its safety margin.
 const EXPIRY_SKEW: Duration = Duration::from_secs(30);
 
-/// Timeout for a single metadata-server round-trip.
+/// Timeout for a single token round-trip, to the metadata server or to
+/// Google's `OAuth2` token endpoint for `source: key_file`.
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // -----------------------------------------------------------------------------
