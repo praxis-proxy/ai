@@ -947,6 +947,12 @@ fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
     }
 }
 
+/// Whether a payload column preserves text without numeric affinity coercion.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_has_text_affinity(declared_type: &str) -> bool {
+    sqlite_type_affinity(declared_type) == SqliteAffinity::Text
+}
+
 /// Folding verdict for a `SQLite` primary key column, from its declared type and
 /// effective collation.
 ///

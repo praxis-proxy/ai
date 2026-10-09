@@ -20,7 +20,10 @@ use std::{
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
+use super::{
+    bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response,
+    history::MessageHistory,
+};
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -487,7 +490,7 @@ pub(crate) struct ResponsesState {
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: MessageHistory,
 
     /// Start of the newly appended local tool-result suffix that still needs
     /// guardrail evaluation before another inference request may be built.
@@ -524,7 +527,7 @@ pub(crate) struct ResponsesState {
     /// This may include output-only metadata items omitted from
     /// [`Self::messages`] because it is not forwarded to backend
     /// inference.
-    pub persisted_messages: Vec<serde_json::Value>,
+    pub persisted_messages: MessageHistory,
 
     /// Server-owned pending MCP approvals emitted during this request.
     ///
@@ -966,12 +969,12 @@ impl Default for ResponsesState {
             mcp_tool_map: HashMap::new(),
             client_tool_lowering: HashMap::new(),
             client_tool_echo: None,
-            messages: Vec::new(),
+            messages: MessageHistory::default(),
             pending_local_tool_guardrail_start: None,
             provider_history_len: 0,
             provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
-            persisted_messages: Vec::new(),
+            persisted_messages: MessageHistory::default(),
             #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
@@ -1013,6 +1016,8 @@ impl ResponsesState {
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
+        let input = messages.clone();
+        let messages = MessageHistory::from(messages);
         let persisted_messages = messages.clone();
         let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
         let tool_choice = body
@@ -1026,7 +1031,7 @@ impl ResponsesState {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
-            input: messages.clone(),
+            input,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
@@ -1046,9 +1051,15 @@ impl ResponsesState {
     /// Identify opaque provider compaction items already present in a stateless
     /// input array. Locally generated summaries use the `compact_` ID prefix or
     /// carry the private provenance marker and must still be translated.
-    pub(crate) fn provider_compaction_ids_from_messages(messages: &[serde_json::Value]) -> HashSet<String> {
+    #[expect(
+        single_use_lifetimes,
+        reason = "generic item borrow keeps the signature usable for both contiguous slices and shared history"
+    )]
+    pub(crate) fn provider_compaction_ids_from_messages<'a>(
+        messages: impl IntoIterator<Item = &'a serde_json::Value>,
+    ) -> HashSet<String> {
         messages
-            .iter()
+            .into_iter()
             .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
             .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
             .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
@@ -1088,6 +1099,20 @@ impl ResponsesState {
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
         self.persisted_messages.push(item);
+    }
+
+    /// Arc-sharing variant of [`Self::persist_collected_output`]: record the same
+    /// `(accumulated_output index, persisted_messages index)` provenance while
+    /// sharing a single allocation with the replay projection instead of cloning
+    /// the item into durable history.
+    pub(crate) fn persist_collected_output_shared(
+        &mut self,
+        accumulated_index: usize,
+        item: std::sync::Arc<serde_json::Value>,
+    ) {
+        self.collected_output_provenance
+            .push((accumulated_index, self.persisted_messages.len()));
+        self.persisted_messages.push_shared(item);
     }
 
     /// Record one agentic round's boundaries after a collector finished it, before

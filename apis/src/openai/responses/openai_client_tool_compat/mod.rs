@@ -775,8 +775,10 @@ fn restoration_armed(ctx: &HttpFilterContext<'_>) -> bool {
 /// to genuinely different backend declarations: the correct declaration is then
 /// ambiguous, so lowering it silently could hoist the wrong contract onto the
 /// backend.
-fn collect_discovered_tools(messages: &[Value]) -> Result<Vec<Value>, FilterAction> {
-    let lowered_call_ids = client_executed_call_ids(messages);
+fn collect_discovered_tools<'a>(
+    messages: impl IntoIterator<Item = &'a Value> + Clone + 'a,
+) -> Result<Vec<Value>, FilterAction> {
+    let lowered_call_ids = client_executed_call_ids(messages.clone());
     let mut seen: HashMap<(String, String), Value> = HashMap::new();
     let mut discovered = Vec::new();
     for item in messages {
@@ -2124,12 +2126,26 @@ fn lower_namespaced_tool_choice(
 /// Lower every typed *client-owned* history item to the function shape a
 /// function-only backend accepts. Returns whether any item changed, or fails
 /// closed on a prior history item this adapter cannot lower.
-fn lower_history_items(messages: &mut [Value]) -> Result<bool, FilterAction> {
-    reject_unsupported_history_items(messages)?;
-    let lowered_call_ids = client_executed_call_ids(messages);
+fn lower_history_items(messages: &mut super::history::MessageHistory) -> Result<bool, FilterAction> {
+    reject_unsupported_history_items(messages.iter())?;
+    let lowered_call_ids = client_executed_call_ids(messages.iter());
     let mut changed = false;
-    for item in messages.iter_mut() {
-        changed |= lower_history_item(item, &lowered_call_ids);
+    for index in 0..messages.len() {
+        let needs_lowering = messages
+            .get(index)
+            .is_some_and(|item| match item.get("type").and_then(Value::as_str) {
+                Some("custom_tool_call" | "custom_tool_call_output") => true,
+                Some("shell_call" | "tool_search_call") => is_client_executed_tool_call(item),
+                Some("shell_call_output" | "tool_search_output") => output_call_was_lowered(item, &lowered_call_ids),
+                Some("function_call") => item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .is_some_and(|namespace| !namespace.is_empty()),
+                _ => false,
+            });
+        if needs_lowering && let Some(item) = messages.get_mut(index) {
+            changed |= lower_history_item(item, &lowered_call_ids);
+        }
     }
     Ok(changed)
 }
@@ -2142,7 +2158,9 @@ fn lower_history_items(messages: &mut [Value]) -> Result<bool, FilterAction> {
 /// (`local_shell_call`/`local_shell_call_output`) are rejected here so an earlier
 /// turn's unsupported call can never reach the backend unchanged on a
 /// continuation. Full `local_shell` lowering/restoration is a follow-up.
-fn reject_unsupported_history_items(messages: &[Value]) -> Result<(), FilterAction> {
+fn reject_unsupported_history_items<'a>(
+    messages: impl IntoIterator<Item = &'a Value> + 'a,
+) -> Result<(), FilterAction> {
     for item in messages {
         if matches!(
             item.get("type").and_then(Value::as_str),
@@ -2157,7 +2175,7 @@ fn reject_unsupported_history_items(messages: &[Value]) -> Result<(), FilterActi
 /// Collect the `call_id`s of client-executed `shell_call`/`tool_search_call`
 /// history items so their matching outputs are lowered in lockstep, while
 /// server/container-owned calls (and their outputs) are left untouched.
-fn client_executed_call_ids(messages: &[Value]) -> HashSet<String> {
+fn client_executed_call_ids<'a>(messages: impl IntoIterator<Item = &'a Value> + 'a) -> HashSet<String> {
     let mut ids = HashSet::new();
     for item in messages {
         let is_gated_call = matches!(

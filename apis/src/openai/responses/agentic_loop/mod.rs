@@ -780,6 +780,10 @@ fn evaluate_loop_decision(
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "update output and shared persistence views before clearing queued calls"
+)]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
@@ -790,23 +794,27 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
-        }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
-        };
-        if matches && let Some(obj) = item.as_object_mut() {
-            obj.insert("status".to_owned(), json!("incomplete"));
-        }
+    let needs_mark = |item: &Value| {
+        item.get("type").and_then(Value::as_str) == Some("tool_search_call")
+            && item.get("status").and_then(Value::as_str) != Some("incomplete")
+            && match item.get("id").and_then(Value::as_str) {
+                Some(id) => queued_ids.iter().any(|queued| queued == id),
+                None => mark_unidentified,
+            }
     };
     for item in &mut state.accumulated_output {
-        mark(item);
+        if needs_mark(item)
+            && let Some(obj) = item.as_object_mut()
+        {
+            obj.insert("status".to_owned(), json!("incomplete"));
+        }
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
+    for index in 0..state.persisted_messages.len() {
+        if state.persisted_messages.get(index).is_some_and(&needs_mark)
+            && let Some(obj) = state.persisted_messages.get_mut(index).and_then(Value::as_object_mut)
+        {
+            obj.insert("status".to_owned(), json!("incomplete"));
+        }
     }
     state.tool_search_calls.clear();
 }
@@ -938,6 +946,18 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     (false, !state.tool_calls.is_empty())
 }
 
+/// Share one owned item between replay and persistence; mutation detaches it.
+///
+/// Records the same `(accumulated_output index, persisted_messages index)`
+/// provenance as [`ResponsesState::persist_collected_output`] so storage
+/// assembly can drop the later wholesale append of this item without guessing by
+/// value, while still sharing the single allocation with the replay projection.
+fn append_shared_history(state: &mut ResponsesState, accumulated_index: usize, item: Value) {
+    let item = std::sync::Arc::new(item);
+    state.messages.push_shared(std::sync::Arc::clone(&item));
+    state.persist_collected_output_shared(accumulated_index, item);
+}
+
 /// Distribute output items from a parsed response into the accumulator and state vectors.
 ///
 /// `private_indices` holds the ascending round-local indices that
@@ -962,12 +982,10 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") if is_dispatchable_function_call(item) => {
                 state.tool_calls.push(item.clone());
-                state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                append_shared_history(state, absolute_index, item.clone());
             },
             Some("reasoning") => {
-                state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                append_shared_history(state, absolute_index, item.clone());
             },
             Some("compaction") => {
                 // Provider compaction items are valid replayable input. Keep
@@ -1128,8 +1146,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
             Some("function_call" | "reasoning") => {
-                state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                append_shared_history(state, absolute_index, item.clone());
                 state.accumulated_output.push(item);
             },
             Some("compaction") => {

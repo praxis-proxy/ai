@@ -3215,6 +3215,165 @@ class TestOpenAIResponsesVLLM:
         assert second_backend.get("previous_response_id") is None, second_backend
         assert isinstance(second_backend.get("input"), list), second_backend
 
+    def test_complete_conversation_history_replayed_after_delete_and_append(
+        self, witness_backend_client
+    ):
+        """#532: native replay includes every surviving item, not one API page."""
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            # PostgreSQL SDK lanes share tables, and deleting a conversation
+            # deliberately retains its item rows. Scope IDs to this conversation.
+            expected = []
+            for batch in range(6):
+                items = [
+                    {
+                        "id": f"item_replay_{conversation.id}_{batch}_{index}",
+                        "type": "message",
+                        "role": "user",
+                        "content": f"HISTORY-{batch}-{index}",
+                    }
+                    for index in range(20)
+                ]
+                client.conversations.items.create(conversation.id, items=items)
+                expected.extend(items)
+            for item in [expected[0], expected[19], expected[-1]]:
+                client.conversations.items.delete(
+                    item["id"], conversation_id=conversation.id
+                )
+                expected.remove(item)
+            appended = {
+                "id": f"item_replay_{conversation.id}_appended",
+                "type": "message",
+                "role": "user",
+                "content": "HISTORY-APPENDED",
+            }
+            client.conversations.items.create(conversation.id, items=[appended])
+            expected.append(appended)
+
+            before = len(forwarded)
+            # The replayed prompt is ~1.2k tokens. The CI inference simulator
+            # runs in echo mode and rejects max_output_tokens below the prompt
+            # length, so a small budget fails before the replay is observable.
+            # A real backend stops at the end of the reply regardless.
+            current_input = 'Reply OK. café "quoted". /no_think'
+            response = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=current_input,
+                store=True,
+                max_output_tokens=2048,
+            )
+            assert response.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            replay = requests[0]["input"]
+            texts = []
+            for item in replay:
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    texts.append(content)
+                else:
+                    texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") in {"input_text", "output_text"}
+                    )
+            assert texts == [item["content"] for item in expected] + [current_input], (
+                "replay must preserve history order and include current input exactly once"
+            )
+
+            before = len(forwarded)
+            next_input = "Reply OK again. /no_think"
+            continuation = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=next_input,
+                store=True,
+                # Echo mode also replays the first response on this turn.
+                max_output_tokens=4096 if VLLM_TEST_BACKEND == "simulator" else 2048,
+            )
+            assert continuation.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            user_texts = []
+            for item in requests[0]["input"]:
+                if item.get("role") != "user":
+                    continue
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    user_texts.append(content)
+                else:
+                    user_texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") == "input_text"
+                    )
+            assert user_texts == [item["content"] for item in expected] + [
+                current_input, next_input
+            ], "selected-upstream replay must not duplicate history or current input"
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    @pytest.mark.parametrize("truncation", ["auto", "disabled"])
+    def test_over_context_conversation_history_truncation(
+        self, witness_backend_client, truncation
+    ):
+        """#532: native vLLM, not Praxis, applies the requested context policy."""
+        client, forwarded = witness_backend_client
+        # vLLM publishes the actual configured limit, which may differ from the
+        # model's advertised maximum or the GPU runner's launch defaults.
+        with httpx.Client(timeout=10) as backend:
+            models = backend.get(f"{VLLM_BASE_URL.rstrip('/')}/v1/models")
+            models.raise_for_status()
+        model = next(
+            item for item in models.json()["data"] if item["id"] == VLLM_MODEL
+        )
+        context_limit = model.get("max_model_len")
+        assert isinstance(context_limit, int) and context_limit > 0, model
+        oversized_history = "obsolete " * (context_limit * 2)
+        conversation = client.conversations.create(
+            items=[
+                {"type": "message", "role": "user", "content": oversized_history},
+                {"type": "message", "role": "user", "content": "Reply OK. /no_think"},
+            ]
+        )
+        try:
+            before = len(forwarded)
+            options = {
+                "model": VLLM_MODEL,
+                "conversation": conversation.id,
+                "input": "Reply OK. /no_think",
+                "truncation": truncation,
+                "max_output_tokens": 32,
+                "store": False,
+            }
+            if truncation == "disabled":
+                with pytest.raises(BadRequestError) as error:
+                    client.responses.create(**options)
+                assert error.value.status_code == 400
+                message = str(error.value).lower()
+                assert "context" in message or "token" in message, message
+            else:
+                response = client.responses.create(**options)
+                assert response.status in {"completed", "incomplete"}
+                assert response.output, response
+
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            request = requests[0]
+            assert request["truncation"] == truncation
+            content = request["input"][0]["content"]
+            history_text = content if isinstance(content, str) else content[0]["text"]
+            assert history_text == oversized_history, (
+                "the gateway must forward complete history even beyond the backend context limit"
+            )
+            assert len(request["input"]) == 3
+        finally:
+            client.conversations.delete(conversation.id)
+
     @requires_real_inference
     def test_conversation_context_and_append_back(self, openai_client):
         conversation = openai_client.conversations.create(

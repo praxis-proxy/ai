@@ -698,14 +698,21 @@ fn continuation_state_fits(
     for values in [
         &state.accumulated_output,
         &state.input,
-        &state.messages,
-        &state.persisted_messages,
         &state.previous_tools,
         &state.tool_calls,
         &state.tools,
         &state.web_search_calls,
     ] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    for history in [&state.messages, &state.persisted_messages] {
+        let Some(size) = bounded_json_size(history, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
             return false;
         };
         used = used.saturating_add(size);

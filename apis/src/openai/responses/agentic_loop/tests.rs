@@ -75,7 +75,7 @@ fn assert_collected_rounds_reconcile(streaming: bool) {
         response,
         owner,
         Some(json!([{"role": "user", "content": "question"}])),
-        Some(state.persisted_messages),
+        Some(state.persisted_messages.into_values()),
         StoredOutputPlan {
             reasoning_replay: &state.translated_reasoning_replay,
             collected_rounds: &state.collected_rounds,
@@ -151,7 +151,7 @@ fn assert_collected_compaction_stored_once(streaming: bool) {
         response,
         owner,
         Some(json!([{"role": "user", "content": "question"}])),
-        Some(state.persisted_messages),
+        Some(state.persisted_messages.into_values()),
         StoredOutputPlan {
             reasoning_replay: &[],
             collected_rounds: &state.collected_rounds,
@@ -3052,10 +3052,39 @@ fn model_output_ordering_survives_all_three_dispatchers() {
 }
 
 #[test]
+fn buffered_and_streamed_history_share_payloads_and_detach_on_mutation() {
+    for streaming in [false, true] {
+        let response = json!({"output": [
+            {"type": "function_call", "id": "fc_shared", "call_id": "call_shared",
+             "name": "lookup", "arguments": "{}", "status": "completed"},
+            {"type": "reasoning", "id": "rs_shared", "summary": []}
+        ]});
+        let mut state = ResponsesState::default();
+        if streaming {
+            state.response_object = response;
+            super::collect_streaming_output_items(&mut state);
+        } else {
+            super::collect_output_items(&response, &mut state, &[]);
+        }
+        assert_eq!(state.messages.len(), 2, "both replay items collected");
+        assert_eq!(state.persisted_messages.len(), 2, "both persisted items collected");
+        for index in 0..2 {
+            assert!(
+                state.messages.shares_item_with(index, &state.persisted_messages, index),
+                "replay and persistence must share payloads (streaming={streaming})"
+            );
+        }
+        state.messages[0]["arguments"] = json!("changed");
+        assert_eq!(state.persisted_messages[0]["arguments"], "{}");
+        assert!(state.messages.shares_item_with(1, &state.persisted_messages, 1));
+    }
+}
+
+#[test]
 fn streamed_provider_conversation_marks_persisted_history() {
     let mut state = ResponsesState {
         conversation: Some(json!({"id": "conv_native"})),
-        messages: vec![json!({"role": "user", "content": "weather in SF"})],
+        messages: vec![json!({"role": "user", "content": "weather in SF"})].into(),
         response_object: json!({
             "output": [{
                 "type": "function_call",
@@ -3091,8 +3120,8 @@ fn appends_streamed_provider_compaction_to_replay_state() {
     });
     let input = json!({"type": "message", "role": "user", "content": "continue"});
     let mut state = ResponsesState {
-        messages: vec![input.clone()],
-        persisted_messages: vec![input],
+        messages: vec![input.clone()].into(),
+        persisted_messages: vec![input].into(),
         response_object: json!({"output": [compaction]}),
         ..ResponsesState::default()
     };

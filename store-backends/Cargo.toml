@@ -34,6 +34,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-ai-store = { workspace = true, features = ["compression"] }
 praxis-core = { workspace = true }

@@ -2309,7 +2309,13 @@ async fn create_items_and_sync_messages_assigns_positions() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both items");
 }
 
 #[tokio::test]
@@ -2354,7 +2360,13 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 3, "messages cache should include all 3 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 3, "history includes all items");
 }
 
 #[tokio::test]
@@ -2426,7 +2438,13 @@ async fn delete_item_and_sync_messages_updates_cache() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 1, "history reflects deletion");
 }
 
 #[tokio::test]
@@ -2820,6 +2838,67 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
     assert!(msg.contains("database recreation required"), "{msg}");
 }
 
+#[tokio::test]
+async fn sqlite_validates_conversation_messages_text_affinity() {
+    use sqlx::AssertSqlSafe;
+    for (declared_type, accepted) in [
+        ("TEXT", true),
+        ("VARCHAR(255)", true),
+        ("CLOB", true),
+        ("INTEGER", false),
+        ("BLOB", false),
+        ("JSONB", false),
+        ("INTTEXT", false),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("messages.db").display());
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("URL")
+            .create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.expect("pool");
+        let ddl = format!(
+            "CREATE TABLE typed_conversations (conversation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, \
+             owner_issuer TEXT NOT NULL, owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+             metadata TEXT NOT NULL, messages {declared_type} NOT NULL)"
+        );
+        sqlx::query(AssertSqlSafe(ddl.as_str()))
+            .execute(&pool)
+            .await
+            .expect("custom schema");
+        pool.close().await;
+        let result = SqliteResponseStore::new(&url, "typed_responses", "typed_conversations", None, None, None).await;
+        if accepted {
+            assert!(result.is_ok(), "TEXT-affinity type {declared_type} must work");
+        } else {
+            let err = result.err().expect("incompatible type rejected").to_string();
+            assert!(err.contains("typed_conversations.messages"), "{err}");
+            assert!(
+                err.contains(declared_type) && err.contains("expected TEXT affinity"),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn pg_rejects_jsonb_conversation_messages_at_startup() {
+    let fixture = PgSchemaFixture::new("jsonb_messages");
+    let ddl = format!(
+        "CREATE TABLE {} (conversation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, \
+         owner_issuer TEXT NOT NULL, owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         metadata TEXT NOT NULL, messages JSONB NOT NULL)",
+        fixture.conversations
+    );
+    let err = fixture.expect_rejected(&[ddl], &[]).await;
+    assert!(err.contains("schema validation failed"), "{err}");
+    assert!(
+        err.contains("messages") && err.contains("jsonb") && err.contains("expected TEXT"),
+        "{err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Schema Version
 // -----------------------------------------------------------------------------
@@ -3124,7 +3203,13 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should include both items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both concurrent writes");
 }
 
 // -----------------------------------------------------------------------------
@@ -4802,7 +4887,13 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both items");
 }
 
 // -----------------------------------------------------------------------------
@@ -4855,7 +4946,13 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 1, "history reflects deletion");
 }
 
 #[tokio::test]
@@ -5296,4 +5393,49 @@ async fn sqlite_backend_satisfies_the_store_contract() {
     .await
     .expect("store creation should succeed");
     praxis_ai_store::contract_tests::run_contract_suite(&store).await;
+}
+
+/// Opening an existing database never converts cache-only conversation history.
+#[tokio::test]
+async fn sqlite_legacy_history_is_preserved_without_startup_conversion() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy.db").display());
+    let owner = crate::test_utils::test_owner("legacy");
+    let messages = json!([{"role": "user", "content": "old history"}]);
+    let store = SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+        .await
+        .expect("store");
+    store
+        .upsert_conversation(&ConversationRecord {
+            owner: owner.clone(),
+            conversation_id: "legacy".into(),
+            created_at: 1,
+            metadata: json!({}),
+            messages: messages.clone(),
+        })
+        .await
+        .expect("legacy conversation");
+    drop(store);
+    let reopened = SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+        .await
+        .expect("reopened store");
+    assert_eq!(
+        ConversationItemStore::get_conversation(&reopened, &owner, "legacy")
+            .await
+            .expect("raw read")
+            .expect("conversation")
+            .messages,
+        messages,
+        "startup preserves the raw legacy cache"
+    );
+    assert_eq!(
+        reopened.max_item_position(&owner, "legacy").await.expect("no new rows"),
+        0,
+        "startup creates no synthetic item rows"
+    );
+    assert_eq!(
+        reopened.conversation_history(&owner, "legacy").await.expect("history"),
+        Some(messages.as_array().expect("array").clone()),
+        "cache-only history remains readable after reopening"
+    );
 }

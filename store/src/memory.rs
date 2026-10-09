@@ -87,11 +87,43 @@ impl InMemoryStore {
     }
 }
 
-/// Rebuild a conversation's denormalized message cache from its items in order.
-fn rebuild_messages(items: &[ConversationItemRecord]) -> serde_json::Value {
+/// Read owned history from the memory backend; copies occur only at the read
+/// ownership boundary, never to refresh a second cache on mutations.
+fn ordered_messages(items: &[ConversationItemRecord]) -> Vec<serde_json::Value> {
     let mut sorted: Vec<&ConversationItemRecord> = items.iter().collect();
     sorted.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.item_id.cmp(&b.item_id)));
-    serde_json::Value::Array(sorted.into_iter().map(|item| item.item_data.clone()).collect())
+    sorted.into_iter().map(|item| item.item_data.clone()).collect()
+}
+
+/// Preserve cache-only history at the first append, without creating item rows.
+fn preserve_legacy_history(inner: &mut Inner, key: &(StateOwner, String)) -> Result<(), StoreError> {
+    let has_items = inner.items.get(key).is_some_and(|items| !items.is_empty());
+    if let Some(record) = inner.conversations.get_mut(key) {
+        if record
+            .messages
+            .get("legacy_messages")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Ok(());
+        }
+        if !has_items && !record.messages.is_null() && !record.messages.is_array() {
+            return Err(StoreError::Serialization(
+                "invalid legacy conversation history".to_owned(),
+            ));
+        }
+        if !has_items && record.messages.as_array().is_some_and(|messages| !messages.is_empty()) {
+            let messages = std::mem::take(&mut record.messages);
+            record.messages = serde_json::json!({"legacy_messages": messages});
+        } else {
+            record.messages = serde_json::json!([]);
+        }
+    }
+    Ok(())
+}
+
+/// Cache writers may not replace an authoritative legacy prefix.
+fn replaces_legacy_history(current: &serde_json::Value, replacement: &serde_json::Value) -> bool {
+    current.get("legacy_messages").is_some_and(serde_json::Value::is_array) && current != replacement
 }
 
 /// Upsert a response, rejecting an id already owned by another principal.
@@ -393,6 +425,15 @@ impl ConversationItemStore for InMemoryStore {
             return Err(StoreError::Database("conversation id collision".to_owned()));
         }
         let key = (record.owner.clone(), record.conversation_id.clone());
+        if inner
+            .conversations
+            .get(&key)
+            .is_some_and(|existing| replaces_legacy_history(&existing.messages, &record.messages))
+        {
+            return Err(StoreError::Database(
+                "conversation upsert would replace legacy history".to_owned(),
+            ));
+        }
         // Preserve the original creation time on update; refreshes of metadata
         // or messages must not rewrite created_at.
         let created_at = inner
@@ -419,11 +460,11 @@ impl ConversationItemStore for InMemoryStore {
             .conversations
             .get_mut(&(owner.clone(), conversation_id.to_owned()))
         {
-            Some(record) => {
+            Some(record) if !replaces_legacy_history(&record.messages, messages) => {
                 record.messages = messages.clone();
                 Ok(true)
             },
-            None => Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -458,7 +499,9 @@ impl ConversationItemStore for InMemoryStore {
             .conversations
             .get_mut(&(owner.clone(), conversation_id.to_owned()))
         {
-            Some(record) if &record.messages == expected_messages => {
+            Some(record)
+                if &record.messages == expected_messages && !replaces_legacy_history(&record.messages, messages) =>
+            {
                 record.messages = messages.clone();
                 Ok(true)
             },
@@ -623,16 +666,44 @@ impl ConversationItemStore for InMemoryStore {
             .unwrap_or(0))
     }
 
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut history = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() && history.is_empty() {
+            history = record.messages.as_array().cloned().unwrap_or_default();
+        }
+        history.extend(ordered_messages(items));
+        Ok(Some(history))
+    }
+
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let mut inner = self.lock()?;
         let key = (owner.clone(), conversation_id.to_owned());
         require_conversation_scope(&inner, owner, conversation_id, items)?;
         reject_duplicate_item_ids(&inner, items)?;
+        preserve_legacy_history(&mut inner, &key)?;
         let mut next = inner
             .items
             .get(&key)
@@ -646,10 +717,6 @@ impl ConversationItemStore for InMemoryStore {
             stored.position = next;
             inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
             inner.items.entry(key.clone()).or_default().push(stored);
-        }
-        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
-        if let Some(conversation) = inner.conversations.get_mut(&key) {
-            conversation.messages = rebuilt;
         }
         Ok(())
     }
@@ -674,16 +741,13 @@ impl ConversationItemStore for InMemoryStore {
                 "conversation disappeared during message sync: {conversation_id}"
             )));
         }
+        preserve_legacy_history(&mut inner, &key)?;
         let items = inner
             .items
             .get_mut(&key)
             .ok_or_else(|| StoreError::Database("conversation items disappeared during message sync".to_owned()))?;
         items.remove(index);
         inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
-        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
-        if let Some(conversation) = inner.conversations.get_mut(&key) {
-            conversation.messages = rebuilt;
-        }
         Ok(true)
     }
 }
@@ -813,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_items_and_sync_assigns_positions_and_rebuilds() {
+    async fn create_items_and_sync_assigns_positions_and_invalidates() {
         let store = InMemoryStore::new();
         let o = owner("a");
         store
@@ -838,7 +902,8 @@ mod tests {
             .await
             .unwrap()
             .expect("conversation");
-        assert_eq!(conversation.messages.as_array().map(Vec::len), Some(2));
+        assert_eq!(conversation.messages, serde_json::json!([]));
+        assert_eq!(store.conversation_history(&o, "c1").await.unwrap().unwrap().len(), 2);
     }
 
     #[tokio::test]

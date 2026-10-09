@@ -1171,6 +1171,49 @@ class TestOpenAIConversations:
             "item_page_0",
         ]
 
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    def test_complete_history_order_after_deletes_and_appends(
+        self, openai_client, order
+    ):
+        """#532: paging must preserve append order across deleted sequence gaps."""
+        conversation = openai_client.conversations.create()
+        try:
+            expected = []
+            for batch in range(6):
+                items = _message_items(f"item_history_{order}_{batch}", 20)
+                openai_client.conversations.items.create(conversation.id, items=items)
+                expected.extend(item["id"] for item in items)
+
+            # Remove the head, a page boundary, and the tail before appending.
+            for item_id in [expected[0], expected[19], expected[-1]]:
+                openai_client.conversations.items.delete(
+                    item_id, conversation_id=conversation.id
+                )
+                expected.remove(item_id)
+            appended = _message_items(f"item_history_{order}_final", 8)
+            openai_client.conversations.items.create(conversation.id, items=appended)
+            expected.extend(item["id"] for item in appended)
+
+            seen = []
+            after = None
+            while True:
+                page = openai_client.conversations.items.list(
+                    conversation.id, order=order, limit=17, after=after
+                )
+                assert page.data, "nonterminal pagination must make progress"
+                ids = [item.id for item in page.data]
+                assert page.first_id == ids[0]
+                assert page.last_id == ids[-1]
+                assert not set(ids).intersection(seen), "cursor repeated history"
+                seen.extend(ids)
+                if not page.has_more:
+                    break
+                after = page.last_id
+
+            assert seen == (expected if order == "asc" else expected[::-1])
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
     def test_item_crud_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
 

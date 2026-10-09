@@ -354,10 +354,14 @@ reviews:
         column is a cross-tenant leak. Do not flag schema, migration, DDL, or
         introspection statements against tables with no owner columns by design
         (the *_schema_version SELECT/INSERT, CREATE TABLE/INDEX, PRAGMA
-        table_info, and pragma_index_* queries). Flag list/sweep queries without
-        a bound LIMIT, and any body- or user-derived value interpolated into the
-        SQL string via format!/AssertSqlSafe instead of being passed as a bound
-        ? parameter.
+        table_info, and pragma_index_* queries). Flag paginated list/sweep
+        queries without a bound LIMIT. conversation_history is a complete,
+        ordered, owner-scoped snapshot read, not a paginated list query; it must
+        include every item and any preserved legacy prefix from one snapshot.
+        Do not propose a total-history limit or combine separate page reads for
+        this method; see docs/architecture/response-store.md. Flag any body- or
+        user-derived value interpolated into the SQL string via
+        format!/AssertSqlSafe instead of being passed as a bound ? parameter.
 
     - path: "store-backends/src/postgres*.rs"
       instructions: |

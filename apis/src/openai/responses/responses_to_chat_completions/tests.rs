@@ -526,7 +526,8 @@ async fn canonical_state_is_translated_and_arms_response() {
     state.messages = vec![
         json!({"role": "user", "content": "earlier history"}),
         json!({"role": "user", "content": "current input"}),
-    ];
+    ]
+    .into();
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"current input","stream":false}"#,
@@ -713,7 +714,8 @@ async fn rehydrated_previous_response_id_translates_full_history() {
         json!({"role": "user", "content": "earlier question"}),
         json!({"role": "assistant", "content": "earlier answer"}),
         json!({"role": "user", "content": "current input"}),
-    ];
+    ]
+    .into();
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":false}"#,
