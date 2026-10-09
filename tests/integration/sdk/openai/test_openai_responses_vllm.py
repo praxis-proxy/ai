@@ -329,6 +329,16 @@ def _write_full_flow_config(
     if compression:
         config = _enable_response_store_compression(config)
 
+    # Widen the IRR inference deadlines for slow CPU-only vLLM, matching the
+    # file-search fixtures. The shipped example ships a 300s per-step budget
+    # tuned for a fast provider, but a full-context prefill (the
+    # over-context truncation case forwards the complete oversized history for
+    # vLLM to truncate natively) takes ~160s on a healthy CI runner and tips
+    # past 300s on a slow/co-located one, surfacing as a sub-request 504. Keep
+    # the production example untouched; only the test config gets the headroom.
+    config = config.replace("step_timeout_ms: 300000", "step_timeout_ms: 600000")
+    config = config.replace("timeout_ms: 360000", "timeout_ms: 660000")
+
     config = _patch_store_backend(config, db_path)
     return _persist_config(config)
 
