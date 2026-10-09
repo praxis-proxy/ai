@@ -11,7 +11,7 @@
 //! - platform-layer failures (quota, auth, org policy, missing model) arrive in Google's error envelope, while client
 //!   retry logic keys on Anthropic error types;
 //! - in streaming responses the `model` lives inside the `message_start` SSE event (`message.model`), so the rewrite is
-//!   a frame-scoped patch — never a whole-stream re-serialization.
+//!   a frame-scoped patch, never a whole-stream re-serialization.
 //!
 //! Error translation covers **pre-stream** failures only: a mid-stream
 //! kill arrives as a dropped stream with no body to rewrite, and is
@@ -45,7 +45,7 @@ pub(crate) fn anthropic_error_type(status: u16) -> ErrorType {
 ///
 /// Returns `None` (forward unchanged) when the body is not JSON, is not
 /// a Google `{"error":{…}}` envelope, or already carries the Anthropic
-/// `{"type":"error",…}` shape — Vertex model-layer errors are
+/// `{"type":"error",…}` shape, since Vertex model-layer errors are
 /// Anthropic-shaped at the source and must not be double-wrapped.
 /// The HTTP status is preserved so client retry policies see the
 /// familiar code with an Anthropic `error.type`.
@@ -71,7 +71,7 @@ pub(crate) fn translate_google_error(body: &[u8], status: u16) -> Option<Vec<u8>
 
 /// Restore the user-facing model id in a buffered JSON response body.
 /// Returns `None` (forward unchanged) when the body is not a JSON
-/// object, carries no `model` (e.g. `count_tokens` responses — injecting
+/// object, carries no `model` (e.g. `count_tokens` responses, where injecting
 /// one would be wrong), or already carries the user-facing id.
 pub(crate) fn restore_model(body: &[u8], user_model: &str) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
@@ -99,8 +99,8 @@ fn patch_model_field(obj: &mut Map<String, Value>, user_model: &str) -> Option<(
 }
 
 /// Rebuild SSE frames for the client, restoring the user-facing model
-/// inside `message_start` events only. Every other frame — deltas, tool
-/// use, `message_stop` — is re-emitted with its original data bytes;
+/// inside `message_start` events only. Every other frame (deltas, tool
+/// use, `message_stop`) is re-emitted with its original data bytes;
 /// partial frames stay inside the caller's [`SseFrameParser`] across
 /// chunk boundaries, so at most one in-flight event is ever buffered.
 ///

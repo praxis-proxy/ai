@@ -16,15 +16,15 @@
 //! `x-praxis-ai-vertex-route: vertex` marker for the router; the marker must
 //! be removed before forwarding upstream.
 //!
-//! **Request** — the body's `model` moves into the URL
+//! **Request**: the body's `model` moves into the URL
 //! (`…/publishers/anthropic/models/{model}:rawPredict`,
 //! `:streamRawPredict` when `stream` is `true`, `stream` read before the
 //! body is rewritten), `anthropic_version` is injected, and the `model`
-//! field is removed — Vertex rejects it with
+//! field is removed, since Vertex rejects it with
 //! `model: Extra inputs are not permitted`. `count_tokens` keeps its
 //! model in the body at a distinct URL.
 //!
-//! **Response** — the snapshot `model` id is restored to the
+//! **Response**: the snapshot `model` id is restored to the
 //! user-facing id (top-level JSON, or `message.model` inside the
 //! `message_start` SSE event, patched frame-scoped without buffering
 //! the stream), and Google error envelopes are translated to Anthropic
@@ -148,7 +148,7 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
     /// Apply the `anthropic-beta` allowlist. An empty allowlist (the
     /// default) forwards the header untouched; otherwise unknown flags
     /// are stripped and the header removed entirely when nothing
-    /// remains — Vertex rejects beta flags it does not support, and
+    /// remains, since Vertex rejects beta flags it does not support, and
     /// clients like Claude Code send several on every request.
     fn filter_beta_flags(&self, ctx: &mut HttpFilterContext<'_>) {
         if self.config.beta_allowlist.is_empty() {
