@@ -45,7 +45,7 @@ pub const CONVERSATIONS_STORE_NAME: &str = "conversations";
 #[cfg(test)]
 #[cfg(all(
     feature = "openai-conversations",
-    feature = "store-postgres",
+    feature = "_store-postgres",
     feature = "store-sqlite"
 ))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

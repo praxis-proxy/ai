@@ -132,6 +132,80 @@ impl CompiledKeySpec {
         }
         KeyDecision::Admit(join_parts(parts))
     }
+
+    /// Return a stable digest of the compiled key policy.
+    ///
+    /// This is configuration, not request data: it records the dimensions,
+    /// their options, and the missing-value policy so a Valkey writer cannot
+    /// reinterpret state created by a differently keyed replica.
+    pub(super) fn config_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"praxis:token_rate_limit:key_config");
+        digest.update(&[0]);
+        digest.update(&[missing_policy_tag(self.missing)]);
+        digest.update(&u64::try_from(self.dimensions.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for dimension in &self.dimensions {
+            digest_dimension(&mut digest, dimension);
+        }
+        digest.finish().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// Encode one compiled dimension without including any request-derived value.
+fn digest_dimension(digest: &mut Sha256, dimension: &CompiledDimension) {
+    match dimension {
+        CompiledDimension::Global => digest.update(b"global"),
+        CompiledDimension::AuthenticatedSubject => digest.update(b"authenticated_subject"),
+        CompiledDimension::Ip {
+            header,
+            trusted_hops,
+            ipv6_prefix,
+        } => {
+            digest.update(b"ip");
+            digest_optional_string(digest, header.as_ref().map(HeaderName::as_str));
+            digest.update(&trusted_hops.to_be_bytes());
+            match ipv6_prefix {
+                Some(prefix) => {
+                    digest.update(&[1, *prefix]);
+                },
+                None => digest.update(&[0]),
+            }
+        },
+        CompiledDimension::Model { header } => {
+            digest.update(b"model");
+            digest_string(digest, header.as_str());
+        },
+        CompiledDimension::Header { name, missing } => {
+            digest.update(b"header");
+            digest_string(digest, name.as_str());
+            digest.update(&[missing_policy_tag(*missing)]);
+        },
+    }
+}
+
+/// Length-delimit a string in the key-policy digest.
+fn digest_string(digest: &mut Sha256, value: &str) {
+    digest.update(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+/// Encode an optional header name without conflating it with an empty value.
+fn digest_optional_string(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update(&[1]);
+            digest_string(digest, value);
+        },
+        None => digest.update(&[0]),
+    }
+}
+
+/// Compact, stable representation of [`MissingKeyPolicy`].
+fn missing_policy_tag(policy: MissingKeyPolicy) -> u8 {
+    match policy {
+        MissingKeyPolicy::Reject => 0,
+        MissingKeyPolicy::Fallback => 1,
+    }
 }
 
 /// Compile a deserialized [`KeySpec`] into a [`CompiledKeySpec`].
@@ -559,6 +633,36 @@ mod tests {
             body_probe: None,
         });
         assert_eq!(decision, KeyDecision::Admit(FALLBACK_KEY.to_owned()));
+    }
+
+    #[test]
+    fn config_fingerprint_captures_key_policy_and_canonicalizes_order() {
+        let global = CompiledKeySpec::global().config_fingerprint();
+        let subject = spec(vec![KeyDimension::AuthenticatedSubject], MissingKeyPolicy::Reject);
+        let subject_reversed = spec(
+            vec![KeyDimension::Model { header: None }, KeyDimension::AuthenticatedSubject],
+            MissingKeyPolicy::Reject,
+        );
+        let subject_forward = spec(
+            vec![KeyDimension::AuthenticatedSubject, KeyDimension::Model { header: None }],
+            MissingKeyPolicy::Reject,
+        );
+
+        assert_ne!(
+            global,
+            subject.config_fingerprint(),
+            "global and subject keying must not share a marker"
+        );
+        assert_eq!(
+            subject_reversed.config_fingerprint(),
+            subject_forward.config_fingerprint(),
+            "composite declaration order is not semantic"
+        );
+        assert_ne!(
+            subject.config_fingerprint(),
+            spec(vec![KeyDimension::AuthenticatedSubject], MissingKeyPolicy::Fallback).config_fingerprint(),
+            "missing-dimension policy is part of the shared accounting contract"
+        );
     }
 
     #[test]
