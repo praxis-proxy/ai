@@ -155,7 +155,10 @@ def _conversations_filter(table_prefix: str, db_path: str) -> dict:
 
 
 def _write_config(
-    port: int, db_path: str, include_operation_classifier: bool = True
+    port: int,
+    db_path: str,
+    include_operation_classifier: bool = True,
+    requests_per_minute: int | None = None,
 ) -> str:
     filters = [
         {
@@ -166,7 +169,12 @@ def _write_config(
     ]
     if include_operation_classifier:
         filters.append({"filter": "ai_operation"})
-    filters.append(_conversations_filter(f"sdk_{port}", db_path))
+    conversations_filter = _conversations_filter(f"sdk_{port}", db_path)
+    if requests_per_minute is not None:
+        conversations_filter["rate_limit"] = {
+            "requests_per_minute": requests_per_minute
+        }
+    filters.append(conversations_filter)
 
     config = {
         "listeners": [
@@ -519,6 +527,119 @@ def praxis_proxy():
                 proc.kill()
                 proc.wait()
             os.unlink(config_path)
+
+
+@pytest.fixture
+def rate_limited_clients():
+    """Isolated three-request window with distinct authenticated SDK owners."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "limited.db")
+        config_path = _write_config(port, db_path, requests_per_minute=3)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            with (
+                OpenAI(
+                    api_key="not-needed",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                    max_retries=0,
+                    timeout=10.0,
+                ) as alice,
+                OpenAI(
+                    api_key="not-needed",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    default_headers={OWNER_HEADER: _owner_assertion("bob")},
+                    max_retries=0,
+                    timeout=10.0,
+                ) as bob,
+            ):
+                yield alice, bob, db_path, f"sdk_{port}_conversation_items"
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if proc.stderr:
+                proc.stderr.close()
+            os.unlink(config_path)
+
+
+def test_conversations_rate_limit_is_owner_scoped(rate_limited_clients):
+    alice, bob, _, _ = rate_limited_clients
+    conversation = alice.conversations.create()
+    assert alice.conversations.retrieve(conversation.id).id == conversation.id
+    assert alice.conversations.items.list(conversation.id).data == []
+    with pytest.raises(openai.RateLimitError) as exc:
+        alice.conversations.retrieve(conversation.id)
+    error = exc.value
+    assert error.status_code == 429
+    assert 1 <= int(error.response.headers["retry-after"]) <= 60
+    body = error.response.json()["error"]
+    assert body["type"] == "rate_limit_error"
+    assert body["code"] == "rate_limit_exceeded"
+    assert body["param"] is None
+    assert "retry after" in body["message"]
+    # Alice's exhausted window must not consume Bob's quota.
+    assert bob.conversations.create().id.startswith("conv_")
+
+
+@pytest.mark.skipif(bool(DATABASE_URL), reason="requires a legacy SQLite record")
+def test_legacy_mcp_error_is_normalized_on_list_and_retrieve(rate_limited_clients):
+    alice, _, db_path, items_table = rate_limited_clients
+    conversation = alice.conversations.create(
+        items=[
+            {
+                "type": "mcp_call",
+                "id": "mcp_legacy",
+                "status": "failed",
+                "server_label": "weather",
+                "name": "lookup",
+                "arguments": "{}",
+                "output": None,
+                "error": {
+                    "type": "mcp_tool_execution_error",
+                    "content": "legacy failure",
+                },
+            }
+        ]
+    )
+    with sqlite3.connect(db_path) as db:
+        raw = db.execute(
+            f'SELECT item_data FROM "{items_table}" WHERE item_id = ?',
+            ("mcp_legacy",),
+        ).fetchone()[0]
+        item = json.loads(raw)
+        item["error"] = "legacy failure"
+        db.execute(
+            f'UPDATE "{items_table}" SET item_data = ? WHERE item_id = ?',
+            (json.dumps(item), "mcp_legacy"),
+        )
+    listed = alice.conversations.items.list(conversation.id).data[0]
+    retrieved = alice.conversations.items.retrieve(
+        "mcp_legacy", conversation_id=conversation.id
+    )
+    expected = {"type": "mcp_tool_execution_error", "content": "legacy failure"}
+    assert listed.model_dump()["error"] == expected
+    assert retrieved.model_dump()["error"] == expected
+    # Read-boundary repair must not mutate the historical database record.
+    with sqlite3.connect(db_path) as db:
+        raw = db.execute(
+            f'SELECT item_data FROM "{items_table}" WHERE item_id = ?',
+            ("mcp_legacy",),
+        ).fetchone()[0]
+    assert json.loads(raw)["error"] == "legacy failure"
 
 
 @pytest.fixture(scope="session")
@@ -1135,6 +1256,12 @@ class TestOpenAIConversations:
         assert listed.id == item.id
         assert listed.type == "configuration_update"
         assert _reasoning_effort(listed) == "high"
+
+        retrieved = openai_client.conversations.items.retrieve(
+            item.id, conversation_id=conversation.id
+        )
+        assert retrieved.type == "configuration_update"
+        assert _reasoning_effort(retrieved) == "high"
 
     def test_item_create_returns_all_items(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -1938,29 +2065,6 @@ class TestConversationTenantIsolation:
     # function_output normalization, structured MCP failure append-back.
     # --------------------------------------------------------------------
 
-    def test_configuration_update_round_trip(self, openai_client):
-        """configuration_update items store and round-trip via the SDK."""
-        conversation = openai_client.conversations.create()
-        created = openai_client.conversations.items.create(
-            conversation.id,
-            items=[{"type": "configuration_update", "reasoning": {"effort": "high"}}],
-        )
-        item = created.data[0]
-        assert item.type == "configuration_update"
-        assert _reasoning_effort(item) == "high"
-
-        page = openai_client.conversations.items.list(conversation.id, order="asc")
-        listed = page.data[0]
-        assert listed.id == item.id
-        assert listed.type == "configuration_update"
-        assert _reasoning_effort(listed) == "high"
-
-        retrieved = openai_client.conversations.items.retrieve(
-            item.id, conversation_id=conversation.id
-        )
-        assert retrieved.type == "configuration_update"
-        assert _reasoning_effort(retrieved) == "high"
-
     def test_nullable_function_output_fields_are_omitted(self, openai_client):
         """name/namespace null on function_call_output normalize to omission, not 400."""
         # OpenAI accepts name/namespace as nullable on function_call_output.
@@ -2081,8 +2185,20 @@ class TestConversationTenantIsolation:
 class _CapturingResponsesBackend(_ChunkedResponsesBackend):
     """Responses backend that records forwarded request bodies for assertions."""
 
-    def do_POST(self):  # noqa: N802
-        body = self.rfile.read(int(self.headers["Content-Length"]))
+    def do_POST(self) -> None:  # noqa: N802
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = []
+            while True:
+                size = int(self.rfile.readline().split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    while self.rfile.readline().strip():
+                        pass
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            body = b"".join(chunks)
+        else:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
         self.server.requests.append(json.loads(body))
         response = json.loads(self.response_body)
         response["id"] = f"resp_capture_{len(self.server.requests)}"
@@ -2093,6 +2209,32 @@ class _CapturingResponsesBackend(_ChunkedResponsesBackend):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_capturing_backend_records_both_request_framings(chunked):
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _CapturingResponsesBackend
+    )
+    backend.requests = []
+    backend.output = []
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    payload = {"model": "gpt-4.1", "input": "hello"}
+    encoded = json.dumps(payload).encode()
+    try:
+        content = iter([encoded[:10], encoded[10:]]) if chunked else encoded
+        response = httpx.post(
+            f"http://127.0.0.1:{backend.server_port}/v1/responses",
+            content=content,
+            timeout=5.0,
+        )
+        assert response.status_code == 200
+        assert backend.requests == [payload]
+    finally:
+        backend.shutdown()
+        backend.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.fixture

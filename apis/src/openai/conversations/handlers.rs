@@ -442,9 +442,7 @@ pub(super) async fn handle_get_item(
     }
     match store.get_conversation_item(conversation_id, item_id).await {
         Ok(Some(record)) => {
-            let mut item_data = record.item_data;
-            project_item(&mut item_data, includes);
-            let item = ConversationItem::from_value(item_data);
+            let item = conversation_item_response(record.item_data, includes);
             Ok(FilterAction::Reject(json_response(200, &item)?))
         },
         Ok(None) => {
@@ -592,12 +590,28 @@ fn conversation_items_response(
         } else if index + 1 == record_count {
             last_id = record.item_id;
         }
-        let mut item_data = record.item_data;
-        project_item(&mut item_data, includes);
-        data.push(ConversationItem::from_value(item_data));
+        data.push(conversation_item_response(record.item_data, includes));
     }
 
     ConversationItemList::new(data, has_more, first_id, last_id)
+}
+
+/// Project stored items for list and retrieve without copying their JSON.
+fn conversation_item_response(mut item: Value, includes: IncludeFields) -> ConversationItem {
+    if item.get("type").and_then(Value::as_str) == Some("mcp_call")
+        && let Some(map) = item.as_object_mut()
+        && map.get("error").is_some_and(Value::is_string)
+        && let Some(content) = map.remove("error")
+    {
+        // Historical records predate the tagged MCP error contract. Move the
+        // legacy content into that shape only at the response boundary.
+        let mut tagged = Map::new();
+        tagged.insert("type".to_owned(), Value::String("mcp_tool_execution_error".to_owned()));
+        tagged.insert("content".to_owned(), content);
+        map.insert("error".to_owned(), Value::Object(tagged));
+    }
+    project_item(&mut item, includes);
+    ConversationItem::from_value(item)
 }
 
 /// Parse and validate cursor-based pagination parameters from a query string.
@@ -820,6 +834,38 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_mcp_errors_normalize_at_the_read_boundary() {
+        let legacy = serde_json::json!({
+            "type": "mcp_call", "id": "mcp_legacy", "status": "failed",
+            "server_label": "weather", "name": "lookup", "arguments": "{}",
+            "output": null, "error": "legacy failure",
+        });
+        let item = conversation_item_response(legacy, IncludeFields::default());
+        let output = serde_json::to_value(item).unwrap();
+        assert_eq!(
+            output["error"],
+            serde_json::json!({
+                "type": "mcp_tool_execution_error", "content": "legacy failure",
+            }),
+            "legacy errors must be tagged before serialization"
+        );
+        assert!(
+            super::super::item_schema::validate_output_item(&output).is_ok(),
+            "normalized legacy MCP output must satisfy the contract"
+        );
+
+        for error in [
+            serde_json::json!({"type": "mcp_protocol_error", "code": -1, "message": "failed"}),
+            Value::Null,
+        ] {
+            let input = serde_json::json!({"type": "mcp_call", "error": error});
+            let output =
+                serde_json::to_value(conversation_item_response(input.clone(), IncludeFields::default())).unwrap();
+            assert_eq!(output, input, "structured and null errors must not change");
+        }
+    }
 
     // -------------------------------------------------------------------------
     // store_error_response

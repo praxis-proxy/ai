@@ -63,12 +63,34 @@ struct OwnerWindow {
     count: u32,
 }
 
+/// Owner windows and the last expiration sweep, protected by one lock.
+struct WindowState {
+    /// Counters retained until their counting windows expire.
+    windows: HashMap<StateOwner, OwnerWindow>,
+    /// Time of the last sweep, limiting map scans to once per minute.
+    last_prune: Instant,
+}
+
+impl WindowState {
+    /// Remove expired owners without resetting active windows.
+    fn prune_expired(&mut self, now: Instant) {
+        if now.duration_since(self.last_prune) >= WINDOW {
+            self.windows
+                .retain(|_, window| now.duration_since(window.window_start) < WINDOW);
+            if self.windows.len() < self.windows.capacity() / 4 {
+                self.windows.shrink_to_fit();
+            }
+            self.last_prune = now;
+        }
+    }
+}
+
 /// Shared per-owner fixed-window rate limiter.
 pub(crate) struct OwnerRateLimiter {
     /// Configured maximum requests per window.
     requests_per_minute: u32,
     /// Per-owner window state.
-    windows: Mutex<HashMap<StateOwner, OwnerWindow>>,
+    windows: Mutex<WindowState>,
     /// Clock used for window arithmetic; injectable for tests.
     now: Box<dyn Fn() -> Instant + Send + Sync>,
 }
@@ -81,15 +103,19 @@ impl OwnerRateLimiter {
 
     /// Build a limiter with an injectable clock.
     fn with_clock(config: RateLimitConfig, now: Box<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        let last_prune = now();
         Self {
             requests_per_minute: config.requests_per_minute,
-            windows: Mutex::new(HashMap::new()),
+            windows: Mutex::new(WindowState {
+                windows: HashMap::new(),
+                last_prune,
+            }),
             now,
         }
     }
 
     /// Lock the window map, surviving a poisoned lock.
-    fn lock_windows(&self) -> std::sync::MutexGuard<'_, HashMap<StateOwner, OwnerWindow>> {
+    fn lock_windows(&self) -> std::sync::MutexGuard<'_, WindowState> {
         // Window counters are advisory state, not correctness state: a panic
         // elsewhere while holding the lock must not take request handling
         // down with it.
@@ -102,8 +128,12 @@ impl OwnerRateLimiter {
     /// owner has exhausted its quota. The value is always at least one,
     /// matching the `Retry-After` schema declared by the contract.
     pub(crate) fn try_acquire(&self, owner: &StateOwner) -> Result<(), u64> {
+        let mut state = self.lock_windows();
+        // Sample under the lock so concurrent acquires cannot observe an older
+        // time than a window installed by another acquire.
         let now = (self.now)();
-        let mut windows = self.lock_windows();
+        state.prune_expired(now);
+        let windows = &mut state.windows;
         // Borrow first so steady-state requests never clone the owner key;
         // the clone is confined to the once-per-owner cold path.
         let window = if let Some(window) = windows.get_mut(owner) {
@@ -129,9 +159,10 @@ impl OwnerRateLimiter {
             window.count += 1;
             return Ok(());
         }
-        let elapsed = now.duration_since(window.window_start);
-        let remaining = WINDOW.saturating_sub(elapsed);
-        Err(remaining.as_secs().max(1))
+        let remaining = WINDOW.saturating_sub(now.duration_since(window.window_start));
+        drop(state);
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        Err(seconds.max(1))
     }
 }
 
@@ -218,6 +249,60 @@ mod tests {
         clock.advance(Duration::from_secs(10));
         // 50 seconds remain in the window.
         assert_eq!(limiter.try_acquire(&owner), Err(50));
+    }
+
+    #[test]
+    fn retry_after_rounds_up_fractional_seconds() {
+        let clock = Arc::new(FakeClock::new());
+        let limiter = limiter_with_clock(Arc::clone(&clock), 1);
+        let owner = owner(1);
+        limiter.try_acquire(&owner).unwrap();
+        clock.advance(Duration::from_millis(9_600));
+        assert_eq!(
+            limiter.try_acquire(&owner),
+            Err(51),
+            "50.4 remaining seconds must round up"
+        );
+        clock.advance(Duration::from_millis(49_401));
+        assert_eq!(
+            limiter.try_acquire(&owner),
+            Err(1),
+            "a fractional final second must round up"
+        );
+    }
+
+    #[test]
+    fn expiration_sweep_preserves_active_owner_quotas() {
+        let clock = Arc::new(FakeClock::new());
+        let limiter = limiter_with_clock(Arc::clone(&clock), 1);
+        for id in 0..100 {
+            limiter.try_acquire(&owner(id)).unwrap();
+        }
+        clock.advance(Duration::from_secs(30));
+        let active = owner(100);
+        limiter.try_acquire(&active).unwrap();
+        clock.advance(Duration::from_secs(30));
+        assert_eq!(
+            limiter.try_acquire(&active),
+            Err(30),
+            "pruning must not reset active quotas"
+        );
+        assert_eq!(
+            limiter.lock_windows().windows.len(),
+            1,
+            "expired owners must be evicted"
+        );
+        assert_eq!(
+            limiter.try_acquire(&owner(0)),
+            Ok(()),
+            "an expired owner gets a fresh window"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            limiter.try_acquire(&active),
+            Err(29),
+            "requests between sweeps keep their quota"
+        );
     }
 
     #[test]

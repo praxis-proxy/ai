@@ -74,8 +74,16 @@ fn assistant_output_text_normalizes_nullable_provider_fields() {
     )
     .unwrap();
 
-    assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
-    assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
+    assert_eq!(
+        normalized[0]["annotations"],
+        serde_json::json!([]),
+        "annotations must remain an empty array"
+    );
+    assert_eq!(
+        normalized[0]["logprobs"],
+        serde_json::json!([]),
+        "null logprobs must normalize to an empty array"
+    );
 }
 
 #[test]
@@ -94,9 +102,9 @@ fn function_output_nullable_qualifiers_normalize_and_validate() {
         let (_, output) = normalize_item(input, &mut counter()).unwrap();
         for (key, value) in [("name", name), ("namespace", namespace)] {
             if value.is_null() {
-                assert!(output.get(key).is_none());
+                assert!(output.get(key).is_none(), "null {key} must normalize to omission");
             } else {
-                assert_eq!(output[key], value);
+                assert_eq!(output[key], value, "non-null {key} must be preserved");
             }
         }
         validate_output_item(&output).unwrap();
@@ -165,12 +173,22 @@ fn reasoning_item_with_null_status_normalizes_and_validates() {
     .unwrap()
     .clone();
 
-    assert!(validate_output_item(&Value::Object(map.clone())).is_err());
+    assert!(
+        validate_output_item(&Value::Object(map.clone())).is_err(),
+        "null reasoning status must fail output validation before normalization"
+    );
 
     default_item_status(&mut map);
 
-    assert_eq!(map["status"], serde_json::json!("completed"));
-    validate_output_item(&Value::Object(map)).unwrap();
+    assert_eq!(
+        map["status"],
+        serde_json::json!("completed"),
+        "null status must default to completed"
+    );
+    assert!(
+        validate_output_item(&Value::Object(map)).is_ok(),
+        "defaulted reasoning status must satisfy the output contract"
+    );
 }
 
 #[test]
@@ -180,7 +198,11 @@ fn default_item_status_preserves_existing_status() {
         .unwrap()
         .clone();
     default_item_status(&mut map);
-    assert_eq!(map["status"], serde_json::json!("in_progress"));
+    assert_eq!(
+        map["status"],
+        serde_json::json!("in_progress"),
+        "defaulting must preserve an explicit status"
+    );
 }
 
 #[test]
