@@ -8,8 +8,8 @@
 //! wire shape:
 //!
 //! - the model moves from the body into the URL path (`…/publishers/anthropic/models/{model}:rawPredict`, or
-//!   `:streamRawPredict` when `stream` is `true`), since Vertex rejects an unknown body `model` field with `model: Extra
-//!   inputs are not permitted`, so it must be removed;
+//!   `:streamRawPredict` when `stream` is `true`), since Vertex rejects an unknown body `model` field with `model:
+//!   Extra inputs are not permitted`, so it must be removed;
 //! - `anthropic_version` is injected with the fixed Vertex value;
 //! - `count_tokens` keeps its `model` in the body but at a distinct URL (`…/models/count-tokens:rawPredict`).
 //!
