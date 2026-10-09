@@ -1,5 +1,5 @@
 # Responses API Full Flow — Unified Agentic Gateway
-# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
+# Requires `--features openai-file-resolve-filter,openai-conversations,openai-compact,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
 # iterative_request_router that executes hosted file_search, web_search,
@@ -15,13 +15,27 @@
 #
 # The request is classified once, then a top-level router freezes one logical
 # cluster plus its application_provider/application_protocol metadata. That
-# binding drives two mutually exclusive paths:
+# binding drives three mutually exclusive paths:
 #
 #   - application_provider=openai: a terminal branch forwards the original
 #     Responses request directly. Managed validation, response state,
 #     persistence/rehydration, hosted-tool resolution, and the IRR never run.
+#   - application_provider=direct: a terminal branch dispatches the raw request
+#     to a passthrough backend. This covers the prompts/embeddings/files/
+#     vector_stores services, the WebSocket upgrade, and native Chat Completions
+#     ingress (POST /v1/chat/completions), none of which enter the Responses
+#     bound-body barrier or the IRR.
 #   - every managed provider: the bound-body barrier runs provider-aware body
 #     filters once, then the IRR executes the agentic loop.
+#
+# Two openai_responses_model_rewrite instances sit before the router: one
+# retargets the Responses body `model` for the managed Chat-translation route
+# without touching the router key, and one applies native Chat Completions model
+# policy on POST /v1/chat/completions. The bound-body barrier also runs
+# openai_responses_compact (summarize history on context_management requests),
+# and the IRR step runs openai_client_tool_compat (lower rich client tools to
+# backend function tools, restore on the response path) plus the
+# openai_responses_to_chat_completions vLLM reasoning dialect.
 #
 # ResponsesState created on the managed path persists across all IRR
 # iterations via extension swapping:
@@ -390,6 +404,41 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
+      # (A) Retarget the outbound Responses body `model` for the managed
+      # Chat-translation route WITHOUT touching the router key. The classifier
+      # above already froze x-praxis-ai-model from the ORIGINAL body, so the
+      # router still binds on the client-facing name; this filter only mutates
+      # the body model (and promotes the separate x-praxis-ai-effective-model),
+      # which openai_responses_validate below the router reads into
+      # ResponsesState. Not a second router. In the shipped example the alias is
+      # identity: a matching alias still marks the body mutated and re-serializes
+      # it, but the model VALUE is preserved, so the request is semantically
+      # unchanged. A deployment (or the vLLM test writer) retargets `vllm-chat`
+      # to the model its Chat backend actually serves.
+      - filter: openai_responses_model_rewrite
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+        model_aliases:
+          "vllm-chat": "vllm-chat"
+
+      # (B) Native Chat Completions ingress model policy. Path-gated so it is
+      # inert for /v1/responses, /v1/conversations, and the service APIs. Runs
+      # before the binding router; the rewritten/injected body `model` leaves on
+      # the chat body while the chat route below binds by PATH, needing no model
+      # header. This lets a gateway advertise one client-facing name and forward
+      # the provider-specific target on the native Chat API too.
+      - filter: openai_responses_model_rewrite
+        conditions:
+          - when:
+              path_prefix: "/v1/chat/completions"
+        default_model: "llama-3.3-70b"
+        model_aliases:
+          "codex-*": "llama-3.3-70b"
+        headers:
+          effective_model: x-praxis-ai-effective-model
+          original_model: x-praxis-ai-original-model
+
       # Bind one logical destination before any provider-owned body work. The
       # fact publisher overwrites the reserved x-praxis-ai-model header from the
       # parsed body, so clients cannot spoof a different promoted value. The path
@@ -412,6 +461,14 @@ filter_chains:
           # openai-responses-backend to pass the API through to OpenAI instead.
           - path_prefix: "/v1/conversations"
             cluster: "inference-backend"
+          # Native Chat Completions ingress: a raw Chat request bound directly
+          # to a Chat backend. The native Chat model policy (instance B above)
+          # already rewrote the body `model`; this binds by the EXACT path to a
+          # direct passthrough cluster (no sub-paths exist under this endpoint),
+          # so the Responses bound-body filters and the IRR are skipped through
+          # the direct-services terminal branch below.
+          - path: "/v1/chat/completions"
+            cluster: "chat-ingress-backend"
           - path: "/v1/responses"
             headers:
               upgrade: "websocket"
@@ -525,6 +582,14 @@ filter_chains:
                           application_provider: direct
                         endpoints:
                           - "127.0.0.1:3002"
+                      # Native Chat Completions passthrough. The request is
+                      # already Chat-shaped, so it is dispatched raw with no
+                      # Responses translation.
+                      - name: "chat-ingress-backend"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:3001"
 
       # The filters below participate in the once-per-request bound-body phase.
       # OpenAI owns these capabilities on its direct path, so the condition
@@ -609,6 +674,29 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+
+      # Summarize history when a request carries context_management compaction
+      # and its token count exceeds the threshold. Runs after rehydrate (history
+      # is present) and after file_resolve/doc_extract (so the rewritten
+      # current-turn tail is preserved, not restored to file_url/input_file).
+      # Inert on requests without context_management. Its anonymous summarization
+      # callout targets the gateway's own Chat backend; a deployment points
+      # inference_url at whatever summarizer it trusts.
+      #
+      # Like the IRR below, this filter owns an ordinary pre-read request-body
+      # hook that runs before the binding router publishes a decision, so it
+      # cannot carry a `bound_upstream` condition (core rejects that combination
+      # at build time). OpenAI-bound requests skip it structurally instead: the
+      # terminal direct-openai branch above stops the parent chain before it
+      # reaches this filter.
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        # Summarizer model served by inference_url. Deployments set this to the
+        # model their summarization endpoint serves (tests substitute it).
+        default_model: gpt-4o-mini
+        timeout_ms: 60000
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
@@ -777,6 +865,19 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
+              # Lower rich client-owned tools (custom, namespace, local shell,
+              # client-executed tool_search) to private function tools the
+              # backend understands, in request_body only; restore the returned
+              # function_call items to their canonical typed items on the
+              # response path. Must run after openai_agentic_loop and before
+              # openai_responses_to_chat_completions so the lowered request body is what
+              # the translator reads. openai_stream_events leads this step, so a
+              # streaming request's lowered calls are restored live in the SSE
+              # lifecycle. Transparent passthrough when no rich client tools are
+              # declared, so native function traffic is unchanged.
+              - filter: openai_client_tool_compat
+                max_rewritten_body_bytes: 67108864
+                max_client_tools: 512
               # Protocol adapters run after the load balancer publishes the
               # selected cluster's typed application metadata.
               - filter: headers
@@ -835,6 +936,13 @@ filter_chains:
                 max_emitted_sse_frame_bytes: 50331648
                 max_stream_events: 100000
                 stream_timeout_secs: 300
+                # vLLM dialect: promote raw choices[].message.reasoning into a
+                # Responses reasoning output item (falls back to the deprecated
+                # reasoning_content alias). Oversized reasoning fails closed.
+                # max_reasoning_bytes must not exceed max_rewritten_body_bytes.
+                reasoning:
+                  dialect: vllm
+                  max_reasoning_bytes: 65536
                 conditions:
                   - when:
                       selected_upstream:

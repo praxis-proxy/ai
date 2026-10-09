@@ -47,6 +47,9 @@ pipeline:
       S13:
         state: active
         note: establishes TraceContext for the managed chat-completions round
+      S14:
+        state: active
+        note: establishes TraceContext for the native Chat Completions ingress
   - id: state_owner
     name: state_owner
     group: identity
@@ -98,6 +101,9 @@ pipeline:
       S13:
         state: active
         note: owner mapped for the managed chat-completions round
+      S14:
+        state: active
+        note: owner mapped for the native Chat Completions ingress
   - id: callout_credentials
     name: callout_credentials
     group: identity
@@ -155,6 +161,9 @@ pipeline:
       S13:
         state: active
         note: strips all provider-key headers and sets the assertion for the managed round (unused this scenario)
+      S14:
+        state: active
+        note: strips all provider-key headers and sets the assertion; unused on the native chat passthrough
   - id: project_state_owner_headers_preirr
     name: project_state_owner_headers
     group: identity
@@ -204,6 +213,9 @@ pipeline:
       S13:
         state: active
         note: projects before the managed chat-completions round
+      S14:
+        state: active
+        note: projects identity before the native chat passthrough
   - id: ai_operation
     name: ai_operation
     group: classification
@@ -251,6 +263,9 @@ pipeline:
       S13:
         state: active
         note: POST /v1/responses -> openai_responses (create); vllm-chat head is classified here, provider chosen at the router
+      S14:
+        state: active
+        note: POST /v1/chat/completions -> application_protocol openai_chat_completions (create); classified against the Chat Completions registry
   - id: openai_responses_request_prerouting
     name: openai_responses_request (pre-routing)
     group: classification
@@ -304,6 +319,120 @@ pipeline:
       S13:
         state: active
         note: classifies openai_responses; model vllm-chat drives the chat-completions (managed) route
+      S14:
+        state: active
+        note: classifies the Chat Completions body -> not openai_responses (on_invalid:continue); the native chat route binds by PATH, not format
+  - id: openai_responses_model_rewrite_managed
+    name: openai_responses_model_rewrite (managed /v1/responses)
+    group: routing
+    filter_type: openai_responses_model_rewrite
+    phase: request-phase model policy for the managed Responses route; path-gated to /v1/responses; runs after the classifier froze x-praxis-ai-model and before the binding router, so it never changes the router key
+    config:
+      conditions:
+      - 'when path_prefix: /v1/responses'
+      model_aliases:
+        vllm-chat: vllm-chat
+    promotes: rewrites the outbound Responses body `model` via the alias table without touching the classifier-owned x-praxis-ai-model router key; the shipped alias is identity (vllm-chat -> vllm-chat), so a matching model still marks the body mutated and re-serializes it but the VALUE is preserved (semantically unchanged); openai_responses_validate below the router reads the body model into ResponsesState; a deployment retargets vllm-chat to the model its Chat backend actually serves
+    scenarios:
+      S1:
+        state: passthrough
+        note: /v1/responses create but the model is not vllm-chat; no alias match and no default_model, so the body is unchanged
+      S2:
+        state: passthrough
+        note: streaming create; model not aliased; body unchanged
+      S3:
+        state: passthrough
+        note: stateless create; model not aliased; body unchanged
+      S4:
+        state: passthrough
+        note: multi-turn create; model not aliased; body unchanged
+      S5:
+        state: passthrough
+        note: file_search create; model not aliased; body unchanged
+      S6:
+        state: passthrough
+        note: MCP create; model not aliased; body unchanged
+      S7:
+        state: passthrough
+        note: web_search create; model not aliased; body unchanged
+      S8:
+        state: passthrough
+        note: GET retrieve is not a create; the filter is a no-op
+      S9:
+        state: passthrough
+        note: WebSocket handshake is not a create; the filter is a no-op
+      S10:
+        state: passthrough
+        note: a non-Responses body is not a Responses create; the filter is a no-op
+      S11:
+        state: skipped
+        note: path is not /v1/responses; the condition gates the filter out
+      S12:
+        state: passthrough
+        note: gpt-5 create; model not aliased; body unchanged (the direct-openai route is chosen at the router)
+      S13:
+        state: active
+        note: vllm-chat create matches the identity alias; the body is marked mutated and re-serialized but the model value is preserved - semantically unchanged
+      S14:
+        state: skipped
+        note: path is /v1/chat/completions; the /v1/responses condition gates this instance out
+  - id: openai_responses_model_rewrite_chat
+    name: openai_responses_model_rewrite (native /v1/chat/completions)
+    group: routing
+    filter_type: openai_responses_model_rewrite
+    phase: request-phase model policy for the native Chat Completions ingress; path-gated to /v1/chat/completions; runs before the binding router so the rewritten body model rides the raw chat body to the direct Chat backend
+    config:
+      conditions:
+      - 'when path_prefix: /v1/chat/completions'
+      default_model: llama-3.3-70b
+      model_aliases:
+        codex-*: llama-3.3-70b
+      headers.effective_model: x-praxis-ai-effective-model
+      headers.original_model: x-praxis-ai-original-model
+    promotes: on the native Chat path only, rewrites the body `model` (codex-* -> llama-3.3-70b, default llama-3.3-70b when the model is absent) and promotes x-praxis-ai-effective-model / x-praxis-ai-original-model; the chat route binds by PATH so no model header is needed; lets a gateway advertise one client-facing name and forward the provider-specific target on the native Chat API
+    scenarios:
+      S1:
+        state: skipped
+        note: path is /v1/responses; the /v1/chat/completions condition gates this instance out
+      S2:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S3:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S4:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S5:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S6:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S7:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S8:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S9:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S10:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S11:
+        state: skipped
+        note: path is a dedicated-service API, not /v1/chat/completions; condition gates this instance out
+      S12:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S13:
+        state: skipped
+        note: path is /v1/responses; condition gates this instance out
+      S14:
+        state: active
+        note: POST /v1/chat/completions {model:codex-mini} matches codex-* -> llama-3.3-70b; the rewritten body rides the raw chat body to chat-ingress-backend
   - id: router
     name: router
     group: routing
@@ -315,12 +444,13 @@ pipeline:
       - 'path_prefix /v1/embeddings -> embeddings-api'
       - 'path_prefix /v1/files -> files-api'
       - 'path_prefix /v1/conversations -> inference-backend'
+      - 'path /v1/chat/completions -> chat-ingress-backend'
       - 'path /v1/responses + upgrade:websocket -> responses-websocket-backend'
       - 'path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:gpt-5 -> openai-responses-backend'
       - 'path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend'
       - 'path_prefix /v1/responses + x-praxis-ai-format:openai_responses -> inference-backend'
       - 'path_prefix /v1/vector_stores -> vector-stores-backend'
-    promotes: binds exactly one logical cluster per request and freezes its application_provider/application_protocol as bound_upstream metadata read by the two terminal branches and the IRR-step load balancer; the classifier-owned x-praxis-ai-model header cannot be spoofed; model gpt-5 -> openai-responses-backend (provider openai), vllm-chat -> chat-completions-backend (managed), any other Responses model -> inference-backend (managed native); a request matching no route is a route-miss (bare 404)
+    promotes: binds exactly one logical cluster per request and freezes its application_provider/application_protocol as bound_upstream metadata read by the two terminal branches and the IRR-step load balancer; the classifier-owned x-praxis-ai-model header cannot be spoofed; model gpt-5 -> openai-responses-backend (provider openai), vllm-chat -> chat-completions-backend (managed), any other Responses model -> inference-backend (managed native); the exact path /v1/chat/completions -> chat-ingress-backend (provider direct) for native Chat Completions ingress; a request matching no route is a route-miss (bare 404)
     scenarios:
       S1:
         state: active
@@ -361,6 +491,9 @@ pipeline:
       S13:
         state: active
         note: binds chat-completions-backend (managed vllm) via the vllm-chat route
+      S14:
+        state: active
+        note: binds chat-ingress-backend (application_provider=direct) via the exact /v1/chat/completions path route
   - id: direct_openai_branch
     name: headers (direct-openai branch)
     group: routing
@@ -414,6 +547,9 @@ pipeline:
       S13:
         state: inert
         note: bound provider=vllm (managed), not openai; branch not taken, chain continues to the managed body filters
+      S14:
+        state: inert
+        note: bound provider=direct (chat-ingress), not openai; branch not taken
   - id: direct_services_branch
     name: headers (direct-services branch)
     group: routing
@@ -425,8 +561,8 @@ pipeline:
       branch_chains:
       - name: direct-services
         rejoin: terminal
-        chain: direct-services-dispatch (load_balancer cluster_source:bound_upstream -> prompts-api 9998 / embeddings-api 9997 / files-api 9999 / responses-websocket-backend 3001 / vector-stores-backend 3002)
-    promotes: terminal branch for dedicated services; when the router bound a cluster whose application_provider is direct (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, and the /v1/responses WebSocket upgrade), forwards straight upstream and rejoins terminal so the IRR never runs
+        chain: direct-services-dispatch (load_balancer cluster_source:bound_upstream -> prompts-api 9998 / embeddings-api 9997 / files-api 9999 / responses-websocket-backend 3001 / vector-stores-backend 3002 / chat-ingress-backend 3001)
+    promotes: terminal branch for dedicated services; when the router bound a cluster whose application_provider is direct (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, the /v1/responses WebSocket upgrade, and the native /v1/chat/completions ingress), forwards straight upstream and rejoins terminal so the IRR never runs
     scenarios:
       S1:
         state: inert
@@ -467,6 +603,9 @@ pipeline:
       S13:
         state: inert
         note: bound provider=vllm (managed), not direct; branch not taken
+      S14:
+        state: active
+        note: bound provider=direct; takes the terminal branch and forwards the raw chat body to chat-ingress-backend (3001); the managed body filters and the IRR never run
   - id: openai_responses_request
     name: openai_responses_request
     group: classification
@@ -826,6 +965,61 @@ pipeline:
       S13:
         state: inert
         note: no input_file parts to convert
+  - id: openai_responses_compact
+    name: openai_responses_compact
+    group: context
+    filter_type: openai_responses_compact
+    phase: request-phase pre-security summarization callout; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; owns an ordinary pre-read request-body hook so it cannot carry a bound_upstream condition (core rejects that combination); OpenAI-bound requests skip it structurally via the direct-openai terminal branch
+    config:
+      inference_url: http://127.0.0.1:3001/v1/chat/completions
+      allow_private_inference_url: true
+      allow_pre_security_callout: true
+      default_model: gpt-4o-mini
+      timeout_ms: 60000
+    promotes: summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management
+    scenarios:
+      S1:
+        state: passthrough
+        note: managed create without context_management; the summarizer is inert
+      S2:
+        state: passthrough
+        note: streaming create without context_management; inert
+      S3:
+        state: passthrough
+        note: stateless create without context_management; inert
+      S4:
+        state: passthrough
+        note: multi-turn create without context_management; inert (history is rehydrated but not summarized)
+      S5:
+        state: passthrough
+        note: file_search create without context_management; inert
+      S6:
+        state: passthrough
+        note: MCP create without context_management; inert
+      S7:
+        state: passthrough
+        note: web_search create without context_management; inert
+      S8:
+        state: skipped
+        note: GET retrieve short-circuits at the store before this filter
+      S9:
+        state: skipped
+        note: direct-services terminal branch; never reached
+      S10:
+        state: passthrough
+        note: "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
+      S11:
+        state: skipped
+        note: direct-services terminal branch; never reached
+      S12:
+        state: skipped
+        note: direct-openai terminal branch stops the parent chain before this filter; never reached
+      S13:
+        state: passthrough
+        note: managed chat create without context_management; the summarizer is inert
+      S14:
+        state: skipped
+        note: native chat direct-services terminal branch; never reached
   - id: openai_mcp_tool_resolve
     name: openai_mcp_tool_resolve
     group: context
@@ -1361,6 +1555,58 @@ pipeline:
       S13:
         state: active
         note: parses the translated round; action=done (no tools)
+  - id: openai_client_tool_compat
+    name: openai_client_tool_compat
+    group: irr-step
+    filter_type: openai_client_tool_compat
+    phase: IRR step; request-phase lowers rich client-owned tools to private function tools in the request body; response-phase restores the returned function_call items; runs after openai_agentic_loop and before responses_to_chat_completions
+    config:
+      max_rewritten_body_bytes: 67108864
+      max_client_tools: 512
+    promotes: lowers custom / namespace / local-shell / client-executed tool_search tools to private function tools the backend understands (request body only) and restores them to canonical typed items on the response path; transparent passthrough when no rich client tools are declared
+    scenarios:
+      S1:
+        state: passthrough
+        note: in the IRR but no rich client tools declared; body unchanged
+      S2:
+        state: passthrough
+        note: streaming round; no rich client tools; body unchanged
+      S3:
+        state: passthrough
+        note: no rich client tools; body unchanged
+      S4:
+        state: passthrough
+        note: no rich client tools; body unchanged
+      S5:
+        state: passthrough
+        note: file_search is a hosted tool, not a client function tool; body unchanged
+      S6:
+        state: passthrough
+        note: MCP is a hosted tool, not a client function tool; body unchanged
+      S7:
+        state: passthrough
+        note: web_search is a hosted tool, not a client function tool; body unchanged
+      S8:
+        state: skipped
+        note: IRR not entered
+      S9:
+        state: skipped
+        note: IRR not entered
+      S10:
+        state: passthrough
+        note: managed inference round entered; no rich client tools declared; body unchanged
+      S11:
+        state: skipped
+        note: IRR not entered
+      S12:
+        state: skipped
+        note: IRR not entered
+      S13:
+        state: passthrough
+        note: the translated chat round carries no rich client tools; body unchanged
+      S14:
+        state: skipped
+        note: native chat bypasses the IRR
   - id: irr_headers
     name: headers (IRR step)
     group: irr-step
@@ -1529,6 +1775,9 @@ pipeline:
       max_emitted_sse_frame_bytes: 50331648
       max_stream_events: 100000
       stream_timeout_secs: 300
+      reasoning:
+        dialect: vllm
+        max_reasoning_bytes: 65536
       conditions:
       - 'when selected_upstream.application_protocol: openai_chat_completions'
     promotes: when the selected upstream speaks Chat Completions, translates the canonical Responses request into a Chat Completions request and (because response filters run in reverse) converts the Chat response - finite JSON or streamed SSE - back into a Responses resource / Responses SSE before openai_agentic_loop and openai_stream_events observe it; inert when the selected upstream speaks Responses natively
@@ -1689,6 +1938,11 @@ pipeline:
     request: 'POST /v1/responses {model:vllm-chat,store:false} (managed vllm, openai_chat_completions)'
     entersIRR: true
     loopRounds: 1
+  - id: S14
+    label: Native Chat ingress
+    request: 'POST /v1/chat/completions {model:codex-mini,messages} (direct passthrough)'
+    entersIRR: false
+    loopRounds: 0
   clusters:
   - name: inference-backend
     endpoints:
@@ -1733,6 +1987,12 @@ pipeline:
     - 127.0.0.1:3001
     definedIn: direct-services-dispatch load_balancer
     routedBy: 'router path /v1/responses + upgrade:websocket (application_provider direct)'
+  - name: chat-ingress-backend
+    endpoints:
+    - 127.0.0.1:3001
+    definedIn: direct-services-dispatch load_balancer
+    routedBy: router path /v1/chat/completions (application_provider direct)
+    note: native Chat Completions passthrough; the request is already Chat-shaped so it is dispatched raw with no Responses translation
   externalServices:
   - name: MCP server
     endpoint: http://127.0.0.1:8001/mcp
@@ -1865,6 +2125,11 @@ scen_meta:
     narr: <b>Chat Completions backend.</b> A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so openai_responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.
     clusters:
     - chat-completions-backend
+    services: []
+  S14:
+    narr: <b>Native Chat ingress.</b> A raw POST /v1/chat/completions is model-rewritten by the native instance (codex-* -> llama-3.3-70b) and bound by the exact-path route to chat-ingress-backend (application_provider direct); the direct-services terminal branch forwards the Chat-shaped body raw, so no Responses translation and no IRR run. The backend response is returned verbatim.
+    clusters:
+    - chat-ingress-backend
     services: []
 wire:
   S1:
@@ -2198,6 +2463,24 @@ wire:
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding: 200, response.object==response + output text "translated"; backend gets one /v1/chat/completions request whose body has messages and no input)
     - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; openai_responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'
+  S14:
+    reqMethod: POST
+    reqPath: /v1/chat/completions
+    reqHeaders:
+    - 'Content-Type: application/json'
+    - 'x-auth-tenant: integration-tenant'
+    - 'x-auth-user: integration-user'
+    - 'x-user-ogx-key: Bearer integration-ogx-key'
+    reqBody: "{\n  \"model\": \"codex-mini\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"ping\"\n    }\n  ]\n}"
+    resStatus: 200 OK
+    resKind: json
+    resHeaders:
+    - 'Content-Type: application/json'
+    resBody: "{\n  \"id\": \"chatcmpl_native\",\n  \"object\": \"chat.completion\",\n  \"created\": 1000,\n  \"model\": \"llama-3.3-70b\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"pong\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 1,\n    \"completion_tokens\": 1,\n    \"total_tokens\": 2\n  }\n}"
+    notes: 'The native Chat model policy (instance B) rewrites the body model codex-mini -> llama-3.3-70b via the codex-* alias and promotes x-praxis-ai-effective-model; the router binds the exact path /v1/chat/completions to chat-ingress-backend (application_provider=direct), so the direct-services terminal branch forwards the Chat-shaped body RAW and stops the chain. The managed body filters (validate/tool_parse/store/rehydrate/file_resolve/doc_extract/compact) and the IRR never run, and no Responses translation happens: the backend receives exactly one request at /v1/chat/completions whose body still has messages (not input) and model llama-3.3-70b, and the backend chat.completion is returned to the client verbatim.'
+    provenance:
+    - 'tests/integration/tests/suite/examples/full_flow_agentic.rs (full_flow_native_chat_ingress_reaches_chat_backend_raw: 200, backend response returned verbatim, backend gets one /v1/chat/completions request whose body has messages, no input, and model llama-3.3-70b)'
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (openai_responses_model_rewrite instance B: when path_prefix /v1/chat/completions, codex-* -> llama-3.3-70b; router route path /v1/chat/completions -> chat-ingress-backend; direct-services branch when bound_upstream.application_provider=direct forwards to 3001 and rejoins terminal)'
 timeline:
   S1:
     summary: 'A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -> IRR forwards the create to inference-backend 127.0.0.1:3001 -> the model returns a final assistant message with NO tool-call items -> the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states ''IRR terminates after the first pass via the default `done: true` branch''). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -> next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.'
