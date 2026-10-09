@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::{
     area::{ANTHROPIC_REFERENCE_MANIFEST, ANTHROPIC_REFERENCE_SPEC},
-    model::OperationScope,
+    model::{OperationScope, SpecOperation},
     reference::sha256_hex,
     registry_check::{Comparison, compare},
     spec::{parse_openapi_operations, read_spec, repo_root, scope_operations},
@@ -24,7 +24,9 @@ const ANTHROPIC_MESSAGES_SCOPE: OperationScope =
 /// Provenance manifest for the vendored Anthropic specification.
 #[derive(Deserialize)]
 struct AnthropicManifest {
+    /// Manifest schema version.
     schema_version: u32,
+    /// SHA-256 of the decompressed vendored JSON.
     vendored_sha256: String,
 }
 
@@ -43,13 +45,18 @@ pub(super) fn check() -> Result<String, String> {
         ));
     }
 
+    compare_registry(&non_beta)
+}
+
+/// Compare every registered operation against the projected specification.
+fn compare_registry(spec_operations: &[SpecOperation]) -> Result<String, String> {
     let registry = praxis_ai_apis::anthropic::routes::operation_specs();
     let mut checked: usize = 0;
     let mut failures = Vec::new();
 
     for spec in registry {
         checked += 1;
-        let found = non_beta
+        let found = spec_operations
             .iter()
             .find(|candidate| {
                 candidate.key.method == spec.method().as_str() && candidate.key.path == spec.runtime_path()
