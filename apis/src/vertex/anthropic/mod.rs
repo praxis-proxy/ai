@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::debug;
 
@@ -50,7 +50,10 @@ use self::{
     config::{FILTER_NAME, VertexAnthropicConfig, build_config},
     request::{classify, transform_request},
 };
-use crate::{anthropic::invalid_request_rejection, openai::sse::SseFrameParser};
+use crate::{
+    anthropic::{error_rejection, invalid_request_rejection},
+    openai::sse::SseFrameParser,
+};
 
 /// Metadata key carrying the classified operation (`messages`,
 /// `count_tokens`). Absent means "not a Vertex-handled request": no
@@ -208,6 +211,9 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         match transform_request(bytes, operation, &self.config) {
             Ok(Some(transformed)) => {
                 self.filter_beta_flags(ctx);
+                // Responses are patched in place, so Vertex must answer
+                // uncompressed.
+                ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
                 debug!(
                     model = %transformed.user_model,
                     path = %transformed.path,
@@ -237,6 +243,9 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         if ctx.get_metadata(OPERATION_KEY).is_none() {
             return Ok(FilterAction::Continue);
         }
+        if let Some(rejection) = encoded_response_rejection(ctx) {
+            return Ok(FilterAction::Reject(rejection));
+        }
 
         let transform = response_transform(ctx);
         ctx.set_metadata(TRANSFORM_KEY, transform);
@@ -259,6 +268,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         }
         if let Some(resp) = &mut ctx.response_header {
             resp.headers.remove(http::header::CONTENT_LENGTH);
+            resp.headers.remove(http::header::CONTENT_ENCODING);
             ctx.response_headers_modified = true;
         }
 
@@ -295,6 +305,37 @@ fn current_path<'a>(ctx: &'a HttpFilterContext<'_>) -> &'a str {
             .path_and_query()
             .map_or_else(|| ctx.request.uri.path(), |pq| pq.as_str())
     })
+}
+
+/// Fail closed on a response that is still content-encoded.
+///
+/// Handled requests drop `Accept-Encoding`, so Vertex answers uncompressed.
+/// A response encoded anyway cannot have its model restored or its Google
+/// error translated, and passing it through would leak the Vertex dialect,
+/// so it becomes an Anthropic error instead. An upstream error status is kept
+/// for client retry policies; an encoded success becomes `502`.
+fn encoded_response_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> {
+    let upstream = ctx.response_header.as_ref()?;
+    let encoded = upstream
+        .headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().trim_ascii().eq_ignore_ascii_case(b"identity"));
+    if !encoded {
+        return None;
+    }
+
+    let status = if upstream.status.is_client_error() || upstream.status.is_server_error() {
+        upstream.status.as_u16()
+    } else {
+        502
+    };
+    debug!(status, "vertex: upstream response is content-encoded; failing closed");
+    Some(error_rejection(
+        status,
+        response::anthropic_error_type(status),
+        "Vertex AI returned a content-encoded response that cannot be translated",
+    ))
 }
 
 /// Select the response transformation mode while headers are available.
@@ -473,6 +514,28 @@ mod tests {
         assert!(ctx.rewritten_path.is_none());
         assert!(ctx.get_metadata(OPERATION_KEY).is_none());
         assert!(!ctx.request_headers_to_set.iter().any(|(name, _)| name == ROUTE_HEADER));
+        assert!(
+            ctx.request_headers_to_remove.is_empty(),
+            "pass-through requests keep every client header"
+        );
+    }
+
+    #[tokio::test]
+    async fn handled_request_drops_accept_encoding() {
+        let filter = filter("project: demo");
+        let mut request = make_request(Method::POST, "/v1/messages");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
+        let mut ctx = make_filter_context(&request);
+
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert!(
+            ctx.request_headers_to_remove.contains(&header::ACCEPT_ENCODING),
+            "Vertex must answer uncompressed so the response can be patched"
+        );
     }
 
     #[tokio::test]
@@ -571,7 +634,10 @@ mod tests {
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-        assert!(ctx.request_headers_to_remove.is_empty());
+        assert!(
+            !ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA),
+            "an allowed flag keeps the header"
+        );
         let beta_header = ctx
             .request_headers_to_set
             .iter()
@@ -593,7 +659,10 @@ mod tests {
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-        assert_eq!(ctx.request_headers_to_remove.len(), 1);
+        assert!(
+            ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA),
+            "a header with no allowed flag left must be removed"
+        );
         assert!(
             ctx.request_headers_to_set
                 .iter()
@@ -648,6 +717,134 @@ mod tests {
         assert_eq!(translated["type"], "error");
         assert_eq!(translated["error"]["type"], "rate_limit_error");
         assert_eq!(translated["error"]["message"], "Quota exceeded. [RESOURCE_EXHAUSTED]");
+    }
+
+    #[tokio::test]
+    async fn encoded_json_response_fails_closed() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+            .headers
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut response);
+
+        let action = filter.on_response(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("an encoded body cannot be restored and must not pass through, got {action:?}");
+        };
+        assert_eq!(rejection.status, 502, "an encoded success becomes a gateway error");
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(
+            ctx.get_metadata(TRANSFORM_KEY).is_none(),
+            "no body transform may run on an encoded response"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_sse_response_fails_closed() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+            .headers
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+        ctx.response_header = Some(&mut response);
+        ctx.current_filter_id = Some(0);
+
+        let action = filter.on_response(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("encoded SSE bytes yield no frames and must not pass through, got {action:?}");
+        };
+        assert_eq!(rejection.status, 502);
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(
+            ctx.get_metadata(TRANSFORM_KEY).is_none(),
+            "no SSE parser may be armed for an encoded stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_error_response_keeps_upstream_status() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+
+        let mut response = make_response();
+        response.status = StatusCode::TOO_MANY_REQUESTS;
+        response
+            .headers
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut response);
+
+        let action = filter.on_response(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("an encoded Google error cannot be translated, got {action:?}");
+        };
+        assert_eq!(
+            rejection.status, 429,
+            "retry policies must still see the upstream status"
+        );
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+    }
+
+    #[tokio::test]
+    async fn identity_encoded_response_is_restored() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+            .headers
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        response
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("79"));
+        ctx.response_header = Some(&mut response);
+
+        let action = filter.on_response(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        let headers = &ctx.response_header.as_ref().unwrap().headers;
+        assert!(
+            !headers.contains_key(header::CONTENT_ENCODING),
+            "the rewritten body carries no content coding"
+        );
+        assert!(
+            !headers.contains_key(header::CONTENT_LENGTH),
+            "the rewritten body length differs from upstream"
+        );
+
+        let mut body = Some(Bytes::from_static(
+            br#"{"id":"msg_vrtx_1","type":"message","model":"claude-sonnet-4-5-20250929"}"#,
+        ));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
+        assert_eq!(out["model"], "vertex/claude-sonnet-4-5");
     }
 
     #[tokio::test]

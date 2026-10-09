@@ -29,7 +29,7 @@ use crate::{
 /// `UNAUTHENTICATED` → 401, …) share the numeric code semantics.
 /// `413` falls back to `invalid_request_error` because
 /// `request_too_large` is not part of the pinned Anthropic error schema.
-fn anthropic_error_type(status: u16) -> ErrorType {
+pub(crate) fn anthropic_error_type(status: u16) -> ErrorType {
     match status {
         401 => ErrorType::Authentication,
         403 => ErrorType::Permission,
