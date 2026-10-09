@@ -53,6 +53,8 @@ pub fn to_pg_ssl_mode(mode: SslMode) -> PgSslMode {
 pub struct PostgresResponseStore {
     /// Connection pool.
     pool: sqlx::PgPool,
+    #[cfg(test)]
+    history_read_probe: Option<std::sync::Arc<tests::HistoryReadProbe>>,
     /// Configured table names.
     tables: TableNames,
     /// Payload compression codec applied on write.
@@ -140,6 +142,8 @@ impl PostgresResponseStore {
         );
         Ok(Self {
             pool,
+            #[cfg(test)]
+            history_read_probe: None,
             tables,
             compression: compression.cloned().unwrap_or_default(),
             redact_url: database_url.to_owned(),
@@ -1569,7 +1573,11 @@ impl ConversationItemStore for PostgresResponseStore {
             "SELECT item_data FROM {table} WHERE conversation_id = $1 AND tenant_id = $2 \
              AND owner_issuer = $3 AND owner_subject = $4 ORDER BY position ASC, item_id ASC"
         );
+        #[cfg(not(test))]
         let mut history = Vec::new();
+        // The test wrapper observes ownership of the actual decoded prefix.
+        #[cfg(test)]
+        let history = tests::ReadHistory::new();
         {
             let mut rows = sqlx::query_scalar::<_, String>(AssertSqlSafe(select_sql.as_str()))
                 .bind(conversation_id)
@@ -1579,8 +1587,14 @@ impl ConversationItemStore for PostgresResponseStore {
                 .fetch(&mut *tx);
             while let Some(json) = rows.try_next().await.map_err(|e| self.db_err(&e))? {
                 history.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
+                #[cfg(test)]
+                if let Some(probe) = &self.history_read_probe {
+                    probe.after_row(&history).await;
+                }
             }
         }
+        #[cfg(test)]
+        let mut history = history.into_inner();
         {
             let projection = if history.is_empty() {
                 "messages"
@@ -2066,7 +2080,25 @@ fn row_to_owner(row: &PgRow) -> Result<StateOwner, StoreError> {
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::sync::{Arc, Mutex, Weak};
+
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires local PostgreSQL via DATABASE_URL"]
+    async fn history_read_cancellation_releases_partial_progress() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(true))
+            .await
+            .expect("cancelled history read must release its only connection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local PostgreSQL via DATABASE_URL"]
+    async fn history_read_error_releases_partial_progress() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(false))
+            .await
+            .expect("failed history read must release its only connection");
+    }
 
     #[tokio::test]
     #[ignore = "requires local PostgreSQL via DATABASE_URL"]
@@ -2297,5 +2329,249 @@ mod tests {
             sql.contains("ON CONFLICT (response_id, sequence_number) DO NOTHING"),
             "a re-released chunk stays idempotent: {sql}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real SQL fixture, cancellation/error, and recovery assertions"
+    )]
+    async fn history_read_cleanup(cancel: bool) {
+        let url = std::env::var("DATABASE_URL").expect("local test database");
+        let suffix = if cancel { "cancel" } else { "error" };
+        let mut store = PostgresResponseStore::new(
+            &url,
+            &format!("read_{suffix}_responses"),
+            &format!("read_{suffix}_conversations"),
+            Some(&format!("read_{suffix}_items")),
+            &PgTlsConfig {
+                ssl_mode: Some(SslMode::Disable),
+                ..PgTlsConfig::default()
+            },
+            Some(&PoolConfig {
+                max_connections: Some(1),
+                min_connections: Some(1),
+                ..PoolConfig::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let conversation_id = format!(
+            "read_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let legacy = serde_json::json!({"id": "legacy"});
+        store
+            .upsert_conversation(&ConversationRecord {
+                owner: owner.clone(),
+                conversation_id: conversation_id.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({"keep": true}),
+                messages: serde_json::json!([legacy]),
+            })
+            .await
+            .unwrap();
+        let items: Vec<_> = ["z", "a", "m"]
+            .into_iter()
+            .map(|id| ConversationItemRecord {
+                owner: owner.clone(),
+                conversation_id: conversation_id.clone(),
+                item_id: format!("{conversation_id}_{id}"),
+                created_at: 1,
+                position: 0,
+                item_data: serde_json::json!({"id": id, "content": "x".repeat(65_536)}),
+            })
+            .collect();
+        store
+            .create_items_and_sync_messages(&owner, &conversation_id, &items)
+            .await
+            .unwrap();
+        let table = store.tables.items.as_deref().unwrap();
+        let update = format!("UPDATE {table} SET item_data = $1 WHERE conversation_id = $2 AND item_id = $3");
+        if !cancel {
+            sqlx::query(AssertSqlSafe(update.as_str()))
+                .bind("{broken-json")
+                .bind(&conversation_id)
+                .bind(&items.get(1).unwrap().item_id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let before = read_snapshot(&store, &conversation_id).await;
+        interrupt_history_read(
+            &mut store,
+            &owner,
+            &conversation_id,
+            &items.first().unwrap().item_data,
+            cancel,
+        )
+        .await;
+        let mut connection = store.pool.acquire().await.unwrap();
+        let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_only, "off",
+            "the history reader's read-only transaction was rolled back"
+        );
+        drop(connection);
+        assert_eq!(
+            read_snapshot(&store, &conversation_id).await,
+            before,
+            "reads must preserve item bytes, positions, and legacy cache"
+        );
+        let stranger = StateOwner::from_trusted_parts("other-tenant", "issuer", "subject").unwrap();
+        assert!(
+            store
+                .conversation_history(&stranger, &conversation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if !cancel {
+            sqlx::query(AssertSqlSafe(update.as_str()))
+                .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
+                .bind(&conversation_id)
+                .bind(&items.get(1).unwrap().item_id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let expected = vec![
+            legacy,
+            items.first().unwrap().item_data.clone(),
+            items.get(1).unwrap().item_data.clone(),
+            items.get(2).unwrap().item_data.clone(),
+        ];
+        assert_eq!(
+            store.conversation_history(&owner, &conversation_id).await.unwrap(),
+            Some(expected),
+            "recovery preserves the complete legacy prefix and position/item-id ordering"
+        );
+        ConversationItemStore::delete_conversation(&store, &owner, &conversation_id)
+            .await
+            .unwrap();
+        store.close().await;
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear checkpoint, cancellation, and ownership-release assertions"
+    )]
+    async fn interrupt_history_read(
+        store: &mut PostgresResponseStore,
+        owner: &StateOwner,
+        conversation_id: &str,
+        expected: &serde_json::Value,
+        cancel: bool,
+    ) {
+        let probe = Arc::new(HistoryReadProbe::default());
+        store.history_read_probe = Some(Arc::clone(&probe));
+        let mut read = Box::pin(store.conversation_history(owner, conversation_id));
+        let early = tokio::select! {
+            result = &mut read => Some(result),
+            () = probe.reached.notified() => None,
+        };
+        assert!(
+            early.is_none(),
+            "reader completed before the decoded-prefix checkpoint: {early:?}"
+        );
+        {
+            let prefix = probe
+                .prefix
+                .lock()
+                .unwrap()
+                .upgrade()
+                .expect("reader owns the allocated prefix");
+            let values = prefix.lock().unwrap();
+            assert_eq!(values.len(), 1, "pause after a decoded row, not pool acquisition");
+            assert_eq!(values.first(), Some(expected));
+            drop(values);
+        }
+        assert_eq!(store.pool.size(), 1);
+        assert_eq!(store.pool.num_idle(), 0, "reader holds the only lease");
+        if cancel {
+            drop(read);
+        } else {
+            probe.resume.notify_one();
+            assert!(
+                matches!(read.await, Err(StoreError::Serialization(_))),
+                "corrupt second row must not return the valid prefix"
+            );
+        }
+        assert!(
+            probe.prefix.lock().unwrap().upgrade().is_none(),
+            "the actual decoded vector and its payloads were dropped"
+        );
+        store.history_read_probe = None;
+    }
+
+    async fn read_snapshot(
+        store: &PostgresResponseStore,
+        conversation_id: &str,
+    ) -> (String, Vec<(String, i64, String)>) {
+        let cache_sql = format!(
+            "SELECT messages FROM {} WHERE conversation_id = $1",
+            store.tables.conversations
+        );
+        let cache = sqlx::query_scalar(AssertSqlSafe(cache_sql.as_str()))
+            .bind(conversation_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let items_sql = format!(
+            "SELECT item_id, position, item_data FROM {} WHERE conversation_id = $1 ORDER BY position, item_id",
+            store.tables.items.as_deref().unwrap()
+        );
+        let rows = sqlx::query_as(AssertSqlSafe(items_sql.as_str()))
+            .bind(conversation_id)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        (cache, rows)
+    }
+
+    #[derive(Default)]
+    pub(super) struct HistoryReadProbe {
+        prefix: Mutex<Weak<Mutex<Vec<serde_json::Value>>>>,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl HistoryReadProbe {
+        pub(super) async fn after_row(&self, history: &ReadHistory) {
+            if history.0.lock().unwrap().len() == 1 {
+                *self.prefix.lock().unwrap() = Arc::downgrade(&history.0);
+                self.reached.notify_one();
+                self.resume.notified().await;
+            }
+        }
+    }
+
+    // Weak observes the allocation that owns the real decoded values, not a
+    // detached drop sentinel. No guard is held while the reader is suspended.
+    pub(super) struct ReadHistory(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    impl ReadHistory {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        pub(super) fn push(&self, item: serde_json::Value) {
+            self.0.lock().unwrap().push(item);
+        }
+
+        pub(super) fn into_inner(self) -> Vec<serde_json::Value> {
+            Arc::try_unwrap(self.0).unwrap().into_inner().unwrap()
+        }
     }
 }

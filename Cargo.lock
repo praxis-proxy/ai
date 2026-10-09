@@ -3678,6 +3678,7 @@ dependencies = [
 name = "praxis-ai-store-backends"
 version = "0.6.0"
 dependencies = [
+ "allocation-counter",
  "async-trait",
  "futures",
  "percent-encoding",
