@@ -1,0 +1,49 @@
+# In-Flight Tracking
+#
+# Tracks live request counts and summed token reservations per model in an
+# in-memory InFlightRegistry. On request start the inflight_tracker filter
+# increments a per-model in-flight count and adds the request's max_tokens
+# (or max_output_tokens) to that model's reservation; both are decremented
+# when the request completes -- on success, client abort, upstream error, or
+# timeout alike -- via an RAII guard, so the counters never leak upward.
+#
+# A future in-flight-requests scorer reads these counters to bias model
+# selection toward the least-loaded backend. There is no status endpoint yet,
+# so to observe the counters, run with trace logging for this filter:
+#
+#   RUST_LOG=info,praxis_ai_filters::inflight=trace \
+#     cargo run -p praxis-ai-proxy -- -c examples/configs/inflight-tracking.yaml
+#
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+#
+# Requests that carry no top-level "model" are attributed to default_model so
+# their count is not silently lost.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: inflight_tracker
+        # Model attributed when the request body carries no top-level "model".
+        default_model: "unknown"
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

@@ -20,8 +20,9 @@ use crate::TokenCeilingFilter;
 use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
-    IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    InFlightRegistry, InFlightTrackerFilter, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -64,23 +65,16 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
 
 /// Install the pipeline extensions the registered AI filters rely on.
 ///
-/// With the `store` feature this adds a fresh response store registry, which
-/// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
-/// share backends. It is gated on this crate's `store` feature, the same one
-/// that registers those filters, so a pipeline can never carry them without
-/// their registry. Builds without the store have nothing to install.
-#[cfg_attr(
-    not(feature = "store"),
-    expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "the pipeline is only mutated when the store feature installs its registry"
-    )
-)]
+/// Always adds a fresh [`InFlightRegistry`] so the `inflight_tracker` filter
+/// finds its shared per-model counter table. With the `store` feature it also
+/// adds a response store registry, which the OpenAI store, rehydrate,
+/// compaction, and MCP approval filters use to share backends; that one is
+/// gated on the same `store` feature that registers those filters, so a
+/// pipeline can never carry them without their registry.
 pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline) {
+    pipeline.add_pipeline_extension(Box::new(InFlightRegistry::new()));
     #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    #[cfg(not(feature = "store"))]
-    let _ = pipeline;
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -201,11 +195,20 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "prompt_enrich" => PromptEnrichFilter::from_config
     );
+    register_request_metadata_filters(registry);
+    register_token_filters(registry);
+}
+
+/// Register filters that observe per-request metadata (timing, in-flight load).
+fn register_request_metadata_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
     );
-    register_token_filters(registry);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "inflight_tracker" => InFlightTrackerFilter::from_config
+    );
 }
 
 /// Register token counting/usage/rate-limiting filters.
@@ -689,6 +692,7 @@ mod tests {
             "openai_tool_parse",
             "openai_chat_completions_request",
             "ai_operation",
+            "inflight_tracker",
             "a2a",
             "intelligent_route",
             "provider_route",

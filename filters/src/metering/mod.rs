@@ -46,6 +46,7 @@ use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::config::{ExternalMeteringConfig, validate_config};
+use crate::json_scan::extract_model_from_bytes;
 // Import the token metadata keys from `token_count`, their sole writer, so this
 // reader can never drift to a stale literal and silently meter zero tokens.
 use crate::token_usage::{
@@ -908,106 +909,6 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Extract the top-level `model` field from a JSON body fragment.
-///
-/// Request bodies arrive in chunks and can be megabytes long, so this scans
-/// with a string- and depth-aware state machine instead of buffering and
-/// deserializing the whole document. Only a `"model"` key belonging to the
-/// top-level object is matched, so `"model"` occurrences nested inside
-/// `messages` content can never misattribute the request. Returns `None`
-/// when the chunk does not contain the complete top-level `"model": "..."`
-/// pair.
-fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut scanner = TopLevelKeyScanner::new(text);
-
-    while let Some(key) = scanner.next_top_level_key() {
-        if key == "model" {
-            return scanner.string_value().map(str::to_owned);
-        }
-    }
-
-    None
-}
-
-/// Incremental scanner over the top-level keys of a JSON object fragment.
-///
-/// Tracks nesting depth and string boundaries (including escapes) so keys
-/// inside nested objects, arrays, or string values are never surfaced.
-struct TopLevelKeyScanner<'a> {
-    /// Remaining unscanned input.
-    rest: &'a str,
-
-    /// Current object/array nesting depth; the document object is depth 1.
-    depth: u32,
-}
-
-impl<'a> TopLevelKeyScanner<'a> {
-    /// Start scanning at the beginning of a JSON document fragment.
-    fn new(text: &'a str) -> Self {
-        Self { rest: text, depth: 0 }
-    }
-
-    /// Advance to the next key of the top-level object and return it.
-    fn next_top_level_key(&mut self) -> Option<&'a str> {
-        loop {
-            let mut chars = self.rest.char_indices();
-            let (pos, ch) = chars.next()?;
-            match ch {
-                '{' | '[' => {
-                    self.depth = self.depth.checked_add(1)?;
-                    self.rest = self.rest.get(pos + 1..)?;
-                },
-                '}' | ']' => {
-                    self.depth = self.depth.checked_sub(1)?;
-                    self.rest = self.rest.get(pos + 1..)?;
-                },
-                '"' => {
-                    let start = pos + 1;
-                    let end = find_string_end(self.rest, start)?;
-                    let content = self.rest.get(start..end)?;
-                    let after = self.rest.get(end + 1..)?;
-                    let is_key = after.trim_start().starts_with(':');
-                    self.rest = after;
-                    if self.depth == 1 && is_key {
-                        return Some(content);
-                    }
-                },
-                _ => {
-                    self.rest = self.rest.get(pos + ch.len_utf8()..)?;
-                },
-            }
-        }
-    }
-
-    /// Read the string value following the key just returned.
-    ///
-    /// Returns `None` when the value is not a string (e.g. `null`) or the
-    /// fragment is cut off before the closing quote.
-    fn string_value(&self) -> Option<&'a str> {
-        let after_colon = self.rest.trim_start().strip_prefix(':')?;
-        let value = after_colon.trim_start().strip_prefix('"')?;
-        let end = find_string_end(value, 0)?;
-        value.get(..end)
-    }
-}
-
-/// Find the byte offset of the unescaped closing quote for the string
-/// starting at `from` (which must point just past the opening quote).
-fn find_string_end(text: &str, from: usize) -> Option<usize> {
-    let mut escaped = false;
-    for (offset, ch) in text.get(from..)?.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(from + offset);
-        }
-    }
-    None
-}
 
 /// Read a numeric `filter_metadata` value, defaulting to zero.
 fn read_token_meta(ctx: &HttpFilterContext<'_>, key: &str) -> u64 {

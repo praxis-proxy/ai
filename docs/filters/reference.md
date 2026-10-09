@@ -123,6 +123,12 @@ see the [Praxis core filter reference][core-ref].
 | [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
+### Inflight
+
+| Filter | Description |
+|--------|-------------|
+| [`inflight_tracker`](inflight_tracker.md) | Tracks live request counts and reserved tokens per model. |
+
 ### Metering
 
 | Filter | Description |
