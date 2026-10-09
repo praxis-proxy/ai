@@ -1,7 +1,9 @@
 # Vertex AI dialect translation (Anthropic Messages -> rawPredict)
 #
-# Rewrites Anthropic Messages requests into Vertex AI rawPredict form:
-# the body model moves into the URL path (:rawPredict /
+# Translates Anthropic Messages requests into Vertex AI rawPredict form
+# and Vertex responses back to the Anthropic dialect.
+#
+# The body model moves into the URL path (:rawPredict /
 # :streamRawPredict), anthropic_version is injected, and responses are
 # translated back (user-facing model id restored, Google error
 # envelopes mapped to Anthropic error types).

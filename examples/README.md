@@ -170,4 +170,4 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
-| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Production note: replace the static credential_injection below with the experimental `gcp_adc` filter (source: key_file) so the gateway mints short-lived OAuth tokens from a service-account key instead of a static value, and point the cluster at aiplatform.googleapis.com:443 with tls.sni likewise |
+| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Translates Anthropic Messages requests into Vertex AI rawPredict form and Vertex responses back to the Anthropic dialect |
