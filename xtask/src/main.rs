@@ -15,6 +15,8 @@
 #![allow(let_underscore_drop, reason = "development tooling")]
 
 #[cfg(feature = "dev")]
+mod check_crypto_inventory;
+#[cfg(feature = "dev")]
 mod debug;
 #[cfg(feature = "dev")]
 mod echo;
@@ -99,6 +101,11 @@ enum Command {
     /// the pinned OpenAI specification.
     #[cfg(feature = "dev")]
     CheckVectorStoresRegistry,
+
+    /// Verify the cryptographic inventory manifest against the runtime
+    /// dependency graph of the production profile.
+    #[cfg(feature = "dev")]
+    CheckCryptoInventory(check_crypto_inventory::Args),
 
     /// Start a quick HTTP test server returning a static
     /// response to every request.
@@ -221,6 +228,7 @@ fn run_dev(command: Command) {
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
         Command::CheckFilesRegistry => openai_conformance::run_files_registry_check(),
         Command::CheckVectorStoresRegistry => openai_conformance::run_vector_stores_registry_check(),
+        Command::CheckCryptoInventory(args) => check_crypto_inventory::run(&args),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),

@@ -21,7 +21,7 @@ mod assets;
 mod binary;
 mod certified;
 mod environment;
-mod graph;
+pub(crate) mod graph;
 mod guards;
 mod host_check;
 mod openpgp;
@@ -31,6 +31,15 @@ mod signature_store;
 mod verify_image;
 
 use clap::{Parser, Subcommand};
+
+/// The canonical FIPS feature set, built `--no-default-features`.
+///
+/// This is the single Rust-side source of truth for the FIPS profile; it must
+/// stay in sync with `FIPS_FEATURES` in the `Makefile`. Consumers (the runtime
+/// probe, the crypto-inventory checker) reference this constant rather than
+/// re-spelling the literal.
+pub(crate) const FIPS_FEATURES: &str =
+    "openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth";
 
 // -----------------------------------------------------------------------------
 // CLI Arguments

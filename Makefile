@@ -300,6 +300,7 @@ lint-xtask:
 	cargo xtask check-chat-completions-registry
 	cargo xtask check-files-registry
 	cargo xtask check-vector-stores-registry
+	cargo xtask check-crypto-inventory
 	cargo xtask openresponses-coverage
 
 # Lint the product crates with only the default-on gates. `-p` without

@@ -1,0 +1,751 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Praxis Contributors
+#
+# Machine-readable cryptographic inventory for the Praxis AI proxy (#1220).
+# This manifest is the AUTHORITATIVE source of record; the prose companion
+# cryptographic-inventory.md is GENERATED from it by
+# `cargo xtask check-crypto-inventory --fix` — never hand-edit the .md.
+#
+# The AI proxy ships two build profiles and the inventory tracks BOTH:
+#   * full — the published container image (`PRAXIS_AI_FEATURES ?= full`,
+#     `standard` + `openai-all` + `store-postgres`);
+#   * fips — the reduced FIPS runtime, built `--no-default-features` with the
+#     feature set shared from `xtask/src/fips.rs::FIPS_FEATURES`
+#     (openai-responses,aws-sigv4-filter).
+# Every `operations` entry and every pinned `providers` entry declares the
+# `profiles:` it is resolved in.
+#
+# This inventory is a maintained MAP of the production cryptographic operations
+# plus a thin DRIFT ALARM — deliberately not a re-implementation of Cargo's
+# resolver. `cargo xtask check-crypto-inventory` (run from `make lint`) resolves
+# the runtime graph of each profile once, on the host target:
+#   cargo tree -p praxis-ai-proxy --edges normal \
+#     --no-default-features --features <profile> --prefix none --format '{p}|{f}'
+# The published image (full) is a superset of the FIPS runtime (fips ⊆ full) and
+# the crypto-relevant crate set is host-independent EXCEPT the OS trust-store
+# backends (schannel on Windows, security-framework[-sys] on macOS), which are
+# exempt from the resolution/drift checks so a Linux CI host still validates the
+# macOS/Windows declarations. The check fails if:
+#   * a crate whose name matches `watch_tokens`, or is named exactly on Red Hat's
+#     FIPS denylist (`xtask/src/fips/graph.rs::DENIED`), enters a profile's
+#     runtime graph but is referenced by no operation and is not in `allow`
+#                                                       (undeclared crypto);
+#   * an `allow` entry names a FIPS-denylisted crate (a denied name is a real
+#     primitive — track it as an operation, not an exception), duplicates an
+#     operation crate, or is absent from every resolved graph (stale);
+#   * a `providers:` entry drifts: wrong version, a missing `require_features`,
+#     or a present `forbid_features` — unlisted extra features are allowed by
+#     design                                            (provider drift);
+#   * an operation is incompletely specified, references a crate absent from a
+#     profile it declares, or carries a non-compliant disposition
+#     (non-validated/needs-remediation) without a remediation reference;
+#   * a FIPS-required operation (T1, A3, A4, A12) is missing or drops its `fips`
+#     profile declaration                               (FIPS capability);
+#   * a crate on the FIPS denylist appears in the `fips` graph (FIPS denylist).
+#
+# `watch_tokens` are matched against each crate name after splitting on '-' and
+# '_' and stripping trailing digits from each part (so `sha2` -> `sha`,
+# `md-5` -> `md`, `chacha20` -> `chacha`). Tokens with no current match are kept
+# to catch future crypto crates.
+
+watch_tokens:
+  - sha
+  - sha1
+  - sha2
+  - sha3
+  - md
+  - md5
+  - hmac
+  - hkdf
+  - blake
+  - ring
+  - aes
+  - rsa
+  - dsa
+  - ecdsa
+  - ecdh
+  - ed25519
+  - ed448
+  - x25519
+  - curve25519
+  - curve
+  - elliptic
+  - ristretto
+  - dalek
+  - schnorr
+  - p224
+  - p256
+  - p384
+  - p521
+  - k256
+  - secp256k1
+  - secp256r1
+  - chacha
+  - poly1305
+  - salsa
+  # Separator-less concatenations the token split cannot reduce to a family
+  # token above, so they are matched as whole crate names: libsecp256k1
+  # (`secp256k1` glued to a `lib` prefix), xsalsa20poly1305 (NaCl secretbox
+  # XSalsa20-Poly1305 AEAD), schnorrkel (sr25519 Schnorr signatures).
+  - libsecp256k1
+  - xsalsa20poly1305
+  - schnorrkel
+  # AEAD constructions and cipher modes.
+  - aead
+  - gcm
+  - ccm
+  - eax
+  - siv
+  # Legacy / regional block & stream ciphers.
+  - camellia
+  - twofish
+  - blowfish
+  - serpent
+  - cast5
+  - cast6
+  - aria
+  - sm4
+  - des
+  - idea
+  - rc2
+  - rc4
+  # Additional hash / MAC families.
+  - sm3
+  - ripemd
+  - whirlpool
+  - groestl
+  - gost
+  - streebog
+  - cmac
+  - pmac
+  # Post-quantum KEM / signature families.
+  - kyber
+  - dilithium
+  - mlkem
+  - mldsa
+  - sphincs
+  - falcon
+  - saber
+  - frodo
+  - pqcrypto
+  - liboqs
+  # Alternative crypto libraries & language bindings (names that do not
+  # tokenize to a primitive token above, e.g. libcrux-ml-kem -> libcrux/ml/kem).
+  - libcrux
+  - hacl
+  - orion
+  - dryoc
+  - botan
+  - mbedtls
+  - wolfssl
+  - nettle
+  - gcrypt
+  - libgcrypt
+  - monocypher
+  - sequoia
+  - openpgp
+  # Higher-level protocol / KEM crates.
+  - hpke
+  - rustls
+  - openssl
+  - boring
+  - boringssl
+  - tls
+  - webpki
+  - crypto
+  - cipher
+  - digest
+  - signature
+  - jwt
+  - jsonwebtoken
+  - sigv4
+  - secrecy
+  - zeroize
+  - subtle
+  - rcgen
+  - yasna
+  - pkcs
+  - spki
+  - asn1
+  - x509
+  - pem
+  - stringprep
+  - scram
+  - pbkdf2
+  - scrypt
+  - argon2
+  - bcrypt
+  - keccak
+  - oid
+  - der
+  - untrusted
+  - getrandom
+  - rand
+  - spin
+  - aws
+  - nacl
+  - sodium
+
+# Reviewed non-primitives: crypto-family-named crates that resolve into a runtime
+# graph but are NOT standalone cryptographic operations — support/trait layers,
+# build-host code generators (proc-macros and their sub-dependencies), FFI
+# companions, and naming coincidences. Each is reviewed and documented here so the
+# drift alarm stays quiet without hiding a real primitive. A crate on the FIPS
+# denylist may NOT appear here (a denied name is a real primitive — track it as an
+# operation). `allow` is profile-agnostic and cross-checked against the resolved
+# graphs: an entry absent from every graph is flagged stale; an entry also
+# referenced by an operation is flagged (a crate has exactly one classification).
+allow:
+  # --- Naming coincidences / caller & wrapper crates (no primitive) ---
+  - crate: aws-credential-types
+    note: AWS credential value types (holds secrets, no primitive).
+  - crate: aws-smithy-async
+    note: AWS SDK async-runtime plumbing (no crypto).
+  - crate: aws-smithy-runtime-api
+    note: AWS SDK runtime API (no crypto).
+  - crate: aws-smithy-types
+    note: AWS SDK shared types (no crypto).
+  - crate: openssl-probe
+    note: Locates the system CA-bundle path; performs no crypto.
+  - crate: spin
+    note: Spinlock library (pulled by the regorus policy engine); not cryptographic.
+  - crate: praxis-proxy-tls
+    note: praxis-core TLS setup wrapper; installs the OpenSSL rustls provider (rustls_openssl) as the process default — the primitive is rustls/OpenSSL (T1).
+  - crate: quixotic-plecostomus-rustls
+    note: Pingora rustls wrapper; installs NO provider and enables rustls `custom-provider` (no built-in fallback); the installed provider is the OpenSSL adapter, so the primitive is rustls/OpenSSL (T1).
+  # --- RustCrypto primitive-support layer (no standalone operation) ---
+  - crate: const-oid
+    note: OID constants for RustCrypto digest support on the JWT/SCRAM path (full).
+  - crate: crypto-common
+    note: RustCrypto primitive-support traits (enters via blake2/digest).
+  - crate: digest
+    note: RustCrypto digest support layer (blake2 in both profiles; sha2/hmac/hkdf/md-5 in full).
+  - crate: untrusted
+    note: Safe input parser (support); enters via rustls-webpki (both) and aws-lc-rs (full). Ring is absent from the graph.
+  - crate: blake2
+    note: BLAKE2b-128 Pingora HTTP cache key (non-secret). Upstream-owned; not a security function.
+  - crate: rand_xoshiro
+    note: Non-crypto statistical sampling in metrics-util (both profiles).
+  # --- Build-host code generators (proc-macros and their sub-dependencies) ---
+  # Present under `--edges normal` but executed on the build host, not linked into
+  # the shipped binary. Kept out of `operations` so the runtime inventory is not
+  # overstated.
+  - crate: asn1-rs-derive
+    note: ASN.1 derive macros for asn1-rs/x509-parser (C6). Build-host code generator.
+  - crate: asn1-rs-impl
+    note: ASN.1 impl macros for asn1-rs/x509-parser (C6). Build-host code generator.
+  - crate: zeroize_derive
+    note: Derive macro for `Zeroize`; the runtime primitive is `zeroize` (C3). Build-host code generator.
+  - crate: aws-smithy-runtime-api-macros
+    note: AWS SDK runtime-API macros (no crypto). Build-host code generator.
+  - crate: openssl-macros
+    note: OpenSSL derive macros (rustls OpenSSL provider + Linux native-tls backend); no crypto. Build-host code generator.
+  - crate: tiny-keccak
+    note: Keccak-f for ahash's const-random compile-time seed; reached only beneath const-random-macro (a proc-macro), so it executes on the build host and is not linked into the runtime binary.
+
+# Load-bearing provider crates whose VERSION and security-relevant FEATURES are
+# pinned so the provider-selection findings in the prose cannot rot while the
+# crate name stays put. Every `require_features` entry must be present and every
+# `forbid_features` entry absent on each profile/target where the crate appears;
+# other (unlisted) features are permitted, since feature sets grow across patch
+# releases and exact-set pinning would churn on benign additions. A provider with
+# no constraints (e.g. `native-tls`) pins only its version. `profiles:` scopes the
+# pin to the profiles the provider is resolved in.
+providers:
+  - crate: quixotic-plecostomus-rustls-openssl
+    version: "0.4.1"
+    profiles: [full, fips]
+    require_features: [tls12]
+    forbid_features: [fips]
+    note: The installed process-default rustls provider (library `rustls_openssl`); routes all rustls TLS onto OpenSSL libcrypto (T1-T9). FIPS is host-activated, not this build feature — the crate's `fips` feature is a no-op and MUST stay unset.
+  - crate: openssl
+    version: "0.10.81"
+    profiles: [full, fips]
+    forbid_features: [vendored]
+    note: libcrypto binding backing the rustls OpenSSL provider (all targets) and the Linux native-tls store backend. MUST NOT gain `vendored` — the validated module is the system libcrypto (OPENSSL_NO_VENDOR=1), not a bundled build.
+  - crate: aws-lc-rs
+    version: "1.18.1"
+    profiles: [full]
+    require_features: [aws-lc-sys]
+    forbid_features: [fips]
+    note: NOT the TLS provider (OpenSSL is); executes only JWT verify (A1) in the full profile. MUST NOT gain `fips` silently — that would misrepresent the compliance story.
+  - crate: rustls
+    version: "0.23.45"
+    profiles: [full, fips]
+    require_features: [custom-provider]
+    forbid_features: [ring, aws_lc_rs]
+    note: The Pingora fork enables `custom-provider` (no built-in provider default) and the OpenSSL provider is installed at start-up; both bundled rustls backends MUST stay absent. `ring` and `aws_lc_rs` are forbidden — the latter is rustls' canonical aws-lc-rs feature that its `aws-lc-rs`/`fips`/`prefer-post-quantum` features all pull in, so forbidding it keeps rustls off a bundled provider even if one of those aliases is enabled. rustls resolves WITHOUT any of them (its features are custom-provider/log/logging/std/tls12); aws-lc-rs enters the full profile only through jsonwebtoken, never as the TLS executor.
+  - crate: jsonwebtoken
+    version: "11.1.0"
+    profiles: [full]
+    require_features: [aws_lc_rs]
+    note: JWT signature verify executes on aws-lc-rs (A1). Full profile only.
+  - crate: native-tls
+    version: "0.2.18"
+    profiles: [full, fips]
+    note: "PostgreSQL store TLS backend — diverges from the rustls data plane (A10; #1217 / R4). In full (store-postgres) and fips (store-postgres-cert-auth): the certificate-only PostgreSQL store ships in the FIPS image, so its TLS backend resolves in both profiles."
+
+# --------------------------------------------------------------------------
+# Cryptographic operations (operation-centric view, #1220 AC#1).
+#
+# This is the heart of the inventory: where cryptography is actually used, for
+# what algorithm, under whose ownership, by which crates, and what remediation is
+# required. `cargo xtask check-crypto-inventory` enforces: unique ids + all
+# required fields; each op's `crates` resolve in every declared profile (except
+# the OS trust-store backends security-framework[-sys]/schannel, which the host
+# may not resolve); non-compliant dispositions (non-validated/needs-remediation)
+# cite a remediation reference; and the FIPS-required operations (T1, A3, A4, A12)
+# exist and declare the `fips` profile. `n-a` operations that run on the standard
+# library (non-cryptographic SipHash) legitimately reference no crypto crate.
+operations:
+  - id: T1
+    name: "Process rustls crypto-provider install (process-default)"
+    owner: "praxis-proxy-tls (praxis core)"
+    caller: "server/src/server.rs:98 boot_server -> install_crypto_provider (praxis_tls::provider::install, server.rs:495); also server/src/subrequest.rs:45"
+    algorithm: "rustls_openssl default_provider().install_default() as the sole CryptoProvider (custom-provider, no ring); OpenSSL-backed suites, key exchange, signatures, digests, MACs, RNG"
+    provider: "OpenSSL libcrypto via quixotic-plecostomus-rustls-openssl (rustls_openssl), installed by praxis-proxy-tls"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Installs rustls_openssl as the sole process-wide CryptoProvider at boot (custom-provider, no ring fallback); every subsequent rustls TLS primitive executes on OpenSSL libcrypto. FIPS is host-activated (docs/fips.md), not asserted by this build."
+  - id: T2
+    name: "Upstream data-plane TLS handshake (proxy -> LLM)"
+    owner: "praxis core (pingora fork)"
+    caller: "praxis-protocol PingoraHttp (registered server/src/server.rs:181); upstream TLS inside the pingora fork"
+    algorithm: "TLS 1.2/1.3 client handshake; rustls delegates every primitive to the installed OpenSSL provider"
+    provider: "OpenSSL via the installed rustls_openssl provider (pingora rustls connector)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, rustls-webpki, tokio-rustls, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Upstream data-plane TLS (proxy -> LLM) runs inside the Pingora fork's rustls connector on the installed OpenSSL provider. ring is absent from the runtime graph."
+  - id: T3
+    name: "AI subrequest callout TLS handshakes"
+    owner: "praxis core (SubRequestConnector)"
+    caller: "apis/src/web_search/provider.rs:147; apis/src/openai/api_client/mod.rs:80; filters/src/guardrails/providers/nemo.rs:119 over server/src/subrequest.rs:51"
+    algorithm: "TLS 1.2/1.3 handshake over the SubRequestConnector rustls config on the OpenSSL provider"
+    provider: "OpenSSL via the installed rustls_openssl provider (SubRequestConnector)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, rustls-webpki, tokio-rustls, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "web_search, file_search api_client, guardrails/NeMo and compact callouts share the praxis-core SubRequestConnector rustls config, delegating every primitive to the installed OpenSSL provider."
+  - id: T4
+    name: "Downstream listener TLS handshake (client -> proxy)"
+    owner: "praxis-proxy-tls (praxis core)"
+    caller: "listeners server/src/server.rs:181-193; ServerConfig in praxis-tls setup.rs:217-255"
+    algorithm: "TLS 1.2/1.3 server handshake (ServerConfig on the OpenSSL provider); optional WebPKI client-cert verification"
+    provider: "OpenSSL via the installed rustls_openssl provider (ServerConfig)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, rustls-webpki, tokio-rustls, rustls-pemfile, rustls-pki-types, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Downstream listener TLS via praxis-proxy-tls ServerConfig on the installed OpenSSL provider; optional WebPKI client-cert verification; cert served through ReloadableCertResolver."
+  - id: T5
+    name: "Outbound file_resolve file_url download TLS (SSRF-guarded sub-request)"
+    owner: "praxis-ai (apis/openai/responses/file_resolve)"
+    caller: "client built at apis/src/openai/responses/file_resolve/mod.rs:211 isolated_client -> apis/src/subrequest.rs:28 (install provider + SubRequestConnector); download via resolve_url.rs:386 execute_url (apis/src/subrequest.rs:178)"
+    algorithm: "TLS 1.2/1.3 handshake over the SubRequestConnector rustls config on the installed OpenSSL provider; DNS/SSRF-guarded, redirect-free"
+    provider: "OpenSSL via the installed rustls_openssl provider (SubRequestConnector)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, rustls-webpki, tokio-rustls, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "file_url download runs over the praxis-core SubRequestConnector (Pingora HttpPeer) on the process-installed OpenSSL provider — the same connector as the other AI callouts (T3), not a reqwest client (the former reqwest/rustls-platform-verifier path was removed in #960/#1186). DNS/SSRF-guarded and redirect-free. openai-file-resolve-filter is in both the full and fips feature sets."
+  - id: T7
+    name: "Redis/Valkey policy session-store TLS (rediss://)"
+    owner: "praxis-proxy/policy (upstream) via redis tls-rustls"
+    caller: "praxis-policy-session-valkey (redis tls-rustls) via the policy engine"
+    algorithm: "TLS 1.2/1.3 for rediss:// via redis tls-rustls (tokio-rustls) on the OpenSSL provider"
+    provider: "OpenSSL via the installed rustls_openssl provider (redis tls-rustls / tokio-rustls)"
+    crates: [tokio-rustls, rustls, rustls-webpki, rustls-native-certs, quixotic-plecostomus-rustls-openssl, openssl, openssl-sys]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "rediss:// TLS for the policy engine's Valkey session store via redis tls-rustls (tokio-rustls) on the installed OpenSSL provider. Compiled only when the policy engine co-resolves redis with tls-rustls; policy-engine is in full but not fips."
+  - id: T9
+    name: "TLS handshake CSPRNG"
+    owner: "quixotic-plecostomus-rustls-openssl (installed provider)"
+    caller: "internal to the installed rustls provider; consumed by every handshake (T2-T7)"
+    algorithm: "CSPRNG for handshake randoms and key material via the provider SecureRandom (OpenSSL RAND_bytes)"
+    provider: "OpenSSL RAND via quixotic-plecostomus-rustls-openssl (rustls_openssl secure_random)"
+    crates: [quixotic-plecostomus-rustls-openssl, rustls, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "The installed provider's SecureRandom (OpenSSL RAND_bytes) supplies ClientHello/ServerHello randoms and TLS key material for every handshake."
+  - id: C1
+    name: "Upstream + sub-request server-cert chain & hostname verification"
+    owner: "praxis core (pingora connector) + praxis-ai (file_resolve sub-request)"
+    caller: "pingora connector in quixotic-plecostomus-core (data plane); file_resolve SubRequestClient apis/src/subrequest.rs:28 (installed OpenSSL provider)"
+    algorithm: "X.509 path validation + RSA/ECDSA CertificateVerify signature check + hostname match"
+    provider: "rustls-webpki (chain) + installed OpenSSL provider (signatures), for both the data plane and the file_resolve sub-request client. ring absent."
+    crates: [rustls-webpki, quixotic-plecostomus-rustls-openssl, openssl]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Upstream server-cert chain and hostname verification: rustls-webpki builds the path and the CertificateVerify signature check routes through the installed OpenSSL provider, for both the data-plane pingora connector and the file_resolve sub-request client (T5). No platform trust-store verifier runs on this path — the file_resolve client dropped its former reqwest/rustls-platform-verifier default (#960/#1186)."
+  - id: C2
+    name: "Downstream mTLS client-cert verification"
+    owner: "praxis-proxy-tls (praxis core)"
+    caller: "praxis-tls client_auth.rs:57 build_client_verifier -> reload.rs:252; from setup.rs:125"
+    algorithm: "X.509 client-cert path validation + signature verification (optional CRL)"
+    provider: "rustls-webpki via praxis-tls; signatures on the installed OpenSSL provider. ring absent."
+    crates: [rustls-webpki, quixotic-plecostomus-rustls-openssl, openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Data-plane listener mTLS: WebPkiClientVerifier path validation (hot-reloadable) with client-cert signature verification executing on the installed OpenSSL provider."
+  - id: C3
+    name: "Listener certificate + private-key PEM load"
+    owner: "praxis-proxy-tls (praxis core)"
+    caller: "praxis-tls setup/loader.rs:44 load_certified_key -> :63 load_cert_and_key"
+    algorithm: "PEM->DER decode; PKCS8/PKCS1/SEC1 key parse; buffers zeroized on drop"
+    provider: "rustls-pki-types (pem) + zeroize"
+    crates: [rustls-pki-types, zeroize]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Listener cert/key PEM->DER load and parse; buffers held in Zeroizing and wiped on drop. Encoding/lifecycle handling, no security-function primitive."
+  - id: C4
+    name: "Upstream certificate SHA-256 fingerprint (telemetry)"
+    owner: "quixotic-plecostomus-rustls (upstream Pingora fork)"
+    caller: "quixotic-plecostomus-rustls 0.10.0 src/lib.rs:289 hash_certificate()"
+    algorithm: "SHA-256 unkeyed digest over the DER certificate (non-secret fingerprint)"
+    provider: "installed CryptoProvider (OpenSSL) via quixotic-plecostomus-rustls-openssl; not ring"
+    crates: [quixotic-plecostomus-rustls-openssl]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Non-secret SHA-256 fingerprint of the DER upstream certificate for telemetry/identity, computed by the installed CryptoProvider (OpenSSL provider, not ring)."
+  - id: C5
+    name: "OS native trust-store load"
+    owner: "praxis core / rustls-native-certs (upstream)"
+    caller: "pingora load_platform_certs (via quixotic-plecostomus-rustls) and the reqwest rustls-platform-verifier Linux native-roots path"
+    algorithm: "Load system CA X.509 anchors into a RootCertStore (no primitive executed)"
+    provider: "rustls-native-certs (+ security-framework on macOS, schannel on Windows)"
+    crates: [rustls-native-certs, security-framework, security-framework-sys, schannel]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Loads OS native CA trust anchors into a RootCertStore. No cryptographic primitive executes."
+  - id: C6
+    name: "X.509 peer/chain structural parse"
+    owner: "praxis core (pingora / cert extraction)"
+    caller: "quixotic-plecostomus-core / praxis-core cert extraction"
+    algorithm: "ASN.1 X.509 v3 DER structural parse"
+    provider: "x509-parser -> der-parser -> asn1-rs -> oid-registry (rusticata stack)"
+    crates: [x509-parser, der-parser, asn1-rs, oid-registry]
+    profiles: [full, fips]
+    disposition: upstream-owned
+    note: "Structural ASN.1 X.509 v3 DER parse for mTLS/CA extraction via the rusticata parser stack. Upstream-maintained; parses, does not verify signatures."
+  - id: C7
+    name: "JWT verification-key ASN.1/PEM parse"
+    owner: "praxis-proxy/policy (upstream identity-jwt capability)"
+    caller: "praxis-policy-builtins (identity-jwt capability) via jsonwebtoken DecodingKey builders"
+    algorithm: "PKCS1/PKCS8/SEC1 DER + PEM decode of JWT verification keys"
+    provider: "simple_asn1 + pem, invoked by jsonwebtoken"
+    crates: [simple_asn1, pem]
+    profiles: [full]
+    disposition: n-a
+    note: "PKCS1/PKCS8/SEC1 DER + PEM decode of JWT verification keys via simple_asn1/pem, invoked by jsonwebtoken in the upstream praxis-policy-builtins identity-jwt capability. Full-only; key parsing, no primitive."
+  - id: A1
+    name: "JWT signature verification (identity authn)"
+    owner: "praxis-proxy/policy (upstream identity-jwt capability)"
+    caller: "praxis-policy-builtins (identity-jwt capability: DecodingKey + Validation only; never signs)"
+    algorithm: "HS256/RS256/PS256/ES256/EdDSA signature verification"
+    provider: "aws-lc-rs 1.18.1 (without the fips feature) via jsonwebtoken"
+    crates: [aws-lc-rs, aws-lc-sys, jsonwebtoken, signature]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "JWT signature verification for identity authn (decode/verify only; production builds no EncodingKey). Executes on aws-lc-rs 1.18.1 built WITHOUT its fips feature, via jsonwebtoken. Full-only."
+  - id: A2
+    name: "OAuth delegated-token cache-key derivation (keyed)"
+    owner: "praxis-proxy/policy (upstream oauth-delegator capability)"
+    caller: "praxis-policy-builtins (oauth-delegator capability) cache-key derive()"
+    algorithm: "HMAC-SHA256 over a length-prefixed identity+payload encoding, keyed by the per-process secret (R-4)"
+    provider: "RustCrypto hmac + sha2 (pure-Rust); not apis::hash / OpenSSL EVP"
+    crates: [hmac, sha2]
+    profiles: [full]
+    disposition: upstream-owned
+    note: "Per-process-keyed HMAC-SHA256 cache-key derivation in the upstream praxis-policy-builtins oauth-delegator capability. Uses RustCrypto hmac/sha2 (pure-Rust), not the OpenSSL EVP seam. Not OAuth state/nonce/PKCE. Upstream-maintained."
+  - id: A3
+    name: "AWS SigV4 signing-key derivation and request signature"
+    owner: "praxis-ai (filters/aws)"
+    caller: "filters/src/aws/sigv4.rs:293 Sigv4SignFilter::on_request -> filters/src/aws/signing.rs:221"
+    algorithm: "HMAC-SHA256 (RFC 2104); AWS4 signing-key chain then HMAC(kSigning, StringToSign)"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "AWS SigV4 signing-key chain (kSecret->kDate->kRegion->kService->kSigning) and final HMAC-SHA256 signature over StringToSign, on OpenSSL EVP via apis::hash; intermediate keys held in Zeroizing. aws-sigv4 itself is a dev-only test oracle (see test_only). FIPS-approvable algorithm; validated only on a FIPS-activated host (docs/fips.md)."
+  - id: A4
+    name: "AWS SigV4 payload and canonical-request SHA-256"
+    owner: "praxis-ai (filters/aws)"
+    caller: "filters/src/aws/sigv4.rs:293 -> filters/src/aws/signing.rs:216 and :220"
+    algorithm: "SHA-256 (lowercase hex) of the request body and of the assembled canonical request"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Two SHA-256 digests inside the SigV4 signature: the request body hash (x-amz-content-sha256 on the wire) and the hashed canonical request folded into StringToSign. OpenSSL EVP via apis::hash."
+  - id: A5
+    name: "PostgreSQL SCRAM-SHA-256 SASL authentication"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SASL exchange); options at :319"
+    algorithm: "SCRAM-SHA-256 (RFC 5802/7677): SHA-256 digest, HMAC-SHA-256 proofs, PBKDF2-HMAC-SHA-256 salted-password derivation"
+    provider: "sqlx-postgres (RustCrypto sha2 + hmac), application-side; not the OpenSSL EVP boundary"
+    crates: [sqlx, sqlx-postgres, sqlx-core, sha2, hmac]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "PostgreSQL SCRAM-SHA-256 SASL auth driven by sqlx-postgres. Application-side RustCrypto sha2/hmac (pure-Rust), NOT the OpenSSL EVP boundary. store-postgres is full-only (excluded from fips)."
+  - id: A6
+    name: "PostgreSQL SCRAM SASLprep password normalization"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SASLprep within SCRAM)"
+    algorithm: "RFC 4013 SASLprep Unicode normalization prior to SCRAM-SHA-256"
+    provider: "sqlx-postgres via stringprep (encoding, not a primitive)"
+    crates: [sqlx-postgres, stringprep]
+    profiles: [full]
+    disposition: n-a
+    note: "RFC 4013 SASLprep Unicode normalization of the password before SCRAM proof computation, via stringprep inside sqlx-postgres. An encoding step, not a cryptographic primitive."
+  - id: A7
+    name: "PostgreSQL SCRAM client-nonce RNG"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (SCRAM client-first nonce)"
+    algorithm: "Random client-nonce generation (ChaCha20 CSPRNG, OS getrandom-seeded)"
+    provider: "sqlx-postgres via rand 0.10.x -> chacha20 + getrandom (OS CSPRNG); not the validated DRBG"
+    crates: [sqlx-postgres, rand, chacha20, rand_core, getrandom]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "SCRAM client-nonce generation via sqlx-postgres's rand 0.10.x (chacha20 CSPRNG, OS-seeded through getrandom); not the FIPS-validated DRBG. Full-only. (rand_chacha is NOT on this path; see A7 vs the rand 0.9.x line in R-5.)"
+  - id: A8
+    name: "PostgreSQL legacy MD5 password authentication"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (AuthenticationMD5Password challenge)"
+    algorithm: "PostgreSQL MD5 password auth: md5(md5(password || username) || salt)"
+    provider: "sqlx-postgres via the md-5 crate (RustCrypto), application-side"
+    crates: [sqlx-postgres, md-5]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Legacy PostgreSQL MD5 password auth via the RustCrypto md-5 crate when the server issues an MD5 challenge. MD5 is not FIPS-approved; prefer SCRAM (A5) and disable MD5 server-side. store-postgres is full-only (excluded from fips)."
+  - id: A9
+    name: "PostgreSQL cleartext password authentication"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (AuthenticationCleartextPassword); options built at :319-344"
+    algorithm: "Cleartext password transmission (no local primitive; confidentiality via TLS A10)"
+    provider: "sqlx-postgres; password wrapped by secrecy; no local primitive"
+    crates: [sqlx-postgres, secrecy]
+    profiles: [full]
+    disposition: n-a
+    note: "Cleartext PostgreSQL password auth: no local cryptographic primitive; the password (secrecy-wrapped) is transmitted, so confidentiality depends entirely on the store TLS channel (A10)."
+  - id: A10
+    name: "PostgreSQL store TLS handshake + server-cert verification"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:121 connect_with (TLS handshake); ssl_mode at :330-331"
+    algorithm: "TLS 1.2/1.3 handshake with X.509 chain + hostname verification (default sslmode verify-full)"
+    provider: "sqlx-postgres via native-tls -> OpenSSL (Linux) / Security.framework (macOS) / schannel (Windows)"
+    crates: [sqlx-postgres, native-tls, openssl, security-framework, schannel]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "#1217"
+    note: "PostgreSQL store TLS with X.509 chain + hostname verification (default sslmode verify-full), via sqlx-postgres native-tls. Diverges from the rustls-on-OpenSSL data plane (#1217). In both profiles: full ships the password-auth store (store-postgres) and fips ships the certificate-only store (store-postgres-cert-auth), both of which open this TLS channel."
+  - id: A11
+    name: "PostgreSQL store client-certificate mutual TLS"
+    owner: "praxis-ai (apis/store)"
+    caller: "store-backends/src/postgres.rs:336-340 ssl_client_cert/ssl_client_key; handshake via connect_with :121"
+    algorithm: "TLS mutual authentication with a client PEM certificate/key"
+    provider: "sqlx-postgres via native-tls -> platform TLS (OpenSSL / Security.framework / schannel)"
+    crates: [sqlx-postgres, native-tls, openssl, security-framework, schannel]
+    profiles: [full, fips]
+    disposition: non-validated
+    remediation: "#1217"
+    note: "PostgreSQL store mutual TLS: client presents a PEM cert/key, asymmetric client-auth negotiated in the handshake, via sqlx-postgres native-tls. In both profiles: the certificate-only store (store-postgres-cert-auth) is the FIPS image's PostgreSQL store and relies on this client-cert mTLS (#1217)."
+  - id: A12
+    name: "HTTP Basic Auth credential verification"
+    owner: "praxis-proxy-filter (praxis core basic_auth builtin)"
+    caller: "praxis-proxy-filter 0.7.1 builtins/http/security/basic_auth/filter.rs:253 hash_password; :237 verify_password_hash"
+    algorithm: "unsalted SHA-256 password digest compared in constant time; dummy-hash compare when the user is unknown (timing-safe miss)"
+    provider: "OpenSSL EVP (hash MessageDigest::sha256) + subtle::ConstantTimeEq; not a RustCrypto digest"
+    crates: [openssl, openssl-sys, subtle]
+    profiles: [full, fips]
+    disposition: upstream-owned
+    note: "HTTP Basic Auth credential check in the praxis core basic_auth builtin: hashes the presented password with OpenSSL EVP SHA-256 and compares it to the stored digest with subtle constant-time equality (dummy compare on unknown user). Compiled into both profiles — the praxis-filter dependency enables `basic-auth-filter` unconditionally — while the AI proxy only registers the filter under the experimental `basic-auth-filter` server feature. Upstream-maintained."
+  - id: H1
+    name: "MCP approval target-identity fingerprint"
+    owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
+    caller: "apis/src/openai/responses/mcp_dispatch/mod.rs:1328 (approval record) and :1742 (McpPoolKey); recomputed on resume in resolve_approval"
+    algorithm: "SHA-256, length-prefixed field framing, key-sorted headers, hex output"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "MCP approval target fingerprint over server_url, authorization, connector_id and the owner/credential/forwarded-header sub-fingerprints. Binds an approval to its concrete destination so a resume cannot redirect execution or swap credentials; deterministic across processes and safe to embed in the client-visible approval record. openai-mcp-tools is full-only."
+  - id: H2
+    name: "Routing candidate stable_id fallback digest"
+    owner: "praxis-ai (filters/routing)"
+    caller: "filters/src/routing/descriptor.rs:296 validate_candidates -> default_stable_id"
+    algorithm: "SHA-256 (fallback only), length-prefixed fields, hex"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "SHA-256 fallback for a routing candidate stable_id only when the overlay supplies none (primary path is a readable string). Non-secret identity digest."
+  - id: H3
+    name: "Routing overlay content change-detection hash"
+    owner: "praxis-ai (filters/routing)"
+    caller: "filters/src/routing/overlay.rs:433 RouteSnapshot::from_overlay_with_scope; intelligent_route.rs:619 + watcher overlay.rs:1082"
+    algorithm: "SHA-256 over the raw overlay file bytes"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "SHA-256 over raw routing-overlay file bytes for change detection (reload trigger). Non-secret, not a security control."
+  - id: H4
+    name: "Routing overlay semantic content-digest self-check"
+    owner: "praxis-ai (filters/routing)"
+    caller: "filters/src/routing/overlay.rs:483 from_envelope (compute_semantic_digest vs envelope.content_digest)"
+    algorithm: "SHA-256 over a JCS/RFC-8785-canonicalized semantic subset, hex"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "SHA-256 self-check over the JCS/RFC-8785-canonicalized semantic subset of a routing overlay, compared to the envelope's declared content_digest. Integrity self-check, non-secret."
+  - id: NEW-mcp-owner-fingerprint
+    name: "MCP approval owner (tenant/issuer/subject) digest"
+    owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
+    caller: "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:434 bind_owner_context -> approval.rs:352 owner_fingerprint"
+    algorithm: "SHA-256, domain-separated ('praxis.ai/mcp-owner/v1') and length-framed over tenant_id|issuer|subject, hex"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Owner-tuple digest, a component of H1; binds an approval to the trusted (tenant_id, issuer, subject) without persisting raw identity. openai-mcp-tools is full-only."
+  - id: NEW-mcp-credential-fingerprint
+    name: "MCP approval effective-bearer credential digest"
+    owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
+    caller: "apis/src/openai/responses/mcp_dispatch/approval.rs:310 bind_credential_context -> :363 credential_fingerprint"
+    algorithm: "SHA-256 (unkeyed digest of a secret), domain-separated ('praxis.ai/mcp-credential/v1'), length-framed, hex"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Effective-bearer digest, a component of H1; detects credential swap on resume without retaining the raw secret (which stays in secret storage). Used only for equality, not confidentiality. openai-mcp-tools is full-only."
+  - id: NEW-mcp-forwarded-headers-fingerprint
+    name: "MCP approval forwarded/ambient-headers digest"
+    owner: "praxis-ai (apis/openai/responses/mcp_dispatch)"
+    caller: "apis/src/openai/responses/mcp_dispatch/approval.rs:375 bind_forwarded_header_context -> :394 forwarded_header_fingerprint"
+    algorithm: "SHA-256, name-sorted and length-framed over reserved header names and wire values, hex"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full]
+    disposition: non-validated
+    remediation: "docs/fips.md"
+    note: "Forwarded/ambient header-set digest, a component of H1; binds an approval to the ambient header set present at approval time. openai-mcp-tools is full-only."
+  - id: NEW-anthropic-safety-identifier
+    name: "Anthropic user_id -> safety_identifier SHA-256"
+    owner: "praxis-ai (apis/anthropic)"
+    caller: "apis/src/anthropic/messages_to_chat_completions/request.rs:104 translate -> map_metadata"
+    algorithm: "SHA-256, lowercase hex (64 chars)"
+    provider: "OpenSSL EVP via apis::hash"
+    crates: [openssl, openssl-sys]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Maps Anthropic metadata.user_id to the Chat Completions safety_identifier as a SHA-256 lowercase-hex digest (pseudonymization). Non-secret transform; the anthropic module compiles in both profiles."
+  - id: NEW-sse-item-change-digest
+    name: "SSE output-item change-detection digest (std SipHash)"
+    owner: "praxis-ai (apis/openai/responses/stream_events)"
+    caller: "apis/src/openai/responses/stream_events/mod.rs:1452 and :1749 (item_digest at :1582)"
+    algorithm: "SipHash-1-3 (std DefaultHasher), 64-bit, over a type-tagged length-prefixed key-sorted JSON walk"
+    provider: "Rust std DefaultHasher (SipHash-1-3); not OpenSSL, not a RustCrypto crate"
+    crates: []
+    profiles: [full, fips]
+    disposition: n-a
+    note: "64-bit SipHash to decide whether an already-streamed output item changed within one request. Never persisted, transmitted, or compared across processes; non-cryptographic and not a security function. Same category as the blake2 Pingora cache key in allow. References no crypto crate (std)."
+  - id: NEW-mcp-list-tools-id
+    name: "MCP tools/list opaque listing id (std SipHash)"
+    owner: "praxis-ai (apis/openai/responses/openai_mcp_tool_resolve)"
+    caller: "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2621 (mcp_list_tools_id at :2646)"
+    algorithm: "SipHash-1-3 (std DefaultHasher), 64-bit, lowercase hex (mcpl_<16 hex>)"
+    provider: "Rust std DefaultHasher (SipHash-1-3); not OpenSSL, not a RustCrypto crate"
+    crates: []
+    profiles: [full]
+    disposition: n-a
+    note: "64-bit SipHash of the operator-configured server_label to yield an opaque listing id that does not embed the raw label. Non-random, non-secret, non-cryptographic. openai-mcp-tools is full-only. References no crypto crate (std)."
+  - id: P1
+    name: "Session-identity binding (SHA-256)"
+    owner: "praxis-proxy/policy (upstream apl-runtime)"
+    caller: "praxis-policy-apl-runtime session_resolver.rs (identity tier)"
+    algorithm: "SHA-256(subject:caller_workload:this_workload)[:16], unkeyed, hex"
+    provider: "RustCrypto sha2 (pure-Rust); not apis::hash / OpenSSL"
+    crates: [sha2]
+    profiles: [full]
+    disposition: upstream-owned
+    note: "Session-identity binding in the upstream apl-runtime policy so an attacker-chosen raw header cannot forge a session. RustCrypto sha2 (pure-Rust), not the OpenSSL seam; full-only. Upstream-maintained."
+  - id: P2
+    name: "Valkey session-store key-name derivation (SHA-256)"
+    owner: "praxis-proxy/policy (upstream session-valkey)"
+    caller: "praxis-policy-session-valkey store.rs"
+    algorithm: "SHA-256(session_id), hex (non-secret key name)"
+    provider: "RustCrypto sha2 (pure-Rust)"
+    crates: [sha2]
+    profiles: [full]
+    disposition: n-a
+    note: "SHA-256(session_id) as a non-secret Valkey key name in the upstream session-valkey policy store. RustCrypto sha2 (pure-Rust); full-only. Upstream-maintained."
+  - id: R-1
+    name: "Load-balancing candidate selection RNG"
+    owner: "praxis-ai (filters/routing/picker)"
+    caller: "filters/src/routing/picker.rs:69 (Random) and :74 (WeightedRandom) via rand::rng().random_range"
+    algorithm: "ChaCha thread-RNG uniform draw over the candidate/weight range"
+    provider: "rand 0.10.x -> chacha20 CSPRNG, OS-seeded via getrandom"
+    crates: [rand, chacha20, getrandom]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Load-balancing candidate selection (Random / WeightedRandom) via rand 0.10.x thread-RNG. Not a security function; selection fairness only."
+  - id: R-2
+    name: "Correlation / idempotency IDs"
+    owner: "praxis-core (IdGenerator)"
+    caller: "apis/src/openai/responses/validate/mod.rs:132 (resp_) and :241 (conv_), among others, via ctx id_generator.generate"
+    algorithm: "IdGenerator: microsecond clock + one-time 32-bit random seed + monotone counter, hex"
+    provider: "praxis-core IdGenerator (one-time rand seed at construction)"
+    crates: [rand]
+    profiles: [full, fips]
+    disposition: upstream-owned
+    note: "Correlation/idempotency IDs (resp_*, conv_*, compact, metering) from the praxis-core IdGenerator. Predictable by design (not a CSPRNG token); upstream-maintained."
+  - id: R-3
+    name: "MCP session id (mcp-session-id header)"
+    owner: "praxis-core (IdGenerator)"
+    caller: "filters/src/agentic/mcp/broker/mod.rs:824 ctx.id_generator.generate"
+    algorithm: "IdGenerator (predictable session id)"
+    provider: "praxis-core IdGenerator (predictable, not a CSPRNG output)"
+    crates: [rand]
+    profiles: [full, fips]
+    disposition: upstream-owned
+    note: "MCP session id (mcp-session-id header) from the same praxis-core IdGenerator; predictable, not a CSPRNG output. Upstream-maintained; the agentic MCP broker compiles in both profiles."
+  - id: R-4
+    name: "OAuth delegator cache-key secret (per-process)"
+    owner: "praxis-proxy/policy (upstream oauth-delegator capability)"
+    caller: "praxis-policy-builtins (oauth-delegator capability) per-process cache-key secret"
+    algorithm: "32-byte per-process secret from the OS CSPRNG (keys the A2 HMAC-SHA256)"
+    provider: "getrandom (OS CSPRNG)"
+    crates: [getrandom]
+    profiles: [full]
+    disposition: upstream-owned
+    note: "32-byte per-process secret drawn from the OS CSPRNG (getrandom) that keys the A2 HMAC in the upstream praxis-policy-builtins oauth-delegator capability. No state/nonce/PKCE. Full-only. Upstream-maintained."
+  - id: R-5
+    name: "Prometheus metrics-exporter sampling RNG"
+    owner: "metrics-exporter-prometheus (upstream) via praxis-proxy-protocol"
+    caller: "metrics-util 0.20.4 (histogram/quantile sampling) via metrics-exporter-prometheus -> praxis-proxy-protocol"
+    algorithm: "ChaCha-based CSPRNG draw (rand 0.9.x -> rand_chacha), OS-seeded"
+    provider: "rand 0.9.x -> rand_chacha (OS-seeded); metrics sampling, not the validated DRBG"
+    crates: [rand_chacha]
+    profiles: [full, fips]
+    disposition: n-a
+    note: "Sampling RNG internal to the Prometheus metrics exporter (metrics-util -> metrics-exporter-prometheus -> praxis-proxy-protocol). The sole consumer of the rand 0.9.x line (and thus rand_chacha) in the graph. Metrics sampling only; not a security function and not the validated DRBG."
