@@ -12,7 +12,8 @@
 //! 2. the bundled Red Hat release key has the fingerprint Red Hat publishes
 //! 3. the host can verify signatures at all: gnupg is installed (podman checks `signedBy` policies through gpgme) and
 //!    podman's `registries.d` names a signature store for Red Hat's registry, as containers-common ships
-//! 4. podman accepts the image under a policy that rejects everything except images signed by that key
+//! 4. podman accepts the image under a policy that rejects everything except images signed by that key. A copy that
+//!    dies mid-blob is retried; a signature rejection is not.
 //! 5. the pulled image carries Red Hat's vendor label
 //!
 //! Requires podman on Linux; docker cannot verify Red Hat's signatures.
@@ -21,6 +22,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -32,6 +34,15 @@ const REGISTRY: &str = assets::REDHAT_REGISTRY;
 
 /// The vendor label Red Hat's images carry.
 const VENDOR: &str = "Red Hat, Inc.";
+
+/// Signed pulls to attempt before a registry copy failure is reported.
+///
+/// One pull is not enough: the blob download can die after podman's own
+/// reconnect, which is what the FIPS job hit on Quay.
+const PULL_ATTEMPTS: u32 = 3;
+
+/// Pause before repeating a signed pull that failed while copying a blob.
+const PULL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 // -----------------------------------------------------------------------------
 // CLI Arguments
@@ -170,25 +181,82 @@ fn check_signature_store(dir: &Path) -> Result<(), String> {
 
 /// Pull the image under a policy that accepts nothing but images signed by
 /// the bundled key.
+///
+/// Quay's CDN sometimes drops a blob mid-read (`unexpected EOF` while
+/// reconnecting). That is a transport failure, not a signature rejection,
+/// so it is retried. A policy or signature error fails on the first attempt.
 fn pull_under_policy(work: &Path, image: &str) -> Result<(), String> {
     let key = work.join("redhat-release-key-2.asc");
     let policy = work.join("policy.json");
     write(&key, assets::REDHAT_RELEASE_KEY_2)?;
     write(&policy, &policy_json(&key))?;
-    let output = Command::new("podman")
-        .args(["pull", "--quiet", "--signature-policy"])
-        .arg(&policy)
-        .arg(image)
-        .output()
-        .map_err(|err| format!("podman is required for signature verification ({err})"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "podman rejected '{image}' under a policy requiring Red Hat's signature: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+
+    let mut attempt = 1;
+    loop {
+        let output = Command::new("podman")
+            .args(["pull", "--quiet", "--signature-policy"])
+            .arg(&policy)
+            .arg(image)
+            .output()
+            .map_err(|err| format!("podman is required for signature verification ({err})"))?;
+        if output.status.success() {
+            println!("fips-verify-image: ok: Red Hat signature verified for {image}");
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if attempt == PULL_ATTEMPTS || !transient_registry_failure(&stderr) {
+            return Err(pull_failure_message(image, &stderr));
+        }
+        eprintln!("fips-verify-image: registry copy failed on attempt {attempt}/{PULL_ATTEMPTS} ({stderr}); retrying");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a synchronous command-line tool with no async runtime"
+        )]
+        std::thread::sleep(PULL_RETRY_DELAY);
+        attempt += 1;
     }
-    println!("fips-verify-image: ok: Red Hat signature verified for {image}");
-    Ok(())
+}
+
+/// Whether `stderr` is a registry transport failure rather than a signature
+/// or policy rejection.
+///
+/// A signature error wins even when the text also mentions EOF, so a bad
+/// signature is never retried.
+fn transient_registry_failure(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "unexpected eof",
+        "connection reset",
+        "connection refused",
+        "i/o timeout",
+        "tls handshake timeout",
+        "temporary failure",
+        "network is unreachable",
+        "no such host",
+        "client.timeout",
+        "while reconnecting",
+    ];
+    let lower = stderr.to_ascii_lowercase();
+    if signature_rejection(&lower) {
+        return false;
+    }
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Whether podman refused the image for a signature or policy reason.
+fn signature_rejection(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &["signature", "signedby", "gpg", "key expired", "policy"];
+    let lower = stderr.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Describe a failed pull. Transport failures stay transport failures so a
+/// CDN drop is not reported as Red Hat rejecting the signature.
+fn pull_failure_message(image: &str, stderr: &str) -> String {
+    if transient_registry_failure(stderr) {
+        format!("podman could not copy '{image}' from the registry after {PULL_ATTEMPTS} attempts: {stderr}")
+    } else {
+        format!("podman rejected '{image}' under a policy requiring Red Hat's signature: {stderr}")
+    }
 }
 
 /// A containers-policy that rejects everything except images from Red Hat's
@@ -277,6 +345,45 @@ mod tests {
         assert!(
             check_signature_store(&missing).is_ok(),
             "the bundled entry satisfies the check"
+        );
+    }
+
+    #[test]
+    fn a_mid_blob_eof_is_a_registry_copy_failure_not_a_signature_rejection() {
+        let stderr = "Error: copying system image from manifest list: writing blob: happened during read: \
+                      unexpected EOF (while reconnecting: Get \"https://cdn01.quay.io/blob\": EOF)";
+        assert!(transient_registry_failure(stderr), "the Quay CDN drop is retried");
+        let message = pull_failure_message("registry.access.redhat.com/ubi9/ubi@sha256:abc", stderr);
+        assert!(
+            message.contains("could not copy"),
+            "not described as a signature rejection: {message}"
+        );
+        assert!(
+            !message.contains("requiring Red Hat's signature"),
+            "the signature policy is not blamed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_signature_is_not_retried() {
+        let stderr = "Error: Source image rejected: A signature was required, but no signature exists";
+        assert!(
+            !transient_registry_failure(stderr),
+            "a policy rejection fails immediately"
+        );
+        let message = pull_failure_message("registry.access.redhat.com/ubi9/ubi@sha256:abc", stderr);
+        assert!(
+            message.contains("requiring Red Hat's signature"),
+            "a signature failure keeps the policy wording: {message}"
+        );
+    }
+
+    #[test]
+    fn an_eof_inside_a_signature_error_is_not_retried() {
+        let stderr = "Error: Source image rejected: Invalid GPG signature: unexpected EOF";
+        assert!(
+            !transient_registry_failure(stderr),
+            "a signature error is not retried just because it mentions EOF"
         );
     }
 

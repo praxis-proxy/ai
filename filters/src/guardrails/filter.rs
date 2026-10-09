@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::replace_json_body;
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
 use praxis_core::{
@@ -22,7 +23,7 @@ use praxis_filter::{
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, MessageRedaction, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -88,6 +89,9 @@ pub struct AiGuardrailsFilter {
     outbound: Arc<FilterPipeline>,
     /// Per-callout deadline derived from the provider configuration.
     callout_timeout: std::time::Duration,
+    /// Chosen verdict for tests that must not call `NeMo`.
+    #[cfg(test)]
+    scripted_verdict: Option<GuardResult>,
 }
 
 impl AiGuardrailsFilter {
@@ -120,6 +124,8 @@ impl AiGuardrailsFilter {
             phase: config.phase,
             outbound,
             callout_timeout,
+            #[cfg(test)]
+            scripted_verdict: None,
         }))
     }
 
@@ -155,6 +161,24 @@ impl AiGuardrailsFilter {
         Self::build(cfg, outbound, client)
     }
 
+    /// Test-only constructor so fail-closed redaction can be exercised
+    /// without a live `NeMo` call. `NeMo` skips `/v1/checks` when there
+    /// is no phase-target message, which would otherwise never produce
+    /// [`GuardResult::Redact`].
+    #[cfg(test)]
+    pub(super) fn with_verdict(verdict: GuardResult, phase: PhaseConfig) -> Result<Self, FilterError> {
+        let client = crate::isolated_subrequest_client(4);
+        let config = serde_yaml::from_str("endpoint: \"http://127.0.0.1:9/v1/checks\"")
+            .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): {error}").into() })?;
+        Ok(Self {
+            provider: nemo::NemoProvider::from_config(&config, client)?,
+            phase,
+            outbound: test_outbound_chain()?,
+            callout_timeout: std::time::Duration::from_secs(5),
+            scripted_verdict: Some(verdict),
+        })
+    }
+
     /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
     fn callout_runtime(&self, ctx: &HttpFilterContext<'_>) -> GuardCalloutRuntime<'_> {
         let now = Instant::now();
@@ -177,6 +201,20 @@ impl AiGuardrailsFilter {
         }
     }
 
+    /// Apply a scripted test verdict, or call the configured `NeMo` provider.
+    async fn evaluate(
+        &self,
+        messages: Vec<serde_json::Value>,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, FilterError> {
+        #[cfg(test)]
+        if let Some(verdict) = &self.scripted_verdict {
+            return Ok(verdict.clone());
+        }
+        self.provider.evaluate(messages, phase, runtime).await
+    }
+
     /// Evaluate the local result suffix and leave terminal response ownership
     /// with `openai_agentic_loop`.
     #[cfg(feature = "openai-responses")]
@@ -186,7 +224,7 @@ impl AiGuardrailsFilter {
         messages: Vec<serde_json::Value>,
     ) -> Result<FilterAction, FilterError> {
         let runtime = self.callout_runtime(ctx);
-        match self.provider.evaluate(messages, GuardPhase::Request, &runtime).await {
+        match self.evaluate(messages, GuardPhase::Request, &runtime).await {
             Ok(result) => record_local_tool_verdict(ctx, result),
             Err(error) => {
                 tracing::error!(%error, phase = "tool_results", "ai_guardrails: evaluation failed");
@@ -305,7 +343,7 @@ impl HttpFilter for AiGuardrailsFilter {
 
         let messages = extract_messages(bytes)?;
         let runtime = self.callout_runtime(ctx);
-        let result = self.provider.evaluate(messages, GuardPhase::Request, &runtime).await?;
+        let result = self.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
     }
 
@@ -355,9 +393,7 @@ impl HttpFilter for AiGuardrailsFilter {
             let runtime = self.callout_runtime(ctx);
             // `on_response_body` is sync (Pingora constraint); use `block_in_place`
             // to bridge into async. See #51 for the plan to make this truly async.
-            tokio::task::block_in_place(|| {
-                handle.block_on(self.provider.evaluate(messages, GuardPhase::Response, &runtime))
-            })
+            tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
         });
 
         match evaluation {
@@ -474,11 +510,158 @@ fn record_verdict(
             Ok(FilterAction::Continue)
         },
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
-        GuardResult::Redact { reason, .. } => {
-            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #49");
+        GuardResult::Redact { replacements, reason } => {
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
+            apply_redaction(body, replacements, phase)
+        },
+    }
+}
+
+/// Rewrite the buffered body with each `NeMo` masked turn and continue.
+///
+/// Request-phase framing is repaired by core via `mutated_request_body_len`.
+/// Response headers are already committed. A rewrite that fits is space-padded
+/// to that length. A rewrite that would grow the body is refused: truncating
+/// it would return malformed JSON with the original 200, so the client receives
+/// a valid fail-closed document fitted to the committed length instead.
+fn apply_redaction(
+    body: &mut Option<Bytes>,
+    replacements: Vec<MessageRedaction>,
+    phase: GuardPhase,
+) -> Result<FilterAction, FilterError> {
+    match phase {
+        GuardPhase::Request => {
+            apply_request_redaction(body, replacements)?;
+            Ok(FilterAction::Continue)
+        },
+        GuardPhase::Response => {
+            if let Err(error) = apply_response_redaction(body, replacements) {
+                tracing::error!(%error, "ai_guardrails: response-phase redaction failed");
+                install_length_fitting_error(
+                    body,
+                    &format!("Guardrail redaction failed: {error}"),
+                    "guardrail_error",
+                    "evaluation_failed",
+                );
+            }
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Replace each redacted user message's `content` with its masked text.
+fn apply_request_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "request")?;
+    let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: request body does not contain recognizable messages".into());
+    };
+    apply_message_replacements(messages, replacements, "user")?;
+    replace_json_body(body, &value, "ai_guardrails", "messages")
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    Ok(())
+}
+
+/// Replace each redacted choice message's `content` when the rewrite fits.
+///
+/// A longer document is refused. The caller emits a fail-closed body instead
+/// of truncating the chat completion to the committed `Content-Length`.
+fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "response")?;
+    let Some(choices) = value.get_mut("choices").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: response body does not contain recognizable choices".into());
+    };
+    for replacement in replacements {
+        let index = replacement.index;
+        let Some(choice) = choices.get_mut(index) else {
+            return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
+        };
+        redact_choice(choice, replacement)?;
+    }
+    let serialized = serde_json::to_string(&value)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    let original_len = body.as_ref().map_or(0, Bytes::len);
+    if serialized.len() > original_len {
+        return Err("ai_guardrails: redacted response exceeds committed Content-Length".into());
+    }
+    *body = Some(fit_to_committed_length(serialized, body));
+    Ok(())
+}
+
+/// Rewrite one choice message and drop `logprobs` that still quote the original tokens.
+///
+/// An absent `logprobs` field is left absent. Inserting it would grow the body past the committed `Content-Length`.
+fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
+    let Some(message) = choice.get_mut("message") else {
+        return Err(format!(
+            "ai_guardrails: cannot redact: choice index {} has no message",
+            replacement.index
+        )
+        .into());
+    };
+    set_message_content(message, replacement.modified_text)?;
+    let Some(choice) = choice.as_object_mut() else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
+    if choice.contains_key("logprobs") {
+        choice.insert("logprobs".to_owned(), serde_json::Value::Null);
+    }
+    Ok(())
+}
+
+/// Apply each replacement to `messages[index]`, requiring `expected_role`.
+fn apply_message_replacements(
+    messages: &mut [serde_json::Value],
+    replacements: Vec<MessageRedaction>,
+    expected_role: &str,
+) -> Result<(), FilterError> {
+    for replacement in replacements {
+        let Some(message) = messages.get_mut(replacement.index) else {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message index {} is out of range",
+                replacement.index
+            )
+            .into());
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some(expected_role) {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message {} is not a {expected_role} turn",
+                replacement.index
+            )
+            .into());
+        }
+        set_message_content(message, replacement.modified_text)?;
+    }
+    Ok(())
+}
+
+/// Parse a buffered JSON body, labeling errors as `kind` (`request` or `response`).
+fn parse_json_body(body: &Option<Bytes>, kind: &str) -> Result<serde_json::Value, FilterError> {
+    let Some(raw) = body.as_ref() else {
+        return Err(format!("ai_guardrails: cannot redact a missing {kind} body").into());
+    };
+    serde_json::from_slice(raw)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: {kind} body is not valid JSON: {e}").into() })
+}
+
+/// Set a chat message's `content` field to `modified_text`.
+fn set_message_content(message: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
+    let Some(object) = message.as_object_mut() else {
+        return Err("ai_guardrails: message is not a JSON object".into());
+    };
+    if object
+        .get("content")
+        .is_some_and(|content| !content.is_string() && !content.is_null())
+    {
+        return Err("ai_guardrails: cannot redact: message content is not a string".into());
+    }
+    object.insert("content".to_owned(), serde_json::Value::String(modified_text));
+    Ok(())
 }
 
 /// Publish the guardrail verdict for routing and observability.
@@ -518,15 +701,108 @@ fn enforce_block(
 
 /// Replace the response body with an error JSON payload.
 fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
-    let error_json = serde_json::json!({
+    let error_json = error_document(message, error_type, code);
+    *body = Some(fit_to_committed_length(error_json, body));
+}
+
+/// Replace the response body with a valid error document of the committed length.
+///
+/// Response headers, including `Content-Length`, are already on the wire. The
+/// message is shortened until the document fits, then padded with spaces.
+/// Trailing spaces are JSON whitespace, so the client still parses one value.
+fn install_length_fitting_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
+    let original_len = body.as_ref().map_or(0, Bytes::len);
+    let full = error_document(message, error_type, code);
+    if full.len() > original_len {
+        tracing::warn!(
+            new_len = full.len(),
+            original_len,
+            "ai_guardrails: fail-closed response shortened to fit committed Content-Length",
+        );
+    }
+    *body = Some(length_fitting_error(message, error_type, code, original_len));
+}
+
+/// OpenAI-style error JSON with `message`, `type`, and `code`.
+fn error_document(message: &str, error_type: &str, code: &str) -> String {
+    serde_json::json!({
         "error": {
             "message": message,
             "type": error_type,
             "code": code,
         }
     })
-    .to_string();
-    *body = Some(fit_to_committed_length(error_json, body));
+    .to_string()
+}
+
+/// Error JSON that parses and occupies exactly `original_len` bytes.
+///
+/// Prefers the full message, then the longest message prefix that fits, then a
+/// code-only object, then `{}`. A body shorter than two bytes cannot hold a
+/// JSON object, so it is filled with spaces and does not echo the upstream text.
+pub(super) fn length_fitting_error(message: &str, error_type: &str, code: &str, original_len: usize) -> Bytes {
+    if original_len == 0 {
+        return Bytes::new();
+    }
+    if let Some(document) = longest_error_document(message, error_type, code, original_len) {
+        return pad_to_len(document, original_len);
+    }
+    for document in fallback_error_documents(code) {
+        if document.len() <= original_len {
+            return pad_to_len(document, original_len);
+        }
+    }
+    Bytes::from(vec![b' '; original_len])
+}
+
+/// Longest `error_document` whose message is a prefix of `message` and whose
+/// serialized form is at most `original_len` bytes.
+fn longest_error_document(message: &str, error_type: &str, code: &str, original_len: usize) -> Option<String> {
+    let full = error_document(message, error_type, code);
+    if full.len() <= original_len {
+        return Some(full);
+    }
+
+    let chars: Vec<char> = message.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    let mut best = None;
+    while low <= high {
+        let mid = low.midpoint(high);
+        let prefix: String = chars.iter().take(mid).collect();
+        let candidate = error_document(&prefix, error_type, code);
+        if candidate.len() <= original_len {
+            best = Some(candidate);
+            if mid == high {
+                break;
+            }
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+/// Documents used when even an empty message does not fit.
+fn fallback_error_documents(code: &str) -> [String; 2] {
+    [
+        serde_json::json!({"error": {"code": code}}).to_string(),
+        "{}".to_owned(),
+    ]
+}
+
+/// Pad `text` with trailing spaces out to `len`.
+fn pad_to_len(text: String, len: usize) -> Bytes {
+    let mut bytes = text.into_bytes();
+    debug_assert!(
+        bytes.len() <= len,
+        "pad_to_len must not truncate; a longer document would no longer be valid JSON"
+    );
+    bytes.resize(len, b' ');
+    Bytes::from(bytes)
 }
 
 /// Fit `replacement` bytes to the original response body length.
