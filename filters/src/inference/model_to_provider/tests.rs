@@ -147,8 +147,9 @@ async fn mapping_does_not_activate_the_ordered_mutation_log() {
     let mut ctx = make_filter_context(&request);
     let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
 
-    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
+    assert!(matches!(action, FilterAction::Continue));
     assert!(
         ctx.pre_read_mutations.is_empty(),
         "writing the ordered log would make core drop other filters' grouped mutations"
