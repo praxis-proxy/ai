@@ -55,6 +55,7 @@ mod harness;
 // Several replayed scenarios run examples backed by the SQLite response store.
 #[cfg(feature = "store-sqlite")]
 mod inference_fixtures;
+mod live_vllm;
 mod mcp;
 mod mcp_broker;
 #[cfg(feature = "store-sqlite")]
@@ -62,5 +63,7 @@ mod openai_mcp_tool_resolve;
 mod openai_responses_model_rewrite;
 mod openai_responses_request;
 mod openai_tool_parse;
+mod opencode;
+mod opencode_vllm;
 mod prompt_enrich;
 mod responses_routing;

@@ -73,9 +73,14 @@ use std::{
 use praxis_core::config::Config;
 use praxis_test_utils::{
     CapturedChildOutput, ProxyGuard, TavilySearchCapture, basic_auth_header, capture_child_output,
-    configure_isolated_process_group, example_config_path, free_port, http_get, start_proxy, start_tavily_relay,
+    configure_isolated_process_group, example_config_path, free_port, http_get, start_tavily_relay,
 };
 use serde_json::Value;
+
+use super::live_vllm::{
+    self, BACKEND_TOKEN_ENV, LISTEN_ADDRESS_ENV, VLLM_BASE_URL_ENV, VLLM_MODEL_ENV, authority_of, env_is_truthy,
+    resolve_ip_binary,
+};
 
 // -----------------------------------------------------------------------------
 // Pins and constants
@@ -83,21 +88,8 @@ use serde_json::Value;
 
 /// Environment variable holding the absolute path to the pinned Claude Code binary.
 const CLAUDE_CODE_BIN_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_BIN";
-/// Environment variable holding the native-Anthropic vLLM base URL or authority.
-const VLLM_BASE_URL_ENV: &str = "PRAXIS_TEST_VLLM_BASE_URL";
-/// Environment variable holding the exact served vLLM model name.
-const VLLM_MODEL_ENV: &str = "PRAXIS_TEST_VLLM_MODEL";
-/// Environment variable holding the backend bearer token injected by Praxis.
-const BACKEND_TOKEN_ENV: &str = "VLLM_API_KEY";
 /// Optional environment variable naming a Linux network namespace to launch in.
 const NETNS_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_NETNS";
-/// Optional environment variable demanding enforced egress isolation.
-///
-/// When truthy (`1`/`true`), the test refuses to run without a configured
-/// [`NETNS_ENV`] namespace, so a CI acceptance run cannot silently degrade to
-/// the advisory-only, non-isolated path. The client's only route is then the
-/// veth to Praxis, which the test verifies actively.
-const REQUIRE_EGRESS_ISOLATION_ENV: &str = "PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION";
 /// Optional environment variable demanding a real live run (no silent skip).
 ///
 /// A Rust test that early-returns reports as PASSED — there is no distinct
@@ -107,13 +99,6 @@ const REQUIRE_EGRESS_ISOLATION_ENV: &str = "PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION
 /// variable is a hard failure instead of a skip, so CI cannot pass without
 /// actually exercising the flow.
 const REQUIRE_LIVE_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE";
-/// Optional environment variable overriding the address Praxis binds.
-///
-/// Under network isolation the client lives in a namespace and reaches Praxis
-/// over a veth pair, so Praxis must bind the host-side veth address rather than
-/// loopback, and the namespaced client can then reach only Praxis. Defaults to
-/// `127.0.0.1`.
-const LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_LISTEN_ADDRESS";
 
 /// Environment variable holding the real Tavily API key for the managed
 /// `anthropic_web_search` loop. Shared with the Anthropic SDK web-search suite.
@@ -1050,23 +1035,9 @@ fn start_isolated_proxy(
     live: &LiveConfig,
     build_config: impl FnOnce(&LiveConfig, u16) -> Config,
 ) -> (ProxyGuard, Option<String>) {
-    let proxy_port = free_port();
-    let config = build_config(live, proxy_port);
-    // Surface the admin listener (set only by the transformed config) so the
-    // caller can scrape degradation metrics; the config is dropped after the
-    // proxy starts.
-    let admin_address = config.admin.address.clone();
-    let proxy = start_proxy(&config);
-
-    if let Some(namespace) = &live.netns {
-        let bound = proxy
-            .addr()
-            .parse::<std::net::SocketAddr>()
-            .unwrap_or_else(|error| panic!("parse Praxis listen address {}: {error}", proxy.addr()));
-        verify_egress_isolation(namespace, bound.ip(), bound.port());
-    }
-
-    (proxy, admin_address)
+    // The admin listener (set only by the transformed config) is surfaced so
+    // the caller can scrape degradation metrics.
+    live_vllm::start_isolated_proxy(live.netns.as_deref(), |proxy_port| build_config(live, proxy_port))
 }
 
 /// Asserts the pinned client exited on its own rather than being reaped.
@@ -1074,12 +1045,7 @@ fn start_isolated_proxy(
 /// A timeout leaves the captured stdout truncated mid-stream, so every other
 /// assertion about the trace would be reasoning about a partial transcript.
 fn assert_not_timed_out(output: &CapturedChildOutput, scenario: &str) {
-    assert!(
-        !output.timed_out,
-        "Claude Code exceeded the {CHILD_TIMEOUT:?} acceptance-test timeout on the {scenario}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    live_vllm::assert_not_timed_out(output, "Claude Code", scenario, CHILD_TIMEOUT);
 }
 
 /// Asserts the pinned client ran to completion inside the acceptance timeout.
@@ -1161,21 +1127,8 @@ impl LiveConfig {
     /// network-isolated or fail loudly, never fall back to trusting the client
     /// to honour `ANTHROPIC_BASE_URL`.
     fn require_egress_isolation_if_demanded(&self) {
-        if env_is_truthy(REQUIRE_EGRESS_ISOLATION_ENV) {
-            assert!(
-                self.netns.is_some(),
-                "{REQUIRE_EGRESS_ISOLATION_ENV} is set but {NETNS_ENV} is not; \
-                 egress isolation cannot be enforced without a network namespace"
-            );
-        }
+        live_vllm::require_egress_isolation_if_demanded(self.netns.as_deref(), NETNS_ENV);
     }
-}
-
-/// Reports whether an environment variable is set to a truthy value.
-fn env_is_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
 }
 
 /// Reads the real Tavily API key, returning `None` (with a skip message) when it
@@ -1200,15 +1153,6 @@ fn live_tavily_key() -> Option<String> {
          set {TAVILY_API_KEY_ENV} (and the full live stack) to run it"
     );
     None
-}
-
-/// Extracts a `host:port` authority from a base URL or an already-bare authority.
-fn authority_of(base: &str) -> String {
-    base.trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/')
-        .to_owned()
 }
 
 /// Build the native-vLLM passthrough config (no body translation).
@@ -1326,13 +1270,7 @@ fn web_search_config(live: &LiveConfig, proxy_port: u16, relay_port: u16, tavily
 /// made ambiguous: were a second occurrence to appear, `str::replace` would
 /// silently rewrite both, so the count is pinned here instead.
 fn replace_once(haystack: &str, from: &str, to: &str, what: &str) -> String {
-    let count = haystack.matches(from).count();
-    assert_eq!(
-        count, 1,
-        "{CONFIG_WEB_SEARCH} must contain the {what} anchor `{from}` exactly once, found {count}; \
-         update the test and the example together",
-    );
-    haystack.replace(from, to)
+    live_vllm::replace_once(haystack, from, to, what, CONFIG_WEB_SEARCH)
 }
 
 // -----------------------------------------------------------------------------
@@ -2010,98 +1948,9 @@ fn child_command(live: &LiveConfig) -> tokio::process::Command {
     }
 }
 
-/// Resolves the `ip(8)` binary, which commonly lives outside a minimal `PATH`.
-fn resolve_ip_binary() -> PathBuf {
-    ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|candidate| candidate.exists())
-        .unwrap_or_else(|| PathBuf::from("ip"))
-}
-
 // -----------------------------------------------------------------------------
 // Enforced egress isolation
 // -----------------------------------------------------------------------------
-
-/// Public endpoints that MUST be unreachable from inside the isolated namespace.
-///
-/// A correctly isolated namespace has only the veth to the host-side Praxis
-/// address and no default route, so any public IP is unreachable. Reaching one
-/// would prove the client has general egress and could bypass Praxis to talk to
-/// Anthropic (or the backend) directly. Two independent, stable anycast targets
-/// guard against one being coincidentally routable.
-const EGRESS_DENYLIST: &[(&str, u16)] = &[("1.1.1.1", 443), ("8.8.8.8", 53)];
-
-/// Bound on each in-namespace connectivity probe.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Actively verify the namespace isolates the client to Praxis only.
-///
-/// Proves, from inside the namespace, that Praxis is reachable and that every
-/// [`EGRESS_DENYLIST`] endpoint is not — i.e. the client's sole network path is
-/// the proxy. Called only when a namespace is configured.
-fn verify_egress_isolation(namespace: &str, praxis_host: IpAddr, praxis_port: u16) {
-    assert!(
-        netns_can_reach(namespace, &praxis_host.to_string(), praxis_port),
-        "the isolated client must be able to reach Praxis at {praxis_host}:{praxis_port}"
-    );
-    for (host, port) in EGRESS_DENYLIST {
-        assert!(
-            !netns_can_reach(namespace, host, *port),
-            "isolated client reached {host}:{port}; egress is not restricted to Praxis, \
-             so the client could bypass the proxy"
-        );
-    }
-}
-
-/// Reports whether a TCP connection to `host:port` succeeds inside `namespace`.
-///
-/// Uses the runner's guaranteed Python interpreter under `ip netns exec`. This
-/// avoids depending on optional `timeout(1)` or Bash `/dev/tcp` support inside
-/// a minimal GPU image, and retains the concrete socket error in CI logs.
-fn netns_can_reach(namespace: &str, host: &str, port: u16) -> bool {
-    let seconds = PROBE_TIMEOUT.as_secs().max(1).to_string();
-    let output = std::process::Command::new(resolve_ip_binary())
-        .arg("netns")
-        .arg("exec")
-        .arg(namespace)
-        .arg(resolve_python_binary())
-        .arg("-c")
-        .arg(
-            "import socket,sys; \
-             socket.create_connection((sys.argv[1], int(sys.argv[2])), \
-             timeout=float(sys.argv[3])).close()",
-        )
-        .arg(host)
-        .arg(port.to_string())
-        .arg(seconds)
-        .stdin(Stdio::null())
-        .output();
-    match output {
-        Ok(output) if output.status.success() => true,
-        Ok(output) => {
-            eprintln!(
-                "network-namespace TCP probe to {host}:{port} failed: status={:?}, stderr={}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            );
-            false
-        },
-        Err(error) => {
-            eprintln!("network-namespace TCP probe to {host}:{port} could not start: {error}");
-            false
-        },
-    }
-}
-
-/// Resolve the Python interpreter used by the workflow before entering netns.
-fn resolve_python_binary() -> PathBuf {
-    ["/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|candidate| candidate.exists())
-        .unwrap_or_else(|| PathBuf::from("python3"))
-}
 
 // -----------------------------------------------------------------------------
 // Helpers

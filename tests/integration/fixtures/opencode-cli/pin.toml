@@ -1,0 +1,281 @@
+# OpenCode acceptance pin manifest
+#
+# Single source of truth for the pinned OpenCode acceptance tests
+# (`tests/integration/tests/suite/opencode.rs`) and their CI job
+# (`.github/workflows/integration.yaml`). OpenCode is the third coding client
+# documented in `docs/developing/cli-vllm-through-praxis.md`, and the only one
+# that speaks OpenAI Chat Completions:
+#
+#   OpenCode -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions
+#
+# There is no body translation anywhere on that path. Praxis authenticates the
+# caller, scrubs client credentials, injects the backend credential, and routes
+# — so these tests prove client compatibility and credential isolation, not a
+# transformation. Wire fidelity is proven deterministically against controlled
+# backends in
+# `tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`.
+#
+# Every value below was validated by hand against the pinned executable. Where
+# a value encodes observed client behavior rather than a choice, the comment
+# says so — those are the ones to re-validate when the version changes.
+
+[opencode]
+# Version substring asserted from `opencode --version`. Keep in sync with
+# OPENCODE_PINNED_VERSION in `tests/integration/tests/suite/harness.rs`; the
+# offline test `pin_toml_version_matches_harness_const` enforces the pair.
+#
+# NOTE: `opencode --version` prints the bare version with NO product prefix
+# (`1.18.35`, not `opencode 1.18.35`). Unlike the Codex pin, an equality check
+# against a prefixed string would never match.
+version = "1.18.35"
+# Platform slug the pinned build targets.
+platform = "linux-x64"
+# How CI obtains the executable.
+#
+# `npm` installs `opencode-ai@<version>`, whose platform binaries ship as
+# optionalDependencies. The published `dist-tags.latest` is a 1.x release and
+# there is no 2.x on npm, so `latest` does not silently cross the major
+# boundary that `major_series` guards.
+#
+# Lane split: the CPU job runs on a GitHub-hosted image that already has npm, so
+# it uses `npm install -g`. The ephemeral GPU AMI ships no Node/npm at all, so
+# that job instead fetches the SAME self-contained `opencode-<platform>` binary
+# directly from the npm registry tarball with curl and verifies it against
+# `tests/integration/fixtures/opencode-cli/<version>-<platform>.sha256` — only
+# curl and tar are required there. Both lanes therefore stage a byte-identical
+# client; keep that checksum fixture in sync with `version`/`platform`.
+#
+# The upstream install script instead drops a single self-contained ELF at
+# `~/.opencode/bin/opencode` (~185 MB, Bun-compiled, no shim and no native
+# sidecar). That form is immune to the noexec/_temp-mount problem the Claude
+# GPU job hit, so switch to `github-release` and fill in `url`/`sha256` if the
+# registry tarball layout ever becomes awkward inside the test namespace.
+install = "npm"
+npm_package = "opencode-ai"
+# Required only when `install = "github-release"`.
+url = ""
+sha256 = ""
+# Major-series tripwire. The `config` plugin hook used by
+# `[opencode.auth.plugin]` is a 1.x contract; OpenCode 2.x requires a different
+# plugin implementation (see the migration guide linked from the client guide).
+# A bump across this boundary must rewrite the plugin, not just the version.
+major_series = 1
+
+[opencode.launch]
+# Headless entry point.
+subcommand = "run"
+# The prompt is a POSITIONAL argument.
+#
+# FOOTGUN: on `run`, `-p`/`--password` is the OpenCode *server* Basic-auth
+# password, NOT the prompt. Copying the `claude -p "<prompt>"` habit silently
+# passes the prompt as a password and the model never sees it. The offline test
+# `opencode_run_uses_positional_prompt_not_dash_p` guards this.
+prompt_is_positional = true
+# `--format json` emits one JSON event per line. Observed shapes:
+#   success: step_start -> text (assistant text at `part.text`) -> step_finish
+#   failure: error (name=APIError, with statusCode and metadata.url)
+format = "json"
+# Global flags (NOT `run` flags). `--print-logs` is mandatory for the plugin
+# lane: a failing plugin is otherwise completely silent (see
+# `[opencode.auth.plugin] fail_open` below).
+log_level = "ERROR"
+global_flags = ["--print-logs", "--log-level"]
+run_flags = ["--model", "--format"]
+# `--pure` runs without external plugins. Verified: with a plugin present,
+# `--pure` sends NO plugin-supplied credential, which is what makes the
+# inversion assertion in the headers lane meaningful.
+pure_flag = "--pure"
+# Exit codes are meaningful and safe to assert on:
+#   0 = success, 1 = unknown model, 1 = unknown provider, 1 = backend 401.
+# A 401 additionally emits an `error` event on stdout.
+exit_code_meaningful = true
+# Observed request count for one trivial prompt: two POSTs to
+# /v1/chat/completions — a toolless title/summary turn and the main turn
+# carrying the full tool schema. The scripted backend must therefore supply
+# more than one response, plus padding, or an extra client turn exhausts the
+# script and fails for the wrong reason.
+observed_turns_for_trivial_prompt = 2
+# No `GET /v1/models` probe was observed; model discovery comes from config.
+probes_models_endpoint = false
+
+# STDIN MUST BE /dev/null.
+#
+# With stdin left open, `opencode run` logs `init` and then blocks forever,
+# before issuing a single request, even though the prompt was supplied as an
+# argument. It is not a network problem and it produces no output. Any harness
+# or CI job that forgets this sees an unexplained hang.
+[opencode.launch.stdin]
+must_be_null = true
+
+[opencode.auth.plugin]
+# The documented path: a `config` hook that attaches the gateway Basic
+# credential at runtime. Verified working on the pinned version.
+plugin_file = "praxis-auth.ts"
+config_file = "opencode.jsonc"
+hook = "config"
+# Loaded via the config `plugin` array as a path relative to the config dir.
+plugin_reference = "./praxis-auth.ts"
+doc = "docs/developing/cli-vllm-through-praxis.md"
+# The fixture beside this manifest is asserted byte-equal to the sole
+# ```typescript block in the doc by `documented_plugin_matches_fixture`. That
+# assertion is what makes "the test validates the documentation" true; without
+# it the test would merely validate its own private copy.
+fixture = "praxis-auth.ts"
+# Environment the documented plugin reads.
+env_password = "GATEWAY_AUTH_PASSWORD"
+env_trusted_url = "PRAXIS_BASE_URL"
+#
+# !! THE PLUGIN IS NOT FAIL-CLOSED. !!
+#
+# When the hook throws — a `baseURL` that does not match `PRAXIS_BASE_URL`, or
+# an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs `plugin config hook failed`
+# and CONTINUES, sending the turn with no `Authorization` header at all. It
+# exits 0, emits no `error` event, and ends the stream with `step_finish`, so
+# the run looks successful. The log line appears ONLY with `--print-logs`.
+#
+# Consequences, both load-bearing for the tests:
+#   1. Exit status is NOT a valid auth oracle. The plugin lane must assert the
+#      `Authorization` header on EVERY captured request.
+#   2. The lane must also assert stderr is free of `plugin_failure_log`, so a
+#      silently broken plugin fails for the right reason.
+#
+# The destination check is therefore defence in depth, not an enforcing
+# control: it withholds the credential from an untrusted host but does not stop
+# the request reaching it.
+fail_open = true
+plugin_failure_log = "plugin config hook failed"
+
+[opencode.auth.headers]
+# The plugin-free alternative. `provider.<id>.options` has NO `headers` key
+# (only apiKey, baseURL, enterpriseUrl, setCacheKey, timeout, headerTimeout,
+# chunkTimeout), but a PER-MODEL `headers` map is part of the published schema
+# and is honored. Verified: the Basic credential reaches the backend with
+# `--pure` and no plugin involved.
+scope = "provider.<id>.models.<model>.headers"
+header_name = "Authorization"
+schema_url = "https://opencode.ai/config.json"
+# The model object is `additionalProperties: false`, so an unknown key is a
+# hard startup error rather than a silently ignored setting. These are the
+# accepted keys as of the pinned schema; `model_headers_config_is_schema_key_safe`
+# asserts the harness only emits members of this set.
+model_keys = [
+  "id", "name", "family", "release_date", "attachment", "reasoning",
+  "temperature", "tool_call", "interleaved", "cost", "limit", "modalities",
+  "experimental", "status", "provider", "options", "headers", "variants",
+]
+# `limit` requires both of these.
+limit_required = ["context", "output"]
+
+[opencode.provider]
+# Provider id the configs declare; the model is addressed as `<id>/<model_id>`.
+id = "praxis"
+npm = "@ai-sdk/openai-compatible"
+# The adapter is BUNDLED in the executable (`using bundled provider`), so no
+# npm fetch happens at startup. Confirmed by the isolation note below.
+bundled = true
+model_id = "qwen3-8b"
+context = 32768
+output = 8192
+# baseURL carries the `/v1` suffix; the client appends `/chat/completions`.
+base_url_suffix = "/v1"
+
+[opencode.isolation]
+# NO startup egress is required.
+#
+# Verified by running the full flow inside a loopback-only network namespace
+# (`unshare --net`, lo up, no default route, no route to 1.1.1.1) with NONE of
+# the `OPENCODE_DISABLE_*` variables set: the run completed in ~2s, exit 0,
+# with both requests reaching the loopback backend. The model-catalog fetch and
+# update probe degrade gracefully when there is no route.
+#
+# So the disable variables below are hygiene (they avoid pointless DNS
+# attempts), not correctness prerequisites. `unshare --net --map-root-user`
+# works unprivileged, which keeps the CPU lane's isolation cheap.
+requires_egress = false
+verified_in_netns = true
+disable_env = [
+  "OPENCODE_DISABLE_MODELS_FETCH",
+  "OPENCODE_DISABLE_AUTOUPDATE",
+  "OPENCODE_DISABLE_SHARE",
+  "OPENCODE_DISABLE_LSP_DOWNLOAD",
+]
+
+[opencode.tools]
+# Tool names the pinned client registers, verbatim from a captured request.
+# They are LOWERCASE — unlike Claude Code's `Read`/`Edit`/`Bash`. A scripted
+# tool-call response must name the tool exactly as it appears here or the
+# client discards the call.
+registered = [
+  "bash", "edit", "glob", "grep", "read", "skill",
+  "task", "todowrite", "webfetch", "write",
+]
+# The shell tool a scripted tool-call turn should invoke.
+bash_tool = "bash"
+tool_choice = "auto"
+# Permission handling for a turn that must actually execute a tool.
+auto_flag = "--auto"
+permission_env = "OPENCODE_PERMISSION"
+
+[vllm]
+# Backend pins for the GPU nightly lane (`vllm-gpu-opencode-acceptance`). The
+# CPU lane ignores this block entirely; it runs against a scripted backend.
+#
+# Pinned by digest, and deliberately the SAME image the Claude acceptance job
+# uses, so both jobs share the warmed on-disk Hugging Face cache on the
+# ephemeral GPU runner rather than each pulling multi-gigabyte weights.
+image = "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+# Weights, and the exact alias they are served under. The alias is slash-free
+# and matches `[opencode.provider] model_id`: the client addresses the model as
+# `<provider_id>/<model_id>`, so a name containing "/" is unaddressable.
+model = "Qwen/Qwen3-8B"
+served_model_name = "qwen3-8b"
+# HF commit the served weights resolve to. Documentary, recorded during
+# qualification; NOT an exported pin and NOT a launch flag.
+model_revision = "TBD-at-qualification"
+# Tool-calling must be served or the tool-call scenario silently degrades to a
+# plain text turn and proves nothing. The `pins` job asserts this is non-empty
+# and that --enable-auto-tool-choice is present in the launch flags.
+tool_call_parser = "hermes"
+# Must equal --max-model-len below and `[opencode.provider] context`; the
+# `pins` job asserts all three agree.
+context_length = 32768
+seed = 0
+
+# Reasoning is disabled at the chat-template level for the same reason as the
+# Claude job: served with thinking on and a parser for another model family,
+# Qwen3 emits <think> text into the assistant message and agentic clients
+# either loop or render reasoning as their answer. `--reasoning-parser` and
+# `--default-chat-template-kwargs` were validated together; change them as a
+# pair.
+#
+# Do NOT add --served-model-name or --api-key here: the CI container run
+# appends both separately, from `served_model_name` above and the per-job
+# ephemeral token, and duplicating them would pass the flag twice.
+[vllm.launch]
+flags = [
+  "--model", "Qwen/Qwen3-8B",
+  "--max-model-len", "32768",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "hermes",
+  "--reasoning-parser", "qwen3",
+  "--default-chat-template-kwargs", '{"enable_thinking":false}',
+  "--gpu-memory-utilization", "0.97",
+  "--enforce-eager",
+  "--seed", "0",
+]
+
+[gateway]
+# The example config the documented path rides. Its `/v1/chat/completions`
+# route is explicit (not the catch-all), and `anthropic_validate` and
+# `anthropic_messages_protocol` are both scoped to `/v1/messages` so neither
+# touches an OpenAI-shaped body.
+example_config = "anthropic/messages-native-vllm.yaml"
+basic_auth_user = "gateway"
+password_env = "GATEWAY_AUTH_PASSWORD"
+backend_credential_env = "VLLM_API_KEY"
+
+[startup_matrix]
+# Every prefix the client is allowed to reach through the gateway. Each one
+# must have a matching explicit `- path:` route in `gateway.example_config`;
+# nothing here may depend on the catch-all.
+allowed_prefixes = ["/v1/chat/completions"]

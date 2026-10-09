@@ -152,8 +152,8 @@ cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
 
 OpenCode was tested with the
 [native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
-Its catch-all route forwards `/v1/chat/completions` to vLLM without body
-translation, and Anthropic validation is scoped to `/v1/messages`.
+It declares an explicit `/v1/chat/completions` route that forwards to vLLM
+without body translation, and Anthropic validation is scoped to `/v1/messages`.
 The same gateway can serve both Claude Code and OpenCode, provided vLLM
 supports their respective endpoints.
 
@@ -493,9 +493,21 @@ export default async () => ({
 ```
 
 The plugin checks the merged provider URL before attaching Basic auth with
-username `gateway`. It rejects project overrides that change the destination.
-Set `PRAXIS_BASE_URL` only to a gateway you trust; it must exactly match
-`baseURL`, including any trailing slash.
+username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you trust; it must
+exactly match `baseURL`, including any trailing slash.
+
+> **The guard withholds the credential; it does not stop the request.**
+> Verified against OpenCode 1.18.35: when the `config` hook throws — a
+> `baseURL` mismatch, or an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs
+> `plugin config hook failed` and **continues**, sending the turn with no
+> `Authorization` header. It exits `0` and the event stream ends in
+> `step_finish`, so the run looks successful. The error is only visible if you
+> passed `--print-logs`.
+>
+> Against a real Praxis gateway the unauthenticated request is rejected with
+> `401`, so the turn does fail — but it fails as a gateway error rather than as
+> a plugin error. Treat the destination check as defence in depth, not as an
+> enforcing control, and read a sudden `401` as a possible plugin failure.
 
 Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
 section 2. It must match the password in the Praxis process environment;
@@ -507,6 +519,72 @@ opencode --model "praxis/$VLLM_MODEL"
 
 Quit and restart OpenCode after changing its configuration or plugin. You can
 also select the configured model with `/models`.
+
+### Headless invocation
+
+`opencode run` drives a single turn non-interactively, which is what CI and
+scripts want:
+
+```console
+opencode run --model "praxis/$VLLM_MODEL" --format json -- "Summarize README.md"
+```
+
+The prompt is a **positional argument**. There is no `-p` prompt flag: on `run`,
+`-p`/`--password` is the OpenCode *server* Basic-auth password, so copying the
+`claude -p "..."` habit silently passes your prompt as a password. Use `--` to
+separate the prompt from the flags.
+
+`--format json` emits raw JSON events, one per line, instead of formatted
+output. A successful turn emits `step_start`, one or more `text` events
+(assistant text is at `part.text`), then `step_finish`; a failed turn emits an
+`error` event carrying `statusCode` and the resolved request URL. `--print-logs`
+and `--log-level DEBUG` are global flags (not `run` flags) and send diagnostics
+to stderr — use them to confirm which `baseURL` the provider actually resolved,
+and to surface plugin failures, which are otherwise silent.
+
+**Redirect stdin from `/dev/null`.** If stdin stays open, `opencode run` blocks
+indefinitely after logging `init` — before it issues a single request — even
+though the prompt was supplied as an argument. In a script or CI job that
+presents as a hang with no output and no network activity.
+
+### Alternative: per-model headers without a plugin
+
+The plugin above exists because `provider.<id>.options` has no `headers` key —
+it accepts only `apiKey`, `baseURL`, `enterpriseUrl`, `setCacheKey`, `timeout`,
+`headerTimeout`, and `chunkTimeout`. But a **per-model** `headers` map is part
+of the published schema, so the gateway credential can be attached declaratively
+and the plugin skipped entirely:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "praxis": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 },
+          "headers": { "Authorization": "Basic <base64 of gateway:password>" }
+        }
+      }
+    }
+  }
+}
+```
+
+Pair it with `opencode --pure`, which runs without external plugins. The model
+object rejects unknown keys, so a misspelling is a hard startup error rather
+than a silently ignored setting.
+
+**Prefer the plugin for interactive use.** It reads the password from the
+environment at runtime and refuses to attach the credential if a project-level
+config has repointed `baseURL` at another host. The `headers` map does neither:
+it bakes a base64 credential into a file on disk and will send it wherever
+`baseURL` happens to point. Use it for CI and ephemeral credentials, not for a
+developer's `~/.config`.
 
 ## Cleanup
 
@@ -521,6 +599,20 @@ kill "$PRAXIS_PID"
 - `401` from Praxis on the Claude or OpenCode path: verify the Basic
   authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
   the gateway's password.
+- `opencode run` hangs after logging `init` and nothing reaches Praxis: stdin
+  is still open. Redirect it from `/dev/null`. This is not a network problem —
+  OpenCode needs no egress beyond Praxis itself, and completes normally in a
+  loopback-only network namespace.
+- OpenCode sends requests with no `Authorization` header and the gateway
+  answers `401`, but the client reports success: the `praxis-auth.ts` `config`
+  hook threw and was swallowed. Re-run with `--print-logs` and look for
+  `plugin config hook failed`. Usual causes are an unset
+  `GATEWAY_AUTH_PASSWORD` or a `PRAXIS_BASE_URL` that does not exactly match
+  the merged `baseURL`.
+- OpenCode reaches api.openai.com instead of Praxis, or asks for
+  `OPENAI_API_KEY`: the provider `options` were not applied, which upstream has
+  reported for both the bundled adapter and sub-sessions. Confirm the resolved
+  `baseURL` with `--print-logs --log-level DEBUG` and pin a known-good version.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
 - Model not found: use the exact slash-free served name, normally `qwen3-8b`.
 - `400` with `request body is not JSON` on a request that has no body, such as

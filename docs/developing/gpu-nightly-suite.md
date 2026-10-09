@@ -45,6 +45,7 @@ backend can serve the same client.
 | **Codex CLI** | translated | Responses → Chat Completions | `/v1/chat/completions` |
 | **Claude Code** | native | Anthropic Messages passed through | `/v1/messages` |
 | **Claude Code** | translated | `anthropic_messages_to_chat_completions[_stream]` | `/v1/chat/completions` |
+| **OpenCode** | native | Chat Completions passed through | `/v1/chat/completions` |
 | **OpenAI Agents SDK** | native | SDK-owned tool loop over Responses | `/v1/responses` |
 | **OpenAI SDK (Responses)** | native | Responses SDK suite, SDK **2.x and 3.x** | `/v1/responses` |
 
@@ -145,7 +146,13 @@ steps, skipping the full Responses suite and every other acceptance step.
   regression guard, in a locked-down network namespace.
 - `vllm-gpu-codex-acceptance` — pinned Codex over native Responses + translated
   Chat paths.
-- `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml`.
+- `vllm-gpu-opencode-acceptance` — pinned OpenCode over the native Chat
+  Completions path: one text turn and one tool-call round trip, in its own
+  locked-down network namespace.
+- `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml` and
+  `tests/integration/fixtures/opencode-cli/pin.toml`, cross-validates their
+  invariants, and exports every value the acceptance jobs consume so those
+  jobs carry no hardcoded version strings.
 - `gpu-qualification-summary` — writes `qualification.json` and the Actions
   summary even if provisioning fails.
 
@@ -166,6 +173,13 @@ carry the detail.
   (native vs transformed path diagram, scenarios incl. #1418).
 - `tests/integration/tests/suite/codex_http.rs` — Codex acceptance + pin-update
   instructions.
+- `tests/integration/tests/suite/opencode_vllm.rs` — OpenCode acceptance
+  (`opencode_vllm_plugin_auth_completes_text_turn`,
+  `opencode_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
+  deterministic CPU lane is `suite/opencode.rs`, run by the `opencode-cpu`
+  job in `integration.yaml`.
+- `tests/integration/tests/suite/live_vllm.rs` — namespace, egress-probe and
+  example-patching scaffolding shared by the live CLI suites.
 
 ## Running it locally
 
@@ -184,7 +198,9 @@ VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   (`qualification.json` schema, report fields, pass/fail semantics, release
   selection).
 - [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) — running Codex /
-  Claude Code / OpenCode through Praxis and vLLM; reasoning-flag regression.
+  Claude Code / OpenCode through Praxis and vLLM; reasoning-flag regression,
+  the headless `opencode run` form, and the OpenCode plugin's fail-open
+  behavior.
 - [`vllm/README.md`](../../vllm/README.md) — GPU container: build, run, health
   check, hardware/model rationale.
 - [llmd-integration-testing.md](llmd-integration-testing.md) — adjacent CPU-side
