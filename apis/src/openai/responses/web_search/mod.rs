@@ -473,7 +473,7 @@ impl WebSearchFilter {
     ///
     /// [`admit_call`] resolves every call the batch budgets exclude, so only
     /// admitted calls reach the provider here. A call that gets only part of
-    /// its queries is dispatched and reported incomplete with the results it
+    /// its queries is dispatched and reported as failed with the results it
     /// obtained. Returns whether any call was rejected by the response-wide
     /// ordered admission pass, which forces local completion without another
     /// model round.
@@ -946,12 +946,12 @@ fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
 /// Decide whether one pending call may reach the provider, appending its
 /// terminal turn when it may not.
 ///
-/// A call without a usable query is surfaced as incomplete on every path, since
+/// A call without a usable query is surfaced as failed on every path, since
 /// neither rejection nor a budget has anything to dispatch. A call `rejected` by
 /// the response-wide ordered admission pass fails locally and forces completion
 /// without another model round. An `over_budget` call — one that can spend
 /// neither a tool-call unit nor a single provider request — is surfaced as
-/// incomplete without reaching the provider.
+/// failed without reaching the provider.
 fn admit_call<'a>(
     ctx: &mut HttpFilterContext<'_>,
     prepared: PreparedCall<'a>,
@@ -969,7 +969,7 @@ fn admit_call<'a>(
     let (status, notice) = if rejected {
         ("failed", TOOL_LIMIT_OUTPUT)
     } else if over_budget {
-        ("incomplete", NOT_PERFORMED_OUTPUT)
+        ("failed", NOT_PERFORMED_OUTPUT)
     } else {
         return Some(prepared);
     };
@@ -984,11 +984,11 @@ fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (
     }
 
     if successful < n_queries && successful < query_cap {
-        return ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT));
+        return ("failed", Some(PARTIAL_UNAVAILABLE_OUTPUT));
     }
 
     if successful == query_cap && successful < n_queries {
-        return ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT));
+        return ("failed", Some(PARTIAL_CLIPPED_OUTPUT));
     }
 
     ("completed", None)
@@ -1129,15 +1129,15 @@ fn append_search_turn(
 
 /// Append a malformed search turn to [`ResponsesState`].
 ///
-/// The public item remains `incomplete`, while the backend-valid bridge carries
-/// the missing arguments and an explicit failure message. This prevents the
-/// next inference iteration and persisted replay from treating a missing query
-/// as a successful search with zero results.
+/// The public item uses the schema's fail-closed `failed` status, while the
+/// backend-valid bridge carries the missing arguments and an explicit failure
+/// message. This prevents the next inference iteration and persisted replay
+/// from treating a missing query as a successful search with zero results.
 fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(
         ids.public,
-        "incomplete",
+        "failed",
         serde_json::json!({"type": "search", "query": ""}),
         &[],
         include_sources,

@@ -756,16 +756,23 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
 
     #: Total queries served across all instances since the last reset.
     request_count = 0
+    response_code = 200
 
     @classmethod
     def reset(cls):
         cls.request_count = 0
+        cls.response_code = 200
+        cls.request_paths.clear()
 
     request_paths: ClassVar[list[str]] = []
 
     def do_GET(self):
         type(self).request_paths.append(self.path)
         BraveSearchHandler.request_count += 1
+        if BraveSearchHandler.response_code != 200:
+            self.send_response(BraveSearchHandler.response_code)
+            self.end_headers()
+            return
         payload = json.dumps(
             {
                 "web": {
@@ -6422,6 +6429,41 @@ class TestAgenticLoopVLLM:
                 recorded_request_count,
                 tool_name="web_search",
             )
+
+    def test_web_search_provider_failure_returns_failed_status(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            BraveSearchHandler.response_code = 503
+            response = translated_agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input=(
+                    "You MUST use web search, then report the result title and "
+                    "URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "failed"
+        finally:
+            BraveSearchHandler.reset()
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(

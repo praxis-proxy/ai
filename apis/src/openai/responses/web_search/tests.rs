@@ -582,7 +582,7 @@ async fn on_request_body_omits_sources_without_include() {
 }
 
 #[tokio::test]
-async fn on_request_body_missing_query_produces_incomplete_status() {
+async fn on_request_body_missing_query_produces_failed_status() {
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchFilter::from_config(&yaml).unwrap();
 
@@ -605,10 +605,7 @@ async fn on_request_body_missing_query_produces_incomplete_status() {
     assert!(state.web_search_calls.is_empty());
 
     let output = &state.accumulated_output[0];
-    assert_eq!(
-        output["status"], "incomplete",
-        "missing query should produce incomplete status"
-    );
+    assert_eq!(output["status"], "failed", "missing query should produce failed status");
 
     let bridge_call = &state.messages[state.messages.len() - 2];
     assert_eq!(bridge_call["type"], "function_call");
@@ -1419,7 +1416,7 @@ fn remaining_budget_subtracts_prior_model_calls() {
     assert_eq!(remaining_web_search_budget(&state), 5);
     state.accumulated_output = vec![
         serde_json::json!({"type":"web_search_call", "id":"ws_1", "status":"completed"}),
-        serde_json::json!({"type":"web_search_call", "id":"ws_2", "status":"incomplete"}),
+        serde_json::json!({"type":"web_search_call", "id":"ws_2", "status":"failed"}),
     ];
     assert_eq!(
         remaining_web_search_budget(&state),
@@ -1469,7 +1466,7 @@ fn remaining_budget_counts_web_and_non_web_builtin_together() {
     state.accumulated_output = vec![
         serde_json::json!({"type": "file_search_call", "id": "fs_1", "status": "completed"}),
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
-        serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "incomplete"}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "failed"}),
         // A non-built-in item (a message) must not consume budget.
         serde_json::json!({"type": "message", "id": "msg_1"}),
     ];
@@ -1556,12 +1553,12 @@ async fn on_request_body_honors_client_max_tool_calls() {
     assert_eq!(state.accumulated_output[0]["status"], "completed");
     assert_eq!(state.accumulated_output[1]["id"], "ws_b");
     assert_eq!(
-        state.accumulated_output[1]["status"], "incomplete",
-        "the over-budget call is surfaced as incomplete, not executed"
+        state.accumulated_output[1]["status"], "failed",
+        "the over-budget call is surfaced as failed, not executed"
     );
     assert_eq!(
         state.accumulated_output[1]["action"]["query"], "second",
-        "the declined query is preserved in the incomplete item"
+        "the declined query is preserved in the failed item"
     );
 
     // The model-facing bridge (state.messages) and the durable rehydration
@@ -1649,7 +1646,7 @@ async fn incomplete_prior_call_still_exhausts_later_round_budget() {
         serde_json::json!({
             "type": "web_search_call",
             "id": "ws_malformed",
-            "status": "incomplete",
+            "status": "failed",
             "action": {"type": "search", "query": ""},
         }),
         next.clone(),
@@ -2639,12 +2636,12 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
         "the first call fit inside the cap"
     );
     assert_eq!(
-        state.accumulated_output[1]["status"], "incomplete",
-        "a call whose queries were clipped is incomplete"
+        state.accumulated_output[1]["status"], "failed",
+        "a call whose queries were clipped is failed"
     );
     assert_eq!(
-        state.accumulated_output[2]["status"], "incomplete",
-        "a call left with no query allowance is incomplete"
+        state.accumulated_output[2]["status"], "failed",
+        "a call left with no query allowance is failed"
     );
     for messages in [&state.messages, &state.persisted_messages] {
         let bridge = find_queries_bridge_output(messages, &clipped).expect("clipped bridge present");
@@ -2706,7 +2703,7 @@ async fn query_cap_boundary_keeps_zero_result_successes_truthful() {
     );
     assert_eq!(
         dispatch(cap + 1).await,
-        (cap, "incomplete".to_owned(), PARTIAL_CLIPPED_OUTPUT.to_owned()),
+        (cap, "failed".to_owned(), PARTIAL_CLIPPED_OUTPUT.to_owned()),
         "one query past the cap clips the call, which still reached the provider {cap} times"
     );
 }
@@ -2740,8 +2737,8 @@ async fn provider_failure_after_success_keeps_partial_results() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.web_search_calls_executed, 1);
     assert_eq!(
-        state.accumulated_output[0]["status"], "incomplete",
-        "a partially answered call is incomplete, not failed"
+        state.accumulated_output[0]["status"], "failed",
+        "a partially answered call uses the failed status"
     );
     let bridge = find_queries_bridge_output(&state.messages, &queries).expect("partial bridge present");
     assert!(
@@ -2825,8 +2822,8 @@ async fn zero_result_success_before_failure_is_not_reported_as_failed() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
-        state.accumulated_output[0]["status"], "incomplete",
-        "a query that ran and found nothing is a success, so the call is incomplete rather than failed"
+        state.accumulated_output[0]["status"], "failed",
+        "a query that ran and found nothing is a success, but the overall partial call uses failed status"
     );
     let bridge = find_queries_bridge_output(&state.messages, &queries).expect("partial bridge present");
     assert_eq!(
@@ -2847,12 +2844,12 @@ fn status_and_notice_separates_zero_result_successes_from_non_execution() {
         ),
         (
             (1, 3, 3),
-            ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT)),
+            ("failed", Some(PARTIAL_UNAVAILABLE_OUTPUT)),
             "short of both bounds, so a query was lost to a provider failure",
         ),
         (
             (2, 5, 2),
-            ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT)),
+            ("failed", Some(PARTIAL_CLIPPED_OUTPUT)),
             "stopped exactly at the cap with queries left, so the batch budget clipped it",
         ),
         (
