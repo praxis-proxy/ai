@@ -209,6 +209,10 @@ fn missing_credential_fails_closed_with_401_authentication_error() {
         body["error"]["message"]
     );
     assert_eq!(search.request_count(), 0, "no provider callout on a missing credential");
+    assert!(
+        model.requests().is_empty(),
+        "a missing credential is rejected at preflight, before any model inference round"
+    );
 }
 
 #[test]
