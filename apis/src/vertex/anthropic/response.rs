@@ -24,23 +24,6 @@ use crate::{
     openai::sse::SseFrame,
 };
 
-/// Map an HTTP status to the Anthropic error type clients retry on.
-/// Vertex Google-envelope statuses (`RESOURCE_EXHAUSTED` → 429,
-/// `UNAUTHENTICATED` → 401, …) share the numeric code semantics.
-/// `413` falls back to `invalid_request_error` because
-/// `request_too_large` is not part of the pinned Anthropic error schema.
-pub(crate) fn anthropic_error_type(status: u16) -> ErrorType {
-    match status {
-        401 => ErrorType::Authentication,
-        403 => ErrorType::Permission,
-        404 => ErrorType::NotFound,
-        429 => ErrorType::RateLimit,
-        503 | 504 => ErrorType::Overloaded,
-        500.. => ErrorType::Api,
-        _ => ErrorType::InvalidRequest,
-    }
-}
-
 /// Translate a Google error envelope into the Anthropic error shape.
 ///
 /// Returns `None` (forward unchanged) when the body is not JSON, is not
@@ -48,7 +31,10 @@ pub(crate) fn anthropic_error_type(status: u16) -> ErrorType {
 /// `{"type":"error",…}` shape, since Vertex model-layer errors are
 /// Anthropic-shaped at the source and must not be double-wrapped.
 /// The HTTP status is preserved so client retry policies see the
-/// familiar code with an Anthropic `error.type`.
+/// familiar code, and the Anthropic `error.type` comes from
+/// [`ErrorType::from_status`], the same mapping the rest of the Anthropic
+/// surface uses (Google-envelope statuses such as `RESOURCE_EXHAUSTED`
+/// 429 and `UNAUTHENTICATED` 401 share the numeric code semantics).
 pub(crate) fn translate_google_error(body: &[u8], status: u16) -> Option<Vec<u8>> {
     let value: Value = serde_json::from_slice(body).ok()?;
     if value.get("type").and_then(Value::as_str) == Some("error") {
@@ -66,7 +52,7 @@ pub(crate) fn translate_google_error(body: &[u8], status: u16) -> Option<Vec<u8>
         None => message.to_owned(),
     };
 
-    Some(error_body(anthropic_error_type(status), &detailed, None))
+    Some(error_body(ErrorType::from_status(status), &detailed, None))
 }
 
 /// Restore the user-facing model id in a buffered JSON response body.
@@ -156,15 +142,15 @@ mod tests {
             (401, "authentication_error"),
             (403, "permission_error"),
             (404, "not_found_error"),
-            (409, "invalid_request_error"),
             (413, "invalid_request_error"),
             (422, "invalid_request_error"),
             (429, "rate_limit_error"),
             (500, "api_error"),
             (502, "api_error"),
-            (503, "overloaded_error"),
-            (504, "overloaded_error"),
+            (503, "api_error"),
+            (504, "timeout_error"),
             (520, "api_error"),
+            (529, "overloaded_error"),
         ] {
             let body = json!({"error": {"code": status, "message": "x"}}).to_string();
             let out: Value = serde_json::from_slice(&translate_google_error(body.as_bytes(), status).unwrap()).unwrap();

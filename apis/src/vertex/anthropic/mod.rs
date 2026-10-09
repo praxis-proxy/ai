@@ -56,7 +56,7 @@ use self::{
     request::{classify, transform_request},
 };
 use crate::{
-    anthropic::{error_rejection, invalid_request_rejection},
+    anthropic::{ErrorType, error_rejection, invalid_request_rejection},
     openai::sse::SseFrameParser,
 };
 
@@ -376,7 +376,7 @@ fn encoded_response_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> 
     debug!(status, "vertex: upstream response is content-encoded; failing closed");
     Some(error_rejection(
         status,
-        response::anthropic_error_type(status),
+        ErrorType::from_status(status),
         "Vertex AI returned a content-encoded response that cannot be translated",
     ))
 }
