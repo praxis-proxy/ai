@@ -35,7 +35,8 @@ filter_chains:
         project: my-gcp-project
         # location: global          # default; use a regional location for data residency
         # model_prefix: "vertex/"   # user-facing ids are stripped to publisher ids
-        # model_pin: "@20250929"    # pin snapshots so upgrades are deliberate
+        # model_pins:               # pin snapshots per model so upgrades are deliberate
+        #   claude-sonnet-4-5: "@20250929"
         # beta_allowlist: [context-1m-2025-08-07]
       - filter: credential_injection
         clusters:

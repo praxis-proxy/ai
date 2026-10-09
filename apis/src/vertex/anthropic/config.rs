@@ -3,6 +3,8 @@
 
 //! Configuration for the Vertex AI dialect filter.
 
+use std::collections::BTreeMap;
+
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -38,12 +40,14 @@ pub(crate) struct VertexAnthropicConfig {
     #[serde(default = "default_model_prefix")]
     pub model_prefix: String,
 
-    /// Optional pinned snapshot suffix appended to the publisher model
-    /// id in the URL, e.g. `@20250929`. Pinning keeps an unpinned
-    /// alias from moving to a new snapshot underneath a stable
-    /// user-facing name.
+    /// Snapshot suffixes keyed by Vertex publisher model id, e.g.
+    /// `claude-sonnet-4-5: "@20250929"`. A pin is appended to the model
+    /// id in the URL only when the publisher id matches its key exactly,
+    /// so each model keeps its own snapshot and an alias cannot move to a
+    /// new snapshot underneath a stable user-facing name. Models without
+    /// an entry are sent unpinned.
     #[serde(default)]
-    pub model_pin: Option<String>,
+    pub model_pins: BTreeMap<String, String>,
 
     /// Allowed `anthropic-beta` flag values. An empty list (the
     /// default) forwards the header untouched; a non-empty list keeps
@@ -81,8 +85,8 @@ pub(crate) fn is_safe_model_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@')
 }
 
-/// Validate identity components (`project`, `location`) used verbatim
-/// in the upstream URL path.
+/// Validate identity components (`project`, `location`, model pins) used
+/// verbatim in the upstream URL path.
 fn validate_path_component(filter: &str, field: &str, value: &str) -> Result<(), FilterError> {
     if value.is_empty() || !value.chars().all(is_safe_model_char) {
         return Err(FilterError::from(format!(
@@ -102,8 +106,9 @@ pub(crate) fn build_config(cfg: VertexAnthropicConfig) -> Result<VertexAnthropic
     )?;
     validate_path_component(FILTER_NAME, "project", &cfg.project)?;
     validate_path_component(FILTER_NAME, "location", &cfg.location)?;
-    if let Some(pin) = &cfg.model_pin {
-        validate_path_component(FILTER_NAME, "model_pin", pin)?;
+    for (model, pin) in &cfg.model_pins {
+        validate_path_component(FILTER_NAME, "model_pins key", model)?;
+        validate_path_component(FILTER_NAME, &format!("model_pins['{model}']"), pin)?;
     }
     for entry in &cfg.beta_allowlist {
         if entry.trim().is_empty() {
@@ -141,7 +146,7 @@ mod tests {
         let cfg = config("project: my-project").unwrap();
         assert_eq!(cfg.location, "global");
         assert_eq!(cfg.model_prefix, "vertex/");
-        assert!(cfg.model_pin.is_none());
+        assert!(cfg.model_pins.is_empty());
         assert!(cfg.beta_allowlist.is_empty());
         assert_eq!(cfg.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
     }
@@ -153,7 +158,10 @@ mod tests {
             "project: \"my project\"",
             "project: my-project\nlocation: global?x=1",
             "project: my-project\nlocation: europe:west1",
-            "project: my-project\nmodel_pin: \"@20250929/../x\"",
+            "project: my-project\nmodel_pins: {claude-sonnet-4-5: \"@20250929/../x\"}",
+            "project: my-project\nmodel_pins: {claude-sonnet-4-5: \"@2025?x=1\"}",
+            "project: my-project\nmodel_pins: {\"claude/../x\": \"@20250929\"}",
+            "project: my-project\nmodel_pins: {claude-sonnet-4-5: \"\"}",
         ] {
             assert!(config(yaml).is_err(), "must reject: {yaml}");
         }
@@ -162,10 +170,17 @@ mod tests {
     #[test]
     fn accepts_valid_components() {
         let cfg = config(
-            "project: gcp-jboyer-san-gemini\nlocation: us-east5\nmodel_pin: '@20250929'\nbeta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]",
+            "project: gcp-jboyer-san-gemini\nlocation: us-east5\nmodel_pins: {claude-sonnet-4-5: '@20250929', claude-opus-4-1: '@20250805'}\nbeta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]",
         )
         .unwrap();
-        assert_eq!(cfg.model_pin.as_deref(), Some("@20250929"));
+        assert_eq!(
+            cfg.model_pins.get("claude-sonnet-4-5").map(String::as_str),
+            Some("@20250929")
+        );
+        assert_eq!(
+            cfg.model_pins.get("claude-opus-4-1").map(String::as_str),
+            Some("@20250805")
+        );
         assert_eq!(cfg.beta_allowlist.len(), 2);
     }
 

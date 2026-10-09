@@ -172,20 +172,13 @@ fn transform_messages(
         "anthropic_version".to_owned(),
         Value::String(VERTEX_ANTHROPIC_VERSION.to_owned()),
     );
+    // Pins apply on an exact publisher-id match only, so one model's
+    // snapshot never leaks onto another model that shares the prefix.
+    let pin = cfg.model_pins.get(publisher).map_or("", String::as_str);
     format!(
-        "/v1/projects/{}/locations/{}/publishers/anthropic/models/{}{verb}",
-        cfg.project,
-        cfg.location,
-        model_with_pin(publisher, cfg)
+        "/v1/projects/{}/locations/{}/publishers/anthropic/models/{publisher}{pin}{verb}",
+        cfg.project, cfg.location,
     )
-}
-
-/// Publisher model with the configured snapshot pin appended, if any.
-fn model_with_pin(publisher: &str, cfg: &VertexAnthropicConfig) -> String {
-    match &cfg.model_pin {
-        Some(pin) => format!("{publisher}{pin}"),
-        None => publisher.to_owned(),
-    }
 }
 
 #[cfg(test)]
@@ -196,7 +189,8 @@ mod tests {
     use super::*;
 
     fn cfg() -> VertexAnthropicConfig {
-        let yaml: serde_yaml::Value = serde_yaml::from_str("project: demo-project\nmodel_pin: '@20250929'").unwrap();
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("project: demo-project\nmodel_pins: {claude-sonnet-4-5: '@20250929'}").unwrap();
         let cfg: VertexAnthropicConfig = serde_yaml::from_value(yaml).unwrap();
         crate::vertex::anthropic::config::build_config(cfg).unwrap()
     }
@@ -242,6 +236,29 @@ mod tests {
             "got {}",
             out.path
         );
+    }
+
+    #[test]
+    fn pins_apply_only_to_their_exact_publisher_model() {
+        for (model, expected) in [
+            (
+                "vertex/claude-sonnet-4-5",
+                "models/claude-sonnet-4-5@20250929:rawPredict",
+            ),
+            ("vertex/claude-opus-4-1", "models/claude-opus-4-1:rawPredict"),
+            ("vertex/claude-sonnet-4-5-1m", "models/claude-sonnet-4-5-1m:rawPredict"),
+            ("vertex/claude-sonnet-4", "models/claude-sonnet-4:rawPredict"),
+        ] {
+            let body = json!({"model": model, "messages": []}).to_string();
+            let out = transform_request(body.as_bytes(), Operation::Messages, &cfg())
+                .unwrap()
+                .unwrap();
+            assert!(
+                out.path.ends_with(expected),
+                "{model} must route to {expected}, got {}",
+                out.path
+            );
+        }
     }
 
     #[test]

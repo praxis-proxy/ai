@@ -102,7 +102,8 @@ const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 /// project: my-gcp-project
 /// location: global
 /// model_prefix: "vertex/"
-/// model_pin: "@20250929"
+/// model_pins:
+///   claude-sonnet-4-5: "@20250929"
 /// beta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]
 /// max_body_bytes: 33554432
 /// ```

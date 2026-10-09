@@ -12,7 +12,7 @@ Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex resp
 | `project` | string | yes | GCP project the upstream URL is built against. |
 | `location` | string | no | Vertex location; `global` routes through the multi-region endpoint and is the recommended default. |
 | `model_prefix` | string | no | Prefix stripped from the request body's `model` to obtain the Vertex publisher model id. Defaults to `vertex/`. |
-| `model_pin` | string | no | Optional pinned snapshot suffix appended to the publisher model id in the URL, e.g. `@20250929`. Pinning keeps an unpinned alias from moving to a new snapshot underneath a stable user-facing name. |
+| `model_pins` | object<string, string> | no | Snapshot suffixes keyed by Vertex publisher model id, e.g. `claude-sonnet-4-5: "@20250929"`. A pin is appended to the model id in the URL only when the publisher id matches its key exactly, so each model keeps its own snapshot and an alias cannot move to a new snapshot underneath a stable user-facing name. Models without an entry are sent unpinned. |
 | `beta_allowlist` | string[] | no | Allowed `anthropic-beta` flag values. An empty list (the default) forwards the header untouched; a non-empty list keeps only the listed comma-separated flags and drops the header if nothing remains. |
 | `max_body_bytes` | integer | no | Maximum buffered request/response body size in bytes. |
 
@@ -32,7 +32,8 @@ filter: anthropic_messages_to_vertexai_anthropic
 project: my-gcp-project
 location: global
 model_prefix: "vertex/"
-model_pin: "@20250929"
+model_pins:
+  claude-sonnet-4-5: "@20250929"
 beta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]
 max_body_bytes: 33554432
 ```
