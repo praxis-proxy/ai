@@ -69,7 +69,10 @@ use self::{
         build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
         parse_approval_response, resolve_approval, target_fingerprint,
     },
-    config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
+    config::{
+        MAX_MCP_CALL_ID_BYTES, MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config,
+        require_inline_outbound_chain,
+    },
 };
 use super::{
     DEFAULT_STORE_NAME,
@@ -1067,7 +1070,10 @@ pub(crate) fn prepare_response_round(
         return Err(DispatchFailure {
             status: 502,
             code: "server_error",
-            message: "model response contained duplicate or missing MCP call_id values".to_owned(),
+            message: format!(
+                "model response contained duplicate, missing, or oversized MCP call_id values \
+                 (maximum {MAX_MCP_CALL_ID_BYTES} bytes)"
+            ),
         });
     }
 
@@ -1146,11 +1152,14 @@ fn count_mcp_tool_calls(tool_calls: &[serde_json::Value], tool_index: &McpToolIn
     tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_index)).count()
 }
 
-/// Require every MCP function call to carry a distinct non-empty correlation ID.
+/// Require every MCP function call to carry a distinct, bounded correlation ID.
 ///
 /// Results are matched and response-wide budgets are deduplicated by `call_id`,
 /// so accepting a missing or repeated value would make separately executed
-/// side effects indistinguishable.
+/// side effects indistinguishable. The id is also persisted verbatim as an
+/// approval correlation id and echoed by retained results, so its length is
+/// capped at [`MAX_MCP_CALL_ID_BYTES`] before any approval record is created;
+/// that keeps the fixed result-limit fallback inside its reserved bytes.
 fn mcp_call_ids_are_unique_and_new(
     tool_calls: &[&serde_json::Value],
     accumulated_output: &[serde_json::Value],
@@ -1159,7 +1168,7 @@ fn mcp_call_ids_are_unique_and_new(
     tool_calls.iter().all(|call| {
         call.get("call_id")
             .and_then(serde_json::Value::as_str)
-            .filter(|call_id| !call_id.is_empty())
+            .filter(|call_id| !call_id.is_empty() && call_id.len() <= MAX_MCP_CALL_ID_BYTES)
             .is_some_and(|call_id| {
                 seen.insert(call_id)
                     && !accumulated_output.iter().any(|item| {
@@ -1384,20 +1393,56 @@ impl McpCallResult {
 #[derive(Debug)]
 struct McpResultLimitExceeded;
 
-/// Replace an oversized completed result with a small truthful tool error.
+/// Replace an oversized completed result with a small truthful tool error, or
+/// fail the batch terminally.
 ///
 /// The filter reserves at least [`MIN_RETAINED_RESULT_BYTES`] before dispatch,
 /// so this fallback can always be retained after the external side effect has
 /// happened. Keeping one result per executed call prevents retries from being
-/// encouraged by a batch-wide proxy error.
+/// encouraged by a batch-wide proxy error. The full `approval_request_id` is
+/// preserved — never truncated — because it correlates the result to the
+/// approval that authorized the side effect. If it cannot fit the reservation
+/// (for example a legacy stored approval id that predates the
+/// [`MAX_MCP_CALL_ID_BYTES`] gate), the batch fails terminally instead of
+/// retaining an oversized fallback.
 fn fit_result_or_limit_error(
     tool_call: &serde_json::Value,
     result: McpCallResult,
     retained_limit: usize,
-) -> McpCallResult {
+) -> Result<McpCallResult, McpResultLimitExceeded> {
     if result.retained_bytes().is_some_and(|bytes| bytes <= retained_limit) {
-        return result;
+        return Ok(result);
     }
+    bounded_result_limit_error(tool_call)
+}
+
+/// Build the fixed limit-error fallback, or fail when it cannot fit its
+/// pre-dispatch reservation.
+fn bounded_result_limit_error(tool_call: &serde_json::Value) -> Result<McpCallResult, McpResultLimitExceeded> {
+    let (call_id, tool_name) = bounded_fallback_identity(tool_call);
+    let fallback = build_error_result(
+        call_id,
+        "unknown",
+        tool_name,
+        "",
+        "MCP tool result exceeded the configured retained-byte limit",
+        approval_request_id(tool_call),
+    );
+    if fallback
+        .retained_bytes()
+        .is_none_or(|bytes| bytes > MIN_RETAINED_RESULT_BYTES)
+    {
+        warn!(
+            approval_request_bytes = approval_request_id(tool_call).map_or(0, str::len),
+            "MCP result-limit fallback exceeded its retained reservation; failing the batch"
+        );
+        return Err(McpResultLimitExceeded);
+    }
+    Ok(fallback)
+}
+
+/// Identity fields retained by the fixed result-limit fallback.
+fn bounded_fallback_identity(tool_call: &serde_json::Value) -> (&str, &str) {
     let bounded_identity = |field: &str| {
         tool_call
             .get(field)
@@ -1410,21 +1455,7 @@ fn fit_result_or_limit_error(
         .and_then(serde_json::Value::as_str)
         .filter(|value| value.len() <= 64)
         .unwrap_or_else(|| bounded_identity("id"));
-    let fallback = build_error_result(
-        call_id,
-        "unknown",
-        bounded_identity("name"),
-        "",
-        "MCP tool result exceeded the configured retained-byte limit",
-        approval_request_id(tool_call),
-    );
-    debug_assert!(
-        fallback
-            .retained_bytes()
-            .is_some_and(|bytes| bytes <= MIN_RETAINED_RESULT_BYTES),
-        "the fixed result-limit error must fit its pre-dispatch reservation"
-    );
-    fallback
+    (call_id, bounded_identity("name"))
 }
 
 /// Controls execution of one homogeneous MCP call batch.
@@ -1479,9 +1510,9 @@ async fn execute_mcp_calls(
         ..options
     };
     if options.parallel {
-        Ok(execute_parallel(mcp_calls, tool_index, bounded_options, callout).await)
+        execute_parallel(mcp_calls, tool_index, bounded_options, callout).await
     } else {
-        Ok(execute_sequential(mcp_calls, tool_index, bounded_options, callout).await)
+        execute_sequential(mcp_calls, tool_index, bounded_options, callout).await
     }
 }
 
@@ -1495,7 +1526,7 @@ async fn execute_parallel(
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
     callout: &mcp_client::McpCallout,
-) -> Vec<McpCallResult> {
+) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     let mut remaining_calls = mcp_calls;
     while !remaining_calls.is_empty() {
@@ -1517,10 +1548,10 @@ async fn execute_parallel(
                     error_result_for_dropped_call(tc, "internal error: call future panicked")
                 },
             };
-            results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes));
+            results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes)?);
         }
     }
-    results
+    Ok(results)
 }
 
 /// Execute MCP tool calls sequentially, emitting error results
@@ -1530,7 +1561,7 @@ async fn execute_sequential(
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
     callout: &mcp_client::McpCallout,
-) -> Vec<McpCallResult> {
+) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
         let result = if let Some(result) = execute_single_call(tc, tool_index, &options, callout).await {
@@ -1539,9 +1570,9 @@ async fn execute_sequential(
             warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
             error_result_for_dropped_call(tc, "internal error: call produced no result")
         };
-        results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes));
+        results.push(fit_result_or_limit_error(tc, result, options.max_result_bytes)?);
     }
-    results
+    Ok(results)
 }
 
 /// Resolve an encoded function name to its unique entry, rejecting

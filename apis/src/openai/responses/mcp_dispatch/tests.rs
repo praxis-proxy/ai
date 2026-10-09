@@ -74,7 +74,7 @@ fn rejected_calls_do_not_dilute_admitted_result_allowance() {
 }
 
 #[test]
-fn mcp_call_ids_must_be_present_nonempty_and_unique() {
+fn mcp_call_ids_must_be_present_nonempty_unique_and_bounded() {
     let distinct = vec![json!({"call_id": "call_1"}), json!({"call_id": "call_2"})];
     assert!(mcp_call_ids_are_unique_and_new(&call_refs(&distinct), &[]));
 
@@ -86,6 +86,12 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
 
     let empty = vec![json!({"call_id": ""})];
     assert!(!mcp_call_ids_are_unique_and_new(&call_refs(&empty), &[]));
+
+    let oversized = vec![json!({"call_id": "x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1)})];
+    assert!(
+        !mcp_call_ids_are_unique_and_new(&call_refs(&oversized), &[]),
+        "a call_id above the documented bound must be rejected before persistence"
+    );
 
     let reused = vec![json!({"call_id": "call_1"})];
     assert!(!mcp_call_ids_are_unique_and_new(
@@ -1562,6 +1568,13 @@ fn prepare_response_round_rejects_invalid_call_ids() {
                 "output":"prior result"
             })],
         ),
+        (
+            vec![json!({
+                "name":"weather__get_weather",
+                "call_id":"x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1)
+            })],
+            Vec::new(),
+        ),
     ] {
         let mut state = ResponsesState {
             mcp_tool_map: auto_approval_tool_map(),
@@ -1579,6 +1592,38 @@ fn prepare_response_round_rejects_invalid_call_ids() {
             "invalid MCP identities must report the call_id invariant"
         );
     }
+}
+
+#[test]
+fn prepare_response_round_rejects_oversized_call_id_before_approval_persistence() {
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1),
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+
+    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert_eq!(failure.code, "server_error");
+    assert!(
+        failure.message.contains("oversized"),
+        "the round must report the bounded call_id invariant: {}",
+        failure.message
+    );
+    assert!(
+        state.pending_approvals.is_empty(),
+        "an oversized correlation id must not reach durable pending state"
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "an oversized correlation id must not emit an approval request"
+    );
 }
 
 #[test]
@@ -1709,7 +1754,8 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
     });
     let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, None);
 
-    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES);
+    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+        .expect("the fallback must fit its pre-dispatch reservation");
 
     assert!(
         bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
@@ -1723,6 +1769,56 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
         "the bounded replacement must explain why the result was discarded"
     );
     assert_eq!(result_payload_limit(4096), 1024);
+}
+
+#[test]
+fn oversized_approval_id_limit_error_fails_terminally() {
+    let oversized_id = "x".repeat(super::MIN_RETAINED_RESULT_BYTES + 1);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": "c1",
+        "approval_request_id": oversized_id,
+    });
+    let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, Some(&oversized_id));
+
+    let outcome = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES);
+
+    assert!(
+        outcome.is_err(),
+        "an approval id that cannot fit the reservation must fail terminally instead of panicking"
+    );
+}
+
+#[test]
+fn bounded_approval_id_is_preserved_in_limit_error_fallback() {
+    let approval_id = "a".repeat(super::MAX_MCP_CALL_ID_BYTES);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": approval_id,
+        "approval_request_id": approval_id,
+    });
+    let result = build_success_result(
+        &approval_id,
+        "srv",
+        "tool",
+        "{}",
+        &"x".repeat(4096),
+        false,
+        Some(&approval_id),
+    );
+
+    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+        .expect("a gate-bounded approval id must fit the reservation");
+
+    assert!(
+        bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
+        "the retained result must stay within its hard memory bound"
+    );
+    assert_eq!(
+        bounded.output_item["approval_request_id"].as_str().unwrap(),
+        approval_id,
+        "a bounded correlation id must be preserved in full, never truncated"
+    );
 }
 
 // =========================================================================

@@ -1239,6 +1239,51 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class OversizedCallIdBackendHandler(BaseHTTPRequestHandler):
+    """Native Responses backend scripting one MCP call with an oversized id.
+
+    Issue #1400: a provider-emitted ``call_id`` longer than the documented MCP
+    correlation-id bound must fail closed before an approval is persisted or
+    the tool executes. Real vLLM cannot be forced to emit such an id, so this
+    handler scripts the deterministic native Responses output.
+    """
+
+    request_count: ClassVar[int] = 0
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        type(self).request_count += 1
+        payload = json.dumps(
+            {
+                "id": "resp_oversized_call_id",
+                "object": "response",
+                "created_at": 1,
+                "model": VLLM_MODEL,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_oversized_call_id",
+                        "call_id": "call_" + "x" * 4096,
+                        "name": "weather__get_weather",
+                        "arguments": json.dumps({"city": "Paris"}),
+                        "status": "completed",
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
 class SimulatorBackendHandler(BaseHTTPRequestHandler):
     """Record Praxis requests and script hosted-tool Chat responses.
 
@@ -1455,9 +1500,7 @@ def _write_agentic_config(
 ) -> str:
     """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
     config = _load_example_config(AGENTIC_CONFIG_PATH, praxis_port)
-    vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
-    if vllm is None:
-        raise ValueError("translated agentic config requires a backend endpoint")
+    vllm = backend_endpoint or _vllm_endpoint()
     config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
     if config.count("read_timeout_ms:") != 1:
         raise RuntimeError(
@@ -5424,6 +5467,57 @@ def translated_agentic_client(translated_agentic_proxy):
     return _make_openai_client(translated_agentic_proxy)
 
 
+@pytest.fixture()
+def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_server):
+    """Run the agentic loop against a backend scripting an oversized MCP id."""
+    OversizedCallIdBackendHandler.request_count = 0
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), OversizedCallIdBackendHandler)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("oversized-mcp-call-id")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_agentic_config(
+        port,
+        db_path,
+        mcp_server,
+        search_server,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port), mcp_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Oversized call id Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 @pytest.fixture(scope="session")
 def live_tavily_client(tmp_path_factory, request, backend_endpoint):
     """Run one credentialed Tavily search through the translated vLLM loop."""
@@ -6480,6 +6574,51 @@ class TestAgenticLoopVLLM:
         assert json.loads(approvals[0].arguments).get("city")
         assert not any(item.type == "mcp_call" for item in response.output), (
             response.output
+        )
+
+    def test_mcp_oversized_call_id_fails_closed_before_dispatch(
+        self,
+        oversized_call_id_client,
+    ):
+        """Issue #1400: an oversized MCP call id fails closed before dispatch.
+
+        The provider-emitted correlation id exceeds the documented MCP bound,
+        so the round is rejected with a 502 before any approval is persisted
+        and before the MCP tool executes.
+        """
+        client, mcp_port = oversized_call_id_client
+        calls_before = MCPHandler.tool_call_count()
+
+        with pytest.raises(openai.InternalServerError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input=(
+                    "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "allowed_tools": ["get_weather"],
+                        "require_approval": "always",
+                    }
+                ],
+                store=True,
+                max_output_tokens=256,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 502, (
+            "an oversized correlation id must fail closed as a server error"
+        )
+        assert error.body["code"] == "server_error"
+        assert "call_id" in error.body["message"], error.body["message"]
+        assert OversizedCallIdBackendHandler.request_count == 1, (
+            "exactly one inference round must run before the round is rejected"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute when the correlation id is rejected"
         )
 
     def test_mcp_authorization_is_bearer_and_not_forwarded_to_model(
