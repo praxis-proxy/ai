@@ -115,17 +115,20 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Test-only RSA material generated at runtime, never stored in the repository.
 struct TestServiceAccountKey {
-    /// Private key in the PEM format used by service-account key files.
+    /// Private key in the PKCS#8 PEM format Google's service-account key
+    /// files carry.
     private_key_pem: String,
     /// Public key used to verify the JWT assertion in tests.
     public_key_pem: Vec<u8>,
 }
 
 static TEST_SERVICE_ACCOUNT_KEY: LazyLock<TestServiceAccountKey> = LazyLock::new(|| {
-    let key = openssl::rsa::Rsa::generate(2048).expect("generate ephemeral test RSA key");
+    let key = openssl::rsa::Rsa::generate(2048)
+        .and_then(openssl::pkey::PKey::from_rsa)
+        .expect("generate ephemeral test RSA key");
     TestServiceAccountKey {
-        private_key_pem: String::from_utf8(key.private_key_to_pem().expect("serialize test private key"))
-            .expect("RSA private PEM is UTF-8"),
+        private_key_pem: String::from_utf8(key.private_key_to_pem_pkcs8().expect("serialize test private key"))
+            .expect("PKCS#8 PEM is UTF-8"),
         public_key_pem: key.public_key_to_pem().expect("serialize test public key"),
     }
 });
@@ -134,28 +137,58 @@ static TEST_SERVICE_ACCOUNT_KEY: LazyLock<TestServiceAccountKey> = LazyLock::new
 const TEST_SA_EMAIL: &str = "test-sa@test-project.iam.gserviceaccount.com";
 
 /// Write a syntactically complete `type: service_account` key file with
-/// the given `token_uri` and the embedded test private key.
+/// the given `token_uri` and the ephemeral test private key.
 fn write_service_account_key_file(token_uri: &str) -> NamedTempFile {
+    write_key_file_with_private_key(&TEST_SERVICE_ACCOUNT_KEY.private_key_pem, token_uri)
+}
+
+/// Write a `type: service_account` key file around `private_key_pem`.
+fn write_key_file_with_private_key(private_key_pem: &str, token_uri: &str) -> NamedTempFile {
     // Serialized, not hand-formatted: the PEM carries newlines that
     // must arrive JSON-escaped, exactly as Google's key files do.
     let doc = serde_json::json!({
         "type": "service_account",
         "client_email": TEST_SA_EMAIL,
-        "private_key": TEST_SERVICE_ACCOUNT_KEY.private_key_pem.as_str(),
+        "private_key": private_key_pem,
         "token_uri": token_uri,
     });
     write_json(&doc.to_string())
 }
 
-/// Build a [`TokenSource::ServiceAccountKey`] from a fixture key file.
-fn service_account_key_source(token_uri: &str) -> TokenSource {
-    let file = write_service_account_key_file(token_uri);
+/// A PKCS#8 PEM P-256 private key: well-formed, but not RSA.
+fn ec_private_key_pem() -> String {
+    let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).expect("P-256");
+    let pem = openssl::ec::EcKey::generate(&group)
+        .and_then(openssl::pkey::PKey::from_ec_key)
+        .and_then(|key| key.private_key_to_pem_pkcs8())
+        .expect("generate EC test key");
+    String::from_utf8(pem).expect("PEM is UTF-8")
+}
+
+/// A passphrase-protected PKCS#8 PEM RSA private key.
+fn encrypted_private_key_pem() -> String {
+    let pem = openssl::rsa::Rsa::generate(2048)
+        .and_then(openssl::pkey::PKey::from_rsa)
+        .and_then(|key| {
+            key.private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), b"test-passphrase")
+        })
+        .expect("generate encrypted test key");
+    String::from_utf8(pem).expect("PEM is UTF-8")
+}
+
+/// Resolve `file` as the credentials of a `source: key_file` config.
+fn resolve_key_file(file: &NamedTempFile) -> Result<TokenSource, praxis_filter::FilterError> {
     let config = parse_gcp_adc_config(&yaml(&format!(
         "source: key_file\ncredentials_file: {}",
         file.path().display()
     )))
     .expect("key_file config should parse");
-    resolve_token_source(&config, None).expect("valid key file should resolve")
+    resolve_token_source(&config, None)
+}
+
+/// Build a [`TokenSource::ServiceAccountKey`] from a fixture key file.
+fn service_account_key_source(token_uri: &str) -> TokenSource {
+    resolve_key_file(&write_service_account_key_file(token_uri)).expect("valid key file should resolve")
 }
 
 /// Extract form field `name` from a captured token-endpoint request, or
@@ -405,12 +438,9 @@ fn from_config_builds_filter_for_metadata_source() {
 fn adc_without_env_selects_metadata() {
     let config = parse_gcp_adc_config(&yaml("{}")).expect("parse");
     let source = resolve_token_source(&config, None).expect("adc without env should select metadata");
-    assert_eq!(
-        source,
-        TokenSource::Metadata {
-            service_account: "default".to_owned(),
-        },
-        "adc without env should select metadata default"
+    assert!(
+        matches!(&source, TokenSource::Metadata { service_account } if service_account == "default"),
+        "adc without env should select metadata default, got {source:?}"
     );
 }
 
@@ -419,22 +449,69 @@ fn adc_with_service_account_json_selects_key_file() {
     let file = write_service_account_key_file(GOOGLE_TOKEN_URL);
     let config = parse_gcp_adc_config(&yaml("{}")).expect("parse");
     let source = resolve_token_source(&config, Some(file.path())).expect("service_account JSON should select key file");
-    match source {
-        TokenSource::ServiceAccountKey(key) => {
-            assert_eq!(key.client_email, TEST_SA_EMAIL, "iss identity must come from the file");
-            assert_eq!(
-                key.token_url, GOOGLE_TOKEN_URL,
-                "token endpoint must come from the file"
-            );
-            assert!(
-                !key.loopback_test,
-                "a Google-endpoint key file is not a loopback fixture"
-            );
-        },
-        TokenSource::Metadata { service_account } => {
-            panic!("expected service account key source, got metadata source {service_account}");
-        },
+    assert!(
+        matches!(
+            &source,
+            TokenSource::ServiceAccountKey(key)
+                if key.client_email == TEST_SA_EMAIL && key.token_url == GOOGLE_TOKEN_URL && !key.loopback_test
+        ),
+        "identity and token endpoint must come from the file, got {source:?}"
+    );
+}
+
+#[test]
+fn key_file_accepts_pkcs1_private_key() {
+    let pem = openssl::rsa::Rsa::generate(2048)
+        .and_then(|key| key.private_key_to_pem())
+        .expect("generate PKCS#1 test key");
+    let file = write_key_file_with_private_key(&String::from_utf8(pem).expect("PEM is UTF-8"), GOOGLE_TOKEN_URL);
+    let source = resolve_key_file(&file).expect("a PKCS#1 RSA key must load");
+    assert!(
+        matches!(source, TokenSource::ServiceAccountKey(_)),
+        "a PKCS#1 key file must select the key source, got {source:?}"
+    );
+}
+
+#[test]
+fn key_file_rejects_unusable_private_keys_at_config_time() {
+    let ec_pem = ec_private_key_pem();
+    let encrypted_pem = encrypted_private_key_pem();
+    let truncated_pem = TEST_SERVICE_ACCOUNT_KEY
+        .private_key_pem
+        .get(..400)
+        .expect("PEM is long");
+
+    for (label, pem) in [
+        ("not PEM", "not-a-key-MARKER"),
+        ("truncated", truncated_pem),
+        ("EC", ec_pem.as_str()),
+        ("encrypted", encrypted_pem.as_str()),
+    ] {
+        let file = write_key_file_with_private_key(pem, GOOGLE_TOKEN_URL);
+        let message = resolve_key_file(&file)
+            .expect_err("an unusable private key must be rejected when the filter is built")
+            .to_string();
+        assert!(
+            message.contains("private_key"),
+            "{label}: error should name private_key, got: {message}"
+        );
+        let key_body = pem.lines().nth(1).unwrap_or("MARKER");
+        assert!(!message.contains(key_body), "{label}: error must not echo key material");
     }
+}
+
+#[test]
+fn service_account_key_debug_omits_private_key() {
+    let debug = format!("{:?}", service_account_key_source(GOOGLE_TOKEN_URL));
+    assert!(
+        debug.contains(TEST_SA_EMAIL),
+        "Debug should still identify the service account"
+    );
+    let leaked = TEST_SERVICE_ACCOUNT_KEY
+        .private_key_pem
+        .lines()
+        .any(|line| debug.contains(line));
+    assert!(!leaked, "Debug output must not contain private key material");
 }
 
 #[test]
@@ -498,12 +575,10 @@ fn key_file_rejects_untrusted_token_uri() {
 #[test]
 fn key_file_accepts_loopback_token_uri_as_test_fixture() {
     let source = service_account_key_source("http://127.0.0.1:9/token");
-    match source {
-        TokenSource::ServiceAccountKey(key) => assert!(key.loopback_test, "loopback fixture must be flagged"),
-        TokenSource::Metadata { service_account } => {
-            panic!("expected service account key source, got metadata source {service_account}");
-        },
-    }
+    assert!(
+        matches!(&source, TokenSource::ServiceAccountKey(key) if key.loopback_test),
+        "loopback fixture must be flagged, got {source:?}"
+    );
 }
 
 #[test]

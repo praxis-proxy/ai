@@ -12,18 +12,24 @@
 //!   token endpoint for a short-lived access token (`urn:ietf:params:oauth:grant-type:jwt-bearer`). Nothing is cached
 //!   at this layer: caching is [`TokenCache`](praxis_ai_apis::token_cache::TokenCache)'s job.
 
-use std::{path::Path, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::HeaderValue;
-use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sign::Signer};
+use openssl::{
+    hash::MessageDigest,
+    pkey::{Id, PKey, Private},
+    rsa::Padding,
+    sign::Signer,
+};
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
     subrequest::{SubRequest, SubRequestClient, SubResponse, execute_url},
 };
 use praxis_filter::FilterError;
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use super::config::{GcpAdcConfig, GcpAdcSource};
 
@@ -54,7 +60,7 @@ const GOOGLE_TOKEN_HOST: &str = "oauth2.googleapis.com";
 // -----------------------------------------------------------------------------
 
 /// Resolved credential source used to fetch a token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(super) enum TokenSource {
     /// GCE/GKE/Cloud Run metadata server.
     Metadata {
@@ -68,15 +74,18 @@ pub(super) enum TokenSource {
 }
 
 /// The fields of a `type: service_account` key file needed to mint an
-/// access token, validated at construct time.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// access token, validated and parsed at construct time.
+///
+/// `Debug` is written by hand so the private key never reaches a log line
+/// or an assertion message.
 pub(super) struct ServiceAccountKey {
-    /// `client_email` — the `iss` claim and the identity the token is
+    /// `client_email`: the `iss` claim and the identity the token is
     /// minted for.
     pub client_email: String,
 
-    /// PKCS#1 or PKCS#8 PEM private key used to sign the assertion.
-    pub private_key_pem: String,
+    /// RSA private key that signs the assertion, parsed from the key
+    /// file's PEM.
+    pub private_key: PKey<Private>,
 
     /// Fully validated token endpoint URL (`token_uri`).
     pub token_url: String,
@@ -86,6 +95,16 @@ pub(super) struct ServiceAccountKey {
     /// [`GOOGLE_TOKEN_HOST`]. Selects the address policy of the pinned
     /// client, mirroring how `metadata_host` accepts loopback for tests.
     pub loopback_test: bool,
+}
+
+impl fmt::Debug for ServiceAccountKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceAccountKey")
+            .field("client_email", &self.client_email)
+            .field("token_url", &self.token_url)
+            .field("loopback_test", &self.loopback_test)
+            .finish_non_exhaustive()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -320,10 +339,7 @@ fn assertion_claims(key: &ServiceAccountKey, scope: &str) -> Result<Vec<u8>, Fil
 /// `RS256` signature of `signing_input` with the key file's private key.
 /// OpenSSL errors name the failing operation, never key material.
 fn rs256_signature(key: &ServiceAccountKey, signing_input: &[u8]) -> Result<Vec<u8>, FilterError> {
-    let private_key = PKey::private_key_from_pem(key.private_key_pem.as_bytes())
-        .map_err(|e| FilterError::from(format!("gcp_adc: invalid private key in credentials file: {e}")))?;
-
-    Signer::new(MessageDigest::sha256(), &private_key)
+    Signer::new(MessageDigest::sha256(), &key.private_key)
         .and_then(|mut signer| {
             signer.set_rsa_padding(Padding::PKCS1)?;
             signer.sign_oneshot_to_vec(signing_input)
@@ -359,8 +375,8 @@ fn parse_token_response(response: &SubResponse, context: &str) -> Result<(Header
 
 /// Discriminator parse of a Google ADC JSON file; the `service_account`
 /// branch additionally needs the three minting fields, which serde only
-/// deserializes on demand.
-#[derive(Debug, Deserialize)]
+/// deserializes on demand. No `Debug`: it carries the private key.
+#[derive(Deserialize)]
 struct GoogleApplicationCredentials {
     /// Google credential `type` field.
     #[serde(rename = "type")]
@@ -370,9 +386,10 @@ struct GoogleApplicationCredentials {
     #[serde(default)]
     client_email: Option<String>,
 
-    /// PEM private key for assertion signing.
+    /// PEM private key for assertion signing, wiped from memory once
+    /// parsed.
     #[serde(default)]
-    private_key: Option<String>,
+    private_key: Option<Zeroizing<String>>,
 
     /// `OAuth2` token endpoint URL.
     #[serde(default)]
@@ -419,8 +436,9 @@ pub(super) fn resolve_token_source(
 /// Read a Google ADC JSON file and map its `type` to a [`TokenSource`].
 fn parse_credential_file(path: &Path) -> Result<TokenSource, FilterError> {
     let display = path.display();
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| FilterError::from(format!("gcp_adc: failed to read credentials file '{display}': {error}")))?;
+    let raw = Zeroizing::new(std::fs::read_to_string(path).map_err(|error| {
+        FilterError::from(format!("gcp_adc: failed to read credentials file '{display}': {error}"))
+    })?);
     let parsed: GoogleApplicationCredentials = serde_json::from_str(&raw).map_err(|error| {
         FilterError::from(format!(
             "gcp_adc: failed to parse credentials file '{display}': {error}"
@@ -449,7 +467,7 @@ fn service_account_source(parsed: GoogleApplicationCredentials) -> Result<TokenS
         .filter(|email| !email.is_empty())
         .ok_or_else(|| FilterError::from("gcp_adc: credentials file is missing client_email"))?;
     super::config::validate_service_account(&client_email)?;
-    let private_key_pem = parsed
+    let private_key = parsed
         .private_key
         .filter(|key| !key.is_empty())
         .ok_or_else(|| FilterError::from("gcp_adc: credentials file is missing private_key"))?;
@@ -461,10 +479,29 @@ fn service_account_source(parsed: GoogleApplicationCredentials) -> Result<TokenS
     let loopback_test = token_url.starts_with("http://127.0.0.1");
     Ok(TokenSource::ServiceAccountKey(ServiceAccountKey {
         client_email,
-        private_key_pem,
+        private_key: parse_private_key(&private_key)?,
         token_url,
         loopback_test,
     }))
+}
+
+/// Parse the key file's PEM private key once, at construct time, so a
+/// malformed or non-RSA key is a configuration error rather than a failure
+/// on every request. Google issues unencrypted PKCS#8; PKCS#1 loads too.
+fn parse_private_key(pem: &str) -> Result<PKey<Private>, FilterError> {
+    // Without a callback OpenSSL prompts on the controlling terminal for an
+    // encrypted key; refusing every passphrase makes it a load error instead.
+    let key = PKey::private_key_from_pem_callback(pem.as_bytes(), |_passphrase| Ok(0)).map_err(|e| {
+        FilterError::from(format!(
+            "gcp_adc: credentials file private_key is not an unencrypted PEM private key: {e}"
+        ))
+    })?;
+    if key.id() != Id::RSA {
+        return Err(FilterError::from(
+            "gcp_adc: credentials file private_key must be an RSA key (assertions are signed with RS256)",
+        ));
+    }
+    Ok(key)
 }
 
 /// Validate a key file's `token_uri` to the exact set of endpoints this
