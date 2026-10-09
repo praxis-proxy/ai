@@ -915,3 +915,52 @@ async fn on_request_overwrites_client_authorization() {
     assert_eq!(auth, Some("Bearer gcp-token"));
     server.join().unwrap();
 }
+
+#[tokio::test]
+async fn on_request_injects_bearer_for_in_scope_cluster() {
+    let (host, server) = mock_metadata_endpoint(r#"{"access_token":"scoped","expires_in":3600}"#);
+    let filter = GcpAdcFilter::from_config(&yaml(&format!(
+        "source: metadata\nmetadata_host: {host}\nclusters: [vertex, vertex-east]"
+    )))
+    .expect("must construct");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(std::sync::Arc::from("vertex-east"));
+
+    let action = filter.on_request(&mut ctx).await.expect("must not error");
+    assert!(matches!(action, FilterAction::Continue), "in-scope requests continue");
+
+    let auth = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| *name == header::AUTHORIZATION)
+        .map(|(_, value)| value.to_str().expect("ascii"));
+    assert_eq!(
+        auth,
+        Some("Bearer scoped"),
+        "a request routed to a listed cluster must get the token"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn on_request_skips_cluster_scope_before_routing() {
+    // Nothing listens on 127.0.0.1:1, so any token fetch would fail closed
+    // with 503; Continue proves the filter never tried.
+    let filter = GcpAdcFilter::from_config(&yaml(
+        "source: metadata\nmetadata_host: 127.0.0.1:1\nclusters: [vertex]",
+    ))
+    .expect("must construct");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+
+    let action = filter.on_request(&mut ctx).await.expect("must not error");
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "with no cluster selected yet, a cluster-scoped filter must not fetch or reject"
+    );
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "with no cluster selected yet, no GCP Authorization header is injected"
+    );
+}
