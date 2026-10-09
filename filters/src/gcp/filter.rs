@@ -179,6 +179,19 @@ impl GcpAdcFilter {
     fn cluster_is_in_scope(&self, cluster: Option<&str>) -> bool {
         self.clusters.is_empty() || cluster.is_some_and(|selected| self.clusters.iter().any(|name| name == selected))
     }
+
+    /// Fetch a fresh token for this filter's credential source; the
+    /// [`TokenCache`] decides when this runs.
+    async fn fetch_token(&self) -> Result<(HeaderValue, Duration), FilterError> {
+        token::fetch_pinned(
+            &self.subrequest_client,
+            &self.source,
+            &self.metadata_host,
+            &self.scope,
+            TOKEN_REQUEST_TIMEOUT,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -203,18 +216,7 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
             return Ok(praxis_filter::FilterAction::Continue);
         }
 
-        let fetched = self
-            .cache
-            .get_or_refresh(|| {
-                token::fetch_pinned(
-                    &self.subrequest_client,
-                    &self.source,
-                    &self.metadata_host,
-                    &self.scope,
-                    TOKEN_REQUEST_TIMEOUT,
-                )
-            })
-            .await;
+        let fetched = self.cache.get_or_refresh(|| self.fetch_token()).await;
         match fetched {
             Ok(authorization) => {
                 if self.failing.swap(false, Ordering::Relaxed) {
