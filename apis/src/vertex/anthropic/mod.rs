@@ -242,7 +242,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
                 // transforms only run for marked requests. Set here (not
                 // in on_request) because the pre-read body phase may run
                 // before the request phase.
-                ctx.set_metadata(OPERATION_KEY, "handled");
+                ctx.set_metadata(OPERATION_KEY, operation.as_str());
                 ctx.set_metadata(MODEL_KEY, transformed.user_model);
                 *body = Some(Bytes::from(transformed.body));
             },
@@ -533,6 +533,7 @@ mod tests {
         assert!(body.get("model").is_none());
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert_eq!(ctx.get_metadata(MODEL_KEY), Some("vertex/claude-sonnet-4-5"));
+        assert_eq!(ctx.get_metadata(OPERATION_KEY), Some("messages"));
         assert!(
             ctx.request_headers_to_set
                 .iter()
@@ -701,6 +702,7 @@ mod tests {
             body["model"], "claude-sonnet-4-5",
             "count_tokens needs the publisher model in the body"
         );
+        assert_eq!(ctx.get_metadata(OPERATION_KEY), Some("count_tokens"));
     }
 
     #[tokio::test]

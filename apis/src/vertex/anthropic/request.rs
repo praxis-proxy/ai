@@ -37,6 +37,16 @@ pub(crate) enum Operation {
     CountTokens,
 }
 
+impl Operation {
+    /// Operation name recorded in request metadata.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count_tokens",
+        }
+    }
+}
+
 /// Classify a request path into a Vertex-supported Anthropic operation.
 /// Anything else is passed through untouched.
 pub(crate) fn classify(path: &str) -> Option<Operation> {
