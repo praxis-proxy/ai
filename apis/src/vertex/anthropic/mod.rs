@@ -435,10 +435,9 @@ fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, en
         ctx.insert_filter_state(parser);
     }
 
-    let user_model = ctx.get_metadata(MODEL_KEY).map(str::to_owned);
     *body = Some(Bytes::from(response::rebuild_sse_frames(
         &frames,
-        user_model.as_deref(),
+        ctx.get_metadata(MODEL_KEY),
     )));
 }
 
