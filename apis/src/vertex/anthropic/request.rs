@@ -147,7 +147,9 @@ pub(crate) fn transform_request(
         Operation::Messages => transform_messages(obj, publisher, cfg),
         Operation::CountTokens => {
             // count_tokens takes the model in the body, unlike
-            // :rawPredict which takes it in the URL.
+            // :rawPredict which takes it in the URL. No `anthropic_version`
+            // is injected: Google's count-tokens request body carries only
+            // `model` and `messages`.
             obj.insert("model".to_owned(), Value::String(publisher.to_owned()));
             format!(
                 "/v1/projects/{}/locations/{}/publishers/anthropic/models/count-tokens:rawPredict",
