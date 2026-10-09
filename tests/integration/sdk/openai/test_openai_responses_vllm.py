@@ -24,6 +24,7 @@ Usage:
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import os
 import signal
@@ -42,11 +43,13 @@ import openai
 import pytest
 from openai import (
     APIConnectionError,
+    APIStatusError,
     BadRequestError,
     NotFoundError,
     OpenAI,
     PermissionDeniedError,
 )
+from openai.types.responses import ResponseCustomToolCall
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -68,11 +71,12 @@ TRUSTED_OWNER_HEADERS = {
     "x-auth-user": "test-user",
 }
 # The full-flow binding router maps model "vllm-chat" to the Chat Completions
-# backend — the ONLY route that runs responses_to_chat_completions. Every
+# backend — the ONLY route that runs openai_responses_to_chat_completions. Every
 # Chat-translation test MUST send this model or it silently routes to the native
 # Responses backend instead. The writer's chat_translation_model kwarg then
 # rewrites the body model (instance A) at whatever the live Chat backend serves.
 CHAT_TRANSLATION_MODEL = "vllm-chat"
+TTFT_CONFIG_PATH = "examples/configs/time-to-first-token.yaml"
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -188,7 +192,7 @@ def _patch_store_backend(config: str, db_path: str) -> str:
 
 
 def _enable_response_store_compression(config: str) -> str:
-    """Append a zstd compression block to the openai_response_store filter."""
+    """Append a zstd compression block to the openai_responses_store filter."""
     anchor = (
         "        responses_table: openai_responses\n"
         "        conversations_table: openai_conversations\n"
@@ -255,6 +259,7 @@ def _write_full_flow_config(
     *,
     backend_endpoint: str | None = None,
     search_port: int | None = None,
+    nemo_port: int | None = None,
     max_event_bytes: int | None = None,
     chat_rewrite_model: str | None = None,
     chat_translation_model: str | None = None,
@@ -274,7 +279,7 @@ def _write_full_flow_config(
         backend_endpoint=resolved_backend,
     )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
-    # The unified gateway wires openai_web_search into the IRR; its config
+    # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
     # These vLLM turns never emit a web_search_call, so a literal placeholder
     # key keeps the dispatcher inert while letting the binary start. The Tavily
@@ -317,7 +322,7 @@ def _write_full_flow_config(
         assert config.count(anchor) == 1, config
         config = config.replace(anchor, f'"vllm-chat": "{chat_translation_model}"')
     if reasoning_dialect is not None:
-        # full-flow hardcodes ``dialect: vllm`` on responses_to_chat_completions.
+        # full-flow hardcodes ``dialect: vllm`` on openai_responses_to_chat_completions.
         # Retarget it so the dialect=none fail-closed path survives convergence
         # (passing "vllm" is a no-op that still runs the drift guard).
         assert config.count("dialect: vllm") == 1, config
@@ -345,7 +350,7 @@ def _write_full_flow_config(
             f"default_model: {compact_default_model}",
         )
     if vector_store_endpoint is not None:
-        # Retarget the IRR openai_file_search_callout at the test vector store
+        # Retarget the IRR openai_file_search_dispatch at the test vector store
         # (a recording shim or OGX directly). The deferred ogx_files credential
         # binds to this authority, so Authorization is injected at the callout.
         anchor = "vector_store_url: http://127.0.0.1:3002"
@@ -373,6 +378,13 @@ def _write_full_flow_config(
             f"                base_url: http://127.0.0.1:{search_port}\n"
             "                # Require the per-user key",
         )
+    if nemo_port is not None:
+        nemo_anchor = "http://127.0.0.1:3003/v1/checks"
+        assert config.count(nemo_anchor) == 1
+        config = config.replace(
+            nemo_anchor,
+            f"http://127.0.0.1:{nemo_port}/v1/checks",
+        )
     if max_event_bytes is not None:
         anchor = (
             "        responses_table: openai_responses\n"
@@ -383,8 +395,56 @@ def _write_full_flow_config(
     if compression:
         config = _enable_response_store_compression(config)
 
+    # Widen the IRR inference deadlines for slow CPU-only vLLM, matching the
+    # file-search fixtures. The shipped example ships a 300s per-step budget
+    # tuned for a fast provider, but a full-context prefill (the
+    # over-context truncation case forwards the complete oversized history for
+    # vLLM to truncate natively) takes ~160s on a healthy CI runner and tips
+    # past 300s on a slow/co-located one, surfacing as a sub-request 504. Keep
+    # the production example untouched; only the test config gets the headroom.
+    config = config.replace("step_timeout_ms: 300000", "step_timeout_ms: 600000")
+    config = config.replace("timeout_ms: 360000", "timeout_ms: 660000")
+
     config = _patch_store_backend(config, db_path)
     return _persist_config(config)
+
+
+def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint: str) -> str:
+    """Patch the TTFT example to target the test backend and expose /metrics.
+
+    The shipped example forwards every path to one backend and records the
+    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` listener is appended so the
+    test can scrape that histogram and confirm the model label
+    ``openai_chat_completions_request`` published for a native chat completion.
+    """
+    with open(TTFT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3000", backend_endpoint)
+
+    admin_block = f'\nadmin:\n  address: "127.0.0.1:{metrics_port}"\n'
+    anchor = "\ninsecure_options:\n"
+    assert config.count(anchor) == 1, "TTFT example should declare insecure_options once"
+    config = config.replace(anchor, admin_block + anchor, 1)
+
+    return _persist_config(config)
+
+
+def _scrape_metrics(metrics_port: int) -> str:
+    """Fetch the Prometheus exposition text from the admin endpoint."""
+    response = httpx.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+    response.raise_for_status()
+    return response.text
+
+
+def _has_ttft_sample_for_model(metrics_text: str, model: str) -> bool:
+    """Whether the TTFT histogram carries a sample labeled with ``model``."""
+    label = f'model="{model}"'
+    return any(
+        line.startswith("praxis_ai_ttft_seconds") and label in line
+        for line in metrics_text.splitlines()
+    )
 
 
 def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
@@ -722,6 +782,36 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
         pass
 
 
+class NemoGuardrailsHandler(BaseHTTPRequestHandler):
+    """Passing NeMo `/v1/checks` mock used by the full-flow SDK tests."""
+
+    #: Total `/v1/checks` requests served across all instances since the last reset.
+    request_count: ClassVar[int] = 0
+    requests: ClassVar[list[dict[str, Any]]] = []
+    lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def reset(cls):
+        with cls.lock:
+            cls.requests.clear()
+            cls.request_count = 0
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        with self.lock:
+            type(self).requests.append(json.loads(body))
+            type(self).request_count += 1
+        payload = json.dumps({"status": "passed", "content": "safe"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 class CompactionHandler(BaseHTTPRequestHandler):
     """Deterministic Chat Completions summarizer for compaction tests."""
 
@@ -767,6 +857,7 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
     """
 
     captured_bodies: ClassVar[list[dict]] = []
+    stream_deltas: ClassVar[list[dict]] = []
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -776,6 +867,21 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
                 type(self).captured_bodies.append(json.loads(body))
             except json.JSONDecodeError:
                 pass
+        if body and json.loads(body).get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for delta in type(self).stream_deltas:
+                chunk = {
+                    "id": "chatcmpl_reasoning_capture", "object": "chat.completion.chunk",
+                    "model": VLLM_MODEL, "choices": [{"index": 0, "delta": delta}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+            self.wfile.flush()
+            return
         payload = json.dumps(
             {
                 "id": "chatcmpl_reasoning_capture",
@@ -858,7 +964,12 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             if k.lower() not in ("host", "content-length")
         }
         url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
-        with httpx.Client(timeout=300.0) as client:
+        # Match the widened IRR/SDK deadlines: the over-context truncation test
+        # forwards a full ~context-length prompt that vLLM prefills on CPU, which
+        # can run past 300s on a slow runner. A 300s cap here would drop the
+        # upstream connection mid-prefill and surface as a spurious 502 before
+        # the backend ever applies its context policy.
+        with httpx.Client(timeout=600.0) as client:
             with client.stream(
                 self.command, url, headers=headers, content=body
             ) as upstream:
@@ -965,6 +1076,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     def _send_conversation_response(self, request_body):
         """Serve native Responses without a model so append/hydration is deterministic."""
         request_input = json.dumps(request_body.get("input"))
+        leading_bom = "STREAM-LEADING-BOM-1546" in request_input
         local_tool_limit = "STREAM-LOCAL-DELETE-410" in request_input
         web_call_limit = "STREAM-WEB-LIMIT-410" in request_input
         tool_model = request_body["model"] == "sdk-conversation-tool-stream"
@@ -1031,11 +1143,20 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 {"type": "response.created", "sequence_number": 0, "response": created},
                 {"type": "response.completed", "sequence_number": 1, "response": response},
             ]
-            encoded_frames = [
-                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
-                for event in frames
-            ]
-            payload = b"".join(encoded_frames) + b"data: [DONE]\n\n"
+            if leading_bom:
+                encoded_frames = [
+                    f"data: {json.dumps(event)}\n\n".encode() for event in frames
+                ]
+            else:
+                encoded_frames = [
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                    for event in frames
+                ]
+            payload = (
+                (b"\xef\xbb\xbf" if leading_bom else b"")
+                + b"".join(encoded_frames)
+                + b"data: [DONE]\n\n"
+            )
             content_type = "text/event-stream"
         else:
             payload = json.dumps(response).encode()
@@ -1373,6 +1494,47 @@ def praxis_proxy(tmp_path_factory, request, backend_endpoint):
 
 
 @pytest.fixture(scope="session")
+def ttft_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy on the TTFT example with the /metrics endpoint exposed.
+
+    Native ``POST /v1/chat/completions`` is forwarded straight to the backend, so
+    ``openai_chat_completions_request`` publishes the request model for the
+    ``time_to_first_token`` histogram. Yields the proxy and admin (metrics) ports.
+    """
+    port = _free_port()
+    metrics_port = _free_port()
+    log_dir = tmp_path_factory.mktemp("ttft")
+    config_path = _write_ttft_config(port, metrics_port, backend_endpoint=backend_endpoint)
+    binary = _find_binary()
+
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, metrics_port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== TTFT proxy Praxis logs ===\n{f.read()}", file=sys.stderr)
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def compression_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy whose response store has zstd compression enabled."""
     port = _free_port()
@@ -1417,7 +1579,7 @@ def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
 
     The full-flow router binds model ``vllm-chat`` to the Chat Completions
     backend, so every request on this fixture must send ``CHAT_TRANSLATION_MODEL``
-    to reach ``responses_to_chat_completions``. ``chat_translation_model``
+    to reach ``openai_responses_to_chat_completions``. ``chat_translation_model``
     retargets the managed Chat-translation alias (instance A) at the model the
     live Chat backend actually serves so the rewritten name is accepted.
     """
@@ -1664,7 +1826,7 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
 
 
 def _witness_proxy_session(
-    tmp_path_factory, request, search_port=None, max_event_bytes=None
+    tmp_path_factory, request, search_port=None, max_event_bytes=None, nemo_port=None
 ):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
@@ -1689,6 +1851,7 @@ def _witness_proxy_session(
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         search_port=search_port,
+        nemo_port=nemo_port,
         max_event_bytes=max_event_bytes,
     )
     binary = _find_binary()
@@ -1733,16 +1896,37 @@ def witness_backend_client(tmp_path_factory, request):
 
 
 @pytest.fixture()
-def witness_tool_client(tmp_path_factory, request, search_server):
-    """Full-flow witness with a deterministic hosted web-search endpoint."""
-    yield from _witness_proxy_session(tmp_path_factory, request, search_server)
+def witness_backend_tool_client(tmp_path_factory, request, nemo_guardrails_server):
+    """Witness proxy whose IRR tool-result guardrail has a reachable NeMo endpoint.
+
+    A request-side tool-limit completion still produces a (failed) tool result
+    that the full-flow guardrail screens before re-entry, so the phase needs a
+    live endpoint even though no hosted search is dispatched.
+    """
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, nemo_port=nemo_guardrails_server
+    )
 
 
 @pytest.fixture()
-def witness_replay_limited_tool_client(tmp_path_factory, request, search_server):
+def witness_tool_client(tmp_path_factory, request, search_server, nemo_guardrails_server):
+    """Full-flow witness with a deterministic hosted web-search endpoint."""
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, search_server, nemo_port=nemo_guardrails_server
+    )
+
+
+@pytest.fixture()
+def witness_replay_limited_tool_client(
+    tmp_path_factory, request, search_server, nemo_guardrails_server
+):
     """Hosted web-search witness whose Response replay limit is one byte."""
     yield from _witness_proxy_session(
-        tmp_path_factory, request, search_server, max_event_bytes=1
+        tmp_path_factory,
+        request,
+        search_server,
+        max_event_bytes=1,
+        nemo_port=nemo_guardrails_server,
     )
 
 
@@ -1804,6 +1988,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     model output: the test checks the assistant reasoning field forwarded upstream.
     """
     ChatCaptureHandler.captured_bodies = []
+    ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
     captured = ChatCaptureHandler.captured_bodies
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
@@ -1813,12 +1998,18 @@ def _reasoning_capture_session(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
     db_path = str(db_dir / "responses.db")
+    # Converged onto full-flow-agentic.yaml: VLLM_MODEL is aliased to the
+    # Chat Completions backend so the native model routes through the
+    # translator, and full-flow's IRR step already runs openai_agentic_loop
+    # ahead of openai_responses_to_chat_completions (so the "agentic" param needs no
+    # extra wiring). Map that param onto the vLLM dialect; "none" disables it.
+    param = getattr(request, "param", "vllm")
     config_path = _write_full_flow_config(
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         chat_translation_model=VLLM_MODEL,
-        reasoning_dialect=getattr(request, "param", "vllm"),
+        reasoning_dialect="vllm" if param == "agentic" else param,
     )
     binary = _find_binary()
 
@@ -2193,6 +2384,18 @@ class TestOpenAIResponsesVLLM:
         assert next_page.has_more is False
         assert "Repeat the marker" in next_page.data[0].content[0].text
 
+        desc_page = openai_client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="desc",
+        )
+        assert desc_page.object == "list"
+        assert len(desc_page.data) == 1
+        assert desc_page.first_id == desc_page.data[0].id
+        assert desc_page.last_id == desc_page.data[-1].id
+        assert desc_page.first_id == next_page.data[0].id
+        assert desc_page.has_more is True
+
         assert openai_client.responses.delete(response.id) is None
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
@@ -2200,6 +2403,42 @@ class TestOpenAIResponsesVLLM:
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(response.id)
         assert exc_info.value.status_code == 404
+
+    def test_duplicate_input_item_ids_auto_paginate(self, witness_backend_client):
+        client, _forwarded = witness_backend_client
+        response = client.responses.create(
+            model="sdk-conversation-stream",
+            input=[
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "c"},
+            ],
+            store=True,
+            max_output_tokens=16,
+        )
+
+        first = client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="asc",
+        )
+        pages = list(islice(first.iter_pages(), 3))
+        assert len(pages) == 2, (
+            "SDK pagination must advance past an ambiguous duplicate target and terminate"
+        )
+        assert all(len(page.data) == 1 for page in pages), (
+            "the requested one-item page size must remain stable during SDK iteration"
+        )
+        ids = [page.data[0].id for page in pages]
+        assert ids == ["dup", "c"], (
+            "SDK-derived after=dup must reach the later unique item without rewriting the reference target"
+        )
+        assert all(page.last_id == page.data[-1].id for page in pages), (
+            "the documented last_id field must remain the final returned item ID"
+        )
+        assert pages[-1].has_more is False, (
+            "SDK pagination must terminate after reaching the final unique item"
+        )
 
     def test_response_resource_not_found_errors(self, openai_client):
         missing_id = "resp_missing_sdk_integration"
@@ -2376,6 +2615,34 @@ class TestOpenAIResponsesVLLM:
             f"request; got: {second.previous_response_id!r}"
         )
 
+    def test_leading_bom_preserves_first_data_only_stream_event(
+        self, witness_backend_client
+    ):
+        """A leading UTF-8 BOM must not hide the first data-only SSE event.
+
+        RFC 3629 Section 6 documents U+FEFF's UTF-8 BOM representation:
+        https://datatracker.ietf.org/doc/html/rfc3629#section-6
+        The requirement to strip one leading BOM while interpreting SSE comes
+        from the WHATWG HTML Standard Section 9.2.6:
+        https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream
+        """
+        client, _ = witness_backend_client
+
+        events = list(
+            client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LEADING-BOM-1546",
+                stream=True,
+                store=False,
+            )
+        )
+        event_types = [event.type for event in events]
+
+        assert event_types == ["response.created", "response.completed"], (
+            "the OpenAI client must receive the first data-only event after the "
+            f"proxy strips one leading UTF-8 BOM; got: {event_types}"
+        )
+
     def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
         """The shipped full-flow graph appends a streamed turn before completion.
 
@@ -2522,6 +2789,8 @@ class TestOpenAIResponsesVLLM:
         client, forwarded = witness_tool_client
         conversation = client.conversations.create()
         searches_before = BraveSearchHandler.request_count
+        with NemoGuardrailsHandler.lock:
+            nemo_before = NemoGuardrailsHandler.request_count
         try:
             events = list(
                 client.responses.create(
@@ -2540,6 +2809,12 @@ class TestOpenAIResponsesVLLM:
             output = completed[0].response.output
             assert [item.type for item in output] == ["web_search_call", "message"]
             assert BraveSearchHandler.request_count == searches_before + 1
+            with NemoGuardrailsHandler.lock:
+                assert NemoGuardrailsHandler.request_count == nemo_before + 1
+                nemo_request = NemoGuardrailsHandler.requests[-1]
+            assert "Mock Search Result" in json.dumps(nemo_request["messages"]), (
+                "NeMo must inspect the hosted search result before model re-entry"
+            )
             assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
             assert "Mock Search Result" in json.dumps(forwarded[1]["input"])
 
@@ -2703,10 +2978,10 @@ class TestOpenAIResponsesVLLM:
                 stream.close()
 
     def test_streamed_local_completion_append_failure_withholds_terminal(
-        self, witness_backend_client
+        self, witness_backend_tool_client
     ):
         """A request-side tool-limit completion must append before its SSE terminal."""
-        client, _ = witness_backend_client
+        client, _ = witness_backend_tool_client
         conversation = client.conversations.create()
         gate = threading.Event()
         ResponsesWitnessHandler.terminal_gate = gate
@@ -2829,6 +3104,186 @@ class TestOpenAIResponsesVLLM:
         # into `input` instead.
         assert second_backend.get("previous_response_id") is None, second_backend
         assert isinstance(second_backend.get("input"), list), second_backend
+
+    def test_complete_conversation_history_replayed_after_delete_and_append(
+        self, witness_backend_client
+    ):
+        """#532: native replay includes every surviving item, not one API page."""
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            # PostgreSQL SDK lanes share tables, and deleting a conversation
+            # deliberately retains its item rows. Scope IDs to this conversation.
+            expected = []
+            for batch in range(6):
+                items = [
+                    {
+                        "id": f"item_replay_{conversation.id}_{batch}_{index}",
+                        "type": "message",
+                        "role": "user",
+                        "content": f"HISTORY-{batch}-{index}",
+                    }
+                    for index in range(20)
+                ]
+                client.conversations.items.create(conversation.id, items=items)
+                expected.extend(items)
+            for item in [expected[0], expected[19], expected[-1]]:
+                client.conversations.items.delete(
+                    item["id"], conversation_id=conversation.id
+                )
+                expected.remove(item)
+            appended = {
+                "id": f"item_replay_{conversation.id}_appended",
+                "type": "message",
+                "role": "user",
+                "content": "HISTORY-APPENDED",
+            }
+            client.conversations.items.create(conversation.id, items=[appended])
+            expected.append(appended)
+
+            before = len(forwarded)
+            # The replayed prompt is ~1.2k tokens. The CI inference simulator
+            # runs in echo mode and rejects max_output_tokens below the prompt
+            # length, so a small budget fails before the replay is observable.
+            # A real backend stops at the end of the reply regardless.
+            current_input = 'Reply OK. café "quoted". /no_think'
+            response = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=current_input,
+                store=True,
+                max_output_tokens=2048,
+            )
+            assert response.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            replay = requests[0]["input"]
+            texts = []
+            for item in replay:
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    texts.append(content)
+                else:
+                    texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") in {"input_text", "output_text"}
+                    )
+            assert texts == [item["content"] for item in expected] + [current_input], (
+                "replay must preserve history order and include current input exactly once"
+            )
+
+            before = len(forwarded)
+            next_input = "Reply OK again. /no_think"
+            continuation = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=next_input,
+                store=True,
+                # Echo mode also replays the first response on this turn.
+                max_output_tokens=4096 if VLLM_TEST_BACKEND == "simulator" else 2048,
+            )
+            assert continuation.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            user_texts = []
+            for item in requests[0]["input"]:
+                if item.get("role") != "user":
+                    continue
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    user_texts.append(content)
+                else:
+                    user_texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") == "input_text"
+                    )
+            assert user_texts == [item["content"] for item in expected] + [
+                current_input, next_input
+            ], "selected-upstream replay must not duplicate history or current input"
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    @pytest.mark.parametrize("truncation", ["auto", "disabled"])
+    def test_over_context_conversation_history_truncation(
+        self, witness_backend_client, truncation
+    ):
+        """#532: native vLLM, not Praxis, applies the requested context policy."""
+        client, forwarded = witness_backend_client
+        # vLLM publishes the actual configured limit, which may differ from the
+        # model's advertised maximum or the GPU runner's launch defaults.
+        with httpx.Client(timeout=10) as backend:
+            models = backend.get(f"{VLLM_BASE_URL.rstrip('/')}/v1/models")
+            models.raise_for_status()
+        model = next(
+            item for item in models.json()["data"] if item["id"] == VLLM_MODEL
+        )
+        context_limit = model.get("max_model_len")
+        assert isinstance(context_limit, int) and context_limit > 0, model
+        oversized_history = "obsolete " * (context_limit * 2)
+        conversation = client.conversations.create(
+            items=[
+                {"type": "message", "role": "user", "content": oversized_history},
+                {"type": "message", "role": "user", "content": "Reply OK. /no_think"},
+            ]
+        )
+        try:
+            before = len(forwarded)
+            options = {
+                "model": VLLM_MODEL,
+                "conversation": conversation.id,
+                "input": "Reply OK. /no_think",
+                "truncation": truncation,
+                "max_output_tokens": 32,
+                "store": False,
+            }
+            if truncation == "disabled":
+                with pytest.raises(BadRequestError) as error:
+                    client.responses.create(**options)
+                assert error.value.status_code == 400
+                message = str(error.value).lower()
+                assert "context" in message or "token" in message, message
+            else:
+                # vLLM — not Praxis — owns the context policy here. With `auto`
+                # it truncates the forwarded over-context history to fit the
+                # window; the full ~context-length prefill runs on CPU and can
+                # take minutes on a slow runner. Give the client a timeout that
+                # outlasts every backend deadline (the witness shim's upstream
+                # read, and the IRR step/total budgets) so it always receives an
+                # HTTP verdict instead of raising an uncatchable client-side
+                # timeout. The small CPU model's native truncation lands right on
+                # the context boundary (it does not reserve room for
+                # max_output_tokens), so it nondeterministically either completes
+                # or rejects the already-forwarded prompt: a clean 400 when it
+                # validates up front, a bare 502 when it raises post-prefill and
+                # drops the connection, or a 504 when the prefill outruns an IRR
+                # deadline. All are legitimate backend outcomes; #532 only
+                # requires Praxis to forward the complete history, which the
+                # assertions below verify regardless of the backend's verdict.
+                try:
+                    response = client.with_options(timeout=720).responses.create(
+                        **options
+                    )
+                    assert response.status in {"completed", "incomplete"}
+                    assert response.output, response
+                except APIStatusError as exc:
+                    assert exc.status_code in {400, 502, 504}, exc
+
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            request = requests[0]
+            assert request["truncation"] == truncation
+            content = request["input"][0]["content"]
+            history_text = content if isinstance(content, str) else content[0]["text"]
+            assert history_text == oversized_history, (
+                "the gateway must forward complete history even beyond the backend context limit"
+            )
+            assert len(request["input"]) == 3
+        finally:
+            client.conversations.delete(conversation.id)
 
     @requires_real_inference
     def test_conversation_context_and_append_back(self, openai_client):
@@ -3345,7 +3800,7 @@ class TestOpenAIResponsesVLLM:
         assert error.body == {
             "code": "invalid_request_error",
             "message": (
-                "prompt templates are supported only for OpenAI-owned upstreams"
+                "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
             ),
             "param": None,
             "type": "invalid_request_error",
@@ -3668,13 +4123,134 @@ class TestOpenAIResponsesVLLM:
 class TestResponsesReasoningVLLM:
     """Reasoning-dialect translation exercised through the OpenAI SDK."""
 
-    def test_reasoning_summary_request_is_rejected(self, reasoning_client):
+    @pytest.mark.parametrize("preferred_field", [True, False], ids=["preferred", "legacy"])
+    def test_streaming_reasoning_sdk_events_and_stored_continuation(
+        self, reasoning_capture_client, preferred_field,
+    ):
+        """The SDK consumes raw reasoning events and persisted reasoning-only output."""
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [
+            {
+                "reasoning": "I picked " if preferred_field else "",
+                "reasoning_content": "ignored" if preferred_field else "I picked ",
+            },
+            {"reasoning_content": "42."},
+        ]
+        with client.responses.stream(model=VLLM_MODEL, input="Pick a number.", store=True) as stream:
+            events = list(stream)
+            final = stream.get_final_response()
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert "".join(event.delta for event in deltas) == "I picked 42."
+        assert all(event.content_index == 0 and event.output_index == 0 for event in deltas)
+        assert final.status == "completed"
+        assert len(final.output) == 1
+        item = final.output[0]
+        assert item.type == "reasoning" and item.summary == []
+        assert item.content[0].type == "reasoning_text"
+        assert item.content[0].text == "I picked 42."
+        assert all(event.item_id == item.id for event in deltas)
+        done = next(event for event in events if event.type == "response.reasoning_text.done")
+        assert done.text == item.content[0].text
+        stored = client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == item.model_dump()
+        client.responses.create(model=VLLM_MODEL, previous_response_id=final.id, input="Which number?", store=False)
+        assert forwarded[-1]["messages"][1] == {
+            "role": "assistant", "content": None, "reasoning": "I picked 42.",
+        }
+
+    @pytest.mark.parametrize("with_tool_call", [False, True], ids=["answer", "answer-then-tool"])
+    def test_late_reasoning_stays_with_its_stored_assistant_turn(
+        self, reasoning_capture_client, with_tool_call,
+    ):
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"content": "Earlier answer."}]
+        with client.responses.stream(model=VLLM_MODEL, input="First turn.", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        ChatCaptureHandler.stream_deltas = [{"content": "Done."}, {"reasoning": "I picked 42."}]
+        if with_tool_call:
+            ChatCaptureHandler.stream_deltas.append({"tool_calls": [{
+                "index": 0, "id": "call_lookup", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]})
+        with client.responses.stream(
+            model=VLLM_MODEL, previous_response_id=first.id, input="Pick a number.", store=True,
+        ) as stream:
+            list(stream)
+            second = stream.get_final_response()
+        expected_types = ["message", "reasoning"] + (["function_call"] if with_tool_call else [])
+        assert [item.type for item in second.output] == expected_types
+        stored = client.responses.retrieve(second.id)
+        # The stream helper adds SDK-only `parsed=None` to text content.
+        assert [item.model_dump(exclude_none=True) for item in stored.output] == [
+            item.model_dump(exclude_none=True) for item in second.output
+        ]
+        continuation = [{"role": "user", "content": "Which number?"}]
+        if with_tool_call:
+            continuation.insert(0, {"type": "function_call_output", "call_id": "call_lookup", "output": "42"})
+        client.responses.create(
+            model=VLLM_MODEL, previous_response_id=second.id, input=continuation, store=False,
+        )
+        messages = forwarded[-1]["messages"]
+        assert messages[1] == {"role": "assistant", "content": "Earlier answer."}
+        assert messages[3] == {"role": "assistant", "content": "Done.", "reasoning": "I picked 42."}
+        if with_tool_call:
+            assert messages[4]["tool_calls"][0]["id"] == "call_lookup"
+            assert "reasoning" not in messages[4]
+            assert messages[5]["role"] == "tool"
+        assert messages[-1] == {"role": "user", "content": "Which number?"}
+        # Rehydrating the reordered history must preserve the service's stored
+        # client-facing output, including its original streamed item order.
+        assert client.responses.retrieve(second.id).output == stored.output
+
+    @pytest.mark.parametrize("bad_delta", [
+        {"reasoning": {"invalid": "provider-private-data"}},
+        {"reasoning": "x" * 65536},
+    ], ids=["malformed", "over-budget"])
+    def test_streaming_reasoning_failure_has_no_completed_items(self, reasoning_capture_client, bad_delta):
+        client, _ = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"reasoning": "valid prefix"}, bad_delta]
+        events = list(client.responses.create(
+            model=VLLM_MODEL, input="Think.", stream=True, store=False,
+        ))
+        assert events[-1].type == "response.failed"
+        assert events[-1].response.output == []
+        assert not any(event.type == "response.output_item.done" for event in events)
+        assert not any(event.type == "response.reasoning_text.done" for event in events)
+        assert "provider-private-data" not in events[-1].model_dump_json()
+        deltas = [event.delta for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas == ["valid prefix"]
+
+    @requires_real_inference
+    def test_live_streaming_reasoning_translation(self, reasoning_client):
+        """Exercise the dialect against the configured live vLLM endpoint."""
+        with reasoning_client.responses.stream(
+            model=VLLM_MODEL, input="What is 17 times 23? Think before answering.",
+            max_output_tokens=1024, store=True,
+        ) as stream:
+            events = list(stream)
+        terminal_event = events[-1]
+        assert terminal_event.type in {"response.completed", "response.incomplete"}, terminal_event.type
+        final = terminal_event.response
+        assert final.status in {"completed", "incomplete"}
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas, "the configured reasoning model must emit raw reasoning"
+        item = next(item for item in final.output if item.type == "reasoning")
+        assert item.summary == []
+        assert item.content[0].text == "".join(event.delta for event in deltas)
+        assert all(event.item_id == item.id for event in deltas)
+        stored = reasoning_client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == final.output[0].model_dump()
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_reasoning_summary_request_is_rejected(self, reasoning_client, streaming):
         """vLLM has no safe-summary contract, so a summary request is a 400."""
         with pytest.raises(BadRequestError) as exc_info:
             reasoning_client.responses.create(
                 model=CHAT_TRANSLATION_MODEL,
                 input="What is 2+2?",
                 reasoning={"summary": "auto"},
+                stream=streaming,
                 store=False,
                 max_output_tokens=64,
             )
@@ -3804,6 +4380,29 @@ class TestResponsesReasoningVLLM:
             {"role": "user", "content": "Now answer."},
         ]
 
+    @pytest.mark.parametrize("reasoning_capture_client", ["agentic"], indirect=True)
+    @pytest.mark.parametrize("late", [False, True], ids=["reasoning-first", "reasoning-late"])
+    def test_agentic_stored_reasoning_is_replayed_once(self, reasoning_capture_client, late):
+        client, forwarded = reasoning_capture_client
+        thought = "x" * 40_000
+        deltas = [{"reasoning": thought}, {"content": "Answer"}]
+        ChatCaptureHandler.stream_deltas = list(reversed(deltas)) if late else deltas
+        with client.responses.stream(model=VLLM_MODEL, input="Question", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        assert first.status == "completed"
+        # The client-facing output keeps its announced order.
+        stored = client.responses.retrieve(first.id)
+        assert [item.type for item in stored.output] == (
+            ["message", "reasoning"] if late else ["reasoning", "message"]
+        )
+        client.responses.create(
+            model=VLLM_MODEL, previous_response_id=first.id, input="Continue", store=False,
+        )
+        # The forwarded history carries the reasoning exactly once, attached to its answer.
+        assistants = [item for item in forwarded[-1]["messages"] if item["role"] == "assistant"]
+        assert assistants == [{"role": "assistant", "content": "Answer", "reasoning": thought}]
+
     @pytest.mark.parametrize("item", [
         {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
         {"type": "reasoning", "summary": []},
@@ -3859,7 +4458,7 @@ class TestResponsesCompactionVLLM:
         assert error.status_code == 400
         assert error.type == "invalid_request_error"
         assert error.body["message"] == (
-            "prompt templates are supported only for OpenAI-owned upstreams"
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
         )
 
     def test_invalid_compaction_threshold_is_rejected(self, compact_client):
@@ -3877,6 +4476,48 @@ class TestResponsesCompactionVLLM:
             )
         assert exc_info.value.status_code == 400, "invalid compaction threshold must return 400"
         assert "compact_threshold" in str(exc_info.value), "error must name the compact_threshold field"
+
+    def test_explicit_compact_rejects_malformed_input_content(self, compact_client):
+        """Issue #1403: a message item whose ``content`` is wrong-typed must fail
+        with 400 before any summarization callout, not be silently formatted into
+        empty text and compacted/stored anyway.
+
+        ``extra_body`` injects the malformed field verbatim so the request body
+        carries ``content: 123``, which the typed ``input`` parameter would not
+        let a caller express.
+        """
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                extra_body={"input": [{"role": "user", "content": 123}]},
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "malformed content must return 400"
+        assert error.type == "invalid_request_error"
+        assert "content" in str(error), "error must name the offending field"
+        assert len(CompactionHandler.requests) == before, (
+            "a rejected malformed-content request must never reach the summarizer"
+        )
+
+    def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
+        """Control for the #1403 rejection: a well-typed inline input compacts
+        with exactly one summarization callout and returns a compaction object."""
+        before = len(CompactionHandler.requests)
+        result = compact_client.responses.compact(
+            model=VLLM_MODEL,
+            input=[
+                {"role": "user", "content": "Explain TCP vs UDP."},
+                {"role": "assistant", "content": "TCP is reliable; UDP is not."},
+            ],
+        )
+
+        assert result.id, "a successful compact returns an identified compaction"
+        assert result.object == "response.compaction"
+        assert len(CompactionHandler.requests) == before + 1, (
+            "a valid explicit compact must make exactly one summarization callout"
+        )
 
     def test_below_threshold_skips_compaction(self, compact_client):
         first = compact_client.responses.create(
@@ -4453,7 +5094,7 @@ class TestResponsesToChatCompletionsVLLM:
 
         A streaming Responses request is translated to Chat Completions,
         the returned private ``web_search`` tool call is restored to a
-        canonical ``web_search_call``, ``openai_web_search`` dispatches the
+        canonical ``web_search_call``, ``openai_web_search_dispatch`` dispatches the
         query, and inference resumes — all exposed to the client as ONE
         logical Responses SSE lifecycle. The terminal event carries the
         completed web-search item and the final assistant message.
@@ -4526,6 +5167,183 @@ class TestResponsesToChatCompletionsVLLM:
             f"message; got: {output_types}"
         )
 
+    def test_web_search_unsupported_user_location_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """Unsupported ``user_location`` fields fail closed, never silently dropped (#1548).
+
+        The Brave-backed provider accepts only an ISO ``country``; a ``city`` it
+        cannot honor must be rejected with a 400 at round 0, before any inference
+        round or provider callout. The canonical web-search state preserves the
+        full ``user_location``, so dropping unsupported fields would change
+        location-sensitive search semantics without telling the caller. No
+        ``@requires_vllm_compat`` marker: the preflight short-circuits before the
+        model, so this contract holds in both live and simulator modes.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "unsupported user_location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        # The request is rejected before the provider is ever contacted.
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_allowed_tools_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool excluded by ``allowed_tools`` but reachable via another
+        continuation tool is still preflighted (#1548).
+
+        ``allowed_tools`` names only ``file_search``, so web search is not callable
+        on round 0. But a file-search continuation resets ``tool_choice`` to
+        ``"auto"`` while retaining the declared web-search tool, making it reachable
+        on a later round — after the round-0 preflight would normally be skipped.
+        The preflight must therefore reject the unsupported ``city`` up front rather
+        than let it be silently dropped once web search runs. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "file_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_unrepresentable_country_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A supported ``country`` the provider cannot encode fails closed (#1548).
+
+        Brave carries the country in the ``X-Loc-Country`` request header. A value
+        with a control character passes the field-support check but cannot be
+        encoded as a header, so it would be silently dropped at dispatch. The
+        preflight rejects it with a 400 ``invalid_value`` instead, before any
+        provider callout. No ``@requires_vllm_compat`` marker: the rejection is at
+        round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "country": "FR\n"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "an unrepresentable country must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "invalid_value"
+        assert "country" in error.body["message"], (
+            f"rejection must name the offending field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_server_tool_search_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool reachable via a server-executed ``tool_search``
+        continuation is still preflighted (#1548).
+
+        ``tools`` declares a server-executed ``tool_search`` (hosted MCP connector
+        discovery); ``allowed_tools`` names it with a bare ``{"type":"tool_search"}``
+        selector that carries no ``execution``. The declaration is authoritative: that
+        hosted discovery continuation resets ``tool_choice`` to ``"auto"`` while
+        retaining the declared web-search tool, making it reachable on a later round —
+        after the round-0 preflight would normally be skipped. The preflight must
+        therefore reject the unsupported ``city`` up front. A client-executed
+        ``tool_search`` (the default) returns to the API client instead and never
+        makes web search reachable; that negative case is covered by the Rust unit
+        tests, which assert ``Continue`` without a model round. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    },
+                    {"type": "tool_search", "execution": "server"},
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "tool_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Agentic Loop Fixtures
@@ -4548,6 +5366,18 @@ def search_server():
     """Start an in-process mock Brave search server for the test session."""
     port = _free_port()
     server = HTTPServer(("127.0.0.1", port), BraveSearchHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def nemo_guardrails_server():
+    """Start a deterministic passing NeMo mock for guarded SDK tool tests."""
+    NemoGuardrailsHandler.reset()
+    port = _free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), NemoGuardrailsHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield port
@@ -4851,6 +5681,159 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    def test_shell_tool_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A local ``shell`` tool is lowered to a private ``function`` vLLM
+        accepts; the returned call is restored to a schema-complete
+        ``shell_call`` with its parsed action moved into the result."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the shell tool with the command: echo ok. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[{"type": "shell", "environment": {"type": "local"}}],
+            tool_choice={"type": "shell"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        shell_calls = [item for item in response.output if item.type == "shell_call"]
+        assert len(shell_calls) >= 1, (
+            "compat filter must restore the function_call to a shell_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = shell_calls[0]
+        assert call.call_id, call
+        assert call.action is not None, call
+        assert call.action.commands, (
+            "restored shell action must include commands: "
+            f"{call.action}"
+        )
+        assert all(command for command in call.action.commands), (
+            "every restored shell command must be non-empty: "
+            f"{call.action}"
+        )
+        assert (
+            call.action.timeout_ms is None or call.action.timeout_ms >= 0
+        ), call.action
+        assert (
+            call.action.max_output_length is None
+            or call.action.max_output_length >= 0
+        ), call.action
+        assert call.environment is not None, (
+            "restored shell call must include its environment: "
+            f"{call}"
+        )
+        assert call.environment.type == "local", (
+            "restored shell call must identify a local environment: "
+            f"{call.environment}"
+        )
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "shell" for t in response.tools), response.tools
+
+    def test_tool_search_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A client-executed ``tool_search`` declaration is lowered to a private
+        ``function`` and its restored call preserves client ownership and parsed
+        arguments through the OpenAI SDK."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call tool_search for client tools. Do not answer "
+                "directly. /no_think"
+            ),
+            tools=[{"type": "tool_search"}],
+            tool_choice="required",
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        search_calls = [
+            item for item in response.output if item.type == "tool_search_call"
+        ]
+        assert len(search_calls) >= 1, (
+            "compat filter must restore the function_call to a tool_search_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = search_calls[0]
+        assert call.call_id, call
+        assert call.execution == "client", call
+        assert call.arguments is not None, call
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "tool_search" for t in response.tools), response.tools
+
+    def test_mcp_namespace_group_name_with_delimiter_is_accepted(
+        self, client_tool_compat_client
+    ):
+        """A ``namespace`` group whose name carries the ``__`` flattening
+        delimiter lowers rather than failing closed.
+
+        Codex names an MCP tool namespace ``mcp__{server}``, so the ``__`` the
+        compat filter uses to delimit its flattened
+        ``agentic_ns__{namespace}__{member}`` wire names appears inside the group
+        name itself. Reserving the delimiter rejected every Codex session that
+        attaches an MCP server with HTTP 400 before any upstream call; the
+        ambiguous pair now takes the hashed wire-name branch instead.
+
+        Asserts only filter-guaranteed, model-independent invariants: whether the
+        small CI model actually calls the member is model-dependent, so the test
+        does not require a live tool call.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Read the hosts file. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_tui",
+                    "description": "Codex MCP tools.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read a file from the workspace.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        # Reaching a terminal response at all is the regression guard: pre-fix the
+        # compat filter rejected the group name with HTTP 400 (raised by the SDK as
+        # BadRequestError) before any upstream call.
+        assert response.status == "completed", response
+        # No private flattened wire name may leak to the client.
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        # Request-phase echo: the client sees its original namespace tool back with
+        # the group name intact, delimiter and all.
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "mcp__codex_tui" in echoed, response.tools
+
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
     ):
@@ -4982,9 +5965,14 @@ class TestClientToolCompatVLLM:
         )
 
         event_types = []
+        added_items = []
         final_response = None
         for event in stream:
             event_types.append(event.type)
+            if event.type == "response.output_item.added":
+                if event.item.type == "custom_tool_call":
+                    ResponseCustomToolCall.model_validate(event.item.model_dump())
+                added_items.append(event.item)
             if event.type == "response.completed":
                 final_response = event.response
 
@@ -5007,6 +5995,17 @@ class TestClientToolCompatVLLM:
         )
         assert custom_calls[0].name == "apply_patch"
         assert isinstance(custom_calls[0].input, str)
+        custom_added_items = [
+            item for item in added_items if item.type == "custom_tool_call"
+        ]
+        assert custom_added_items, (
+            "stream must announce the restored call with a custom_tool_call "
+            f"output_item.added frame; got: {[item.type for item in added_items]}"
+        )
+        assert all(item.input == "" for item in custom_added_items), (
+            "each restored custom_tool_call added frame must start with an empty "
+            f"input: {[item.model_dump() for item in custom_added_items]}"
+        )
         # No un-restored private function_call item may leak to the client.
         assert "function_call" not in output_types, (
             f"lowered function must not leak on the stream: {output_types}"
@@ -5020,7 +6019,7 @@ class TestClientToolCompatVLLM:
 class TestClientToolCompatChatVLLM:
     """Issue #1206: rich Codex client tools reach a function-only **Chat
     Completions** backend by composing ``openai_client_tool_compat`` with
-    ``responses_to_chat_completions`` in one iterative-router step.
+    ``openai_responses_to_chat_completions`` in one iterative-router step.
 
     Unlike :class:`TestClientToolCompatVLLM` (native Responses backend), here the
     backend only ever sees ``POST /v1/chat/completions`` with plain ``function``
@@ -6996,6 +7995,7 @@ class TestStreamingMcpDiscoveryFailureVLLM:
 # File search: dedicated proxy config, fixtures, and tests
 # ---------------------------------------------------------------------------
 
+
 class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
     """Recording shim between the file-search callout and OGX.
 
@@ -7143,7 +8143,7 @@ def file_search_backend(backend_endpoint):
 
 @pytest.fixture(scope="session")
 def file_search_proxy(tmp_path_factory, request, file_search_backend):
-    """Start a Praxis proxy with the file-search-callout pipeline.
+    """Start a Praxis proxy with the file-search-dispatch pipeline.
 
     The vector-store callout is pointed at an in-process recording shim
     (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
@@ -7373,7 +8373,7 @@ class TestFileSearchChatCompletionsVLLM:
     """Issue #296: hosted file_search against a Chat Completions backend.
 
     Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
-    this drives responses_to_chat_completions: the native file_search tool
+    this drives openai_responses_to_chat_completions: the native file_search tool
     is synthesized into a private chat `function`, vLLM's
     /v1/chat/completions emits the call, the proxy runs the OGX vector-store
     search, and drives one more finite inference round -- without ever
@@ -7407,9 +8407,9 @@ class TestFileSearchChatCompletionsVLLM:
         )
 
         # The backend-lowered private function must not leak into the echoed
-        # request declarations. openai_file_search_callout rewrites
+        # request declarations. openai_file_search_dispatch rewrites
         # request_body.tools into {"type":"function","name":"file_search"} for the
-        # Chat backend, but responses_to_chat_completions must echo the hosted
+        # Chat backend, but openai_responses_to_chat_completions must echo the hosted
         # tool the client sent, derived from the preserved ResponsesState.tools.
         dumped = response.model_dump()
         echoed_tools = dumped.get("tools") or []
@@ -7489,7 +8489,7 @@ class TestFileSearchChatCompletionsVLLM:
 def file_search_streaming_proxy(
     tmp_path_factory, request, file_search_backend
 ):
-    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    """Start a Praxis proxy with the streaming file-search-dispatch pipeline."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("file-search-streaming")
     db_path = str(db_dir / "responses.db")
@@ -7565,7 +8565,7 @@ class TestFileSearchStreamingVLLM:
     """Issue #313: streaming hosted file_search (stream=True).
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
-    example config: openai_stream_events(logical_stream) + openai_file_search_callout
+    example config: openai_stream_events(logical_stream) + openai_file_search_dispatch
     + openai_responses_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces
@@ -8898,6 +9898,49 @@ class TestModelRewriteChatCompletionsVLLM:
 
         assert response.status_code == 200, response.text
         assert response.json()["model"] == VLLM_MODEL, response.text
+
+
+# ---------------------------------------------------------------------------
+# Time to first token: native Chat Completions model label
+# ---------------------------------------------------------------------------
+
+
+@requires_real_inference
+def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
+    """A streamed native chat completion labels TTFT with its request model.
+
+    Drives ``openai_chat_completions_request`` through the OpenAI client: the
+    filter reads the model from the native ``POST /v1/chat/completions`` body and
+    publishes the fact ``time_to_first_token`` records as the
+    ``praxis_ai_ttft_seconds`` model label. Without the request filter the sample
+    would fall back to ``unknown``.
+    """
+    praxis_port, metrics_port = ttft_proxy
+    client = _make_openai_client(praxis_port)
+
+    stream = client.chat.completions.create(
+        model=VLLM_MODEL,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
+        max_tokens=16,
+        stream=True,
+    )
+    chunks = list(stream)
+    assert chunks, "native chat completion should stream at least one chunk"
+
+    # The histogram is recorded as the first SSE chunk is relayed on the response
+    # path; retry briefly so the scrape never races the recorder's render.
+    deadline = time.monotonic() + 10
+    metrics_text = ""
+    while time.monotonic() < deadline:
+        metrics_text = _scrape_metrics(metrics_port)
+        if _has_ttft_sample_for_model(metrics_text, VLLM_MODEL):
+            break
+        time.sleep(0.2)
+
+    assert _has_ttft_sample_for_model(metrics_text, VLLM_MODEL), (
+        "praxis_ai_ttft_seconds must carry a sample labeled with the request "
+        f"model {VLLM_MODEL!r}; got:\n{metrics_text}"
+    )
 
 
 if __name__ == "__main__":

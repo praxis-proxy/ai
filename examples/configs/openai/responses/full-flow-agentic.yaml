@@ -35,7 +35,7 @@
 # openai_responses_compact (summarize history on context_management requests),
 # and the IRR step runs openai_client_tool_compat (lower rich client tools to
 # backend function tools, restore on the response path) plus the
-# responses_to_chat_completions vLLM reasoning dialect.
+# openai_responses_to_chat_completions vLLM reasoning dialect.
 #
 # ResponsesState created on the managed path persists across all IRR
 # iterations via extension swapping:
@@ -870,7 +870,7 @@ filter_chains:
               # backend understands, in request_body only; restore the returned
               # function_call items to their canonical typed items on the
               # response path. Must run after openai_agentic_loop and before
-              # responses_to_chat_completions so the lowered request body is what
+              # openai_responses_to_chat_completions so the lowered request body is what
               # the translator reads. openai_stream_events leads this step, so a
               # streaming request's lowered calls are restored live in the SSE
               # lifecycle. Transparent passthrough when no rich client tools are

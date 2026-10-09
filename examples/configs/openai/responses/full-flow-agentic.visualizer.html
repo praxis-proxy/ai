@@ -647,9 +647,9 @@
           <circle cx="636" cy="254" r="3.2" fill="#f4713b"/>
 
           <line x1="636" y1="118" x2="702" y2="118" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
-          <g class="flt" data-fid="openai_web_search">
+          <g class="flt" data-fid="openai_web_search_dispatch">
             <rect x="704" y="98" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
-            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search</text>
+            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search_dispatch</text>
             <text x="720" y="133" class="s-mono" fill="#6d8492" font-size="9.5">Brave · per-user brave_search slot</text>
           </g>
           <line x1="636" y1="186" x2="702" y2="186" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
@@ -659,9 +659,9 @@
             <text x="720" y="201" class="s-mono" fill="#6d8492" font-size="9.5">8001 · mcp_gateway cred + assertion · ≤8∥</text>
           </g>
           <line x1="636" y1="254" x2="702" y2="254" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
-          <g class="flt" data-fid="openai_file_search_callout">
+          <g class="flt" data-fid="openai_file_search_dispatch">
             <rect x="704" y="234" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
-            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_callout</text>
+            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_dispatch</text>
             <text x="720" y="269" class="s-mono" fill="#6d8492" font-size="9.5">3002 · ogx_files cred · on_failure closed</text>
           </g>
 
@@ -682,7 +682,7 @@
           <g>
             <rect x="30" y="362" width="330" height="50" rx="8" fill="#0c1319" stroke="#d98cbb"/>
             <text x="46" y="383" class="s-mono" fill="#e2edf3" font-size="11.5">▣ DONE → compose terminal event</text>
-            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_response_store persists</text>
+            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_responses_store persists</text>
           </g>
         </svg>
       </div>
@@ -825,7 +825,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "establishes TraceContext before the route-miss"
+          "note": "establishes TraceContext for the single inference round"
         },
         "S11": {
           "state": "active",
@@ -897,7 +897,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "owner mapped before route-miss"
+          "note": "maps x-auth-* ingress into owner context (no auth verification)"
         },
         "S11": {
           "state": "active",
@@ -973,7 +973,7 @@ const PIPELINE = {
         },
         "S7": {
           "state": "active",
-          "note": "captures the brave_search key required by openai_web_search; strips + sets the assertion (web_search does not consume it)"
+          "note": "captures the brave_search key required by openai_web_search_dispatch; strips + sets the assertion (web_search does not consume it)"
         },
         "S8": {
           "state": "active",
@@ -985,7 +985,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "strips all provider-key headers and sets the assertion before the route-miss"
+          "note": "strips all x-user-* provider keys defensively (slots empty if absent); also strips client x-mcp-authorized and sets the verified assertion, consumed only by MCP filters"
         },
         "S11": {
           "state": "active",
@@ -1055,7 +1055,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "projects before route-miss"
+          "note": "projects x-tenant-id/x-user-id, strips raw ingress"
         },
         "S11": {
           "state": "active",
@@ -1076,8 +1076,8 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_operation",
-      "name": "openai_operation",
+      "id": "ai_operation",
+      "name": "ai_operation",
       "group": "classification",
       "order": 5,
       "phase": "request-phase classification; no response phase",
@@ -1122,7 +1122,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "head-based match -\u003e openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format"
+          "note": "head-based match -\u003e openai_responses create; operation identity is authoritative, so the Chat/Anthropic/unclassified body shape does not change the operation (#1602)"
         },
         "S11": {
           "state": "passthrough",
@@ -1143,12 +1143,13 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_responses_format",
-      "name": "openai_responses_format",
+      "id": "openai_responses_request_prerouting",
+      "name": "openai_responses_request (pre-routing)",
       "group": "classification",
       "order": 6,
-      "phase": "request-phase classifier; promotes internal x-praxis-* routing headers",
+      "phase": "request-phase classifier (initialize_state false); promotes internal x-praxis-* routing headers without minting state",
       "config": {
+        "initialize_state": false,
         "on_invalid": "continue",
         "headers.format": "x-praxis-ai-format",
         "headers.model": "x-praxis-ai-model",
@@ -1195,7 +1196,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "classifies as chat/anthropic/unclassified -\u003e not openai_responses, on_invalid:continue avoids early reject"
+          "note": "classify_matched_operation forces format=openai_responses for the matched create body regardless of its Chat/Anthropic shape; promotes format + model=gpt-4, stream=false"
         },
         "S11": {
           "state": "passthrough",
@@ -1426,7 +1427,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "no route matches (format is not openai_responses, no upgrade header) -\u003e route-miss (bare 404)"
+          "note": "model gpt-4 misses the gpt-5/vllm-chat model routes and falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format openai_responses) -\u003e inference-backend (managed native)"
         },
         "S11": {
           "state": "active",
@@ -1503,8 +1504,8 @@ const PIPELINE = {
           "note": "WS bound responses-websocket-backend (direct), not openai; branch not taken"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss already returned 404"
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
         },
         "S11": {
           "state": "inert",
@@ -1581,8 +1582,8 @@ const PIPELINE = {
           "note": "bound responses-websocket-backend (direct) -\u003e takes the direct-services terminal branch; forwards the WS upgrade to 3001"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss already returned 404"
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
         },
         "S11": {
           "state": "active",
@@ -1603,8 +1604,8 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_responses_validate",
-      "name": "openai_responses_validate",
+      "id": "openai_responses_request",
+      "name": "openai_responses_request",
       "group": "classification",
       "order": 12,
       "phase": "request-phase; JSON syntax + ID generation + managed-provider background/prompt policy; gated unless bound_upstream.application_provider=openai",
@@ -1652,8 +1653,8 @@ const PIPELINE = {
           "note": "WS took the direct-services terminal branch before the body filters"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before the body filters"
+          "state": "active",
+          "note": "managed owner builds ResponsesState and generates the response id from the one parse; the Chat-shaped body is carried as the Responses create body"
         },
         "S11": {
           "state": "skipped",
@@ -1719,8 +1720,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no tools; has_tools=false"
         },
         "S11": {
           "state": "skipped",
@@ -1790,8 +1791,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
         },
         "S11": {
           "state": "skipped",
@@ -1808,8 +1809,8 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_response_store",
-      "name": "openai_response_store",
+      "id": "openai_responses_store",
+      "name": "openai_responses_store",
       "group": "store",
       "order": 15,
       "phase": "request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai",
@@ -1861,8 +1862,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "active",
+          "note": "persists buffered response on reverse path (store default true)"
         },
         "S11": {
           "state": "skipped",
@@ -1928,8 +1929,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no previous_response_id/conversation"
         },
         "S11": {
           "state": "skipped",
@@ -2001,8 +2002,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "inert",
+          "note": "no file_id refs; callout does not fire"
         },
         "S11": {
           "state": "skipped",
@@ -2070,8 +2071,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "inert",
+          "note": "no input_file parts to convert"
         },
         "S11": {
           "state": "skipped",
@@ -2140,7 +2141,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "passthrough",
-          "note": "managed create (chat/anthropic body routed by"
+          "note": "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
         },
         "S11": {
           "state": "skipped",
@@ -2222,8 +2223,8 @@ const PIPELINE = {
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss before this filter"
+          "state": "passthrough",
+          "note": "no MCP tool entries"
         },
         "S11": {
           "state": "skipped",
@@ -2253,7 +2254,7 @@ const PIPELINE = {
           "unless path: /v1/responses"
         ]
       },
-      "promotes": "fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_response_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai",
+      "promotes": "fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_responses_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai",
       "scenarios": {
         "S1": {
           "state": "inert",
@@ -2285,15 +2286,15 @@ const PIPELINE = {
         },
         "S8": {
           "state": "skipped",
-          "note": "openai_response_store already served the GET retrieve"
+          "note": "openai_responses_store already served the GET retrieve"
         },
         "S9": {
           "state": "skipped",
           "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before this filter"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S11": {
           "state": "skipped",
@@ -2375,8 +2376,8 @@ const PIPELINE = {
           "note": "WS handshake took the direct-services terminal branch"
         },
         "S10": {
-          "state": "skipped",
-          "note": "router route-miss (404) before the IRR"
+          "state": "active",
+          "note": "enters IRR; one inference round; agentic_loop action=done"
         },
         "S11": {
           "state": "skipped",
@@ -2441,8 +2442,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "re-projects owner headers each round"
         },
         "S11": {
           "state": "skipped",
@@ -2469,7 +2470,7 @@ const PIPELINE = {
         "max_events": 200000,
         "timeout_secs": 600
       },
-      "promotes": "composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store",
+      "promotes": "composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the openai_responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -2508,8 +2509,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "one-round logical stream; still composes and populates response_object"
         },
         "S11": {
           "state": "skipped",
@@ -2526,8 +2527,8 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_web_search",
-      "name": "openai_web_search",
+      "id": "openai_web_search_dispatch",
+      "name": "openai_web_search_dispatch",
       "group": "irr-step",
       "order": 25,
       "phase": "IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call",
@@ -2576,8 +2577,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no web_search_call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2650,8 +2651,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no MCP call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2668,8 +2669,8 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_file_search_callout",
-      "name": "openai_file_search_callout",
+      "id": "openai_file_search_dispatch",
+      "name": "openai_file_search_dispatch",
       "group": "irr-step",
       "order": 27,
       "phase": "IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call",
@@ -2722,8 +2723,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "no file_search_call emitted"
         },
         "S11": {
           "state": "skipped",
@@ -2740,10 +2741,84 @@ const PIPELINE = {
       }
     },
     {
+      "id": "ai_guardrails",
+      "name": "ai_guardrails",
+      "group": "irr-step",
+      "order": 28,
+      "phase": "IRR step request-body EOS; checks only newly produced local Responses tool results; records blocked/provider-failure verdicts for openai_agentic_loop; no response phase",
+      "config": {
+        "provider.type": "nemo",
+        "provider.endpoint": "http://127.0.0.1:3003/v1/checks",
+        "provider.guardrails.config_ids": [
+          "your-config"
+        ],
+        "provider.timeout_ms": 5000,
+        "provider.max_message_checks": 32,
+        "phase.request": false,
+        "phase.response": false,
+        "phase.tool_results": true
+      },
+      "promotes": "checks the new MCP, web-search, or file-search result suffix before it can be sent to the model on the next IRR round; a block or check failure is finalized by openai_agentic_loop",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S5": {
+          "state": "active",
+          "note": "checks the file-search result before model re-entry"
+        },
+        "S6": {
+          "state": "active",
+          "note": "checks the MCP result before model re-entry"
+        },
+        "S7": {
+          "state": "active",
+          "note": "checks the web-search result before model re-entry"
+        },
+        "S8": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S10": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no local tool result produced"
+        }
+      }
+    },
+    {
       "id": "openai_agentic_loop",
       "name": "openai_agentic_loop",
       "group": "irr-step",
-      "order": 28,
+      "order": 29,
       "phase": "IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)",
       "config": {
         "max_infer_iters": 7
@@ -2787,8 +2862,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "parses single round; action=done (no tools)"
         },
         "S11": {
           "state": "skipped",
@@ -2808,7 +2883,7 @@ const PIPELINE = {
       "id": "openai_client_tool_compat",
       "name": "openai_client_tool_compat",
       "group": "irr-step",
-      "order": 29,
+      "order": 30,
       "phase": "IRR step; request-phase lowers rich client-owned tools to private function tools in the request body; response-phase restores the returned function_call items; runs after openai_agentic_loop and before responses_to_chat_completions",
       "config": {
         "max_rewritten_body_bytes": 67108864,
@@ -2878,7 +2953,7 @@ const PIPELINE = {
       "id": "irr_headers",
       "name": "headers (IRR step)",
       "group": "irr-step",
-      "order": 30,
+      "order": 31,
       "phase": "IRR step request-phase; sets outbound header",
       "config": {
         "request_set": [
@@ -2927,8 +3002,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "sets Content-Type"
         },
         "S11": {
           "state": "skipped",
@@ -2948,7 +3023,7 @@ const PIPELINE = {
       "id": "irr_load_balancer",
       "name": "load_balancer (IRR step)",
       "group": "irr-step",
-      "order": 31,
+      "order": 32,
       "phase": "IRR step request-phase; selects the endpoint for the router-bound cluster (cluster_source:bound_upstream) and publishes its typed application_protocol BEFORE the protocol-adaptive body builders",
       "config": {
         "cluster_source": "bound_upstream",
@@ -3010,8 +3085,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S11": {
           "state": "skipped",
@@ -3031,7 +3106,7 @@ const PIPELINE = {
       "id": "openai_responses_proxy",
       "name": "openai_responses_proxy",
       "group": "irr-step",
-      "order": 32,
+      "order": 33,
       "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Responses (selected_upstream.application_protocol=openai_responses); response-phase handles buffered/streamed",
       "config": {
         "conditions": [
@@ -3077,8 +3152,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "active",
+          "note": "rebuilds body; buffered (stream:false)"
         },
         "S11": {
           "state": "skipped",
@@ -3095,10 +3170,10 @@ const PIPELINE = {
       }
     },
     {
-      "id": "responses_to_chat_completions",
-      "name": "responses_to_chat_completions",
+      "id": "openai_responses_to_chat_completions",
+      "name": "openai_responses_to_chat_completions",
       "group": "irr-step",
-      "order": 33,
+      "order": 34,
       "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Chat Completions; request-phase translates Responses-\u003eChat, response-phase (reverse) translates Chat-\u003eResponses",
       "config": {
         "max_rewritten_body_bytes": 33554432,
@@ -3152,8 +3227,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
         },
         "S11": {
           "state": "skipped",
@@ -3173,7 +3248,7 @@ const PIPELINE = {
       "id": "path_rewrite",
       "name": "path_rewrite",
       "group": "irr-step",
-      "order": 34,
+      "order": 35,
       "phase": "IRR step request-phase; rewrites the outbound path to /v1/chat/completions when the selected upstream speaks Chat Completions",
       "config": {
         "replace.pattern": "^/v1/responses/?$",
@@ -3221,8 +3296,8 @@ const PIPELINE = {
           "note": "IRR not entered"
         },
         "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
         },
         "S11": {
           "state": "skipped",
@@ -3280,7 +3355,7 @@ const PIPELINE = {
       {
         "order": 5,
         "depth": 0,
-        "filter_type": "openai_operation",
+        "filter_type": "ai_operation",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -3289,7 +3364,7 @@ const PIPELINE = {
       {
         "order": 6,
         "depth": 0,
-        "filter_type": "openai_responses_format",
+        "filter_type": "openai_responses_request",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -3559,7 +3634,7 @@ const PIPELINE = {
       {
         "order": 12,
         "depth": 0,
-        "filter_type": "openai_responses_validate",
+        "filter_type": "openai_responses_request",
         "name": null,
         "irr_step": null,
         "conditions": [
@@ -3631,7 +3706,7 @@ const PIPELINE = {
       {
         "order": 15,
         "depth": 0,
-        "filter_type": "openai_response_store",
+        "filter_type": "openai_responses_store",
         "name": null,
         "irr_step": null,
         "conditions": [
@@ -3819,7 +3894,7 @@ const PIPELINE = {
       {
         "order": 25,
         "depth": 1,
-        "filter_type": "openai_web_search",
+        "filter_type": "openai_web_search_dispatch",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3837,7 +3912,7 @@ const PIPELINE = {
       {
         "order": 27,
         "depth": 1,
-        "filter_type": "openai_file_search_callout",
+        "filter_type": "openai_file_search_dispatch",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3846,7 +3921,7 @@ const PIPELINE = {
       {
         "order": 28,
         "depth": 1,
-        "filter_type": "openai_agentic_loop",
+        "filter_type": "ai_guardrails",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3855,7 +3930,7 @@ const PIPELINE = {
       {
         "order": 29,
         "depth": 1,
-        "filter_type": "openai_client_tool_compat",
+        "filter_type": "openai_agentic_loop",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3864,7 +3939,7 @@ const PIPELINE = {
       {
         "order": 30,
         "depth": 1,
-        "filter_type": "headers",
+        "filter_type": "openai_client_tool_compat",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3873,7 +3948,7 @@ const PIPELINE = {
       {
         "order": 31,
         "depth": 1,
-        "filter_type": "load_balancer",
+        "filter_type": "headers",
         "name": null,
         "irr_step": "inference",
         "conditions": [],
@@ -3881,6 +3956,15 @@ const PIPELINE = {
       },
       {
         "order": 32,
+        "depth": 1,
+        "filter_type": "load_balancer",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 33,
         "depth": 1,
         "filter_type": "openai_responses_proxy",
         "name": null,
@@ -3897,9 +3981,9 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 33,
+        "order": 34,
         "depth": 1,
-        "filter_type": "responses_to_chat_completions",
+        "filter_type": "openai_responses_to_chat_completions",
         "name": null,
         "irr_step": "inference",
         "conditions": [
@@ -3914,7 +3998,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 34,
+        "order": 35,
         "depth": 1,
         "filter_type": "path_rewrite",
         "name": null,
@@ -4024,8 +4108,8 @@ const PIPELINE = {
       "id": "S10",
       "label": "Non-Responses body on /v1/responses",
       "request": "POST /v1/responses with Chat Completions / Anthropic / unclassified body",
-      "entersIRR": false,
-      "loopRounds": 0
+      "entersIRR": true,
+      "loopRounds": 1
     },
     {
       "id": "S11",
@@ -4082,7 +4166,7 @@ const PIPELINE = {
       ],
       "definedIn": "router route (model vllm-chat) + IRR-step load_balancer (cluster_source:bound_upstream)",
       "routedBy": "router binds this when x-praxis-ai-model is vllm-chat; the IRR inference step resolves it on 3001",
-      "note": "application_provider vllm, application_protocol openai_chat_completions -\u003e responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy"
+      "note": "application_provider vllm, application_protocol openai_chat_completions -\u003e openai_responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy"
     },
     {
       "name": "prompts-api",
@@ -4158,16 +4242,23 @@ const PIPELINE = {
       "name": "Vector store",
       "endpoint": "http://127.0.0.1:3002",
       "usedBy": [
-        "openai_file_search_callout (vector_store_url)",
+        "openai_file_search_dispatch (vector_store_url)",
         "vector-stores-backend cluster (/v1/vector_stores direct-services branch)"
       ],
       "credential": "user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts"
     },
     {
+      "name": "NeMo Guardrails",
+      "endpoint": "http://127.0.0.1:3003/v1/checks",
+      "usedBy": [
+        "ai_guardrails (local tool-result checks inside the IRR)"
+      ]
+    },
+    {
       "name": "Brave Search",
       "endpoint": "provider:brave (external Brave API)",
       "usedBy": [
-        "openai_web_search"
+        "openai_web_search_dispatch"
       ],
       "credential": "user_credential brave_search (per-user slot from x-user-brave-key); WEB_SEARCH_API_KEY still required by provider config; missing per-user slot fails closed (no shared-key fallback)"
     }
@@ -4213,7 +4304,7 @@ const SCEN_META = {
     "services": []
   },
   "S2": {
-    "narr": "\u003cb\u003eStreaming create.\u003c/b\u003e openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.",
+    "narr": "\u003cb\u003eStreaming create.\u003c/b\u003e openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_responses_store persists on the reverse path.",
     "clusters": [
       "inference-backend"
     ],
@@ -4234,35 +4325,38 @@ const SCEN_META = {
     "services": []
   },
   "S5": {
-    "narr": "\u003cb\u003eFile search loop.\u003c/b\u003e The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.",
+    "narr": "\u003cb\u003eFile search loop.\u003c/b\u003e The model emits file_search_call; openai_file_search_dispatch queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.",
     "clusters": [
       "inference-backend",
       "vector-stores-backend"
     ],
     "services": [
-      "Vector store"
+      "Vector store",
+      "NeMo Guardrails"
     ]
   },
   "S6": {
-    "narr": "\u003cb\u003eMCP loop.\u003c/b\u003e openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.",
+    "narr": "\u003cb\u003eMCP loop.\u003c/b\u003e openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.",
     "clusters": [
       "inference-backend"
     ],
     "services": [
-      "MCP server"
+      "MCP server",
+      "NeMo Guardrails"
     ]
   },
   "S7": {
-    "narr": "\u003cb\u003eWeb search loop.\u003c/b\u003e The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.",
+    "narr": "\u003cb\u003eWeb search loop.\u003c/b\u003e The model emits web_search_call; openai_web_search_dispatch executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.",
     "clusters": [
       "inference-backend"
     ],
     "services": [
-      "Brave Search"
+      "Brave Search",
+      "NeMo Guardrails"
     ]
   },
   "S8": {
-    "narr": "\u003cb\u003eGET retrieve.\u003c/b\u003e openai_response_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.",
+    "narr": "\u003cb\u003eGET retrieve.\u003c/b\u003e openai_responses_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.",
     "clusters": [],
     "services": []
   },
@@ -4274,8 +4368,10 @@ const SCEN_META = {
     "services": []
   },
   "S10": {
-    "narr": "\u003cb\u003eNon-Responses body.\u003c/b\u003e A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, so no router route matches — a route-miss returns a bare 404 before any body filter runs.",
-    "clusters": [],
+    "narr": "\u003cb\u003eChat/Anthropic body on /v1/responses.\u003c/b\u003e Operation identity is authoritative over body shape (#1602): ai_operation matches the POST /v1/responses head and openai_responses_request forces format=openai_responses, so a Chat/Anthropic/unclassified body routes by model through the Responses catch-all to the managed inference-backend and runs one IRR round, returning 200 - superseding the pre-#1602 route-miss 404.",
+    "clusters": [
+      "inference-backend"
+    ],
     "services": []
   },
   "S11": {
@@ -4299,7 +4395,7 @@ const SCEN_META = {
     "services": []
   },
   "S13": {
-    "narr": "\u003cb\u003eChat Completions backend.\u003c/b\u003e A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.",
+    "narr": "\u003cb\u003eChat Completions backend.\u003c/b\u003e A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so openai_responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.",
     "clusters": [
       "chat-completions-backend"
     ],
@@ -4336,12 +4432,12 @@ const WIRE = {
       "x-request-id: req_d1561f573ba741d7adf74a0ad57445f0"
     ],
     "resBody": "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_001\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}",
-    "notes": "Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_response_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.",
+    "notes": "Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_responses_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.",
     "provenance": [
       "examples/configs/openai/responses/full-flow-agentic.yaml:202-205",
       "examples/configs/openai/responses/full-flow-agentic.yaml:192-198",
       "tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:51-144",
-      "tests/integration/tests/suite/examples/openai_response_store.rs:20,48-78"
+      "tests/integration/tests/suite/examples/openai_responses_store.rs:20,48-78"
     ]
   },
   "S2": {
@@ -4432,11 +4528,11 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_final\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"fs_1\",\n      \"type\": \"file_search_call\",\n      \"status\": \"completed\",\n      \"queries\": [\n        \"deployment instructions\"\n      ],\n      \"results\": [\n        {\n          \"file_id\": \"file-readme\",\n          \"filename\": \"README.md\",\n          \"score\": 0.92,\n          \"content\": [\n            {\n              \"type\": \"text\",\n              \"text\": \"Deploy the gateway by building the container image with `make container`, then run it behind an auth boundary.\"\n            }\n          ],\n          \"attributes\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"msg_final\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Deploy by building the container image and running it.\",\n          \"annotations\": [\n            {\n              \"type\": \"file_citation\",\n              \"file_id\": \"file-readme\",\n              \"filename\": \"README.md\",\n              \"index\": 54\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 12,\n    \"total_tokens\": 42\n  }\n}",
-    "notes": "Buffered final composed object after a 2-round model-\u003etool-\u003emodel loop. Round 1: model emits a pending file_search_call (id fs_1, status \"searching\", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {\"query\":\"deployment instructions\",\"rewrite_query\":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a \u003c|file-readme|\u003e marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:[\"file_search_call.results\"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).",
+    "notes": "Buffered final composed object after a 2-round model-\u003etool-\u003emodel loop. Round 1: model emits a pending file_search_call (id fs_1, status \"searching\", queries). openai_file_search_dispatch POSTs a vector-store query to 127.0.0.1:3002 with body {\"query\":\"deployment instructions\",\"rewrite_query\":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a \u003c|file-readme|\u003e marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:[\"file_search_call.results\"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).",
     "provenance": [
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:1190-1305",
-      "tests/integration/tests/suite/examples/file_search_callout.rs:37-146",
-      "apis/src/openai/responses/file_search_callout/citations.rs:158-213",
+      "tests/integration/tests/suite/examples/file_search_dispatch.rs:37-146",
+      "apis/src/openai/responses/file_search_dispatch/citations.rs:158-213",
       "apis/src/openai/include.rs:206-224",
       "examples/configs/openai/responses/full-flow-agentic.yaml:585-607"
     ]
@@ -4469,8 +4565,8 @@ const WIRE = {
       "tests/integration/tests/suite/examples/openai_agentic_loop.rs:2106-2264",
       "tests/integration/tests/suite/examples/openai_agentic_loop.rs:6813-6819",
       "tests/integration/tests/suite/examples/openai_mcp_streaming.rs:56-137",
-      "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2606-2635",
-      "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2705-2715",
+      "apis/src/openai/responses/mcp_tool_resolve/mod.rs:2606-2635",
+      "apis/src/openai/responses/mcp_tool_resolve/mod.rs:2705-2715",
       "apis/src/openai/responses/mcp_dispatch/mod.rs:1774-1816",
       "apis/src/openai/responses/mcp_dispatch/mod.rs:1630-1716"
     ]
@@ -4491,13 +4587,13 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_0a1b2c3d4e5f60718293a4b5c6\",\n  \"object\": \"response\",\n  \"created_at\": 1783307880,\n  \"status\": \"completed\",\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"output\": [\n    {\n      \"type\": \"web_search_call\",\n      \"id\": \"ws_68a1f0c2d1348190a7c3e5f102\",\n      \"status\": \"completed\",\n      \"action\": {\n        \"type\": \"search\",\n        \"query\": \"latest Toronto Raptors headlines\"\n      }\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_68a1f0c3a2b48190b4d6f70213\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The Raptors are finalizing their rotation ahead of the season opener, with Scottie Barnes expected to take on a larger playmaking role, and the team added frontcourt depth in a roster move this week.\",\n          \"annotations\": [\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.nba.com/raptors/news\",\n              \"title\": \"Toronto Raptors News | NBA.com\",\n              \"start_index\": 0,\n              \"end_index\": 132\n            },\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.sportsnet.ca/nba/toronto-raptors/\",\n              \"title\": \"Toronto Raptors - Sportsnet\",\n              \"start_index\": 134,\n              \"end_index\": 195\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 318,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 96,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 414\n  }\n}",
-    "notes": "Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:[\"web_search_call.action.sources\"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.",
+    "notes": "Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search_dispatch executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:[\"web_search_call.action.sources\"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.",
     "provenance": [
       "examples/configs/openai/responses/full-flow-agentic.yaml:551-565",
       "examples/configs/openai/responses/full-flow-agentic.yaml:326-337",
-      "apis/src/openai/responses/web_search/mod.rs:819-856",
-      "apis/src/openai/responses/file_search_callout/citations.rs:507-512",
-      "apis/src/openai/responses/file_search_callout/citations.rs:563",
+      "apis/src/openai/responses/web_search_dispatch/mod.rs:819-856",
+      "apis/src/openai/responses/file_search_dispatch/citations.rs:507-512",
+      "apis/src/openai/responses/file_search_dispatch/citations.rs:563",
       "tests/integration/fixtures/agentic_api/web_search_nonstreaming.json:25-83",
       "tests/integration/fixtures/inference/recordings/synthetic/responses/chat-web-search.json:63-92",
       "tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:139-175",
@@ -4520,15 +4616,15 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}",
-    "notes": "openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.",
+    "notes": "openai_responses_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.",
     "provenance": [
       "apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)",
       "apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)",
       "apis/src/openai/responses/store/filter.rs:1034-1037 (owner-scoped via require_state_owner)",
-      "tests/integration/tests/suite/examples/openai_response_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)",
+      "tests/integration/tests/suite/examples/openai_responses_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:33 (FIRST_RESPONSE_JSON completed shape), 441-452 (GET stored streamed resource, status/output asserted)",
       "tests/integration/tests/suite/codex_http.rs:1105-1114 (OpenResponses usage: input_tokens_details.cached_tokens + output_tokens_details.reasoning_tokens required)",
-      "examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_response_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)"
+      "examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_responses_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)"
     ]
   },
   "S9": {
@@ -4570,22 +4666,21 @@ const WIRE = {
       "x-auth-tenant: integration-tenant",
       "x-auth-user: integration-user"
     ],
-    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
-    "resStatus": "404 Not Found",
-    "resKind": "none",
+    "reqBody": "{\n  \"model\": \"gpt-4\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
     "resHeaders": [
-      "Connection: close"
+      "Content-Type: application/json"
     ],
-    "resBody": "",
-    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so none of the router's /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.",
+    "resBody": "{\n  \"id\": \"resp_chat_body\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"model\": \"gpt-4\",\n  \"status\": \"completed\",\n  \"output\": []\n}",
+    "notes": "Operation identity is authoritative over body shape (#1602). ai_operation matches the request head POST /v1/responses -\u003e createResponse (application_protocol=openai_responses), and openai_responses_request's classify_matched_operation then forces format=openai_responses for the matched create body regardless of its {model,messages} Chat shape, promoting x-praxis-ai-format:openai_responses and x-praxis-ai-model:gpt-4. The model-specific /v1/responses routes do not match (gpt-5 and vllm-chat require their x-praxis-ai-model), so the body falls to the Responses catch-all (path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend). That cluster is not application_provider=openai, so the direct-OpenAI branch is skipped and the managed path handles the request, reaching the inference backend which returns a Response object -\u003e 200. This supersedes the pre-#1602 behavior, where a Chat/Anthropic-shaped body demoted the format fact and missed every format-constrained route, yielding a bare 404. The resBody mirrors the minimal completed Response the integration test's capturing backend returns (output shape is produced by the real inference backend).",
     "provenance": [
-      "examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
+      "apis/src/openai/responses/request/mod.rs:550-552 (classify_matched_operation forces classified.format = AiRequestFormat::Responses for a matched Responses create body, so body shape never demotes the format fact)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:432-435 (router Responses catch-all: path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend, reached once the gpt-5/vllm-chat model routes miss)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-532 (full_flow_chat_completions_body_on_responses_path_is_treated_as_responses asserts 200 and the backend receives the request once)",
       {
-        "tests/integration/tests/suite/examples/full_flow_agentic.rs:521-560 (full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend": "same route-miss for an Anthropic body)"
-      },
-      "~/.cargo/registry/.../praxis-proxy-filter-0.7.1/src/builtins/http/traffic_management/router/mod.rs (route-miss =\u003e Rejection::status(404), body:None) [praxis core dep]",
-      "~/.cargo/registry/.../praxis-proxy-protocol-0.7.1/src/http/pingora/convert.rs (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:534-577 (full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses": "same Responses routing for an Anthropic-shaped body)"
+      }
     ]
   },
   "S11": {
@@ -4626,7 +4721,7 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}",
-    "notes": "model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_validate, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider's response (status:queued) is returned verbatim without gateway composition.",
+    "notes": "model gpt-5 makes the pre-routing openai_responses_request publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so the managed openai_responses_request owner, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider's response (status:queued) is returned verbatim without gateway composition.",
     "provenance": [
       {
         "tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough": "200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)"
@@ -4653,12 +4748,12 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}",
-    "notes": "model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object==\"response\" and output[0].content[0].text==\"translated\"; the id shown is gateway-generated (openai_responses_validate ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.",
+    "notes": "model vllm-chat makes the pre-routing openai_responses_request publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires openai_responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path openai_responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object==\"response\" and output[0].content[0].text==\"translated\"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.",
     "provenance": [
       {
         "tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding": "200, response.object==response + output text \"translated\"; backend gets one /v1/chat/completions request whose body has messages and no input)"
       },
-      "examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -\u003e chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)"
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -\u003e chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; openai_responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)"
     ]
   },
   "S14": {
@@ -4772,7 +4867,7 @@ const TIMELINE = {
     ]
   },
   "S5": {
-    "summary": "Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_callout POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose \u003c|file-q4|\u003e marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.",
+    "summary": "Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_dispatch POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose \u003c|file-q4|\u003e marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.",
     "rounds": "2 rounds · hosted file_search",
     "steps": [
       {
@@ -4832,16 +4927,16 @@ const TIMELINE = {
         "from": "gateway",
         "to": "vector-store",
         "kind": "request",
-        "title": "openai_file_search_callout searches the vector store",
+        "title": "openai_file_search_dispatch searches the vector store",
         "channel": "POST http://127.0.0.1:3002/v1/vector_stores/vs_q4/search",
-        "note": "VERIFIED. Exactly one POST callout (S5 asserts search_callouts.len()==1 at :1281-1283). Body shape confirmed by the sibling assertion query==\"What were the Q4 results?\" + rewrite_query==false (file_search_callout.rs:131-133) and by VectorStoreSearchRequest (client.rs:120-143, rewrite_query always false at :138/:159). URL path v1/vector_stores/{store_id}/search built by search_url/resource_url (client.rs:887-903); destination is vector_store_url http://127.0.0.1:3002 (config :586). Headers asserted at :1284-1304: authorization: bearer integration-ogx-key (scoped ogx_files slot, NOT client search-key), x-tenant-id, x-user-id, no x-auth-*. Outbound chain sets X-Vector-Store-Client: praxis-ai-gateway (config :596-599). Request also carries optional filters/max_num_results/ranking_options/search_mode (omitted, skip_serializing_if none, not asserted).",
+        "note": "VERIFIED. Exactly one POST callout (S5 asserts search_callouts.len()==1 at :1281-1283). Body shape confirmed by the sibling assertion query==\"What were the Q4 results?\" + rewrite_query==false (file_search_dispatch.rs:131-133) and by VectorStoreSearchRequest (client.rs:120-143, rewrite_query always false at :138/:159). URL path v1/vector_stores/{store_id}/search built by search_url/resource_url (client.rs:887-903); destination is vector_store_url http://127.0.0.1:3002 (config :586). Headers asserted at :1284-1304: authorization: bearer integration-ogx-key (scoped ogx_files slot, NOT client search-key), x-tenant-id, x-user-id, no x-auth-*. Outbound chain sets X-Vector-Store-Client: praxis-ai-gateway (config :596-599). Request also carries optional filters/max_num_results/ranking_options/search_mode (omitted, skip_serializing_if none, not asserted).",
         "bodyKind": "json",
         "body": "{\"query\": \"What were the Q4 results?\", \"rewrite_query\": false}",
         "provenance": [
-          "tests/integration/tests/suite/examples/file_search_callout.rs:131-133",
+          "tests/integration/tests/suite/examples/file_search_dispatch.rs:131-133",
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1281-1304",
-          "apis/src/openai/responses/file_search_callout/client.rs:120-143",
-          "apis/src/openai/responses/file_search_callout/client.rs:786-902",
+          "apis/src/openai/responses/file_search_dispatch/client.rs:120-143",
+          "apis/src/openai/responses/file_search_dispatch/client.rs:786-902",
           "examples/configs/openai/responses/full-flow-agentic.yaml:585-607"
         ]
       },
@@ -4858,8 +4953,8 @@ const TIMELINE = {
         "body": "{\"data\": [{\"file_id\": \"file-q4\", \"filename\": \"q4-results.txt\", \"score\": 0.99, \"content\": [{\"type\": \"text\", \"text\": \"Q4 revenue was $42 million.\"}], \"attributes\": null}]}",
         "provenance": [
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1225-1234",
-          "apis/src/openai/responses/file_search_callout/tests.rs:611-612",
-          "apis/src/openai/responses/file_search_callout/mod.rs:1339-1366"
+          "apis/src/openai/responses/file_search_dispatch/tests.rs:611-612",
+          "apis/src/openai/responses/file_search_dispatch/mod.rs:1339-1366"
         ]
       },
       {
@@ -4874,10 +4969,10 @@ const TIMELINE = {
         "bodyKind": "json",
         "body": "{\"model\": \"gpt-4.1\", …, \"input\": [ …prior items…, {\"type\": \"function_call\", \"call_id\": \"file_search_0_\u003chash16\u003e\", \"name\": \"file_search\", \"arguments\": \"{\\\"query\\\":\\\"What were the Q4 results?\\\"}\", \"status\": \"completed\"}, {\"type\": \"function_call_output\", \"call_id\": \"file_search_0_\u003chash16\u003e\", \"output\": \"file_search found 1 chunks for \\\"What were the Q4 results?\\\":\\n[0] q4-results.txt (score: 0.99) cite as \u003c|file-q4|\u003e\\nQ4 revenue was $42 million.\\n\"}]}",
         "provenance": [
-          "apis/src/openai/responses/file_search_callout/mod.rs:1339-1366",
-          "apis/src/openai/responses/file_search_callout/tests.rs:520-536",
-          "apis/src/openai/responses/file_search_callout/model_context.rs:26-29",
-          "apis/src/openai/responses/file_search_callout/model_context.rs:382",
+          "apis/src/openai/responses/file_search_dispatch/mod.rs:1339-1366",
+          "apis/src/openai/responses/file_search_dispatch/tests.rs:520-536",
+          "apis/src/openai/responses/file_search_dispatch/model_context.rs:26-29",
+          "apis/src/openai/responses/file_search_dispatch/model_context.rs:382",
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1261-1279"
         ]
       },
@@ -4905,13 +5000,13 @@ const TIMELINE = {
         "kind": "response",
         "title": "Final /v1/responses object returned to client",
         "channel": "200 http://127.0.0.1:8080/v1/responses",
-        "note": "VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The \u003c|file-q4|\u003e marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_callout.rs:117-125: text==\"Q4 revenue was $42 million\", annotations[0].file_id==\"file-q4\") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.",
+        "note": "VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The \u003c|file-q4|\u003e marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_dispatch.rs:117-125: text==\"Q4 revenue was $42 million\", annotations[0].file_id==\"file-q4\") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.",
         "bodyKind": "json",
         "body": "{\"id\": \"resp_final\", \"object\": \"response\", \"status\": \"completed\", \"output\": [{\"id\": \"fs_1\", \"type\": \"file_search_call\", \"status\": \"completed\", \"queries\": [\"What were the Q4 results?\"]}, {\"id\": \"msg_final\", \"type\": \"message\", \"role\": \"assistant\", \"status\": \"completed\", \"content\": [{\"type\": \"output_text\", \"text\": \"Q4 revenue was $42 million\", \"annotations\": [{\"type\": \"file_citation\", \"file_id\": \"file-q4\", \"filename\": \"q4-results.txt\", \"index\": …}]}]}]}",
         "provenance": [
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1254-1259",
-          "tests/integration/tests/suite/examples/file_search_callout.rs:117-125",
-          "apis/src/openai/responses/file_search_callout/citations.rs:209-212"
+          "tests/integration/tests/suite/examples/file_search_dispatch.rs:117-125",
+          "apis/src/openai/responses/file_search_dispatch/citations.rs:209-212"
         ]
       }
     ]
@@ -5120,7 +5215,7 @@ const TIMELINE = {
         "kind": "response",
         "title": "Composed /v1/responses object returned to client",
         "channel": "200 http://localhost:8080/v1/responses",
-        "note": "Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_response_store (yaml:372-379) persists it for GET /v1/responses/{id}.",
+        "note": "Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_responses_store (yaml:372-379) persists it for GET /v1/responses/{id}.",
         "bodyKind": "json",
         "body": "{\"id\":\"resp_2\",\"object\":\"response\",\"status\":\"completed\",\"output\":[…,{\"type\":\"mcp_call\",\"id\":\"call_abc\",\"server_label\":\"weather\",\"name\":\"get_weather\",\"output\":\"mock result for get_weather\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"The weather in SF is 72F and sunny.\"}]}]}",
         "provenance": [
@@ -5133,7 +5228,7 @@ const TIMELINE = {
     ]
   },
   "S7": {
-    "summary": "Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml's web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml's own structural guards; hence grounded:false.",
+    "summary": "Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml's web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search_dispatch Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml's own structural guards; hence grounded:false.",
     "rounds": "2 rounds · web_search (+ fail-closed variant)",
     "steps": [
       {
@@ -5176,7 +5271,7 @@ const TIMELINE = {
         "kind": "response",
         "title": "Round-1 inference emits a web_search_call item",
         "channel": "200 POST http://127.0.0.1:3001/v1/responses",
-        "note": "openai_agentic_loop parses this, records the web_search_call assignment for the openai_web_search dispatcher, and publishes action=loop.",
+        "note": "openai_agentic_loop parses this, records the web_search_call assignment for the openai_web_search_dispatch dispatcher, and publishes action=loop.",
         "bodyKind": "json",
         "body": "{\"id\":\"resp_ws_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"Rust 2025 edition\"}}]}",
         "provenance": [
@@ -5189,7 +5284,7 @@ const TIMELINE = {
         "from": "gateway",
         "to": "brave",
         "kind": "request",
-        "title": "openai_web_search Brave callout (deferred per-user x-subscription-token)",
+        "title": "openai_web_search_dispatch Brave callout (deferred per-user x-subscription-token)",
         "channel": "GET https://api.search.brave.com/res/v1/web/search?q=Rust%202025%20edition\u0026count=5",
         "note": "URL modeled by build_brave_request: {base}/res/v1/web/search?q={percent-encoded query}\u0026count={count}; count=5 from default_context_size Medium (result_count). Only Accept: application/json rides in-chain; the API key is staged as a deferred x-subscription-token injected only at the resolved authority. With user_credential: brave_search the per-user secret from x-user-brave-key is used, not the shared api_key — the slot wiring (brave_search slot, source_header x-user-brave-key, web_search user_credential brave_search) is proven structurally by full_flow_agentic.rs:1409-1457, and the runtime behavior by scoped-credentials: callout carries 'x-subscription-token: alice-brave-secret', shared 'test-key' absent, 'x-user-brave-key' stripped. In the round-trip functional test the provider base_url is patched to a local mock via load_web_search_config (openai_agentic_loop.rs:5506-5509).",
         "bodyKind": "none",
@@ -5233,7 +5328,7 @@ const TIMELINE = {
         "body": "{…, \"input\":[ …, {\"type\":\"function_call\",\"call_id\":\"\u003cbridge\u003e\",\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Rust 2025 edition\\\"}\",\"status\":\"completed\"}, {\"type\":\"function_call_output\",\"call_id\":\"\u003cbridge\u003e\",\"output\":\"[1] Rust 2025 Edition\\nhttps://blog.rust-lang.org/2025\\nThe Rust 2025 edition is here.\"} ]}",
         "provenance": [
           "tests/integration/tests/suite/examples/openai_agentic_loop.rs:3309-3341",
-          "apis/src/openai/responses/web_search/mod.rs:876-905",
+          "apis/src/openai/responses/web_search_dispatch/mod.rs:876-905",
           "apis/src/web_search/mod.rs:66-82"
         ]
       },
@@ -5335,7 +5430,7 @@ const GROUPS = {
 function filterColor(f){
   if(f.group!=="irr-step") return GROUPS[f.group].c;
   if(f.id==="openai_agentic_loop") return "var(--c-loop)";
-  if(["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)) return "var(--c-dispatch)";
+  if(["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)) return "var(--c-dispatch)";
   if(f.id==="openai_stream_events") return "var(--c-classification)";
   if(["irr_router","irr_load_balancer","openai_responses_proxy"].includes(f.id)) return "var(--c-backend)";
   return "var(--c-context)";
@@ -5361,7 +5456,7 @@ function fmtBytes(n){
    ========================================================================= */
 (function renderTiles(){
   const wrap=document.getElementById("tiles");
-  const disp=PIPELINE.filters.filter(f=>["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)).length;
+  const disp=PIPELINE.filters.filter(f=>["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)).length;
   const tiles=[
     ["Filters",PIPELINE.filters.length,""],
     ["Dispatchers",disp,""],
@@ -5614,7 +5709,7 @@ function setDonut(d,v){
   const k=PIPELINE.knobs;
   const foot=document.getElementById("foot");
   foot.innerHTML=
-    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_response_store is pre-IRR (#9) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
+    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_responses_store is pre-IRR (#9) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
     "<b>Trace + scoped credentials.</b> trace_context (#1) establishes a typed correlation identity BEFORE the IRR snapshots request extensions, so every nested web-search / OGX / MCP callout keeps this request's trace while Praxis core mints a fresh span per hop. callout_credentials captures per-user secrets into typed slots (brave_search / ogx_files / mcp_gateway) and STRIPS the raw x-user-* ingress headers; each dispatcher selects only its slot (web_search→brave_search, file_resolve + file_search→ogx_files, MCP→mcp_gateway), and the legacy raw authorization forward has been dropped from the file callouts. Unified in #1341, callout_credentials (#3) also captures the MCP authorization assertion in the same establishing filter: it deletes any client-supplied x-mcp-authorized and sets a verified, opaque, short-lived assertion forwarded unchanged ONLY to configured connector_id targets — the MCP Gateway makes the authorization decision. (The former standalone callout_authorization filter was removed in #1341.)<br><br>"+
     "<b>Timeouts</b> "+k.timeout_ms+" ms loop / "+k.step_timeout_ms+" ms step · "+
     "<b>Byte caps</b> response "+fmtBytes(k.max_response_bytes)+" · state "+fmtBytes(k.max_state_bytes)+" · "+
