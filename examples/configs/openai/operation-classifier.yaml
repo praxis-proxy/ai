@@ -87,8 +87,7 @@
 #   # falls through to the default backend
 #   curl -X PUT http://localhost:8080/v1/responses
 #
-#   # classified anthropic_messages/messages_post -> default backend here;
-#   # see anthropic/unified-gateway.yaml for a branch on it
+#   # classified anthropic_messages/messages_post -> anthropic backend
 #   curl -X POST http://localhost:8080/v1/messages \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"claude-opus-4-8","max_tokens":16,"messages":[]}'
@@ -173,6 +172,19 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "vector-stores-backend"
             rejoin: shared_load_balancer
+          - name: anthropic-messages
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: anthropic_messages
+            chains:
+              - name: anthropic-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "anthropic-backend"
+            rejoin: shared_load_balancer
 
       # Default: anything that did not branch, classified or not.
       - filter: router
@@ -198,6 +210,9 @@ filter_chains:
           - name: "vector-stores-backend"
             endpoints:
               - "127.0.0.1:3005"
+          - name: "anthropic-backend"
+            endpoints:
+              - "127.0.0.1:3006"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
