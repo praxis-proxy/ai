@@ -45,7 +45,7 @@ insecure_options:
     }
 
     #[test]
-    fn resolve_pipelines_hands_connector_to_the_runtime_registry() {
+    fn registry_clone_preserves_connector_and_pipelines_build_successfully() {
         let config = Config::from_yaml(CONFIG).expect("the test config must parse");
         let client = client(&config);
         let expected_connector = client.connector().clone();
