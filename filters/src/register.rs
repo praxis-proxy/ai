@@ -21,7 +21,8 @@ use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    ProviderRouteFilter, ServiceAccountTokenFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -264,6 +265,11 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
     );
     register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
     register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+    register_routing_security_filter(
+        registry,
+        "service_account_token",
+        ServiceAccountTokenFilter::from_config,
+    );
 }
 
 /// Register a routing HTTP filter as security-critical.

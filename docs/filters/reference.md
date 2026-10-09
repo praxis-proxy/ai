@@ -143,6 +143,7 @@ see the [Praxis core filter reference][core-ref].
 | [`credential_inject`](credential_inject.md) | Replaces caller credentials with the upstream credential selected by `intelligent_route` or `provider_route`. |
 | [`intelligent_route`](intelligent_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
 | [`provider_route`](provider_route.md) | Exact provider-local mapping from an authenticated intelligent routing selection to a private backend cluster. |
+| [`service_account_token`](service_account_token.md) | Reads a bearer token from a file fresh on every request and injects it into the configured header. See the module documentation for the complete rotation and security model. |
 
 ### Time To First Token
 

@@ -48,7 +48,7 @@ pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
-pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
+pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter, ServiceAccountTokenFilter};
 #[cfg(feature = "store")]
 pub use store_readiness::{FILTER_NAME as STORE_READINESS_GATE_FILTER_NAME, StoreReadinessGateFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;

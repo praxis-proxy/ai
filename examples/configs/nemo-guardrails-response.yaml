@@ -5,6 +5,10 @@
 # the upstream. This config is used by integration tests to verify
 # response-phase behavior in isolation.
 #
+# The nemo-outbound chain authenticates NeMo callouts with a Kubernetes
+# projected `serviceAccountToken` volume; see nemo-guardrails.yaml for
+# the full explanation and the Pod spec needed to project the token.
+#
 #   Response phase:
 #     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
@@ -49,6 +53,8 @@ filter_chains:
 
   - name: nemo-outbound
     filters:
+      - filter: service_account_token
+        token_file: /var/run/secrets/tokens/nemo/token
       - filter: request_id
 
 insecure_options:
