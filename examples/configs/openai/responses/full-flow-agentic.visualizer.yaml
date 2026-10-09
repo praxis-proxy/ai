@@ -1005,8 +1005,8 @@ pipeline:
         state: skipped
         note: direct-services terminal branch; never reached
       S10:
-        state: skipped
-        note: route-miss (404); never reached
+        state: passthrough
+        note: managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert
       S11:
         state: skipped
         note: direct-services terminal branch; never reached
@@ -1536,8 +1536,8 @@ pipeline:
         state: skipped
         note: IRR not entered
       S10:
-        state: skipped
-        note: IRR not entered
+        state: passthrough
+        note: managed inference round entered; no rich client tools declared; body unchanged
       S11:
         state: skipped
         note: IRR not entered
