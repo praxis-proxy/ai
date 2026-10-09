@@ -5,8 +5,9 @@
 //!
 //! The exact configured model/path pair sets the internal
 //! `x-praxis-ai-provider` route selector, rewrites the request body's `model`
-//! field, and records the client-facing model ID in filter metadata for the
-//! provider response adapter. Unknown models and paths pass through unchanged.
+//! field, and records the client-facing model ID in filter metadata for a
+//! provider response adapter. Responses are never rewritten here. Unknown
+//! models and paths pass through unchanged.
 //! Configuration is local to the filter pipeline; this filter does not watch
 //! Kubernetes resources or perform request-time control-plane lookups.
 
@@ -97,6 +98,11 @@ struct ModelProviderMapping {
 /// for provider response adapters. Unknown models and paths pass through.
 /// Configuration is pipeline-local: the filter performs no Kubernetes or
 /// other control-plane lookups.
+///
+/// The filter does not restore the client-facing model ID in responses, so a
+/// provider that echoes the model it served returns `target_model` to the
+/// client. A provider response adapter that needs the client-facing ID must
+/// read it from the `model_to_provider.client_model` metadata key.
 ///
 /// # YAML configuration
 ///

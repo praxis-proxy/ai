@@ -1,6 +1,7 @@
 # Map a stable public model ID to a provider route and provider-specific model.
 # The router consumes the reserved x-praxis-ai-provider header; the provider
-# receives the rewritten body model.
+# receives the rewritten body model. Responses are not rewritten back, so the
+# client sees the provider's model ID (vertex/claude-sonnet-4-5).
 listeners:
   - name: model-to-provider
     address: "127.0.0.1:8080"
