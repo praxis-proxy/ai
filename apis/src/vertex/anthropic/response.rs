@@ -19,23 +19,25 @@
 
 use serde_json::{Map, Value};
 
-use crate::{anthropic::error_body, openai::sse::SseFrame};
+use crate::{
+    anthropic::{ErrorType, error_body},
+    openai::sse::SseFrame,
+};
 
 /// Map an HTTP status to the Anthropic error type clients retry on.
 /// Vertex Google-envelope statuses (`RESOURCE_EXHAUSTED` → 429,
 /// `UNAUTHENTICATED` → 401, …) share the numeric code semantics.
-fn anthropic_error_type(status: u16) -> &'static str {
+/// `413` falls back to `invalid_request_error` because
+/// `request_too_large` is not part of the pinned Anthropic error schema.
+fn anthropic_error_type(status: u16) -> ErrorType {
     match status {
-        400 | 409 | 422 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        500..=502 => "api_error",
-        503 | 504 => "overloaded_error",
-        _ if status >= 500 => "api_error",
-        _ => "invalid_request_error",
+        401 => ErrorType::Authentication,
+        403 => ErrorType::Permission,
+        404 => ErrorType::NotFound,
+        429 => ErrorType::RateLimit,
+        503 | 504 => ErrorType::Overloaded,
+        500.. => ErrorType::Api,
+        _ => ErrorType::InvalidRequest,
     }
 }
 
@@ -148,12 +150,18 @@ mod tests {
         );
 
         for (status, expected) in [
-            (401_u16, "authentication_error"),
+            (400_u16, "invalid_request_error"),
+            (401, "authentication_error"),
             (403, "permission_error"),
             (404, "not_found_error"),
-            (413, "request_too_large"),
+            (409, "invalid_request_error"),
+            (413, "invalid_request_error"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
             (500, "api_error"),
+            (502, "api_error"),
             (503, "overloaded_error"),
+            (504, "overloaded_error"),
             (520, "api_error"),
         ] {
             let body = json!({"error": {"code": status, "message": "x"}}).to_string();

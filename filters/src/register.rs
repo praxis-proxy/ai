@@ -325,7 +325,8 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "vertex" => praxis_ai_apis::vertex::VertexFilter::from_config
+        http "anthropic_messages_to_vertexai_anthropic" =>
+            praxis_ai_apis::vertex::AnthropicMessagesToVertexaiAnthropicFilter::from_config
     );
 }
 

@@ -16,7 +16,7 @@
 # so it can be exercised without GCP credentials.
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/vertex-anthropic.yaml
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/vertex/messages-to-anthropic.yaml
 
 listeners:
   - name: gateway
@@ -31,7 +31,7 @@ filter_chains:
         routes:
           - path_prefix: "/"
             cluster: vertex
-      - filter: vertex
+      - filter: anthropic_messages_to_vertexai_anthropic
         project: my-gcp-project
         # location: global          # default; use a regional location for data residency
         # model_prefix: "vertex/"   # user-facing ids are stripped to publisher ids

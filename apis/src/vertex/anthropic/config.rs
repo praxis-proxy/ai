@@ -16,12 +16,15 @@ pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 33_554_432;
 /// `claude-sonnet-4-5`).
 pub(crate) const DEFAULT_MODEL_PREFIX: &str = "vertex/";
 
-/// YAML configuration for the [`VertexFilter`].
+/// YAML-facing filter name, shared with the filter module.
+pub(super) const FILTER_NAME: &str = "anthropic_messages_to_vertexai_anthropic";
+
+/// YAML configuration for the [`AnthropicMessagesToVertexaiAnthropicFilter`].
 ///
-/// [`VertexFilter`]: super::VertexFilter
+/// [`AnthropicMessagesToVertexaiAnthropicFilter`]: super::AnthropicMessagesToVertexaiAnthropicFilter
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct VertexConfig {
+pub(crate) struct VertexAnthropicConfig {
     /// GCP project the upstream URL is built against.
     pub project: String,
 
@@ -54,17 +57,17 @@ pub(crate) struct VertexConfig {
     pub max_body_bytes: usize,
 }
 
-/// Serde default for [`VertexConfig::location`].
+/// Serde default for [`VertexAnthropicConfig::location`].
 fn default_location() -> String {
     "global".to_owned()
 }
 
-/// Serde default for [`VertexConfig::model_prefix`].
+/// Serde default for [`VertexAnthropicConfig::model_prefix`].
 fn default_model_prefix() -> String {
     DEFAULT_MODEL_PREFIX.to_owned()
 }
 
-/// Serde default for [`VertexConfig::max_body_bytes`].
+/// Serde default for [`VertexAnthropicConfig::max_body_bytes`].
 fn default_max_body_bytes() -> usize {
     DEFAULT_MAX_BODY_BYTES
 }
@@ -92,29 +95,32 @@ fn validate_path_component(filter: &str, field: &str, value: &str) -> Result<(),
 /// Validate the parsed configuration: every field that lands verbatim
 /// in the upstream URL is checked at config time, so a misconfiguration
 /// fails at pipeline build rather than per request.
-pub(crate) fn build_config(cfg: VertexConfig) -> Result<VertexConfig, FilterError> {
-    const FILTER: &str = "vertex";
+pub(crate) fn build_config(cfg: VertexAnthropicConfig) -> Result<VertexAnthropicConfig, FilterError> {
     praxis_filter::builtins::http::payload_processing::config_validation::validate_max_body_bytes(
-        FILTER,
+        FILTER_NAME,
         cfg.max_body_bytes,
     )?;
-    validate_path_component(FILTER, "project", &cfg.project)?;
-    validate_path_component(FILTER, "location", &cfg.location)?;
+    validate_path_component(FILTER_NAME, "project", &cfg.project)?;
+    validate_path_component(FILTER_NAME, "location", &cfg.location)?;
     if let Some(pin) = &cfg.model_pin {
-        validate_path_component(FILTER, "model_pin", pin)?;
+        validate_path_component(FILTER_NAME, "model_pin", pin)?;
     }
     for entry in &cfg.beta_allowlist {
         if entry.trim().is_empty() {
-            return Err(FilterError::from("vertex: beta_allowlist entries must not be empty"));
+            return Err(FilterError::from(format!(
+                "{FILTER_NAME}: beta_allowlist entries must not be empty"
+            )));
         }
         if entry.contains(['\r', '\n', ',']) {
-            return Err(FilterError::from(
-                "vertex: beta_allowlist entries must be bare flag values (no commas or newlines)",
-            ));
+            return Err(FilterError::from(format!(
+                "{FILTER_NAME}: beta_allowlist entries must be bare flag values (no commas or newlines)"
+            )));
         }
     }
     if cfg.model_prefix.is_empty() {
-        return Err(FilterError::from("vertex: model_prefix must not be empty"));
+        return Err(FilterError::from(format!(
+            "{FILTER_NAME}: model_prefix must not be empty"
+        )));
     }
     Ok(cfg)
 }
@@ -124,9 +130,9 @@ pub(crate) fn build_config(cfg: VertexConfig) -> Result<VertexConfig, FilterErro
 mod tests {
     use super::*;
 
-    fn config(yaml: &str) -> Result<VertexConfig, FilterError> {
+    fn config(yaml: &str) -> Result<VertexAnthropicConfig, FilterError> {
         let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        let cfg: VertexConfig = serde_yaml::from_value(parsed).unwrap();
+        let cfg: VertexAnthropicConfig = serde_yaml::from_value(parsed).unwrap();
         build_config(cfg)
     }
 

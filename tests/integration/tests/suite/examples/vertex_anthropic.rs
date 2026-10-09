@@ -30,7 +30,7 @@ fn anthropic_request(body: &str) -> String {
 
 fn patched_example(proxy_port: u16, backend_port: u16) -> praxis_core::config::Config {
     super::load_example_config(
-        "vertex-anthropic.yaml",
+        "vertex/messages-to-anthropic.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port)]),
     )
@@ -39,7 +39,7 @@ fn patched_example(proxy_port: u16, backend_port: u16) -> praxis_core::config::C
 #[test]
 fn vertex_anthropic_config_parses() {
     let config = super::load_example_config(
-        "vertex-anthropic.yaml",
+        "vertex/messages-to-anthropic.yaml",
         29930,
         HashMap::from([("127.0.0.1:3000", 29931_u16)]),
     );

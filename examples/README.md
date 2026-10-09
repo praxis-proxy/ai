@@ -71,7 +71,6 @@ for how these are authored and regenerated.
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
-| [vertex-anthropic.yaml](configs/vertex-anthropic.yaml) | Production note: replace the static credential_injection below with the experimental `gcp_adc` filter (source: key_file) so the gateway mints short-lived OAuth tokens from a service-account key instead of a static value, and point the cluster at aiplatform.googleapis.com:443 with tls.sni likewise |
 
 ### Anthropic
 
@@ -171,3 +170,4 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
+| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Production note: replace the static credential_injection below with the experimental `gcp_adc` filter (source: key_file) so the gateway mints short-lived OAuth tokens from a service-account key instead of a static value, and point the cluster at aiplatform.googleapis.com:443 with tls.sni likewise |

@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 
-use super::config::{VertexConfig, is_safe_model_char};
+use super::config::{VertexAnthropicConfig, is_safe_model_char};
 
 /// Body value of `anthropic_version` accepted by Vertex `rawPredict`.
 pub(crate) const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
@@ -114,7 +114,7 @@ fn validate_publisher_model(model: &str) -> Result<(), RequestError> {
 pub(crate) fn transform_request(
     body: &[u8],
     operation: Operation,
-    cfg: &VertexConfig,
+    cfg: &VertexAnthropicConfig,
 ) -> Result<Option<TransformedRequest>, RequestError> {
     let mut value: Value =
         serde_json::from_slice(body).map_err(|error| RequestError::InvalidJson(error.to_string()))?;
@@ -152,7 +152,11 @@ pub(crate) fn transform_request(
 }
 
 /// Rewrite the Messages body in place and build its `rawPredict` path.
-fn transform_messages(obj: &mut serde_json::Map<String, Value>, publisher: &str, cfg: &VertexConfig) -> String {
+fn transform_messages(
+    obj: &mut serde_json::Map<String, Value>,
+    publisher: &str,
+    cfg: &VertexAnthropicConfig,
+) -> String {
     // The stream verb must be decided from the body's `stream` flag
     // before anything else mutates it; after the rewrite nothing else
     // carries it into the URL.
@@ -177,7 +181,7 @@ fn transform_messages(obj: &mut serde_json::Map<String, Value>, publisher: &str,
 }
 
 /// Publisher model with the configured snapshot pin appended, if any.
-fn model_with_pin(publisher: &str, cfg: &VertexConfig) -> String {
+fn model_with_pin(publisher: &str, cfg: &VertexAnthropicConfig) -> String {
     match &cfg.model_pin {
         Some(pin) => format!("{publisher}{pin}"),
         None => publisher.to_owned(),
@@ -191,10 +195,10 @@ mod tests {
 
     use super::*;
 
-    fn cfg() -> VertexConfig {
+    fn cfg() -> VertexAnthropicConfig {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: demo-project\nmodel_pin: '@20250929'").unwrap();
-        let cfg: VertexConfig = serde_yaml::from_value(yaml).unwrap();
-        crate::vertex::config::build_config(cfg).unwrap()
+        let cfg: VertexAnthropicConfig = serde_yaml::from_value(yaml).unwrap();
+        crate::vertex::anthropic::config::build_config(cfg).unwrap()
     }
 
     #[test]
