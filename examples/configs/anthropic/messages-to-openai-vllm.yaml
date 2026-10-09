@@ -67,19 +67,14 @@ filter_chains:
           - username: gateway
             env_var: GATEWAY_AUTH_PASSWORD
 
-      # Classify the request as Anthropic Messages and promote facts to internal
-      # `x-praxis-ai-*` headers. `on_invalid: continue` lets non-message paths
-      # (health checks, model discovery) pass through.
-      - filter: anthropic_messages_format
-        on_invalid: continue
-
-      # Validate only the message-bearing endpoints before translation. Scoping
-      # to `/v1/messages` keeps bodyless probes such as `GET /v1/models` from
-      # being rejected for having an empty body.
-      - filter: anthropic_validate
-        conditions:
-          - when:
-              path_prefix: "/v1/messages"
+      # Process the create-message body before translation: validate the
+      # envelope and promote facts to internal `x-praxis-ai-*` headers.
+      # `on_invalid: reject` refuses a malformed body at the gateway, which is
+      # what the separate validator here used to do. No path condition is
+      # needed — the operation keys the filter, so bodyless probes such as
+      # `GET /v1/models` are released untouched.
+      - filter: anthropic_messages_request
+        on_invalid: reject
 
       # Translate the Anthropic request body into OpenAI Chat Completions and the
       # non-streaming response body back into Anthropic Messages.

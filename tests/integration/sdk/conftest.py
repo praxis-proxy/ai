@@ -94,7 +94,7 @@ filter_chains:
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:
@@ -112,7 +112,7 @@ filter_chains:
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:

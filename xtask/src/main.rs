@@ -90,6 +90,16 @@ enum Command {
     #[cfg(feature = "dev")]
     CheckChatCompletionsRegistry,
 
+    /// Check the runtime Files operation registry against
+    /// the pinned OpenAI specification.
+    #[cfg(feature = "dev")]
+    CheckFilesRegistry,
+
+    /// Check the runtime Vector Stores operation registry against
+    /// the pinned OpenAI specification.
+    #[cfg(feature = "dev")]
+    CheckVectorStoresRegistry,
+
     /// Start a quick HTTP test server returning a static
     /// response to every request.
     #[cfg(feature = "dev")]
@@ -209,6 +219,8 @@ fn run_dev(command: Command) {
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
+        Command::CheckFilesRegistry => openai_conformance::run_files_registry_check(),
+        Command::CheckVectorStoresRegistry => openai_conformance::run_vector_stores_registry_check(),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),

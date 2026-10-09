@@ -44,6 +44,8 @@ pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
 #[cfg(feature = "openai-responses")]
 pub(crate) mod file_search_callout;
+#[cfg(feature = "openai-responses")]
+pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
@@ -235,9 +237,8 @@ pub fn local_tool_guardrail_messages(
 
     let outputs: Vec<&serde_json::Value> = state
         .messages
-        .get(start..)
-        .unwrap_or_default()
         .iter()
+        .skip(start)
         .filter(|message| message.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output"))
         .filter_map(|message| message.get("output"))
         .collect();

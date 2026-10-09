@@ -296,6 +296,9 @@ pub(crate) enum SseParseError {
         event_type: String,
     },
 
+    /// A decoded event type contains an SSE line delimiter.
+    InvalidEventType,
+
     /// The SSE `event:` field did not match the JSON payload `type`.
     EventTypeMismatch {
         /// Event type from the SSE `event:` field.
@@ -376,6 +379,7 @@ impl fmt::Display for SseParseError {
             Self::MissingEventType { field, event_type } => {
                 write!(f, "missing string SSE event type field '{field}' near '{event_type}'")
             },
+            Self::InvalidEventType => write!(f, "SSE event type contains a carriage return or newline"),
             Self::EventTypeMismatch {
                 sse_event_type,
                 data_event_type,

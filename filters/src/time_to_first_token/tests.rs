@@ -254,7 +254,7 @@ fn resolve_model_anthropic() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("anthropic_messages_format.model", "claude-sonnet-5");
+    ctx.set_metadata("anthropic_messages_request.model", "claude-sonnet-5");
     assert_eq!(resolve_model(&ctx), "claude-sonnet-5");
 }
 
@@ -273,7 +273,7 @@ fn resolve_model_prefers_openai_over_anthropic() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("openai_responses_request.model", "gpt-4o");
-    ctx.set_metadata("anthropic_messages_format.model", "claude-sonnet-5");
+    ctx.set_metadata("anthropic_messages_request.model", "claude-sonnet-5");
     assert_eq!(resolve_model(&ctx), "gpt-4o");
 }
 

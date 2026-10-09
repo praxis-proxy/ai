@@ -222,11 +222,11 @@ const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// harness serves requests. Generous enough for a Postgres pool (and its TLS
 /// handshake) to open under coverage instrumentation. A permanent provisioning
 /// failure falls through so the test's own assertion reports it.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 const STORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between store-readiness polls.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 const STORE_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Harness store-provisioning readiness waiter.
@@ -236,7 +236,7 @@ const STORE_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[derive(Clone, Default)]
 struct HarnessStoreReadiness {
     /// Readiness handle shared with the provisioning background service.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     handle: Option<praxis_ai::store_provision::StoreReadinessHandle>,
 }
 
@@ -245,7 +245,7 @@ impl HarnessStoreReadiness {
     /// elapses. Polls the shared readiness value to observe the provisioner
     /// without a timing assumption. A no-op when no store is configured.
     fn wait(&self) {
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         if let Some(handle) = &self.handle {
             use praxis_ai::store_provision::StoreReadiness;
             let deadline = Instant::now() + STORE_READY_TIMEOUT;
@@ -417,7 +417,7 @@ impl Drop for ProxyGuard {
 ///
 /// [`Server`]: pingora_core::server::Server
 #[cfg_attr(
-    any(feature = "store-postgres", feature = "store-sqlite"),
+    feature = "_store-backend",
     expect(
         clippy::too_many_lines,
         reason = "listener wiring plus store provisioning mirror boot_server"
@@ -434,17 +434,17 @@ fn build_pingora_server(
     // build the per-listener registries plus the background service, install the
     // shared registries into the pipelines, and register the service so
     // store-filter requests through the harness resolve a provisioned backend.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let readiness = HarnessStoreReadiness {
         handle: Some(store_readiness),
     };
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let readiness = HarnessStoreReadiness::default();
 
     let mut cert_shutdowns = Vec::new();
@@ -475,7 +475,7 @@ fn build_pingora_server(
         );
     }
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     server.add_service(pingora_core::services::background::background_service(
         "store-provision",
         store_service,

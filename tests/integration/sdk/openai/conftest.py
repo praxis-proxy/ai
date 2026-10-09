@@ -79,4 +79,3 @@ def openai_sdk_info(request):
         getattr(config, "_openai_sdk_version", "unknown"),
         getattr(config, "_openai_sdk_lane", "unknown"),
     )
-

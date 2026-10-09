@@ -101,7 +101,7 @@ listeners:
 filter_chains:
   - name: transform
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576

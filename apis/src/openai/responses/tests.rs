@@ -478,7 +478,8 @@ fn local_tool_guardrail_handoff_is_shared_by_each_configured_policy() {
             serde_json::json!({"type":"function_call", "call_id":"call_1", "name":"lookup"}),
             serde_json::json!({"type":"function_call_output", "call_id":"call_1", "output":"untrusted result"}),
             serde_json::json!({"type":"reasoning", "summary":[]}),
-        ],
+        ]
+        .into(),
         ..state::ResponsesState::default()
     };
     state.mark_local_tool_results_from(1);
@@ -512,7 +513,8 @@ fn local_tool_guardrail_handoff_rejects_oversized_result_before_copying() {
             "type":"function_call_output",
             "call_id":"call_1",
             "output":"untrusted result"
-        })],
+        })]
+        .into(),
         ..state::ResponsesState::default()
     };
     state.mark_local_tool_results_from(0);

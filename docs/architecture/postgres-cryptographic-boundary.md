@@ -24,13 +24,14 @@ hostname verification, and, when configured, **client-certificate
 authentication** — runs inside the platform TLS library. SQLx selects it
 through its `tls-native-tls` feature, which binds [native-tls] to the
 operating system's own provider: **OpenSSL on Linux** and
-**Security.framework (Secure Transport) on macOS**. The `store-postgres`
-feature in `apis/Cargo.toml` turns it on:
+**Security.framework (Secure Transport) on macOS**. The PostgreSQL profiles in
+`store-backends/Cargo.toml` turn it on:
 
 ```toml
 [features]
-store = ["dep:sqlx", "dep:dashmap"]
-store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
+_postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-native-tls"]
+postgres = ["_postgres", "sqlx/postgres-password-auth"]
+postgres-cert-auth = ["_postgres"]
 ```
 
 Everything on this path is the host's system TLS stack. Client
@@ -114,23 +115,27 @@ SQLx performs directly and the crate that implements each. This is the
 | `AuthenticationOk` (cert / trust / peer) | none | — | — |
 | TLS handshake + client cert | key exchange, AEAD, chain + hostname verify, client cert | [native-tls] (OpenSSL / Security.framework) | platform TLS |
 
-The password families (SCRAM/MD5) are pulled in transitively through
-`sqlx-postgres`; they are not separately gated. The only way to keep
-them off the connection is to ensure the server never issues a password
-challenge — i.e. authenticate with a client certificate.
+The general-purpose `store-postgres` profile enables SQLx's password
+authentication feature for compatibility. The `store-postgres-cert-auth`
+profile does not compile cleartext, MD5, or SCRAM authentication support;
+it also omits migration checksums and advisory-lock string hashing. The FIPS
+build selects this reduced profile and additionally requires client-certificate
+authentication during startup validation.
 
 ## Selected approach: certificate authentication
 
 The supported compliance approach is **mutual-TLS client-certificate
-authentication**, gated by the `require_certificate_authentication`
-filter field. Under `cert` authentication the server responds to the TLS
+authentication**, compiled with `store-postgres-cert-auth` and gated by the
+`require_certificate_authentication` filter field. A certificate-only build
+rejects PostgreSQL configuration that does not enable that field. Under
+`cert` authentication the server responds to the TLS
 handshake with `AuthenticationOk` and **no password primitive executes**
 — authentication happens entirely inside the platform TLS boundary.
 
 ### Client configuration
 
 Both filters accept the same TLS fields (carried by `PgTlsConfig` in
-`apis/src/store/postgres_tls.rs`):
+`store-backends/src/postgres_tls.rs`):
 
 | Field | Purpose |
 | --- | --- |
@@ -280,6 +285,9 @@ harness lives in `tests/utils/src/net/postgres.rs`
 - [Response store](response-store.md)
 - [Outbound callout security](outbound-callouts.md)
 - [Features](../features.md)
+- [SQLx password-authentication feature](https://github.com/transact-rs/sqlx/pull/4417)
+- [SQLx migration feature](https://github.com/transact-rs/sqlx/pull/4420)
+- [SQLx advisory-lock hashing issue](https://github.com/transact-rs/sqlx/issues/4421)
 
 [native-tls]: https://github.com/sfackler/rust-native-tls
 [`hmac`]: https://github.com/RustCrypto/MACs

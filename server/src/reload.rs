@@ -14,7 +14,7 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 use crate::pipelines::resolve_pipelines_with_stores;
 
 // -----------------------------------------------------------------------------
@@ -56,7 +56,7 @@ pub(crate) fn reload_pipelines(
     store_reload: &crate::StoreReloadHandle,
     health_slot: &crate::SharedHealthRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let _ = store_reload;
     info!("building new pipelines from reloaded config");
 
@@ -76,7 +76,7 @@ pub(crate) fn reload_pipelines(
     // Validate the complete candidate pipeline before provisioning touches a
     // database. Factory validation alone cannot cover cross-filter contracts or
     // every filter-owned security check, such as SQLite path traversal.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let prepared_stores = if crate::store_provision::config_uses_store(new_config)
         || crate::store_provision::config_uses_store(old_config)
     {
@@ -95,9 +95,9 @@ pub(crate) fn reload_pipelines(
         None
     };
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let empty_store_registries = crate::StoreRegistries::default();
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let build = resolve_pipelines_with_stores(
         new_config,
         registry,
@@ -108,7 +108,7 @@ pub(crate) fn reload_pipelines(
             .as_ref()
             .map_or(&empty_store_registries, |prepared| &prepared.registries),
     );
-    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    #[cfg(all(feature = "store", not(feature = "_store-backend")))]
     let build = crate::pipelines::resolve_pipelines_with_stores(
         new_config,
         registry,
@@ -122,7 +122,7 @@ pub(crate) fn reload_pipelines(
     let new_pipelines = match build {
         Ok(p) => p,
         Err(e) => {
-            #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+            #[cfg(feature = "_store-backend")]
             if let Some(prepared) = prepared_stores
                 && let Err(abort_error) = store_reload.abort(prepared)
             {
@@ -136,7 +136,7 @@ pub(crate) fn reload_pipelines(
     log_restart_required_changes(old_config, new_config);
     warn_stateful_filter_reset(new_config);
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let old_pipelines = crate::store_provision::store_listener_names(old_config)
         .into_iter()
         .filter_map(|name| live.get(&name).map(|slot| Arc::downgrade(&slot.load_full())))
@@ -145,7 +145,7 @@ pub(crate) fn reload_pipelines(
     // Promotion cannot fail after this acknowledgement, and the ArcSwap stores
     // below are infallible. Commit before publication so shutdown can never
     // classify an already-published generation as unattached pending state.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     if let Some(prepared) = prepared_stores {
         store_reload.commit(prepared, old_pipelines)?;
     }

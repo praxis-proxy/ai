@@ -704,7 +704,7 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     });
     ctx.extensions.insert(ResponsesState {
         response_object: response_json.clone(),
-        persisted_messages: vec![json!({"role": "user", "content": "Hello"})],
+        persisted_messages: vec![json!({"role": "user", "content": "Hello"})].into(),
         ..Default::default()
     });
 
@@ -1047,7 +1047,7 @@ async fn armed_streaming_ctx<'a>(
             "status": "completed",
             "output": [{"type": "message", "role": "assistant", "content": "Done"}]
         }),
-        persisted_messages: vec![json!({"role": "user", "content": "Hi"})],
+        persisted_messages: vec![json!({"role": "user", "content": "Hi"})].into(),
         logical_stream_terminal_emitted: terminal_emitted,
         ..Default::default()
     });
@@ -2163,7 +2163,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
     });
     ctx.extensions.insert(ResponsesState {
         response_object: response_json.clone(),
-        persisted_messages: vec![json!({"role": "user", "content": "Hello"})],
+        persisted_messages: vec![json!({"role": "user", "content": "Hello"})].into(),
         ..Default::default()
     });
 
@@ -6942,6 +6942,16 @@ fn input_item_page_serialization_100_item_nontrivial_allocation_evidence() {
 /// double leaves the conversation-item surface unsupported.
 #[async_trait::async_trait]
 impl crate::store::ConversationItemStore for RecordingResponseStore {
+    async fn conversation_history(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
     async fn upsert_conversation(
         &self,
         _record: &crate::store::ConversationRecord,

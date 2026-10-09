@@ -418,7 +418,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
         filter_type,
         "ai_operation"
             | "openai_agentic_loop"
-            | "anthropic_messages_format"
+            | "anthropic_messages_request"
             | "anthropic_messages_protocol"
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"

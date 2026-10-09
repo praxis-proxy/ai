@@ -17,7 +17,7 @@ use super::load_example_config;
 // -----------------------------------------------------------------------------
 
 #[test]
-fn anthropic_validate_forwards_valid_request() {
+fn anthropic_messages_request_forwards_valid_request() {
     let backend_guard = start_backend_with_shutdown("ok");
     let proxy_port = free_port();
 
@@ -36,7 +36,7 @@ fn anthropic_validate_forwards_valid_request() {
 }
 
 #[test]
-fn anthropic_validate_forwards_backend_owned_semantics() {
+fn anthropic_messages_request_forwards_backend_owned_semantics() {
     let backend_guard = start_backend_with_shutdown("ok");
     let proxy_port = free_port();
 
@@ -59,7 +59,7 @@ fn anthropic_validate_forwards_backend_owned_semantics() {
 }
 
 #[test]
-fn anthropic_validate_rejects_malformed_json() {
+fn anthropic_messages_request_rejects_malformed_json() {
     let backend_guard = start_backend_with_shutdown("ok");
     let proxy_port = free_port();
 

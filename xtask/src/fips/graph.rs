@@ -79,8 +79,9 @@ fn hint_fix(crate_name: &str) -> &'static str {
              no-provider features)"
         },
         "sha2" | "hmac" | "md-5" | "rsa" | "hkdf" => {
-            "keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has \
-             no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
+            "use store-postgres-cert-auth instead of store-postgres, or keep the feature that pulls it out of \
+             FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has no OpenSSL backend to switch to; \
+             aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
         },
         "sha1" => "keep it a dev-dependency; it must not appear in the release graph",
         "openssl-src" => "remove 'vendored', build with OPENSSL_NO_VENDOR=1, never set OPENSSL_STATIC",

@@ -91,7 +91,7 @@ pub(crate) enum SqlDialect {
     #[cfg(feature = "sqlite")]
     Sqlite,
     /// `PostgreSQL` backend.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     Postgres,
 }
 
@@ -101,7 +101,7 @@ impl SqlDialect {
         match self {
             #[cfg(feature = "sqlite")]
             SqlDialect::Sqlite => "BLOB",
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "_postgres")]
             SqlDialect::Postgres => "BYTEA",
         }
     }
@@ -225,7 +225,7 @@ pub(crate) fn ddl_error(statement: &str, error: &sqlx::Error) -> StoreError {
 ///
 /// Returns [`StoreError::Database`] when an identifier would exceed
 /// the `PostgreSQL` limit or would be case-folded.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), StoreError> {
     let (r, c) = validate_table_names(tables)?;
 
@@ -258,7 +258,7 @@ pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), S
 /// # Errors
 ///
 /// Returns an error if a table name is not a valid `PostgreSQL` identifier.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub fn validate_postgres_table_identifiers(responses_table: &str, conversations_table: &str) -> Result<(), StoreError> {
     validate_postgres_table_set_identifiers(responses_table, conversations_table, None)
 }
@@ -269,7 +269,7 @@ pub fn validate_postgres_table_identifiers(responses_table: &str, conversations_
 /// # Errors
 ///
 /// Returns an error if any table name is not a valid `PostgreSQL` identifier.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub fn validate_postgres_table_set_identifiers(
     responses_table: &str,
     conversations_table: &str,
@@ -437,29 +437,29 @@ fn validate_table_names(tables: &TableNames) -> Result<(&str, &str), StoreError>
 }
 
 /// Maximum identifier length accepted by `PostgreSQL`.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 
 /// Maximum conversation table name length that leaves room for
 /// `idx_` (4) and `_tenant_id` (10) in the generated index name.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_CONVERSATION_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 14;
 
 /// Maximum items table name length that leaves room for `idx_` (4)
 /// and `_conversation` (13) in the generated index name.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_ITEMS_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 17;
 
 /// Maximum responses table name length that leaves room for the
 /// `_schema_version` suffix in the derived version table name.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SCHEMA_VERSION_SUFFIX.len();
 
 /// Maximum responses table name length that leaves room for the
 /// `_pending_approvals` suffix in the derived pending-approvals table
 /// name. This suffix is longer than `_schema_version`, so it is the
 /// binding constraint on the responses table name for `PostgreSQL`.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
     POSTGRES_MAX_IDENTIFIER_LEN - PENDING_APPROVALS_SUFFIX.len();
 
@@ -467,7 +467,7 @@ const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
 /// suffix in the derived event log table name. Shorter than both the
 /// `_schema_version` and `_pending_approvals` suffixes, so it is never the
 /// binding constraint; validated for symmetry with the other derived tables.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_EVENTS: usize = POSTGRES_MAX_IDENTIFIER_LEN - EVENTS_SUFFIX.len();
 
 /// Validate the items table name and ensure it is distinct from the
@@ -488,7 +488,7 @@ fn validate_items_table<'a>(items: &'a str, responses: &str, conversations: &str
 }
 
 /// Reject a `PostgreSQL` identifier that would be truncated.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> Result<(), StoreError> {
     if name.len() > max_len {
         return Err(StoreError::Database(format!(
@@ -512,7 +512,7 @@ fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> R
 ///
 /// This is `PostgreSQL`-only. `SQLite` compares table names case-insensitively,
 /// so a mixed-case name resolves to the same table on both paths there.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), StoreError> {
     if name.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(StoreError::Database(format!(
@@ -947,6 +947,12 @@ fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
     }
 }
 
+/// Whether a payload column preserves text without numeric affinity coercion.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_has_text_affinity(declared_type: &str) -> bool {
+    sqlite_type_affinity(declared_type) == SqliteAffinity::Text
+}
+
 /// Folding verdict for a `SQLite` primary key column, from its declared type and
 /// effective collation.
 ///
@@ -987,7 +993,7 @@ pub(crate) fn sqlite_key_column_folding(declared_type: &str, collation: Option<&
 /// every other type -- `citext`, an enum, a custom type, or a `DOMAIN` (whose
 /// column reports the domain's own OID, never one of these) -- is likewise
 /// rejected.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 
 /// Folding verdict for a `PostgreSQL` primary key column, from its catalog
@@ -1004,7 +1010,7 @@ pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 /// The type is checked first, so a
 /// non-collatable column -- whose `collation_deterministic` is `None` -- can only
 /// reach the later checks with an allow-listed type, which is always collatable.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub(crate) fn pg_key_column_folding(
     type_oid: i64,
     type_name: &str,
@@ -1036,7 +1042,7 @@ pub(crate) fn pg_key_column_folding(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[cfg(all(feature = "postgres", feature = "sqlite"))]
+#[cfg(all(feature = "_postgres", feature = "sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

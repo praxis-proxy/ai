@@ -678,7 +678,11 @@ fn continuation_state_fits(
     max_bytes: usize,
     incoming_bytes: usize,
 ) -> bool {
-    let mut used = framework_bytes.saturating_add(incoming_bytes);
+    let mut used = framework_bytes
+        .saturating_add(incoming_bytes)
+        .saturating_add(size_of_val(state.translated_reasoning_replay.as_slice()))
+        .saturating_add(size_of_val(state.collected_rounds.as_slice()))
+        .saturating_add(size_of_val(state.collected_output_provenance.as_slice()));
     for value in [
         &state.request_body,
         &state.response_object,
@@ -694,14 +698,21 @@ fn continuation_state_fits(
     for values in [
         &state.accumulated_output,
         &state.input,
-        &state.messages,
-        &state.persisted_messages,
         &state.previous_tools,
         &state.tool_calls,
         &state.tools,
         &state.web_search_calls,
     ] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    for history in [&state.messages, &state.persisted_messages] {
+        let Some(size) = bounded_json_size(history, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
             return false;
         };
         used = used.saturating_add(size);

@@ -395,6 +395,26 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.reasoning.stream
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-reasoning-stream
+      - responses/chat-reasoning-stream-late
+      - responses/chat-reasoning-stream-late-tool
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.reasoning.stream_errors
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-reasoning-stream-malformed
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.tools.text_output
     scopes:
       - responses_to_chat_completions
@@ -495,6 +515,25 @@ features:
     scenarios:
       - messages/stop-sequence-nonstream
       - messages/stop-sequence-stream
+    providers:
+      vllm:
+        status: live_covered
+  - id: responses.streaming.invalid_event_type
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/invalid-stream-event-type
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.reasoning.agentic_replay
+    scopes:
+      - responses_agentic_loop
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/responses-to-chat-completions-reasoning-agentic
     providers:
       vllm:
         status: live_covered

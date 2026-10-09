@@ -347,7 +347,7 @@ pub(crate) enum TranslationError {
 #[derive(Debug, Clone, Copy, Default)]
 struct RequestOverrides<'a> {
     /// Canonical enriched message items.
-    messages: Option<&'a [Value]>,
+    messages: Option<&'a [&'a Value]>,
     /// Canonical processed tool definitions.
     tools: Option<&'a [Value]>,
     /// Canonical current tool choice.
@@ -367,17 +367,18 @@ pub(crate) fn responses_request_to_chat_request(
 }
 
 /// Convert canonical Responses state into a Chat Completions request.
-pub(crate) fn responses_state_to_chat_request(
+pub(crate) fn responses_state_to_chat_request<'a>(
     request: &Value,
-    messages: &[Value],
+    messages: impl IntoIterator<Item = &'a Value> + 'a,
     tools: &[Value],
     tool_choice: &Value,
     reasoning: &ReasoningOptions,
 ) -> Result<Value, TranslationError> {
+    let messages: Vec<&Value> = messages.into_iter().collect();
     translate_responses_request(
         request,
         RequestOverrides {
-            messages: Some(messages),
+            messages: Some(&messages),
             tools: Some(tools),
             tool_choice: Some(tool_choice),
         },
@@ -634,7 +635,7 @@ fn json_schema_response_format(format: &Map<String, Value>) -> Value {
 /// Build Chat Completions messages from `Responses` instructions and input.
 fn build_chat_messages(
     obj: &Map<String, Value>,
-    messages_override: Option<&[Value]>,
+    messages_override: Option<&[&Value]>,
     reasoning: &ReasoningOptions,
 ) -> Result<Vec<Value>, TranslationError> {
     let mut messages = Vec::new();
@@ -646,7 +647,7 @@ fn build_chat_messages(
     }
 
     if let Some(override_messages) = messages_override {
-        append_input_item_sequence(&mut messages, override_messages, reasoning)?;
+        append_input_item_sequence(&mut messages, override_messages.iter().copied(), reasoning)?;
     } else if let Some(input) = obj.get("input") {
         append_input_messages(&mut messages, input, reasoning)?;
     }
@@ -672,9 +673,9 @@ fn append_input_messages(
 }
 
 /// Append a sequence of Responses input items, batching adjacent function calls.
-fn append_input_item_sequence(
+fn append_input_item_sequence<'a>(
     messages: &mut Vec<Value>,
-    items: &[Value],
+    items: impl IntoIterator<Item = &'a Value> + 'a,
     reasoning: &ReasoningOptions,
 ) -> Result<(), TranslationError> {
     let mut pending_tool_calls = Vec::new();

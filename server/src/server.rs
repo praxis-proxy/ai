@@ -110,7 +110,7 @@ fn boot_server(
 
     let health_registry = build_health_registry(&config.clusters);
     #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        not(feature = "_store-backend"),
         expect(unused_mut, reason = "store_service is taken only with a store backend")
     )]
     let mut state = build_server_state(&config, &registry, &health_registry, subrequest_client);
@@ -123,7 +123,7 @@ fn boot_server(
     // Provision response-store backends as a serving-runtime startup service.
     // The service holds Pingora's ready notifier until every initial pool is
     // open and exits startup on a terminal failure.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     if let Some(service) = state.store_service.take() {
         server
             .server_mut()
@@ -132,7 +132,7 @@ fn boot_server(
                 service,
             ));
     }
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     register_store_readiness_endpoint(
         &mut server,
         state.store_readiness.clone(),
@@ -168,11 +168,11 @@ struct ServerState {
     health_slot: crate::SharedHealthRegistry,
     /// Serving-runtime store provisioner, taken by `boot_server` and registered
     /// as a Pingora background service before the server runs.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     store_service: Option<crate::store_provision::StoreProvisionService>,
     /// Readiness handle the store provisioner drives, read by the readiness
     /// endpoint.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     store_readiness: crate::store_provision::StoreReadinessHandle,
 }
 
@@ -190,12 +190,12 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, store_reload, store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
-    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    #[cfg(all(feature = "store", not(feature = "_store-backend")))]
     let store_registries = crate::StoreRegistries::default();
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let store_reload = crate::StoreReloadHandle::default();
 
     #[cfg(feature = "store")]
@@ -230,9 +230,9 @@ fn build_server_state(
         health_shutdown,
         store_reload,
         health_slot,
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         store_service: Some(store_service),
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         store_readiness,
     }
 }
@@ -330,7 +330,7 @@ fn register_admin_endpoints(
 /// It runs on a separate port because the protocol admin service owns its route
 /// set. It reads the provisioning readiness handle and composes it with cluster
 /// health, so an orchestrator probe gates traffic on store provisioning.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 fn register_store_readiness_endpoint(
     server: &mut PingoraServerRuntime,
     readiness: crate::store_provision::StoreReadinessHandle,
@@ -583,15 +583,34 @@ fn spawn_health_check_tasks(
 // Utility Functions
 // -----------------------------------------------------------------------------
 
+/// Whether the compiled response-store profile has had every cryptographic
+/// operation outside the system `OpenSSL` removed.
+///
+/// Cargo features are additive, so the certificate-authentication profile is
+/// safe only when none of the general-purpose backends or store-backed groups
+/// are also present. Those profiles either restore `SQLx` password
+/// authentication or have not yet had their additional dependency boundaries
+/// cleared for the FIPS build.
+const FIPS_SAFE_STORE_PROFILE: bool = cfg!(all(
+    feature = "store-postgres-cert-auth",
+    not(any(
+        feature = "store-postgres",
+        feature = "store-sqlite",
+        feature = "openai-conversations",
+        feature = "openai-compact",
+        feature = "openai-mcp-tools"
+    ))
+));
+
 /// Registered filter names whose dependencies do their own cryptography
 /// outside the system OpenSSL, so a binary that registers one cannot honor
 /// `PRAXIS_REQUIRE_FIPS` whatever the provider reports.
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
 ///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2`
-///   (and, with `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools)
-///   implies `store`, so this one name covers them all.
+/// - `openai_response_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
+///   bring cryptography outside the system `OpenSSL`; the isolated `store-postgres-cert-auth` profile does not, so
+///   [`fips_blocker`] excludes this name only for that exact profile.
 const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
 
 /// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
@@ -606,6 +625,7 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
     let registered: Vec<String> = NON_FIPS_FILTERS
         .iter()
         .copied()
+        .filter(|name| *name != "openai_response_store" || !FIPS_SAFE_STORE_PROFILE)
         .filter(|name| available.contains(name))
         .map(|name| format!("`{name}` filter"))
         .collect();
@@ -771,14 +791,17 @@ mod tests {
             praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None));
         let registry = crate::build_full_registry(&client);
         let blocker = super::fips_blocker(&registry);
-        if cfg!(any(feature = "policy-engine", feature = "store")) {
+        let store_is_blocked = cfg!(feature = "store") && !super::FIPS_SAFE_STORE_PROFILE;
+        if cfg!(feature = "policy-engine") || store_is_blocked {
             let reason = blocker.expect("a binary with non-FIPS filters is blocked");
             assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
             if cfg!(feature = "policy-engine") {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
-            if cfg!(feature = "store") {
+            if store_is_blocked {
                 assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            } else {
+                assert!(!reason.contains("`openai_response_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");

@@ -200,12 +200,6 @@ of Praxis already sets the header, an
 `unless: {headers_present: [...]}` condition on the
 filter skips it entirely, preserving the incoming value.
 
-### `openai_responses_format`
-
-Classifies AI API request bodies and promotes format,
-model, stream, store, background, and mode to
-headers, metadata, and filter results.
-
 ### `openai_responses_request`
 
 Runs for the Responses operations `ai_operation`
@@ -227,10 +221,12 @@ intervening body rewrite is never reused stale; on a chain
 with no managed owner that request-scoped cache is simply
 released, unused, when the request ends.
 
-### `anthropic_messages_format`
+### `anthropic_messages_request`
 
-Classifies Anthropic Messages API requests and
-promotes format metadata.
+Owns the Anthropic create-message body. The Messages
+registry decides the operation from the request head, then
+the body is deserialized once for envelope validation,
+routing facts, and canonical state.
 
 ### `prompt_enrich`
 

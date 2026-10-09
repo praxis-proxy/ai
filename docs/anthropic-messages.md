@@ -9,8 +9,7 @@ Anthropic requests to reach any backend.
 
 | Filter | Purpose |
 | ------ | ------- |
-| `anthropic_messages_format` | Classify requests and promote routing facts to headers |
-| `anthropic_validate` | Validate the JSON request envelope before forwarding |
+| `anthropic_messages_request` | Process the create-message body once: validate the envelope and promote routing facts |
 | `anthropic_messages_protocol` | Header management for native `/v1/messages` backends |
 | `anthropic_messages_to_chat_completions` | Bidirectional body transformation to the Chat Completions wire shape |
 | `anthropic_messages_to_chat_completions_stream` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
@@ -30,10 +29,8 @@ listeners:
 filter_chains:
   - name: anthropic
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
@@ -278,10 +275,8 @@ listeners:
 filter_chains:
   - name: anthropic
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
@@ -341,10 +336,8 @@ listeners:
 filter_chains:
   - name: transform
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
@@ -443,15 +436,15 @@ path.
 
 ## Filter Configuration Reference
 
-### `anthropic_messages_format`
+### `anthropic_messages_request`
 
-Classifies requests by body structure, then promotes
-ambiguous `/v1/messages` or `anthropic-version`
-requests to Anthropic Messages when the body otherwise
-looks like Chat Completions.
+Owns the Anthropic create-message body. The Messages operation registry decides
+from the request head whether this filter applies, so `POST /v1/messages` is
+processed and every other operation — token counting, the batch family — and
+every other path is released untouched.
 
 ```yaml
-filter: anthropic_messages_format
+filter: anthropic_messages_request
 on_invalid: continue      # continue | reject
 max_body_bytes: 1048576    # 1 MiB
 headers:
@@ -460,32 +453,35 @@ headers:
   stream: x-praxis-ai-stream
 ```
 
-Body classification precedence:
-1. `input` or object-valued `prompt` → OpenAI Responses
-   (an object-valued `prompt` is OpenAI's deprecated reusable
-   prompt object, retired with `v1/prompts` on 2026-11-30; new
-   clients should send prompt content via `input`)
-2. `messages` + `max_tokens` + Anthropic structural
-   signals → Anthropic Messages
-3. `messages` alone → OpenAI Chat Completions
+The matched body is deserialized once. That parse produces the routing
+metadata, the promoted headers, the filter results, and the typed
+`AnthropicMessagesState`. The forwarded bytes are never rewritten here.
 
-`anthropic-version` and `/v1/messages` upgrade only the
-ambiguous Chat Completions result to Anthropic Messages;
-they do not override Responses-shaped bodies.
+Body classification precedence no longer applies to this surface. The filter
+this replaced ranked `input`, then `messages` plus `max_tokens` with Anthropic
+structural signals, then `messages` alone — so an ordinary Anthropic body could
+be read as Chat Completions until a `/v1/messages` or `anthropic-version`
+tiebreak corrected it. The registry removes that guesswork.
 
-### `anthropic_validate`
+The endpoint is the authority on protocol. A Chat Completions-shaped body on
+`/v1/messages` is still the create-message operation, and an Anthropic-shaped
+body on another path is not. `anthropic-version` is contract validation rather
+than operation identity, so its absence changes nothing.
 
-Validates the proxy-owned JSON envelope before forwarding.
-Backend-owned Anthropic semantics such as model availability,
-message shape, role ordering, and token limits are deferred
-to the backend.
+This replaced a pair of filters that inferred the protocol from body structure
+and broke ties on `/v1/messages` or `anthropic-version`. That precedence is
+gone: the body no longer votes on which protocol a request belongs to.
 
-```yaml
-filter: anthropic_validate
-max_body_bytes: 1048576    # 1 MiB
-```
+`on_invalid` governs the envelope — a missing, malformed, or non-object body:
 
-Checks: request body is present, valid JSON, and a JSON object.
+| Value | Behavior |
+| ----- | -------- |
+| `continue` (default) | Forward the body and let the backend answer |
+| `reject` | Refuse at the gateway with an Anthropic-compatible client error |
+
+Those were previously separate filters with contradictory answers, and which
+one applied depended on whether a chain included the validator. Choose
+explicitly.
 
 ### `anthropic_messages_protocol`
 

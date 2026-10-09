@@ -13,6 +13,7 @@ mod area;
 mod chat_completions_registry;
 /// Operation coverage calculation.
 mod coverage;
+mod files_registry;
 /// Source-derived Conversation item schema artifact.
 mod item_contracts;
 /// Machine-readable JSON report rendering.
@@ -33,6 +34,7 @@ mod responses_registry;
 mod semantic_yaml;
 /// `OpenAPI` spec loading and operation extraction.
 mod spec;
+mod vector_stores_registry;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -117,6 +119,28 @@ pub(crate) struct Args {
 /// Run the Responses registry drift check and report the outcome.
 pub(crate) fn run_responses_registry_check() {
     match responses_registry::check() {
+        Ok(summary) => println!("{summary}"),
+        Err(failures) => {
+            eprintln!("{failures}");
+            std::process::exit(1);
+        },
+    }
+}
+
+/// Run the Files registry drift check and report the outcome.
+pub(crate) fn run_files_registry_check() {
+    match files_registry::check() {
+        Ok(summary) => println!("{summary}"),
+        Err(failures) => {
+            eprintln!("{failures}");
+            std::process::exit(1);
+        },
+    }
+}
+
+/// Run the Vector Stores registry drift check and report the outcome.
+pub(crate) fn run_vector_stores_registry_check() {
+    match vector_stores_registry::check() {
         Ok(summary) => println!("{summary}"),
         Err(failures) => {
             eprintln!("{failures}");

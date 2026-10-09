@@ -162,10 +162,9 @@ flag code that matches a recorded exception.
 
 In scope when the diff touches Anthropic-format code
 under `apis/src/anthropic/`. Representative filters:
-`anthropic_messages_format`,
+`anthropic_messages_request`,
 `anthropic_messages_protocol`, `anthropic_stream_events`,
-`anthropic_to_openai`, `anthropic_validate`, and
-`anthropic_web_search`.
+`anthropic_to_openai`, and `anthropic_web_search`.
 
 Source of truth:
 `docs/conformance/specs/anthropic-spec.json` (see
