@@ -504,15 +504,18 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
 
-/// Register `ai_guardrails` as a chain-binding filter that resolves its
-/// optional outbound chain at construction time.
+/// Register `ai_guardrails` as a security-critical chain-binding filter.
+///
+/// The optional outbound chain is resolved at construction time. The security
+/// class makes `failure_mode: open` fail pipeline validation, so a provider
+/// timeout or error cannot silently skip content screening.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let isolated_client = crate::isolated_subrequest_client(4);
     let shared_client = subrequest_client.cloned();
 
     registry
-        .register_chain_binding(
+        .register_chain_binding_with_class(
             "ai_guardrails",
             std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
                 let cfg: crate::guardrails::config::AiGuardrailsConfig =
@@ -521,6 +524,7 @@ fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Opti
                 let client = shared_client.clone().unwrap_or_else(|| isolated_client.clone());
                 AiGuardrailsFilter::build(cfg, outbound, client)
             }),
+            praxis_filter::SecurityClass::Security,
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'ai_guardrails'"));
 }
@@ -671,10 +675,8 @@ fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<
 mod tests {
     use std::collections::HashMap;
 
-    use praxis_core::config::InsecureOptions;
-    #[cfg(feature = "openai-responses")]
-    use praxis_filter::FilterEntry;
-    use praxis_filter::FilterPipeline;
+    use praxis_core::config::{InsecureOptions, SkipPipelineChecks};
+    use praxis_filter::{FilterEntry, FilterPipeline};
 
     use super::build_ai_registry;
 
@@ -773,6 +775,58 @@ provider:
         );
     }
 
+    /// Parse one `ai_guardrails` entry, optionally prefixed with entry-level fields.
+    fn guardrails_entry(prefix: &str) -> FilterEntry {
+        serde_yaml::from_str(&format!(
+            "{prefix}\
+filter: ai_guardrails
+provider:
+  type: nemo
+  endpoint: \"http://nemo:8000/v1/checks\"
+"
+        ))
+        .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}"))
+    }
+
+    /// Build an `ai_guardrails` pipeline and return its ordering diagnostics.
+    fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
+        let registry = build_ai_registry();
+        let mut entries = vec![guardrails_entry(prefix)];
+        let pipeline =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &HashMap::new(), &InsecureOptions::default())
+                .expect("ai_guardrails should build");
+        pipeline.ordering_errors(&entries, allow_open_security, &SkipPipelineChecks::default())
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_fails_pipeline_validation() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", false);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("failure_mode: open") && error.contains("ai_guardrails")),
+            "open ai_guardrails should fail security validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_allowed_by_insecure_flag() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", true);
+        assert!(
+            !errors.iter().any(|error| error.contains("failure_mode: open")),
+            "allow_open_security_filters should demote the open failure_mode error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_closed_failure_mode_passes_security_validation() {
+        let errors = guardrails_ordering_errors("", false);
+        assert!(
+            !errors.iter().any(|error| error.contains("failure_mode: open")),
+            "the default closed failure mode should not trip the open-security check: {errors:?}"
+        );
+    }
+
     /// Assert `name` is registered iff its cargo feature is `enabled`.
     fn assert_experimental_registration(names: &[&str], name: &str, enabled: bool) {
         if enabled {
@@ -835,6 +889,7 @@ provider:
     #[test]
     fn build_ai_registry_marks_security_filters() {
         let registry = build_ai_registry();
+        assert!(registry.is_security_filter("ai_guardrails"));
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         #[cfg(feature = "aws-sigv4-filter")]
