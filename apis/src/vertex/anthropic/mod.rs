@@ -46,7 +46,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TrustedHeaderMutation,
+    parse_filter_config,
 };
 use tracing::debug;
 
@@ -153,7 +154,8 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         if self.config.beta_allowlist.is_empty() {
             return;
         }
-        let Some(value) = ctx.request.headers.get(&ANTHROPIC_BETA).and_then(|v| v.to_str().ok()) else {
+        let request = ctx.request;
+        let Some(value) = request.headers.get(&ANTHROPIC_BETA).and_then(|v| v.to_str().ok()) else {
             return;
         };
 
@@ -164,9 +166,9 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
             .collect();
 
         if kept.is_empty() {
-            ctx.request_headers_to_remove.push(ANTHROPIC_BETA.clone());
+            queue_header_removal(ctx, ANTHROPIC_BETA);
         } else if let Ok(joined) = kept.join(", ").parse() {
-            ctx.request_headers_to_set.push((ANTHROPIC_BETA.clone(), joined));
+            queue_header_set(ctx, ANTHROPIC_BETA, joined);
         }
     }
 }
@@ -227,16 +229,15 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
                 self.filter_beta_flags(ctx);
                 // Responses are patched in place, so Vertex must answer
                 // uncompressed.
-                ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
-                ctx.request_headers_to_remove.push(X_API_KEY);
+                queue_header_removal(ctx, http::header::ACCEPT_ENCODING);
+                queue_header_removal(ctx, X_API_KEY);
                 debug!(
                     model = %transformed.user_model,
                     path = %transformed.path,
                     "translated Anthropic request to Vertex rawPredict"
                 );
                 ctx.rewritten_path = Some(transformed.path);
-                ctx.request_headers_to_set
-                    .push((ROUTE_HEADER.clone(), ROUTE_VALUE.clone()));
+                queue_header_set(ctx, ROUTE_HEADER, ROUTE_VALUE);
                 // Marks "this request was transformed"; response-side
                 // transforms only run for marked requests. Set here (not
                 // in on_request) because the pre-read body phase may run
@@ -304,6 +305,33 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+// -----------------------------------------------------------------------------
+// Request Header Helpers
+// -----------------------------------------------------------------------------
+
+/// Queue a request header removal from the body phase.
+///
+/// Core discards a pre-read pass's grouped header queues once an earlier
+/// filter in that pass has written the ordered `pre_read_mutations` log, so
+/// the removal joins that log when it is active. The log is never started
+/// here: activating it would discard every other filter's grouped mutations.
+fn queue_header_removal(ctx: &mut HttpFilterContext<'_>, name: HeaderName) {
+    if !ctx.pre_read_mutations.is_empty() {
+        ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(name.clone()));
+    }
+    ctx.request_headers_to_remove.push(name);
+}
+
+/// Queue a request header overwrite from the body phase, joining the ordered
+/// `pre_read_mutations` log when it is active (see [`queue_header_removal`]).
+fn queue_header_set(ctx: &mut HttpFilterContext<'_>, name: HeaderName, value: HeaderValue) {
+    if !ctx.pre_read_mutations.is_empty() {
+        ctx.pre_read_mutations
+            .push(TrustedHeaderMutation::Set(name.clone(), value.clone()));
+    }
+    ctx.request_headers_to_set.push((name, value));
 }
 
 // -----------------------------------------------------------------------------
@@ -575,6 +603,59 @@ mod tests {
         assert!(
             !ctx.request_headers_to_remove.contains(&header::AUTHORIZATION),
             "Authorization belongs to the credential filters"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_mutations_join_an_active_ordered_log() {
+        let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07]");
+        let mut request = make_request(Method::POST, "/v1/messages");
+        request
+            .headers
+            .insert(ANTHROPIC_BETA, HeaderValue::from_static("tool-search-2025-04-14"));
+        let mut ctx = make_filter_context(&request);
+        ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+            HeaderName::from_static("x-earlier-filter"),
+            HeaderValue::from_static("1"),
+        ));
+
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+
+        let log = &ctx.pre_read_mutations;
+        assert!(
+            log.iter().any(|mutation| matches!(
+                mutation,
+                TrustedHeaderMutation::Set(name, value) if name == ROUTE_HEADER && value == ROUTE_VALUE
+            )),
+            "core drops the grouped queues once the ordered log is active, so the route marker must join it: {log:?}"
+        );
+        for removed in [ANTHROPIC_BETA, X_API_KEY, header::ACCEPT_ENCODING] {
+            assert!(
+                log.iter()
+                    .any(|mutation| matches!(mutation, TrustedHeaderMutation::Remove(name) if *name == removed)),
+                "{removed:?} removal must join the ordered log: {log:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_mutations_never_start_the_ordered_log() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert!(
+            ctx.pre_read_mutations.is_empty(),
+            "starting core's exclusive ordered mode would discard other filters' grouped mutations"
+        );
+        assert!(
+            ctx.request_headers_to_set.iter().any(|(name, _)| name == ROUTE_HEADER),
+            "the grouped queue still carries the route marker"
         );
     }
 
