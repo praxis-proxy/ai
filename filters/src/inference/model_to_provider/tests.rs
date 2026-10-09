@@ -104,3 +104,53 @@ async fn mapping_matches_path_without_query_string() {
             .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") })
     );
 }
+
+#[tokio::test]
+async fn mapping_joins_an_already_active_ordered_mutation_log() {
+    let filter = build_filter(vertex_config());
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        HeaderName::from_static("x-trusted-tenant"),
+        HeaderValue::from_static("acme"),
+    ));
+    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_set
+            .iter()
+            .any(|(name, value)| name == PROVIDER_HEADER && value == "vertex"),
+        "the grouped queue should still carry the provider selector"
+    );
+    assert_eq!(
+        ctx.pre_read_mutations.len(),
+        2,
+        "the selector should be appended after the earlier ordered mutation"
+    );
+    assert!(
+        matches!(
+            ctx.pre_read_mutations.last(),
+            Some(TrustedHeaderMutation::Set(name, value)) if *name == PROVIDER_HEADER && value == "vertex"
+        ),
+        "core ignores grouped queues once the ordered log is active, so the selector must be in it: {:?}",
+        ctx.pre_read_mutations
+    );
+}
+
+#[tokio::test]
+async fn mapping_does_not_activate_the_ordered_mutation_log() {
+    let filter = build_filter(vertex_config());
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
+
+    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        ctx.pre_read_mutations.is_empty(),
+        "writing the ordered log would make core drop other filters' grouped mutations"
+    );
+}

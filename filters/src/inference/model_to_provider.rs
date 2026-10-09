@@ -28,8 +28,9 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
 use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, MODEL_PROVIDER_HEADER, json_body::replace_json_body};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation,
+    body::DEFAULT_JSON_BODY_MAX_BYTES, builtins::http::payload_processing::config_validation::validate_max_body_bytes,
+    parse_filter_config,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -201,6 +202,21 @@ fn validate_mapping_value(field: &str, value: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
+/// Queue the provider selector for the router.
+///
+/// Core drops a pre-read pass's grouped header queues once any filter in that
+/// pass wrote the ordered `pre_read_mutations` log, so the selector must also
+/// join that log when an earlier filter already activated it. An empty log is
+/// left alone: activating ordered mode here would discard the grouped
+/// mutations of every other body filter in the pass.
+fn queue_provider_header(ctx: &mut HttpFilterContext<'_>, provider: &HeaderValue) {
+    ctx.request_headers_to_set.push((PROVIDER_HEADER, provider.clone()));
+    if !ctx.pre_read_mutations.is_empty() {
+        ctx.pre_read_mutations
+            .push(TrustedHeaderMutation::Set(PROVIDER_HEADER, provider.clone()));
+    }
+}
+
 #[async_trait]
 impl HttpFilter for ModelToProviderFilter {
     fn name(&self) -> &'static str {
@@ -258,8 +274,7 @@ impl HttpFilter for ModelToProviderFilter {
             return Ok(FilterAction::Continue);
         }
 
-        ctx.request_headers_to_set
-            .push((PROVIDER_HEADER.clone(), mapping.provider.clone()));
+        queue_provider_header(ctx, &mapping.provider);
         ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
 
         if object.get("model").and_then(Value::as_str) != Some(mapping.target_model.as_str()) {
