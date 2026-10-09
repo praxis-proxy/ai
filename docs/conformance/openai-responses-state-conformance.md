@@ -16,8 +16,8 @@ On `POST /v1/responses` Praxis **forwards the request to the backend
 essentially unchanged**. The outbound body is only rebuilt when state
 genuinely requires it — rehydrated history must be replayed, the agentic loop
 appended tool results, or a rewrite filter changed a provider-visible field
-(`openai_responses_proxy::request_needs_rebuild` in
-`apis/src/openai/responses/openai_responses_proxy/mod.rs`). Otherwise the
+(`responses_proxy::request_needs_rebuild` in
+`apis/src/openai/responses/responses_proxy/mod.rs`). Otherwise the
 client bytes pass through to the backend verbatim
 (`SelectedUpstreamBodyOutcome::Continue`).
 
