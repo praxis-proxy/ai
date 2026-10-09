@@ -215,7 +215,7 @@ listeners:
 filter_chains:
   - name: classify
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:

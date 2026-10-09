@@ -215,10 +215,12 @@ intervening body rewrite is never reused stale; on a chain
 with no managed owner that request-scoped cache is simply
 released, unused, when the request ends.
 
-### `anthropic_messages_format`
+### `anthropic_messages_request`
 
-Classifies Anthropic Messages API requests and
-promotes format metadata.
+Owns the Anthropic create-message body. The Messages
+registry decides the operation from the request head, then
+the body is deserialized once for envelope validation,
+routing facts, and canonical state.
 
 ### `prompt_enrich`
 

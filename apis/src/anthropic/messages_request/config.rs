@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration types for the Anthropic Messages format classifier filter.
+//! Configuration types for the Anthropic Messages request processor.
 
 use praxis_filter::{
     FilterError,
@@ -26,17 +26,17 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
-// AnthropicMessagesFormatHeaders
+// AnthropicMessagesRequestHeaders
 // -----------------------------------------------------------------------------
 
-/// Configurable header names for promoted classification facts.
+/// Configurable header names for promoted routing facts.
 ///
 /// Transport, credential, API-key, and other internal `x-praxis-*` names
 /// are rejected. Each field may use its dedicated default or a custom
 /// non-`x-praxis-*` header.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnthropicMessagesFormatHeaders {
+pub(crate) struct AnthropicMessagesRequestHeaders {
     /// Header name for the detected format.
     ///
     /// Must not be a hop-by-hop, framing, Host, credential, API-key, or
@@ -63,7 +63,7 @@ pub(crate) struct AnthropicMessagesFormatHeaders {
     pub stream: Option<String>,
 }
 
-impl Default for AnthropicMessagesFormatHeaders {
+impl Default for AnthropicMessagesRequestHeaders {
     fn default() -> Self {
         Self {
             format: default_format_header(),
@@ -101,15 +101,15 @@ fn default_stream_header() -> Option<String> {
 }
 
 // -----------------------------------------------------------------------------
-// AnthropicMessagesFormatConfig
+// AnthropicMessagesRequestConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the [`AnthropicMessagesFormatFilter`].
+/// YAML configuration for the [`AnthropicMessagesRequestFilter`].
 ///
-/// [`AnthropicMessagesFormatFilter`]: super::AnthropicMessagesFormatFilter
+/// [`AnthropicMessagesRequestFilter`]: super::AnthropicMessagesRequestFilter
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnthropicMessagesFormatConfig {
+pub(crate) struct AnthropicMessagesRequestConfig {
     /// Behavior when the body cannot be classified.
     #[serde(default = "OnInvalidBehavior::default_continue")]
     pub on_invalid: OnInvalidBehavior,
@@ -123,7 +123,7 @@ pub(crate) struct AnthropicMessagesFormatConfig {
     /// Must not be hop-by-hop, framing, Host, credential, API-key, or
     /// other internal `x-praxis-*` names. Dedicated defaults remain allowed.
     #[serde(default)]
-    pub headers: AnthropicMessagesFormatHeaders,
+    pub headers: AnthropicMessagesRequestHeaders,
 }
 
 /// Default max body bytes.
@@ -136,23 +136,23 @@ fn default_max_body_bytes() -> usize {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: AnthropicMessagesFormatConfig) -> Result<AnthropicMessagesFormatConfig, FilterError> {
-    validate_max_body_bytes("anthropic_messages_format", cfg.max_body_bytes)?;
-    validate_anthropic_format_headers(&cfg.headers)?;
+pub(crate) fn build_config(cfg: AnthropicMessagesRequestConfig) -> Result<AnthropicMessagesRequestConfig, FilterError> {
+    validate_max_body_bytes("anthropic_messages_request", cfg.max_body_bytes)?;
+    validate_anthropic_request_headers(&cfg.headers)?;
     Ok(cfg)
 }
 
 /// Validate dedicated names and reject collisions across header fields.
-fn validate_anthropic_format_headers(headers: &AnthropicMessagesFormatHeaders) -> Result<(), FilterError> {
+fn validate_anthropic_request_headers(headers: &AnthropicMessagesRequestHeaders) -> Result<(), FilterError> {
     for (field, name, dedicated) in [
         ("format", headers.format.as_deref(), "x-praxis-ai-format"),
         ("model", headers.model.as_deref(), "x-praxis-ai-model"),
         ("stream", headers.stream.as_deref(), "x-praxis-ai-stream"),
     ] {
-        crate::promotion::validate_dedicated_promotion_header("anthropic_messages_format", field, name, &[dedicated])?;
+        crate::promotion::validate_dedicated_promotion_header("anthropic_messages_request", field, name, &[dedicated])?;
     }
     crate::promotion::reject_duplicate_promotion_fields(
-        "anthropic_messages_format",
+        "anthropic_messages_request",
         &[
             ("format", headers.format.as_deref()),
             ("model", headers.model.as_deref()),
@@ -180,8 +180,8 @@ mod tests {
     // -- Serde defaults -------------------------------------------------------
 
     #[test]
-    fn serde_defaults_anthropic_messages_format_config() {
-        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("{}").unwrap();
+    fn serde_defaults_anthropic_messages_request_config() {
+        let cfg: AnthropicMessagesRequestConfig = serde_yaml::from_str("{}").unwrap();
 
         assert_eq!(cfg.max_body_bytes, 1_048_576, "default should be 1 MiB");
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
@@ -193,8 +193,8 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_messages_format_headers_defaults() {
-        let h = AnthropicMessagesFormatHeaders::default();
+    fn anthropic_messages_request_headers_defaults() {
+        let h = AnthropicMessagesRequestHeaders::default();
         assert_eq!(h.format.as_deref(), Some("x-praxis-ai-format"));
         assert_eq!(h.model.as_deref(), Some("x-praxis-ai-model"));
         assert_eq!(h.stream.as_deref(), Some("x-praxis-ai-stream"));
@@ -203,8 +203,8 @@ mod tests {
     // -- deny_unknown_fields --------------------------------------------------
 
     #[test]
-    fn deny_unknown_fields_anthropic_messages_format_config() {
-        let res = serde_yaml::from_str::<AnthropicMessagesFormatConfig>(
+    fn deny_unknown_fields_anthropic_messages_request_config() {
+        let res = serde_yaml::from_str::<AnthropicMessagesRequestConfig>(
             r#"
 bogus: true
 "#,
@@ -213,8 +213,8 @@ bogus: true
     }
 
     #[test]
-    fn deny_unknown_fields_anthropic_messages_format_headers() {
-        let res = serde_yaml::from_str::<AnthropicMessagesFormatHeaders>(
+    fn deny_unknown_fields_anthropic_messages_request_headers() {
+        let res = serde_yaml::from_str::<AnthropicMessagesRequestHeaders>(
             r#"
 format: x-test
 extra: true
@@ -227,16 +227,16 @@ extra: true
 
     #[test]
     fn build_config_minimal_ok() {
-        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("{}").unwrap();
+        let cfg: AnthropicMessagesRequestConfig = serde_yaml::from_str("{}").unwrap();
         assert!(build_config(cfg).is_ok());
     }
 
     #[test]
     fn build_config_zero_max_body_bytes_rejected() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: 0,
-            headers: AnthropicMessagesFormatHeaders::default(),
+            headers: AnthropicMessagesRequestHeaders::default(),
         };
         let err = build_config(cfg).unwrap_err();
         assert!(
@@ -247,10 +247,10 @@ extra: true
 
     #[test]
     fn build_config_invalid_header_name_rejected() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: Some("not a valid header!".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
@@ -265,10 +265,10 @@ extra: true
 
     #[test]
     fn build_config_valid_custom_headers_ok() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: Some("x-custom-format".into()),
                 model: Some("x-custom-model".into()),
                 stream: Some("x-custom-stream".into()),
@@ -279,10 +279,10 @@ extra: true
 
     #[test]
     fn build_config_authorization_header_rejected() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: default_format_header(),
                 model: Some("authorization".into()),
                 stream: default_stream_header(),
@@ -297,10 +297,10 @@ extra: true
 
     #[test]
     fn build_config_api_key_header_rejected() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: default_format_header(),
                 model: Some("x-api-key".into()),
                 stream: default_stream_header(),
@@ -315,10 +315,10 @@ extra: true
 
     #[test]
     fn build_config_unrelated_internal_header_rejected() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: Some("x-praxis-route".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
@@ -333,10 +333,10 @@ extra: true
 
     #[test]
     fn build_config_model_header_rejects_format_routing_fact() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: default_format_header(),
                 model: Some("x-praxis-ai-format".into()),
                 stream: default_stream_header(),
@@ -351,10 +351,10 @@ extra: true
 
     #[test]
     fn build_config_format_header_rejects_model_rewrite_fact() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: Some("x-praxis-ai-effective-model".into()),
                 model: default_model_header(),
                 stream: default_stream_header(),
@@ -369,10 +369,10 @@ extra: true
 
     #[test]
     fn build_config_rejects_duplicate_promotion_headers() {
-        let cfg = AnthropicMessagesFormatConfig {
+        let cfg = AnthropicMessagesRequestConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            headers: AnthropicMessagesFormatHeaders {
+            headers: AnthropicMessagesRequestHeaders {
                 format: Some("x-foo".into()),
                 model: Some("X-Foo".into()),
                 stream: default_stream_header(),
@@ -389,7 +389,7 @@ extra: true
 
     #[test]
     fn null_header_disables_promotion() {
-        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str(
+        let cfg: AnthropicMessagesRequestConfig = serde_yaml::from_str(
             r#"
 headers:
   format: null

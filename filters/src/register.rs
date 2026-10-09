@@ -290,7 +290,7 @@ fn register_routing_security_filter(
 fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_messages_format" => praxis_ai_apis::anthropic::AnthropicMessagesFormatFilter::from_config
+        http "anthropic_messages_request" => praxis_ai_apis::anthropic::AnthropicMessagesRequestFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -303,10 +303,6 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     praxis_filter::register_filters!(
         @register registry,
         http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "anthropic_validate" => praxis_ai_apis::anthropic::AnthropicValidateFilter::from_config
     );
     register_anthropic_web_search(registry, subrequest_client);
 }
@@ -697,7 +693,6 @@ mod tests {
             "intelligent_route",
             "provider_route",
             "credential_inject",
-            "anthropic_validate",
             "anthropic_web_search",
             "request_id",
             "openai_chat_completions_to_azureai_chat_completions",

@@ -84,6 +84,7 @@ for how these are authored and regenerated.
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
 | [web-search-scoped-credentials.yaml](configs/anthropic/web-search-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml |
+| [web-search-tavily-scoped-credentials.yaml](configs/anthropic/web-search-tavily-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml, over Tavily |
 
 ### Azure
 

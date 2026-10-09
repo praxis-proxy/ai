@@ -125,8 +125,7 @@ fn transform_vllm_chain_translates_to_chat_completions() {
         types,
         [
             "basic_auth",
-            "anthropic_messages_format",
-            "anthropic_validate",
+            "anthropic_messages_request",
             "anthropic_messages_to_chat_completions",
             "anthropic_messages_to_chat_completions_stream",
             "headers",
@@ -153,19 +152,20 @@ fn transform_vllm_chain_translates_to_chat_completions() {
 }
 
 #[test]
-fn transform_vllm_validate_is_scoped_to_messages() {
-    // `anthropic_validate` rejects bodyless requests, so it must be gated to
-    // `/v1/messages` — otherwise a bodyless probe would be rejected with 400.
+fn transform_vllm_request_processing_needs_no_path_condition() {
+    // The processor is keyed to the create-message operation, so a bodyless
+    // probe is released untouched. The separate validator this replaced
+    // rejected bodyless requests and had to be gated to `/v1/messages`.
     let config = load_example_config(CONFIG, 29944, HashMap::from([("127.0.0.1:8000", 29945_u16)]));
-    let validate = config.filter_chains[0]
+    let processor = config.filter_chains[0]
         .filters
         .iter()
-        .find(|f| f.filter_type == "anthropic_validate")
-        .expect("chain should contain anthropic_validate");
+        .find(|f| f.filter_type == "anthropic_messages_request")
+        .expect("chain should contain anthropic_messages_request");
 
     assert!(
-        !validate.conditions.is_empty(),
-        "anthropic_validate must be gated by a path condition, not run unconditionally"
+        processor.conditions.is_empty(),
+        "the operation keys the processor, so no path condition should be needed"
     );
 }
 

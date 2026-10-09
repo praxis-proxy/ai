@@ -164,7 +164,6 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
 /// caller that reuses the same parsed value afterwards — to build request
 /// state, say — must still see the body the client actually sent. That costs
 /// one copy of the model string, which the owned path above avoids.
-#[cfg(feature = "openai-responses")]
 pub(crate) fn classify_object(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
     let model = copy_string(obj, "model");
     classify_fields(obj, model)
@@ -305,7 +304,6 @@ fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) 
 /// Copies rather than moves, because the caller reuses the same parsed value
 /// afterwards. Moving would leave an empty string behind and forward a request
 /// the client never sent.
-#[cfg(feature = "openai-responses")]
 fn copy_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(|v| match v {
         serde_json::Value::String(s) => Some(s.clone()),
