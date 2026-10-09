@@ -401,48 +401,98 @@ fn handle_json_body(
     provider: ProviderKind,
     max_body_bytes: usize,
 ) {
-    // `StreamBuffer` contract violation guard: while a buffered chain is
-    // accumulating, the protocol hands filters each raw chunk *and* re-delivers
-    // the frozen full buffer at end-of-stream. Accumulating both would feed
-    // every byte twice into the hex buffer, and the concatenated parse would
-    // fail. Detect the buffered delivery and read the EOS body directly
-    // instead; the hex path stays for plain `Stream` chains and for chains
-    // whose buffer was released mid-stream (where the EOS call carries no
-    // body).
-    let buffered_eos_body = body
-        .as_deref()
-        .filter(|_| end_of_stream && matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. }));
+    match ctx.response_body_mode {
+        // A buffered chain hands filters each raw chunk while it accumulates and
+        // then re-delivers the frozen whole buffer at end-of-stream, so that body
+        // must not be appended to the chunks already captured.
+        BodyMode::StreamBuffer { .. } if end_of_stream && let Some(eos_body) = body.as_deref() => {
+            record_buffered_eos_usage(ctx, provider, eos_body, max_body_bytes);
+            clear_all_metadata(ctx);
+        },
+        _ => accumulate_json_body(ctx, body, end_of_stream, provider, max_body_bytes),
+    }
+}
 
+/// Captures each chunk as it arrives and parses the captured document once
+/// the stream ends.
+///
+/// Serves plain `Stream` chains, buffered chains while they accumulate (the
+/// captured chunks back the fallback in [`record_buffered_eos_usage`]), and
+/// buffered chains whose end-of-stream call carries no body.
+fn accumulate_json_body(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    provider: ProviderKind,
+    max_body_bytes: usize,
+) {
     if let Some(chunk) = body.as_ref()
-        && buffered_eos_body.is_none()
         && !accumulate_response_hex(ctx, chunk, max_body_bytes)
     {
-        set_token_status_overflow(ctx);
-        debug!("JSON response exceeded token_count capture limit, usage is unavailable");
+        mark_json_overflow(ctx);
         clear_all_metadata(ctx);
         return;
     }
 
     if end_of_stream {
-        let hex_data = if buffered_eos_body.is_none() {
-            ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex))
-        } else {
-            None
-        };
-        if let Some(data) = buffered_eos_body.or(hex_data.as_deref()) {
-            record_json_usage(ctx, provider, data);
+        if let Some(data) = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex)) {
+            record_json_usage(ctx, provider, &data);
         }
 
         clear_all_metadata(ctx);
     }
 }
 
-/// Parses buffered JSON usage and records the normalized counts, prompt cache
-/// breakdown, and reasoning tokens. Called once at end-of-stream with the fully
-/// buffered body; a body carrying no recognizable usage records nothing.
-fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, data: &[u8]) {
-    let Some(usage) = provider.extract_token_usage(data) else {
+/// Extracts usage from the body a buffered chain hands filters at
+/// end-of-stream.
+///
+/// That body is normally the frozen whole response. After a filter returns
+/// `FilterAction::Release`, though, Praxis core keeps reporting `StreamBuffer`
+/// while delivering chunks the way `Stream` does (praxis-proxy/praxis#1270), so
+/// the body may be only the final chunk. A body that yields no usage is
+/// therefore retried as the captured chunks followed by that body, unless it
+/// already starts with every captured byte: then it is the frozen buffer of a
+/// response that reports no usage, and the concatenation could only fail to
+/// parse or trip the capture limit.
+fn record_buffered_eos_usage(
+    ctx: &mut HttpFilterContext<'_>,
+    provider: ProviderKind,
+    eos_body: &[u8],
+    max_body_bytes: usize,
+) {
+    if eos_body.len() > max_body_bytes {
+        mark_json_overflow(ctx);
         return;
+    }
+
+    if record_json_usage(ctx, provider, eos_body) {
+        return;
+    }
+
+    let Some(mut data) = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex)) else {
+        return;
+    };
+
+    if eos_body.starts_with(&data) {
+        trace!("buffered end-of-stream body repeats the captured chunks and reports no usage");
+        return;
+    }
+
+    if data.len().saturating_add(eos_body.len()) > max_body_bytes {
+        mark_json_overflow(ctx);
+        return;
+    }
+
+    data.extend_from_slice(eos_body);
+    record_json_usage(ctx, provider, &data);
+}
+
+/// Parses JSON usage and records the normalized counts, prompt cache
+/// breakdown, and reasoning tokens. Returns `false`, recording nothing, when
+/// the body carries no recognizable usage.
+fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, data: &[u8]) -> bool {
+    let Some(usage) = provider.extract_token_usage(data) else {
+        return false;
     };
 
     publish_token_usage(ctx, usage);
@@ -455,6 +505,14 @@ fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, da
         reasoning = ?usage.reasoning_tokens(),
         "extracted token usage from JSON response"
     );
+    true
+}
+
+/// Records the explicit overflow status for a JSON response that outgrew the
+/// capture limit.
+fn mark_json_overflow(ctx: &mut HttpFilterContext<'_>) {
+    set_token_status_overflow(ctx);
+    debug!("JSON response exceeded token_count capture limit, usage is unavailable");
 }
 
 /// Writes normalized totals plus any reported cache and reasoning breakdowns.
