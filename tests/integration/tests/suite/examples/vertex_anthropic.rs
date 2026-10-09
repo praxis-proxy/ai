@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    free_port, http_send, parse_body, parse_status, start_capturing_backend, start_uri_echo_backend,
+    free_port, http_send, parse_body, parse_status, start_capturing_backend, start_header_echo_backend,
+    start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -20,6 +21,7 @@ fn anthropic_request(body: &str) -> String {
             "Host: localhost\r\n",
             "Content-Type: application/json\r\n",
             "x-api-key: client-key\r\n",
+            "Accept-Encoding: gzip, br\r\n",
             "Content-Length: {}\r\n",
             "Connection: close\r\n\r\n{}",
         ),
@@ -110,5 +112,34 @@ fn stream_true_sends_stream_rawpredict_upstream() {
     assert!(
         echoed.starts_with("/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict"),
         "model must move into the URL with the stream verb, got: {echoed}"
+    );
+}
+
+#[test]
+fn handled_request_reaches_vertex_without_client_key_or_encoding() {
+    let backend = start_header_echo_backend();
+    let proxy_port = free_port();
+    let proxy = praxis_test_utils::start_proxy(&patched_example(proxy_port, backend.port()));
+
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_request(
+            r#"{"model":"vertex/claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "header echo should succeed: {raw}");
+
+    let upstream = parse_body(&raw).to_ascii_lowercase();
+    assert!(
+        !upstream.contains("x-api-key"),
+        "the client's Anthropic key must not reach Vertex, got: {upstream}"
+    );
+    assert!(
+        !upstream.contains("accept-encoding"),
+        "Vertex must be asked for an uncompressed response, got: {upstream}"
+    );
+    assert!(
+        upstream.contains("authorization: bearer ya29.example-static-token"),
+        "Vertex auth must come from the credential filter, got: {upstream}"
     );
 }

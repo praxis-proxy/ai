@@ -75,6 +75,10 @@ const STATUS_KEY: &str = "vertex_anthropic.response_status";
 
 /// `anthropic-beta` header name, for the beta-flag allowlist.
 const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
+/// Anthropic API key header. Vertex authenticates with a Google bearer
+/// token set by the credential filters, so the client's Anthropic key must
+/// never reach Google.
+const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 /// Internal route marker read by the unified router. Client-supplied
 /// `x-praxis-*` headers are rejected at the protocol boundary.
 pub(crate) const ROUTE_HEADER: HeaderName = HeaderName::from_static("x-praxis-ai-vertex-route");
@@ -214,6 +218,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
                 // Responses are patched in place, so Vertex must answer
                 // uncompressed.
                 ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+                ctx.request_headers_to_remove.push(X_API_KEY);
                 debug!(
                     model = %transformed.user_model,
                     path = %transformed.path,
@@ -535,6 +540,31 @@ mod tests {
         assert!(
             ctx.request_headers_to_remove.contains(&header::ACCEPT_ENCODING),
             "Vertex must answer uncompressed so the response can be patched"
+        );
+    }
+
+    #[tokio::test]
+    async fn handled_request_drops_anthropic_api_key() {
+        let filter = filter("project: demo");
+        let mut request = make_request(Method::POST, "/v1/messages");
+        request
+            .headers
+            .insert(X_API_KEY, HeaderValue::from_static("sk-ant-client-key"));
+        request
+            .headers
+            .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer ya29.token"));
+        let mut ctx = make_filter_context(&request);
+
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert!(
+            ctx.request_headers_to_remove.contains(&X_API_KEY),
+            "the client's Anthropic key must not reach Google"
+        );
+        assert!(
+            !ctx.request_headers_to_remove.contains(&header::AUTHORIZATION),
+            "Authorization belongs to the credential filters"
         );
     }
 
