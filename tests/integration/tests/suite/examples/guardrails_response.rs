@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_capturing_backend, start_proxy,
+    Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, start_backend_with_shutdown,
+    start_capturing_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -223,5 +224,64 @@ fn response_guardrails_non_chat_body_replaces_body() {
     assert!(
         body.contains(r#""error""#),
         "body should be replaced with an error payload; got: {body}"
+    );
+}
+
+/// A streaming request (`stream: true`) cannot be guarded on the response side:
+/// an SSE response never arrives as one buffered body, so the output rail would
+/// be silently skipped. With a response guardrail active, the request must be
+/// rejected before the model is invoked instead of streaming through unevaluated.
+#[test]
+fn response_guardrails_reject_streaming_before_model() {
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_completion_body("unused"))]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"ok"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, _body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Hello"}],"stream":true}"#,
+    );
+
+    assert_eq!(
+        status, 422,
+        "streaming must be rejected when a response guardrail is active"
+    );
+    // The upstream model is contacted only by a forwarded POST; a GET "/" is the
+    // load-balancer health probe, not a model invocation.
+    let forwarded_posts = backend.requests().into_iter().filter(|r| r.method == "POST").count();
+    assert_eq!(
+        forwarded_posts, 0,
+        "the upstream model must not be invoked for a rejected streaming request"
+    );
+    assert!(
+        nemo.requests().iter().all(|r| r.method != "POST"),
+        "NeMo must not be called; the request is rejected before any callout"
+    );
+}
+
+/// Control for the streaming reject: the same response-phase config forwards a
+/// non-streaming request to the model as usual.
+#[test]
+fn response_guardrails_non_streaming_reaches_model() {
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_completion_body("Hi"))]).start_with_shutdown();
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hi"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, _body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Hello"}],"stream":false}"#,
+    );
+
+    assert_eq!(status, 200, "a non-streaming request should reach the model");
+    assert!(
+        backend.requests().iter().any(|r| r.method == "POST"),
+        "the upstream model should be invoked (POST forwarded) for a non-streaming request"
     );
 }

@@ -643,6 +643,32 @@ phase:
 }
 
 #[tokio::test]
+async fn on_request_body_response_guardrails_reject_streaming() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 422,
+        "streaming must be rejected with response guardrails enabled"
+    );
+    assert_eq!(
+        rejection.body.as_deref(),
+        Some(&b"ai_guardrails: streaming responses are not supported while a response guardrail is active"[..]),
+        "streaming rejection must return the documented response-guardrail error body",
+    );
+    assert!(
+        !ctx.filter_results.contains_key("ai_guardrails"),
+        "the request must be rejected before any provider evaluation"
+    );
+}
+
+#[tokio::test]
 async fn on_request_body_none_continues_without_evaluating() {
     let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
