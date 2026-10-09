@@ -103,6 +103,8 @@ fn patch_model_field(obj: &mut Map<String, Value>, user_model: &str) -> Option<(
 /// use, `message_stop` — is re-emitted with its original data bytes;
 /// partial frames stay inside the caller's [`SseFrameParser`] across
 /// chunk boundaries, so at most one in-flight event is ever buffered.
+///
+/// [`SseFrameParser`]: crate::openai::sse::SseFrameParser
 pub(crate) fn rebuild_sse_frames(frames: &[SseFrame], user_model: Option<&str>) -> Vec<u8> {
     let mut output = Vec::new();
     for frame in frames {

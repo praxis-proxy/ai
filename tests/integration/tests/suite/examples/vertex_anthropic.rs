@@ -108,7 +108,7 @@ fn stream_true_sends_stream_rawpredict_upstream() {
     let raw = http_send(proxy.addr(), &request);
     assert_eq!(parse_status(&raw), 200);
 
-    let echoed = parse_body(&raw).to_owned();
+    let echoed = parse_body(&raw);
     assert!(
         echoed.starts_with("/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict"),
         "model must move into the URL with the stream verb, got: {echoed}"

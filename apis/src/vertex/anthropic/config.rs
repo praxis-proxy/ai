@@ -11,7 +11,7 @@ use serde::Deserialize;
 /// Default maximum request/response body size (32 MiB) — long Claude
 /// contexts are large, and the request body is buffered to read `model`
 /// and `stream` before they move into the URL.
-pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 33_554_432;
+pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 33_554_432; // 32 MiB
 
 /// Default request-URL path prefix stripped to obtain the Vertex
 /// publisher model id (`vertex/claude-sonnet-4-5` ->
