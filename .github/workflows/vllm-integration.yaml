@@ -1848,6 +1848,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
       - name: Fail on unset pins
         run: |
           set -euo pipefail
@@ -1905,11 +1919,20 @@ jobs:
           set -euo pipefail
           # Keyed deliberately: the credential-isolation proof requires the
           # backend to REJECT a request that Praxis did not inject into.
+          gpu_args=()
+          cache_mount="${GPU_HF_CACHE_DIR}:/root/.cache/huggingface"
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+            cache_mount="${cache_mount}:Z"
+          else
+            gpu_args=(--gpus all)
+          fi
           mkdir -p "${GPU_HF_CACHE_DIR}"
+          "$CONTAINER_RUNTIME" pull "${OPENCODE_VLLM_IMAGE}"
           # shellcheck disable=SC2086
-          docker run -d --name vllm-opencode \
-            --gpus all --ipc=host -p 8000:8000 \
-            -v "${GPU_HF_CACHE_DIR}:/root/.cache/huggingface" \
+          "$CONTAINER_RUNTIME" run -d --name vllm-opencode \
+            "${gpu_args[@]}" --ipc=host -p 8000:8000 \
+            -v "$cache_mount" \
             -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
             -e VLLM_API_KEY="${VLLM_API_KEY}" \
             "${OPENCODE_VLLM_IMAGE}" \
@@ -1930,7 +1953,7 @@ jobs:
           done
           if [ "${ready:-0}" != 1 ]; then
             echo "::error::vLLM did not become ready"
-            docker logs vllm-opencode --tail 200 || true
+            "$CONTAINER_RUNTIME" logs vllm-opencode --tail 200 || true
             exit 1
           fi
           # Prove the surface the client actually uses, before any test runs.
@@ -2055,7 +2078,7 @@ jobs:
         if: ${{ always() }}
         run: |
           set -uo pipefail
-          docker logs vllm-opencode --tail 400 > "$RUNNER_TEMP/opencode-vllm.log" 2>&1 || true
+          "${CONTAINER_RUNTIME:-docker}" logs vllm-opencode --tail 400 > "$RUNNER_TEMP/opencode-vllm.log" 2>&1 || true
 
       - name: Upload OpenCode acceptance diagnostics
         if: ${{ always() }}
@@ -2112,8 +2135,15 @@ jobs:
             sudo firewall-cmd --zone=trusted --remove-interface=oc-veth-host 2>/dev/null || true
           fi
           if [ "${OPENCODE_NFT_VETH:-}" = 1 ]; then
-            sudo nft -a list ruleset 2>/dev/null \
-              | grep 'praxis-opencode-veth' || true
+            sudo nft -j -a list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              rule = item.get("rule", {})
+              if rule.get("comment") == "praxis-opencode-veth":
+                  print(rule["family"], rule["table"], rule["chain"], rule["handle"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain handle; do
+              sudo nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+            done
           fi
           sudo iptables -D INPUT -i oc-veth-host -s 10.202.0.2 -d 10.202.0.1 -j ACCEPT 2>/dev/null || true
           sudo ip link del oc-veth-host 2>/dev/null || true
@@ -2124,7 +2154,8 @@ jobs:
 
       - name: Stop vLLM
         if: ${{ always() }}
-        run: docker rm -f vllm-opencode 2>/dev/null || true
+        run: |
+          "${CONTAINER_RUNTIME:-docker}" rm -f vllm-opencode 2>/dev/null || true
 
   gpu-start-runner:
     name: Start ephemeral EC2 GPU runner
