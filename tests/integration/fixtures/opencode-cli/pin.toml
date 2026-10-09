@@ -37,11 +37,19 @@ platform = "linux-x64"
 # there is no 2.x on npm, so `latest` does not silently cross the major
 # boundary that `major_series` guards.
 #
+# Lane split: the CPU job runs on a GitHub-hosted image that already has npm, so
+# it uses `npm install -g`. The ephemeral GPU AMI ships no Node/npm at all, so
+# that job instead fetches the SAME self-contained `opencode-<platform>` binary
+# directly from the npm registry tarball with curl and verifies it against
+# `tests/integration/fixtures/opencode-cli/<version>-<platform>.sha256` — only
+# curl and tar are required there. Both lanes therefore stage a byte-identical
+# client; keep that checksum fixture in sync with `version`/`platform`.
+#
 # The upstream install script instead drops a single self-contained ELF at
 # `~/.opencode/bin/opencode` (~185 MB, Bun-compiled, no shim and no native
 # sidecar). That form is immune to the noexec/_temp-mount problem the Claude
 # GPU job hit, so switch to `github-release` and fill in `url`/`sha256` if the
-# npm layout ever becomes awkward inside the test namespace.
+# registry tarball layout ever becomes awkward inside the test namespace.
 install = "npm"
 npm_package = "opencode-ai"
 # Required only when `install = "github-release"`.

@@ -1884,16 +1884,35 @@ jobs:
       - name: Install pinned OpenCode CLI
         run: |
           set -euo pipefail
-          npm install -g "${OPENCODE_NPM_PACKAGE}@${OPENCODE_VERSION}"
-          # Resolve the NATIVE executable, not the npm launcher. The platform
-          # binary ships as an optionalDependency and is self-contained, so it
-          # can be staged beside the Rust artifacts; the launcher cannot,
-          # because it resolves its payload relative to the npm root.
-          npm_root="$(npm root -g)"
-          native="$npm_root/opencode-linux-x64/bin/opencode"
+          # The ephemeral GPU AMI ships no Node/npm, so the CPU lane's
+          # `npm install -g` is unavailable here. Fetch the SAME self-contained
+          # platform binary the CPU lane stages — the `opencode-linux-x64`
+          # optionalDependency of `opencode-ai@<version>`, matching pin.toml
+          # `platform` — directly from the npm registry with curl, mirroring the
+          # Codex download step. Only curl and tar are required, both present on
+          # the AMI; the fetched binary is byte-identical to what npm resolves,
+          # so both lanes exercise the same client.
+          platform="linux-x64"
+          pkg="opencode-$platform"
+          tarball="$pkg-$OPENCODE_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-$OPENCODE_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/$pkg/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli/$OPENCODE_VERSION-$platform.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          # Resolve the NATIVE executable. The platform binary is self-contained,
+          # so it can be staged beside the Rust artifacts; the npm launcher
+          # cannot, because it resolves its payload relative to the npm root.
+          native="$work/package/bin/opencode"
           if [ ! -x "$native" ]; then
-            echo "::error::expected the native OpenCode binary at $native; npm layout changed"
-            ls -la "$npm_root" || true
+            echo "::error::expected the native OpenCode binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
             exit 1
           fi
           # The GPU AMI denies exec from the Actions _temp mount after entering
