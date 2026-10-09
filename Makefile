@@ -114,6 +114,8 @@ test-unit-apis:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
+	cargo test -p praxis-ai-store -p praxis-ai-store-backends --no-default-features \
+		--features praxis-ai-store-backends/sqlite $(_NOCAPTURE)
 
 test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
@@ -205,17 +207,14 @@ test-inference-fixtures:
 	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
-# Both filters are needed. libtest matches each as a substring, and
-# `store::tests::pg_` is not a substring of
-# `store::tests::postgres_passes_shared_ownership_contract` (the character
-# after `pg` is `o`), so that test was never selected by this target and
-# never ran in CI. The file uses both naming conventions, so list both
-# prefixes; libtest ORs every filter that follows `--`, same as the
-# integration target below. When adding a PostgreSQL test, check it against
-# this list, because a missed prefix drops it silently.
+# The API store contracts use both pg_ and postgres_ prefixes. Backend tests
+# live in their own crate; run all its ignored tests with only PostgreSQL enabled
+# so new history regressions cannot be silently dropped by a name filter.
 test-postgres-unit:
 	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
 		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
+	cargo test -p praxis-ai-store-backends --no-default-features --features postgres \
+		-- --ignored $(if $(V),--nocapture)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:

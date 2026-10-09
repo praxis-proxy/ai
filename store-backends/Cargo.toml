@@ -47,6 +47,7 @@ tokio = { workspace = true, features = ["rt", "time", "net"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 praxis-ai-store = { workspace = true, features = ["test-support"] }
 praxis-ai-store-lifecycle = { path = "../store-lifecycle" }
 serde_yaml = { workspace = true }
