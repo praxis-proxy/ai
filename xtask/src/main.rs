@@ -80,6 +80,11 @@ enum Command {
     #[cfg(feature = "dev")]
     CheckInference(inference_fixtures::CheckArgs),
 
+    /// Check the runtime Anthropic Messages operation registry
+    /// against the pinned Anthropic specification.
+    #[cfg(feature = "dev")]
+    CheckAnthropicMessagesRegistry,
+
     /// Check the runtime Responses operation registry against
     /// the pinned OpenAI specification.
     #[cfg(feature = "dev")]
@@ -216,6 +221,7 @@ fn main() {
 #[cfg(feature = "dev")]
 fn run_dev(command: Command) {
     match command {
+        Command::CheckAnthropicMessagesRegistry => openai_conformance::run_anthropic_messages_registry_check(),
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
