@@ -322,13 +322,13 @@ impl Proxy {
     }
 }
 
-/// Metered proxy config for `setup` on `port`, admin on `admin`.
+/// Metered proxy config for `setup` on `port`, metrics on `admin`.
 fn config(port: u16, admin: u16, setup: &Setup<'_>) -> String {
     format!(
         r#"
 shutdown_timeout_secs: 1
 admin:
-  address: "127.0.0.1:{admin}"
+  metrics_address: "127.0.0.1:{admin}"
 runtime:
   threads: 1
   {runtime}

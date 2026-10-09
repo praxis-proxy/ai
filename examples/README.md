@@ -55,6 +55,7 @@ for how these are authored and regenerated.
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
+| [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
 | [project-state-owner-headers.yaml](configs/project-state-owner-headers.yaml) | Demonstrates the production boundary used when an external authenticator injects separate tenant and subject headers. `state_owner` consumes those assertions into an immutable internal owner and strips the inbound copies. `project_state_owner_headers` then recreates destination-specific headers from that normalized context |

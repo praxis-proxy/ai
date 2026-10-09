@@ -9,7 +9,7 @@
 #   curl http://localhost:8080/
 
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 
 listeners:
   - name: default

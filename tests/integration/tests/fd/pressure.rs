@@ -177,14 +177,14 @@ fn descriptor_usage_is_exported() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// HTTP proxy on `port` routing to `backend`, admin on `admin`, with
+/// HTTP proxy on `port` routing to `backend`, metrics on `admin`, with
 /// `runtime_lines` under `runtime:`.
 fn http_config(port: u16, admin: u16, backend: u16, runtime_lines: &str) -> String {
     format!(
         r#"
 shutdown_timeout_secs: 1
 admin:
-  address: "127.0.0.1:{admin}"
+  metrics_address: "127.0.0.1:{admin}"
 runtime:
   threads: 1
   {runtime_lines}
@@ -210,14 +210,14 @@ insecure_options:
     )
 }
 
-/// TCP proxy on `port` forwarding to `upstream`, admin on `admin`, with
+/// TCP proxy on `port` forwarding to `upstream`, metrics on `admin`, with
 /// `max_open_files: 256`.
 fn tcp_config(port: u16, admin: u16, upstream: u16) -> String {
     format!(
         r#"
 shutdown_timeout_secs: 1
 admin:
-  address: "127.0.0.1:{admin}"
+  metrics_address: "127.0.0.1:{admin}"
 runtime:
   threads: 1
   max_open_files: 256

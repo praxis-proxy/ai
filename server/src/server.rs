@@ -301,17 +301,25 @@ fn register_admin_endpoints(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+        praxis_protocol::http::pingora::health::add_admin_api_to_pingora_server(
             server.server_mut(),
             admin_addr,
             praxis_protocol::http::pingora::health::AdminEndpointOptions {
-                health_registry: Some(health_registry),
+                health_registry: Some(HealthRegistry::clone(&health_registry)),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
                 stats: None,
                 verbose: config.admin.verbose,
             },
+        );
+    }
+    if let Some(metrics_addr) = &config.admin.metrics_address {
+        praxis_protocol::http::pingora::health::add_health_endpoint_to_pingora_server(
+            server.server_mut(),
+            metrics_addr,
+            Some(health_registry),
+            config.admin.verbose,
         );
     }
 }

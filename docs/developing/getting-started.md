@@ -205,7 +205,7 @@ insecure_options:
 | ------ | -------- |
 | `allow_open_security_filters` | Allow security-critical filters (`ip_acl`, `forwarded_headers`) to use `failure_mode: open`. Without this flag, open security filters are rejected because a runtime error would bypass security enforcement. With this flag enabled, the error is demoted to a warning. |
 | `allow_private_health_checks` | Allow health check endpoints that resolve to loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or cloud metadata addresses. Blocked by default as SSRF protection. |
-| `allow_public_admin` | Allow the admin health endpoint to bind to a public interface (`0.0.0.0` / `[::]`). By default this is a validation error. |
+| `allow_public_admin` | Allow the admin management API to bind to a public interface (`0.0.0.0` / `[::]`). By default this is a validation error. |
 | `allow_root` | Allow starting as root (UID 0). Praxis refuses to run as root by default. |
 | `allow_tls_without_sni` | Allow upstream TLS connections without an explicit SNI hostname. Most TLS servers require SNI; without this flag, missing SNI is a validation error. |
 | `allow_unbounded_body` | Allow unbounded body processing. This covers two checks: (1) `body_limits.max_request_bytes` or `max_response_bytes` set to `null`, and (2) `StreamBuffer` body mode without a `max_bytes` limit. Without this flag, both are rejected at startup. |

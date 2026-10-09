@@ -38,6 +38,7 @@
 )]
 
 mod a2a;
+mod admin;
 mod agentic_mocks;
 mod anthropic_messages;
 mod claude_code;

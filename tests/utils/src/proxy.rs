@@ -461,10 +461,15 @@ fn build_pingora_server(
     }
     drop(cert_shutdowns);
 
-    if let Some(admin_addr) = &config.admin.address {
+    let health_addr = config
+        .admin
+        .metrics_address
+        .as_deref()
+        .or(config.admin.address.as_deref());
+    if let Some(addr) = health_addr {
         praxis_protocol::http::pingora::health::add_health_endpoint_to_pingora_server(
             &mut server,
-            admin_addr,
+            addr,
             None,
             config.admin.verbose,
         );

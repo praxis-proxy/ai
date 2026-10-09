@@ -14,7 +14,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use praxis_core::config::Config;
-    use praxis_filter::{FilterFactory, FilterRegistry, registered_policy_subrequest_connector};
+    use praxis_filter::FilterRegistry;
 
     const CONFIG: &str = r#"
 listeners:
@@ -24,7 +24,17 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: policy_registration_probe
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+insecure_options:
+  allow_private_endpoints: true
 "#;
 
     /// The proxy's shared client, built on the crypto provider the binary
@@ -35,25 +45,26 @@ filter_chains:
     }
 
     #[test]
-    fn resolving_pipelines_registers_policy_connector_before_filter_construction() {
+    fn registry_clone_preserves_connector_and_pipelines_build_successfully() {
         let config = Config::from_yaml(CONFIG).expect("the test config must parse");
         let client = client(&config);
         let expected_connector = client.connector().clone();
-        let mut registry = FilterRegistry::with_builtins();
-        registry
-            .register(
-                "policy_registration_probe",
-                FilterFactory::Http(Arc::new(move |_| {
-                    let registered = registered_policy_subrequest_connector()
-                        .expect("pipeline construction must have a policy connector registered");
-                    assert!(
-                        std::ptr::eq(registered.connector(), expected_connector.connector()),
-                        "policy filters must receive the proxy's shared connector"
-                    );
-                    Err("registration probe completed".into())
-                })),
-            )
-            .expect("the probe filter name must be unique");
+        let registry = FilterRegistry::with_builtins();
+
+        let mut runtime = registry.clone();
+        runtime.set_policy_connector(client.connector());
+
+        let held = runtime
+            .policy_connector()
+            .expect("the runtime registry must carry a policy connector after set_policy_connector");
+        assert!(
+            std::ptr::eq(held.connector(), expected_connector.connector()),
+            "policy filters must receive the proxy's shared connector"
+        );
+        assert!(
+            registry.policy_connector().is_none(),
+            "the caller's registry must not pick up the runtime's connector"
+        );
 
         let result = praxis_ai::resolve_pipelines(
             &config,
@@ -62,11 +73,10 @@ filter_chains:
             &praxis_core::kv::KvStoreRegistry::new(),
             &client,
         );
-
-        let error = result.err().expect("the probe factory must stop pipeline construction");
         assert!(
-            error.to_string().contains("registration probe completed"),
-            "the probe factory must be reached: {error}"
+            result.is_ok(),
+            "resolve_pipelines must succeed with the connector set: {}",
+            result.err().map_or_else(String::new, |e| e.to_string())
         );
     }
 }

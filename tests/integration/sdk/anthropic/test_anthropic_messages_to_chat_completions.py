@@ -34,9 +34,10 @@ import threading
 import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
-from anthropic import APIStatusError, Anthropic, BadRequestError
+from anthropic import APIConnectionError, APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
@@ -235,17 +236,20 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
         config = replaced
+    # Rejection evidence must be flushed before the client observes the abort.
+    config += "\nruntime:\n  logging:\n    non_blocking: false\n"
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
         f.write(config)
     return path
 
 
-def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
+def _start_client(log_path: Path, *, allow_lossy: bool) -> Iterator[Anthropic]:
     """Start a backend + proxy and yield an Anthropic client plus the proxy port.
 
     `allow_lossy` selects the strict example config (the default) or the same
     config with operator-approved degradation enabled on the translation filter.
+    The proxy's stdout and stderr go to `log_path`.
     """
     backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
@@ -253,11 +257,12 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
 
     proxy_port = _free_port()
     config_path = _write_config(proxy_port, backend_port, allow_lossy=allow_lossy)
-    proc = subprocess.Popen(
-        [_find_binary(), "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with log_path.open("wb") as output:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
     try:
         _wait_for_proxy(proxy_port)
         yield Anthropic(
@@ -278,13 +283,19 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
 
 
 @pytest.fixture(scope="module")
-def anthropic_client():
-    yield from _start_client(allow_lossy=False)
+def proxy_log(tmp_path_factory):
+    return tmp_path_factory.mktemp("messages-to-chat").joinpath("proxy.log")
 
 
 @pytest.fixture(scope="module")
-def degrading_client():
-    yield from _start_client(allow_lossy=True)
+def anthropic_client(proxy_log):
+    yield from _start_client(proxy_log, allow_lossy=False)
+
+
+@pytest.fixture(scope="module")
+def degrading_client(tmp_path_factory):
+    log_path = tmp_path_factory.mktemp("messages-to-chat-degrading").joinpath("proxy.log")
+    yield from _start_client(log_path, allow_lossy=True)
 
 
 class TestRequestFieldHandling:
@@ -513,11 +524,18 @@ class TestResponseValidation:
         assert error.status_code == 500, "an unrecognized upstream error must surface as HTTP 500"
         assert error.body["error"]["type"] == "api_error", "the Anthropic error type must normalize to api_error"
 
-    @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
-    def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
+    @pytest.mark.parametrize("kind, expected_error", [
+        ("finish_reason", "Chat finish_reason cannot be translated to Anthropic Messages"),
+        ("refusal", "Chat response field cannot be translated to Anthropic Messages"),
+    ])
+    def test_untranslatable_success_fails_closed(
+        self, anthropic_client, proxy_log, kind, expected_error
+    ):
+        RecordingBackend.bodies.clear()
+        log_offset = proxy_log.stat().st_size
         RecordingBackend.untranslatable_reply_once = kind
         try:
-            with pytest.raises((APIStatusError, json.JSONDecodeError)) as excinfo:
+            with pytest.raises((APIStatusError, json.JSONDecodeError, APIConnectionError)) as excinfo:
                 anthropic_client.messages.create(
                     model=MODEL,
                     max_tokens=64,
@@ -531,10 +549,15 @@ class TestResponseValidation:
             assert error.status_code == 500
             assert error.body["type"] == "error"
             assert error.body["error"]["type"] == "api_error"
-        else:
+        elif isinstance(error, json.JSONDecodeError):
             # A response-body rejection can abort after 200 headers have been
             # sent. The SDK then fails to parse the empty, aborted body.
             assert error.doc == ""
+        else:
+            logs = proxy_log.read_bytes()[log_offset:].decode("utf-8")
+            assert expected_error in logs, "connection failure must follow the controlled response rejection"
+            assert "failed to transform Chat Completions-compatible response" in logs
+        assert len(RecordingBackend.bodies) == 1, "the controlled response must reach the proxy exactly once"
 
 
 class TestStreamingResponseValidation:

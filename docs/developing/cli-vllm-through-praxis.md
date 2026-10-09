@@ -273,20 +273,23 @@ The on-demand GPU endpoint needs no backend-specific container handling: the
 tunnel hostname is public, so the `endpoints` and `tls.sni` edits above are the
 only vLLM-side change with either networking mode.
 
-Follow startup with `docker logs -f praxis-vllm`. For an explicit readiness
-probe, add an admin listener to the copied config:
+Follow startup with `docker logs -f praxis-vllm`. For an explicit health
+probe, add a health/metrics listener to the copied config:
 
 ```yaml
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 ```
 
-The admin endpoint must bind loopback unless
-`insecure_options.allow_public_admin: true` is set, so query it from inside the
-container with
+This listener binds loopback, so query it from inside the container with
 `docker exec praxis-vllm wget -qO- http://127.0.0.1:9901/healthy` (or directly
 from the host under `--network host`). When finished, replace the `kill` in
 the cleanup section with `docker rm -f praxis-vllm`.
+
+The management API uses the separate `admin.address` setting. Health probes
+and Prometheus scrapers use `admin.metrics_address`, even when no management
+listener is configured. Move health-only `admin.address` configurations to
+`admin.metrics_address` to retain their existing probe port.
 
 #### The native Codex example needs a writable database path
 

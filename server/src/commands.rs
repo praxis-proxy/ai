@@ -95,12 +95,15 @@ mod tests {
 
     #[test]
     fn validate_catches_invalid_log_overrides() {
-        let config = Config::from_yaml(
-            r#"
+        for (module, level, expected) in [
+            ("invalid module", "info", "invalid module path 'invalid module'"),
+            ("praxis_core", "invalid_level", "invalid level 'invalid_level'"),
+        ] {
+            let yaml = format!(
+                r#"
 runtime:
   log_overrides:
-    "invalid module": "info"
-    "praxis_core": "invalid_level"
+    "{module}": "{level}"
 listeners:
   - name: web
     address: "127.0.0.1:8080"
@@ -109,19 +112,10 @@ filter_chains:
   - name: main
     filters: []
 "#,
-        )
-        .unwrap();
-        let result = validate_config_for_startup(&config);
-        assert!(result.is_err(), "invalid log overrides should fail validation");
-        let err = result.err().unwrap().to_string();
-        assert!(
-            err.contains("invalid module path 'invalid module'"),
-            "error should mention invalid module path: {err}"
-        );
-        assert!(
-            err.contains("invalid level 'invalid_level'"),
-            "error should mention invalid level: {err}"
-        );
+            );
+            let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected}, got: {error}");
+        }
     }
 
     #[test]

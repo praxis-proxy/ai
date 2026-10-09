@@ -201,7 +201,7 @@ USER 1001:1001
 
 WORKDIR /etc/praxis
 
-# Port 8080: proxy listener, port 9901: admin API for the health check and
+# Port 8080: proxy listener, port 9901: health check and
 # metrics, both from the built-in default config, as in the standard image.
 EXPOSE 8080 9901
 
