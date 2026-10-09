@@ -10,17 +10,17 @@
 //! Postgres transient connect is retryable), compute the dedup key, and close
 //! the pool on retirement.
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use std::time::Duration;
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::BackendError;
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use super::redact_connection_error;
 
 /// A permanent build failure, redacted, as a backend-unavailable error.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 fn permanent(url: &str, message: &str) -> BackendError {
     BackendError::Unavailable(redact_connection_error(url, message))
 }
@@ -29,17 +29,17 @@ fn permanent(url: &str, message: &str) -> BackendError {
 ///
 /// Pool acquisition timeouts do not bound a schema statement waiting on a
 /// database lock, so provisioning needs its own end-to-end deadline.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 const BACKEND_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A transient build failure, redacted, so provisioning retries within budget.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 fn transient(url: &str, message: &str) -> BackendError {
     BackendError::Transient(redact_connection_error(url, message))
 }
 
 /// A stable fingerprint of the pool overrides for the dedup key.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 fn pool_fingerprint(pool: Option<&crate::PoolConfig>) -> String {
     let pool = pool.cloned().unwrap_or_default();
     format!(
@@ -54,7 +54,7 @@ fn pool_fingerprint(pool: Option<&crate::PoolConfig>) -> String {
 }
 
 /// A stable fingerprint of the compression override for the dedup key.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 fn compression_fingerprint(compression: Option<&praxis_ai_store::StoreCompressionConfig>) -> String {
     use praxis_ai_store::CompressionAlgorithm;
 
@@ -257,7 +257,7 @@ mod sqlite {
 }
 
 /// Postgres-backed store-backend factory.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 mod postgres {
     use std::{str::FromStr as _, sync::Arc};
 
@@ -481,14 +481,14 @@ mod postgres {
 
 /// The concrete store-backend factories compiled into this build, for a binary
 /// to inject into the lifecycle cache. Empty when no backend feature is set.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 #[must_use]
 #[expect(clippy::vec_init_then_push, reason = "each push is feature-gated")]
 pub fn store_backend_factories() -> Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> {
     let mut factories: Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> = Vec::new();
     #[cfg(feature = "sqlite")]
     factories.push(std::sync::Arc::new(sqlite::SqliteBackendFactory));
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     factories.push(std::sync::Arc::new(postgres::PostgresBackendFactory));
     factories
 }
@@ -505,7 +505,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     use super::postgres::PostgresBackendFactory;
     use super::sqlite::SqliteBackendFactory;
 
@@ -773,7 +773,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     #[test]
     fn postgres_effective_key_canonicalizes_default_ssl_mode() {
         let base = json!({
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(implicit, explicit);
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     #[test]
     fn postgres_namespace_key_ignores_credentials_tls_pool_and_compression() {
         let base = json!({
@@ -826,7 +826,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     #[test]
     fn postgres_namespace_key_conservatively_ignores_roles() {
         let base = json!({
@@ -849,7 +849,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "_postgres")]
     #[test]
     fn postgres_namespace_key_distinguishes_socket_ports() {
         let factory = PostgresBackendFactory;
@@ -973,7 +973,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "tests")]
 mod postgres_tests {
@@ -1002,9 +1002,6 @@ mod postgres_tests {
 
     /// A client-cert mTLS config the response-store filter accepts must also
     /// pass factory validation: the factory runs the same TLS check.
-    ///
-    /// `require_certificate_authentication` is left off so the compliance
-    /// profile's `PGPASSWORD`-env read does not make this env-dependent.
     #[test]
     fn validate_accepts_client_cert_mtls_config() {
         let cfg = json!({
@@ -1016,6 +1013,7 @@ mod postgres_tests {
             "ssl_root_cert": "/etc/pki/ca.pem",
             "ssl_client_cert": "/etc/pki/client.pem",
             "ssl_client_key": "/etc/pki/client.key",
+            "require_certificate_authentication": true,
         });
         PostgresBackendFactory
             .validate_config(&cfg)
@@ -1034,6 +1032,7 @@ mod postgres_tests {
             "ssl_mode": "require",
             "ssl_client_cert": "/etc/pki/client.pem",
             "ssl_client_key": "/etc/pki/client.key",
+            "require_certificate_authentication": true,
         });
         let err = PostgresBackendFactory
             .validate_config(&cfg)

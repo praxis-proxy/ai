@@ -20,6 +20,55 @@ fn default_filter() -> RehydrateFilter {
     RehydrateFilter
 }
 
+#[test]
+fn replay_shares_canonical_items_and_copies_only_legacy_normalization() {
+    let canonical = vec![
+        json!({"type": "message", "role": "user", "content": "hello"}),
+        json!({"type": "item_reference", "id": "msg_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+        json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"}),
+        json!({"type": "function_call", "call_id": "call_1", "name": "weather", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "sunny"}),
+    ];
+    let mut persisted = MessageHistory::from(canonical.clone());
+    persisted.insert(
+        1,
+        json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+    );
+    persisted.push(json!({"role": "assistant", "content": "legacy answer"}));
+    persisted.push(json!({"id": "legacy_reference"}));
+    let original = persisted.clone();
+
+    let replay = replay_messages_from_stored(&persisted);
+
+    assert_eq!(replay.len(), canonical.len() + 2);
+    assert_eq!(persisted.len(), canonical.len() + 3);
+    for (index, expected) in canonical.iter().enumerate() {
+        let persisted_index = if index == 0 { 0 } else { index + 1 };
+        assert_eq!(replay[index], *expected);
+        assert!(
+            replay.shares_item_with(index, &persisted, persisted_index),
+            "canonical item {index} must not be cloned during replay"
+        );
+    }
+    assert_eq!(
+        replay[6],
+        json!({"type": "message", "role": "assistant", "content": "legacy answer"})
+    );
+    assert_eq!(replay[7], json!({"type": "item_reference", "id": "legacy_reference"}));
+    assert!(!replay.shares_item_with(6, &persisted, 7));
+    assert!(!replay.shares_item_with(7, &persisted, 8));
+    assert_eq!(
+        persisted, original,
+        "legacy normalization must not alter exact persisted history"
+    );
+    assert!(persisted[7].get("type").is_none());
+    assert!(persisted[8].get("type").is_none());
+    for index in 0..persisted.len() {
+        assert!(persisted.shares_item_with(index, &original, index));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // from_config
 // -----------------------------------------------------------------------------
@@ -299,6 +348,104 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
         state.store_persist_armed,
         "conversation rehydrate must also preserve the persistence-armed marker"
     );
+}
+
+#[tokio::test]
+async fn sqlite_item_history_rehydrates_complete_order_after_delete_and_append_at_bound_seam() {
+    let (db_url, db_path) = temp_sqlite_url("rehydrate_item_history");
+    let store = SqliteResponseStore::new(
+        &db_url,
+        "test_responses",
+        "test_conversations",
+        Some("test_items"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let owner = crate::test_utils::test_owner("default");
+    ConversationItemStore::upsert_conversation(
+        &store,
+        &ConversationRecord {
+            conversation_id: "conv_items".to_owned(),
+            owner: owner.clone(),
+            created_at: 1000,
+            metadata: json!({}),
+            messages: json!([]),
+        },
+    )
+    .await
+    .unwrap();
+    let item = |index: usize| ConversationItemRecord {
+        item_id: format!("msg_{index}"),
+        owner: owner.clone(),
+        conversation_id: "conv_items".to_owned(),
+        item_data: json!({"id": format!("msg_{index}"), "type": "message", "role": "user", "content": format!("turn {index}")}),
+        created_at: 1000,
+        position: 0,
+    };
+    let initial: Vec<_> = (0..125).map(&item).collect();
+    store
+        .create_items_and_sync_messages(&owner, "conv_items", &initial)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .delete_item_and_sync_messages(&owner, "conv_items", "msg_62")
+            .await
+            .unwrap()
+    );
+    let appended: Vec<_> = (125..128).map(item).collect();
+    store
+        .create_items_and_sync_messages(&owner, "conv_items", &appended)
+        .await
+        .unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&Arc::from("default"), Arc::new(store)).unwrap();
+    let expected: Vec<_> = initial
+        .into_iter()
+        .chain(appended)
+        .filter(|record| record.item_id != "msg_62")
+        .map(|record| record.item_data)
+        .collect();
+
+    for truncation in ["auto", "disabled"] {
+        let filter = default_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        ctx.set_metadata("openai_responses_request.format", "openai_responses");
+        let original = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4.1", "input": "next", "conversation": "conv_items", "truncation": truncation
+            }))
+            .unwrap(),
+        );
+        let mut body = Some(original.clone());
+        let outcome = filter
+            .on_bound_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+        assert_eq!(body.as_ref(), Some(&original));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert!(state.history_rehydrated);
+        assert_eq!(state.request_body["truncation"], truncation);
+        assert_eq!(state.messages.len(), expected.len() + 1);
+        assert!(state.messages.iter().take(expected.len()).eq(expected.iter()));
+        assert!(state.persisted_messages.iter().take(expected.len()).eq(expected.iter()));
+        for index in 0..state.messages.len() {
+            assert!(
+                state.messages.shares_item_with(index, &state.persisted_messages, index),
+                "canonical history item {index} must share its replay and persistence allocation"
+            );
+        }
+        assert_eq!(state.persisted_messages.len(), expected.len() + 1);
+        assert_eq!(state.messages.last().unwrap()["content"], "next");
+        assert_eq!(state.persisted_messages.last().unwrap()["content"], "next");
+    }
+    drop(registry);
+    cleanup_sqlite_file(&db_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -959,6 +1106,19 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
         state.persisted_messages[1]["type"], "mcp_list_tools",
         "persistence history should preserve stored MCP metadata"
     );
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "only the hosted listing is excluded from replay"
+    );
+    for (replay_index, persisted_index) in [(0, 0), (1, 2), (2, 3)] {
+        assert!(
+            state
+                .messages
+                .shares_item_with(replay_index, &state.persisted_messages, persisted_index),
+            "canonical items must remain shared even when hosted metadata shifts replay positions"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1227,7 +1387,7 @@ fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
     ];
 
     assert_eq!(
-        replay_messages_from_stored(&stored),
+        replay_messages_from_stored(&stored.into()),
         vec![
             json!({"id":"item-1","type":"item_reference"}),
             json!({"id":"item-2","type":"item_reference"}),
@@ -1522,9 +1682,13 @@ async fn configuration_update_applies_to_native_and_translated_conversation_requ
                 "rehydration must release: translated={translated}, request_reasoning={request_reasoning:?}"
             );
             let state = ctx.extensions.get::<ResponsesState>().unwrap();
-            assert_eq!(
-                state.persisted_messages[..3],
-                stored.as_array().unwrap()[..],
+            assert!(
+                state
+                    .persisted_messages
+                    .iter()
+                    .take(3)
+                    .zip(stored.as_array().unwrap())
+                    .all(|(actual, expected)| actual == expected),
                 "durable history must preserve configuration: translated={translated}, request_reasoning={request_reasoning:?}"
             );
             assert!(
@@ -3823,10 +3987,26 @@ fn cleanup_sqlite_file(db_path: &std::path::Path) {
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }
 
-/// The rehydrate registry facade uses only the response half, so this test
-/// double leaves the conversation-item surface unsupported.
+/// Read the complete cache-only array from the response-store fixture,
+/// preserving its owner checks and failure behavior. Item writes and item-level
+/// reads remain unsupported.
 #[async_trait::async_trait]
 impl ConversationItemStore for MockStore {
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<Value>>, StoreError> {
+        ResponseStore::get_conversation(self, owner, conversation_id)
+            .await?
+            .map(|record| match record.messages {
+                Value::Array(messages) => Ok(messages),
+                Value::Null => Ok(Vec::new()),
+                _ => Err(StoreError::Serialization("invalid mock history array".to_owned())),
+            })
+            .transpose()
+    }
+
     async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
         Err(StoreError::Unavailable(
             "mock store has no conversation items".to_owned(),
@@ -3869,12 +4049,10 @@ impl ConversationItemStore for MockStore {
 
     async fn get_conversation(
         &self,
-        _owner: &StateOwner,
-        _conversation_id: &str,
+        owner: &StateOwner,
+        conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        Err(StoreError::Unavailable(
-            "mock store has no conversation items".to_owned(),
-        ))
+        ResponseStore::get_conversation(self, owner, conversation_id).await
     }
 
     async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {

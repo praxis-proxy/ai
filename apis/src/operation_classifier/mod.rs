@@ -71,7 +71,8 @@ use crate::{
     anthropic::routes as anthropic_messages_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        responses::routes as responses_routes,
+        files::routes as files_routes, responses::routes as responses_routes,
+        vector_stores::routes as vector_stores_routes,
     },
     operation::{ApplicationProtocol, OperationEntry, PathParameterOffsets, RequestBody, RouteParams, Transport},
 };
@@ -322,13 +323,16 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
 /// the only protocol reachable over a `WebSocket` upgrade.
 ///
 /// Registered path spaces do not overlap — OpenAI serves `/v1/responses`,
-/// `/v1/conversations`, and `/v1/chat/completions` while Anthropic serves
-/// `/v1/messages` — so at most one registry can match one head, and the order
-/// below does not decide between protocols.
+/// `/v1/conversations`, `/v1/chat/completions`, `/v1/files`, and
+/// `/v1/vector_stores` while Anthropic serves `/v1/messages` — so at most one
+/// registry can match one head, and the order below does not decide between
+/// protocols.
 pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
     let http_match = (transport == Transport::Http).then(|| {
         classify_conversation(method, path)
             .or_else(|| classify_chat_completions(method, path))
+            .or_else(|| classify_files(method, path))
+            .or_else(|| classify_vector_stores(method, path))
             .or_else(|| classify_anthropic_messages(method, path))
     });
     http_match
@@ -349,6 +353,16 @@ fn classify_chat_completions(method: &str, path: &str) -> Option<AiOperationMatc
 /// Match one Anthropic Messages operation.
 fn classify_anthropic_messages(method: &str, path: &str) -> Option<AiOperationMatch> {
     anthropic_messages_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Files operation.
+fn classify_files(method: &str, path: &str) -> Option<AiOperationMatch> {
+    files_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Vector Stores operation.
+fn classify_vector_stores(method: &str, path: &str) -> Option<AiOperationMatch> {
+    vector_stores_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Responses operation.

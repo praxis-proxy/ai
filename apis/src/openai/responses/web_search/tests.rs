@@ -1389,7 +1389,10 @@ fn web_search_call(id: &str, query: &str) -> Value {
 /// pair keyed by a bounded hash id (issue #808), so the tool result is located
 /// by the query carried in the `function_call` arguments rather than by the
 /// unbounded public `web_search_call.id`.
-fn find_bridge_output<'a>(messages: &'a [Value], query: &str) -> Option<&'a Value> {
+fn find_bridge_output<'a>(
+    messages: &'a crate::openai::responses::history::MessageHistory,
+    query: &str,
+) -> Option<&'a Value> {
     let needle = serde_json::json!({ "query": query }).to_string();
     let call_id = messages.iter().find_map(|m| {
         (m["type"] == "function_call" && m["arguments"] == needle)
@@ -2518,7 +2521,10 @@ fn web_search_queries_call(id: &str, queries: &[&str]) -> Value {
 }
 
 /// Find the `function_call_output` bridged for a multi-query call.
-fn find_queries_bridge_output<'a>(messages: &'a [Value], queries: &[&str]) -> Option<&'a Value> {
+fn find_queries_bridge_output<'a>(
+    messages: &'a crate::openai::responses::history::MessageHistory,
+    queries: &[&str],
+) -> Option<&'a Value> {
     let needle = serde_json::json!({ "queries": queries }).to_string();
     let call_id = messages.iter().find_map(|m| {
         (m["type"] == "function_call" && m["arguments"] == needle)

@@ -70,6 +70,19 @@
 #   # classified openai_chat_completions/listChatCompletions -> chat backend
 #   curl http://localhost:8080/v1/chat/completions
 #
+#   # classified openai_files/createFile -> files backend. The upload is
+#   # multipart, so only head classification can recognize it.
+#   curl -X POST http://localhost:8080/v1/files \\
+#     -F purpose=assistants -F file=@./example.txt
+#
+#   # classified openai_vector_stores/getVectorStoreFile -> vector stores
+#   # backend. {file_id} here names a vector-store file, not a Files upload.
+#   curl http://localhost:8080/v1/vector_stores/vs_1/files/file_1
+#
+#   # unknown subresource: no operation matches, so it falls through rather
+#   # than entering the vector stores route a path prefix would have matched
+#   curl http://localhost:8080/v1/vector_stores/vs_1/unknown
+#
 #   # unsupported method: no operation matches, headers stripped,
 #   # falls through to the default backend
 #   curl -X PUT http://localhost:8080/v1/responses
@@ -134,6 +147,32 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "chat-backend"
             rejoin: shared_load_balancer
+          - name: files
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: openai_files
+            chains:
+              - name: files-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "files-backend"
+            rejoin: shared_load_balancer
+          - name: vector-stores
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: openai_vector_stores
+            chains:
+              - name: vector-stores-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "vector-stores-backend"
+            rejoin: shared_load_balancer
 
       # Default: anything that did not branch, classified or not.
       - filter: router
@@ -153,6 +192,12 @@ filter_chains:
           - name: "chat-backend"
             endpoints:
               - "127.0.0.1:3003"
+          - name: "files-backend"
+            endpoints:
+              - "127.0.0.1:3004"
+          - name: "vector-stores-backend"
+            endpoints:
+              - "127.0.0.1:3005"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

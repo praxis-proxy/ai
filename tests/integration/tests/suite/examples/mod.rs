@@ -15,6 +15,7 @@ mod anthropic_messages;
 mod anthropic_messages_native_vllm;
 mod anthropic_messages_to_openai_vllm;
 mod anthropic_web_search_scoped_credentials;
+mod anthropic_web_search_tavily_scoped_credentials;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
@@ -77,7 +78,7 @@ mod openai_prompts_routing;
 mod openai_response_store;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres;
-#[cfg(feature = "store-postgres")]
+#[cfg(any(feature = "store-postgres", feature = "store-postgres-cert-auth"))]
 mod openai_response_store_postgres_mtls;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;

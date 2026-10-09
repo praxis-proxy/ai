@@ -16,7 +16,7 @@ listeners:
 filter_chains:
   - name: anthropic-native
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
 
       - filter: anthropic_messages_protocol

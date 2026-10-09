@@ -295,17 +295,23 @@ pub trait ResponseStore: Send + Sync {
 /// is exact-owner- and conversation-scoped.
 #[async_trait]
 pub trait ConversationItemStore: Send + Sync {
-    /// Insert or update a conversation message cache.
+    /// Insert or update a conversation record.
+    ///
+    /// An existing authoritative legacy prefix must remain unchanged. Use
+    /// [`Self::update_conversation_metadata`] for metadata-only updates rather
+    /// than upserting a stale record with an empty cache.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the database operation fails.
+    /// Returns [`StoreError`] if the database operation fails or the upsert
+    /// would replace a preserved legacy prefix.
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError>;
 
-    /// Update only the denormalized message cache for a conversation.
+    /// Update only the legacy message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
-    /// conversation existed for this owner.
+    /// conversation existed for this owner or the write would replace an
+    /// authoritative legacy prefix. An identical prefix may be written again.
     ///
     /// # Errors
     ///
@@ -342,11 +348,16 @@ pub trait ConversationItemStore: Send + Sync {
         metadata: &serde_json::Value,
     ) -> Result<bool, StoreError>;
 
-    /// Replace the denormalized message cache only when it still equals
+    /// Replace the legacy message cache only when it still equals
     /// `expected_messages`.
     ///
+    /// Retained for cache-only compatibility; incremental item mutations no
+    /// longer use this operation. It must not replace an authoritative legacy
+    /// prefix, even when the expected value matches.
+    ///
     /// Returns `true` when the compare-and-swap succeeds and `false` after a
-    /// concurrent cache update or when the conversation does not exist.
+    /// concurrent cache update, when the conversation does not exist, or when
+    /// the replacement would change a preserved legacy prefix.
     ///
     /// # Errors
     ///
@@ -497,23 +508,42 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn max_item_position(&self, owner: &StateOwner, conversation_id: &str) -> Result<i64, StoreError>;
 
-    /// Atomically insert items and rebuild the conversation message cache.
+    /// Read complete ordered history from a consistent owner-scoped snapshot.
     ///
-    /// Within a single database transaction this method:
-    /// 1. Reads the current maximum item position.
-    /// 2. Assigns sequential positions starting from `max + 1`.
-    /// 3. Inserts the items.
-    /// 4. Rebuilds the `messages` cache from **all** items.
-    /// 5. Updates the conversation row.
+    /// Implementations must read item rows and any preserved legacy prefix from
+    /// the same snapshot. Cache-only stores may return their complete array;
+    /// adapters must forward this method to the backing store rather than read
+    /// the retired cache. There is no default because the cache alone cannot
+    /// reconstruct item-backed history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if reading or decoding the history fails.
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError>;
+
+    /// Atomically insert items and invalidate the retired message cache.
+    ///
+    /// Within a single database transaction this method assigns positions from
+    /// `max + 1`, inserts the items and clears the cache without decoding existing
+    /// item payloads. A first append preserves cache-only legacy history as an
+    /// explicit prefix in the existing JSON column instead of discarding it.
     ///
     /// The `position` field in each input record is **ignored**; positions
     /// are assigned within the transaction to prevent collisions.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] if the conversation does not exist
-    /// in the owner's scope when the transaction begins. No items are committed.
-    /// Other [`StoreError`] values indicate an unavailable table or failed write.
+    /// Returns [`StoreError::NotFound`] if the conversation does not exist in
+    /// the owner's scope when the transaction begins. No items are committed.
+    /// Other [`StoreError`] values may indicate an unavailable table, a failed
+    /// database operation, or a cache-only row with an unsupported history
+    /// shape. Rejected malformed history is left intact. Repair requires
+    /// verified replacement history and an owner-scoped compare-and-swap of the
+    /// exact observed value; it is never an automatic empty-history fallback.
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,
@@ -521,12 +551,10 @@ pub trait ConversationItemStore: Send + Sync {
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
 
-    /// Atomically delete an item and rebuild the conversation message cache.
+    /// Atomically delete an item and invalidate the retired message cache.
     ///
-    /// Within a single database transaction this method:
-    /// 1. Deletes the item row.
-    /// 2. Rebuilds the `messages` cache from all remaining items.
-    /// 3. Updates the conversation row.
+    /// The parent-row check and cache invalidation share the item transaction.
+    /// No remaining item payloads are decoded or rewritten.
     ///
     /// Returns `true` if the item was deleted, `false` if it did not
     /// exist.

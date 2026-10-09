@@ -277,12 +277,17 @@ fn build_backend_resource(backend: &BackendConfig) -> Result<BackendResource, Fi
 /// # Errors
 ///
 /// Returns [`FilterError`] if the ledger config is invalid.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "builder parameters are the distinct sliding-window accounting fields"
+)]
 fn build_sliding_window_backend(
     backend: &BackendResource,
     rule_name: &str,
     budgets: Vec<Budget>,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
@@ -303,6 +308,7 @@ fn build_sliding_window_backend(
             max_keys,
             valkey,
             namespace.as_str(),
+            accounting,
         ),
     }
 }
@@ -327,6 +333,7 @@ fn build_sw_valkey_backend(
     max_keys: usize,
     valkey: &ValkeyConnection,
     namespace: &str,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     let min_window_ms = budgets.iter().map(|b| b.window_ms).min().unwrap_or(0);
     if reservation_timeout_ms > min_window_ms {
@@ -344,6 +351,7 @@ fn build_sw_valkey_backend(
         reservation_timeout_ms,
         max_keys,
         max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+        accounting: accounting.clone(),
     })))
 }
 
@@ -365,6 +373,7 @@ fn build_token_bucket_backend(
     refill_rate: f64,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
@@ -389,6 +398,7 @@ fn build_token_bucket_backend(
                 reservation_timeout_ms,
                 max_keys,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+                accounting: accounting.clone(),
             })?))
         },
     }
@@ -416,6 +426,7 @@ pub(super) struct BodyProbe {
 /// Built once at filter construction from the deserialized
 /// [`EstimationConfig`]; all per-request math runs against this
 /// pre-validated form.
+#[derive(Clone)]
 enum CompiledEstimation {
     /// Constant per request (the legacy `reserved_tokens` path, plus
     /// the `estimation: { strategy: fixed }` equivalent).
@@ -495,6 +506,19 @@ impl CompiledEstimation {
             },
         }
     }
+}
+
+/// Stable policy inputs that affect shared Valkey reservations and
+/// reconciliation. Request-derived values, such as an individual request's
+/// `max_tokens`, remain outside this configuration object.
+#[derive(Clone)]
+struct AccountingPolicy {
+    /// Compiled request-estimation strategy.
+    estimation: CompiledEstimation,
+    /// Effective token-type reconciliation weights.
+    weights: TokenWeights,
+    /// Stable digest of the filter-wide budget-key policy.
+    key_fingerprint: String,
 }
 
 /// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
@@ -729,12 +753,17 @@ fn compile_matcher(rule_name: &str, r#match: Option<MatchConfig>) -> Result<Opti
 /// # Errors
 ///
 /// See [`build_sliding_window_backend`]/[`build_token_bucket_backend`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "builder parameters are the distinct rule and accounting inputs"
+)]
 fn build_rule_backend(
     algorithm: &RuleAlgorithm,
     backend: &BackendResource,
     rule_name: &str,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match algorithm {
         RuleAlgorithm::SlidingWindow { window, capacity } => {
@@ -743,7 +772,14 @@ fn build_rule_backend(
                 window_ms,
                 capacity: *capacity,
             }];
-            build_sliding_window_backend(backend, rule_name, budgets, reservation_timeout_ms, max_keys)
+            build_sliding_window_backend(
+                backend,
+                rule_name,
+                budgets,
+                reservation_timeout_ms,
+                max_keys,
+                accounting,
+            )
         },
         RuleAlgorithm::TokenBucket { capacity, refill_rate } => build_token_bucket_backend(
             backend,
@@ -752,6 +788,7 @@ fn build_rule_backend(
             *refill_rate,
             reservation_timeout_ms,
             max_keys,
+            accounting,
         ),
     }
 }
@@ -1403,19 +1440,36 @@ fn compile_single_header_name(rule_name: &str, loc: &str, name: &str) -> Result<
 /// valid durations, a `match` header name is invalid, a weight is
 /// negative or non-finite, or the rule's backend fails to construct
 /// (see [`build_rule_backend`]).
+#[expect(
+    clippy::too_many_lines,
+    reason = "rule compilation keeps the validation and compiled-rule assembly together"
+)]
 fn compile_rule(
     rule: RuleConfig,
     backend: &BackendResource,
     filter_defaults: TokenWeights,
     max_keys: usize,
+    key_fingerprint: &str,
 ) -> Result<CompiledRule, FilterError> {
     let capacity = rule.algorithm.capacity();
     let reservation_timeout_ms = validate_rule_bounds(&rule, capacity)?;
     let estimation = compile_estimation(&rule.name, rule.reserved_tokens, rule.estimation, capacity)?;
-    let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms, max_keys)?;
-    let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let loc = format!("rule '{}'", rule.name);
     let weights = filter_defaults.overlay(&rule.weights, &loc)?;
+    let accounting = AccountingPolicy {
+        estimation,
+        weights,
+        key_fingerprint: key_fingerprint.to_owned(),
+    };
+    let backend = build_rule_backend(
+        &rule.algorithm,
+        backend,
+        &rule.name,
+        reservation_timeout_ms,
+        max_keys,
+        &accounting,
+    )?;
+    let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let tiers = compile_tiers(&rule.name, rule.tiers, capacity)?;
     reject_deny_tier_with_soft_enforcement(&rule.name, rule.enforcement, &tiers)?;
     let mut inject_header_names = collect_inject_header_names(&tiers);
@@ -1432,8 +1486,8 @@ fn compile_rule(
         name: rule.name,
         matcher,
         backend,
-        estimation,
-        weights,
+        estimation: accounting.estimation,
+        weights: accounting.weights,
         tiers,
         inject_header_names,
         enforcement: rule.enforcement,
@@ -1533,6 +1587,10 @@ impl TokenRateLimitFilter {
     /// Returns [`FilterError`] if the YAML config is invalid, `rules` is
     /// empty, two rules share a `name`, or any individual rule fails to
     /// compile (see `compile_rule`).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "filter validation and compiled-rule assembly stay together"
+    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: TokenRateLimitConfig = parse_filter_config("token_rate_limit", config)?;
         if cfg.rules.is_empty() {
@@ -1552,10 +1610,11 @@ impl TokenRateLimitFilter {
             return Err("token_rate_limit: max_keys must be greater than 0".into());
         }
         let key_spec = compile_key_spec(cfg.key)?;
+        let key_fingerprint = key_spec.config_fingerprint();
         let rules = cfg
             .rules
             .into_iter()
-            .map(|rule| compile_rule(rule, &backend, filter_defaults, max_keys))
+            .map(|rule| compile_rule(rule, &backend, filter_defaults, max_keys, &key_fingerprint))
             .collect::<Result<Vec<_>, _>>()?;
 
         let needs_body = rules.iter().any(|r| r.estimation.needs_body());
@@ -1808,7 +1867,7 @@ impl TokenRateLimitFilter {
         estimate: u64,
         error: &BackendError,
     ) -> FilterAction {
-        record_backend_error_metric(&rule.name, rule.backend.backend_name());
+        record_backend_error_metric(&rule.name, rule.backend.backend_name(), error);
         record_accounting_failure(rule, "reserve", error);
         record_admission_span(ctx, rule, estimate, "error");
         tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
@@ -2037,7 +2096,7 @@ impl TokenRateLimitFilter {
             return;
         }
         if let Err(error) = rule.backend.enqueue_reconcile(request) {
-            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_backend_error_metric(&rule.name, rule.backend.backend_name(), &error);
             record_accounting_failure(rule, "enqueue_reconcile", &error);
             tracing::error!(%error, rule = rule.name, "token_rate_limit: failed to enqueue reconciliation");
         }
@@ -2103,11 +2162,21 @@ fn record_reserved_metric(rule_name: &str, estimate: u64) {
     counter!("praxis_trl_tokens_reserved_total", "rule" => rule_name.to_owned()).increment(estimate);
 }
 
+/// Map backend failures to the bounded Prometheus label vocabulary.
+fn backend_error_kind(error: &BackendError) -> &'static str {
+    match error {
+        BackendError::Unavailable(_) => "unavailable",
+        BackendError::InvalidResponse => "invalid_response",
+        BackendError::ConfigurationMismatch => "configuration_mismatch",
+    }
+}
+
 /// Count one bounded backend failure.
-fn record_backend_error_metric(rule_name: &str, backend: &'static str) {
+fn record_backend_error_metric(rule_name: &str, backend: &'static str, error: &BackendError) {
     counter!(
         "praxis_trl_backend_errors_total",
         "backend" => backend,
+        "error" => backend_error_kind(error),
         "rule" => rule_name.to_owned(),
     )
     .increment(1);
@@ -2449,8 +2518,8 @@ mod backend_injection_tests {
             BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReserveRequest,
             TokenRateLimitStateBackend,
         },
-        record_backend_error_metric, record_request_metric, record_reserved_metric, record_settlement_metrics,
-        record_state_metrics, record_unauthenticated_metric,
+        backend_error_kind, record_backend_error_metric, record_request_metric, record_reserved_metric,
+        record_settlement_metrics, record_state_metrics, record_unauthenticated_metric,
     };
 
     #[test]
@@ -2470,6 +2539,25 @@ mod backend_injection_tests {
         assert!(
             filter.now_ms() > 1_000_000_000_000,
             "shared Valkey timestamps use Unix time"
+        );
+    }
+
+    #[test]
+    fn backend_error_metric_kind_uses_only_bounded_values() {
+        assert_eq!(
+            backend_error_kind(&BackendError::Unavailable("backend detail".to_owned())),
+            "unavailable",
+            "unavailable backend errors map to the unavailable label"
+        );
+        assert_eq!(
+            backend_error_kind(&BackendError::InvalidResponse),
+            "invalid_response",
+            "invalid backend responses map to the invalid_response label"
+        );
+        assert_eq!(
+            backend_error_kind(&BackendError::ConfigurationMismatch),
+            "configuration_mismatch",
+            "configuration mismatches map to the configuration_mismatch label"
         );
     }
 
@@ -2599,7 +2687,11 @@ mod backend_injection_tests {
                 },
             );
             record_state_metrics(&rule.name, rule.backend.as_ref());
-            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_backend_error_metric(
+                &rule.name,
+                rule.backend.backend_name(),
+                &BackendError::Unavailable("test".to_owned()),
+            );
             record_unauthenticated_metric(&rule.name);
         });
 
@@ -2650,7 +2742,7 @@ mod backend_injection_tests {
         );
         assert_eq!(
             labels_for("praxis_trl_backend_errors_total"),
-            vec![vec!["backend".to_owned(), "rule".to_owned()]]
+            vec![vec!["backend".to_owned(), "error".to_owned(), "rule".to_owned()]]
         );
     }
 }

@@ -31,6 +31,12 @@ const CONVERSATIONS_MARKER: &str = "{\"selected\":\"conversations-backend\"}";
 /// Body returned by the Chat Completions backend, proving it was selected.
 const CHAT_MARKER: &str = "{\"selected\":\"chat-backend\"}";
 
+/// Body returned by the Files backend, proving it was selected.
+const FILES_MARKER: &str = "{\"selected\":\"files-backend\"}";
+
+/// Body returned by the Vector Stores backend, proving it was selected.
+const VECTOR_STORES_MARKER: &str = "{\"selected\":\"vector-stores-backend\"}";
+
 /// Started example: a header-echoing default backend and marker-returning
 /// family backends.
 struct Harness {
@@ -40,6 +46,10 @@ struct Harness {
     _conversations: praxis_test_utils::CapturingBackendGuard,
     /// Chat Completions backend, which returns [`CHAT_MARKER`].
     _chat: praxis_test_utils::CapturingBackendGuard,
+    /// Files backend, which returns [`FILES_MARKER`].
+    _files: praxis_test_utils::CapturingBackendGuard,
+    /// Vector Stores backend, which returns [`VECTOR_STORES_MARKER`].
+    _vector_stores: praxis_test_utils::CapturingBackendGuard,
     /// The running proxy.
     proxy: praxis_test_utils::ProxyGuard,
 }
@@ -49,6 +59,8 @@ fn start() -> Harness {
     let responses = start_header_echo_backend();
     let conversations = start_capturing_backend(CONVERSATIONS_MARKER);
     let chat = start_capturing_backend(CHAT_MARKER);
+    let files = start_capturing_backend(FILES_MARKER);
+    let vector_stores = start_capturing_backend(VECTOR_STORES_MARKER);
     let proxy_port = free_port();
     let config = load_example_config(
         "openai/operation-classifier.yaml",
@@ -57,6 +69,8 @@ fn start() -> Harness {
             ("127.0.0.1:3001", responses.port()),
             ("127.0.0.1:3002", conversations.port()),
             ("127.0.0.1:3003", chat.port()),
+            ("127.0.0.1:3004", files.port()),
+            ("127.0.0.1:3005", vector_stores.port()),
         ]),
     );
     let proxy = start_proxy(&config);
@@ -64,6 +78,8 @@ fn start() -> Harness {
         _responses: responses,
         _conversations: conversations,
         _chat: chat,
+        _files: files,
+        _vector_stores: vector_stores,
         proxy,
     }
 }
@@ -76,6 +92,96 @@ fn echoed(raw: &str) -> String {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+/// A multipart upload reaches the Files backend. The body is
+/// `multipart/form-data`, so only head classification can route it.
+#[test]
+fn a_classified_files_operation_selects_the_files_backend() {
+    let h = start();
+
+    let body = "--X\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nassistants\r\n--X--\r\n";
+    let raw = http_send(
+        h.proxy.addr(),
+        &format!(
+            "POST /v1/files HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: multipart/form-data; boundary=X\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "createFile should be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        FILES_MARKER,
+        "openai_files must branch to the Files backend"
+    );
+}
+
+/// A nested Vector Stores path reaches its own backend. `{file_id}` here names
+/// a vector-store file rather than a Files upload, so the two families must
+/// not collide.
+#[test]
+fn a_classified_vector_stores_operation_selects_the_vector_stores_backend() {
+    let h = start();
+
+    let raw = http_send(
+        h.proxy.addr(),
+        "GET /v1/vector_stores/vs_1/files/file_1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(parse_status(&raw), 200, "getVectorStoreFile should be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        VECTOR_STORES_MARKER,
+        "openai_vector_stores must branch to the Vector Stores backend"
+    );
+}
+
+/// An unknown subresource under a family path does not enter that family's
+/// route. A path prefix would have admitted it.
+#[test]
+fn an_unknown_family_subresource_falls_through() {
+    let h = start();
+
+    for path in [
+        "/v1/vector_stores/vs_1/unknown",
+        "/v1/files/file_1/unknown",
+        "/v1/vector_stores_extra",
+    ] {
+        let raw = http_send(
+            h.proxy.addr(),
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+
+        let body = parse_body(&raw);
+        assert_ne!(body, FILES_MARKER, "{path} must not reach the Files backend");
+        assert_ne!(
+            body, VECTOR_STORES_MARKER,
+            "{path} must not reach the Vector Stores backend"
+        );
+    }
+}
+
+/// An unsupported method on a family path does not enter that family's route.
+#[test]
+fn an_unsupported_family_method_falls_through() {
+    let h = start();
+
+    for (method, path) in [("PUT", "/v1/files"), ("DELETE", "/v1/vector_stores")] {
+        let raw = http_send(
+            h.proxy.addr(),
+            &format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+
+        let body = parse_body(&raw);
+        assert_ne!(body, FILES_MARKER, "{method} {path} must not reach the Files backend");
+        assert_ne!(
+            body, VECTOR_STORES_MARKER,
+            "{method} {path} must not reach the Vector Stores backend"
+        );
+    }
+}
 
 /// A Chat Completions client keeps OpenAI-shaped errors when the proxy itself
 /// fails, without any Responses filter in the chain.

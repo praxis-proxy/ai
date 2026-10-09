@@ -1,0 +1,56 @@
+version: 1
+id: responses/responses-to-chat-completions-reasoning-agentic
+description: >-
+  An agentic reasoning turn is stored, then continued with previous_response_id.
+  The agentic output collector records the round's reasoning into the stored
+  history; assembly must not append it a second time, so the continuation forwards
+  the assistant answer with its reasoning exactly once.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions-reasoning-agentic.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.reasoning.agentic_replay
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input: "What is 2+2? Reply with just the number."
+          reasoning:
+            effort: medium
+          store: true
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: continuation
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input: "Now what is that plus 10? Reply with just the number."
+          store: false
+          stream: false
+          previous_response_id: "${PREVIOUS_RESPONSE_ID}"
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

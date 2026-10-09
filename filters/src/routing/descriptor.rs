@@ -161,7 +161,8 @@ pub(crate) struct CandidateConfig {
     /// Site that owns this capability.
     pub site: String,
 
-    /// Optional bounded weight used only by weighted selection.
+    /// Optional weight for an overlay using `selection_policy.mode: weightedRandom`.
+    /// Inline static candidates cannot use traffic weights.
     #[serde(default)]
     pub traffic_weight: Option<u32>,
 }

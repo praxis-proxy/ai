@@ -16,6 +16,7 @@
 //! and `conversation` only after local rehydration consumes them.
 
 mod config;
+mod selected_input;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -171,75 +172,24 @@ impl ResponsesProxyFilter {
         let members = scan_top_level_object(body).map_err(|error| -> FilterError {
             format!("openai_responses_proxy: invalid selected request body: {error}").into()
         })?;
-        let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
-            state.messages.get(state.provider_history_len..).unwrap_or_default()
+        let messages = selected_input::reconcile(body, &members, state, preserve_native_compaction)?;
+        let discovered =
+            ResponsesState::provider_compaction_ids_from_messages(messages.iter().filter_map(|item| match item {
+                Cow::Owned(item) => Some(item),
+                Cow::Borrowed(_) => None,
+            }));
+        let provider_compaction_ids = if discovered.is_subset(&state.provider_compaction_ids) {
+            Cow::Borrowed(&state.provider_compaction_ids)
         } else {
-            &state.messages
+            let mut ids = state.provider_compaction_ids.clone();
+            ids.extend(discovered);
+            Cow::Owned(ids)
         };
-        let live_input = selected_input_messages(body, &members)?;
-        let state_backend_messages = messages_for_backend(
-            state_messages,
+        let input_replacement = serde_json::to_vec(&SelectedMessages {
+            messages: &messages,
             preserve_native_compaction,
-            &state.provider_compaction_ids,
-        );
-        let mut reconciled_messages = None;
-        if let Some(live_input) = live_input {
-            if live_input.as_slice() == state.input.as_slice()
-                || live_input.as_slice() == state_backend_messages.as_ref()
-            {
-                // The earlier request-body phase already produced the same
-                // projection; keep the state-owned representation so compaction
-                // translation and provenance are applied exactly once.
-            } else if state.history_rehydrated {
-                let appended = appended_state_messages(state);
-                let history_len = state.messages.len().saturating_sub(state.input.len() + appended.len());
-                let history = state.messages.get(..history_len).unwrap_or_default();
-                let projected_history =
-                    messages_for_backend(history, preserve_native_compaction, &state.provider_compaction_ids);
-                if live_input.len() >= projected_history.len()
-                    && live_input.get(..projected_history.len()) == Some(projected_history.as_ref())
-                {
-                    // A prior rebuild has already included local history. Keep
-                    // the live body so later filters' edits remain visible,
-                    // while retaining any agentic results appended afterward.
-                    reconciled_messages = Some(append_state_messages(live_input, appended));
-                } else {
-                    // A direct selected-body invocation may still contain only
-                    // the current input. Reattach the locally replayed history
-                    // and any agentic results appended after it.
-                    let mut merged = history.to_vec();
-                    merged.extend(live_input);
-                    merged.extend(appended.iter().cloned());
-                    reconciled_messages = Some(merged);
-                }
-            } else if provider_owns_conversation(state) && state.iteration > 0 {
-                // Provider-owned continuations send only the new delta. A
-                // later body filter may restore the original input, but it
-                // must not replace the accumulated tool result for this round.
-                reconciled_messages = Some(append_state_messages(live_input, state_messages));
-            } else {
-                // Preserve later filters' input edits while retaining agentic
-                // results appended after the original stateless input.
-                reconciled_messages = Some(append_state_messages(live_input, appended_state_messages(state)));
-            }
-        }
-        let messages = reconciled_messages.as_deref().unwrap_or(state_messages);
-        let provider_compaction_ids = reconciled_messages.as_ref().map_or_else(
-            || Cow::Borrowed(&state.provider_compaction_ids),
-            |messages| {
-                let discovered = ResponsesState::provider_compaction_ids_from_messages(messages);
-                if discovered.is_empty() || discovered.is_subset(&state.provider_compaction_ids) {
-                    Cow::Borrowed(&state.provider_compaction_ids)
-                } else {
-                    let mut ids = state.provider_compaction_ids.clone();
-                    ids.extend(discovered);
-                    Cow::Owned(ids)
-                }
-            },
-        );
-        let input_replacement = serde_json::to_vec(
-            messages_for_backend(messages, preserve_native_compaction, provider_compaction_ids.as_ref()).as_ref(),
-        )
+            provider_compaction_ids: provider_compaction_ids.as_ref(),
+        })
         .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
         let stream_replacement = state
             .request_body
@@ -430,45 +380,32 @@ fn selected_body_slice(body: &[u8], start: usize, end: usize) -> Result<&[u8], F
         .ok_or_else(|| "openai_responses_proxy: invalid selected request body range".into())
 }
 
-/// Parse only the selected body's `input` member for reconciliation.
-fn selected_input_messages(
-    body: &[u8],
-    members: &[TopLevelMember],
-) -> Result<Option<Vec<serde_json::Value>>, FilterError> {
-    let Some(member) = members.iter().rev().find(|member| member.name == TopLevelField::Input) else {
-        return Ok(None);
-    };
-    let value = serde_json::from_slice(selected_body_slice(body, member.value_start, member.value_end)?).map_err(
-        |error| -> FilterError { format!("openai_responses_proxy: invalid selected input: {error}").into() },
-    )?;
-    Ok(Some(normalize_input_owned(value)))
+/// Borrow reconciled messages and translate only individual summaries.
+struct SelectedMessages<'a> {
+    /// Borrowed history and the few owned live edits.
+    messages: &'a [Cow<'a, serde_json::Value>],
+    /// Selected native Responses protocol.
+    preserve_native_compaction: bool,
+    /// Known provider-originated compaction IDs.
+    provider_compaction_ids: &'a HashSet<String>,
 }
 
-/// Append state-owned messages that are not part of the original input.
-fn append_state_messages(
-    mut live_input: Vec<serde_json::Value>,
-    appended: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
-    if !appended.is_empty() && !live_input.ends_with(appended) {
-        live_input.extend(appended.iter().cloned());
+impl serde::Serialize for SelectedMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let mut sequence = serializer.serialize_seq(Some(self.messages.len()))?;
+        for item in self.messages {
+            let projected = messages_for_backend(
+                std::slice::from_ref(item.as_ref()),
+                self.preserve_native_compaction,
+                self.provider_compaction_ids,
+            );
+            for item in projected.iter() {
+                sequence.serialize_element(item)?;
+            }
+        }
+        sequence.end()
     }
-    live_input
-}
-
-/// Return messages appended after the original request input.
-fn appended_state_messages(state: &ResponsesState) -> &[serde_json::Value] {
-    let input_len = state.input.len();
-    if input_len == 0 {
-        return &state.messages;
-    }
-    let Some(input_start) = state
-        .messages
-        .windows(input_len)
-        .rposition(|window| window == state.input.as_slice())
-    else {
-        return &[];
-    };
-    state.messages.get(input_start + input_len..).unwrap_or_default()
 }
 
 /// Locate top-level members without materializing the complete JSON value.
@@ -813,22 +750,23 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
-        let messages = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
-            self.state
-                .messages
-                .get(self.state.provider_history_len..)
-                .unwrap_or_default()
+        let start = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
+            self.state.provider_history_len
         } else {
-            &self.state.messages
+            0
         };
-        let backend_messages =
-            messages_for_backend(messages, self.preserve_native_compaction, self.provider_compaction_ids);
+        let backend_messages = BackendMessages {
+            history: &self.state.messages,
+            start,
+            preserve_native_compaction: self.preserve_native_compaction,
+            provider_compaction_ids: self.provider_compaction_ids,
+        };
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
             match name.as_str() {
                 "input" => {
-                    map.serialize_entry(name, backend_messages.as_ref())?;
+                    map.serialize_entry(name, &backend_messages)?;
                     wrote_input = true;
                 },
                 "previous_response_id" | "conversation" if self.state.history_rehydrated => {},
@@ -836,7 +774,7 @@ impl serde::Serialize for OutboundBody<'_> {
             }
         }
         if !wrote_input {
-            map.serialize_entry("input", backend_messages.as_ref())?;
+            map.serialize_entry("input", &backend_messages)?;
         }
         map.end()
     }
@@ -861,6 +799,19 @@ fn serialize_outbound_body(
         preserve_native_compaction,
         provider_compaction_ids: &state.provider_compaction_ids,
     })
+}
+
+/// Borrow history directly, translating only compaction items while serializing.
+struct BackendMessages<'a> {
+    /// Shared canonical messages.
+    history: &'a super::history::MessageHistory,
+    /// First message not already owned by the provider.
+    start: usize,
+    /// Preserve provider-native compaction items instead of translating them
+    /// to Chat-style assistant messages.
+    preserve_native_compaction: bool,
+    /// IDs of compaction items known to have come from a provider response.
+    provider_compaction_ids: &'a HashSet<String>,
 }
 
 /// Project compaction items into the selected backend's input format.
@@ -897,6 +848,35 @@ fn messages_for_backend<'a>(
     match translated {
         Some(vec) => Cow::Owned(vec),
         None => Cow::Borrowed(messages),
+    }
+}
+
+impl serde::Serialize for BackendMessages<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq as _;
+
+        let mut sequence = serializer.serialize_seq(Some(self.history.len().saturating_sub(self.start)))?;
+        for item in self.history.iter().skip(self.start) {
+            let is_provider_compaction = self.preserve_native_compaction
+                && item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                && item
+                    .get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                && match item.get("id").and_then(serde_json::Value::as_str) {
+                    Some(id) => self.provider_compaction_ids.contains(id),
+                    None => true,
+                };
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") && !is_provider_compaction {
+                sequence.serialize_element(&compaction_to_assistant_message(item))?;
+            } else {
+                sequence.serialize_element(item)?;
+            }
+        }
+        sequence.end()
     }
 }
 

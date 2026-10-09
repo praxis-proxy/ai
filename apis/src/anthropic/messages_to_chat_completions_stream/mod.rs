@@ -99,7 +99,7 @@ const ARMED_KEY: &str = "anthropic_stream.armed";
 /// Anthropic Messages formats, processing each chunk as it arrives.
 ///
 /// Arms automatically when an upstream classifier or transform
-/// filter sets `anthropic_messages_format.stream` or
+/// filter sets `anthropic_messages_request.stream` or
 /// `anthropic_messages_to_chat_completions.streaming` metadata to `"true"` and
 /// the backend response has `Content-Type: text/event-stream`
 /// (with or without parameters such as `charset=utf-8`) and does
@@ -487,7 +487,7 @@ fn should_arm(ctx: &HttpFilterContext<'_>) -> bool {
 /// Whether an upstream filter classified this as a streaming request.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.filter_metadata
-        .get("anthropic_messages_format.stream")
+        .get("anthropic_messages_request.stream")
         .is_some_and(|v| v == "true")
         || ctx
             .filter_metadata
@@ -1493,7 +1493,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_format.stream", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1640,13 +1640,13 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_format.stream", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
         assert!(
             is_armed(&ctx),
-            "filter should arm via anthropic_messages_format.stream metadata"
+            "filter should arm via anthropic_messages_request.stream metadata"
         );
     }
 

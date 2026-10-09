@@ -26,6 +26,25 @@ fn req(method: &str, path: &str) -> Request {
     make_request(http::Method::from_bytes(method.as_bytes()).unwrap(), path)
 }
 
+/// Classify one request and assert its published protocol and operation.
+async fn assert_family(method: &str, path: &str, protocol: &'static str, operation_id: &str) {
+    let filter = default_filter();
+    let request = req(method, path);
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<AiOperationMatch>().copied();
+    assert!(matched.is_some(), "{method} {path} should classify");
+    let matched = matched.unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new(protocol),
+        "{method} {path}"
+    );
+    assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+}
+
 /// `WebSocket` opening handshake headers.
 fn websocket_headers() -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
@@ -210,19 +229,69 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
     );
 }
 
+/// Files publishes through the shared classifier, so a chain can branch on a
+/// proxy-owned fact instead of a path prefix.
+#[tokio::test]
+async fn classifies_files_operations() {
+    for (method, path, operation_id) in [
+        ("GET", "/v1/files", "listFiles"),
+        ("POST", "/v1/files", "createFile"),
+        ("GET", "/v1/files/file_abc/content", "downloadFile"),
+    ] {
+        assert_family(method, path, "openai_files", operation_id).await;
+    }
+}
+
+/// Vector Stores nests three levels deep and reuses `{file_id}` beneath a
+/// store, so each template has to resolve to its own operation.
+#[tokio::test]
+async fn classifies_vector_stores_operations() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/vector_stores", "createVectorStore"),
+        ("GET", "/v1/vector_stores/vs_1/files/file_1", "getVectorStoreFile"),
+        ("POST", "/v1/vector_stores/vs_1/search", "searchVectorStore"),
+        (
+            "GET",
+            "/v1/vector_stores/vs_1/file_batches/b_1/files",
+            "listFilesInVectorStoreBatch",
+        ),
+    ] {
+        assert_family(method, path, "openai_vector_stores", operation_id).await;
+    }
+}
+
+/// An unsupported method on a family path publishes nothing, so it cannot
+/// enter a route keyed on the classifier's output.
+#[tokio::test]
+async fn unsupported_family_methods_publish_no_match() {
+    for (method, path) in [("PUT", "/v1/files"), ("DELETE", "/v1/vector_stores")] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_none(),
+            "{method} {path} must not classify"
+        );
+    }
+}
+
 /// The error formatter is installed from the request head, so an OpenAI
 /// client keeps OpenAI-shaped errors on proxy failures without any
 /// protocol-specific filter later in the chain.
 ///
-/// Membership is derived from the protocol name, so a registry added later —
-/// Files and Vector Stores, for instance — is covered without touching this
-/// filter.
+/// Membership is derived from the protocol name, so the Files and Vector
+/// Stores registries are covered without touching this filter.
 #[tokio::test]
 async fn an_openai_operation_installs_the_error_formatter() {
     for (method, path) in [
         ("POST", "/v1/chat/completions"),
         ("POST", "/v1/responses"),
         ("GET", "/v1/conversations/conv_123"),
+        ("GET", "/v1/files"),
+        ("POST", "/v1/vector_stores"),
     ] {
         let filter = default_filter();
         let request = req(method, path);
@@ -775,9 +844,12 @@ async fn unregistered_anthropic_surfaces_publish_no_match() {
     for (method, path) in [
         ("POST", "/v1/complete"),
         ("GET", "/v1/models"),
-        ("POST", "/v1/files"),
         ("GET", "/v1/messages"),
         ("GET", "/v1/messages/msg_123"),
+        // `/v1/files` is deliberately absent: Anthropic and OpenAI share that
+        // path, and the OpenAI Files registry claims it. A request there is
+        // classified, just not as Anthropic — see
+        // `anthropic_paths_shared_with_openai_classify_as_openai`.
     ] {
         let filter = default_filter();
         let request = req(method, path);
@@ -789,6 +861,27 @@ async fn unregistered_anthropic_surfaces_publish_no_match() {
             "{method} {path} is outside every registered protocol"
         );
     }
+}
+
+/// A path Anthropic and OpenAI share resolves to the registry that declares it.
+///
+/// Both providers expose `/v1/files`. Only OpenAI Files declares those
+/// operations, so a request there classifies as `openai_files`. Asserted
+/// because the Anthropic scope doc lists `/v1/files` as outside its surface,
+/// which could be misread as "no match".
+#[tokio::test]
+async fn anthropic_paths_shared_with_openai_classify_as_openai() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/files");
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx
+        .extensions
+        .get::<AiOperationMatch>()
+        .copied()
+        .expect("the OpenAI Files registry declares this path");
+    assert_eq!(matched.application_protocol.as_str(), "openai_files");
 }
 
 /// The request head alone decides the operation.

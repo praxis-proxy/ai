@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 use crate::store::StoreCompressionConfig;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 
 /// Filter name used in SSRF validation error messages.
@@ -178,7 +178,7 @@ pub(crate) struct ResponseStoreConfig {
     pub max_event_bytes: NonZeroU64,
 }
 
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 impl ResponseStoreConfig {
     /// Borrow the `PostgreSQL` TLS settings as a [`PgTlsConfig`].
     pub(crate) fn tls_config(&self) -> PgTlsConfig<'_> {
@@ -222,7 +222,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
             reject_postgres_fields(cfg)?;
         },
         StorageBackend::Postgres => {
-            #[cfg(feature = "store-postgres")]
+            #[cfg(feature = "_store-postgres")]
             validate_postgres_config(cfg, database_url)?;
         },
     }
@@ -231,7 +231,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
 
 /// Reject a configured backend that was not compiled into this binary.
 #[cfg_attr(
-    all(feature = "store-postgres", feature = "store-sqlite"),
+    all(feature = "_store-postgres", feature = "store-sqlite"),
     expect(clippy::unnecessary_wraps, reason = "other feature sets reject unavailable backends")
 )]
 fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError> {
@@ -243,18 +243,19 @@ fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError
         .into()),
         #[cfg(feature = "store-sqlite")]
         StorageBackend::Sqlite => Ok(()),
-        #[cfg(not(feature = "store-postgres"))]
+        #[cfg(not(feature = "_store-postgres"))]
         StorageBackend::Postgres => Err(format!(
-            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' feature"
+            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' or \
+             'store-postgres-cert-auth' feature"
         )
         .into()),
-        #[cfg(feature = "store-postgres")]
+        #[cfg(feature = "_store-postgres")]
         StorageBackend::Postgres => Ok(()),
     }
 }
 
 /// Validate configuration that is specific to the `PostgreSQL` backend.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 fn validate_postgres_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
     postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
     validate_postgres_table_identifiers(&cfg.responses_table, &cfg.conversations_table)
@@ -281,7 +282,7 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
 }
 
 /// Validate `PostgreSQL` TLS options.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
     cfg.tls_config().validate(FILTER_NAME, database_url)
 }
@@ -342,7 +343,7 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-#[cfg(any(not(feature = "store-postgres"), not(feature = "store-sqlite")))]
+#[cfg(any(not(feature = "_store-postgres"), not(feature = "store-sqlite")))]
 #[expect(clippy::allow_attributes, reason = "test-only panic assertions")]
 #[allow(clippy::expect_used, reason = "tests")]
 mod backend_availability_tests {
@@ -366,7 +367,7 @@ mod backend_availability_tests {
         assert!(error.to_string().contains("'store-sqlite' feature"), "{error}");
     }
 
-    #[cfg(not(feature = "store-postgres"))]
+    #[cfg(not(feature = "_store-postgres"))]
     #[test]
     fn from_config_rejects_postgres_when_backend_is_not_compiled() {
         let yaml = serde_yaml::from_str(
@@ -381,6 +382,10 @@ mod backend_availability_tests {
             .err()
             .expect("unavailable PostgreSQL backend must fail during construction");
 
-        assert!(error.to_string().contains("'store-postgres' feature"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'store-postgres'") && message.contains("'store-postgres-cert-auth'"),
+            "{error}"
+        );
     }
 }

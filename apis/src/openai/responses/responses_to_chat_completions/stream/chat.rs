@@ -11,7 +11,9 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, de::IgnoredAny};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
+
+use crate::openai::translation::reasoning::{RawReasoningField, ReasoningDialect};
 
 /// One Chat Completions streaming chunk (`chat.completion.chunk`).
 #[derive(Debug, Deserialize)]
@@ -56,6 +58,12 @@ pub(super) struct ChatChoice<'a> {
 /// The incremental delta payload of a Chat Completions choice.
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatDelta<'a> {
+    /// Defer decoding provider-specific fields so a disabled dialect ignores even malformed values.
+    #[serde(default, borrow)]
+    pub reasoning: Option<&'a RawValue>,
+    /// Deprecated vLLM alias, decoded only if the preferred field has no text.
+    #[serde(default, borrow)]
+    pub reasoning_content: Option<&'a RawValue>,
     /// Message role, when the provider repeats it in a delta.
     #[serde(default, borrow)]
     pub role: Option<Cow<'a, str>>,
@@ -74,6 +82,28 @@ pub(super) struct ChatDelta<'a> {
     /// fail closed instead of silently dropping the call.
     #[serde(default)]
     pub function_call: Option<IgnoredAny>,
+}
+
+impl ChatDelta<'_> {
+    /// Borrow unescaped reasoning text and allocate only when JSON unescaping requires it.
+    pub(super) fn raw_reasoning(&self, dialect: ReasoningDialect) -> Result<Option<Cow<'_, str>>, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+
+        for field in dialect.raw_fields() {
+            let raw = match *field {
+                RawReasoningField::Reasoning => self.reasoning,
+                RawReasoningField::ReasoningContent => self.reasoning_content,
+            };
+            if let Some(raw) = raw {
+                let Text(text) = serde_json::from_str(raw.get())?;
+                if !text.is_empty() {
+                    return Ok(Some(text));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// One incremental tool-call fragment.
@@ -175,5 +205,20 @@ mod tests {
             logprobs_content(Some(&serde_json::json!({"content": [{"token": "a"}]}))),
             serde_json::json!([{"token": "a"}])
         );
+    }
+
+    #[test]
+    fn raw_reasoning_borrows_unescaped_text() -> Result<(), serde_json::Error> {
+        let delta: ChatDelta<'_> = serde_json::from_str(r#"{"reasoning":"thought"}"#)?;
+        assert!(matches!(
+            delta.raw_reasoning(ReasoningDialect::Vllm)?,
+            Some(Cow::Borrowed("thought"))
+        ));
+        let escaped: ChatDelta<'_> = serde_json::from_str(r#"{"reasoning":"line\nbreak"}"#)?;
+        assert!(matches!(
+            escaped.raw_reasoning(ReasoningDialect::Vllm)?,
+            Some(Cow::Owned(_))
+        ));
+        Ok(())
     }
 }

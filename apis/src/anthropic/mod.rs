@@ -4,18 +4,16 @@
 //! Anthropic protocol filters and the Messages operation registry.
 
 pub(crate) mod error_response_formatter;
-mod messages_format;
+mod messages_request;
 pub(crate) mod messages_to_chat_completions;
 mod messages_to_chat_completions_stream;
 mod protocol;
 pub mod routes;
-mod validate;
 mod web_search;
 mod wire;
 
-pub use messages_format::AnthropicMessagesFormatFilter;
+pub use messages_request::{AnthropicMessagesRequestFilter, AnthropicMessagesState};
 pub use messages_to_chat_completions::AnthropicMessagesToChatCompletionsFilter;
 pub use messages_to_chat_completions_stream::AnthropicMessagesToChatCompletionsStreamFilter;
 pub use protocol::AnthropicMessagesProtocolFilter;
-pub use validate::AnthropicValidateFilter;
 pub use web_search::AnthropicWebSearchFilter;

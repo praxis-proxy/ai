@@ -13,7 +13,7 @@
 # without measurement.
 #
 # A request fact filter (openai_responses_request, openai_chat_completions_request,
-# anthropic_messages_format, or anthropic_messages_to_chat_completions) must run
+# anthropic_messages_request, or anthropic_messages_to_chat_completions) must run
 # upstream to set model metadata in the request path. Without one, all TTFT
 # samples are labeled "unknown".
 #

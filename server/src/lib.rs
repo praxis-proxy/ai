@@ -5,18 +5,18 @@
 
 mod fd_limit;
 pub(crate) mod pipelines;
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 pub mod readiness;
 pub(crate) mod reload;
 mod server;
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 mod store_config;
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 pub use pipelines::validate_pipelines_with_store_wiring;
 pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
@@ -34,10 +34,10 @@ pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_ap
 /// Serving-runtime command handle used to provision store generations during
 /// config reload. Backend-free builds carry a placeholder because they have no
 /// concrete factory or pool lifecycle to drive.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 pub(crate) type StoreReloadHandle = store_provision::StoreReloadHandle;
 /// Feature-off placeholder for [`StoreReloadHandle`].
-#[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+#[cfg(not(feature = "_store-backend"))]
 #[derive(Clone, Default)]
 pub(crate) struct StoreReloadHandle(std::marker::PhantomData<()>);
 

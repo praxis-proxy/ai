@@ -107,13 +107,13 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
 /// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
-/// translation is not yet implemented, so a streaming request is rejected when
-/// valid reasoning dialect is configured. On continuation, raw reasoning
-/// is replayed into the following assistant turn's `reasoning` field, preserving
-/// its ordinary `content`. Reasoning-only output becomes a standalone assistant
-/// message at a turn boundary or end of input. Reasoning input requires an
-/// enabled dialect and non-empty raw `reasoning_text` content; encrypted,
+/// the deprecated `reasoning.generate_summary`) is rejected. Streaming responses
+/// translate `delta.reasoning` (or `delta.reasoning_content`) incrementally into
+/// `response.reasoning_text.delta` events under the same byte limit. On continuation,
+/// raw reasoning is replayed into the following assistant turn's `reasoning` field,
+/// preserving its ordinary `content`. Reasoning-only output becomes a standalone
+/// assistant message at a turn boundary or end of input. Reasoning input requires
+/// an enabled dialect and non-empty raw `reasoning_text` content; encrypted,
 /// summary-only, and malformed items are rejected before forwarding.
 ///
 /// To emit translated SSE events incrementally, this filter forces the
@@ -301,6 +301,7 @@ impl ResponsesToChatCompletionsFilter {
             response_id,
             created_at,
             self.config.stream_limits(),
+            self.config.reasoning,
         ));
         Ok(FilterAction::Continue)
     }
@@ -343,6 +344,8 @@ impl ResponsesToChatCompletionsFilter {
         if end_of_stream && let Some(events) = converter.finish(&inputs)? {
             out.extend_from_slice(&events);
         }
+
+        record_stream_reasoning_replay(ctx, &mut converter);
 
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
@@ -565,7 +568,7 @@ fn translate_canonical_state(
         return Err(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()));
     };
     ensure_previous_response_rehydrated(state)?;
-    reject_incompatible_reasoning(&state.request_body, reasoning, request_is_streaming(ctx))?;
+    reject_incompatible_reasoning(&state.request_body, reasoning)?;
     // Read the *outbound* tools/tool_choice through the accessor so a
     // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
     // private `function` tools in `request_body` only) translates the lowered view
@@ -593,20 +596,10 @@ fn translate_canonical_state(
 fn reject_incompatible_reasoning(
     request_body: &serde_json::Value,
     reasoning: &ReasoningOptions,
-    streaming: bool,
 ) -> Result<(), SelectedUpstreamBodyOutcome> {
     let Some(request) = request_body.as_object() else {
         return Ok(());
     };
-    // Streaming reasoning translation is not yet implemented.
-    if streaming && reasoning.dialect.is_enabled() {
-        debug!("streaming reasoning translation is unsupported for the configured dialect");
-        return Err(SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "streaming is not supported when a reasoning dialect is configured",
-        )));
-    }
     validate_requested_reasoning(request, reasoning).map_err(|error| {
         debug!(error = %error, "reasoning request rejected before forwarding");
         SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
@@ -740,6 +733,18 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
+/// Retain the translator's turn boundary for stored replay across IRR re-entry.
+fn record_stream_reasoning_replay(ctx: &mut HttpFilterContext<'_>, converter: &mut StreamConverter) {
+    if let Some(reasoning_index) = converter.take_replay_reasoning_index()
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        // Match the stream accumulator's output offset. Request extensions
+        // survive IRR re-entry and are visible to the outer response store.
+        let start = state.accumulated_output.len();
+        state.translated_reasoning_replay.push(start..=start + reasoning_index);
+    }
+}
+
 /// Read the response id and creation timestamp needed to seed the converter.
 fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
     let state = ctx.extensions.get::<ResponsesState>();
@@ -795,7 +800,7 @@ fn translate_success_response(
     let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs())
-            .with_reasoning_options(reasoning.clone());
+            .with_reasoning_options(*reasoning);
     // Echo the client's canonical tool declarations, not the backend-lowered forms
     // that openai_file_search_callout writes into request_body (e.g. a hosted
     // `file_search` tool lowered to a private `function`). This mirrors how the

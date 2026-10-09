@@ -1114,17 +1114,27 @@ fn debug_format_lists_configured_rule_names() {
     let cfg: super::config::TokenRateLimitConfig =
         praxis_filter::parse_filter_config("token_rate_limit", &yaml).unwrap();
     let backend = super::build_backend_resource(&cfg.backend).unwrap();
+    let key_spec = super::compile_key_spec(cfg.key).unwrap();
+    let key_fingerprint = key_spec.config_fingerprint();
     let rules = cfg
         .rules
         .into_iter()
-        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY, super::MAX_KEYS))
+        .map(|rule| {
+            super::compile_rule(
+                rule,
+                &backend,
+                super::TokenWeights::UNITY,
+                super::MAX_KEYS,
+                &key_fingerprint,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let needs_body = rules.iter().any(|r| r.estimation.needs_body());
     let filter = TokenRateLimitFilter {
         rules,
         needs_body,
-        key_spec: super::compile_key_spec(cfg.key).unwrap(),
+        key_spec,
         epoch: std::time::Instant::now(),
         valkey_clock: false,
     };
@@ -1493,13 +1503,45 @@ async fn assert_denied(filter: &dyn HttpFilter, req: &praxis_filter::Request, wh
     );
 }
 
-/// Poll `filter.on_request` for `req` up to `attempts` times, sleeping
-/// briefly between each, until it's admitted. Used to await an
-/// asynchronous (background-worker) Valkey reconciliation without a
-/// fixed, flaky sleep.
-async fn poll_until_admitted(filter: &dyn HttpFilter, req: &praxis_filter::Request, attempts: u32) -> bool {
+/// Assert `req` is rejected with one exact HTTP status.
+async fn assert_rejected_with_status(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    expected_status: u16,
+    why: &str,
+) {
+    match request_action(filter, req).await {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, expected_status, "{why}"),
+        other => panic!("{why}: expected status {expected_status}, got {other:?}"),
+    }
+}
+
+/// Run one body-dependent request with a request-derived `max_tokens` value.
+async fn request_with_max_tokens_action(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    max_tokens: u64,
+) -> FilterAction {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from(format!(r#"{{"max_tokens":{max_tokens}}}"#)));
+    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+}
+
+/// Poll a body-dependent request up to `attempts` times, sleeping briefly
+/// between each, until it is admitted. Used to await asynchronous
+/// background-worker Valkey reconciliation without a fixed, flaky sleep.
+async fn poll_until_admitted_with_max_tokens(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    max_tokens: u64,
+    attempts: u32,
+) -> bool {
     for _ in 0..attempts {
-        if matches!(request_action(filter, req).await, FilterAction::Continue) {
+        if matches!(
+            request_with_max_tokens_action(filter, req, max_tokens).await,
+            FilterAction::Continue
+        ) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1595,6 +1637,170 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
 }
 
 #[tokio::test]
+async fn valkey_sliding_window_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-sw-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 10s\ncapacity: 5\nreserved_tokens: 5\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1s\ncapacity: 5\nreserved_tokens: 1\nreservation_timeout: 1s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and consumes its budget",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different window for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not erase or reinterpret the original reservation",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_key_policy_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-key-policy-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 5",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let keyed = TokenRateLimitFilter::from_config(&single_rule_yaml_with(
+        &format!("key: model\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}"),
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+    ))
+    .unwrap();
+    let req = make_request_with_header("x-model", "gpt-test");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the global-key writer registers the shared accounting generation",
+    )
+    .await;
+    assert_rejected_with_status(
+        keyed.as_ref(),
+        &req,
+        503,
+        "a different budget-key policy must fail closed before sharing state",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected key-policy writer must not change the original budget",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_unmarked_v2_state_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-unmarked-v2-{}", std::process::id());
+    let rule_hash = super::valkey::key_hash(&[b"default"]);
+    let state_index = format!("{namespace}:v2:keys:{rule_hash}");
+    let connection = super::valkey::ValkeyConnection::new(url.clone()).unwrap();
+    let mut pipe = redis::pipe();
+    pipe.cmd("ZADD")
+        .arg(&state_index)
+        .arg(9_999_999_999_u64)
+        .arg("legacy-key")
+        .ignore();
+    pipe.cmd("PEXPIRE").arg(&state_index).arg(60_000).ignore();
+    let _: () = connection.pipeline(&pipe).await.unwrap();
+
+    let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_rejected_with_status(
+        filter.as_ref(),
+        &req,
+        503,
+        "a new writer must not claim pre-marker v2 quota state",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_unmarked_v2_quota_state_without_index_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-unmarked-counter-{}", std::process::id());
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let key_id = super::valkey::key_hash(&[namespace.as_bytes(), b"default", b"legacy-key"]);
+    let usage_key = format!("{namespace}:v2:{key_id}:u60000:{}", now_ms / 60_000);
+    let marker_key = format!(
+        "{namespace}:v2:sw:rule:{}:accounting-config",
+        super::valkey::key_hash(&[b"default"])
+    );
+    let connection = super::valkey::ValkeyConnection::new(url.clone()).unwrap();
+    let mut pipe = redis::pipe();
+    pipe.cmd("SET").arg(marker_key).arg("v3:legacy-test").ignore();
+    pipe.cmd("SET").arg(&usage_key).arg(5).arg("PX").arg(600_000).ignore();
+    let () = connection.pipeline(&pipe).await.unwrap();
+
+    let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_rejected_with_status(
+        filter.as_ref(),
+        &req,
+        503,
+        "unmarked physical quota state without its index must fail closed",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn valkey_worker_reconciles_usage_off_the_response_path() {
     let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
         tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
@@ -1602,7 +1808,7 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     };
     let namespace = format!("praxis-test-valkey-worker-{}", std::process::id());
     let yaml = single_rule_valkey_yaml(
-        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
@@ -1610,7 +1816,9 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
@@ -1627,13 +1835,13 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     // estimate - 10 actual); before that, 50 (still-active reservation)
     // + 85 would exceed capacity and be denied.
     let yaml_probe = single_rule_valkey_yaml(
-        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 85",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
     let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
 
-    let settled = poll_until_admitted(probe_filter.as_ref(), &req, 40).await;
+    let settled = poll_until_admitted_with_max_tokens(probe_filter.as_ref(), &req, 85, 40).await;
     assert!(
         settled,
         "worker-based reconciliation should eventually release the unused reservation into the shared Valkey budget"
@@ -1694,6 +1902,49 @@ async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_anoth
 }
 
 #[tokio::test]
+async fn valkey_token_bucket_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-tb-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 0.001\nreserved_tokens: 10\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 10\nreserved_tokens: 1\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and depletes its bucket",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different refill rate for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not refill or reset the original bucket",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn valkey_token_bucket_failure_fails_closed() {
     // The token-bucket analog of `valkey_failure_fails_closed`: an
     // unreachable Valkey backend must not silently admit token-bucket
@@ -1726,7 +1977,7 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     };
     let namespace = format!("praxis-test-tb-worker-{}", std::process::id());
     let yaml = single_rule_valkey_yaml(
-        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nreserved_tokens: 50",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
@@ -1734,7 +1985,9 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
@@ -1747,13 +2000,13 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     // (50 estimate - 10 actual); before that, 50 (still-reserved) + 85
     // would exceed capacity and be denied.
     let yaml_probe = single_rule_valkey_yaml(
-        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nreserved_tokens: 85",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
     let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
 
-    let settled = poll_until_admitted(probe_filter.as_ref(), &req, 40).await;
+    let settled = poll_until_admitted_with_max_tokens(probe_filter.as_ref(), &req, 85, 40).await;
     assert!(
         settled,
         "worker-based reconciliation should eventually credit into the shared bucket"

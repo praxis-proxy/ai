@@ -2175,7 +2175,7 @@ fn oversized_lowered_request_is_rejected_and_rolled_back() {
 fn lower_history_items_lowers_only_client_owned_calls() {
     // A local shell_call and its output are lowered together; a container-owned
     // call and its output keep their wire semantics across the continuation turn.
-    let mut messages = vec![
+    let messages = vec![
         json!({
             "type": "shell_call", "call_id": "local_1", "action": {"commands": ["ls"]},
             "environment": {"type": "local"}, "id": "sh_1", "status": "completed"
@@ -2187,9 +2187,20 @@ fn lower_history_items_lowers_only_client_owned_calls() {
         }),
         json!({"type": "shell_call_output", "call_id": "cont_1", "output": "ok"}),
     ];
+    let mut messages = super::super::history::MessageHistory::from(messages);
+    let snapshot = messages.clone();
     assert!(
         lower_history_items(&mut messages).expect("supported history lowers without error"),
         "at least one client-owned item is lowered"
+    );
+    assert_eq!(snapshot[0]["type"], "shell_call", "shared snapshot stays canonical");
+    assert!(
+        std::ptr::eq(&snapshot[2], &messages[2]),
+        "untouched calls remain shared"
+    );
+    assert!(
+        std::ptr::eq(&snapshot[3], &messages[3]),
+        "untouched outputs remain shared"
     );
     assert_eq!(messages[0]["type"], "function_call", "the local shell_call is lowered");
     assert_eq!(
@@ -2211,13 +2222,14 @@ fn local_shell_call_history_item_is_rejected() {
     // A `local_shell` declaration fails closed on the request; its typed history
     // item must fail closed too, so a prior turn's unsupported call cannot reach a
     // function-only backend unchanged on a continuation.
-    let mut messages = vec![json!({
+    let messages = vec![json!({
         "type": "local_shell_call",
         "call_id": "call_1",
         "id": "lsh_1",
         "action": {"type": "exec", "command": ["ls"]},
         "status": "completed"
     })];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     let action = lower_history_items(&mut messages).expect_err("a prior local_shell_call must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an unsupported history item is a bad request");
@@ -2231,11 +2243,12 @@ fn local_shell_call_history_item_is_rejected() {
 fn local_shell_call_output_history_item_is_rejected() {
     // The output half of an unsupported `local_shell` call is rejected on the same
     // grounds, even when the matching call is not present in this window.
-    let mut messages = vec![json!({
+    let messages = vec![json!({
         "type": "local_shell_call_output",
         "call_id": "call_1",
         "output": "listing"
     })];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     let action = lower_history_items(&mut messages).expect_err("a prior local_shell_call_output must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an unsupported history item is a bad request");
@@ -4947,7 +4960,7 @@ fn lowering_history_preserves_incomplete_status() {
     // `apply_message_status` must preserve all three `FunctionCallStatus` values; an
     // `incomplete` historical client-owned call must reach the backend with its
     // terminal state, not as a status-less call.
-    let mut messages = vec![
+    let messages = vec![
         json!({
             "type": "shell_call", "call_id": "s1", "action": {"commands": ["ls"]},
             "environment": {"type": "local"}, "id": "sh_1", "status": "incomplete"
@@ -4961,6 +4974,7 @@ fn lowering_history_preserves_incomplete_status() {
             "input": "patch", "id": "ctc_1", "status": "incomplete"
         }),
     ];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     assert!(
         lower_history_items(&mut messages).expect("supported history lowers without error"),
         "client-owned items are lowered"

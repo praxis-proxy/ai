@@ -12,7 +12,7 @@
 #
 # Responses still routes on a body fact. `openai_responses_request`
 # classifies the body for its own filter results but does not promote a
-# format header (avoids overwriting), and `anthropic_messages_format`
+# format header (avoids overwriting), and `anthropic_messages_request`
 # promotes `x-praxis-ai-format` and `x-praxis-ai-model` for the requests
 # that reach it. `/v1/messages` no longer needs a body-format router rule:
 # the head already identified it.
@@ -54,20 +54,28 @@ filter_chains:
                         cluster: "openai-backend"
             rejoin: shared_load_balancer
 
-      - filter: anthropic_messages_format
-        on_invalid: continue
-        headers:
-          format: x-praxis-ai-format
-          model: x-praxis-ai-model
-          stream: x-praxis-ai-stream
-
-      - filter: openai_responses_request
-        initialize_state: false
+      # Validates the create-message envelope for Anthropic traffic the head
+      # branch above did not take. Header promotion is disabled: this processor
+      # owns only `POST /v1/messages`, so it cannot classify the Responses
+      # traffic the router below still has to separate.
+      - filter: anthropic_messages_request
         on_invalid: continue
         headers:
           format: ~
           model: ~
           stream: ~
+
+      # Promotes the routing header the Responses route matches on. This filter
+      # owns `/v1/responses`, so it publishes that fact itself rather than
+      # leaning on a general-purpose body classifier.
+      # `initialize_state: false` because nothing here consumes Responses state.
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
 
       - name: body_classifiers
         filter: router

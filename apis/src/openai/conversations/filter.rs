@@ -168,13 +168,13 @@ impl OpenaiConversationsFilter {
     ///
     /// Production pipelines build the filter from YAML config; this
     /// constructor serves tests that exercise the unlimited default.
-    #[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(all(test, feature = "_store-postgres", feature = "store-sqlite"))]
     pub(super) fn unlimited() -> Self {
         Self { rate_limiter: None }
     }
 
     /// Construct a filter limited to `requests_per_minute` per owner.
-    #[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(all(test, feature = "_store-postgres", feature = "store-sqlite"))]
     pub(super) fn limited_for_tests(requests_per_minute: u32) -> Self {
         let limiter = OwnerRateLimiter::new(super::rate_limit::RateLimitConfig { requests_per_minute });
         Self {
