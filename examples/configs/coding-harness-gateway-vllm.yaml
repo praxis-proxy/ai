@@ -1,0 +1,224 @@
+# Coding Harness Gateway (Codex + Claude Code + OpenCode -> one vLLM)
+# Requires `--features openai-all,store-sqlite` because the Responses filters
+# are opt-in.
+#
+# Serves all three supported coding CLIs from a single configuration, a single
+# proxy process, and a single vLLM backend, with one shared gateway credential.
+# Each client keeps its own native wire format end to end — nothing is
+# translated to Chat Completions:
+#
+#   Codex       -> /v1/responses        -> vLLM /v1/responses
+#   Claude Code -> /v1/messages         -> vLLM /v1/messages
+#   OpenCode    -> /v1/chat/completions -> vLLM /v1/chat/completions
+#
+# This config composes two existing examples that could not otherwise share a
+# listener: `anthropic/messages-native-vllm.yaml` (Claude Code and OpenCode)
+# and `openai/responses/client-tool-compat.yaml` (Codex). See
+# `docs/developing/cli-vllm-through-praxis.md` for the client-side setup.
+#
+# Why two listeners rather than one
+#
+#   Codex's rich client tools need `openai_client_tool_compat`, which needs
+#   `openai_stream_events`, which fails closed outside an
+#   `iterative_request_router` step. The IRR is a TERMINAL filter, so no filter
+#   may follow it in a chain and it may not share a chain with a top-level
+#   `load_balancer` — every protocol in that chain would have to route through
+#   the IRR. The IRR buffers a sub-request response unless a filter selects
+#   `SubRequestResponseMode::Streaming`, and only the Responses and
+#   Anthropic->Chat translation filters do. Native `/v1/messages` and
+#   `/v1/chat/completions` select nothing, so routing them through the IRR
+#   would buffer their SSE and Claude Code and OpenCode would render nothing
+#   until each turn finished. Splitting the Responses pipeline onto its own
+#   listener keeps every client streaming incrementally. The split is invisible
+#   in practice: each CLI already configures its own base URL.
+#
+# Credential isolation is identical on both listeners (three distinct
+# credentials, each at its own boundary):
+#   - `basic_auth` authenticates the *client* to this gateway with the shared
+#     `GATEWAY_AUTH_PASSWORD`, and `strip_authorization: true` removes it so it
+#     never reaches the backend. All three CLIs can present it: Claude Code via
+#     `ANTHROPIC_CUSTOM_HEADERS`, OpenCode via a plugin, and Codex via
+#     `env_http_headers` (NOT `env_key`, which would append a second
+#     `Authorization: Bearer` header alongside it).
+#   - The `headers` filter removes the client's native Anthropic `x-api-key`.
+#   - `credential_injection` injects the backend's own distinct Bearer token
+#     from `VLLM_API_KEY` toward the cluster.
+#
+# Both secrets are resolved from the proxy process environment at pipeline
+# build time; set `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` there.
+
+listeners:
+  # Claude Code (`/v1/messages`) and OpenCode (`/v1/chat/completions`).
+  - name: messages-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [claude-and-opencode]
+
+  # Codex (`/v1/responses`).
+  - name: responses-gateway
+    address: "127.0.0.1:8081"
+    filter_chains: [codex-responses]
+
+filter_chains:
+  # ---------------------------------------------------------------------------
+  # Claude Code + OpenCode: native passthrough, no IRR, SSE streams unbuffered.
+  # ---------------------------------------------------------------------------
+  - name: claude-and-opencode
+    filters:
+      # Authenticate the client to the gateway BEFORE anything else, and strip
+      # the gateway `Authorization` so it never reaches the backend.
+      - filter: basic_auth
+        realm: "praxis-coding-harness-gateway"
+        strip_authorization: true
+        credentials:
+          - username: gateway
+            env_var: GATEWAY_AUTH_PASSWORD
+
+      # Classify from the request head, before any body is read. This listener
+      # serves two protocols, and this is what installs the matching error
+      # formatter for each, so a proxy-generated failure reaches Claude Code as
+      # an Anthropic error and OpenCode as an OpenAI one. The request processor
+      # below covers the Anthropic Messages surface only; without this filter
+      # OpenCode would get RFC 9457 problem details that an OpenAI client
+      # cannot parse.
+      - filter: ai_operation
+
+      # Process the create-message body once: validate the envelope and promote
+      # routing facts to internal `x-praxis-ai-*` headers. No path condition is
+      # needed — the operation keys the filter, so OpenCode's
+      # `/v1/chat/completions` traffic and bodyless probes such as
+      # `GET /v1/models` are released untouched.
+      - filter: anthropic_messages_request
+        on_invalid: reject
+
+      # Supply a default `anthropic-version` for non-SDK callers that omit it.
+      # Real Claude Code always sends one, so this is a no-op for it.
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
+
+      # Strip the client's native Anthropic auth header so it never reaches the
+      # backend. `credential_injection` below handles `Authorization`.
+      - filter: headers
+        request_remove:
+          - x-api-key
+
+      - filter: router
+        routes:
+          - path: "/v1/messages"
+            cluster: "vllm-backend"
+          - path: "/v1/messages/count_tokens"
+            cluster: "vllm-backend"
+          # OpenCode's native endpoint, forwarded without body translation.
+          - path: "/v1/chat/completions"
+            cluster: "vllm-backend"
+          - path: "/v1/models"
+            cluster: "vllm-backend"
+          # Any other native endpoint (health checks and documented startup
+          # probes) is proxied unchanged to the same backend.
+          - path_prefix: "/"
+            cluster: "vllm-backend"
+
+      # Inject the backend's own credential after routing selects the cluster.
+      - filter: credential_injection
+        clusters:
+          - name: vllm-backend
+            header: Authorization
+            env_var: VLLM_API_KEY
+            header_prefix: "Bearer "
+            strip_client_credential: true
+
+      - filter: load_balancer
+        clusters:
+          - name: "vllm-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+  # ---------------------------------------------------------------------------
+  # Codex: native Responses with persisted state and client-tool lowering.
+  # ---------------------------------------------------------------------------
+  - name: codex-responses
+    filters:
+      - filter: basic_auth
+        realm: "praxis-coding-harness-gateway"
+        strip_authorization: true
+        credentials:
+          - username: gateway
+            env_var: GATEWAY_AUTH_PASSWORD
+
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
+
+      # Persisted Responses/Conversations state is scoped to an immutable owner.
+      # `basic_auth` in front of this chain authenticates one shared gateway
+      # operator, so a fixed single-tenant owner is the honest model here; a
+      # multi-tenant deployment would use mode: trusted_headers so an upstream
+      # gateway asserts the tenant/subject instead.
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      # vLLM does not implement `store` / `previous_response_id`, so Praxis owns
+      # Responses state for Codex.
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 4
+        steps:
+          - name: inference
+            filters:
+              # Leads the step so it arms streaming restoration (a request-phase
+              # marker) before client tools are lowered. It also requires an IRR
+              # step: outside one it fails closed with HTTP 500.
+              - filter: openai_stream_events
+              - filter: openai_agentic_loop
+                max_infer_iters: 4
+              # Lowers Codex's client-owned custom, namespace, local shell, and
+              # client-executed tool_search declarations to private function
+              # tools vLLM understands, and restores the typed items on the way
+              # back. A transparent passthrough when no rich tools are declared.
+              - filter: openai_client_tool_compat
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "vllm-responses-backend"
+              - filter: credential_injection
+                clusters:
+                  - name: vllm-responses-backend
+                    header: Authorization
+                    env_var: VLLM_API_KEY
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+              - filter: load_balancer
+                clusters:
+                  - name: "vllm-responses-backend"
+                    endpoints:
+                      - "127.0.0.1:8000"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local vLLM backend

@@ -24,6 +24,8 @@ mod bedrock;
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]
+mod coding_harness_gateway_vllm;
+#[cfg(feature = "store-sqlite")]
 mod compact;
 mod credential_injection;
 mod external_metering;
