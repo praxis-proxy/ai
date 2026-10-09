@@ -1,0 +1,823 @@
+# Translation support matrix — source of truth.
+#
+# Rendered to docs/conformance/translation-matrix.md by
+# `cargo xtask translation-matrix --fix`. Do not hand-edit the rendered file.
+#
+# status vocabulary, worst case wins for a cell:
+#
+#   native          Praxis implements the operation locally and owns the payload.
+#   passthrough     Forwarded to the backend unchanged; backend semantics apply.
+#   translated      Converted with no semantic loss.
+#   translated-lossy Converted, something is approximated. `note` must say what.
+#   rejected        Explicit dialect-shaped error at the proxy edge.
+#   dropped         Accepted, then silently ignored or silently wrong.
+#   n-a             The client API has no such concept.
+#
+# `dropped` is a defect, not a support level. The renderer MUST fail if a cell
+# has status `dropped` without a `blocker`, and MUST NOT emit `dropped` cells
+# into the customer-facing table — they render into a separate "Known gaps"
+# section so the matrix never claims support Praxis does not provide.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Preconditions that hold for every surface below.
+# ---------------------------------------------------------------------------
+preconditions:
+  - id: clean-rejection-is-opt-in
+    summary: >-
+      Praxis emits a provider-shaped error only when one of three filters ran
+      and matched. With none installed the proxy emits RFC 9457
+      application/problem+json, not the client's dialect.
+    evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/fail_to_proxy.rs:264-283
+    detail:
+      - "Installers: openai_operation (apis/src/openai/operation_classifier/mod.rs:172-182),
+         openai_responses_format (apis/src/openai/responses/mod.rs:409-421),
+         anthropic_messages_format (apis/src/anthropic/messages_format/mod.rs:181-195)."
+      - "63 of 99 configs under examples/configs install none of the three."
+
+  - id: on-invalid-defaults-to-continue
+    summary: >-
+      Malformed or unrecognized bodies are forwarded to the backend and lose
+      the error formatter. 13 of the 20 examples that set on_invalid choose
+      continue.
+    evidence: apis/src/openai/responses/config.rs:117-118
+    detail: []
+
+  - id: no-deny-unknown-fields-on-the-wire
+    summary: >-
+      No request body is deserialized into a typed struct on any surface.
+      Unknown fields are governed only by hand-written allowlists, where those
+      exist. Absence of an allowlist means silent acceptance.
+    evidence: apis/src/openai/translation/chat_completions.rs:176-216
+    detail: []
+
+# ---------------------------------------------------------------------------
+# Shared feature vocabulary. Every surface answers the same rows, so the
+# rendered table reads as a matrix rather than a pile of per-filter notes.
+# ---------------------------------------------------------------------------
+features:
+  - id: text-chat
+    label: Plain text completion
+  - id: system-prompt
+    label: System / developer instructions
+  - id: multi-turn
+    label: Multi-turn history
+  - id: multimodal-image
+    label: Image input
+  - id: multimodal-audio
+    label: Audio input
+  - id: documents-files
+    label: Document / file input
+  - id: function-tools
+    label: Client function tools
+  - id: tool-choice
+    label: Tool choice
+  - id: parallel-tool-calls
+    label: Parallel tool calls
+  - id: hosted-tools
+    label: Provider-hosted tools (web search, file search, MCP, code interpreter)
+  - id: structured-output
+    label: Structured output / JSON schema
+  - id: streaming
+    label: Streaming
+  - id: streaming-terminal-events
+    label: Streaming terminates correctly
+  - id: upstream-error-midstream
+    label: Mid-stream upstream failure is surfaced
+  - id: content-filter-signal
+    label: Content-filter / safety signal reaches the client
+  - id: usage-accounting
+    label: Token usage accounting
+  - id: cache-accounting
+    label: Prompt-cache token accounting
+  - id: reasoning-content
+    label: Reasoning / thinking content
+  - id: stop-sequences
+    label: Stop sequences
+  - id: sampling-params
+    label: Sampling parameters
+  - id: logprobs
+    label: Logprobs
+  - id: state-continuation
+    label: Server-side state continuation
+  - id: unsupported-operations
+    label: Unsupported operations on a supported path
+  - id: error-envelope
+    label: Error envelope matches the client dialect
+  - id: oversized-body
+    label: Oversized request body
+
+# ---------------------------------------------------------------------------
+# Native surfaces.
+# ---------------------------------------------------------------------------
+native_surfaces:
+  - id: openai-conversations
+    client_api: OpenAI Conversations
+    operations: 8
+    status: native
+    note: >-
+      All 8 operations are HandlingMode::Local; Praxis owns the payload and
+      terminates locally. Handlers emit OpenAI-shaped 400/404/500 themselves.
+    evidence: apis/src/openai/conversations/routes.rs:298-436
+
+  - id: openai-responses-create
+    client_api: OpenAI Responses
+    operations: 1
+    status: native
+    note: POST /v1/responses is HandlingMode::Transform with an owned contract.
+    evidence: apis/src/openai/responses/routes/mod.rs:187-199
+
+  - id: openai-responses-readback
+    client_api: OpenAI Responses
+    operations: 3
+    status: passthrough
+    note: >-
+      GET /v1/responses/{id}, DELETE, and GET .../input_items are classified
+      passthrough but are terminated locally when openai_response_store is in
+      the chain. Registry mode is a classification default, not a transport
+      guarantee.
+    evidence: apis/src/openai/responses/store/filter.rs:681,686-689,1564-1567
+
+  - id: openai-chat-completions
+    client_api: OpenAI Chat Completions
+    operations: 6
+    status: passthrough
+    note: >-
+      Recognized by the registry with owned_contract: None. Outside conformance
+      scope — no oasdiff, no capability claim, no runtime suite.
+    evidence: apis/src/openai/chat_completions/routes/mod.rs:104,112-161
+
+  - id: anthropic-messages-native
+    client_api: Anthropic Messages
+    operations: null
+    status: passthrough
+    note: >-
+      Header-only filter (injects anthropic-version, preserves anthropic-beta);
+      bodies are untouched. No operation registry, no conformance gate. Path
+      match is a /v1/messages prefix test, so count_tokens and batches are not
+      distinguished.
+    evidence: apis/src/anthropic/protocol/mod.rs:81-87; apis/src/anthropic/messages_format/mod.rs:286-289
+
+conformance_claim_caveat: >-
+  The report's "15/15, 100%" counts non-beta Conversations and Responses
+  operations only — 7 of 14 projected Responses operations are scored. Publish
+  the qualified number, never the bare percentage.
+
+# ---------------------------------------------------------------------------
+# Translation surfaces.
+# ---------------------------------------------------------------------------
+surfaces:
+
+  # -------------------------------------------------------------------------
+  - id: anthropic-messages-to-chat-completions
+    short: "Anthropic -> CC"
+    client_api: Anthropic Messages
+    backend_api: OpenAI Chat Completions
+    filters:
+      - anthropic_messages_to_chat_completions
+      - anthropic_messages_to_chat_completions_stream
+    clean_rejection_requires: [anthropic_messages_format]
+    unknown_field_policy: >-
+      Unrecognized top-level fields are forwarded verbatim to the Chat backend
+      (forward_unmapped_fields), not dropped and not rejected.
+    cells:
+      text-chat:
+        status: translated
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:447-452
+      system-prompt:
+        status: translated-lossy
+        note: >-
+          An array of text blocks is joined with newlines into one string;
+          per-block boundaries and per-block cache points are lost.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:489-499
+      multi-turn:
+        status: translated
+        note: In-array system messages are accepted deliberately (Claude Code emits them).
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:161-169
+      multimodal-image:
+        status: translated
+        note: >-
+          User messages only. An image in an assistant message, or in any
+          message that also carries tool_use, is rejected 400.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:255-269
+      multimodal-audio:
+        status: n-a
+      documents-files:
+        status: rejected
+        note: All document source types rejected 400; no PDF support.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:315
+      function-tools:
+        status: translated
+        note: input_schema is moved verbatim; absent description is synthesized as "".
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:1113-1140
+      tool-choice:
+        status: translated
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:1181-1201
+      parallel-tool-calls:
+        status: translated
+        note: disable_parallel_tool_use true maps to parallel_tool_calls false.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:1147-1159
+      hosted-tools:
+        status: rejected
+        note: Typed server tools (web_search, bash, computer, code_execution) rejected 400.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:181-188
+      structured-output:
+        status: translated-lossy
+        note: >-
+          output_config.format becomes response_format.json_schema with a
+          fabricated name "output_format" and a forced strict:true the client
+          never requested.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:1040-1051
+      streaming:
+        status: translated
+        note: stream_options.include_usage is force-set true, overriding a client false.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:946-964
+      streaming-terminal-events:
+        status: dropped
+        note: >-
+          Terminal events are emitted only from the [DONE] branch. If the
+          upstream stream ends without the sentinel, no message_delta and no
+          message_stop are sent — a truncated response reported as success.
+          Anthropic's documented `ping` keep-alive is never emitted either.
+        blocker: TODO-ISSUE emit terminal events at end-of-stream
+        evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:931-948
+      upstream-error-midstream:
+        status: dropped
+        note: >-
+          A `data: {"error":{...}}` chunk after a 200 parses as valid JSON,
+          matches neither choices nor usage, and is discarded. The client sees
+          a short clean completion for a failed generation.
+        blocker: TODO-ISSUE surface mid-stream upstream error objects
+        evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:583-616
+      content-filter-signal:
+        status: dropped
+        note: >-
+          Non-streaming rejects finish_reason content_filter; streaming
+          silently maps it to end_turn. Identical backend behavior yields
+          opposite client-visible outcomes depending on `stream`.
+        blocker: TODO-ISSUE reconcile content_filter across streaming and finite paths
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:141-144 vs stream/mod.rs:1016-1022
+      usage-accounting:
+        status: dropped
+        note: >-
+          message_start.usage.input_tokens is hardcoded 0 rather than null, so
+          clients reading prompt tokens at message_start get a wrong number,
+          not a missing one. Finite-path usage is correct.
+        blocker: TODO-ISSUE populate or null message_start usage
+        evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1011-1013
+      cache-accounting:
+        status: translated-lossy
+        note: >-
+          cache_read_input_tokens maps correctly; cache_creation_input_tokens
+          is hardcoded null because Chat Completions has no cache-write
+          counter, so cache-write billing is invisible.
+        evidence: apis/src/anthropic/wire.rs:127-139
+      reasoning-content:
+        status: dropped
+        note: >-
+          Upstream message.reasoning_content and delta.refusal are never read
+          on either path. Billed output the client never sees.
+        blocker: TODO-ISSUE reject or surface reasoning_content and refusal
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:107-146
+      stop-sequences:
+        status: translated-lossy
+        note: >-
+          A genuine stop-sequence stop is reported as end_turn with
+          stop_sequence null whenever the backend does not surface the matched
+          string.
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:281-291
+      sampling-params:
+        status: translated
+        note: >-
+          temperature and top_p move verbatim with no rescaling. top_k is not
+          mapped and is forwarded as a literal non-spec key, which vLLM accepts
+          and OpenAI rejects.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:369-373
+      logprobs:
+        status: rejected
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:38-46
+      state-continuation:
+        status: n-a
+      unsupported-operations:
+        status: n-a
+      error-envelope:
+        status: translated
+        note: >-
+          Upstream errors carrying Anthropic vocabulary are preserved; a
+          foreign error.type is replaced by the HTTP-status mapping and only
+          `message` survives. OpenAI error.code and error.param are not read.
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:149-194
+      oversized-body:
+        status: dropped
+        note: See the shared oversized-body gap below.
+        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+        evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127
+
+  # -------------------------------------------------------------------------
+  - id: responses-to-chat-completions
+    short: "Responses -> CC"
+    client_api: OpenAI Responses
+    backend_api: OpenAI Chat Completions
+    filters: [responses_to_chat_completions]
+    clean_rejection_requires: [openai_responses_format]
+    unknown_field_policy: >-
+      No allowlist and no typed deserialization. Every unrecognized top-level
+      field, sub-field, and content-part property is accepted and ignored.
+    cells:
+      text-chat:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:769-788
+      system-prompt:
+        status: translated
+        note: instructions becomes a leading system message and is echoed on the response.
+        evidence: apis/src/openai/translation/chat_completions.rs:642-646
+      multi-turn:
+        status: translated
+        note: Adjacent function_calls are batched into one assistant message.
+        evidence: apis/src/openai/translation/chat_completions.rs:675-703
+      multimodal-image:
+        status: translated
+        note: input_image with image_url is lowered correctly; file_id-only input is rejected 400.
+        evidence: apis/src/openai/translation/chat_completions.rs:1030-1052
+      multimodal-audio:
+        status: rejected
+        evidence: apis/src/openai/translation/chat_completions.rs:965
+      documents-files:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:1055-1078
+      function-tools:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:1409-1424
+      tool-choice:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:1467-1483
+      parallel-tool-calls:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:452
+      hosted-tools:
+        status: translated-lossy
+        note: >-
+          web_search and file_search are replaced by synthesized private
+          functions taking only a query string. search_context_size,
+          user_location, vector_store_ids, max_num_results, filters and
+          ranking_options are validated but never conveyed to the backend. MCP,
+          code_interpreter and computer_use are rejected 400.
+        evidence: apis/src/openai/translation/chat_completions.rs:1291-1365
+      structured-output:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:614-632
+      streaming:
+        status: translated
+        evidence: apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-740
+      streaming-terminal-events:
+        status: translated
+        evidence: apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1326-1394
+      upstream-error-midstream:
+        status: translated-lossy
+        note: >-
+          Surfaced as response.failed, which force-empties `output` and
+          contradicts items already announced via output_item.added. The spec's
+          top-level `error` SSE event is never emitted.
+        evidence: apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1770-1838
+      content-filter-signal:
+        status: translated
+        note: content_filter maps to incomplete_details.reason.
+        evidence: apis/src/openai/translation/chat_completions.rs:1809-1815
+      usage-accounting:
+        status: translated-lossy
+        note: >-
+          Missing values become 0 rather than null. audio_tokens and
+          accepted/rejected_prediction_tokens are discarded.
+        evidence: apis/src/openai/translation/chat_completions.rs:2212-2250
+      cache-accounting:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:2212-2250
+      reasoning-content:
+        status: rejected
+        note: >-
+          Under the default dialect `none`, reasoning input items are rejected
+          400 and upstream reasoning fields are not read. Under the `vllm`
+          dialect reasoning round-trips, but streaming is then rejected 400
+          outright. reasoning.summary is rejected unconditionally — no dialect
+          reports supports_safe_summary.
+        evidence: apis/src/openai/translation/reasoning.rs:30-35,87-96
+      stop-sequences:
+        status: n-a
+      sampling-params:
+        status: translated
+        evidence: apis/src/openai/translation/chat_completions.rs:446-469
+      logprobs:
+        status: translated-lossy
+        note: >-
+          top_logprobs force-injects logprobs:true into the Chat request, a
+          field the client never set, and the result is surfaced regardless of
+          `include`.
+        evidence: apis/src/openai/translation/chat_completions.rs:548-553
+      state-continuation:
+        status: dropped
+        note: >-
+          previous_response_id and conversation rehydrate correctly, but on
+          continuation any stored output item that is not message,
+          function_call, function_call_output, reasoning, compaction or
+          item_reference is filter_map'd away with no error — the model
+          silently loses hosted-tool history. Separately, an unknown
+          previous_response_id returns 400 where OpenAI returns 404.
+        blocker: TODO-ISSUE preserve or reject hosted-tool history on continuation
+        evidence: apis/src/openai/responses/mod.rs:703-738
+      unsupported-operations:
+        status: dropped
+        note: >-
+          POST /v1/responses/compact and the GET /v1/responses WebSocket
+          upgrade are positively classified as Responses traffic — the compact
+          path is even allocated a resp_ id and state — then forwarded verbatim
+          to a Chat-Completions-only backend because is_responses_create()
+          matches only /v1/responses exactly. No guard says "this Responses
+          operation has no Chat Completions translation". Accounts for 9 of the
+          10 templates the OpenResponses manifest marks inapplicable.
+        blocker: TODO-ISSUE reject untranslatable Responses operations at the edge
+        evidence: apis/src/classifier/mod.rs:126-128; responses_to_chat_completions/mod.rs:525-527
+      error-envelope:
+        status: translated-lossy
+        note: >-
+          `type` and `code` are always set to the same string, where OpenAI
+          usually leaves code null or distinct. Provider param, type and extra
+          fields are discarded on upstream errors.
+        evidence: apis/src/openai/responses/error.rs:21,77-91
+      oversized-body:
+        status: dropped
+        note: See the shared oversized-body gap below.
+        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+        evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127
+
+  # -------------------------------------------------------------------------
+  - id: chat-completions-to-vertexai-gemini
+    short: "CC -> Gemini"
+    client_api: OpenAI Chat Completions
+    backend_api: Vertex AI Gemini
+    filters: [openai_chat_completions_to_vertexai_gemini]
+    clean_rejection_requires: []
+    unknown_field_policy: >-
+      Strict hand-written top-level allowlist plus a per-message field
+      allowlist. Anything outside both is rejected 400.
+    cells:
+      text-chat:
+        status: translated
+        evidence: apis/src/vertex/gemini/request.rs:375-386
+      system-prompt:
+        status: translated
+        note: Multiple system/developer messages merge in order into systemInstruction.
+        evidence: apis/src/vertex/gemini/request.rs:344-368
+      multi-turn:
+        status: translated
+        note: >-
+          Consecutive tool results are merged into one user turn as Gemini
+          requires. Client tool_call ids are deliberately not sent and do not
+          round-trip; response ids are minted fresh.
+        evidence: apis/src/vertex/gemini/request.rs:557-562,611-649
+      multimodal-image:
+        status: translated-lossy
+        note: >-
+          A base64 data URI translates faithfully. An http URL becomes fileData
+          with the MIME type guessed from the file extension, silently
+          defaulting to image/jpeg for anything not .png/.gif/.webp.
+        evidence: apis/src/vertex/gemini/request.rs:441-463
+      multimodal-audio:
+        status: rejected
+        evidence: apis/src/vertex/gemini/request.rs:415
+      documents-files:
+        status: rejected
+        evidence: apis/src/vertex/gemini/request.rs:415
+      function-tools:
+        status: translated-lossy
+        note: >-
+          parameters JSON Schema is copied verbatim with no conversion to
+          Gemini's OpenAPI subset, so unsupported keywords reach Vertex
+          unchanged and fail upstream rather than at the edge.
+        evidence: apis/src/vertex/gemini/request.rs:835-886
+      tool-choice:
+        status: translated
+        evidence: apis/src/vertex/gemini/request.rs:905-923
+      parallel-tool-calls:
+        status: rejected
+        note: Only the default true is accepted and discarded; false is rejected 400.
+        evidence: apis/src/vertex/gemini/request.rs:120-123
+      hosted-tools:
+        status: rejected
+        evidence: apis/src/vertex/gemini/request.rs:844-846
+      structured-output:
+        status: dropped
+        note: >-
+          json_schema translates, but the json_schema sub-object has no
+          allowlist: name, description and strict are read by nothing.
+          strict:true is accepted and silently ignored, so structured-output
+          strictness is lost with no error.
+        blocker: TODO-ISSUE reject or honor response_format.json_schema.strict
+        evidence: apis/src/vertex/gemini/request.rs:794-819
+      streaming:
+        status: translated
+        evidence: apis/src/vertex/gemini/response.rs:590-752
+      streaming-terminal-events:
+        status: translated
+        note: Gemini never sends [DONE]; it is synthesized proxy-side.
+        evidence: apis/src/vertex/gemini/mod.rs:312-317
+      upstream-error-midstream:
+        status: rejected
+        note: Frames with no candidates but an error or promptFeedback.blockReason become a stream error.
+        evidence: apis/src/vertex/gemini/response.rs:795-822
+      content-filter-signal:
+        status: translated
+        note: >-
+          SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII, IMAGE_SAFETY,
+          LANGUAGE, OTHER and MODEL_ARMOR all map to content_filter. Unknown
+          finish reasons are a hard error, not a silent "stop".
+        evidence: apis/src/vertex/gemini/response.rs:435-482
+      usage-accounting:
+        status: translated-lossy
+        note: Token counts map; see cache-accounting and reasoning-content for what does not.
+        evidence: apis/src/vertex/gemini/response.rs:489-502
+      cache-accounting:
+        status: dropped
+        note: cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted.
+        blocker: TODO-ISSUE map Gemini cachedContentTokenCount
+        evidence: apis/src/vertex/gemini/response.rs:489-502
+      reasoning-content:
+        status: dropped
+        note: >-
+          thoughtsTokenCount is discarded, so no
+          completion_tokens_details.reasoning_tokens is emitted. A streaming
+          Part carrying only thoughtSignature produces no output and no error.
+        blocker: TODO-ISSUE map Gemini thoughtsTokenCount
+        evidence: apis/src/vertex/gemini/response.rs:284,489-502
+      stop-sequences:
+        status: translated
+        evidence: apis/src/vertex/gemini/request.rs:775-785
+      sampling-params:
+        status: translated-lossy
+        note: >-
+          Values are copied verbatim with no range validation. top_logprobs is
+          copied even when logprobs is absent or false, which OpenAI forbids;
+          there is no coupling check.
+        evidence: apis/src/vertex/gemini/request.rs:755-768
+      logprobs:
+        status: translated
+        evidence: apis/src/vertex/gemini/response.rs:517-567
+      state-continuation:
+        status: n-a
+      unsupported-operations:
+        status: n-a
+      error-envelope:
+        status: translated-lossy
+        note: >-
+          OpenAI-shaped with param:null. Differs from the Bedrock filter's
+          envelope — see the cross-surface gap below.
+        evidence: apis/src/vertex/wire.rs:151-164
+      oversized-body:
+        status: dropped
+        note: See the shared oversized-body gap below.
+        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+        evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127
+
+  # -------------------------------------------------------------------------
+  - id: chat-completions-to-azureai
+    short: "CC -> Azure"
+    client_api: OpenAI Chat Completions
+    backend_api: Azure AI Chat Completions
+    filters: [openai_chat_completions_to_azureai_chat_completions]
+    clean_rejection_requires: [openai_operation]
+    unknown_field_policy: >-
+      None. This filter is not a translator: the entire request-side transform
+      is obj.remove("model"). There is no allowlist, no validation, and no
+      rejection path — on_request_body always returns Continue.
+    cells:
+      text-chat: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      system-prompt: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      multi-turn: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      multimodal-image: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      multimodal-audio: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      documents-files: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      function-tools: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      tool-choice: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      parallel-tool-calls: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      hosted-tools: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      structured-output:
+        status: passthrough
+        note: Support depends entirely on the configured api_version, not on Praxis.
+        evidence: apis/src/azure/to_openai/request.rs:19-26
+      streaming:
+        status: passthrough
+        note: >-
+          The request `stream` flag is never read; response mode is chosen from
+          the upstream Content-Type.
+        evidence: apis/src/azure/to_openai/mod.rs:252-269
+      streaming-terminal-events: {status: passthrough, evidence: "apis/src/azure/to_openai/mod.rs:311-396"}
+      upstream-error-midstream: {status: passthrough, evidence: "apis/src/azure/to_openai/mod.rs:311-396"}
+      content-filter-signal:
+        status: dropped
+        note: >-
+          Azure's per-choice content_filter_results, content_filter_offsets,
+          content_filter_raw and top-level prompt_filter_results are stripped
+          from every response with no replacement. A streaming frame carrying
+          only annotations is dropped whole. Customers relying on Azure safety
+          metadata lose it entirely.
+        blocker: TODO-ISSUE preserve or document Azure content-filter metadata
+        evidence: apis/src/azure/to_openai/response.rs:22,25,44-67
+      usage-accounting: {status: passthrough, evidence: "apis/src/azure/to_openai/response.rs:52-58"}
+      cache-accounting: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      reasoning-content: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      stop-sequences: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      sampling-params: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      logprobs: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
+      state-continuation: {status: n-a}
+      unsupported-operations:
+        status: dropped
+        note: >-
+          A malformed JSON body is forwarded to Azure unchanged — strip_ignored_fields
+          returns None on parse failure and the proxy emits no 400. The body
+          `model` is also silently stripped, so when it disagrees with the
+          deployment name in the URL the client's choice is ignored without a
+          word.
+        blocker: TODO-ISSUE validate or explicitly pass through malformed Azure bodies
+        evidence: apis/src/azure/to_openai/request.rs:19-26
+      error-envelope:
+        status: translated
+        note: error.type is filled from the HTTP status; Azure's innererror is stripped.
+        evidence: apis/src/azure/wire.rs:20-58
+      oversized-body:
+        status: dropped
+        note: See the shared oversized-body gap below.
+        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+        evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127
+
+  # -------------------------------------------------------------------------
+  - id: chat-completions-to-bedrock-converse
+    short: "CC -> Bedrock"
+    client_api: OpenAI Chat Completions
+    backend_api: AWS Bedrock Converse
+    filters: [openai_chat_completions_to_bedrock_converse]
+    clean_rejection_requires: []
+    unknown_field_policy: >-
+      Strict hand-written top-level allowlist plus a no-op-default escape
+      hatch. There is no per-message allowlist, unlike the Vertex filter.
+    doc_gap: >-
+      docs/filters/openai_chat_completions_to_bedrock_converse.md does not
+      exist and the filter is absent from docs/filters/reference.md, despite
+      being registered at filters/src/register.rs:123.
+    cells:
+      text-chat:
+        status: translated
+        evidence: apis/src/bedrock/converse/request.rs:374
+      system-prompt:
+        status: translated
+        evidence: apis/src/bedrock/converse/request.rs:266-306
+      multi-turn:
+        status: dropped
+        note: >-
+          Roles and tool results translate correctly and client tool_call ids
+          round-trip. But with no per-message allowlist, messages[].name,
+          refusal, annotations and the deprecated function_call are never read
+          and silently discarded, and a non-"function" tool_call type is
+          accepted and emitted as a toolUse. An assistant turn with no content
+          gets a synthetic empty-string block.
+        blocker: TODO-ISSUE add a per-message field allowlist to the Bedrock translator
+        evidence: apis/src/bedrock/converse/request.rs:314-346,449-475
+      multimodal-image:
+        status: rejected
+        note: >-
+          Rejected 400 — a translator limitation, not a provider one. Bedrock
+          Converse supports images natively.
+        evidence: apis/src/bedrock/converse/request.rs:387-389
+      multimodal-audio:
+        status: rejected
+        evidence: apis/src/bedrock/converse/request.rs:390-392
+      documents-files:
+        status: rejected
+        evidence: apis/src/bedrock/converse/request.rs:390-392
+      function-tools:
+        status: translated-lossy
+        note: >-
+          strict is forwarded as toolSpec.strict, which is not a documented
+          Bedrock Converse ToolSpecification field; no test asserts Bedrock
+          accepts it.
+        evidence: apis/src/bedrock/converse/request.rs:626-657
+      tool-choice:
+        status: translated-lossy
+        note: >-
+          "none" omits the entire toolConfig, which also drops every tools[]
+          definition — the model loses all tool schema awareness instead of
+          merely being told not to call.
+        evidence: apis/src/bedrock/converse/request.rs:600-602,690
+      parallel-tool-calls:
+        status: rejected
+        evidence: apis/src/bedrock/converse/request.rs:220
+      hosted-tools:
+        status: rejected
+        evidence: apis/src/bedrock/converse/request.rs:628-630
+      structured-output:
+        status: rejected
+        note: No structured-output support at all; json_object and json_schema both rejected 400.
+        evidence: apis/src/bedrock/converse/request.rs:144,216
+      streaming:
+        status: translated
+        evidence: apis/src/bedrock/converse/response.rs:299-510
+      streaming-terminal-events:
+        status: translated
+        note: >-
+          [DONE] is appended only on a clean end of stream; truncation and
+          decode failures become in-band SSE error frames instead.
+        evidence: apis/src/bedrock/converse/mod.rs:413-436
+      upstream-error-midstream:
+        status: rejected
+        note: Exceptions and truncated frames become an in-band SSE error frame with a typed code.
+        evidence: apis/src/bedrock/converse/mod.rs:413-434,455-470
+      content-filter-signal:
+        status: translated
+        note: content_filtered and guardrail_intervened both map to content_filter.
+        evidence: apis/src/bedrock/converse/response.rs:70-95
+      usage-accounting:
+        status: translated-lossy
+        note: Missing token fields default to 0 rather than erroring.
+        evidence: apis/src/bedrock/converse/response.rs:221-240
+      cache-accounting:
+        status: dropped
+        note: cacheReadInputTokens and cacheWriteInputTokens are discarded.
+        blocker: TODO-ISSUE map Bedrock cache token counters
+        evidence: apis/src/bedrock/converse/response.rs:221-240
+      reasoning-content:
+        status: dropped
+        note: >-
+          Streaming reasoningContent deltas return Ok(None) with no output and
+          no error. Citation and image deltas take the same path and vanish
+          silently.
+        blocker: TODO-ISSUE reject or surface Bedrock reasoningContent and citations
+        evidence: apis/src/bedrock/converse/response.rs:444-449
+      stop-sequences:
+        status: translated
+        evidence: apis/src/bedrock/converse/request.rs:573-586
+      sampling-params:
+        status: translated
+        note: >-
+          temperature, top_p and max_tokens translate with type validation.
+          seed, user, top_logprobs and reasoning_effort are rejected 400 —
+          reasoning_effort even at OpenAI's default "medium".
+        evidence: apis/src/bedrock/converse/request.rs:140-145,559-570
+      logprobs:
+        status: rejected
+        evidence: apis/src/bedrock/converse/request.rs:214
+      state-continuation:
+        status: n-a
+      unsupported-operations:
+        status: n-a
+      error-envelope:
+        status: translated-lossy
+        note: >-
+          OpenAI-shaped but omits `param` and uses code "invalid_request".
+          Differs from the Vertex filter's envelope — see the cross-surface gap
+          below.
+        evidence: apis/src/bedrock/wire.rs:61-72
+      oversized-body:
+        status: dropped
+        note: See the shared oversized-body gap below.
+        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+        evidence: praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127
+
+# ---------------------------------------------------------------------------
+# Defects that span surfaces. Rendered once, above the per-surface tables, so
+# a reader does not have to infer the pattern from repeated cells.
+# ---------------------------------------------------------------------------
+cross_surface_gaps:
+  - id: reasoning-and-cache-tokens-vanish
+    affects: [anthropic-messages-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse]
+    summary: >-
+      Reasoning content and cache-token accounting are silently discarded on
+      every translation path that has them. Customers are billed for tokens the
+      matrix would otherwise claim they receive.
+    blocker: TODO-ISSUE systematic handling of reasoning and cache tokens across translators
+
+  - id: oversized-body-bare-413
+    affects: [anthropic-messages-to-chat-completions, responses-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-azureai, chat-completions-to-bedrock-converse]
+    summary: >-
+      An oversized body produces Rejection::status(413) with no headers and no
+      body, then short-circuits fail_to_proxy before any formatter runs. This
+      fires for the global body_limits ceiling and for every filter's
+      StreamBuffer{max_bytes}, including both validate filters and both format
+      filters. An SDK receives a content-type-less empty 413 in every dialect.
+    blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+
+  - id: divergent-error-envelopes
+    affects: [chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse, chat-completions-to-azureai]
+    summary: >-
+      Three filters emit three different OpenAI-shaped envelopes — Vertex
+      includes param:null, Bedrock omits param and uses code "invalid_request",
+      Azure rewrites whatever Azure returned. One client error handler cannot
+      cover all three.
+    blocker: TODO-ISSUE converge on one OpenAI error envelope builder
+
+  - id: inverted-token-budget-precedence
+    affects: [chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse]
+    summary: >-
+      When both max_tokens and max_completion_tokens are present, Vertex
+      prefers max_completion_tokens and Bedrock prefers max_tokens. The same
+      client request gets a different token budget depending on the backend.
+      No test, comment or issue explains the divergence.
+    blocker: TODO-ISSUE pick one max-tokens precedence across translators
