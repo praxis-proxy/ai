@@ -8,14 +8,16 @@
 //! - [`TokenSource::Metadata`] acquires a token from the GCE/GKE metadata server, which returns one on request for the
 //!   VM's attached service account.
 //! - [`TokenSource::ServiceAccountKey`] (a parsed `type: service_account` key file) mints a token itself: it signs a
-//!   `JWT` assertion with the key file's private key and exchanges it at Google's `OAuth2` token endpoint for a
-//!   short-lived access token (`urn:ietf:params:oauth: grant-type:jwt-bearer`). Nothing is cached at this layer —
-//!   caching is [`TokenCache`](praxis_ai_apis::token_cache::TokenCache)'s job.
+//!   `JWT` assertion with the key file's private key through the system OpenSSL and exchanges it at Google's `OAuth2`
+//!   token endpoint for a short-lived access token (`urn:ietf:params:oauth:grant-type:jwt-bearer`). Nothing is cached
+//!   at this layer: caching is [`TokenCache`](praxis_ai_apis::token_cache::TokenCache)'s job.
 
 use std::{path::Path, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::HeaderValue;
+use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sign::Signer};
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
     subrequest::{SubRequest, SubRequestClient, SubResponse, execute_url},
@@ -37,6 +39,11 @@ const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 /// shorter lifetime narrows the window in which a leaked assertion can
 /// be replayed against the token endpoint.
 const ASSERTION_LIFETIME: Duration = Duration::from_secs(600);
+
+/// `JOSE` header of every assertion: `RS256` (RSA PKCS#1 v1.5 over
+/// SHA-256) is what Google's token endpoint expects for service-account
+/// keys.
+const ASSERTION_HEADER: &str = r#"{"alg":"RS256","typ":"JWT"}"#;
 
 /// The only non-loopback token-endpoint host accepted for
 /// [`TokenSource::ServiceAccountKey`]: Google's `OAuth2` token endpoint.
@@ -276,25 +283,51 @@ struct AssertionClaims<'a> {
     exp: u64,
 }
 
-/// Sign the `JWT`-bearer assertion for `key`.
+/// Sign the `JWT`-bearer assertion for `key`: base64url header and claims,
+/// then their `RS256` signature, computed by the system OpenSSL so it runs
+/// inside the validated module on a FIPS host.
 fn sign_assertion(key: &ServiceAccountKey, scope: &str) -> Result<String, FilterError> {
+    let claims = assertion_claims(key, scope)?;
+
+    let mut assertion = URL_SAFE_NO_PAD.encode(ASSERTION_HEADER);
+    assertion.push('.');
+    URL_SAFE_NO_PAD.encode_string(claims, &mut assertion);
+
+    let signature = rs256_signature(key, assertion.as_bytes())?;
+    assertion.push('.');
+    URL_SAFE_NO_PAD.encode_string(signature, &mut assertion);
+    Ok(assertion)
+}
+
+/// Serialize the assertion claims for `key`, issued now and valid for
+/// [`ASSERTION_LIFETIME`].
+fn assertion_claims(key: &ServiceAccountKey, scope: &str) -> Result<Vec<u8>, FilterError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| FilterError::from(format!("gcp_adc: system clock before Unix epoch: {e}")))?
         .as_secs();
 
-    let claims = AssertionClaims {
+    serde_json::to_vec(&AssertionClaims {
         iss: &key.client_email,
         scope,
         aud: &key.token_url,
         iat: now,
         exp: now.saturating_add(ASSERTION_LIFETIME.as_secs()),
-    };
+    })
+    .map_err(|e| FilterError::from(format!("gcp_adc: failed to encode service-account assertion: {e}")))
+}
 
-    let signing_key = jsonwebtoken::EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes())
+/// `RS256` signature of `signing_input` with the key file's private key.
+/// OpenSSL errors name the failing operation, never key material.
+fn rs256_signature(key: &ServiceAccountKey, signing_input: &[u8]) -> Result<Vec<u8>, FilterError> {
+    let private_key = PKey::private_key_from_pem(key.private_key_pem.as_bytes())
         .map_err(|e| FilterError::from(format!("gcp_adc: invalid private key in credentials file: {e}")))?;
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    jsonwebtoken::encode(&header, &claims, &signing_key)
+
+    Signer::new(MessageDigest::sha256(), &private_key)
+        .and_then(|mut signer| {
+            signer.set_rsa_padding(Padding::PKCS1)?;
+            signer.sign_oneshot_to_vec(signing_input)
+        })
         .map_err(|e| FilterError::from(format!("gcp_adc: failed to sign service-account assertion: {e}")))
 }
 

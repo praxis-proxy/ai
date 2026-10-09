@@ -49,9 +49,9 @@ http-callout-filter = ["experimental", "dep:serde_json_path"]
 azure-ad-filter = ["experimental"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
-# Activates the `experimental` marker. `jsonwebtoken` signs the service-
-# account `JWT` assertion for `source: key_file`.
-gcp-adc-filter = ["experimental", "dep:jsonwebtoken"]
+# Activates the `experimental` marker. `openssl` signs the service-account
+# `JWT` assertion for `source: key_file` in the system library.
+gcp-adc-filter = ["experimental", "dep:openssl"]
 # Experimental: the anthropic_messages_to_vertexai_anthropic (Anthropic Messages
 # to Vertex AI rawPredict) translation filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
@@ -90,6 +90,7 @@ dashmap = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
+openssl = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
@@ -99,7 +100,6 @@ praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
-jsonwebtoken = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
@@ -117,7 +117,6 @@ zeroize = { workspace = true, features = ["serde"] }
 # The SigV4 reference implementation the OpenSSL-backed signer is checked
 # against (filters/src/aws/signing.rs); never linked into the binary.
 aws-sigv4 = { workspace = true }
-openssl.workspace = true
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -8,6 +8,7 @@ use std::{
     sync::LazyLock,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, Method, header};
 use praxis_ai_apis::subrequest::SubRequestClient;
 use praxis_filter::FilterAction;
@@ -157,13 +158,37 @@ fn service_account_key_source(token_uri: &str) -> TokenSource {
     resolve_token_source(&config, None).expect("valid key file should resolve")
 }
 
-/// Extract the `assertion` form field from a captured token-endpoint
-/// request, or `None` if the body is absent or malformed.
-fn captured_assertion(request: &str) -> Option<String> {
+/// Extract form field `name` from a captured token-endpoint request, or
+/// `None` if the body is absent or lacks it.
+fn captured_form_field(request: &str, name: &str) -> Option<String> {
     let body = request.split_once("\r\n\r\n")?.1;
     url::form_urlencoded::parse(body.as_bytes())
-        .find(|(key, _)| key == "assertion")
+        .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
+}
+
+/// Whether the `RS256` signature on `assertion` verifies under the RSA
+/// public key in `public_key_pem`.
+fn assertion_signature_verifies(assertion: &str, public_key_pem: &[u8]) -> bool {
+    let (signing_input, signature) = assertion.rsplit_once('.').expect("assertion must carry a signature");
+    let signature = URL_SAFE_NO_PAD.decode(signature).expect("signature must be base64url");
+    let public_key = openssl::pkey::PKey::public_key_from_pem(public_key_pem).expect("public PEM must parse");
+    let mut verifier = openssl::sign::Verifier::new(openssl::hash::MessageDigest::sha256(), &public_key)
+        .expect("SHA-256 verifier must build");
+    verifier
+        .set_rsa_padding(openssl::rsa::Padding::PKCS1)
+        .expect("PKCS#1 padding must apply");
+    verifier
+        .verify_oneshot(&signature, signing_input.as_bytes())
+        .expect("verification must run")
+}
+
+/// Decode the JSON in the `index`th base64url segment of `assertion`
+/// (0 is the header, 1 the claims).
+fn assertion_segment(assertion: &str, index: usize) -> serde_json::Value {
+    let segment = assertion.split('.').nth(index).expect("assertion segment must exist");
+    let json = URL_SAFE_NO_PAD.decode(segment).expect("segment must be base64url");
+    serde_json::from_slice(&json).expect("segment must be JSON")
 }
 
 // -----------------------------------------------------------------------------
@@ -576,17 +601,29 @@ async fn fetch_service_account_key_mints_bearer_from_signed_assertion() {
         request.starts_with("POST /token") && request.contains("application/x-www-form-urlencoded"),
         "mint must be a form-encoded POST, got: {request}"
     );
-    let assertion = captured_assertion(&request).expect("form body must carry the assertion");
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[token_url.as_str()]);
-    let claims = jsonwebtoken::decode::<serde_json::Value>(
-        &assertion,
-        &jsonwebtoken::DecodingKey::from_rsa_pem(&TEST_SERVICE_ACCOUNT_KEY.public_key_pem)
-            .expect("fixture public PEM must parse"),
-        &validation,
-    )
-    .expect("assertion must verify against the fixture public key")
-    .claims;
+    assert_eq!(
+        captured_form_field(&request, "grant_type").as_deref(),
+        Some("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        "mint must use the JWT-bearer grant"
+    );
+    let assertion = captured_form_field(&request, "assertion").expect("form body must carry the assertion");
+    assert!(
+        assertion_signature_verifies(&assertion, &TEST_SERVICE_ACCOUNT_KEY.public_key_pem),
+        "assertion must verify against the fixture key's public half"
+    );
+    let unrelated = openssl::rsa::Rsa::generate(2048)
+        .and_then(|key| key.public_key_to_pem())
+        .expect("generate unrelated RSA key");
+    assert!(
+        !assertion_signature_verifies(&assertion, &unrelated),
+        "assertion must not verify under an unrelated key"
+    );
+    assert_eq!(
+        assertion_segment(&assertion, 0),
+        serde_json::json!({"alg": "RS256", "typ": "JWT"}),
+        "header must declare RS256"
+    );
+    let claims = assertion_segment(&assertion, 1);
     assert_eq!(claims["iss"], TEST_SA_EMAIL, "iss must be the service-account email");
     assert_eq!(
         claims["scope"], "https://www.googleapis.com/auth/cloud-platform",
@@ -595,7 +632,12 @@ async fn fetch_service_account_key_mints_bearer_from_signed_assertion() {
     assert_eq!(claims["aud"], token_url, "aud must be the token endpoint");
     let iat = claims["iat"].as_u64().expect("iat claim");
     let exp = claims["exp"].as_u64().expect("exp claim");
-    assert!(exp > iat, "assertion must expire after issuance");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(iat.abs_diff(now) <= 60, "iat must be the signing time");
+    assert_eq!(exp - iat, 600, "assertion must live for exactly ten minutes");
     server.join().unwrap();
 }
 
