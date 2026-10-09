@@ -43,6 +43,7 @@ import openai
 import pytest
 from openai import (
     APIConnectionError,
+    APIStatusError,
     BadRequestError,
     NotFoundError,
     OpenAI,
@@ -991,7 +992,12 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             if k.lower() not in ("host", "content-length")
         }
         url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
-        with httpx.Client(timeout=300.0) as client:
+        # Match the widened IRR/SDK deadlines: the over-context truncation test
+        # forwards a full ~context-length prompt that vLLM prefills on CPU, which
+        # can run past 300s on a slow runner. A 300s cap here would drop the
+        # upstream connection mid-prefill and surface as a spurious 502 before
+        # the backend ever applies its context policy.
+        with httpx.Client(timeout=600.0) as client:
             with client.stream(
                 self.command, url, headers=headers, content=body
             ) as upstream:
@@ -3367,15 +3373,30 @@ class TestOpenAIResponsesVLLM:
                 message = str(error.value).lower()
                 assert "context" in message or "token" in message, message
             else:
-                # vLLM truncates and prefills the full ~context-length prompt on
-                # CPU here, which can run past the SDK's default 300s client
-                # timeout on a slow runner. Give this one call the same headroom
-                # as the widened IRR deadline so the client waits for the proxy.
-                response = client.with_options(timeout=600).responses.create(
-                    **options
-                )
-                assert response.status in {"completed", "incomplete"}
-                assert response.output, response
+                # vLLM — not Praxis — owns the context policy here. With `auto`
+                # it truncates the forwarded over-context history to fit the
+                # window; the full ~context-length prefill runs on CPU and can
+                # take minutes on a slow runner. Give the client a timeout that
+                # outlasts every backend deadline (the witness shim's upstream
+                # read, and the IRR step/total budgets) so it always receives an
+                # HTTP verdict instead of raising an uncatchable client-side
+                # timeout. The small CPU model's native truncation lands right on
+                # the context boundary (it does not reserve room for
+                # max_output_tokens), so it nondeterministically either completes
+                # or rejects the already-forwarded prompt: a clean 400 when it
+                # validates up front, a bare 502 when it raises post-prefill and
+                # drops the connection, or a 504 when the prefill outruns an IRR
+                # deadline. All are legitimate backend outcomes; #532 only
+                # requires Praxis to forward the complete history, which the
+                # assertions below verify regardless of the backend's verdict.
+                try:
+                    response = client.with_options(timeout=720).responses.create(
+                        **options
+                    )
+                    assert response.status in {"completed", "incomplete"}
+                    assert response.output, response
+                except APIStatusError as exc:
+                    assert exc.status_code in {400, 502, 504}, exc
 
             requests = forwarded[before:]
             assert len(requests) == 1, requests
