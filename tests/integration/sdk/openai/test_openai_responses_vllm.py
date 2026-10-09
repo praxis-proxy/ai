@@ -3367,7 +3367,13 @@ class TestOpenAIResponsesVLLM:
                 message = str(error.value).lower()
                 assert "context" in message or "token" in message, message
             else:
-                response = client.responses.create(**options)
+                # vLLM truncates and prefills the full ~context-length prompt on
+                # CPU here, which can run past the SDK's default 300s client
+                # timeout on a slow runner. Give this one call the same headroom
+                # as the widened IRR deadline so the client waits for the proxy.
+                response = client.with_options(timeout=600).responses.create(
+                    **options
+                )
                 assert response.status in {"completed", "incomplete"}
                 assert response.output, response
 
