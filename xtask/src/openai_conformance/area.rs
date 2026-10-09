@@ -8,6 +8,11 @@ pub(super) const OPENAI_REFERENCE_SPEC: &str = "docs/conformance/specs/openai-op
 /// Provenance pin for the vendored complete OpenAI reference.
 pub(super) const OPENAI_REFERENCE_MANIFEST: &str = "docs/conformance/specs/openai-openapi-source.json";
 
+/// Vendored Anthropic `OpenAPI` reference.
+pub(super) const ANTHROPIC_REFERENCE_SPEC: &str = "docs/conformance/specs/anthropic-spec.json";
+/// Provenance pin for the vendored Anthropic reference.
+pub(super) const ANTHROPIC_REFERENCE_MANIFEST: &str = "docs/conformance/specs/anthropic-spec-source.json";
+
 /// Conversations operations selected from the full OpenAI reference.
 pub(super) const CONVERSATIONS_SCOPE: OperationScope =
     OperationScope::new("conversations", "Conversations", &["/conversations"]).without_inherited_security();
