@@ -127,6 +127,12 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// never override verified claims, and identity headers plus client
 /// credentials are always stripped before the request is forwarded.
 ///
+/// When no `{prefix}model` identity header names the model and
+/// `model_to_provider` mapped the request, balance checks and usage events use
+/// the client-facing model ID it recorded rather than the provider target.
+/// That filter buffers the request body, so its body pass completes before
+/// this filter's request hook runs the balance check.
+///
 /// # YAML
 ///
 /// ```yaml

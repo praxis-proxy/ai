@@ -9,6 +9,8 @@ Integrates with an external metering service for pre-request balance checks and 
 
 Tenant identity is resolved from the highest-trust source available: verified `{prefix}*` metadata written by an authentication filter, then the `identity_header_guard` filter's namespaced `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request headers. A higher tier always wins, so forged client headers can never override verified claims, and identity headers plus client credentials are always stripped before the request is forwarded.
 
+When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
+
 ## Configuration
 
 | Field | Type | Required | Description |
