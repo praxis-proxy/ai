@@ -17,4 +17,5 @@ pub use messages_to_chat_completions::AnthropicMessagesToChatCompletionsFilter;
 pub use messages_to_chat_completions_stream::AnthropicMessagesToChatCompletionsStreamFilter;
 pub use protocol::AnthropicMessagesProtocolFilter;
 pub use web_search::AnthropicWebSearchFilter;
+#[cfg(feature = "vertex-anthropic")]
 pub(crate) use wire::{ErrorType, error_body, error_rejection, invalid_request_rejection};

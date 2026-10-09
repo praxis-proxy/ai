@@ -44,6 +44,10 @@ openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
 full = ["openai-all", "store-postgres"]
+# Experimental: the anthropic_messages_to_vertexai_anthropic translation filter
+# (Anthropic Messages to Vertex AI rawPredict). Work in progress; the config
+# surface may change. Enabled through praxis-ai-filters' vertex-anthropic-filter.
+vertex-anthropic = []
 praxis-main = []
 
 [lints]

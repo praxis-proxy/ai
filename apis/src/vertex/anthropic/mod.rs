@@ -3,6 +3,10 @@
 
 //! Anthropic Messages ⇄ Vertex AI `rawPredict` dialect filter.
 //!
+//! **Experimental.** Requires the `vertex-anthropic-filter` cargo feature,
+//! which is off by default and activates the `experimental` marker. The
+//! configuration surface may change between releases.
+//!
 //! Vertex serves Claude through the Anthropic Messages wire format but
 //! with a dialect seam on each side of the request. This filter closes
 //! both so a single client-facing model id can route to either backend:
@@ -87,6 +91,11 @@ const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 
 /// Translates Anthropic Messages requests to Vertex AI `rawPredict` and
 /// Vertex responses back to the Anthropic dialect.
+///
+/// Experimental: requires the `vertex-anthropic-filter` cargo feature,
+/// which is off by default and activates the `experimental` marker. This
+/// filter is a work in progress and its configuration surface may change
+/// between releases.
 ///
 /// # YAML
 ///

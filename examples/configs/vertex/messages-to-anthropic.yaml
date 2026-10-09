@@ -15,8 +15,12 @@
 # This example is fully self-contained and proxies to a local backend
 # so it can be exercised without GCP credentials.
 #
+# Experimental: rebuild with --features vertex-anthropic-filter.
+# Configuration may change before graduation.
+#
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/vertex/messages-to-anthropic.yaml
+#   cargo run -p praxis-ai-proxy --features vertex-anthropic-filter -- \
+#     -c examples/configs/vertex/messages-to-anthropic.yaml
 
 listeners:
   - name: gateway

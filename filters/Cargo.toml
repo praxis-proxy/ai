@@ -51,6 +51,10 @@ azure-ad-filter = ["experimental"]
 # authentication filter. Work in progress; the config surface may change.
 # Activates the `experimental` marker.
 gcp-adc-filter = ["experimental"]
+# Experimental: the anthropic_messages_to_vertexai_anthropic (Anthropic Messages
+# to Vertex AI rawPredict) translation filter. Work in progress; the config
+# surface may change. Activates the `experimental` marker.
+vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,

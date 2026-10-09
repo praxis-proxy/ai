@@ -5,6 +5,10 @@
 
 Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex responses back to the Anthropic dialect.
 
+## Configuration Notes
+
+Experimental: requires the `vertex-anthropic-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
+
 ## Configuration
 
 | Field | Type | Required | Description |

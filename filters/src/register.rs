@@ -323,6 +323,7 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "openai_chat_completions_to_vertexai_gemini" => praxis_ai_apis::vertex::OpenaiChatCompletionsToVertexaiGeminiFilter::from_config
     );
+    #[cfg(feature = "vertex-anthropic-filter")]
     praxis_filter::register_filters!(
         @register registry,
         http "anthropic_messages_to_vertexai_anthropic" =>
@@ -808,6 +809,11 @@ provider:
         assert_experimental_registration(&names, "http_callout", cfg!(feature = "http-callout-filter"));
         assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
         assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
+        assert_experimental_registration(
+            &names,
+            "anthropic_messages_to_vertexai_anthropic",
+            cfg!(feature = "vertex-anthropic-filter"),
+        );
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
         assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
     }
