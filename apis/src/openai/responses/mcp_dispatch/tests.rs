@@ -517,6 +517,35 @@ fn find_approval_required_ambiguous_tool_requires_approval() {
 // Result Construction
 // =========================================================================
 
+#[cfg(feature = "openai-conversations")]
+#[test]
+fn mcp_results_satisfy_conversation_append_back_contract() {
+    let document: serde_json::Value =
+        serde_json::from_str(&crate::openai::conversations::implementation_openapi_json().unwrap()).unwrap();
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&json!({
+            "$ref": "#/components/schemas/ConversationItem",
+            "components": document["components"],
+        }))
+        .unwrap();
+    let success = build_success_result("call_1", "weather", "lookup", "{}", "sunny", false, None);
+    let tool_error = build_success_result("call_2", "weather", "lookup", "{}", "not found", true, None);
+    let transport_error = build_error_result("call_3", "weather", "lookup", "{}", "connection refused", None);
+    for result in [&success, &tool_error, &transport_error] {
+        validator.validate(&result.output_item).unwrap();
+    }
+    assert!(success.output_item.get("error").is_none());
+    for result in [&tool_error, &transport_error] {
+        assert_eq!(result.output_item["error"]["type"], "mcp_tool_execution_error");
+        assert!(result.output_item["error"]["content"].is_string());
+    }
+    // Prove the schema gate rejects the string-valued errors emitted before #1362.
+    let mut invalid = transport_error.output_item;
+    invalid["error"] = json!("connection refused");
+    assert!(validator.validate(&invalid).is_err());
+}
+
 #[test]
 fn build_success_result_message_format() {
     let result = build_success_result("call_1", "weather", "get_weather", "{}", "Sunny, 22°C", false, None);
@@ -538,7 +567,7 @@ fn build_success_result_with_tool_error() {
     assert_eq!(result.message["output"], "Error: Not found");
     assert!(result.output_item["approval_request_id"].is_null());
     assert_eq!(
-        result.output_item["error"], "Not found",
+        result.output_item["error"]["content"], "Not found",
         "error field should contain the error text"
     );
 }
@@ -579,7 +608,7 @@ fn build_error_result_includes_error_message() {
     );
     assert!(result.output_item["approval_request_id"].is_null());
     assert_eq!(result.output_item["output"], "");
-    assert_eq!(result.output_item["error"], "connection refused");
+    assert_eq!(result.output_item["error"]["content"], "connection refused");
 }
 
 // =========================================================================
@@ -892,7 +921,10 @@ fn resolve_tool_entry_returns_error_for_ambiguous_tool() {
     let result = resolve_tool_entry(&McpToolIndex::new(&map), "my_server__get", "call_1", None);
     let err = result.unwrap_err().expect("should return error result for ambiguity");
     assert!(
-        err.output_item["error"].as_str().unwrap().contains("ambiguous"),
+        err.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous"),
         "error should mention ambiguity"
     );
 }
@@ -920,7 +952,12 @@ fn parse_call_arguments_string_parsed() {
 fn parse_call_arguments_malformed_string_returns_error() {
     let tc = serde_json::json!({"name": "tool", "arguments": "not-json"});
     let err = parse_call_arguments(&tc, "c1", "srv", "tool", None).unwrap_err();
-    assert!(err.output_item["error"].as_str().unwrap().contains("malformed"));
+    assert!(
+        err.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("malformed")
+    );
 }
 
 #[test]
@@ -974,7 +1011,7 @@ fn process_call_result_tool_error() {
     call_result.is_error = Some(true);
     let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}", None, TEST_MAX_RESULT_BYTES);
     assert!(result.message["output"].as_str().unwrap().starts_with("Error:"));
-    assert_eq!(result.output_item["error"], "oops");
+    assert_eq!(result.output_item["error"]["content"], "oops");
 }
 
 #[test]
@@ -986,7 +1023,7 @@ fn process_call_result_transport_error() {
     let result = process_call_result(Err(err), "c1", "srv", "tool", "{}", None, TEST_MAX_RESULT_BYTES);
     assert!(result.message["output"].as_str().unwrap().contains("Error:"));
     assert!(
-        result.output_item["error"]
+        result.output_item["error"]["content"]
             .as_str()
             .unwrap()
             .contains("tools/call failed")
@@ -1222,7 +1259,12 @@ async fn execute_single_call_ambiguous_returns_error() {
     )
     .await
     .unwrap();
-    assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
+    assert!(
+        result.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous")
+    );
 }
 
 #[tokio::test]
@@ -1239,7 +1281,12 @@ async fn execute_single_call_malformed_args_returns_error() {
     )
     .await
     .unwrap();
-    assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
+    assert!(
+        result.output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("malformed")
+    );
 }
 
 #[tokio::test]
@@ -1357,7 +1404,12 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
     .await
     .unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
+    assert!(
+        results[0].output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("no result")
+    );
 }
 
 #[tokio::test]
@@ -1375,7 +1427,12 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
     .unwrap();
     assert_eq!(results.len(), 1, "must emit error even without call_id");
     assert_eq!(results[0].output_item["id"], "unknown");
-    assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
+    assert!(
+        results[0].output_item["error"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("no result")
+    );
 }
 
 #[tokio::test]
@@ -1716,7 +1773,7 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
         "the retained result must stay within its hard memory bound"
     );
     assert!(
-        bounded.output_item["error"]
+        bounded.output_item["error"]["content"]
             .as_str()
             .unwrap()
             .contains("retained-byte limit"),
@@ -2050,7 +2107,7 @@ async fn max_tool_calls_does_not_gate_mcp_execution() {
     assert!(
         state.accumulated_output.iter().all(|item| {
             item["type"] == "mcp_call"
-                && item["error"]
+                && item["error"]["content"]
                     .as_str()
                     .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
@@ -2099,7 +2156,7 @@ async fn deferred_web_limit_does_not_gate_mcp_siblings() {
     assert!(
         state.accumulated_output[2..].iter().all(|item| {
             item["type"] == "mcp_call"
-                && item["error"]
+                && item["error"]["content"]
                     .as_str()
                     .is_none_or(|error| !error.contains("max_tool_calls"))
         }),

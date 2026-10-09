@@ -10,26 +10,26 @@
   },
   "reference": {
     "source": "docs/conformance/specs/openai-openapi.yaml",
-    "source_sha256": "0bf136e5f8e135a04f4b4bda93c13e75d83e98954da48ccb1e3b4b080b47b068",
+    "source_sha256": "9430b00d75b4cd96b70edb1aed7127f9d58e183e8b1011552d169ba57904e840",
     "upstream": {
       "repository": "https://github.com/openai/openai-openapi",
-      "revision": "db3e53198a66732cfe161339ea63bf36fc0137ad",
+      "revision": "cf79040afd73deda323d2cc869199d4f463bd7ad",
       "path": "openapi.yaml",
-      "source_sha256": "0bf136e5f8e135a04f4b4bda93c13e75d83e98954da48ccb1e3b4b080b47b068"
+      "source_sha256": "9430b00d75b4cd96b70edb1aed7127f9d58e183e8b1011552d169ba57904e840"
     }
   },
   "area_projections": [
     {
       "area_id": "conversations",
       "area": "Conversations",
-      "projection_sha256": "b5b8af413e9cc84597d300f41789b6fb988f328baa531a61df8877fe321dc856",
+      "projection_sha256": "9c92cf1d3c63e7f0f2786317ed1b3318d9464b8722b3ab3c2340d260e8765e77",
       "operations": 8,
       "inherited_security": "deployment"
     },
     {
       "area_id": "responses",
       "area": "Responses",
-      "projection_sha256": "1ab6e85792f77615d31f4d386f17a001dcad92ba49ed488a2ba9912028491797",
+      "projection_sha256": "71d66fe9e0e899c7385325795b233def83762fed6365962e407ab723f481738a",
       "operations": 14,
       "inherited_security": "deployment"
     }

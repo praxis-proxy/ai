@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    example_config_path, free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_proxy,
+    example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
+    start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -466,6 +467,77 @@ fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
     );
     let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+/// The example config leaves `rate_limit` commented out, so this test builds
+/// the same pipeline with a two-request window to exercise the declared
+/// `429` behavior end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rate_limit_returns_openai_429_with_retry_after() {
+    let proxy_port = free_port();
+    let yaml = format!(
+        r#"
+listeners:
+  - name: conversations-gateway
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [conversations-pipeline]
+
+filter_chains:
+  - name: conversations-pipeline
+    filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+      - filter: ai_operation
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        rate_limit:
+          requests_per_minute: 2
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "fallback-backend"
+      - filter: load_balancer
+        clusters:
+          - name: "fallback-backend"
+            endpoints: ["127.0.0.1:1"]
+
+insecure_options:
+  allow_private_endpoints: true
+"#
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let get = "GET /v1/conversations/conv_unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    // Requests within the window dispatch to the store and miss: 404, not 429.
+    for _ in 0..2 {
+        let raw = http_send(proxy.addr(), get);
+        assert_eq!(parse_status(&raw), 404, "request within the limit must reach the store");
+    }
+
+    let raw = http_send(proxy.addr(), get);
+    assert_eq!(parse_status(&raw), 429, "third request must be rate limited");
+    let retry_after: u64 = parse_header(&raw, "retry-after")
+        .expect("429 must carry Retry-After")
+        .parse()
+        .expect("Retry-After must be an integer");
+    assert!(
+        (1..=60).contains(&retry_after),
+        "Retry-After must be >=1 and <= the window"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert!(body["error"]["param"].is_null());
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("retry after"))
+    );
 }
 
 // -----------------------------------------------------------------------------

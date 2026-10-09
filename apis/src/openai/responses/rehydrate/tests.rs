@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use praxis_filter::{FilterAction, FilterEntry, FilterPipeline};
+use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
 use super::*;
@@ -1645,6 +1645,140 @@ async fn rehydrates_from_conversation_object_form() {
     assert_eq!(
         state.messages[2]["content"], "follow up",
         "current input should be last"
+    );
+}
+
+#[tokio::test]
+async fn configuration_update_applies_to_native_and_translated_conversation_requests() {
+    for translated in [false, true] {
+        for request_reasoning in [None, Some(json!({})), Some(json!({"effort": "low"}))] {
+            let explicit_effort = request_reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str);
+            let stored = json!([
+                {"type": "configuration_update", "id": "cnfu_1", "reasoning": {"effort": "medium"}},
+                {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
+                {"type": "configuration_update", "id": "cnfu_2", "reasoning": {"effort": "high"}},
+            ]);
+            let registry = setup_registry(MockStore::with_conversation("conv_config", stored.clone()));
+            let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+            ctx.extensions.insert(registry);
+            ctx.set_metadata("openai_responses_request.format", "openai_responses");
+            let mut request = json!({
+                "model": "gpt-4.1", "input": "continue", "conversation": "conv_config",
+            });
+            if let Some(reasoning) = &request_reasoning {
+                request["reasoning"] = reasoning.clone();
+            }
+            let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+            let action = default_filter()
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "rehydration must release: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let state = ctx.extensions.get::<ResponsesState>().unwrap();
+            assert!(
+                state
+                    .persisted_messages
+                    .iter()
+                    .take(3)
+                    .zip(stored.as_array().unwrap())
+                    .all(|(actual, expected)| actual == expected),
+                "durable history must preserve configuration: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            assert!(
+                state.messages.iter().all(|item| item["type"] != "configuration_update"),
+                "configuration must not become model input: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let filter = if translated {
+                crate::openai::responses::responses_to_chat_completions::ResponsesToChatCompletionsFilter::from_config(
+                    &serde_yaml::Value::Null,
+                )
+                .unwrap()
+            } else {
+                crate::openai::responses::openai_responses_proxy::ResponsesProxyFilter::from_config(
+                    &serde_yaml::Value::Null,
+                )
+                .unwrap()
+            };
+            let outcome = filter
+                .on_selected_upstream_request_body(&mut ctx, &mut body)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                "upstream processing must continue: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let upstream: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+            let effort = if translated {
+                &upstream["reasoning_effort"]
+            } else {
+                &upstream["reasoning"]["effort"]
+            };
+            assert_eq!(
+                effort,
+                explicit_effort.unwrap_or("high"),
+                "explicit effort wins, otherwise latest configuration applies: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            assert!(
+                upstream.get("conversation").is_none(),
+                "local conversation reference must not reach upstream: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let input = if translated {
+                &upstream["messages"]
+            } else {
+                &upstream["input"]
+            };
+            assert!(
+                input
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["type"] != "configuration_update"),
+                "upstream input must exclude configuration items: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
+    for replacement in [
+        json!({"type": "configuration_update"}),
+        json!({"type": "configuration_update", "reasoning": {}}),
+        json!({"type": "configuration_update", "reasoning": {"effort": null}}),
+    ] {
+        let stored = vec![
+            json!({"type": "configuration_update", "reasoning": {"effort": "high"}}),
+            replacement,
+        ];
+        let state = build_state(json!({"model": "m", "input": "hello"}), stored, vec![], None);
+        assert!(state.request_body["reasoning"]["effort"].is_null());
+        assert_eq!(
+            state.persisted_messages.len(),
+            3,
+            "configuration remains in durable history"
+        );
+        assert_eq!(state.messages.len(), 1, "configuration is not model input");
+    }
+}
+
+#[test]
+fn configuration_update_preserves_other_request_reasoning_fields() {
+    let state = build_state(
+        json!({"input": "hello", "reasoning": {"summary": "auto"}}),
+        vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})],
+        vec![],
+        None,
+    );
+    assert_eq!(
+        state.request_body["reasoning"],
+        json!({"summary": "auto", "effort": "high"})
     );
 }
 

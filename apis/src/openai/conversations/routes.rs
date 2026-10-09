@@ -26,7 +26,7 @@ use crate::openai::{
     include::IncludeField,
     operation::{
         MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
-        schema_binding,
+        TOO_MANY_REQUESTS_RESPONSE, schema_binding,
     },
 };
 #[cfg(feature = "openai-conversations")]
@@ -106,6 +106,35 @@ macro_rules! operation_contract {
         owned {
             parameters: [$($parameter:expr),* $(,)?],
             request: $request:tt,
+            response: $response:ty,
+            errors: [$($error:expr),* $(,)?] $(,)?
+        }
+    ) => {{
+        #[cfg(feature = "openai-conversations")]
+        {
+            Some(OwnedOperationContract {
+                parameters: &[$($parameter),*],
+                request: request_binding!($request),
+                responses: &[
+                    ResponseSpec {
+                        status: "200",
+                        description: "OK",
+                        content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                        headers: &[],
+                    },
+                    $($error),*
+                ],
+            })
+        }
+        #[cfg(not(feature = "openai-conversations"))]
+        {
+            None
+        }
+    }};
+    (
+        owned {
+            parameters: [$($parameter:expr),* $(,)?],
+            request: $request:tt,
             response: $response:ty $(,)?
         }
     ) => {{
@@ -118,6 +147,7 @@ macro_rules! operation_contract {
                     status: "200",
                     description: "OK",
                     content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                    headers: &[],
                 }],
             })
         }
@@ -155,6 +185,17 @@ macro_rules! request_body_shape {
 macro_rules! contract_request_body {
     (none {}) => {
         RequestBody::None
+    };
+    (
+        owned {
+            parameters:
+            [$($parameter:expr),* $(,)?],request:
+            $request:tt,response:
+            $response:ty,errors:
+            [$($error:expr),* $(,)?] $(,)?
+        }
+    ) => {
+        request_body_shape!($request)
     };
     (owned { parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:ty $(,)? }) => {
         request_body_shape!($request)
@@ -305,6 +346,7 @@ conversation_operations! {
             parameters: [],
             request: [optional CreateConversationRequest],
             response: ConversationResource,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     GetConversation {
@@ -319,6 +361,7 @@ conversation_operations! {
             )],
             request: [none],
             response: ConversationResource,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     UpdateConversation {
@@ -333,6 +376,7 @@ conversation_operations! {
             )],
             request: [required UpdateConversationRequest],
             response: ConversationResource,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     DeleteConversation {
@@ -347,6 +391,7 @@ conversation_operations! {
             )],
             request: [none],
             response: DeletedConversationResource,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     CreateConversationItems {
@@ -368,6 +413,7 @@ conversation_operations! {
             ],
             request: [required CreateConversationItemsRequest],
             response: ConversationItemList,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     ListConversationItems {
@@ -392,6 +438,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItemList,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     GetConversationItem {
@@ -414,6 +461,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItem,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
     DeleteConversationItem {
@@ -431,6 +479,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationResource,
+            errors: [TOO_MANY_REQUESTS_RESPONSE],
         },
     },
 }

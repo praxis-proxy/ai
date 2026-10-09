@@ -388,6 +388,91 @@ async fn selected_rebuild_projects_state_owned_tools_and_tool_choice() {
 }
 
 #[tokio::test]
+async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_settings() {
+    for (live_reasoning, expected) in [
+        (None, json!({"effort": "high"})),
+        (
+            Some(json!({"summary": "auto"})),
+            json!({"summary": "auto", "effort": "high"}),
+        ),
+        (
+            Some(json!({"effort": "low", "summary": "detailed"})),
+            json!({"effort": "low", "summary": "detailed"}),
+        ),
+        (Some(json!({"effort": null})), json!({"effort": null})),
+        (Some(json!(null)), json!(null)),
+    ] {
+        let filter = make_filter();
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "before-filter",
+            "input": "original",
+            "conversation": "conv_configuration",
+            "reasoning": {"effort": "high", "summary": "old"}
+        }));
+        state.history_rehydrated = true;
+        ctx.extensions.insert(state);
+        let mut live = json!({
+            "model": "after-filter",
+            "input": "edited",
+            "conversation": "conv_configuration",
+            "metadata": {"changed": true}
+        });
+        if let Some(reasoning) = live_reasoning {
+            live["reasoning"] = reasoning;
+        }
+        let mut body = Some(Bytes::from(serde_json::to_vec(&live).unwrap()));
+        let action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+        let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            rebuilt["reasoning"], expected,
+            "live effort wins; only omitted effort inherits"
+        );
+        assert_eq!(rebuilt["model"], "after-filter", "later model edits must survive");
+        assert_eq!(
+            rebuilt["input"][0]["content"], "edited",
+            "later input edits must survive"
+        );
+        assert_eq!(
+            rebuilt["metadata"], live["metadata"],
+            "unrelated live fields must survive"
+        );
+        assert!(
+            rebuilt.get("conversation").is_none(),
+            "locally consumed selector must be removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_rebuild_does_not_inject_reasoning_without_local_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1", "input": "hello", "reasoning": {"effort": "high"}
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("reasoning").is_none(),
+        "non-rehydrated requests retain live reasoning absence"
+    );
+}
+
+#[tokio::test]
 async fn selected_rebuild_preserves_later_input_filter_edit() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

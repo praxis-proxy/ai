@@ -43,7 +43,7 @@ fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
 
 /// Build the stateless conversations filter under test.
 fn build_test_filter() -> OpenaiConversationsFilter {
-    OpenaiConversationsFilter
+    OpenaiConversationsFilter::unlimited()
 }
 
 /// Publish the same generic extension as `ai_operation`.
@@ -3014,6 +3014,94 @@ async fn list_items_desc_order() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn create_conversation_preserves_configuration_update_item() {
+    let (filter, store) = harness();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "item_configuration",
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create conversation");
+    };
+    assert_eq!(rejection.status, 200, "create should return 200");
+    let response = rejection_body(&rejection);
+    let conversation_id = response["id"].as_str().unwrap();
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    assert_eq!(rejection.status, 200, "list items should return 200");
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["id"], "item_configuration");
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+    assert_eq!(response["data"][0]["reasoning"], serde_json::json!({"effort": "high"}));
+}
+
+#[tokio::test]
+async fn append_configuration_update_item_round_trips() {
+    let (filter, store) = harness();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(b"{}"));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create conversation");
+    };
+    let conversation_id = rejection_body(&rejection)["id"].as_str().unwrap().to_owned();
+
+    let req = make_request(Method::POST, &format!("/v1/conversations/{conversation_id}/items"));
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "item_configuration_append",
+            "type": "configuration_update",
+            "reasoning": {"effort": "low"}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from append items");
+    };
+    assert_eq!(rejection.status, 200, "append items should return 200");
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+    assert_eq!(response["data"][0]["reasoning"], serde_json::json!({"effort": "low"}));
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["id"], "item_configuration_append");
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+}
+
+#[tokio::test]
 async fn create_conversation_with_non_array_items_returns_400() {
     let (filter, store) = harness();
 
@@ -4638,7 +4726,7 @@ fn harness() -> TestHarness {
 
 /// A harness over a caller-supplied backend (e.g. a fault-injecting double).
 fn harness_with(store: Arc<dyn PersistedStateBackend>) -> TestHarness {
-    (Box::new(OpenaiConversationsFilter), store)
+    (Box::new(OpenaiConversationsFilter::unlimited()), store)
 }
 
 /// A harness over a real SQLite backend, for tests that assert the SQL backend's
@@ -4659,7 +4747,7 @@ async fn sqlite_harness() -> TestHarness {
         .await
         .expect("sqlite store should build"),
     );
-    (Box::new(OpenaiConversationsFilter), store)
+    (Box::new(OpenaiConversationsFilter::unlimited()), store)
 }
 
 /// Build a request context with the shared store registered under the
@@ -5800,4 +5888,130 @@ async fn create_conversation_response_field_order_matches_openai() {
     let resp = rejection_body(&rejection);
     let keys: Vec<&String> = resp.as_object().unwrap().keys().collect();
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
+}
+
+// -----------------------------------------------------------------------------
+// Rate Limit Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn parse_and_build_rate_limited_config() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        rate_limit:
+          requests_per_minute: 60
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    assert_eq!(cfg.rate_limit.map(|limit| limit.requests_per_minute), Some(60));
+
+    // The filter builds from the same config without error.
+    OpenaiConversationsFilter::from_config(&yaml).unwrap();
+}
+
+#[test]
+fn rate_limit_config_rejects_zero_requests() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        rate_limit:
+          requests_per_minute: 0
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    assert!(validate_config(&cfg).is_err());
+}
+
+/// Drive one bodyless operation (GET conversation) through the request phase.
+async fn run_get_conversation(filter: &dyn HttpFilter, store: &Arc<dyn PersistedStateBackend>) -> FilterAction {
+    let req = make_request(Method::GET, "/v1/conversations/conv_unknown");
+    let mut ctx = conv_ctx(store, &req);
+    ctx.extensions.insert(crate::test_utils::test_owner("default"));
+    filter.on_request(&mut ctx).await.unwrap()
+}
+
+#[tokio::test]
+async fn rate_limit_rejects_with_declared_response_shape() {
+    let filter = OpenaiConversationsFilter::limited_for_tests(2);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(InMemoryStore::new());
+
+    // Requests within the limit dispatch to the handler: the unknown
+    // conversation yields a store miss, not a rate-limit rejection.
+    for _ in 0..2 {
+        let action = run_get_conversation(&filter, &store).await;
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected Reject, got {action:?}");
+        };
+        assert_ne!(
+            rejection.status, 429,
+            "request within the limit must not be rate limited"
+        );
+    }
+
+    let action = run_get_conversation(&filter, &store).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 429);
+
+    let headers: Vec<(&str, &str)> = rejection
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    assert!(headers.contains(&("content-type", "application/json")));
+    let retry_after: u64 = headers
+        .iter()
+        .find(|(name, _)| *name == "retry-after")
+        .and_then(|(_, value)| value.parse().ok())
+        .expect("retry-after header must be an integer");
+    assert!(
+        (1..=60).contains(&retry_after),
+        "retry-after must be >=1 and <= the window"
+    );
+
+    let resp = rejection_body(&rejection);
+    let error = &resp["error"];
+    assert_eq!(error["type"], "rate_limit_error");
+    assert_eq!(error["code"], "rate_limit_exceeded");
+    assert!(error["param"].is_null());
+    assert!(
+        error["message"].as_str().is_some_and(|m| m.contains("retry after")),
+        "message should state the retry guidance: {error}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_counts_each_exchange_once() {
+    // A create request passes through both the request-head phase and the
+    // body phase. With a limit of two, two complete create exchanges must
+    // both succeed if and only if each exchange is counted exactly once.
+    let filter = OpenaiConversationsFilter::limited_for_tests(2);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(InMemoryStore::new());
+
+    for i in 0..2 {
+        let id = create_test_conversation(&filter, &store, serde_json::json!({"project": format!("test-{i}")})).await;
+        assert!(!id.is_empty());
+    }
+
+    // The third exchange is rejected at the request-head phase, before any
+    // body is read or store work is spent.
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.extensions.insert(crate::test_utils::test_owner("default"));
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 429);
 }

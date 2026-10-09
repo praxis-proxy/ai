@@ -106,10 +106,22 @@ fn normalize_item(item: Value, generate_item_id: &mut impl FnMut() -> String) ->
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
+    strip_known_nullable_nulls(&mut map);
     default_item_status(&mut map);
     let item = Value::Object(map);
     validate_output_item(&item).map_err(StoreError::InvalidInput)?;
     Ok((item_id, item))
+}
+
+/// Input permits null optional fields, but output permits only absent or string values.
+fn strip_known_nullable_nulls(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) == Some("function_call_output") {
+        for key in ["call_id", "name", "namespace"] {
+            if map.get(key).is_some_and(Value::is_null) {
+                map.remove(key);
+            }
+        }
+    }
 }
 
 /// Default a missing or `null` item `status` to `completed`.

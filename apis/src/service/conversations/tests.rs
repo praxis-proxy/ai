@@ -10,9 +10,12 @@ use std::sync::Arc;
 use praxis_ai_store::{
     ConversationItemRecord, ConversationRecord, PersistedStateBackend, StoreError, StoreRegistry, memory::InMemoryStore,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::{build_item_records, duplicate_item_id, validate_item_count};
+use super::{
+    build_item_records, default_item_status, duplicate_item_id, normalize_item, normalize_message_content,
+    validate_item_count, validate_output_item,
+};
 use crate::{StateOwner, store::OwnerScopedResponseStore};
 
 /// Build a validated owner for a fixed tenant and issuer.
@@ -57,6 +60,128 @@ fn counter() -> impl FnMut() -> String {
 // -----------------------------------------------------------------------------
 // Item-record assembly (transport-neutral, no pipeline)
 // -----------------------------------------------------------------------------
+
+#[test]
+fn assistant_output_text_normalizes_nullable_provider_fields() {
+    let normalized = normalize_message_content(
+        "assistant",
+        serde_json::json!([{
+            "type": "output_text",
+            "text": "hello",
+            "annotations": [],
+            "logprobs": null
+        }]),
+    )
+    .unwrap();
+
+    assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
+    assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
+}
+
+#[test]
+fn function_output_nullable_qualifiers_normalize_and_validate() {
+    for (name, namespace) in [
+        (Value::Null, Value::Null),
+        (serde_json::json!("lookup"), Value::Null),
+        (Value::Null, serde_json::json!("weather")),
+        (serde_json::json!("lookup"), serde_json::json!("weather")),
+    ] {
+        let input = serde_json::json!({
+            "type": "function_call_output", "call_id": "call_1", "output": "done",
+            "name": name, "namespace": namespace,
+        });
+        crate::openai::conversations::item_schema::validate_input_item(&input).unwrap();
+        let (_, output) = normalize_item(input, &mut counter()).unwrap();
+        for (key, value) in [("name", name), ("namespace", namespace)] {
+            if value.is_null() {
+                assert!(output.get(key).is_none());
+            } else {
+                assert_eq!(output[key], value);
+            }
+        }
+        validate_output_item(&output).unwrap();
+    }
+    let invalid = serde_json::json!({
+        "type": "function_call_output", "call_id": "call_1", "output": "done", "name": 42,
+    });
+    assert!(
+        normalize_item(invalid, &mut counter()).is_err(),
+        "non-null invalid qualifiers stay invalid"
+    );
+}
+
+#[test]
+fn function_output_nullable_call_id_normalizes_and_validates() {
+    let input = serde_json::json!({
+        "type": "function_call_output", "call_id": null, "output": "done",
+    });
+    assert!(
+        crate::openai::conversations::item_schema::validate_input_item(&input).is_ok(),
+        "null call_id is valid input"
+    );
+    let mut unnormalized = input.clone();
+    unnormalized["id"] = serde_json::json!("item_nullable");
+    unnormalized["status"] = serde_json::json!("completed");
+    assert!(
+        validate_output_item(&unnormalized).is_err(),
+        "null call_id is invalid output even with id and status"
+    );
+    unnormalized.as_object_mut().unwrap().remove("call_id");
+    assert!(
+        validate_output_item(&unnormalized).is_ok(),
+        "omitted call_id is valid output"
+    );
+    let (_, output) = normalize_item(input, &mut counter()).unwrap();
+    assert!(
+        output.get("call_id").is_none(),
+        "null call_id must normalize to omission"
+    );
+    assert!(
+        validate_output_item(&output).is_ok(),
+        "normalized output must satisfy the contract"
+    );
+    let invalid = serde_json::json!({
+        "type": "function_call_output", "call_id": 42, "output": "done",
+    });
+    assert!(
+        normalize_item(invalid, &mut counter()).is_err(),
+        "non-null invalid call_id must not be stripped"
+    );
+}
+
+#[test]
+fn reasoning_item_with_null_status_normalizes_and_validates() {
+    // Backends such as vLLM emit `status: null` on reasoning output items;
+    // the status must be defaulted before it satisfies the item contract.
+    let mut map = serde_json::json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "\n\n"}],
+        "encrypted_content": null,
+        "status": null
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    assert!(validate_output_item(&Value::Object(map.clone())).is_err());
+
+    default_item_status(&mut map);
+
+    assert_eq!(map["status"], serde_json::json!("completed"));
+    validate_output_item(&Value::Object(map)).unwrap();
+}
+
+#[test]
+fn default_item_status_preserves_existing_status() {
+    let mut map = serde_json::json!({"status": "in_progress"})
+        .as_object()
+        .unwrap()
+        .clone();
+    default_item_status(&mut map);
+    assert_eq!(map["status"], serde_json::json!("in_progress"));
+}
 
 #[test]
 fn build_item_records_generates_ids_for_items_without_them() {

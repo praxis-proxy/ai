@@ -204,6 +204,7 @@ impl ResponsesProxyFilter {
         let mut wrote_input = false;
         let mut wrote_tools = false;
         let mut wrote_tool_choice = false;
+        let mut wrote_reasoning = false;
         for member in members {
             if state.history_rehydrated
                 && matches!(
@@ -225,6 +226,14 @@ impl ResponsesProxyFilter {
                 serialized.extend_from_slice(&replacement);
                 wrote_tools |= member.name == TopLevelField::Tools;
                 wrote_tool_choice |= member.name == TopLevelField::ToolChoice;
+            } else if member.name == TopLevelField::Reasoning {
+                let live = selected_body_slice(body, member.value_start, member.value_end)?;
+                if let Some(replacement) = selected_reasoning_default(state, Some(live))? {
+                    serialized.extend_from_slice(&replacement);
+                } else {
+                    serialized.extend_from_slice(live);
+                }
+                wrote_reasoning = true;
             } else if member.name == TopLevelField::Stream {
                 if let Some(replacement) = &stream_replacement {
                     serialized.extend_from_slice(replacement);
@@ -262,6 +271,13 @@ impl ResponsesProxyFilter {
             serialized.extend_from_slice(&replacement);
             wrote_member = true;
         }
+        if !wrote_reasoning && let Some(replacement) = selected_reasoning_default(state, None)? {
+            if wrote_member {
+                serialized.push(b',');
+            }
+            serialized.extend_from_slice(br#""reasoning":"#);
+            serialized.extend_from_slice(&replacement);
+        }
         serialized.push(b'}');
         if serialized.len() > self.config.max_rewritten_body_bytes {
             return Ok(Err(reject_rewritten_body_too_large(
@@ -284,6 +300,8 @@ enum TopLevelField {
     Tools,
     /// Provider-visible tool choice owned by [`ResponsesState`].
     ToolChoice,
+    /// Live reasoning settings that may inherit a stored effort default.
+    Reasoning,
     /// A locally consumed response selector.
     PreviousResponseId,
     /// A locally consumed conversation selector.
@@ -319,6 +337,39 @@ fn selected_state_field(state: &ResponsesState, field: TopLevelField) -> Result<
         return Ok(None);
     };
     serde_json::to_vec(value)
+        .map(Some)
+        .map_err(|error| format!("openai_responses_proxy: {error}").into())
+}
+
+/// Fill only an omitted effort in locally rehydrated requests. Live settings,
+/// including explicit nulls and later filter edits, take precedence over state.
+fn selected_reasoning_default(state: &ResponsesState, live: Option<&[u8]>) -> Result<Option<Vec<u8>>, FilterError> {
+    if !state.history_rehydrated {
+        return Ok(None);
+    }
+    let Some(effort) = state
+        .request_body
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+    else {
+        return Ok(None);
+    };
+    let reasoning = if let Some(live) = live {
+        let mut reasoning: serde_json::Value = serde_json::from_slice(live)
+            .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
+        let Some(object) = reasoning.as_object_mut() else {
+            return Ok(None);
+        };
+        if object.contains_key("effort") {
+            return Ok(None);
+        }
+        // Only the small default needs ownership in the newly parsed reasoning object.
+        object.insert("effort".to_owned(), effort.clone());
+        reasoning
+    } else {
+        serde_json::json!({"effort": effort})
+    };
+    serde_json::to_vec(&reasoning)
         .map(Some)
         .map_err(|error| format!("openai_responses_proxy: {error}").into())
 }
@@ -390,6 +441,7 @@ fn scan_top_level_object(body: &[u8]) -> Result<Vec<TopLevelMember>, &'static st
                 "stream" => TopLevelField::Stream,
                 "tools" => TopLevelField::Tools,
                 "tool_choice" => TopLevelField::ToolChoice,
+                "reasoning" => TopLevelField::Reasoning,
                 "previous_response_id" => TopLevelField::PreviousResponseId,
                 "conversation" => TopLevelField::Conversation,
                 _ => TopLevelField::Other,

@@ -64,6 +64,19 @@ def _owner_assertion(subject: str) -> str:
     ).encode()
     return "v1." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
+
+def _reasoning_effort(item) -> object:
+    """Read ``reasoning.effort`` across SDK lanes.
+
+    The 2.x ``ConversationItem`` models keep the ``reasoning`` object as a
+    plain dict while the 3.x lane types it. Normalize both so these tests
+    assert the wire contract rather than an SDK typing detail.
+    """
+    reasoning = item.reasoning
+    if isinstance(reasoning, dict):
+        return reasoning.get("effort")
+    return reasoning.effort
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1096,6 +1109,33 @@ class TestOpenAIConversations:
         assert item.content[0].type == "input_text"
         assert item.content[0].text == "hello"
 
+    def test_configuration_update_item_round_trip(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {
+                    "type": "configuration_update",
+                    "reasoning": {"effort": "high"},
+                },
+            ],
+        )
+
+        item = created.data[0]
+        assert item.id.startswith("item_")
+        assert item.type == "configuration_update"
+        assert _reasoning_effort(item) == "high"
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        listed = page.data[0]
+        assert listed.id == item.id
+        assert listed.type == "configuration_update"
+        assert _reasoning_effort(listed) == "high"
+
     def test_item_create_returns_all_items(self, openai_client):
         conversation = openai_client.conversations.create()
 
@@ -1892,6 +1932,232 @@ class TestConversationTenantIsolation:
         with pytest.raises(NotFoundError) as exc_info:
             spoofing_client.conversations.retrieve(conversation.id)
         assert exc_info.value.status_code == 404, "spoofed tenant header must not grant access and must return 404"
+
+    # --------------------------------------------------------------------
+    # PR1362 regression tests: configuration_update reasoning, nullable
+    # function_output normalization, structured MCP failure append-back.
+    # --------------------------------------------------------------------
+
+    def test_configuration_update_round_trip(self, openai_client):
+        """configuration_update items store and round-trip via the SDK."""
+        conversation = openai_client.conversations.create()
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[{"type": "configuration_update", "reasoning": {"effort": "high"}}],
+        )
+        item = created.data[0]
+        assert item.type == "configuration_update"
+        assert _reasoning_effort(item) == "high"
+
+        page = openai_client.conversations.items.list(conversation.id, order="asc")
+        listed = page.data[0]
+        assert listed.id == item.id
+        assert listed.type == "configuration_update"
+        assert _reasoning_effort(listed) == "high"
+
+        retrieved = openai_client.conversations.items.retrieve(
+            item.id, conversation_id=conversation.id
+        )
+        assert retrieved.type == "configuration_update"
+        assert _reasoning_effort(retrieved) == "high"
+
+    def test_nullable_function_output_fields_are_omitted(self, openai_client):
+        """name/namespace null on function_call_output normalize to omission, not 400."""
+        # OpenAI accepts name/namespace as nullable on function_call_output.
+        # Normalization must omit nulls rather than emit "name": null, which
+        # the refreshed output contracts reject as a non-string.
+        null_item = {
+            "type": "function_call_output",
+            "call_id": "call_nullable_sdk",
+            "output": "sunny",
+            "name": None,
+            "namespace": None,
+        }
+        conversation = openai_client.conversations.create(items=[null_item])
+        try:
+            page = openai_client.conversations.items.list(conversation.id, order="asc")
+            stored = page.data[0]
+            wire = stored.model_dump(exclude_unset=True)
+            # SDK defaults can serialize as null; fields_set tracks wire presence.
+            assert "name" not in stored.model_fields_set
+            assert "namespace" not in stored.model_fields_set
+            assert wire["output"] == "sunny"
+            assert wire["call_id"] == "call_nullable_sdk"
+            # Nulls must be absent from the wire representation.
+            assert "name" not in wire
+            assert "namespace" not in wire
+
+            retrieved = openai_client.conversations.items.retrieve(
+                stored.id, conversation_id=conversation.id
+            )
+            rwire = retrieved.model_dump(exclude_unset=True)
+            assert "name" not in retrieved.model_fields_set
+            assert "namespace" not in retrieved.model_fields_set
+            assert "name" not in rwire
+            assert "namespace" not in rwire
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
+    def test_structured_mcp_error_is_dict(self, conversation_responses_client):
+        """PR1362: MCP error fields are structured objects, not bare strings.
+
+        A backend response carrying an ``mcp_call`` output item with a
+        structured error (dict with type/content) must round-trip through
+        the proxy and SDK with that object shape intact, rather than
+        degrading to the old string-valued error that the refreshed schema
+        rejects during conversation append-back.
+        """
+        client, backend = conversation_responses_client
+        backend.output = [
+            {
+                "type": "mcp_call",
+                "id": "mcp_sdk_failure",
+                "status": "failed",
+                "server_label": "weather",
+                "name": "get_weather",
+                "arguments": "{}",
+                "output": "",
+                "error": {
+                    "type": "mcp_tool_execution_error",
+                    "content": "controlled failure for schema validation",
+                },
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}],
+            },
+        ]
+        conversation = client.conversations.create()
+        try:
+            response = client.responses.create(
+                model="gpt-4.1",
+                conversation=conversation.id,
+                input="weather?",
+                store=True,
+            )
+            assert response.status == "completed"
+            mcp_items = [
+                item
+                for item in response.output
+                if item.type == "mcp_call"
+            ]
+            assert mcp_items, "expected an mcp_call output item"
+            mcp = mcp_items[0]
+            error = mcp.error if isinstance(mcp.error, dict) else mcp.error.model_dump()
+            assert error["type"] == "mcp_tool_execution_error", error
+            assert error["content"] == (
+                "controlled failure for schema validation"
+            )
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_configuration_update_affects_subsequent_responses(
+        self, conversation_responses_client
+    ):
+        """A configuration_update item's reasoning carries to the next Responses request."""
+        client, backend = conversation_responses_client
+        conversation = client.conversations.create(
+            items=[{"type": "configuration_update", "reasoning": {"effort": "high"}}]
+        )
+        try:
+            response = client.responses.create(
+                model="gpt-4.1",
+                conversation=conversation.id,
+                input="Hello",
+            )
+            assert response.status == "completed"
+            forwarded = backend.requests[-1]
+            assert forwarded["reasoning"]["effort"] == "high"
+            # configuration_update is consumed, not forwarded as an input item
+            assert all(
+                item.get("type") != "configuration_update"
+                for item in forwarded.get("input", [])
+            )
+        finally:
+            client.conversations.delete(conversation.id)
+
+
+class _CapturingResponsesBackend(_ChunkedResponsesBackend):
+    """Responses backend that records forwarded request bodies for assertions."""
+
+    def do_POST(self):  # noqa: N802
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.requests.append(json.loads(body))
+        response = json.loads(self.response_body)
+        response["id"] = f"resp_capture_{len(self.server.requests)}"
+        response["output"] = self.server.output
+        encoded = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+@pytest.fixture
+def conversation_responses_inference_client():
+    """Proxy with conversations store + Responses routing to a capturing backend."""
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _CapturingResponsesBackend
+    )
+    backend.requests = []
+    backend.translated = False
+    backend.output = json.loads(_ChunkedResponsesBackend.response_body)["output"]
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as db_dir:
+            port = _free_port()
+            config_path = _write_chunked_response_config(
+                port, backend.server_port, os.path.join(db_dir, "config.db")
+            )
+            # Rehydrate and project stored configuration into the upstream body;
+            # the shared config already supplies operation and request classification.
+            with open(config_path) as f:
+                config = json.load(f)
+            filters = config["filter_chains"][0]["filters"]
+            request_filter = next(
+                entry for entry in filters if entry["filter"] == "openai_responses_request"
+            )
+            request_filter["initialize_state"] = True
+            filters.insert(5, {"filter": "openai_responses_rehydrate"})
+            filters.insert(6, {"filter": "openai_responses_proxy"})
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+            readiness_port = _free_port()
+            proc = subprocess.Popen(
+                [_find_binary(), "-c", config_path], stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, text=True,
+                env=_proxy_env(readiness_port),
+            )
+            try:
+                _wait_for_proxy(port, proc)
+                _wait_for_store_ready(readiness_port, proc)
+                with OpenAI(
+                    api_key="not-needed", base_url=f"http://127.0.0.1:{port}/v1",
+                    default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                    max_retries=0, timeout=10.0,
+                ) as client:
+                    yield client, backend
+            finally:
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                if proc.stderr:
+                    proc.stderr.close()
+                os.unlink(config_path)
+    finally:
+        backend.shutdown()
+        backend.server_close()
+        thread.join(timeout=5)
+
+
+# Alias matching the fixture name used by the tests above
+conversation_responses_client = conversation_responses_inference_client
 
 
 if __name__ == "__main__":

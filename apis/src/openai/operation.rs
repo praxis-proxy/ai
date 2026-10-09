@@ -8,8 +8,15 @@
 //! half lives in the `openapi` submodule and depends on `utoipa`.
 
 #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+mod error_contracts;
+
+#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
 mod openapi;
 
+#[cfg(feature = "openai-conversations")]
+pub(crate) use error_contracts::TOO_MANY_REQUESTS_RESPONSE;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) use error_contracts::{INFERENCE_RATE_LIMITED_RESPONSE, INFERENCE_SERVICE_UNAVAILABLE_RESPONSE};
 #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
 pub(crate) use openapi::{
     MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, SchemaBinding, implementation_openapi,
