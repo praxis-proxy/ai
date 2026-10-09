@@ -178,13 +178,44 @@ impl FlowGraph {
         }
         Some(nodes)
     }
+
+    /// Flatten every filter chain a listener references, in listener order, into
+    /// one ordered node list — the composed request pipeline the proxy runs.
+    ///
+    /// This is the composition the proxy itself performs when a listener names
+    /// several chains: each chain's filters already carry their inherited
+    /// chain-level conditions (see [`flow_chain`]), and the inference filters of
+    /// any `iterative_request_router` step are hoisted inline. Node orders are
+    /// global (1-based across the whole composed pipeline), so the result is a
+    /// single flat view regardless of how many chains the listener names.
+    ///
+    /// Returns `None` when the listener, or any chain it references, is absent.
+    pub(crate) fn flatten_listener(&self, listener_name: &str) -> Option<Vec<FlowNode>> {
+        let listener = self.listeners.iter().find(|l| l.name == listener_name)?;
+        let mut nodes = Vec::new();
+        for chain_name in &listener.filter_chains {
+            let chain = self.filter_chains.iter().find(|c| c.name == *chain_name)?;
+            for filter in &chain.filters {
+                push_filter_node(&mut nodes, filter);
+            }
+        }
+        Some(nodes)
+    }
 }
 
 /// Build a [`FlowChain`] from a parsed filter chain.
+///
+/// The chain's filters are taken from [`FilterChainConfig::expanded_entries`],
+/// so any chain-level (inherited) `conditions` are folded into each entry's own
+/// conditions — exactly as the proxy composes them at pipeline build. The model
+/// therefore records each filter's effective request gate (`chain AND filter`),
+/// not just its locally declared conditions.
+///
+/// [`FilterChainConfig::expanded_entries`]: praxis_core::config::FilterChainConfig::expanded_entries
 fn flow_chain(chain: &praxis_core::config::FilterChainConfig) -> FlowChain {
     FlowChain {
         name: chain.name.clone(),
-        filters: chain.filters.iter().map(flow_filter).collect(),
+        filters: chain.expanded_entries().iter().map(flow_filter).collect(),
     }
 }
 
@@ -380,8 +411,8 @@ mod tests {
     /// The committed full-flow config, relative to the xtask crate root.
     const FULL_FLOW: &str = "../examples/configs/openai/responses/full-flow-agentic.yaml";
 
-    /// The chain the visualizer flattens.
-    const PIPELINE_CHAIN: &str = "full-flow-agentic-pipeline";
+    /// The listener whose composed chains the visualizer flattens.
+    const PIPELINE_LISTENER: &str = "ai-gateway";
 
     /// A minimal valid config with `count` copies of `trace_context` followed
     /// by a `static_response`, for topology mutation tests.
@@ -404,7 +435,7 @@ mod tests {
     #[test]
     fn full_flow_flattens_to_thirty_one_ordered_nodes() {
         let graph = full_flow_graph();
-        let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
+        let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
         assert_eq!(nodes.len(), 31, "19 main + 12 IRR-step filters");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
@@ -414,7 +445,7 @@ mod tests {
     #[test]
     fn full_flow_node_types_and_depths_match_yaml() {
         let graph = full_flow_graph();
-        let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
+        let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
         assert_eq!(nodes[0].filter_type, "trace_context");
         assert_eq!(nodes[18].filter_type, IRR_FILTER, "IRR is the 19th filter");
         assert_eq!(nodes[18].depth, 0, "the IRR itself is main-chain");
@@ -434,9 +465,39 @@ mod tests {
     }
 
     #[test]
+    fn inherited_chain_conditions_are_folded_into_each_node() {
+        let graph = full_flow_graph();
+        let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
+        // `managed-responses` declares the managed-provider gate once at chain
+        // level; every filter it expands must inherit it in the flattened view.
+        // The config carries two `openai_responses_request` filters: the
+        // ungated pre-routing fact publisher (`on_invalid: continue`) in
+        // `ingress-and-binding`, and the managed owner (`on_invalid: reject`)
+        // under `managed-responses`. Target the managed owner, which is the one
+        // that must inherit the chain-level gate.
+        let request = nodes
+            .iter()
+            .find(|node| {
+                node.filter_type == "openai_responses_request"
+                    && node.config.get("on_invalid").and_then(Json::as_str) == Some("reject")
+            })
+            .expect("managed-responses openai_responses_request present");
+        let conditions = request.conditions.as_array().expect("conditions is an array");
+        assert_eq!(conditions.len(), 1, "the inherited gate is the only condition");
+        let unless = conditions[0].get("unless").expect("inherited gate is an `unless`");
+        assert_eq!(
+            unless
+                .pointer("/bound_upstream/application_provider")
+                .and_then(Json::as_str),
+            Some("openai"),
+            "managed-responses filters inherit the chain-level provider gate"
+        );
+    }
+
+    #[test]
     fn irr_router_node_retains_limits() {
         let graph = full_flow_graph();
-        let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
+        let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
         let router = nodes
             .iter()
             .find(|node| node.filter_type == IRR_FILTER)

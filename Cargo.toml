@@ -119,11 +119,14 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.3", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+# TEMPORARY: track praxis main for CI validation of inherited chain
+# conditions (praxis #1286), which is unreleased as of praxis v0.7.3.
+# Revert to the published crates.io version once a release carries #1286.
+praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", branch = "main", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", branch = "main", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", branch = "main", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", branch = "main", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis.git", branch = "main", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer

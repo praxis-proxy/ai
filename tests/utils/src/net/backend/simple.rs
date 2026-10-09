@@ -775,6 +775,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
 
     let chain = FilterChainConfig {
         name: "backend".to_owned(),
+        conditions: Vec::new(),
         filters,
     };
 

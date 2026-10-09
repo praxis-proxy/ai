@@ -8,7 +8,9 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
+use praxis_core::config::{
+    ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
+};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
 use praxis_tls::ClientCertMode;
@@ -134,7 +136,6 @@ pub(crate) fn resolve_pipelines_with_stores(
 /// Returns an error when pipeline construction fails.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "threads config, registries, shared services, the policy-connector setup, and a per-listener hook"
 )]
 fn build_listener_pipelines(
@@ -147,23 +148,19 @@ fn build_listener_pipelines(
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Expand each chain's inherited `conditions:` into its filters before
+    // composition, so a chain-level gate applies to every filter in the chain
+    // (chain gate evaluated first, AND-composed with each filter's own gate).
+    // `as_slices()` borrows the expanded entries for branch/outbound chain
+    // resolution; `for_listener()` concatenates the listener's referenced chains
+    // in declaration order with the same inherited conditions folded in.
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
     let mut pipelines = HashMap::with_capacity(config.listeners.len());
 
     for listener in &config.listeners {
-        let mut entries = Vec::new();
-        for chain_name in &listener.filter_chains {
-            let chain_filters = chains.get(chain_name.as_str()).ok_or_else(|| {
-                let lname = &listener.name;
-                format!("unknown chain '{chain_name}' for listener '{lname}'")
-            })?;
-            entries.extend_from_slice(chain_filters);
-        }
+        let mut entries = expanded_chains.for_listener(listener)?;
 
         #[cfg(feature = "store")]
         if gate_store_traffic(listener) {

@@ -46,7 +46,8 @@
 #      enforcement before it is exposed as a multi-owner state service.
 #
 #   0. ai_operation publishes the typed registry match consumed by
-#      openai_conversations. It must remain earlier in this filter chain.
+#      openai_conversations. It must remain earlier in the pipeline (it sits in
+#      ingress-and-binding; openai_conversations sits in managed-responses).
 #
 #   1. openai_conversations handles the Conversations API only for managed
 #      providers. The router binds /v1/conversations first: an OpenAI binding
@@ -320,10 +321,23 @@
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:8080"
-    filter_chains: [full-flow-agentic-pipeline]
+    filter_chains: [ingress-and-binding, managed-responses, managed-execution]
 
+# The pipeline is expressed as three named chains composed in order by the
+# listener. Splitting it lets the shared managed-provider gate be declared once
+# as a chain-level condition (praxis #1280) instead of repeated on every managed
+# body filter. The concatenation of the three chains in listener order is
+# equivalent, filter-for-filter and condition-for-condition, to a single flat
+# chain:
+#   1. ingress-and-binding — ingress, identity normalization, request
+#      classification, the binding router, and the two terminal bypass branches
+#      (direct OpenAI, direct services). No shared condition.
+#   2. managed-responses   — the once-per-request bound-body group, all gated on
+#      `unless application_provider: openai` via one inherited chain condition.
+#   3. managed-execution   — the local resource-store 404 and the agentic IRR.
+#      No shared condition (see that chain's note).
 filter_chains:
-  - name: full-flow-agentic-pipeline
+  - name: ingress-and-binding
     filters:
       - filter: trace_context
         # Establish typed correlation before IRR snapshots request extensions.
@@ -526,9 +540,22 @@ filter_chains:
                         endpoints:
                           - "127.0.0.1:3002"
 
-      # The filters below participate in the once-per-request bound-body phase.
-      # OpenAI owns these capabilities on its direct path, so the condition
-      # suppresses their request, response, and response-body lifecycle hooks.
+  # The once-per-request bound-body group. Every filter here runs at the
+  # post-binding bound-body barrier and shares one execution gate: skip the
+  # whole group on the direct OpenAI path. The gate is declared ONCE as this
+  # chain's condition (praxis #1280) and inherited by every filter below —
+  # effective condition = chain AND filter — instead of repeating
+  # `unless application_provider: openai` on each entry. OpenAI owns these
+  # capabilities on its own direct path, so the inherited condition suppresses
+  # every filter's request, response, and response-body lifecycle hooks
+  # together. The binding router in ingress-and-binding runs first, so the
+  # bound_upstream metadata this condition reads is already frozen here.
+  - name: managed-responses
+    conditions:
+      - unless:
+          bound_upstream:
+            application_provider: openai
+    filters:
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -536,26 +563,14 @@ filter_chains:
           model: ~
           stream: ~
           mode: ~
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_tool_parse
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_conversations
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         conversations_table: openai_conversations
         items_table: openai_conversation_items
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_responses_store
         backend: sqlite
@@ -565,16 +580,8 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_responses_rehydrate
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -597,18 +604,10 @@ filter_chains:
               subject_header: x-user-id
         on_missing: reject
         timeout_ms: 10000
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_doc_extract
         allow_pre_security_callout: true
         on_unsupported: continue
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
@@ -622,11 +621,15 @@ filter_chains:
         connectors:
           - id: trusted-mcp
             server_url: http://127.0.0.1:8001/mcp
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
 
+  # Terminal managed execution: the local resource-store 404 and the agentic
+  # loop. This chain intentionally declares NO shared condition. OpenAI-bound
+  # traffic already left through the direct-openai terminal branch, and the IRR
+  # must stay ungated — it owns an ordinary pre-read body hook that cannot depend
+  # on bound_upstream metadata the binding router publishes later. static_response
+  # keeps its own path conditions.
+  - name: managed-execution
+    filters:
       # The router needs a /v1/responses prefix route so managed GET/DELETE
       # resource endpoints can reach the local store. That prefix also binds
       # unknown subpaths. After recognized store operations have terminated,

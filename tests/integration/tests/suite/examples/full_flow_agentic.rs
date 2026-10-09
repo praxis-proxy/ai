@@ -2003,6 +2003,32 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
     );
 }
 
+/// Flatten every filter the gateway listener composes, in the listener's
+/// declared chain order, into one owned sequence. The full-flow config expresses
+/// its pipeline as three named chains (`ingress-and-binding`, `managed-responses`,
+/// `managed-execution`) so the shared managed-provider gate is inherited once at
+/// the chain level (praxis #1280). Tests that reason about the whole pipeline —
+/// filter presence, relative order across the binding boundary — must see that
+/// composed view rather than a single chain.
+fn flatten_listener_pipeline(config: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
+    let chains = config["filter_chains"]
+        .as_sequence()
+        .expect("config should declare filter_chains");
+    config["listeners"][0]["filter_chains"]
+        .as_sequence()
+        .expect("listener should declare filter_chains")
+        .iter()
+        .flat_map(|name| {
+            let name = name.as_str().expect("chain name should be a string");
+            let chain = chains
+                .iter()
+                .find(|chain| chain["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("listener references unknown chain '{name}'"));
+            chain["filters"].as_sequence().cloned().unwrap_or_default()
+        })
+        .collect()
+}
+
 #[test]
 fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     // The agentic IRR must execute every hosted tool the loop owner can
@@ -2012,9 +2038,8 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let irr = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("filter chain should contain filters")
+    let pipeline = flatten_listener_pipeline(&config);
+    let irr = pipeline
         .iter()
         .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
         .expect("config should contain an iterative_request_router");
@@ -2043,9 +2068,7 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let outer_filters = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("outer filter chain should contain filters");
+    let outer_filters = flatten_listener_pipeline(&config);
     let credentials_index = outer_filters
         .iter()
         .position(|filter| filter["filter"].as_str() == Some("callout_credentials"))

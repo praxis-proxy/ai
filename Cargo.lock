@@ -4,6 +4,17 @@ version = 4
 
 [[package]]
 name = "ahash"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891477e0c6a8957309ee5c45a6368af3ae14bb510732d2684ffa19af310920f9"
+dependencies = [
+ "getrandom 0.2.17",
+ "once_cell",
+ "version_check",
+]
+
+[[package]]
+name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -1599,7 +1610,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf5efcf77a4da27927d3ab0509dec5b0954bb3bc59da5a1de9e52642ebd4cdf9"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "num_cpus",
  "parking_lot",
  "seize",
@@ -1886,6 +1897,9 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+dependencies = [
+ "ahash 0.7.8",
+]
 
 [[package]]
 name = "hashbrown"
@@ -1899,8 +1913,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -2457,7 +2469,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "657c6a38b0e00dda091d9c006cc1741957ba2377f00dccfd6e79df4c95619bb1"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "bytecount",
  "data-encoding",
  "email_address",
@@ -2494,7 +2506,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9097316258ece14ed6908011db130c54a11a5bd0c46472b1fe112c8c86261263"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
@@ -3517,7 +3529,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
+ "quixotic-plecostomus-core 0.10.0",
  "regex",
  "rmcp",
  "schemars 1.2.2",
@@ -3649,7 +3661,7 @@ dependencies = [
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
+ "quixotic-plecostomus-core 0.10.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -3708,9 +3720,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c29127807143a63fa3945ce53eb12f7d8c9d1054f50212ddeeea40cb5f04b476"
+checksum = "16a15db17e236119799a946d479574af9202880f588ddc437730cd0ed20fecaa"
 dependencies = [
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
@@ -3721,9 +3733,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-cmf"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "936c4d020239bec0ce98668dd64911e7c7f955d4d0d84c05459e298715cc86d4"
+checksum = "d027a9e6e1be7a6ca70a8cd7124f52a46b3be9d9d48baba03cb41c65b48d2319"
 dependencies = [
  "praxis-policy-apl-core",
  "praxis-policy-core",
@@ -3732,9 +3744,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4904bf1243f151b5d5863362f819be52603eb049db50aedb3afd2156499ee9ed"
+checksum = "ab3103d91e74eaea5ebf4088c44cc3faf1622befe0a7dcc9bed44b882ec392ac"
 dependencies = [
  "async-trait",
  "futures",
@@ -3749,9 +3761,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-runtime"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd4cd985fca958142381efbe765ce54248bb187bf097a752b68c62251ce0fbbc"
+checksum = "2526dddeb0a1a5c982a5ca646b64b93b5f933854e1db8ea01856ec58e5c5ff7f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3768,9 +3780,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-builtins"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3594abb9927fc58e15b50847cf51389b7975ed9607b11925f965da0f06e99db"
+checksum = "0de898d5b7db29bf2b1eb1ab35ae50f5bcf8ad08184bf78239d6a0e652b0fa36"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3798,25 +3810,29 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "yaml_serde",
  "zeroize",
 ]
 
 [[package]]
 name = "praxis-policy-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e92e0efaa06b49c0b0fc44e0e44cd12cbc95e81ce7c70ac191c4a6940d7475"
+checksum = "93404cbc73d95267705f6aef5ab533525243f6fb4d4c8519aaa47b75529617fa"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "hashbrown 0.17.1",
+ "hmac",
  "http",
  "praxis-policy-orchestration",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3829,9 +3845,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-orchestration"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68bf14dc4bbff55bf6357733d76f1320343e69339c366b22b6b3bc6ff2707586"
+checksum = "ca9e7e35d58c278047576090f9425f036ea31ffb66708388c1d33db51944be46"
 dependencies = [
  "futures",
  "tokio",
@@ -3840,8 +3856,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f402714db9ad19f8d7ab47b1dec83533412d0f3fd1b214a6d55606a66a8bfc"
+source = "git+https://github.com/praxis-proxy/praxis.git?branch=main#9ef1cb71f0252aabbcdab9f803038a91d4d2b180"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3862,8 +3877,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be9a64d340db0f296e91b71aedebeb2b612d9c227879c0406b05ac211030b2d0"
+source = "git+https://github.com/praxis-proxy/praxis.git?branch=main#9ef1cb71f0252aabbcdab9f803038a91d4d2b180"
 dependencies = [
  "bytes",
  "chrono",
@@ -3872,8 +3886,8 @@ dependencies = [
  "metrics",
  "percent-encoding",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
- "quixotic-plecostomus-http",
+ "quixotic-plecostomus-core 0.11.0",
+ "quixotic-plecostomus-http 0.11.0",
  "rand 0.10.3",
  "regex",
  "serde",
@@ -3888,13 +3902,13 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47953af135b13051fb858fc8a47ef1f85c195a842d878d094e062004fd8644d8"
+source = "git+https://github.com/praxis-proxy/praxis.git?branch=main#9ef1cb71f0252aabbcdab9f803038a91d4d2b180"
 dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "dashmap",
  "http",
  "metrics",
@@ -3904,7 +3918,7 @@ dependencies = [
  "praxis-policy",
  "praxis-proxy-core",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
+ "quixotic-plecostomus-core 0.11.0",
  "rand 0.10.3",
  "regex",
  "secrecy",
@@ -3915,6 +3929,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicase",
  "yaml_serde",
  "zeroize",
 ]
@@ -3922,8 +3937,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddf2ff46c78f58f444459394b470b5b25c7bd4ba76ff82c2b9d6ae211207cf82"
+source = "git+https://github.com/praxis-proxy/praxis.git?branch=main#9ef1cb71f0252aabbcdab9f803038a91d4d2b180"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3936,8 +3950,8 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
- "quixotic-plecostomus-http",
+ "quixotic-plecostomus-core 0.11.0",
+ "quixotic-plecostomus-http 0.11.0",
  "quixotic-plecostomus-proxy",
  "rand 0.10.3",
  "serde",
@@ -3951,8 +3965,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b79d96e17d8d3c65da4c42cfe5ce8f9f7b1380940cd080f728234af6a1c4158e"
+source = "git+https://github.com/praxis-proxy/praxis.git?branch=main#9ef1cb71f0252aabbcdab9f803038a91d4d2b180"
 dependencies = [
  "arc-swap",
  "notify",
@@ -3989,7 +4002,7 @@ dependencies = [
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
+ "quixotic-plecostomus-core 0.10.0",
  "rand 0.10.3",
  "rcgen",
  "reqwest",
@@ -4295,11 +4308,11 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-cache"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "648c751afa211b3f5f02af5ad21c54360851fa73bb138629a71f3f83ed16bdec"
+checksum = "263a6e2db6ce36e9a8de7526e90d6f6f089901ca003777c1f63e98765872e58a"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrayvec 0.7.8",
  "async-trait",
  "blake2",
@@ -4314,12 +4327,12 @@ dependencies = [
  "lru",
  "once_cell",
  "parking_lot",
- "quixotic-plecostomus-core",
- "quixotic-plecostomus-error",
+ "quixotic-plecostomus-core 0.11.0",
+ "quixotic-plecostomus-error 0.11.0",
  "quixotic-plecostomus-header-serde",
- "quixotic-plecostomus-http",
+ "quixotic-plecostomus-http 0.11.0",
  "quixotic-plecostomus-lru",
- "quixotic-plecostomus-timeout",
+ "quixotic-plecostomus-timeout 0.11.0",
  "rand 0.10.3",
  "regex",
  "rmp",
@@ -4335,7 +4348,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c045ef42063cc1f01fb490cc91faa600bd2732d0e2e370dd4a1ce12020e3ea4c"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "async-trait",
  "brotli",
  "bstr",
@@ -4359,12 +4372,12 @@ dependencies = [
  "ouroboros",
  "parking_lot",
  "percent-encoding",
- "quixotic-plecostomus-error",
- "quixotic-plecostomus-http",
- "quixotic-plecostomus-pool",
- "quixotic-plecostomus-runtime",
- "quixotic-plecostomus-rustls",
- "quixotic-plecostomus-timeout",
+ "quixotic-plecostomus-error 0.10.0",
+ "quixotic-plecostomus-http 0.10.0",
+ "quixotic-plecostomus-pool 0.10.0",
+ "quixotic-plecostomus-runtime 0.10.0",
+ "quixotic-plecostomus-rustls 0.10.0",
+ "quixotic-plecostomus-timeout 0.10.0",
  "rand 0.10.3",
  "regex",
  "serde",
@@ -4383,22 +4396,82 @@ dependencies = [
 ]
 
 [[package]]
+name = "quixotic-plecostomus-core"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdbb499d4264efdbb98aa4e5178c4d9ad6545d57700d11ee626d9e6c5f99648a"
+dependencies = [
+ "ahash 0.8.12",
+ "async-trait",
+ "brotli",
+ "bstr",
+ "bytes",
+ "chrono",
+ "clap",
+ "daemonix",
+ "daggy",
+ "flate2",
+ "flurry",
+ "futures",
+ "h2",
+ "http",
+ "httparse",
+ "httpdate",
+ "libc",
+ "log",
+ "nix",
+ "once_cell",
+ "openssl-probe 0.1.6",
+ "ouroboros",
+ "parking_lot",
+ "percent-encoding",
+ "quixotic-plecostomus-error 0.11.0",
+ "quixotic-plecostomus-http 0.11.0",
+ "quixotic-plecostomus-pool 0.11.0",
+ "quixotic-plecostomus-runtime 0.11.0",
+ "quixotic-plecostomus-rustls 0.11.0",
+ "quixotic-plecostomus-timeout 0.11.0",
+ "rand 0.10.3",
+ "regex",
+ "serde",
+ "sfv",
+ "socket2",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-util",
+ "unicase",
+ "windows-sys 0.59.0",
+ "x509-parser",
+ "yaml_serde",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "quixotic-plecostomus-error"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "766a57cfa0d9f878cd7ba904bf5108d2eb62b7c34cbc92b5b55676a067224840"
 
 [[package]]
-name = "quixotic-plecostomus-header-serde"
-version = "0.10.0"
+name = "quixotic-plecostomus-error"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e557031f5e005605e724041da51dfc26674d7b6db746ea459d85a67605c380f"
+checksum = "8f5194971dca8add6ff0af06c581ecd9a36c16e7d930e997ca507a87fe44714d"
+
+[[package]]
+name = "quixotic-plecostomus-header-serde"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ae773393e9a1ef81add82f4d8a95a47fd7c9cb7fc39ae1b40fce22836e21915"
 dependencies = [
  "bytes",
  "http",
  "httparse",
- "quixotic-plecostomus-error",
- "quixotic-plecostomus-http",
+ "quixotic-plecostomus-error 0.11.0",
+ "quixotic-plecostomus-http 0.11.0",
  "thread_local",
  "zstd 0.13.3",
  "zstd-safe 7.3.0",
@@ -4412,20 +4485,31 @@ checksum = "c8b4cf1627eee7eb403c7460de2998dab626abd8cd6f4f15752f45ed25bb9ded"
 dependencies = [
  "bytes",
  "http",
- "quixotic-plecostomus-error",
+ "quixotic-plecostomus-error 0.10.0",
+]
+
+[[package]]
+name = "quixotic-plecostomus-http"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c5b9b84e31715f3636a3d9795259ad752ba7f2a250a72e9d44b56dbdecb8dce"
+dependencies = [
+ "bytes",
+ "http",
+ "quixotic-plecostomus-error 0.11.0",
 ]
 
 [[package]]
 name = "quixotic-plecostomus-lru"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262e2e6a09cd73f1238d6e28b138d955a151f13976960abf53c43f6a0d40ab9e"
+checksum = "10b38a989795e8007d39b663f3a93c5aab5a9d943403123c9a1903f50231d3db"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.15.5",
+ "hashbrown 0.12.3",
  "log",
  "parking_lot",
  "rand 0.10.3",
@@ -4444,15 +4528,31 @@ dependencies = [
  "log",
  "lru",
  "parking_lot",
- "quixotic-plecostomus-timeout",
+ "quixotic-plecostomus-timeout 0.10.0",
+ "tokio",
+]
+
+[[package]]
+name = "quixotic-plecostomus-pool"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4485a15f77716fd0a7a0725f66e75632d63441dcc86840dde41aac1cdebce8d3"
+dependencies = [
+ "crossbeam-queue",
+ "dashmap",
+ "futures",
+ "log",
+ "lru",
+ "parking_lot",
+ "quixotic-plecostomus-timeout 0.11.0",
  "tokio",
 ]
 
 [[package]]
 name = "quixotic-plecostomus-proxy"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d899350b898c6641308b4009b5b33e6d77ddd26d54fc6a586f761c3f6cc1df7"
+checksum = "758b3f31391e4fe46f2ae86cfe0f914b6551f0065701c37f862fcd61530d7011"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4463,9 +4563,9 @@ dependencies = [
  "log",
  "once_cell",
  "quixotic-plecostomus-cache",
- "quixotic-plecostomus-core",
- "quixotic-plecostomus-error",
- "quixotic-plecostomus-http",
+ "quixotic-plecostomus-core 0.11.0",
+ "quixotic-plecostomus-error 0.11.0",
+ "quixotic-plecostomus-http 0.11.0",
  "rand 0.10.3",
  "regex",
  "tokio",
@@ -4486,6 +4586,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "quixotic-plecostomus-runtime"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da9a37da793a8462cdf90ec3133e7a75f210be350bb80ee801322d3c9b9b0374"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.10.3",
+ "serde",
+ "thread_local",
+ "tokio",
+]
+
+[[package]]
 name = "quixotic-plecostomus-rustls"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4493,7 +4607,23 @@ checksum = "d00071361b274f59fd1bc361d63ef37ed45cf0c167a2d08f31e713f5cd107b63"
 dependencies = [
  "log",
  "no_debug",
- "quixotic-plecostomus-error",
+ "quixotic-plecostomus-error 0.10.0",
+ "rustls",
+ "rustls-native-certs 0.7.3",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "quixotic-plecostomus-rustls"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4d17b81a9336b506f4452dcf4a683a8c37ee03eec1b210a5f7a48f92dc38023"
+dependencies = [
+ "log",
+ "no_debug",
+ "quixotic-plecostomus-error 0.11.0",
  "rustls",
  "rustls-native-certs 0.7.3",
  "rustls-pemfile",
@@ -4520,6 +4650,19 @@ name = "quixotic-plecostomus-timeout"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16d77e25c2a9da147a5fe78f5d46ff08b85628160001ce5bb0b572986fb9f2c9"
+dependencies = [
+ "once_cell",
+ "parking_lot",
+ "pin-project-lite",
+ "thread_local",
+ "tokio",
+]
+
+[[package]]
+name = "quixotic-plecostomus-timeout"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43470b45f68afa629b14796d0ec5e3aacedfa21ca14ad6e2be92a8ad32dd91a9"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -4709,7 +4852,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddfcda65789fdadcc3ddde7b127bd2272deb3fc97fddb4fc94a499f839989990"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "fluent-uri",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",

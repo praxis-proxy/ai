@@ -53,10 +53,11 @@ sidecar** — it is read from the config through the real parser
 ([`xtask/src/flow_graph.rs`](../../xtask/src/flow_graph.rs)) and cross-checked
 against the sidecar at generation time:
 
-- The flattened filter chain (main chain plus IRR inference steps) determines
-  filter **count, order, and type**. If the sidecar's filter list disagrees at
-  any position — an added, removed, reordered, relocated, or mistyped filter —
-  generation **fails** with an actionable message.
+- The flattened listener pipeline (its referenced filter chains composed in
+  order, each chain's inherited conditions folded in, plus IRR inference steps)
+  determines filter **count, order, and type**. If the sidecar's filter list
+  disagrees at any position — an added, removed, reordered, relocated, or
+  mistyped filter — generation **fails** with an actionable message.
 - Every `load_balancer` cluster (however deeply nested, including inside branch
   chains and IRR steps) and its endpoints must match the sidecar's declared
   clusters.
@@ -109,8 +110,9 @@ pretty JSON, so `--fix` is a no-op when nothing changed and diffs stay legible.
    `<name>.visualizer.template.html` (start from the full-flow files).
 3. Register the tuple in `VISUALIZERS` in
    [`xtask/src/flow_visualizer.rs`](../../xtask/src/flow_visualizer.rs): the
-   config, template, sidecar, and output HTML paths, the pipeline chain name,
-   and the knob checks that bind surfaced limits to their config source.
+   config, template, sidecar, and output HTML paths, the listener name whose
+   composed chains the HTML flattens, and the knob checks that bind surfaced
+   limits to their config source.
 4. Run `cargo xtask sync-flow-visualizers --fix` to produce the HTML, then
    `make lint` to confirm the gate is green.
 

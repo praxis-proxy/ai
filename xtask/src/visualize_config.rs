@@ -302,9 +302,6 @@ mod tests {
     /// The committed full-flow config, relative to the xtask crate root.
     const FULL_FLOW: &str = "../examples/configs/openai/responses/full-flow-agentic.yaml";
 
-    /// The chain the full-flow visualizer flattens.
-    const PIPELINE_CHAIN: &str = "full-flow-agentic-pipeline";
-
     /// A minimal valid config with the given filters in one chain.
     fn minimal_config(filters: &[&str]) -> String {
         let mut body = String::from(
@@ -337,7 +334,7 @@ mod tests {
         let descriptions = filter_docs::filter_descriptions(&workspace_root());
         let model = build_model("full-flow", &graph, &descriptions);
 
-        let known = find_filter(&model, PIPELINE_CHAIN, "openai_responses_proxy").expect("proxy present");
+        let known = find_filter(&model, "managed-execution", "openai_responses_proxy").expect("proxy present");
         assert_eq!(
             known.get("known").and_then(Json::as_bool),
             Some(true),
@@ -351,7 +348,7 @@ mod tests {
             "known filter carries a description"
         );
 
-        let unknown = find_filter(&model, PIPELINE_CHAIN, "trace_context").expect("trace_context present");
+        let unknown = find_filter(&model, "ingress-and-binding", "trace_context").expect("trace_context present");
         assert_eq!(
             unknown.get("known").and_then(Json::as_bool),
             Some(false),

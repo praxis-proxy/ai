@@ -77,14 +77,14 @@ pub(crate) enum KnobSource {
 /// missing sidecar blocks). The HTML is produced only when no errors remain.
 pub(crate) fn render(
     graph: &FlowGraph,
-    chain: &str,
+    listener: &str,
     sidecar: &Value,
     template: &str,
     knobs: &[KnobCheck],
 ) -> Result<String, Vec<String>> {
     let nodes = graph
-        .flatten_chain(chain)
-        .ok_or_else(|| vec![format!("chain not found in config: {chain}")])?;
+        .flatten_listener(listener)
+        .ok_or_else(|| vec![format!("listener not found in config: {listener}")])?;
     let mut errors = Vec::new();
     let pipeline = build_pipeline(&nodes, sidecar, graph, knobs, &mut errors);
     let blocks: Vec<(&str, &Value)> = VERBATIM_BLOCKS
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn renders_when_config_and_sidecar_align() {
-        let html = render(&graph(), "c", &sidecar(), TEMPLATE, &[]).expect("aligned inputs render");
+        let html = render(&graph(), "l", &sidecar(), TEMPLATE, &[]).expect("aligned inputs render");
         assert!(!html.contains("@@"), "all placeholders substituted");
         assert!(html.contains("\"trace_context\""), "filter surfaced in PIPELINE");
         assert!(html.contains("\"order\": 1"), "order sourced from the config");
@@ -590,7 +590,7 @@ mod tests {
             .and_then(|f| f.get_mut(1))
             .and_then(|e| e.get_mut("filter_type"))
             .unwrap() = Value::from("wrong_type");
-        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("type drift must fail");
+        let errors = render(&graph(), "l", &side, TEMPLATE, &[]).expect_err("type drift must fail");
         assert!(errors.iter().any(|e| e.contains("filter 2")), "got {errors:?}");
     }
 
@@ -601,7 +601,7 @@ mod tests {
         if let Value::Sequence(seq) = filters {
             seq.reverse();
         }
-        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("reorder must fail");
+        let errors = render(&graph(), "l", &side, TEMPLATE, &[]).expect_err("reorder must fail");
         assert!(errors.iter().any(|e| e.contains("filter")), "got {errors:?}");
     }
 
@@ -613,7 +613,7 @@ mod tests {
             let extra = seq.last().cloned().unwrap();
             seq.push(extra);
         }
-        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("count drift must fail");
+        let errors = render(&graph(), "l", &side, TEMPLATE, &[]).expect_err("count drift must fail");
         assert!(errors.iter().any(|e| e.contains("filter count")), "got {errors:?}");
         assert!(
             errors.iter().any(|e| e.contains("no matching config filter")),
@@ -627,7 +627,7 @@ mod tests {
         if let Value::Mapping(map) = &mut side {
             map.remove(Value::from("wire"));
         }
-        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("missing block must fail");
+        let errors = render(&graph(), "l", &side, TEMPLATE, &[]).expect_err("missing block must fail");
         assert!(errors.iter().any(|e| e.contains("wire")), "got {errors:?}");
     }
 
@@ -638,7 +638,7 @@ mod tests {
         // required sequence, must fail cleanly rather than panic or silently
         // render an empty pipeline.
         *side.get_mut("pipeline").and_then(|p| p.get_mut("filters")).unwrap() = Value::Mapping(Mapping::new());
-        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("malformed filters must fail");
+        let errors = render(&graph(), "l", &side, TEMPLATE, &[]).expect_err("malformed filters must fail");
         assert!(errors.iter().any(|e| e.contains("not a sequence")), "got {errors:?}");
     }
 
@@ -663,7 +663,7 @@ mod tests {
             source: KnobSource::Filter("openai_agentic_loop"),
             key: "max_infer_iters",
         }];
-        let errors = render(&graph, "c", &side, TEMPLATE, &knobs).expect_err("knob drift must fail");
+        let errors = render(&graph, "l", &side, TEMPLATE, &knobs).expect_err("knob drift must fail");
         assert!(errors.iter().any(|e| e.contains("max_infer_iters")), "got {errors:?}");
     }
 
@@ -685,7 +685,7 @@ mod tests {
              scen_meta: {}\nwire: {}\ntimeline: {}\ngroups: {}\nstate_label: {}\n",
         )
         .expect("sidecar parses");
-        let errors = render(&graph, "c", &side, TEMPLATE, &[]).expect_err("cluster drift must fail");
+        let errors = render(&graph, "l", &side, TEMPLATE, &[]).expect_err("cluster drift must fail");
         assert!(errors.iter().any(|e| e.contains("cluster c1")), "got {errors:?}");
     }
 

@@ -41,8 +41,9 @@ struct Visualizer {
     sidecar: &'static str,
     /// Generated HTML output, relative to the workspace root.
     html: &'static str,
-    /// The filter chain the HTML flattens and documents.
-    chain: &'static str,
+    /// The listener whose composed filter chains the HTML flattens and
+    /// documents (the chains it references are concatenated in listener order).
+    listener: &'static str,
     /// Scalar limits the HTML surfaces and the config source of each.
     knobs: &'static [KnobCheck],
 }
@@ -53,7 +54,7 @@ const VISUALIZERS: &[Visualizer] = &[Visualizer {
     template: "examples/configs/openai/responses/full-flow-agentic.visualizer.template.html",
     sidecar: "examples/configs/openai/responses/full-flow-agentic.visualizer.yaml",
     html: "examples/configs/openai/responses/full-flow-agentic.visualizer.html",
-    chain: "full-flow-agentic-pipeline",
+    listener: "ai-gateway",
     knobs: FULL_FLOW_KNOBS,
 }];
 
@@ -249,7 +250,7 @@ fn process(root: &Path, viz: &Visualizer, fix: bool) -> Report {
         Ok(text) => text,
         Err(err) => return Report::Errors(vec![format!("read {}: {err}", viz.template)]),
     };
-    let generated = match flow_generator::render(&graph, viz.chain, &sidecar, &template, viz.knobs) {
+    let generated = match flow_generator::render(&graph, viz.listener, &sidecar, &template, viz.knobs) {
         Ok(html) => html,
         Err(errors) => return Report::Errors(errors),
     };
@@ -365,8 +366,8 @@ mod tests {
         let graph = FlowGraph::from_file(&root.join(viz.config)).expect("config parses");
         let sidecar = read_yaml(&root.join(viz.sidecar)).expect("sidecar parses");
         let template = std::fs::read_to_string(root.join(viz.template)).expect("template readable");
-        let first = flow_generator::render(&graph, viz.chain, &sidecar, &template, viz.knobs).expect("renders");
-        let second = flow_generator::render(&graph, viz.chain, &sidecar, &template, viz.knobs).expect("renders");
+        let first = flow_generator::render(&graph, viz.listener, &sidecar, &template, viz.knobs).expect("renders");
+        let second = flow_generator::render(&graph, viz.listener, &sidecar, &template, viz.knobs).expect("renders");
         assert_eq!(first, second, "rendering must be deterministic");
     }
 

@@ -4,7 +4,6 @@
 //! Proxy startup and configuration test utilities for integration tests.
 
 use std::{
-    collections::HashMap,
     fmt,
     path::PathBuf,
     sync::{Arc, mpsc},
@@ -15,7 +14,7 @@ use std::{
 use arc_swap::ArcSwap;
 use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 use praxis_core::{
-    config::{Config, Listener},
+    config::{Config, ExpandedFilterChains, Listener},
     server::RuntimeOptions,
 };
 use praxis_filter::{FilterFactory, FilterPipeline, FilterRegistry, HttpFilter};
@@ -126,19 +125,15 @@ fn resolve_listener_pipeline(
     client: &praxis_core::subrequest::SubRequestClient,
     store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
 ) -> Arc<FilterPipeline> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Mirror the server: fold each chain's inherited `conditions:` into its
+    // filters before composition so chain-level gates apply to every filter in
+    // the chain (chain gate AND filter gate).
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
-    let mut entries = Vec::new();
-    for chain_name in &listener.filter_chains {
-        let filters = chains
-            .get(chain_name.as_str())
-            .unwrap_or_else(|| panic!("unknown filter chain: {chain_name}"));
-        entries.extend_from_slice(filters);
-    }
+    let mut entries = expanded_chains
+        .for_listener(listener)
+        .unwrap_or_else(|err| panic!("{err}"));
 
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
@@ -438,7 +433,8 @@ fn build_pingora_server(
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
     #[cfg(not(feature = "_store-backend"))]
-    let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
+    let store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> =
+        std::collections::HashMap::new();
 
     #[cfg(feature = "_store-backend")]
     let readiness = HarnessStoreReadiness {
