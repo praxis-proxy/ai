@@ -36,6 +36,7 @@ use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     callout_target::AddressPolicy,
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
@@ -125,6 +126,12 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// headers. A higher tier always wins, so forged client headers can
 /// never override verified claims, and identity headers plus client
 /// credentials are always stripped before the request is forwarded.
+///
+/// When no `{prefix}model` identity header names the model and
+/// `model_to_provider` mapped the request, balance checks and usage events use
+/// the client-facing model ID it recorded rather than the provider target.
+/// That filter buffers the request body, so its body pass completes before
+/// this filter's request hook runs the balance check.
 ///
 /// # YAML
 ///
@@ -294,6 +301,9 @@ impl ExternalMeteringFilter {
         if !state.model.is_empty() {
             return state.model.clone();
         }
+        if let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA) {
+            return model.to_owned();
+        }
         if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
             return model.clone();
         }
@@ -346,6 +356,11 @@ impl HttpFilter for ExternalMeteringFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
+        if state.model.is_empty()
+            && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        {
+            state.model = model.to_owned();
+        }
 
         if state.username.is_empty() {
             let Some(fallback) = self.default_username.as_ref() else {

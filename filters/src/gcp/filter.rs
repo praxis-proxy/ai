@@ -27,7 +27,8 @@ use super::{
 /// flight. Passed to [`TokenCache::new`] as its safety margin.
 const EXPIRY_SKEW: Duration = Duration::from_secs(30);
 
-/// Timeout for a single metadata-server round-trip.
+/// Timeout for a single token round-trip, to the metadata server or to
+/// Google's `OAuth2` token endpoint for `source: key_file`.
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // -----------------------------------------------------------------------------
@@ -42,23 +43,37 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// between releases.
 ///
 /// Acquires a token via Application Default Credentials (GKE metadata
-/// server) and injects `Authorization: Bearer <token>` on every proxied
-/// request, keeping GCP credentials invisible to the downstream client.
-/// There is no background refresh thread: caching is cache-through, the
-/// same as [`crate::azure::azure_ad`] — see
+/// server, or a service-account key file) and injects `Authorization:
+/// Bearer <token>` on every proxied request, keeping GCP credentials
+/// invisible to the downstream client. There is no background refresh
+/// thread: caching is cache-through, the same as
+/// [`crate::azure::azure_ad`]; see
 /// [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
 ///
-/// **Service-account key file (`source: key_file`) token fetch is not
-/// implemented yet** — it needs `JWT` signing, which this workspace does
-/// not currently depend on. Config parsing, file resolution, and
-/// validation for `key_file` all work; `on_request` fails closed with a
-/// clear "not implemented" reason instead of silently 503ing forever.
+/// For `source: key_file`, the filter mints tokens itself: it signs an
+/// `RS256` `JWT` assertion with the key file's private key through the
+/// system OpenSSL and exchanges it at Google's `OAuth2` token endpoint.
+/// The key file's `token_uri` must be exactly
+/// `https://oauth2.googleapis.com/token`, so a tampered key file cannot
+/// send the signed assertion anywhere else. The key file is fully parsed
+/// when the pipeline is built: one missing `client_email`, `private_key`,
+/// or `token_uri`, or whose `private_key` is not an unencrypted RSA key,
+/// is rejected as a configuration error. Reload the config to pick up a
+/// rotated key.
 ///
 /// Credential-source resolution happens at construct time:
 /// `GOOGLE_APPLICATION_CREDENTIALS` is read once when the pipeline is
 /// built (reload the config to pick up changes), and a `gcloud` user
 /// credential file (`authorized_user`) is rejected as a configuration
 /// error rather than silently falling through the ADC chain.
+///
+/// With `clusters` set, the token is injected only into requests whose
+/// selected cluster is listed, so a chain that routes to several providers
+/// never hands the GCP token to the others. The cluster is chosen by the
+/// routing filters, so `gcp_adc` must come after the `router` (or whichever
+/// filter selects the cluster) and after anything that can change that
+/// choice; placed earlier, no cluster is selected yet and it injects
+/// nothing.
 ///
 /// This filter only injects `Authorization`. Pointing the request at
 /// the correct Vertex endpoint (cluster `endpoints` + `tls.sni`) is
@@ -68,10 +83,11 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// fetch fails — the request is rejected with `503` rather than
 /// forwarded unauthenticated.
 ///
-/// Metadata requests use a proxy-free, redirect-free client pinned to the
+/// Token requests use a proxy-free, redirect-free client pinned to the
 /// complete validated DNS result set. Metadata mode intentionally permits
-/// the protocol-owned private endpoint; arbitrary private hosts remain
-/// invalid configuration.
+/// the protocol-owned private endpoint, the key-file token endpoint must
+/// resolve to public addresses, and arbitrary private hosts remain invalid
+/// configuration.
 ///
 /// # YAML configuration
 ///
@@ -85,11 +101,14 @@ pub struct GcpAdcFilter {
     /// [`praxis_ai_apis::token_cache`].
     cache: TokenCache<HeaderValue>,
 
-    /// Shared sub-request client for metadata server callouts.
+    /// Shared sub-request client for metadata and token endpoint callouts.
     subrequest_client: SubRequestClient,
 
     /// Resolved credential source.
     source: TokenSource,
+
+    /// Optional logical upstream cluster allowlist for credential injection.
+    clusters: Vec<String>,
 
     /// `OAuth2` scope requested with the access token.
     scope: String,
@@ -122,6 +141,7 @@ impl GcpAdcFilter {
             cache: TokenCache::new(EXPIRY_SKEW),
             subrequest_client,
             source,
+            clusters: config.clusters.clone(),
             scope: config.scope.clone(),
             metadata_host: config.metadata_host.clone(),
             failing: AtomicBool::new(false),
@@ -167,6 +187,24 @@ impl GcpAdcFilter {
             client,
         )?))
     }
+
+    /// Whether this filter should inject credentials for the selected upstream.
+    fn cluster_is_in_scope(&self, cluster: Option<&str>) -> bool {
+        self.clusters.is_empty() || cluster.is_some_and(|selected| self.clusters.iter().any(|name| name == selected))
+    }
+
+    /// Fetch a fresh token for this filter's credential source; the
+    /// [`TokenCache`] decides when this runs.
+    async fn fetch_token(&self) -> Result<(HeaderValue, Duration), FilterError> {
+        token::fetch_pinned(
+            &self.subrequest_client,
+            &self.source,
+            &self.metadata_host,
+            &self.scope,
+            TOKEN_REQUEST_TIMEOUT,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -187,18 +225,11 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
-        let fetched = self
-            .cache
-            .get_or_refresh(|| {
-                token::fetch_pinned(
-                    &self.subrequest_client,
-                    &self.source,
-                    &self.metadata_host,
-                    &self.scope,
-                    TOKEN_REQUEST_TIMEOUT,
-                )
-            })
-            .await;
+        if !self.cluster_is_in_scope(ctx.cluster_name()) {
+            return Ok(praxis_filter::FilterAction::Continue);
+        }
+
+        let fetched = self.cache.get_or_refresh(|| self.fetch_token()).await;
         match fetched {
             Ok(authorization) => {
                 if self.failing.swap(false, Ordering::Relaxed) {

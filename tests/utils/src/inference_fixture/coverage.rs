@@ -1248,6 +1248,7 @@ mod tests {
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
+                vec!["messages_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
@@ -1326,6 +1327,7 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
@@ -1377,9 +1379,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 69, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 58, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 63, "manifest recording inventory count");
+        assert_eq!(report.features_total, 70, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 59, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 64, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1391,6 +1393,7 @@ mod tests {
                 "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
+                "messages/model-provider-map",
                 "messages/native-basic-nonstream",
                 "messages/native-basic-stream",
                 "messages/native-count-tokens",
@@ -1443,7 +1446,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 69, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 70, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1547,6 +1550,10 @@ mod tests {
                 (
                     &"messages.native.count_tokens".to_owned(),
                     &vec!["messages/native-count-tokens".to_owned()]
+                ),
+                (
+                    &"messages.model_provider.request_target".to_owned(),
+                    &vec!["messages/model-provider-map".to_owned()]
                 ),
                 (
                     &"responses.native.request".to_owned(),
@@ -1866,7 +1873,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("synthetic", CoverageStatus::SyntheticOnly)],
         );
-        for feature in &manifest.features[20..23] {
+        assert_eq!(
+            manifest.features[20]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+        );
+        for feature in &manifest.features[21..24] {
             assert_eq!(
                 feature
                     .providers
@@ -1879,7 +1894,7 @@ mod tests {
                 ],
             );
         }
-        for feature in &manifest.features[23..35] {
+        for feature in &manifest.features[24..36] {
             assert_eq!(
                 feature
                     .providers
@@ -1889,7 +1904,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        for feature in &manifest.features[35..37] {
+        for feature in &manifest.features[36..38] {
             assert_eq!(
                 feature
                     .providers
@@ -1899,7 +1914,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)],
             );
         }
-        for feature in &manifest.features[37..52] {
+        for feature in &manifest.features[38..53] {
             assert_eq!(
                 feature
                     .providers
@@ -1910,20 +1925,12 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[52]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("vllm", CoverageStatus::LiveCovered)],
-        );
-        assert_eq!(
             manifest.features[53]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+            vec![("vllm", CoverageStatus::LiveCovered)],
         );
         assert_eq!(
             manifest.features[54]
@@ -1931,9 +1938,17 @@ mod tests {
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+        );
+        assert_eq!(
+            manifest.features[55]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[55..69] {
+        for feature in &manifest.features[56..70] {
             assert_eq!(
                 feature
                     .providers
@@ -2044,6 +2059,22 @@ mod tests {
         assert_eq!(native_stream.turns[0].expect.client_body_kind, BodyKind::Sse);
         assert_eq!(native_stream.turns[0].expect.client_sse_interleaved_events, ["ping"]);
         assert_eq!(native_stream.turns[0].expect.upstream_sse_interleaved_events, ["ping"]);
+
+        let model_provider = InferenceScenario::load(&root.join("scenarios/messages/model-provider-map.yaml")).unwrap();
+        assert_eq!(model_provider.id, "messages/model-provider-map");
+        assert_eq!(
+            model_provider.description,
+            "Stable client model ID is routed to its provider with a provider-specific request model."
+        );
+        assert_eq!(model_provider.protocol, InferenceProtocol::AnthropicMessages);
+        assert_eq!(model_provider.example_config, "model-to-provider.yaml");
+        assert_eq!(model_provider.upstream_authority, "127.0.0.1:9001");
+        assert_eq!(model_provider.features, ["messages.model_provider.request_target"]);
+        assert_eq!(model_provider.turns[0].request.path, "/v1/messages");
+        let RecordedBody::Json { value } = &model_provider.turns[0].request.body else {
+            panic!("model-to-provider request must be JSON");
+        };
+        assert_eq!(value["model"], "claude-sonnet-4-5");
 
         let responses_nonstream =
             InferenceScenario::load(&root.join("scenarios/responses/native-basic-nonstream.yaml")).unwrap();

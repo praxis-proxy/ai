@@ -69,6 +69,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`anthropic_messages_to_vertexai_anthropic`](anthropic_messages_to_vertexai_anthropic.md) | Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex responses back to the Anthropic dialect. |
 | [`openai_chat_completions_to_vertexai_gemini`](openai_chat_completions_to_vertexai_gemini.md) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini `generateContent` format and translates responses back. |
 
 ## Cross-Provider Filters (praxis-ai-filters)
@@ -122,6 +123,7 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+| [`model_to_provider`](model_to_provider.md) | Maps stable client-facing model IDs to an internal provider selector and provider-specific target model. |
 
 ### Metering
 

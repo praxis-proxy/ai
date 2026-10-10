@@ -37,6 +37,10 @@ azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
 # Experimental: gates the gcp_adc example test, which needs the gcp_adc
 # filter registered in the in-process proxy registry.
 gcp-adc-filter = ["praxis-ai-proxy/gcp-adc-filter"]
+# Experimental: gates the vertex_anthropic example test, which needs the
+# anthropic_messages_to_vertexai_anthropic filter registered in the in-process
+# proxy registry.
+vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
 # Experimental: gates authenticated-subject token-rate-limit tests, which need
 # Praxis's released Basic Auth filter registered in the in-process registry.
 basic-auth-filter = ["praxis-ai-proxy/basic-auth-filter"]

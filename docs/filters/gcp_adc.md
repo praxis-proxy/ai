@@ -9,17 +9,19 @@ Injects a GCP `OAuth2` access token into outbound requests.
 
 Experimental: requires the `gcp-adc-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
 
-Acquires a token via Application Default Credentials (GKE metadata server) and injects `Authorization: Bearer <token>` on every proxied request, keeping GCP credentials invisible to the downstream client. There is no background refresh thread: caching is cache-through, the same as [`crate::azure::azure_ad`] — see [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
+Acquires a token via Application Default Credentials (GKE metadata server, or a service-account key file) and injects `Authorization: Bearer <token>` on every proxied request, keeping GCP credentials invisible to the downstream client. There is no background refresh thread: caching is cache-through, the same as [`crate::azure::azure_ad`]; see [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
 
-**Service-account key file (`source: key_file`) token fetch is not implemented yet** — it needs `JWT` signing, which this workspace does not currently depend on. Config parsing, file resolution, and validation for `key_file` all work; `on_request` fails closed with a clear "not implemented" reason instead of silently 503ing forever.
+For `source: key_file`, the filter mints tokens itself: it signs an `RS256` `JWT` assertion with the key file's private key through the system OpenSSL and exchanges it at Google's `OAuth2` token endpoint. The key file's `token_uri` must be exactly `https://oauth2.googleapis.com/token`, so a tampered key file cannot send the signed assertion anywhere else. The key file is fully parsed when the pipeline is built: one missing `client_email`, `private_key`, or `token_uri`, or whose `private_key` is not an unencrypted RSA key, is rejected as a configuration error. Reload the config to pick up a rotated key.
 
 Credential-source resolution happens at construct time: `GOOGLE_APPLICATION_CREDENTIALS` is read once when the pipeline is built (reload the config to pick up changes), and a `gcloud` user credential file (`authorized_user`) is rejected as a configuration error rather than silently falling through the ADC chain.
+
+With `clusters` set, the token is injected only into requests whose selected cluster is listed, so a chain that routes to several providers never hands the GCP token to the others. The cluster is chosen by the routing filters, so `gcp_adc` must come after the `router` (or whichever filter selects the cluster) and after anything that can change that choice; placed earlier, no cluster is selected yet and it injects nothing.
 
 This filter only injects `Authorization`. Pointing the request at the correct Vertex endpoint (cluster `endpoints` + `tls.sni`) is the operator's responsibility.
 
 Whenever no valid token can be produced — none cached and the inline fetch fails — the request is rejected with `503` rather than forwarded unauthenticated.
 
-Metadata requests use a proxy-free, redirect-free client pinned to the complete validated DNS result set. Metadata mode intentionally permits the protocol-owned private endpoint; arbitrary private hosts remain invalid configuration.
+Token requests use a proxy-free, redirect-free client pinned to the complete validated DNS result set. Metadata mode intentionally permits the protocol-owned private endpoint, the key-file token endpoint must resolve to public addresses, and arbitrary private hosts remain invalid configuration.
 
 ## Configuration
 
@@ -29,6 +31,7 @@ Metadata requests use a proxy-free, redirect-free client pinned to the complete 
 | `scope` | string | no | `OAuth2` scope requested with the access token. |
 | `service_account` | string | no | Metadata service account email, or `default` (the default). Only used with the `metadata` and `adc` sources; rejected for `key_file`. Interpolated into the metadata path, so it must be `default` or a service-account email (letters, digits, `@`, `.`, `-`, `_`). |
 | `credentials_file` | string | no | Path to a service-account key JSON file. Required when `source` is `key_file`; rejected for the other sources (`adc` reads `GOOGLE_APPLICATION_CREDENTIALS` instead). |
+| `clusters` | string[] | no | Optional logical upstream clusters that receive GCP credentials. When omitted or empty, the filter applies to every request in its chain. Use this in a multi-provider chain so a GCP bearer token is not sent to non-GCP providers; the filter must then come after the router, since before it no cluster is selected and nothing is injected. |
 | `metadata_host` | string | no | GCE/GKE metadata server host. Must be the real metadata hostname. The metadata endpoint is only safe to reach over plain HTTP because it never leaves the VM/host, so nothing else is accepted. |
 
 ## Example

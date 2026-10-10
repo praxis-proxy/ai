@@ -437,6 +437,8 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_chat_completions_to_vertexai_gemini"
             | "openai_responses_to_chat_completions"
             | "aws_sigv4_sign"
+            | "model_to_header"
+            | "model_to_provider"
             | "router"
             | "load_balancer"
     )
@@ -2752,6 +2754,13 @@ mod tests {
         let source = replay_config_source("openai/responses/agentic-loop-deferred-mcp-fixture.yaml");
         let config = Config::from_yaml(&source).expect("deferred MCP fixture config should parse");
         validate_replay_filters(&config).expect("deferred MCP fixture contains only replay-safe filters");
+    }
+
+    #[test]
+    fn replay_config_allows_model_to_provider_fixture() {
+        let source = replay_config_source("model-to-provider.yaml");
+        let config = Config::from_yaml(&source).expect("model-to-provider example config should parse");
+        validate_replay_filters(&config).expect("model-to-provider example contains only replay-safe filters");
     }
 
     #[test]

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, RoutedBackend, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send, parse_body,
-    parse_status, start_header_echo_backend,
+    Backend, RoutedBackend, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send,
+    json_post_with_header, parse_body, parse_status, start_header_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -268,5 +268,87 @@ fn external_metering_skips_when_no_identity() {
         parse_status(&raw),
         200,
         "should proxy without metering when no identity headers"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Provider-Resolved Model
+// -----------------------------------------------------------------------------
+
+#[test]
+fn external_metering_uses_client_model_resolved_by_model_to_provider() {
+    let backend = StatefulCapturingBackend::new(vec![(200, r#"{"ok":true}"#.to_owned())]).start_with_shutdown();
+    let metering = StatefulCapturingBackend::new(vec![
+        (200, r#"{"hasAccess": true, "balance": 9000.0}"#.to_owned()),
+        (204, String::new()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:{metering_port}"
+        allow_private_endpoint: true
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        provider: "vertex"
+        fail_open: false
+        identity_header_prefix: "x-tenant-"
+      - filter: model_to_provider
+        models:
+          - model: claude-sonnet-4-5
+            provider: vertex
+            target_model: vertex/claude-sonnet-4-5
+            paths: [/v1/messages]
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
+"#,
+        metering_port = metering.port(),
+        backend_port = backend.port(),
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).unwrap();
+
+    let proxy = praxis_test_utils::start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            "/v1/messages",
+            r#"{"model":"claude-sonnet-4-5","messages":[]}"#,
+            "x-tenant-username: alice",
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "metered request should be proxied");
+
+    let balance = metering
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "GET")
+        .expect("the balance check should reach the metering service");
+    assert!(
+        balance.uri.ends_with("?model=claude-sonnet-4-5"),
+        "the balance check should name the client model, not the provider target: {}",
+        balance.uri
+    );
+    let event = wait_for_usage_event(&metering);
+    let json: serde_json::Value = serde_json::from_str(&event).expect("usage event body should be valid JSON");
+    assert_eq!(
+        json["data"]["model"], "claude-sonnet-4-5",
+        "usage should be reported against the client model"
     );
 }
