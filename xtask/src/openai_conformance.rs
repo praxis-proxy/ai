@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command}
 
 use clap::Parser;
 
+/// Anthropic Messages registry drift check against the pinned specification.
+mod anthropic_messages_registry;
 /// Conformance areas included in this task.
 mod area;
 /// Chat Completions registry drift check against the pinned specification.
@@ -115,6 +117,17 @@ pub(crate) struct Args {
 // -----------------------------------------------------------------------------
 // Entry Point
 // -----------------------------------------------------------------------------
+
+/// Run the Anthropic Messages registry drift check and report the outcome.
+pub(crate) fn run_anthropic_messages_registry_check() {
+    match anthropic_messages_registry::check() {
+        Ok(summary) => println!("{summary}"),
+        Err(failures) => {
+            eprintln!("{failures}");
+            std::process::exit(1);
+        },
+    }
+}
 
 /// Run the Responses registry drift check and report the outcome.
 pub(crate) fn run_responses_registry_check() {

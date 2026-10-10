@@ -37,6 +37,9 @@ const FILES_MARKER: &str = "{\"selected\":\"files-backend\"}";
 /// Body returned by the Vector Stores backend, proving it was selected.
 const VECTOR_STORES_MARKER: &str = "{\"selected\":\"vector-stores-backend\"}";
 
+/// Body returned by the Anthropic Messages backend, proving it was selected.
+const ANTHROPIC_MARKER: &str = "{\"selected\":\"anthropic-backend\"}";
+
 /// Started example: a header-echoing default backend and marker-returning
 /// family backends.
 struct Harness {
@@ -50,6 +53,8 @@ struct Harness {
     _files: praxis_test_utils::CapturingBackendGuard,
     /// Vector Stores backend, which returns [`VECTOR_STORES_MARKER`].
     _vector_stores: praxis_test_utils::CapturingBackendGuard,
+    /// Anthropic Messages backend, which returns [`ANTHROPIC_MARKER`].
+    _anthropic: praxis_test_utils::CapturingBackendGuard,
     /// The running proxy.
     proxy: praxis_test_utils::ProxyGuard,
 }
@@ -61,6 +66,7 @@ fn start() -> Harness {
     let chat = start_capturing_backend(CHAT_MARKER);
     let files = start_capturing_backend(FILES_MARKER);
     let vector_stores = start_capturing_backend(VECTOR_STORES_MARKER);
+    let anthropic = start_capturing_backend(ANTHROPIC_MARKER);
     let proxy_port = free_port();
     let config = load_example_config(
         "openai/operation-classifier.yaml",
@@ -71,6 +77,7 @@ fn start() -> Harness {
             ("127.0.0.1:3003", chat.port()),
             ("127.0.0.1:3004", files.port()),
             ("127.0.0.1:3005", vector_stores.port()),
+            ("127.0.0.1:3006", anthropic.port()),
         ]),
     );
     let proxy = start_proxy(&config);
@@ -80,6 +87,7 @@ fn start() -> Harness {
         _chat: chat,
         _files: files,
         _vector_stores: vector_stores,
+        _anthropic: anthropic,
         proxy,
     }
 }
@@ -485,4 +493,61 @@ fn client_supplied_headers_are_rejected_on_an_unclassified_path_too() {
         !echoed(&raw).contains("x-praxis-ai-application-protocol"),
         "a forged protocol must not cross the proxy on an unclassified path"
     );
+}
+
+/// `POST /v1/messages` reaches the Anthropic Messages backend. The classifier
+/// recognizes it from the head alone, so this proves the branch is wired.
+#[test]
+fn a_classified_anthropic_messages_operation_selects_the_anthropic_backend() {
+    let h = start();
+
+    let raw = http_send(
+        h.proxy.addr(),
+        &json_post(
+            "/v1/messages",
+            r#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "messages_post should be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        ANTHROPIC_MARKER,
+        "anthropic_messages must branch to the Anthropic backend"
+    );
+}
+
+/// The body cannot change which operation `POST /v1/messages` resolves to.
+/// A malformed, empty, or Chat Completions-shaped body on the Anthropic path
+/// still selects the Anthropic backend.
+#[test]
+fn anthropic_messages_identity_does_not_depend_on_the_body() {
+    let h = start();
+
+    let chat_body = r#"{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}"#;
+    let chat_on_anthropic = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{chat_body}",
+        chat_body.len()
+    );
+
+    let malformed = "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\
+         not json";
+    let empty = "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+    for (name, request) in [
+        ("malformed JSON", malformed),
+        ("empty body", empty),
+        ("chat completions body on an anthropic path", chat_on_anthropic.as_str()),
+    ] {
+        let raw = http_send(h.proxy.addr(), request);
+        assert_eq!(parse_status(&raw), 200, "{name} should be forwarded");
+        assert_eq!(
+            parse_body(&raw),
+            ANTHROPIC_MARKER,
+            "{name} must still select the Anthropic backend"
+        );
+    }
 }
