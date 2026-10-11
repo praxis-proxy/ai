@@ -243,10 +243,47 @@ fn transient_registry_failure(stderr: &str) -> bool {
 }
 
 /// Whether podman refused the image for a signature or policy reason.
+///
+/// Download URLs are removed first. `X-Amz-Signature` and `akamai_signature` are request signatures, not an image
+/// signature rejection.
 fn signature_rejection(stderr: &str) -> bool {
     const MARKERS: &[&str] = &["signature", "signedby", "gpg", "key expired", "policy"];
-    let lower = stderr.to_ascii_lowercase();
+    let lower = without_urls(&stderr.to_ascii_lowercase());
     MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Drop HTTP and HTTPS URLs so their query strings are not scanned for policy words.
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(scheme_len) = url_scheme_at(rest) {
+            out.push(' ');
+            rest = &rest[scheme_len..];
+            let end = rest.find(url_terminator).unwrap_or(rest.len());
+            rest = &rest[end..];
+        } else {
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// `https://` or `http://` at the start of `text`, as a byte length.
+fn url_scheme_at(text: &str) -> Option<usize> {
+    if text.starts_with("https://") {
+        Some("https://".len())
+    } else if text.starts_with("http://") {
+        Some("http://".len())
+    } else {
+        None
+    }
+}
+
+/// A character that ends a URL in podman's pull errors.
+fn url_terminator(ch: char) -> bool {
+    !ch.is_ascii() || ch.is_ascii_whitespace() || matches!(ch, '"' | '\'')
 }
 
 /// Describe a failed pull. Transport failures stay transport failures so a
@@ -358,6 +395,24 @@ mod tests {
             message.contains("could not copy"),
             "not described as a signature rejection: {message}"
         );
+        assert!(
+            !message.contains("requiring Red Hat's signature"),
+            "the signature policy is not blamed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_quay_request_signature_in_the_blob_url_is_still_retried() {
+        let stderr = "Error: copying system image from manifest list: writing blob: storing blob to file \
+                      \"/var/tmp/container_images_storage1/1\": happened during read: unexpected EOF \
+                      (while reconnecting: Get \"https://cdn01.quay.io/blob?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                      &X-Amz-Signature=abc&akamai_signature=def\": EOF)";
+        assert!(
+            transient_registry_failure(stderr),
+            "request signatures in the CDN URL are not a policy rejection"
+        );
+        let message = pull_failure_message("registry.access.redhat.com/ubi9/ubi@sha256:abc", stderr);
+        assert!(message.contains("could not copy"), "not described as a signature rejection: {message}");
         assert!(
             !message.contains("requiring Red Hat's signature"),
             "the signature policy is not blamed: {message}"
