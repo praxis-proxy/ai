@@ -259,12 +259,12 @@ fn without_urls(text: &str) -> String {
     while let Some(ch) = rest.chars().next() {
         if let Some(scheme_len) = url_scheme_at(rest) {
             out.push(' ');
-            rest = &rest[scheme_len..];
+            rest = rest.get(scheme_len..).unwrap_or_default();
             let end = rest.find(url_terminator).unwrap_or(rest.len());
-            rest = &rest[end..];
+            rest = rest.get(end..).unwrap_or_default();
         } else {
             out.push(ch);
-            rest = &rest[ch.len_utf8()..];
+            rest = rest.get(ch.len_utf8()..).unwrap_or_default();
         }
     }
     out
