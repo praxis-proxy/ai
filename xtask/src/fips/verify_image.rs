@@ -412,7 +412,10 @@ mod tests {
             "request signatures in the CDN URL are not a policy rejection"
         );
         let message = pull_failure_message("registry.access.redhat.com/ubi9/ubi@sha256:abc", stderr);
-        assert!(message.contains("could not copy"), "not described as a signature rejection: {message}");
+        assert!(
+            message.contains("could not copy"),
+            "not described as a signature rejection: {message}"
+        );
         assert!(
             !message.contains("requiring Red Hat's signature"),
             "the signature policy is not blamed: {message}"
