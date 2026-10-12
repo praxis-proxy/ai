@@ -12,7 +12,7 @@ OpenCode    -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
 ```
 
 One gateway can serve all three clients over their native paths at once; see
-[One gateway for all three clients](#one-gateway-for-all-three-clients).
+[Serving all three clients from one gateway](#serving-all-three-clients-from-one-gateway).
 
 Use the native paths when vLLM exposes the corresponding Responses or
 Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
@@ -151,9 +151,6 @@ cp examples/configs/anthropic/messages-native-vllm.yaml praxis-vllm.yaml
 
 # Claude Code, translated to Chat Completions
 cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
-
-# All three clients at once, native paths only
-cp examples/configs/coding-harness-gateway-vllm.yaml praxis-vllm.yaml
 ```
 
 OpenCode was tested with the
@@ -163,39 +160,56 @@ translation, and Anthropic validation is scoped to `/v1/messages`.
 The same gateway can serve both Claude Code and OpenCode, provided vLLM
 supports their respective endpoints.
 
-### One gateway for all three clients
+### Serving all three clients from one gateway
 
-[`coding-harness-gateway-vllm.yaml`](../../examples/configs/coding-harness-gateway-vllm.yaml)
-composes the two native examples above into one configuration, one proxy
-process, and one vLLM backend, sharing a single `GATEWAY_AUTH_PASSWORD` across
-all three CLIs. Every client keeps its own wire format end to end; nothing is
-translated. Use it when you want one gateway running instead of switching
-configs per client. For a single client, the focused examples above are less to
-read.
+One proxy process can serve all three CLIs over their native paths at once.
+There is no example config for this, because it is the two native examples
+above placed in one file: the Claude Code and OpenCode chain from
+`anthropic/messages-native-vllm.yaml` and the Codex chain from
+`openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
+the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
 
-It binds **two** listeners:
+```yaml
+listeners:
+  # Claude Code (/v1/messages) and OpenCode (/v1/chat/completions).
+  - name: messages-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [claude-and-opencode]
 
-| Listener | Serves | Client base URL |
-| --- | --- | --- |
-| `127.0.0.1:8080` | Claude Code (`/v1/messages`), OpenCode (`/v1/chat/completions`) | `http://127.0.0.1:8080` |
-| `127.0.0.1:8081` | Codex (`/v1/responses`) | `http://127.0.0.1:8081/v1` |
+  # Codex (/v1/responses).
+  - name: responses-gateway
+    address: "127.0.0.1:8081"
+    filter_chains: [codex-responses]
 
-The split is not cosmetic. Codex's rich client tools need
+filter_chains:
+  - name: claude-and-opencode
+    filters: # ... from anthropic/messages-native-vllm.yaml
+  - name: codex-responses
+    # Prefix with the same basic_auth filter the chain above uses, so one
+    # shared credential gates both listeners. Give this chain's cluster its
+    # own name; the endpoint is the same vLLM server.
+    filters: # ... from openai/responses/client-tool-compat.yaml
+```
+
+Keep Codex on a listener of its own. Its rich client tools need
 `openai_client_tool_compat`, which needs `openai_stream_events`, which fails
 closed outside an `iterative_request_router` step. The IRR is a terminal filter
-that cannot share a chain with a top-level `load_balancer`, so everything in
-that chain would have to route through it — and the IRR buffers a sub-request
-response unless a filter selects streaming, which the native `/v1/messages` and
-`/v1/chat/completions` paths do not. Routing them through it would hold each
-turn's SSE until the turn finished. Two listeners keep all three clients
-streaming incrementally. Because every CLI configures its own base URL, the
-second port costs one line of client config.
+that cannot share a chain with a top-level `load_balancer`, so everything on
+that listener would have to route through it — and the IRR buffers a
+sub-request response unless a filter selects streaming, which the native
+`/v1/messages` and `/v1/chat/completions` paths do not. Routing them through it
+would hold each turn's SSE until the turn finished, so Claude Code and OpenCode
+would render nothing until completion. Because every CLI configures its own
+base URL, the second port costs one line of client config.
 
-Everything else in this guide applies unchanged, except that Codex authenticates
-with Basic rather than Bearer — see [section 3](#3-connect-codex). The store
-needs the same absolute `database_url` as the native Codex example when running
-from the container image; see
-[the writable database path note](#the-store-backed-examples-need-a-writable-database-path).
+Point Claude Code and OpenCode at `http://127.0.0.1:8080` and Codex at
+`http://127.0.0.1:8081/v1`, then follow sections 3 to 5 unchanged with two
+exceptions: Codex now sits behind `basic_auth` and must present the shared
+Basic credential rather than a Bearer key — see
+[Codex behind the gateway's Basic auth](#codex-behind-the-gateways-basic-auth) —
+and from the container image the store needs the same absolute `database_url`
+as the native Codex example, see
+[the writable database path note](#the-native-codex-example-needs-a-writable-database-path).
 
 The native Codex example uses `127.0.0.1:3001` as its fixture backend; change
 that endpoint to `127.0.0.1:8000` for the local vLLM server. The other examples
@@ -234,8 +248,8 @@ export GATEWAY_AUTH_PASSWORD="$(openssl rand -hex 24)"
 
 Build and start Praxis. Running it in the background keeps the two generated
 values in the shell that will launch the client. The SQLite feature enables the
-local response store used by the native Codex and unified examples, and is
-harmless for the other paths:
+local response store used by the native Codex example and is harmless for the
+other paths:
 
 ```console
 cargo build -p praxis-ai-proxy --no-default-features \
@@ -328,14 +342,13 @@ container with
 from the host under `--network host`). When finished, replace the `kill` in
 the cleanup section with `docker rm -f praxis-vllm`.
 
-#### The store-backed examples need a writable database path
+#### The native Codex example needs a writable database path
 
 The image is built with `full,store-sqlite`, so `client-tool-compat.yaml` — the
-preferred native Codex example — and `coding-harness-gateway-vllm.yaml` both run
-on the stock image. The other three configurations in this section have no store
-filter and need no change at all.
+preferred native Codex example — runs on the stock image. The other three
+configurations in this section have no store filter and need no change at all.
 
-The one edit the store examples do need is an absolute `database_url`. The
+The one edit the store example does need is an absolute `database_url`. The
 image's `/etc/praxis` working directory is root-owned while the process runs as
 `praxis` (UID 100), so the example's relative `sqlite://responses.db?mode=rwc`
 cannot be created: the proxy starts, and the first `/v1/responses` request
@@ -406,43 +419,37 @@ If you selected the translated Codex example instead, set
 Chat Completions, injects `VLLM_API_KEY`, and streams the translated response
 back.
 
-### Codex on the unified gateway
+### Codex behind the gateway's Basic auth
 
-The unified example gates its Responses listener with the same `basic_auth`
-filter the Claude examples use, so Codex presents the gateway's Basic
-credential instead of a Bearer token. Codex builds its provider headers from
-`http_headers` and `env_http_headers` independently of `env_key`, and applies
-the `env_key` bearer by *appending* `Authorization` rather than replacing it —
-setting both sends two `Authorization` headers. So omit `env_key` entirely and
-carry the credential in `env_http_headers`:
+The native Codex example has no `basic_auth` filter, so the client credential
+above *is* the backend credential. Put Codex behind a gateway that
+authenticates clients — as the Claude examples do, and as the
+[all-in-one gateway](#serving-all-three-clients-from-one-gateway) does — and it
+must present the Basic credential instead. Codex builds its provider headers
+from `http_headers` and `env_http_headers` independently of `env_key`, and
+applies the `env_key` bearer by *appending* `Authorization` rather than
+replacing it, so setting both sends two `Authorization` headers. Omit `env_key`
+entirely and carry the credential in `env_http_headers`:
 
 ```console
-export CODEX_HOME="$(mktemp -d)"
 export PRAXIS_GATEWAY_AUTH="Basic $(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
-cat > "$CODEX_HOME/config.toml" <<EOF
-model = "$VLLM_MODEL"
-model_provider = "praxis"
-web_search = "disabled"
+```
 
+```toml
 [model_providers.praxis]
 name = "Local Praxis"
 base_url = "http://127.0.0.1:8081/v1"
 wire_api = "responses"
 env_http_headers = { Authorization = "PRAXIS_GATEWAY_AUTH" }
-EOF
-
-codex exec --skip-git-repo-check \
-  "Inspect this directory, create praxis-vllm-check.txt, then summarize the change."
 ```
 
 With no `env_key`, no `experimental_bearer_token`, and `requires_openai_auth`
 left at its default, Codex resolves an unauthenticated provider and contributes
-no auth headers of its own. The isolated `CODEX_HOME` is required rather than
-merely tidy here: a logged-in Codex home would supply ambient credentials that
-this provider would otherwise inherit.
+no auth headers of its own. The isolated `CODEX_HOME` is load-bearing rather
+than merely tidy here: a logged-in Codex home would supply ambient credentials
+that this provider would otherwise inherit.
 
-Unlike the single-client native path, the client credential is no longer the
-backend credential. `basic_auth` verifies it and strips it, and
+`basic_auth` then verifies the client credential and strips it, and
 `credential_injection` supplies `VLLM_API_KEY` toward vLLM — the same
 three-credential separation the Claude examples use.
 
@@ -603,7 +610,7 @@ kill "$PRAXIS_PID"
   authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
   the gateway's password.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
-- `401` from Praxis on the Codex path of the unified gateway: `env_key` is
+- `401` from Praxis on a Codex path gated by `basic_auth`: `env_key` is
   probably still set alongside `env_http_headers`. Codex appends the `env_key`
   bearer rather than replacing the configured header, so the request carries
   two `Authorization` headers and `basic_auth` does not see the Basic one it
@@ -632,8 +639,8 @@ kill "$PRAXIS_PID"
   the Chat Completions traffic a coding client also sends, and the
   request reaches core's error path with no formatter installed. `ai_operation`
   classifies from the request head and installs the matching formatter for
-  every OpenAI and Anthropic protocol. Every example in section 2 leads with
-  it, directly after `basic_auth`.
+  every OpenAI and Anthropic protocol; put it directly after `basic_auth`, as
+  the Codex examples and the native Claude Code and OpenCode example do.
   This bites OpenCode hardest: it is the one client whose traffic
   (`/v1/chat/completions`) shares a listener with another protocol, so a config
   derived from an older copy sends it problem details its SDK cannot parse.
@@ -668,9 +675,12 @@ kill "$PRAXIS_PID"
   the host firewall; a loopback-only listener refuses the connection
   immediately, whereas a blocked port usually hangs or reports no route. Binding
   to `0.0.0.0` exposes the gateway to the network, so keep the authentication
-  filter in place. The unified example has a second listener on `127.0.0.1:8081`
-  that needs the same treatment, plus `-p 8081:8081` under the published-port
-  container path.
+  filter in place and terminate TLS in front of it — the shared Basic password
+  is otherwise readable on the wire. A second listener, such as the Codex one
+  in the
+  [all-in-one gateway](#serving-all-three-clients-from-one-gateway), needs the
+  same treatment plus its own `-p 8081:8081` under the published-port container
+  path.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.

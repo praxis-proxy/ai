@@ -16,7 +16,7 @@
 //!
 //! [`ErrorResponseFormatter`]: https://docs.rs/praxis-filter
 
-use crate::{parse_body, parse_status};
+use crate::{parse_body, parse_header, parse_status};
 
 /// Asserts `raw` is an OpenAI-shaped error for an unreachable upstream.
 ///
@@ -96,12 +96,27 @@ pub fn assert_error_is_anthropic_shaped(raw: &str) {
 ///
 /// Both envelopes share this preamble: the failure must come from the proxy
 /// (5xx for a refused upstream) and must be JSON before any shape assertion is
-/// meaningful.
+/// meaningful. `Content-Type` is what the SDK dispatches on, so an
+/// `application/problem+json` response is caught here even when its body
+/// happens to parse — the media type is matched ignoring any parameters, per
+/// RFC 9110 §8.3.
 fn upstream_failure_body(raw: &str) -> (String, serde_json::Value) {
     let status = parse_status(raw);
     assert!(
         (500..600).contains(&status),
         "an unreachable backend should fail the request, got {status}"
+    );
+
+    let content_type = parse_header(raw, "content-type").unwrap_or_default();
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    assert_eq!(
+        media_type, "application/json",
+        "error responses must be served as JSON, got Content-Type: {content_type}"
     );
 
     let body = parse_body(raw);
