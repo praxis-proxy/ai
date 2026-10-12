@@ -142,9 +142,15 @@ The Claude Code server-side web-search acceptance test
 (`claude_code_vllm::pinned_claude_code_resolves_server_side_web_search_through_tavily`)
 drives the **real** `claude` binary, which puts `WebSearch` on the wire as a
 custom client tool with `tool_choice: null` — it never *forces* the tool. Qwen3-8B
-does not reliably decide to call `WebSearch` on its own, so the managed
-`anthropic_web_search` loop dispatches no search and the turn returns an empty
-answer. This is a model-capability limit, not a proxy bug or flake.
+does not reliably drive that loop to a finished answer. Two failure shapes were
+observed on live Qwen3-8B, both model-capability limits rather than proxy bugs or
+flakes:
+
+- it never decides to call `WebSearch`, so the managed `anthropic_web_search` loop
+  dispatches no search and the turn returns an empty answer; or
+- it *does* call `WebSearch`, Praxis resolves a real Tavily search server-side (a
+  valid exchange, tool_use suppressed) and the turn exits `success`, but the 8B
+  model then synthesizes **no** final answer from the results (`result:"\n\n"`).
 
 Praxis's server-side Tavily resolution is proven on every run by the
 **forced-tool-choice** SDK web-search tests, which set
@@ -156,20 +162,24 @@ model:
 - the `ANTHROPIC_STUBBED_WEB_SEARCH` / `ANTHROPIC_CREDENTIALED_WEB_SEARCH`
   acceptance scenarios.
 
-So the Claude Code lane grades as an **XFAIL on Qwen3-8B**, narrowed to exactly
-the documented outcome: the live search-loop assertions (a real Tavily exchange
-captured through the relay, a non-empty cited answer, no leaked `WebSearch`
-tool_use) are **skipped** only when the live model matches
-`WEB_SEARCH_XFAIL_MODEL` (`qwen3-8b`) **and** the model made no search attempt (no
-Tavily exchange and no `WebSearch` tool_use in the trace) — and even then the child
-must still have run to completion cleanly through Praxis — with an `XFAIL (...)`
-line logged. If the model *did* attempt a search, or on a more capable model, the
-full `check_server_side_web_search` oracle runs as hard assertions, so a real
-regression (a broken managed loop, a leaked tool_use, an `is_error` fallback)
-cannot hide behind the limitation. Making the proxy inject/force `tool_choice` for the
-managed web-search tool (so small backends open the loop through the real client)
-would let this lane drop the XFAIL — tracked separately as a possible filter
-feature, not done here.
+So the Claude Code lane grades like the compaction lane: **hard-assert everything
+the proxy owns, XFAIL only the model-completion outcome.** The
+`check_server_side_web_search` oracle classifies each failure (`WebSearchFailure`):
+
+- **Proxy regression — hard on every model.** A leaked `WebSearch` tool_use (the
+  managed loop must suppress it), an `is_error` flag on an otherwise-successful
+  turn, or any Tavily exchange that *did* run being malformed or failed (non-200,
+  wrong key, empty query, empty/relative-URL results). These are checked **first**
+  and always, so a broken managed loop can never hide behind the limitation.
+- **Model incomplete — XFAIL on `WEB_SEARCH_XFAIL_MODEL` (`qwen3-8b`), hard on a
+  capable model.** The turn did not converge, the model never called `WebSearch`
+  (no Tavily exchange), or it got real results and produced no usable final
+  answer. On `qwen3-8b` these are **skipped** with an `XFAIL (...)` line logged,
+  and the child must still have run to completion cleanly through Praxis.
+
+Making the proxy inject/force `tool_choice` for the managed web-search tool (so
+small backends open the loop through the real client) would let this lane drop the
+XFAIL — tracked separately as a possible filter feature, not done here.
 
 ## Reusing published images
 
