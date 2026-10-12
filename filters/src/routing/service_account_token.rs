@@ -1,36 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! [`ServiceAccountTokenFilter`] — reads a login token from a file and
-//! attaches it to every outgoing request.
+//! [`ServiceAccountTokenFilter`] — attaches a Kubernetes pod identity token
+//! to every outgoing request.
 //!
 //! # Overview
 //!
-//! Kubernetes can hand a pod a short-lived login token in a file (a
-//! "`serviceAccountToken`") and automatically swap that file out for a
-//! fresh one before the old token expires. This filter opens the file and
-//! reads it again every time it sends a request — there is no cache and
-//! no background refresh job, so whatever is in the file right now is
-//! what gets used. A rotated token is picked up on the very next request
-//! with no config reload and no restart. The file is small (well under
-//! [`MAX_TOKEN_BYTES`]) and backed by memory rather than disk, so reading
-//! it on every request is cheap.
+//! Kubernetes writes a short-lived login token to a file inside the pod and
+//! replaces it automatically before it expires. This filter reads that file
+//! once at startup, keeps the value in memory, and watches the file for
+//! changes in the background. Every request gets the token from memory — no
+//! disk access on the hot path. When Kubernetes swaps in a new token the
+//! background watcher picks it up in milliseconds without a restart.
 //!
-//! Add this filter to an `outbound_chain` used by a callout filter (for
-//! example, `ai_guardrails`'s `NeMo` provider) so that the outbound
-//! request carries proof of identity to a destination that checks
-//! Kubernetes tokens, such as a `kube-rbac-proxy` sidecar that asks
-//! Kubernetes "is this caller allowed to do this?" before letting the
-//! request through.
+//! Use this in an `outbound_chain` to prove Praxis's identity to a protected
+//! upstream — for example, the auth proxy in front of a NeMo Guardrails
+//! service.
 //!
 //! # Security
 //!
-//! - The token is read straight into a [`Zeroizing`] buffer and is never written to `filter_metadata`, trace logs, or
-//!   error messages.
-//! - If the token file is missing, empty, or too large, the request is rejected with `503` instead of being sent
-//!   without a token.
-//! - The header this filter writes to can't be a header Praxis already manages internally, or one that controls the
-//!   HTTP connection itself — the same rule [`crate::routing::credential_inject`] uses for its own header.
+//! - The token is never written to logs, traces, or error messages.
+//! - If the file is missing, empty, or too large at any point, all requests
+//!   are rejected with `503` rather than forwarded without a token.
+//! - The target header cannot be one that Praxis manages internally or one
+//!   that controls the HTTP connection (e.g. `host`, `proxy-authorization`).
 //!
 //! # YAML config
 //!
@@ -41,10 +34,18 @@
 //! prefix: "Bearer "       # optional, defaults to "Bearer "
 //! ```
 
-use std::{fs::File, io::Read as _, path::Path};
+use std::{
+    fs::File,
+    io::Read as _,
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -55,21 +56,20 @@ use super::descriptor::RESERVED_HEADER_PREFIXES;
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Maximum byte length accepted for the configured file path.
+/// Max length for the token file path.
 const MAX_PATH_LEN: usize = 4096;
 
-/// Maximum byte length accepted for the configured header prefix.
+/// Max length for the header value prefix (e.g. `"Bearer "`).
 const MAX_PREFIX_LEN: usize = 64;
 
-/// Maximum raw token size accepted from the file.
+/// Max token size accepted from the file.
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
-/// One byte beyond [`MAX_TOKEN_BYTES`] so an oversized file is detected
-/// without reading it into memory in full.
+/// Read one byte past the limit so we can detect oversized files without
+/// loading them fully into memory.
 const MAX_TOKEN_READ_BYTES: u64 = MAX_TOKEN_BYTES as u64 + 1;
 
-/// Default header value prefix. Matches the `Authorization: Bearer <jwt>`
-/// convention used by Kubernetes bearer-token authenticators.
+/// Default prefix prepended to the token in the header value.
 const DEFAULT_PREFIX: &str = "Bearer ";
 
 // -----------------------------------------------------------------------------
@@ -80,48 +80,79 @@ const DEFAULT_PREFIX: &str = "Bearer ";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceAccountTokenConfig {
-    /// Path to the projected token file. Re-read on every request; must
-    /// exist, be readable, and be non-empty at construction time.
+    /// Path to the token file. Must exist and be non-empty at startup.
+    /// The file is watched for changes after startup.
     token_file: String,
 
-    /// Header receiving the assembled value. Defaults to `Authorization`.
-    /// Can't be a header Praxis already manages internally (`x-praxis-`,
-    /// `x-mcp-`), or one that controls the HTTP connection itself, like
-    /// `host`, `content-length`, or `proxy-authorization`.
+    /// Header to set on outgoing requests. Defaults to `Authorization`.
+    /// Cannot be an internal Praxis header or a connection-level header
+    /// (`host`, `content-length`, `proxy-authorization`, etc.).
     #[serde(default)]
     header: Option<String>,
 
-    /// Prefix placed before the token in the header value. Defaults to
-    /// `"Bearer "`. Set to `""` to inject the raw token value.
+    /// Text prepended to the token in the header value. Defaults to
+    /// `"Bearer "`. Use `""` to send the raw token with no prefix.
     #[serde(default)]
     prefix: Option<String>,
+}
+
+// -----------------------------------------------------------------------------
+// Internal types
+// -----------------------------------------------------------------------------
+
+/// The token value held in memory and swapped out on each rotation.
+///
+/// `None` means the last file read failed; requests are rejected with 503
+/// until a good token is available again.
+struct TokenSnapshot {
+    /// The fully assembled header value (`"{prefix}{token}"`), or `None` if
+    /// the last read failed. Zeroized on drop so the token doesn't linger.
+    header_value: Option<Zeroizing<String>>,
+}
+
+/// Messages sent to the background watcher thread.
+enum WatcherMessage {
+    /// A filesystem change was detected.
+    Event(notify::Event),
+    /// Shut down — sent when the filter is dropped.
+    Shutdown,
+}
+
+/// Keeps the background watcher thread alive for as long as the filter exists.
+struct TokenReloadHandle {
+    /// Sends the shutdown signal to the watcher thread.
+    shutdown: mpsc::Sender<WatcherMessage>,
+    /// The watcher thread; joined when this handle is dropped.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TokenReloadHandle {
+    fn drop(&mut self) {
+        drop(self.shutdown.send(WatcherMessage::Shutdown));
+        if let Some(thread) = self.thread.take() {
+            drop(thread.join());
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Filter
 // -----------------------------------------------------------------------------
 
-/// Reads a bearer token from a file fresh on every request and injects it
-/// into the configured header. See the module documentation for the
-/// complete rotation and security model.
+/// Attaches a Kubernetes pod identity token to every outgoing request.
+/// See the module documentation for the full behaviour description.
 pub struct ServiceAccountTokenFilter {
-    /// Path to the projected token file, re-read on every request.
-    token_file: std::path::PathBuf,
-    /// Header receiving the assembled value.
+    /// Header to set on each request.
     header_name: HeaderName,
-    /// Prefix placed before the token in the header value.
-    prefix: String,
+    /// Latest token, updated in the background when the file changes.
+    snapshot: Arc<ArcSwap<TokenSnapshot>>,
+    /// Keeps the watcher thread alive; dropped after the snapshot.
+    _reload_handle: TokenReloadHandle,
 }
 
 impl ServiceAccountTokenFilter {
-    /// Parse from YAML config.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if:
-    /// - `token_file` is empty, oversized, missing, unreadable, or empty
-    /// - `header` is set to a header Praxis manages internally, or one that controls the HTTP connection itself
-    /// - `prefix` is oversized
+    /// Build from YAML config. Fails if the token file can't be read, the
+    /// header or prefix are invalid, or the background watcher can't start.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ServiceAccountTokenConfig = parse_filter_config("service_account_token", value)?;
 
@@ -130,15 +161,26 @@ impl ServiceAccountTokenFilter {
         let prefix = cfg.prefix.unwrap_or_else(|| DEFAULT_PREFIX.to_owned());
         validate_prefix(&prefix)?;
 
-        let token_file = std::path::PathBuf::from(&cfg.token_file);
-        // Fail fast at construction: a pipeline that can never produce a
-        // token should not reach the request path.
-        read_token(&token_file)?;
+        let token_file = PathBuf::from(&cfg.token_file);
+
+        // Read the token now so a bad config fails at startup.
+        let initial_token = read_token(&token_file)?;
+        let initial_value = format!("{prefix}{}", initial_token.as_str());
+        // Check the assembled value is a valid HTTP header value before storing it.
+        HeaderValue::from_str(&initial_value).map_err(|e| -> FilterError {
+            format!("service_account_token: assembled header value is not valid HTTP: {e}").into()
+        })?;
+
+        let snapshot = Arc::new(ArcSwap::from_pointee(TokenSnapshot {
+            header_value: Some(Zeroizing::new(initial_value)),
+        }));
+
+        let reload_handle = spawn_token_watcher(token_file, prefix, Arc::clone(&snapshot))?;
 
         Ok(Box::new(Self {
-            token_file,
             header_name,
-            prefix,
+            snapshot,
+            _reload_handle: reload_handle,
         }))
     }
 }
@@ -150,26 +192,20 @@ impl HttpFilter for ServiceAccountTokenFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let token = match read_token(&self.token_file) {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(
-                    path = %self.token_file.display(),
-                    %error,
-                    "service_account_token: token unavailable; failing closed"
-                );
-                return Ok(FilterAction::Reject(Rejection::status(503)));
-            },
+        // Lock-free snapshot load: no file I/O, no syscall on the hot path.
+        let snapshot = self.snapshot.load_full();
+        let Some(ref assembled) = snapshot.header_value else {
+            tracing::warn!("service_account_token: token unavailable; failing closed");
+            return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let assembled = Zeroizing::new(format!("{}{}", self.prefix, token.as_str()));
-        let header_value = HeaderValue::from_str(assembled.as_str()).map_err(|e| -> FilterError {
-            format!("service_account_token: assembled header value is not valid HTTP: {e}").into()
-        })?;
+        // The snapshot only holds values that already passed HeaderValue::from_str
+        // in from_config and reload_token.
+        let header_value = HeaderValue::from_str(assembled.as_str())
+            .expect("snapshot contains a pre-validated header value");
 
-        // Strip any value already present on this header before setting
-        // ours, matching the fail-closed replacement behavior of
-        // `credential_inject`.
+        // Strip any caller-supplied value on this header before setting ours,
+        // so the caller can't smuggle their own token through to the upstream.
         ctx.request_headers_to_remove.push(self.header_name.clone());
         ctx.request_headers_to_set
             .push((self.header_name.clone(), header_value));
@@ -179,18 +215,171 @@ impl HttpFilter for ServiceAccountTokenFilter {
 }
 
 // -----------------------------------------------------------------------------
+// Watcher
+// -----------------------------------------------------------------------------
+
+/// Re-read the token file and publish a new snapshot, failing closed on any
+/// error. The token value is never included in diagnostics — only the file
+/// path and the error from the OS or HTTP layer appear in the warning.
+fn reload_token(path: &Path, prefix: &str, snapshot: &ArcSwap<TokenSnapshot>) {
+    let header_value = match read_token(path) {
+        Ok(token) => {
+            let assembled = format!("{prefix}{}", token.as_str());
+            match HeaderValue::from_str(&assembled) {
+                Ok(_) => Some(Zeroizing::new(assembled)),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "service_account_token: assembled header value is not valid HTTP; failing closed"
+                    );
+                    None
+                },
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "service_account_token: token unavailable; failing closed"
+            );
+            None
+        },
+    };
+    snapshot.store(Arc::new(TokenSnapshot { header_value }));
+}
+
+/// Apply one filesystem event from the notify watcher.
+fn process_watcher_event(event: &notify::Event, path: &Path, prefix: &str, snapshot: &ArcSwap<TokenSnapshot>) {
+    if event.need_rescan() || matches!(event.kind, EventKind::Other) {
+        reload_token(path, prefix, snapshot);
+        return;
+    }
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return;
+    }
+    let affected = event
+        .paths
+        .iter()
+        .any(|p| p == path || p.parent() == path.parent());
+    if affected {
+        reload_token(path, prefix, snapshot);
+    }
+}
+
+/// Start watching the token file and keep the in-memory snapshot up to date.
+///
+/// Starts a background thread that:
+/// 1. Watches the token file's directory for changes.
+/// 2. Re-reads the file immediately to catch any rotation that happened
+///    between construction and the watcher becoming active.
+/// 3. Signals that startup finished — this function blocks until that point.
+/// 4. Reloads the token whenever the file is created, changed, or deleted.
+///
+/// The thread stops cleanly when the returned [`TokenReloadHandle`] is dropped.
+fn spawn_token_watcher(
+    path: PathBuf,
+    prefix: String,
+    snapshot: Arc<ArcSwap<TokenSnapshot>>,
+) -> Result<TokenReloadHandle, FilterError> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (message_tx, message_rx) = mpsc::channel();
+    let callback_tx = message_tx.clone();
+
+    let thread = std::thread::Builder::new()
+        .name("service-account-token-watcher".to_owned())
+        .spawn(move || {
+            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
+                if let Ok(event) = event {
+                    drop(callback_tx.send(WatcherMessage::Event(event)));
+                }
+            }) {
+                Ok(w) => w,
+                Err(error) => {
+                    drop(ready_tx.send(Err(format!("failed to create token watcher: {error}"))));
+                    return;
+                },
+            };
+
+            let directory = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+            if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
+                drop(ready_tx.send(Err(format!(
+                    "failed to watch token directory {}: {error}",
+                    directory.display()
+                ))));
+                return;
+            }
+
+            // Start watching before re-reading so we can't miss a rotation that
+            // happens between the two. Any filesystem event that fires during
+            // the read stays queued and is handled after startup completes.
+            match read_token(&path) {
+                Ok(token) => {
+                    let assembled = format!("{prefix}{}", token.as_str());
+                    match HeaderValue::from_str(&assembled) {
+                        Ok(_) => {
+                            snapshot.store(Arc::new(TokenSnapshot {
+                                header_value: Some(Zeroizing::new(assembled)),
+                            }));
+                        },
+                        Err(error) => {
+                            drop(ready_tx.send(Err(format!(
+                                "assembled header value is not valid HTTP: {error}"
+                            ))));
+                            return;
+                        },
+                    }
+                },
+                Err(error) => {
+                    drop(ready_tx.send(Err(format!("failed authoritative token read: {error}"))));
+                    return;
+                },
+            }
+            drop(ready_tx.send(Ok(())));
+
+            while let Ok(message) = message_rx.recv() {
+                let WatcherMessage::Event(event) = message else {
+                    break;
+                };
+                process_watcher_event(&event, &path, &prefix, &snapshot);
+            }
+        })
+        .map_err(|error| format!("service_account_token: failed to spawn watcher: {error}"))?;
+
+    let ready = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(ready) => ready,
+        Err(error) => {
+            drop(message_tx.send(WatcherMessage::Shutdown));
+            drop(thread.join());
+            return Err(format!("service_account_token: watcher did not initialize: {error}").into());
+        },
+    };
+    if let Err(error) = ready {
+        drop(message_tx.send(WatcherMessage::Shutdown));
+        drop(thread.join());
+        return Err(format!("service_account_token: {error}").into());
+    }
+
+    Ok(TokenReloadHandle {
+        shutdown: message_tx,
+        thread: Some(thread),
+    })
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Determine the injection header, defaulting to `Authorization`.
+/// Pick the header to inject the token into, defaulting to `Authorization`.
 ///
-/// Headers Praxis already manages internally are rejected because Praxis
-/// would strip them out before the request ever leaves the proxy, so the
-/// token would never actually reach anywhere. Headers that control the
-/// HTTP connection itself are rejected too, since writing to them can
-/// break how the request gets routed or framed — and `proxy-authorization`
-/// specifically would hand the token to a middleman proxy instead of the
-/// real destination.
+/// Rejects headers that Praxis owns internally (they'd be stripped before
+/// leaving the proxy, so the token would never arrive) and headers that
+/// control the HTTP connection itself (writing to them corrupts routing or,
+/// in the case of `proxy-authorization`, hands the token to a middleman
+/// instead of the real destination).
 fn resolve_header_name(configured: Option<&str>) -> Result<HeaderName, FilterError> {
     let Some(header) = configured else {
         return Ok(AUTHORIZATION);
@@ -383,7 +572,7 @@ mod tests {
             .insert(AUTHORIZATION, HeaderValue::from_static("Bearer smuggled"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
-        let _unused = f.on_request(&mut ctx).await.unwrap();
+        drop(f.on_request(&mut ctx).await.unwrap());
         assert!(ctx.request_headers_to_remove.contains(&AUTHORIZATION));
         assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "Bearer sa-jwt-value");
     }
@@ -397,13 +586,42 @@ mod tests {
         let req = crate::test_utils::make_request(Method::POST, "/v1/checks");
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
-        let _unused = f.on_request(&mut ctx).await.unwrap();
+        drop(f.on_request(&mut ctx).await.unwrap());
         assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-service-token");
         assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "raw-token");
     }
 
+    // -------------------------------------------------------------------------
+    // Rotation / Watcher
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn authoritative_startup_reread_replaces_pre_watcher_snapshot() {
+        // Pre-populate the snapshot with token-b (simulates the value read at
+        // construction), write token-c to the file, then start the watcher.
+        // The authoritative re-read inside spawn_token_watcher must publish
+        // token-c before returning.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "token-b\n").unwrap();
+
+        let snapshot = Arc::new(ArcSwap::from_pointee(TokenSnapshot {
+            header_value: Some(Zeroizing::new("Bearer token-b".to_owned())),
+        }));
+
+        std::fs::write(&path, "token-c\n").unwrap();
+        let handle = spawn_token_watcher(path, DEFAULT_PREFIX.to_owned(), Arc::clone(&snapshot)).unwrap();
+
+        assert_eq!(
+            snapshot.load().header_value.as_deref().unwrap(),
+            "Bearer token-c",
+            "authoritative re-read must overwrite the pre-watcher snapshot"
+        );
+        drop(handle);
+    }
+
     #[tokio::test]
-    async fn rotation_is_observed_on_the_very_next_request() {
+    async fn rotation_is_observed_without_restarting_filter() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_token(&dir, "token-a");
         let f = parse(&format!("token_file: {}", path.display())).unwrap();
@@ -413,18 +631,26 @@ mod tests {
         drop(f.on_request(&mut first).await.unwrap());
         assert_eq!(first.request_headers_to_set[0].1, "Bearer token-a");
 
-        // Kubernetes rotates a projected token via an atomic rename, the
-        // same pattern used here.
+        // Kubernetes rotates a projected token via an atomic rename.
         let replacement = dir.path().join("token.next");
         std::fs::write(&replacement, "token-b\n").unwrap();
         std::fs::rename(replacement, &path).unwrap();
 
+        // Poll until the watcher publishes the new snapshot, or time out.
         let mut second = crate::test_utils::make_filter_context(&req);
-        drop(f.on_request(&mut second).await.unwrap());
-        assert_eq!(
-            second.request_headers_to_set[0].1, "Bearer token-b",
-            "the very next request must observe the rotated token without any watcher or reload"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                second.request_headers_to_set.clear();
+                drop(f.on_request(&mut second).await.unwrap());
+                if second.request_headers_to_set[0].1 == "Bearer token-b" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher did not publish the rotated token");
+        assert_eq!(second.request_headers_to_set[0].1, "Bearer token-b");
     }
 
     #[tokio::test]
@@ -435,10 +661,34 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let req = crate::test_utils::make_request(Method::POST, "/v1/checks");
+        // Poll until the watcher publishes the fail-closed None snapshot.
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        let action = f.on_request(&mut ctx).await.unwrap();
-        assert!(matches!(action, FilterAction::Reject(r) if r.status == 503));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                ctx.request_headers_to_set.clear();
+                let action = f.on_request(&mut ctx).await.unwrap();
+                if matches!(action, FilterAction::Reject(ref r) if r.status == 503) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher did not publish the fail-closed snapshot after file deletion");
         assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[test]
+    fn watcher_shutdown_wakes_without_receive_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_token(&dir, "tok");
+        let filter = parse(&format!("token_file: {}", path.display())).unwrap();
+        let started = std::time::Instant::now();
+        drop(filter);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "watcher teardown should be woken immediately, not wait on a timeout"
+        );
     }
 
     #[tokio::test]
@@ -449,7 +699,7 @@ mod tests {
         let req = crate::test_utils::make_request(Method::POST, "/v1/checks");
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
-        let _unused = f.on_request(&mut ctx).await.unwrap();
+        drop(f.on_request(&mut ctx).await.unwrap());
         for value in ctx.filter_metadata.values() {
             assert!(
                 !value.contains("super-secret-sa-token"),
@@ -459,10 +709,39 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Security: token not in logs on invalid reload
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn invalid_token_replacement_fails_closed_without_token_in_logs() {
+        // A rotated token containing a NUL byte is valid UTF-8 but not a
+        // valid HTTP header value. reload_token must set the snapshot to None
+        // (fail closed) and must NOT include the token value in the warning —
+        // only the path and the HTTP error appear (verified by inspection of
+        // the tracing::warn! call in reload_token, which logs path and error
+        // but not the assembled value).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        // A NUL byte is rejected by HeaderValue::from_str.
+        std::fs::write(&path, b"valid-prefix\x00invalid-suffix\n").unwrap();
+
+        let snapshot = Arc::new(ArcSwap::from_pointee(TokenSnapshot {
+            header_value: Some(Zeroizing::new("Bearer old-token".to_owned())),
+        }));
+
+        reload_token(&path, DEFAULT_PREFIX, &snapshot);
+
+        assert!(
+            snapshot.load().header_value.is_none(),
+            "snapshot must be None after a reload with an invalid HTTP header value"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
 
-    fn write_token(dir: &tempfile::TempDir, token: &str) -> std::path::PathBuf {
+    fn write_token(dir: &tempfile::TempDir, token: &str) -> PathBuf {
         let path = dir.path().join("token");
         std::fs::write(&path, format!("{token}\n")).unwrap();
         path
