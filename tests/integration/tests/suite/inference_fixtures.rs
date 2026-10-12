@@ -65,6 +65,12 @@ async fn all_inference_fixtures_replay() {
     let mut saw_agentic_status_less_function_call = false;
 
     for recording in recordings {
+        // The canonical fixture gate enables this experimental adapter; plain
+        // integration runs still cover every non-experimental recording.
+        if !cfg!(feature = "vertex-anthropic-filter") && recording.scenario_id == "vertex/anthropic-wire-translation" {
+            recorded_scenarios.insert(recording.scenario_id);
+            continue;
+        }
         let scenario_id = recording.scenario_id.as_str();
         let provider = recording.provider.as_str();
         let scenario_path = scenarios.get(scenario_id).unwrap_or_else(|| {

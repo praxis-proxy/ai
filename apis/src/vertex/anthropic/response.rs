@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     anthropic::{ErrorType, error_body},
-    openai::sse::SseFrame,
+    openai::sse::SseFrameParser,
 };
 
 /// Translate a Google error envelope into the Anthropic error shape.
@@ -84,35 +84,63 @@ fn patch_model_field(obj: &mut Map<String, Value>, user_model: &str) -> Option<(
     None
 }
 
-/// Rebuild SSE frames for the client, restoring the user-facing model
-/// inside `message_start` events only. Every other frame (deltas, tool
-/// use, `message_stop`) is re-emitted with its original data bytes;
-/// partial frames stay inside the caller's [`SseFrameParser`] across
-/// chunk boundaries, so at most one in-flight event is ever buffered.
-///
-/// [`SseFrameParser`]: crate::openai::sse::SseFrameParser
-pub(crate) fn rebuild_sse_frames(frames: &[SseFrame], user_model: Option<&str>) -> Vec<u8> {
+/// Restore message-start models while forwarding every other wire frame unchanged.
+pub(crate) fn rebuild_sse_frames(frames: &[Vec<u8>], user_model: Option<&str>, initial_frame: bool) -> Vec<u8> {
     let mut output = Vec::new();
-    for frame in frames {
-        if let Some(event) = &frame.event_type {
-            output.extend_from_slice(b"event: ");
-            output.extend_from_slice(event.as_bytes());
-            output.extend_from_slice(b"\n");
-        }
-
-        // Only message_start carries a model worth patching; a failed
-        // patch (malformed data) forwards the frame as received rather
-        // than corrupting the stream.
-        let patched = match (frame.event_type.as_deref(), user_model) {
-            (Some("message_start"), Some(user_model)) => restore_model(&frame.data, user_model),
-            _ => None,
-        };
-        let data = patched.as_deref().unwrap_or(&frame.data);
-
-        output.extend_from_slice(b"data: ");
-        output.extend_from_slice(data);
-        output.extend_from_slice(b"\n\n");
+    for (index, raw) in frames.iter().enumerate() {
+        let patched = user_model.and_then(|model| patch_wire_frame(raw, model, initial_frame && index == 0));
+        output.extend_from_slice(patched.as_deref().unwrap_or(raw));
     }
+    output
+}
+
+/// Preserve non-data fields while replacing a message-start JSON payload.
+fn patch_wire_frame(raw: &[u8], user_model: &str, initial_frame: bool) -> Option<Vec<u8>> {
+    let raw = if initial_frame {
+        raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+    } else {
+        raw
+    };
+    let mut parser = SseFrameParser::new(raw.len());
+    // BOM recognition belongs to the logical stream, not to each parser instance.
+    parser.parse_chunk(b"\n").ok()?;
+    let frames = parser.parse_chunk(raw).ok()?;
+    let frame = frames
+        .first()
+        .filter(|frame| frame.event_type.as_deref() == Some("message_start"))?;
+    let patched = restore_model(&frame.data, user_model)?;
+    Some(replace_wire_data(raw, &patched))
+}
+
+/// Keep the ordered non-data fields and emit exactly one replacement payload.
+fn replace_wire_data(raw: &[u8], patched: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut wrote_data = false;
+    for line in raw
+        .split(|byte| matches!(byte, b'\r' | b'\n'))
+        .filter(|line| !line.is_empty())
+    {
+        if line == b"data" || line.starts_with(b"data:") {
+            if wrote_data {
+                continue;
+            }
+            output.extend_from_slice(b"data: ");
+            output.extend_from_slice(patched);
+            wrote_data = true;
+        } else {
+            output.extend_from_slice(line);
+        }
+        output.push(b'\n');
+    }
+    output.push(b'\n');
+    output
+}
+
+/// Signal a failed logical stream in the client's Anthropic wire format.
+pub(super) fn sse_error(message: &str) -> Vec<u8> {
+    let mut output = b"event: error\ndata: ".to_vec();
+    output.extend_from_slice(&error_body(ErrorType::Api, message, None));
+    output.extend_from_slice(b"\n\n");
     output
 }
 
@@ -203,61 +231,48 @@ mod tests {
     }
 
     #[test]
-    fn sse_rebuild_patches_only_message_start() {
-        let frames = vec![
-            SseFrame {
-                event_type: Some("message_start".to_owned()),
-                data:
-                    br#"{"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929","role":"assistant"}}"#
-                        .to_vec(),
-            },
-            SseFrame {
-                event_type: Some("content_block_delta".to_owned()),
-                data: br#"{"type":"content_block_delta","delta":{"text":"hi"}}"#.to_vec(),
-            },
-        ];
-        let out = rebuild_sse_frames(&frames, Some("vertex/claude-sonnet-4-5"));
+    fn sse_rebuild_preserves_comments_ids_retry_and_multiline_data() {
+        let start =
+            b": start\nid: first\nretry: 1000\nevent: message_start\ndata: {\"message\":{\"model\":\"snapshot\"}}\n\n"
+                .to_vec();
+        let unchanged =
+            b": ping\r\nid: second\r\nretry: 2000\r\nevent: content_block_delta\r\ndata: first\r\ndata: second\r\n\r\n"
+                .to_vec();
+        let frames = vec![start, unchanged.clone()];
+        let out = rebuild_sse_frames(&frames, Some("vertex/model"), true);
         let text = String::from_utf8(out).unwrap();
-        let mut parts = text.split("\n\n");
-        let first = parts.next().unwrap();
+        assert!(text.contains("\"model\":\"vertex/model\""));
+        assert!(text.starts_with(": start\nid: first\nretry: 1000\n"));
         assert!(
-            first.starts_with("event: message_start\ndata: {"),
-            "frame shape preserved"
-        );
-        assert!(
-            first.contains("\"model\":\"vertex/claude-sonnet-4-5\""),
-            "message_start model restored: {first}"
-        );
-        assert!(!first.contains("20250929"), "snapshot id fully replaced: {first}");
-        let second = parts.next().unwrap();
-        assert_eq!(
-            second, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}",
-            "non-message_start frames are byte-identical"
+            text.as_bytes().ends_with(&unchanged),
+            "unmodified frames must preserve all wire bytes"
         );
     }
 
     #[test]
-    fn sse_rebuild_without_user_model_passes_frames_through() {
-        let frames = vec![SseFrame {
-            event_type: Some("message_start".to_owned()),
-            data: br#"{"type":"message_start"}"#.to_vec(),
-        }];
-        let out = rebuild_sse_frames(&frames, None);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
-        );
+    fn sse_rebuild_keeps_malformed_or_unmapped_message_start_unchanged() {
+        let frames = vec![b"event: message_start\ndata: {not json\n\n".to_vec()];
+        assert_eq!(rebuild_sse_frames(&frames, Some("vertex/x"), true), frames.concat());
+        assert_eq!(rebuild_sse_frames(&frames, None, true), frames.concat());
     }
 
     #[test]
-    fn sse_rebuild_tolerates_unparseable_message_start() {
-        // A malformed message_start data line must not corrupt the
-        // stream: it is forwarded as received.
-        let frames = vec![SseFrame {
-            event_type: Some("message_start".to_owned()),
-            data: b"{not json".to_vec(),
-        }];
-        let out = rebuild_sse_frames(&frames, Some("vertex/x"));
-        assert!(String::from_utf8(out).unwrap().contains("data: {not json"));
+    fn sse_rebuild_handles_bom_and_data_before_message_start_event() {
+        let raw = b"\xEF\xBB\xBFdata: {\"message\":{\"model\":\"snapshot\"}}\nid: first\nevent: message_start\n\n";
+        let output = rebuild_sse_frames(&[raw.to_vec()], Some("vertex/client-model"), true);
+        let frames = SseFrameParser::new(1024).parse_chunk(&output).unwrap();
+        assert_eq!(frames.len(), 1, "rewritten SSE must contain a single event");
+        let value: Value = serde_json::from_slice(&frames[0].data).unwrap();
+        assert_eq!(value["message"]["model"], "vertex/client-model");
+        assert!(!output.windows(8).any(|bytes| bytes == b"snapshot"));
+        assert!(output.windows(9).any(|bytes| bytes == b"id: first"));
+    }
+    #[test]
+    fn sse_rebuild_does_not_strip_a_bom_after_stream_start() {
+        let raw = b"\xEF\xBB\xBFdata: {\"message\":{\"model\":\"snapshot\"}}\nevent: message_start\n\n";
+        assert_eq!(
+            rebuild_sse_frames(&[raw.to_vec()], Some("vertex/client-model"), false),
+            raw
+        );
     }
 }

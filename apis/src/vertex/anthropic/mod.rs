@@ -41,6 +41,7 @@
 mod config;
 mod request;
 mod response;
+mod sse;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -58,7 +59,6 @@ use self::{
 use crate::{
     MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     anthropic::{ErrorType, error_rejection, invalid_request_rejection},
-    openai::sse::SseFrameParser,
 };
 
 /// Metadata key carrying the classified operation (`messages`,
@@ -98,6 +98,10 @@ const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 /// or the public id that `model_to_provider` recorded in the
 /// `model_to_provider.client_model` metadata when it mapped the request onto
 /// that target earlier in the chain.
+///
+/// Streaming preserves SSE comments, event IDs, and retry fields. Oversized or
+/// incomplete frames emit an Anthropic error event after complete events and
+/// suppress the remaining stream.
 ///
 /// Experimental: requires the `vertex-anthropic-filter` cargo feature,
 /// which is off by default and activates the `experimental` marker. This
@@ -298,7 +302,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         if transform == TRANSFORM_SSE {
             // Streaming stays Stream mode; only the (small) in-flight
             // frame is ever buffered, inside the per-request parser.
-            ctx.insert_filter_state(SseFrameParser::new(self.config.max_body_bytes));
+            ctx.insert_filter_state(sse::WireParser::new(self.config.max_body_bytes));
         } else {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(self.config.max_body_bytes),
@@ -429,38 +433,28 @@ fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
 /// `message_start` only, and re-emit. Partial frames stay in the
 /// per-request parser across chunk boundaries.
 fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
-    let Some(bytes) = body.as_ref() else {
-        if end_of_stream {
-            *body = Some(Bytes::new());
+    let Some(mut parser) = ctx.remove_filter_state::<sse::WireParser>() else {
+        return;
+    };
+    let initial_frame = parser.completed_frames == 0;
+    let output = if parser.failed {
+        Vec::new()
+    } else {
+        match parser.parse_chunk(body.as_deref().unwrap_or_default(), end_of_stream) {
+            Ok(frames) => response::rebuild_sse_frames(&frames, ctx.get_metadata(MODEL_KEY), initial_frame),
+            Err(error) => {
+                debug!(error = error.message, "vertex: SSE translation failed");
+                let mut output =
+                    response::rebuild_sse_frames(&error.frames, ctx.get_metadata(MODEL_KEY), initial_frame);
+                output.extend_from_slice(&response::sse_error(error.message));
+                output
+            },
         }
-        return;
     };
-
-    let Some(mut parser) = ctx.remove_filter_state::<SseFrameParser>() else {
-        return;
-    };
-
-    let frames = match parser.parse_chunk(bytes) {
-        Ok(frames) => frames,
-        Err(error) => {
-            // A malformed or oversized frame must not kill the stream or
-            // emit split duplicates; drop the chunk and let the stream
-            // finish (matches the azure translation filter's behavior).
-            debug!(%error, "vertex: SSE frame parse failed; dropping chunk to keep the stream alive");
-            ctx.insert_filter_state(parser);
-            *body = Some(Bytes::new());
-            return;
-        },
-    };
-
     if !end_of_stream {
         ctx.insert_filter_state(parser);
     }
-
-    *body = Some(Bytes::from(response::rebuild_sse_frames(
-        &frames,
-        ctx.get_metadata(MODEL_KEY),
-    )));
+    *body = Some(Bytes::from(output));
 }
 
 /// Translate a buffered Google error envelope to the Anthropic shape,
@@ -1099,6 +1093,35 @@ mod tests {
         assert!(
             !emitted2.contains("20250929"),
             "snapshot id replaced across the boundary: {emitted2}"
+        );
+    }
+    #[tokio::test]
+    async fn sse_failure_emits_anthropic_error_and_suppresses_later_success() {
+        let filter = filter("project: demo\nmax_body_bytes: 64");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.current_filter_id = Some(0);
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        ctx.response_header = Some(&mut response);
+        filter.on_response(&mut ctx).await.unwrap();
+        let valid = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let mut body = Some(Bytes::from(format!("{valid}data: {}\n\n", "x".repeat(128))));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        let output = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            output.starts_with(valid) && output.contains("event: error\ndata: "),
+            "completed events and SSE failures must both reach the client"
+        );
+        assert!(output.contains("api_error"));
+        let mut later = Some(Bytes::from_static(b"event: message_stop\ndata: {}\n\n"));
+        filter.on_response_body(&mut ctx, &mut later, true).unwrap();
+        assert!(
+            later.unwrap().is_empty(),
+            "a failed stream must not end with a success event"
         );
     }
 }

@@ -1219,6 +1219,7 @@ mod tests {
                 "responses_client_tool_compat",
                 "openai_chat_completions_to_azureai_chat_completions",
                 "openai_chat_completions_to_vertexai_gemini",
+                "anthropic_messages_to_vertexai_anthropic",
             ]
         );
         assert_eq!(
@@ -1299,6 +1300,8 @@ mod tests {
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["messages_to_chat_completions"],
+                vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["anthropic_messages_to_vertexai_anthropic"],
             ]
         );
         assert_eq!(
@@ -1379,11 +1382,13 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 71, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 60, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 65, "manifest recording inventory count");
+        assert_eq!(report.features_total, 73, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 61, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 66, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1445,11 +1450,12 @@ mod tests {
                 "responses/native-continuation-stream",
                 "responses/native-tool-call",
                 "responses/responses-to-chat-completions-reasoning-agentic",
+                "vertex/anthropic-wire-translation",
                 "vertex/bounded-stream-limits",
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 71, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 73, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1787,6 +1793,14 @@ mod tests {
                     &"messages.error.malformed_success_status".to_owned(),
                     &vec!["messages/malformed-success".to_owned()]
                 ),
+                (
+                    &"vertex.anthropic.error.google_envelope".to_owned(),
+                    &vec!["vertex/anthropic-wire-translation".to_owned()]
+                ),
+                (
+                    &"vertex.anthropic.streaming.wire_fields".to_owned(),
+                    &vec!["vertex/anthropic-wire-translation".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -1949,7 +1963,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[57..71] {
+        for feature in &manifest.features[57..73] {
             assert_eq!(
                 feature
                     .providers

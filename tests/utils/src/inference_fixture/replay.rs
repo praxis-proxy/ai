@@ -420,6 +420,8 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_agentic_loop"
             | "anthropic_messages_request"
             | "anthropic_messages_protocol"
+            | "anthropic_messages_to_vertexai_anthropic"
+            | "credential_injection"
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"
             | "iterative_request_router"

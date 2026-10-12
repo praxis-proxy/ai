@@ -1,0 +1,222 @@
+{
+  "version": 1,
+  "scenario_id": "vertex/anthropic-wire-translation",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "vertex/claude-sonnet-4-5",
+    "source_id": "controlled-vertex-wire-translation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "quota-error",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "vertex/claude-sonnet-4-5",
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "type": "error",
+              "error": {
+                "type": "rate_limit_error",
+                "message": "Quota exceeded [RESOURCE_EXHAUSTED]"
+              },
+              "request_id": null
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ],
+              "anthropic_version": "vertex-2023-10-16"
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": 429,
+                "message": "Quota exceeded",
+                "status": "RESOURCE_EXHAUSTED"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "stream-fields",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "vertex/claude-sonnet-4-5",
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ],
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"model\":\"vertex/claude-sonnet-4-5\"},\"type\":\"message_start\"}",
+                "id": "start-one",
+                "retry": 1000
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\n\"type\":\"content_block_delta\",\n\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\n}",
+                "id": "delta-one",
+                "retry": 2000
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ],
+              "stream": true,
+              "anthropic_version": "vertex-2023-10-16"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\"}}",
+                "id": "start-one",
+                "retry": 1000
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\n\"type\":\"content_block_delta\",\n\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\n}",
+                "id": "delta-one",
+                "retry": 2000
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      }
+    }
+  ]
+}

@@ -205,9 +205,9 @@ test-integration:
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --features store-all,vertex-anthropic-filter $(_NOCAPTURE)
 	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
 
 # Both filters are needed. libtest matches each as a substring, and
 # `store::tests::pg_` is not a substring of
