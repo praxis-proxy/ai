@@ -440,7 +440,7 @@ fn adc_without_env_selects_metadata() {
     let source = resolve_token_source(&config, None).expect("adc without env should select metadata");
     assert!(
         matches!(&source, TokenSource::Metadata { service_account } if service_account == "default"),
-        "adc without env should select metadata default, got {source:?}"
+        "adc without env should select metadata default"
     );
 }
 
@@ -455,7 +455,7 @@ fn adc_with_service_account_json_selects_key_file() {
             TokenSource::ServiceAccountKey(key)
                 if key.client_email == TEST_SA_EMAIL && key.token_url == GOOGLE_TOKEN_URL
         ),
-        "identity and token endpoint must come from the file, got {source:?}"
+        "identity and token endpoint must come from the file"
     );
 }
 
@@ -468,7 +468,7 @@ fn key_file_accepts_pkcs1_private_key() {
     let source = resolve_key_file(&file).expect("a PKCS#1 RSA key must load");
     assert!(
         matches!(source, TokenSource::ServiceAccountKey(_)),
-        "a PKCS#1 key file must select the key source, got {source:?}"
+        "a PKCS#1 key file must select the key source"
     );
 }
 
@@ -586,7 +586,7 @@ fn key_file_accepts_loopback_token_uri_as_test_fixture() {
     let source = service_account_key_source("http://127.0.0.1:9/token");
     assert!(
         matches!(&source, TokenSource::ServiceAccountKey(key) if key.token_url == "http://127.0.0.1:9/token"),
-        "unit-test builds must admit the loopback mock endpoint, got {source:?}"
+        "unit-test builds must admit the loopback mock endpoint"
     );
 }
 
@@ -599,7 +599,7 @@ fn key_file_accepts_normalized_google_token_uri() {
         let source = service_account_key_source(token_uri);
         assert!(
             matches!(&source, TokenSource::ServiceAccountKey(key) if key.token_url == GOOGLE_TOKEN_URL),
-            "{token_uri} is Google's endpoint and must normalize to it, got {source:?}"
+            "{token_uri} is Google's endpoint and must normalize to it"
         );
     }
 }
@@ -663,7 +663,7 @@ fn explicit_metadata_ignores_credentials_path() {
     let source = resolve_token_source(&config, Some(file.path())).expect("metadata must ignore ADC file");
     assert!(
         matches!(source, TokenSource::Metadata { .. }),
-        "explicit metadata must not read GOOGLE_APPLICATION_CREDENTIALS, got {source:?}"
+        "explicit metadata must not read GOOGLE_APPLICATION_CREDENTIALS"
     );
 }
 
