@@ -108,7 +108,10 @@ pub(crate) fn start_isolated_proxy(
 ) -> (ProxyGuard, Option<String>) {
     let proxy_port = free_port();
     let config = build_config(proxy_port);
-    let admin_address = config.admin.address.clone();
+    // praxis 0.7.4 serves `/metrics` (and `/healthy`, `/ready`) on the
+    // health/metrics listener bound to `admin.metrics_address`, not the `/api`
+    // admin address; return that so callers can scrape it.
+    let admin_address = config.admin.metrics_address.clone();
     let proxy = start_proxy(&config);
 
     if let Some(namespace) = netns {

@@ -1162,15 +1162,16 @@ fn native_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
 
 /// Build the transformed-vLLM config (Anthropic Messages -> Chat Completions).
 ///
-/// Enables a loopback admin listener so the per-feature degradation counter the
-/// filter increments while translating each request can be scraped from
-/// `/metrics` after the live run (see [`assert_degradation_signaled`]). The
-/// listener binds `127.0.0.1` rather than the proxy's isolation veth, so only the
-/// host-side test can reach it — never the namespaced client — and no public-admin
-/// opt-in is needed.
+/// Enables a loopback health/metrics listener so the per-feature degradation
+/// counter the filter increments while translating each request can be scraped
+/// from `/metrics` after the live run (see [`assert_degradation_signaled`]).
+/// praxis 0.7.4 serves `/metrics` on `admin.metrics_address`, not the `/api`
+/// admin address. The listener binds `127.0.0.1` rather than the proxy's
+/// isolation veth, so only the host-side test can reach it — never the
+/// namespaced client — and no public-admin opt-in is needed.
 fn transformed_vllm_config(live: &LiveConfig, proxy_port: u16) -> Config {
     let mut config = live_vllm_config(CONFIG_TRANSFORMED, live, proxy_port);
-    config.admin.address = Some(format!("127.0.0.1:{}", free_port()));
+    config.admin.metrics_address = Some(format!("127.0.0.1:{}", free_port()));
     config
 }
 
