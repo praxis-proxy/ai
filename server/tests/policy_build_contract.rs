@@ -11,10 +11,7 @@
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "integration test")]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
-
     use praxis_core::config::Config;
-    use praxis_filter::{FilterFactory, FilterRegistry, registered_policy_subrequest_connector};
 
     const CONFIG: &str = r#"
 listeners:
@@ -23,8 +20,7 @@ listeners:
     filter_chains: [main]
 filter_chains:
   - name: main
-    filters:
-      - filter: policy_registration_probe
+    filters: []
 "#;
 
     /// The proxy's shared client, built on the crypto provider the binary
@@ -34,39 +30,26 @@ filter_chains:
         praxis_ai::create_subrequest_client(config)
     }
 
+    /// Praxis 0.7.4 moved the policy sub-request connector off a process-global
+    /// onto the registry (`FilterRegistry::set_policy_connector`). This asserts
+    /// `build_full_registry` hands the registry's `policy` filters the proxy's
+    /// shared connector, so their outbound calls (JWKS fetches, token exchanges)
+    /// reuse one keepalive pool, admission limit, and circuit breaker instead of
+    /// each opening a pool of its own.
     #[test]
-    fn resolving_pipelines_registers_policy_connector_before_filter_construction() {
+    fn build_full_registry_hands_policy_filters_the_shared_connector() {
         let config = Config::from_yaml(CONFIG).expect("the test config must parse");
         let client = client(&config);
         let expected_connector = client.connector().clone();
-        let mut registry = FilterRegistry::with_builtins();
-        registry
-            .register(
-                "policy_registration_probe",
-                FilterFactory::Http(Arc::new(move |_| {
-                    let registered = registered_policy_subrequest_connector()
-                        .expect("pipeline construction must have a policy connector registered");
-                    assert!(
-                        std::ptr::eq(registered.connector(), expected_connector.connector()),
-                        "policy filters must receive the proxy's shared connector"
-                    );
-                    Err("registration probe completed".into())
-                })),
-            )
-            .expect("the probe filter name must be unique");
 
-        let result = praxis_ai::resolve_pipelines(
-            &config,
-            &registry,
-            &Arc::new(HashMap::new()),
-            &praxis_core::kv::KvStoreRegistry::new(),
-            &client,
-        );
+        let registry = praxis_ai::build_full_registry(&client);
 
-        let error = result.err().expect("the probe factory must stop pipeline construction");
+        let registered = registry
+            .policy_connector()
+            .expect("build_full_registry must hand policy filters the shared connector");
         assert!(
-            error.to_string().contains("registration probe completed"),
-            "the probe factory must be reached: {error}"
+            std::ptr::eq(registered.connector(), expected_connector.connector()),
+            "policy filters must receive the proxy's shared connector"
         );
     }
 }

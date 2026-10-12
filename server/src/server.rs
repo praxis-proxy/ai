@@ -301,7 +301,7 @@ fn register_admin_endpoints(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+        praxis_protocol::http::pingora::health::add_admin_api_to_pingora_server(
             server.server_mut(),
             admin_addr,
             praxis_protocol::http::pingora::health::AdminEndpointOptions {
