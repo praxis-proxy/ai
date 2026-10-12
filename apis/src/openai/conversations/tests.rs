@@ -1547,7 +1547,7 @@ async fn conversations_upgrade_cannot_bypass_the_classifier_dependency() {
 
     let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let classifier = AiOperationFilter::from_config(&config).unwrap();
-    drop(classifier.on_request(&mut ctx).await.unwrap());
+    drop(classifier.on_request_head(&mut ctx).await.unwrap());
     assert!(
         ctx.extensions.get::<AiOperationMatch>().is_none(),
         "the HTTP-only Conversations route must remain unclassified on a WebSocket handshake"

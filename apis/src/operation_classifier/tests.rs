@@ -5,7 +5,8 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
-use praxis_filter::{BodyAccess, BodyMode, ErrorResponseFormatterHandle, Request};
+use bytes::Bytes;
+use praxis_filter::{ErrorResponseFormatterHandle, Request};
 
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
@@ -32,7 +33,7 @@ async fn assert_family(method: &str, path: &str, protocol: &'static str, operati
     let request = req(method, path);
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied();
     assert!(matched.is_some(), "{method} {path} should classify");
@@ -54,20 +55,11 @@ fn websocket_headers() -> http::HeaderMap {
 }
 
 #[test]
-fn observes_the_body_phase_without_buffering() {
+fn opts_into_the_request_head_phase() {
     let filter = default_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadOnly,
-        "the body hook observes the phase so it can publish before a buffered pre-read"
-    );
     assert!(
-        matches!(filter.request_body_mode(), BodyMode::Stream),
-        "read-only observation must never upgrade the pipeline to buffering"
-    );
-    assert!(
-        filter.needs_request_context(),
-        "the body hook classifies from the request head, which must survive into the body phase"
+        filter.runs_request_head(),
+        "classification publishes from the request-head phase, ahead of any buffered body pre-read"
     );
 }
 
@@ -76,7 +68,7 @@ async fn classifies_a_conversations_operation() {
     let filter = default_filter();
     let request = req("GET", "/v1/conversations/conv_123");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(
@@ -186,7 +178,7 @@ async fn classifies_chat_completions_operations_from_the_request_head() {
         let filter = default_filter();
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         let matched = ctx.extensions.get::<AiOperationMatch>().copied();
         assert!(matched.is_some(), "{method} {path} must classify");
@@ -207,7 +199,7 @@ async fn websocket_handshake_on_chat_completions_does_not_match() {
     let mut request = req("GET", "/v1/chat/completions");
     request.headers = websocket_headers();
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
     assert!(
         ctx.extensions.get::<AiOperationMatch>().is_none(),
         "Chat Completions is HTTP-only, so a websocket handshake must not classify"
@@ -221,7 +213,7 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
     request.headers = websocket_headers();
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert!(
         ctx.extensions.get::<AiOperationMatch>().is_none(),
@@ -269,7 +261,7 @@ async fn unsupported_family_methods_publish_no_match() {
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
 
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         assert!(
             ctx.extensions.get::<AiOperationMatch>().is_none(),
@@ -297,7 +289,7 @@ async fn an_openai_operation_installs_the_error_formatter() {
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
 
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         assert!(
             ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
@@ -314,7 +306,7 @@ async fn an_unmatched_request_installs_no_error_formatter() {
     let request = req("POST", "/v1/unknown");
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert!(
         ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
@@ -327,7 +319,7 @@ async fn classifies_a_responses_operation() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(
@@ -342,7 +334,7 @@ async fn publishes_proxy_owned_routing_headers() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let set: Vec<(String, String)> = ctx
         .request_headers_to_set
@@ -369,7 +361,7 @@ async fn client_supplied_headers_cannot_spoof_a_matched_operation() {
         .insert("x-praxis-ai-operation", "createFile".parse().unwrap());
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     // set (overwrite) semantics, so the forged values cannot survive alongside.
     let protocol = ctx
@@ -389,7 +381,7 @@ async fn client_supplied_headers_are_stripped_when_nothing_matches() {
         .insert("x-praxis-ai-application-protocol", "openai_responses".parse().unwrap());
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert!(ctx.extensions.get::<AiOperationMatch>().is_none());
     let removed: Vec<&str> = ctx
@@ -409,7 +401,7 @@ async fn websocket_handshake_selects_the_websocket_operation() {
     request.headers = websocket_headers();
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.transport, Transport::WebSocket);
@@ -421,7 +413,7 @@ async fn plain_get_on_the_responses_collection_does_not_match() {
     let filter = default_filter();
     let request = req("GET", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
     assert!(
         ctx.extensions.get::<AiOperationMatch>().is_none(),
         "a GET without upgrade headers is not the websocket operation"
@@ -433,7 +425,7 @@ async fn static_endpoints_are_not_consumed_as_identifiers() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses/input_tokens");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.operation_id, "Getinputtokencounts");
@@ -450,7 +442,7 @@ async fn unsupported_methods_publish_no_operation() {
         let filter = default_filter();
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
         assert!(
             ctx.extensions.get::<AiOperationMatch>().is_none(),
             "{method} {path} must not classify"
@@ -463,7 +455,7 @@ async fn configured_header_names_are_honored() {
     let filter = filter("\nheaders:\n  application_protocol: x-protocol\n  operation: x-operation\n");
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let names: Vec<&str> = ctx
         .request_headers_to_set
@@ -479,7 +471,7 @@ async fn headers_can_be_disabled_while_metadata_still_publishes() {
     let filter = filter("\nheaders:\n  application_protocol: ~\n  operation: ~\n");
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert!(ctx.request_headers_to_set.is_empty());
     assert_eq!(
@@ -606,7 +598,7 @@ async fn publishes_filter_results_for_branch_conditions() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let results = ctx
         .filter_results
@@ -623,7 +615,7 @@ async fn upgrade_headers_on_a_non_get_request_still_classify() {
     request.headers = websocket_headers();
     let mut ctx = make_filter_context(&request);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx
         .extensions
@@ -676,7 +668,7 @@ async fn classifies_an_anthropic_messages_operation() {
     let filter = default_filter();
     let request = req("POST", "/v1/messages");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(
@@ -697,7 +689,7 @@ async fn assert_classifies(cases: &[ExpectedOperation]) {
         let filter = default_filter();
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         let matched = ctx
             .extensions
@@ -758,7 +750,7 @@ async fn anthropic_operations_install_the_anthropic_error_formatter() {
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
 
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         assert!(
             ctx.extensions.get::<AiOperationMatch>().is_some(),
@@ -777,7 +769,7 @@ async fn an_anthropic_failure_body_uses_the_anthropic_envelope() {
     let filter = default_filter();
     let request = req("GET", "/v1/messages/batches/msgbatch_1");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let handle = ctx
         .extensions
@@ -805,7 +797,7 @@ async fn an_anthropic_batch_path_captures_its_identifier() {
     let filter = default_filter();
     let request = req("GET", "/v1/messages/batches/msgbatch_abc123/results");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
     assert_eq!(matched.operation_id, "message_batches_results");
@@ -821,7 +813,7 @@ async fn publishes_anthropic_metadata_and_filter_results() {
     let filter = default_filter();
     let request = req("POST", "/v1/messages");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert_eq!(
         ctx.filter_metadata
@@ -854,7 +846,7 @@ async fn unregistered_anthropic_surfaces_publish_no_match() {
         let filter = default_filter();
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         assert!(
             ctx.extensions.get::<AiOperationMatch>().is_none(),
@@ -874,7 +866,7 @@ async fn anthropic_paths_shared_with_openai_classify_as_openai() {
     let filter = default_filter();
     let request = req("POST", "/v1/files");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx
         .extensions
@@ -887,9 +879,10 @@ async fn anthropic_paths_shared_with_openai_classify_as_openai() {
 /// The request head alone decides the operation.
 ///
 /// A Chat Completions-shaped, malformed, empty, or absent body must not change
-/// which operation `POST /v1/messages` resolves to. The body is placed in the
-/// context so the assertion is about the classifier ignoring an available
-/// payload, not merely about one being unavailable.
+/// which operation `POST /v1/messages` resolves to. A payload is staged in the
+/// context before the head hook runs so the assertion is that classification
+/// ignores an available body, not merely that none is present — the head phase
+/// normally runs before any body is buffered.
 #[tokio::test]
 async fn a_request_body_never_changes_the_classified_operation() {
     let bodies = [
@@ -909,7 +902,7 @@ async fn a_request_body_never_changes_the_classified_operation() {
         let mut ctx = make_filter_context(&request);
         ctx.buffered_request_body = body.clone();
 
-        drop(filter.on_request(&mut ctx).await.unwrap());
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
 
         let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
         assert_eq!(
@@ -924,90 +917,26 @@ async fn a_request_body_never_changes_the_classified_operation() {
     }
 }
 
-/// The body hook publishes the match for a downstream buffered pre-read.
+/// Re-running the head hook publishes the match once per invocation.
 ///
-/// Core runs a `StreamBuffer` consumer's body pre-read before the header phase,
-/// so when this filter is ordered ahead of that consumer its body hook is where
-/// the match first appears. The hook inspects only the head: the chunk passes
-/// through untouched and is never buffered.
+/// The request-head phase runs exactly once per request, so there is no
+/// completion marker. This drives the hook twice to prove a single pass
+/// publishes exactly one routing-header pair — the per-call cost the retired
+/// body-phase marker used to amortize is gone, not hidden.
 #[tokio::test]
-async fn the_body_hook_publishes_the_match_for_a_pre_read() {
-    let filter = default_filter();
-    let request = req("POST", "/v1/responses");
-    let mut ctx = make_filter_context(&request);
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-5","input":"hi"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(
-        body.as_deref(),
-        Some(&br#"{"model":"gpt-5","input":"hi"}"#[..]),
-        "the body hook must pass the chunk through untouched"
-    );
-    let matched = ctx.extensions.get::<AiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.application_protocol.as_str(), "openai_responses");
-    assert_eq!(matched.operation_id, "createResponse");
-}
-
-/// Classification runs once however the pipeline schedules the hooks.
-///
-/// The body pre-read, every streamed chunk, and the header phase resolve to a
-/// single classify-and-publish pass. Proven through the set-header side effect:
-/// each pass appends the configured routing headers, so one pass leaves exactly
-/// one pair no matter how many times the hooks run.
-#[tokio::test]
-async fn classification_runs_once_across_both_hooks_and_every_chunk() {
+async fn one_head_pass_publishes_one_routing_header_pair() {
     let filter = filter(
         "headers:\n  application_protocol: x-praxis-ai-application-protocol\n  operation: x-praxis-ai-operation\n",
     );
     let request = req("POST", "/v1/responses");
     let mut ctx = make_filter_context(&request);
 
-    let mut first = Some(Bytes::from_static(br#"{"model":"gpt-5","#));
-    drop(filter.on_request_body(&mut ctx, &mut first, false).await.unwrap());
-    let mut last = Some(Bytes::from_static(br#""input":"hi"}"#));
-    drop(filter.on_request_body(&mut ctx, &mut last, true).await.unwrap());
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
-    assert!(
-        ctx.extensions.get::<OperationClassified>().is_some(),
-        "the completion marker records the single pass"
-    );
     assert_eq!(
         ctx.request_headers_to_set.len(),
         2,
-        "the match must be published once, not once per hook or chunk"
-    );
-}
-
-/// An unmatched request classifies once too, rather than on every chunk.
-///
-/// The completion marker is set even when nothing matched, so the header strip
-/// an unmatched request performs runs a single time across the pre-read, the
-/// chunks, and the header phase.
-#[tokio::test]
-async fn an_unmatched_request_classifies_once() {
-    let filter = filter(
-        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n  operation: x-praxis-ai-operation\n",
-    );
-    let request = req("GET", "/healthz");
-    let mut ctx = make_filter_context(&request);
-
-    let mut chunk = Some(Bytes::from_static(b"anything"));
-    drop(filter.on_request_body(&mut ctx, &mut chunk, false).await.unwrap());
-    drop(filter.on_request_body(&mut ctx, &mut chunk, true).await.unwrap());
-    drop(filter.on_request(&mut ctx).await.unwrap());
-
-    assert!(
-        ctx.extensions.get::<OperationClassified>().is_some(),
-        "a no-match request is still classified exactly once"
-    );
-    assert!(ctx.extensions.get::<AiOperationMatch>().is_none());
-    assert_eq!(
-        ctx.request_headers_to_remove.len(),
-        2,
-        "the strip must happen once, not once per hook or chunk"
+        "one head pass publishes exactly the protocol and operation routing headers"
     );
 }
 
@@ -1018,7 +947,7 @@ async fn an_anthropic_match_sets_the_configured_routing_headers() {
     );
     let request = req("POST", "/v1/messages");
     let mut ctx = make_filter_context(&request);
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     let set = ctx
         .request_headers_to_set
