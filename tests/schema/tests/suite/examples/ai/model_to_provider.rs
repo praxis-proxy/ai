@@ -8,10 +8,11 @@ use praxis_test_utils::{free_port, http_post, start_capturing_backend, start_pro
 
 #[test]
 fn model_to_provider_routes_and_rewrites_stable_model_id() {
-    let provider = start_capturing_backend(r#"{"ok":true}"#);
+    let provider = start_capturing_backend(r#"{"backend":"provider"}"#);
+    let fallback = start_capturing_backend(r#"{"backend":"fallback"}"#);
     let proxy_port = free_port();
 
-    let yaml = make_yaml(proxy_port, provider.port());
+    let yaml = make_yaml(proxy_port, provider.port(), fallback.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -21,18 +22,25 @@ fn model_to_provider_routes_and_rewrites_stable_model_id() {
         r#"{"model":"claude-sonnet-4-5","messages":[]}"#,
     );
     assert_eq!(status, 200, "mapped model should route to its provider");
-    assert_eq!(response, r#"{"ok":true}"#);
+    assert_eq!(
+        response, r#"{"backend":"provider"}"#,
+        "the selector must choose the provider backend"
+    );
 
     let forwarded: serde_yaml::Value = serde_yaml::from_str(&provider.body()).unwrap();
-    assert_eq!(forwarded["model"], "vertex/claude-sonnet-4-5");
+    assert_eq!(
+        forwarded["model"], "vertex/claude-sonnet-4-5",
+        "the provider must receive its target model"
+    );
 }
 
 #[test]
 fn model_to_provider_leaves_unmapped_model_body_unchanged() {
-    let provider = start_capturing_backend(r#"{"ok":true}"#);
+    let provider = start_capturing_backend(r#"{"backend":"provider"}"#);
+    let fallback = start_capturing_backend(r#"{"backend":"fallback"}"#);
     let proxy_port = free_port();
 
-    let yaml = make_yaml(proxy_port, provider.port());
+    let yaml = make_yaml(proxy_port, provider.port(), fallback.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -42,13 +50,21 @@ fn model_to_provider_leaves_unmapped_model_body_unchanged() {
         r#"{"model":"unknown-model","messages":[]}"#,
     );
     assert_eq!(status, 200, "unmapped models continue to the configured default route");
-    assert_eq!(response, r#"{"ok":true}"#);
-    let forwarded: serde_yaml::Value = serde_yaml::from_str(&provider.body()).unwrap();
-    assert_eq!(forwarded["model"], "unknown-model");
+    assert_eq!(
+        response, r#"{"backend":"fallback"}"#,
+        "an unmapped request must select the fallback backend"
+    );
+    let forwarded: serde_yaml::Value = serde_yaml::from_str(&fallback.body()).unwrap();
+    assert_eq!(
+        forwarded["model"], "unknown-model",
+        "the fallback must receive the unchanged client model"
+    );
 }
 
-fn make_yaml(proxy_port: u16, provider_port: u16) -> String {
+/// Bind both example clusters to their owned test backends.
+fn make_yaml(proxy_port: u16, provider_port: u16, fallback_port: u16) -> String {
     include_str!("../../../../../../examples/configs/model-to-provider.yaml")
         .replace("127.0.0.1:8080", &format!("127.0.0.1:{proxy_port}"))
         .replace("127.0.0.1:9001", &format!("127.0.0.1:{provider_port}"))
+        .replace("127.0.0.1:9002", &format!("127.0.0.1:{fallback_port}"))
 }
