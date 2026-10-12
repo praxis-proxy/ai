@@ -118,6 +118,7 @@ An `InferenceScenario` declares:
 - a stable slash-separated `id`;
 - the client `protocol` and repository `example_config`;
 - the `upstream_authority` replaced by the local runner;
+- optional `replay_upstream_aliases`, exact example endpoints also bound to that same owned backend;
 - one or more coverage-manifest `features`; and
 - ordered turns containing a client request and expected client/upstream
   response properties.

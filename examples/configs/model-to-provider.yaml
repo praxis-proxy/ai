@@ -2,6 +2,7 @@
 # The router consumes the reserved x-praxis-ai-provider header; the provider
 # receives the rewritten body model. Responses are not rewritten back, so the
 # client sees the provider's model ID (vertex/claude-sonnet-4-5).
+# Unmapped models use a separate fallback backend without a body rewrite.
 listeners:
   - name: model-to-provider
     address: "127.0.0.1:8080"
@@ -26,12 +27,15 @@ filter_chains:
               x-praxis-ai-provider: vertex
             cluster: vertex
           - path_prefix: "/"
-            cluster: vertex
+            cluster: fallback
       - filter: load_balancer
         clusters:
           - name: vertex
             endpoints:
               - "127.0.0.1:9001"
+          - name: fallback
+            endpoints:
+              - "127.0.0.1:9002"
 
 insecure_options:
   allow_private_endpoints: true

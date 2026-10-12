@@ -4,6 +4,8 @@ description: Stable client model ID is routed to its provider with a provider-sp
 protocol: anthropic_messages
 example_config: model-to-provider.yaml
 upstream_authority: 127.0.0.1:9001
+replay_upstream_aliases:
+  - 127.0.0.1:9002
 features:
   - messages.model_provider.request_target
 turns:

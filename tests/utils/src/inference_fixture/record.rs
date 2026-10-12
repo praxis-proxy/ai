@@ -3901,6 +3901,7 @@ mod tests {
             protocol: InferenceProtocol::AnthropicMessages,
             example_config: "anthropic/messages-to-openai.yaml".to_owned(),
             upstream_authority: "127.0.0.1:8000".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["messages.request.minimal".to_owned()],
             turns: vec![live_turn("first", "first prompt"), live_turn("second", "second prompt")],
         }
@@ -3946,6 +3947,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/responses-to-chat-completions.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.chat.continuation".to_owned()],
             turns: vec![
                 live_responses_turn("initial", "first prompt", None),

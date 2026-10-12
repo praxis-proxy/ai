@@ -3,10 +3,12 @@
 
 //! Tests for `model_to_provider` route selection across two backends.
 
+use std::collections::HashMap;
+
 use praxis_core::config::Config;
 use praxis_test_utils::{
     CapturedRequest, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send, json_post,
-    json_post_with_header, parse_body, parse_status, start_proxy,
+    json_post_with_header, load_example_config, parse_body, parse_status, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -44,6 +46,36 @@ fn model_to_provider_routes_mapped_model_to_provider_backend() {
     assert!(
         fallback.requests().is_empty(),
         "the fallback backend must not see a mapped model"
+    );
+}
+
+#[test]
+fn model_to_provider_routes_count_tokens_to_provider_backend() {
+    let vertex = capturing_backend("vertex-response");
+    let fallback = capturing_backend("fallback-response");
+    let proxy = start_proxy(&config(vertex.port(), fallback.port()));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/messages/count_tokens",
+            r#"{"model":"claude-sonnet-4-5","messages":[]}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "the second configured mapping path must be proxied"
+    );
+    let forwarded = only_request(&vertex);
+    let body: serde_json::Value =
+        serde_json::from_str(&forwarded.body).expect("forwarded count-token body must be JSON");
+    assert_eq!(
+        body["model"], "vertex/claude-sonnet-4-5",
+        "count-token requests must use the provider model"
+    );
+    assert!(
+        fallback.requests().is_empty(),
+        "the fallback must not receive the second mapped path"
     );
 }
 
@@ -143,44 +175,11 @@ fn only_request(backend: &StatefulCapturingGuard) -> CapturedRequest {
     requests.remove(0)
 }
 
-/// Build a two-cluster config: the router sends the `vertex` provider
-/// selector to one backend and everything else to a fallback.
+/// Load the actual example, assigning each cluster its own capturing backend.
 fn config(vertex_port: u16, fallback_port: u16) -> Config {
-    let proxy_port = free_port();
-    let yaml = format!(
-        r#"
-listeners:
-  - name: default
-    address: "127.0.0.1:{proxy_port}"
-    filter_chains: [main]
-filter_chains:
-  - name: main
-    filters:
-      - filter: model_to_provider
-        models:
-          - model: claude-sonnet-4-5
-            provider: vertex
-            target_model: vertex/claude-sonnet-4-5
-            paths: [/v1/messages]
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            headers:
-              x-praxis-ai-provider: vertex
-            cluster: vertex
-          - path_prefix: "/"
-            cluster: fallback
-      - filter: load_balancer
-        clusters:
-          - name: vertex
-            endpoints:
-              - "127.0.0.1:{vertex_port}"
-          - name: fallback
-            endpoints:
-              - "127.0.0.1:{fallback_port}"
-insecure_options:
-  allow_private_endpoints: true
-"#
-    );
-    Config::from_yaml(&yaml).expect("model_to_provider test config should parse")
+    load_example_config(
+        "model-to-provider.yaml",
+        free_port(),
+        HashMap::from([("127.0.0.1:9001", vertex_port), ("127.0.0.1:9002", fallback_port)]),
+    )
 }
