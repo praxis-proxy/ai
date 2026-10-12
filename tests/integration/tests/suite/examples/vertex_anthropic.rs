@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 
+use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, parse_body, parse_status, start_capturing_backend, start_header_echo_backend,
-    start_uri_echo_backend,
+    example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
+    start_header_echo_backend, start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -141,5 +142,42 @@ fn handled_request_reaches_vertex_without_client_key_or_encoding() {
     assert!(
         upstream.contains("authorization: bearer ya29.example-static-token"),
         "Vertex auth must come from the credential filter, got: {upstream}"
+    );
+}
+
+/// Preserve repeated beta flags per [RFC 9110 Section 5.3].
+///
+/// [RFC 9110 Section 5.3]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.3
+#[test]
+fn beta_allowlist_keeps_allowed_flags_from_later_header_lines() {
+    let backend = start_header_echo_backend();
+    let source = std::fs::read_to_string(example_config_path("vertex/messages-to-anthropic.yaml"))
+        .expect("the Vertex example must load")
+        .replace("# beta_allowlist:", "beta_allowlist:");
+    let source = patch_yaml(
+        &source,
+        free_port(),
+        &HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let config = Config::from_yaml(&source).expect("the example with its optional allowlist must parse");
+    let proxy = praxis_test_utils::start_proxy(&config);
+    let request = anthropic_request(r#"{"model":"vertex/claude-sonnet-4-5","max_tokens":8,"messages":[]}"#).replace(
+        "x-api-key: client-key\r\n",
+        "anthropic-beta: unknown\r\nanthropic-beta: context-1m-2025-08-07\r\n",
+    );
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a repeated beta header must reach the configured provider"
+    );
+    let upstream = parse_body(&raw).to_ascii_lowercase();
+    assert!(
+        upstream.contains("anthropic-beta: context-1m-2025-08-07"),
+        "allowed flags from later lines must reach Vertex: {upstream}"
+    );
+    assert!(
+        !upstream.contains("unknown"),
+        "disallowed flags from any header instance must be stripped: {upstream}"
     );
 }

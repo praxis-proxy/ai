@@ -165,12 +165,16 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
             return;
         }
         let request = ctx.request;
-        let Some(value) = request.headers.get(&ANTHROPIC_BETA).and_then(|v| v.to_str().ok()) else {
+        if !request.headers.contains_key(&ANTHROPIC_BETA) {
             return;
-        };
+        }
 
-        let kept: Vec<&str> = value
-            .split(',')
+        let kept: Vec<&str> = request
+            .headers
+            .get_all(&ANTHROPIC_BETA)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
             .map(str::trim)
             .filter(|flag| !flag.is_empty() && self.config.beta_allowlist.iter().any(|allowed| allowed == flag))
             .collect();
@@ -808,6 +812,65 @@ mod tests {
         );
     }
 
+    /// Combine repeated field values per [RFC 9110 Section 5.3].
+    ///
+    /// [RFC 9110 Section 5.3]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.3
+    #[tokio::test]
+    async fn beta_allowlist_combines_valid_instances_and_ignores_obs_text() {
+        let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]");
+        let mut request = make_request(Method::POST, "/v1/messages");
+        for value in [
+            HeaderValue::from_static("context-1m-2025-08-07, unknown"),
+            HeaderValue::from_bytes(b"interleaved-thinking-2025-05-14, \xff").unwrap(),
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        ] {
+            request.headers.append(ANTHROPIC_BETA, value);
+        }
+        let mut ctx = make_filter_context(&request);
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        let values: Vec<_> = ctx
+            .request_headers_to_set
+            .iter()
+            .filter(|(name, _)| name == ANTHROPIC_BETA)
+            .collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "all header instances must be replaced by one filtered value"
+        );
+        assert_eq!(
+            values[0].1.to_str().unwrap(),
+            "context-1m-2025-08-07, interleaved-thinking-2025-05-14",
+            "later allowed flags must survive and invalid values must contribute no flags"
+        );
+    }
+
+    #[tokio::test]
+    async fn beta_allowlist_removes_obs_text_only_header() {
+        let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07]");
+        let mut request = make_request(Method::POST, "/v1/messages");
+        request.headers.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_bytes(b"context-1m-2025-08-07, \xff").unwrap(),
+        );
+        let mut ctx = make_filter_context(&request);
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert!(
+            ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA),
+            "invalid field values must not bypass the allowlist"
+        );
+        assert!(
+            !ctx.request_headers_to_set
+                .iter()
+                .any(|(name, _)| name == ANTHROPIC_BETA),
+            "an invalid value must never be forwarded as an allowed flag"
+        );
+    }
+
     #[tokio::test]
     async fn beta_header_untouched_when_allowlist_empty() {
         let filter = filter("project: demo");
@@ -816,18 +879,40 @@ mod tests {
             HeaderName::from_static("anthropic-beta"),
             "anything-goes".parse().unwrap(),
         );
+        request
+            .headers
+            .append(ANTHROPIC_BETA, HeaderValue::from_bytes(b"\xff").unwrap());
         let mut ctx = make_filter_context(&request);
 
-        let body = Bytes::from_static(
-            br#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
-        );
-        run_request_body(filter.as_ref(), &mut ctx, body).await.unwrap();
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
         assert!(
             ctx.request_headers_to_set
                 .iter()
                 .all(|(name, _)| name != ANTHROPIC_BETA)
         );
         assert!(ctx.request_headers_to_remove.iter().all(|name| name != ANTHROPIC_BETA));
+    }
+
+    #[tokio::test]
+    async fn beta_allowlist_keeps_an_absent_header_absent() {
+        let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07]");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
+        assert!(
+            !ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA),
+            "an absent beta header needs no mutation"
+        );
+        assert!(
+            !ctx.request_headers_to_set
+                .iter()
+                .any(|(name, _)| name == ANTHROPIC_BETA),
+            "the allowlist must never inject a beta header"
+        );
     }
 
     #[tokio::test]
