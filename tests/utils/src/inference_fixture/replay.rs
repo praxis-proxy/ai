@@ -389,7 +389,7 @@ pub(super) fn build_replay_config(
 }
 
 /// Binds declared endpoint aliases before enforcing unchanged replay containment.
-fn build_replay_config_with_aliases(
+pub(super) fn build_replay_config_with_aliases(
     source: &str,
     listener_port: u16,
     upstream_authority: &str,
