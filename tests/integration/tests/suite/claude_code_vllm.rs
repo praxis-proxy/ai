@@ -977,18 +977,32 @@ async fn run_web_search_flow(live: &LiveConfig, tavily_key: &str) {
     let output = launch_claude_code(live, &proxy_base_url, project.path(), Turn::WEB_SEARCH).await;
     assert_not_timed_out(&output, "web-search turn");
 
-    // XFAIL on the known-limited model: the real Claude Code client sends
-    // `tool_choice: null`, and Qwen3-8B does not reliably emit the WebSearch tool
-    // call without it, so the managed loop dispatches no server-side search and the
-    // turn returns an empty answer. Praxis's server-side Tavily resolution is proven
-    // on this same run by the forced-tool-choice SDK web-search tests, so record the
-    // model limitation and stop before the live search-loop oracle rather than
-    // failing the job. A capable model falls through to the full check.
-    if live.model.to_ascii_lowercase().contains(WEB_SEARCH_XFAIL_MODEL) {
+    // Diagnose from the trace and the observed Tavily exchange BEFORE asserting
+    // the exit status: a backend that never calls WebSearch, or a managed loop
+    // that silently fell back to the `is_error` tool result, still exits cleanly,
+    // so a bare status assertion would miss the real failure.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let captures = relay.captures();
+    let trace = ToolTrace::parse(&stdout);
+
+    // Narrow the XFAIL to exactly the documented missing-tool-call outcome on the
+    // known-limited model: the real Claude Code client sends `tool_choice: null`,
+    // and Qwen3-8B does not reliably emit the WebSearch tool call without it, so no
+    // search reaches the managed loop and the turn returns an empty answer. Any
+    // evidence the model DID attempt a search — a Tavily exchange through the relay
+    // or a WebSearch tool_use in the trace — means the search-loop path actually ran
+    // and must face the full oracle even on this model, so a real regression cannot
+    // hide behind the limitation. Praxis's server-side Tavily resolution is
+    // otherwise proven on every run by the forced-tool-choice SDK web-search tests.
+    let model_attempted_search = !captures.is_empty() || trace.tool_use_names().contains(&MANAGED_WEB_SEARCH_TOOL);
+    if live.model.to_ascii_lowercase().contains(WEB_SEARCH_XFAIL_MODEL) && !model_attempted_search {
+        // Skip only the model-dependent search-loop assertions; the child must
+        // still have run to completion cleanly through Praxis.
+        assert_child_completed(&output, "web-search turn");
         eprintln!(
             "XFAIL (model `{model}`, documented Qwen3-8B limitation): the real Claude Code client \
-             sends tool_choice:null and the 8B model does not reliably emit the WebSearch tool call, \
-             so Praxis's managed loop dispatched no server-side search. Server-side Tavily resolution \
+             sends tool_choice:null and the 8B model did not emit the WebSearch tool call, so \
+             Praxis's managed loop dispatched no server-side search. Server-side Tavily resolution \
              is proven on this run by the forced-tool-choice SDK web-search tests; skipping the live \
              search-loop assertions. See docs/developing/gpu-nightly-suite.md.",
             model = live.model,
@@ -996,12 +1010,7 @@ async fn run_web_search_flow(live: &LiveConfig, tavily_key: &str) {
         return;
     }
 
-    // Diagnose from the trace and the observed Tavily exchange BEFORE asserting
-    // the exit status: a backend that never calls WebSearch, or a managed loop
-    // that silently fell back to the `is_error` tool result, still exits cleanly,
-    // so a bare status assertion would miss the real failure.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Err(reason) = check_server_side_web_search(&stdout, &relay.captures(), tavily_key) {
+    if let Err(reason) = check_server_side_web_search(&stdout, &captures, tavily_key) {
         panic!("{reason}\nstdout:\n{stdout}");
     }
     assert_child_completed(&output, "web-search turn");
