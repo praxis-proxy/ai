@@ -56,7 +56,7 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The key file's `token_uri` must be exactly
 /// `https://oauth2.googleapis.com/token`, so a tampered key file cannot
 /// send the signed assertion anywhere else. The key file is fully parsed
-/// when the pipeline is built: one missing `client_email`, `private_key`,
+/// when the pipeline is built: a key file missing `client_email`, `private_key`,
 /// or `token_uri`, or whose `private_key` is not an unencrypted RSA key,
 /// is rejected as a configuration error. Reload the config to pick up a
 /// rotated key.
