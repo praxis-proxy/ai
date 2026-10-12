@@ -12,7 +12,9 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
+use praxis_core::connectivity::{
+    PreparedSubrequest, PreparedTarget, UrlResolutionPolicy, prepare_url_target_with_policy,
+};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback, SubRequest, SubrequestRuntime,
@@ -720,16 +722,23 @@ impl FileSearchClient {
     ) -> Result<PreparedTarget, FileSearchError> {
         let remaining = deadline_remaining(execution_timeout, execution_started, store_id)?;
         let address_policy = AddressPolicy::from_allow_private(allow_private);
+        // The vector-store host is operator-configured, so it resolves through
+        // the shared DNS cache.
         tokio::time::timeout(
             remaining,
-            Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
-                if addresses.iter().any(|address| address_policy.blocks(&address.ip())) {
-                    return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
-                        "vector-store target resolved to an address blocked by outbound policy".into(),
-                    );
-                }
-                Ok(())
-            })),
+            Box::pin(prepare_url_target_with_policy(
+                url,
+                deadline,
+                |addresses: &[SocketAddr]| {
+                    if addresses.iter().any(|address| address_policy.blocks(&address.ip())) {
+                        return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                            "vector-store target resolved to an address blocked by outbound policy".into(),
+                        );
+                    }
+                    Ok(())
+                },
+                UrlResolutionPolicy::OperatorCached,
+            )),
         )
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))?
@@ -819,7 +828,7 @@ impl FileSearchClient {
     #[expect(
         clippy::too_many_arguments,
         clippy::large_stack_frames,
-        reason = "one sub-request threads the shared executor, chain, bound request, and deadline clock; the executor future is inherently large"
+        reason = "one sub-request threads the shared executor, chain, bound request, and deadline clock; the policy-aware executor future materializes transiently on the stack before `Box::pin` moves it to the heap"
     )]
     async fn run_outbound(
         &self,

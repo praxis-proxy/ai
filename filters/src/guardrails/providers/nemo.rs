@@ -12,7 +12,7 @@ use praxis_ai_apis::{
     callout_target::{AddressPolicy, validate_configured_http_target, validate_resolved_addrs},
     subrequest::{SubRequest, SubRequestClient, SubResponse},
 };
-use praxis_core::connectivity::{UrlTargetError, prepare_url_target};
+use praxis_core::connectivity::{UrlResolutionPolicy, UrlTargetError, prepare_url_target_with_policy};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, FilterError, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback,
@@ -254,11 +254,18 @@ impl NemoProvider {
         runtime: &GuardCalloutRuntime<'_>,
     ) -> Result<SubResponse, FilterError> {
         let address_policy = AddressPolicy::from_allow_private(runtime.outbound.allow_private_upstreams());
-        let target = prepare_url_target(&self.endpoint, runtime.deadline, |addrs| {
-            validate_resolved_addrs("ai_guardrails (nemo)", addrs, address_policy)
-                .map(|_| ())
-                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.to_string().into() })
-        })
+        // The guardrails provider endpoint is operator-configured, so it
+        // resolves through the shared DNS cache.
+        let target = prepare_url_target_with_policy(
+            &self.endpoint,
+            runtime.deadline,
+            |addrs| {
+                validate_resolved_addrs("ai_guardrails (nemo)", addrs, address_policy)
+                    .map(|_| ())
+                    .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.to_string().into() })
+            },
+            UrlResolutionPolicy::OperatorCached,
+        )
         .await
         .map_err(map_url_target_error)?;
 

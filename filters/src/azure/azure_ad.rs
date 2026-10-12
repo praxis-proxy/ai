@@ -158,16 +158,21 @@ async fn fetch_token(
         body: Bytes::from(body),
     };
 
-    let response = praxis_ai_apis::subrequest::execute_url(
-        client,
-        token_url,
-        request,
-        65_536,
-        TOKEN_REQUEST_TIMEOUT,
-        address_policy,
-    )
-    .await
-    .map_err(|e| FilterError::from(format!("azure_ad: token request failed: {e}")))?;
+    // `token_url` is the operator-configured Azure AD token endpoint, so it
+    // resolves through the shared DNS cache.
+    let response = client
+        .execute_url(
+            token_url,
+            request,
+            praxis_ai_apis::subrequest::address_policy_hook(address_policy),
+            praxis_ai_apis::subrequest::UrlResolutionPolicy::OperatorCached,
+            TOKEN_REQUEST_TIMEOUT,
+            65_536,
+            None,
+        )
+        .await
+        .map_err(praxis_ai_apis::subrequest::map_url_error)
+        .map_err(|e| FilterError::from(format!("azure_ad: token request failed: {e}")))?;
 
     let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     if !status.is_success() {

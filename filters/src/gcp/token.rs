@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::HeaderValue;
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
-    subrequest::{SubRequest, SubRequestClient, execute_url},
+    subrequest::{SubRequest, SubRequestClient, UrlResolutionPolicy, address_policy_hook, map_url_error},
 };
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -148,6 +148,21 @@ fn metadata_token_url(metadata_host: &str, service_account: &str, scope: &str) -
     url
 }
 
+/// A bodiless GET sub-request carrying the GCE metadata flavor header.
+fn metadata_token_request() -> SubRequest {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::HeaderName::from_static("metadata-flavor"),
+        HeaderValue::from_static("Google"),
+    );
+    SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers,
+        body: Bytes::new(),
+    }
+}
+
 /// Send one metadata token request via `SubRequestClient`.
 async fn fetch_metadata_token_url(
     client: &SubRequestClient,
@@ -155,20 +170,20 @@ async fn fetch_metadata_token_url(
     timeout: Duration,
     address_policy: AddressPolicy,
 ) -> Result<(HeaderValue, Duration), FilterError> {
-    let mut headers = http::HeaderMap::new();
-    headers.insert(
-        http::HeaderName::from_static("metadata-flavor"),
-        HeaderValue::from_static("Google"),
-    );
-    let request = SubRequest {
-        method: http::Method::GET,
-        uri: http::Uri::default(),
-        headers,
-        body: Bytes::new(),
-    };
-
-    let response = execute_url(client, url, request, 65_536, timeout, address_policy)
+    // The metadata token endpoint host is operator/environment-configured, so
+    // it resolves through the shared DNS cache.
+    let response = client
+        .execute_url(
+            url,
+            metadata_token_request(),
+            address_policy_hook(address_policy),
+            UrlResolutionPolicy::OperatorCached,
+            timeout,
+            65_536,
+            None,
+        )
         .await
+        .map_err(map_url_error)
         .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
 
     let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -187,7 +202,6 @@ async fn fetch_metadata_token_url(
 
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
-
 
 // -----------------------------------------------------------------------------
 // GoogleApplicationCredentials
