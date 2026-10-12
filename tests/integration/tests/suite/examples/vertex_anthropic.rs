@@ -31,7 +31,7 @@ fn anthropic_request(body: &str) -> String {
     )
 }
 
-fn patched_example(proxy_port: u16, backend_port: u16) -> praxis_core::config::Config {
+fn patched_example(proxy_port: u16, backend_port: u16) -> Config {
     super::load_example_config(
         "vertex/messages-to-anthropic.yaml",
         proxy_port,
