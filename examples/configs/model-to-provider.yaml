@@ -11,8 +11,6 @@ listeners:
 filter_chains:
   - name: mapped-model
     filters:
-      - filter: model_to_header
-        header: X-Model
       - filter: model_to_provider
         models:
           - model: claude-sonnet-4-5
