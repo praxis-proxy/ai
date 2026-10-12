@@ -204,18 +204,30 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "tool call missing required non-empty function `name`".to_owned())?;
-        let args_str = tc
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
-        let input = serde_json::from_str::<Map<String, Value>>(args_str)
-            .map_err(|error| format!("invalid tool call arguments: {error}"))?;
+        let input = parse_tool_call_arguments(tc)?;
 
         blocks.push(ContentBlock::tool_use(id, input, name));
     }
 
     Ok(())
+}
+
+/// Parse a Chat Completions tool call's `function.arguments` into an object map.
+///
+/// An empty or whitespace-only string is how Chat/vLLM tool parsers encode a
+/// parameterless tool call (the OpenAI streaming spec example uses `"arguments":""`),
+/// so it is absent arguments rather than malformed input and maps to `{}`.
+fn parse_tool_call_arguments(tool_call: &Value) -> Result<Map<String, Value>, String> {
+    let args_str = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
+    if args_str.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    serde_json::from_str::<Map<String, Value>>(args_str)
+        .map_err(|error| format!("invalid tool call arguments: {error}"))
 }
 
 // -----------------------------------------------------------------------------
@@ -663,6 +675,27 @@ mod tests {
         assert!(
             error.contains("invalid tool call arguments"),
             "malformed arguments should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_string_tool_call_arguments_become_empty_object() {
+        // vLLM tool parsers (and the OpenAI streaming spec example) encode a
+        // parameterless call as `"arguments":""`; it must parse to `{}`, not error.
+        for arguments in ["", "   ", "\n\t"] {
+            let tool_call = json!({"function": {"name": "now", "arguments": arguments}});
+            assert_eq!(
+                parse_tool_call_arguments(&tool_call).unwrap(),
+                Map::new(),
+                "empty/whitespace args become an empty object for {arguments:?}"
+            );
+        }
+
+        let populated = json!({"function": {"name": "now", "arguments": "{\"tz\":\"utc\"}"}});
+        assert_eq!(
+            parse_tool_call_arguments(&populated).unwrap()["tz"],
+            json!("utc"),
+            "populated arguments still parse"
         );
     }
 

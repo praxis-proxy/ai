@@ -79,6 +79,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     bodies: list[dict] = []
     response_content_type = "application/json"
     send_tool_reply_once = False
+    tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
     error_response_once = False
 
@@ -114,13 +115,15 @@ class RecordingBackend(BaseHTTPRequestHandler):
         }
         if RecordingBackend.send_tool_reply_once:
             RecordingBackend.send_tool_reply_once = False
+            arguments = RecordingBackend.tool_call_arguments
+            RecordingBackend.tool_call_arguments = "{}"
             choice["message"] = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
+                    "function": {"name": "lookup", "arguments": arguments},
                 }],
             }
             choice["finish_reason"] = "tool_calls"
@@ -406,6 +409,26 @@ class TestRequestFieldHandling:
         upstream = RecordingBackend.bodies[-1]
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
+
+    def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.send_tool_reply_once = True
+        RecordingBackend.tool_call_arguments = ""
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+        )
+
+        tool_use = next(block for block in response.content if block.type == "tool_use")
+        assert tool_use.name == "lookup"
+        assert tool_use.input == {}, (
+            'empty-string arguments ("arguments":"") are absent arguments, per the '
+            "vLLM tool parser / OpenAI streaming spec encoding, and must become input "
+            "{} rather than failing as a 500"
+        )
+        assert response.stop_reason == "tool_use"
 
     def test_empty_citations_in_history_reach_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()

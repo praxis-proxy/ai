@@ -16,7 +16,7 @@ also get faster CPU-side coverage against the inference simulator (see the
 | --- | --- | --- |
 | [`vllm-integration.yaml`](../../.github/workflows/vllm-integration.yaml) | `17 4 * * *` | Main GPU suite: live Responses SDK suite, OpenAI Agents SDK loop, and the Claude Code / Codex CLI acceptance jobs against real Qwen3-8B. |
 | [`anthropic-vllm-vision.yaml`](../../.github/workflows/anthropic-vllm-vision.yaml) | `31 6 * * *` | Vision companion: Anthropic SDK image requests through Praxis to `Qwen/Qwen3-VL-4B-Instruct` (the main nightly model is text-only). |
-| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds, live-tests, and publishes the model-baked GPU image to GHCR. |
+| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, `vllm/images.json`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds, live-tests, and publishes **every** model-baked GPU image in [`vllm/images.json`](../../vllm/images.json) to GHCR. Sole publisher; the two nightlies consume what it publishes. |
 | [`vllm-dev-endpoint.yaml`](../../.github/workflows/vllm-dev-endpoint.yaml) | manual only | On-demand vLLM endpoint over a Cloudflare tunnel for interactive testing. Not part of CI. |
 
 All also accept `workflow_dispatch`, and the main suite can be forced on a PR by
@@ -30,7 +30,12 @@ applying the `vllm-full-suite` label.
 - **Model:** `Qwen/Qwen3-8B` (~15.3 GiB bf16) — chosen because it supports
   tool-calling (file_search, MCP); the 0.6B CPU simulator model used on PRs does
   not.
-- **Built image:** `ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B`.
+- **Images:** `ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B` (main suite) and
+  `:Qwen3-VL-4B-Instruct` (vision companion), both published by
+  `vllm-gpu-container.yaml` from [`vllm/images.json`](../../vllm/images.json).
+  Each also gets an immutable `:<tag>-<commit sha>` tag. The nightlies pull
+  these rather than rebuilding them; see
+  [Reusing published images](#reusing-published-images).
 
 ## Use cases: the client-path matrix
 
@@ -131,15 +136,36 @@ NOT also pass `run_live_vllm=true`, which would trigger the full suite): it
 provisions the GPU runner and runs only the Codex and Claude Code compaction
 steps, skipping the full Responses suite and every other acceptance step.
 
+## Reusing published images
+
+Neither nightly rebuilds the model-baked image by default. Each calls
+[`resolve-vllm-gpu-image`](../../.github/actions/resolve-vllm-gpu-image/action.yml),
+which pulls the published tag and keeps it only when the image's provenance
+labels match that checkout — the same `vllm/Containerfile` hash, model ID, and
+pinned model revision. On a mismatch, an unreachable registry, or a tag that
+does not exist yet, it falls back to building from source.
+
+That keeps two properties at once: a nightly where nothing changed skips a
+multi-gigabyte rebuild entirely, and a PR that edits the `Containerfile` or
+repins a model is still validated against the image it actually describes. A
+lagging or failed publish degrades to a local build rather than breaking the
+run or, worse, qualifying a stale backend.
+
+The qualification record reports which happened: `backend.image_source` is
+`registry` or `local-build`, and `backend.registry_digest` is populated only
+for a pulled image.
+
 ## Jobs in the main suite (`vllm-integration.yaml`)
 
 - `changes` — path-filter gate.
 - `vllm-responses`, `vllm-live-cpu`, `vllm-responses-postgres` — fast CPU-side
   coverage on PRs (simulator + `llm-d-inference-sim`).
 - `gpu-start-runner` / `gpu-stop-runner` — provision / tear down the GPU EC2 box.
-- `vllm-gpu-full-suite` — builds the model-baked image and runs the complete
-  live Responses SDK suite (SDK 2.x + 3.x) plus the OpenAI Agents SDK loop
-  against real Qwen3-8B with a PostgreSQL store.
+- `vllm-gpu-full-suite` — resolves the model-baked image (pulling the
+  published build, or building from source when it does not match the
+  checkout) and runs the complete live Responses SDK suite (SDK 2.x + 3.x)
+  plus the OpenAI Agents SDK loop against real Qwen3-8B with a PostgreSQL
+  store.
 - `vllm-gpu-claude-acceptance` — pinned Claude Code over native + translated
   Anthropic paths (acceptEdits + auto mode), including the #1418 planning-turn
   regression guard, in a locked-down network namespace.
