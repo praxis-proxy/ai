@@ -119,11 +119,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.3", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis-core = { version = "0.7.4", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.4", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.4", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.4", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.4", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -141,9 +141,9 @@ praxis-ai-build-support = { version = "0.6.0", path = "server/build_support" }
 # Pingora (temporary fork), at the version praxis builds against; two versions
 # of the fork in one graph do not share types, and the older one carries its
 # own rustls provider.
-pingora-core = { version = "0.10.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
-pingora-http = { version = "0.10.0", package = "quixotic-plecostomus-http" }
-pingora-proxy = { version = "0.10.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
+pingora-core = { version = "0.11.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
+pingora-http = { version = "0.11.0", package = "quixotic-plecostomus-http" }
+pingora-proxy = { version = "0.11.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 arc-swap = "1.9.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }

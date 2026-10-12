@@ -5146,6 +5146,7 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
         authority: None,
+        base_path: None,
         tls: None,
         connection: Arc::new(ConnectionOptions::default()),
     });
@@ -5193,6 +5194,7 @@ async fn apply_arm_keeps_a_tighter_cluster_read_timeout() {
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
         authority: None,
+        base_path: None,
         tls: None,
         connection: Arc::new(ConnectionOptions {
             read_timeout: Some(Duration::from_millis(250)),
@@ -5325,6 +5327,7 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
         authority: None,
+        base_path: None,
         tls: None,
         connection: Arc::new(ConnectionOptions {
             read_timeout: Some(Duration::from_secs(30)),

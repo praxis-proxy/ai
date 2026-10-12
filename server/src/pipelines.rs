@@ -135,7 +135,7 @@ pub(crate) fn resolve_pipelines_with_stores(
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "threads config, registries, shared services, the policy-connector setup, and a per-listener hook"
+    reason = "threads config, registries, shared services, and a per-listener hook"
 )]
 fn build_listener_pipelines(
     config: &Config,
@@ -146,7 +146,6 @@ fn build_listener_pipelines(
     gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
-    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()

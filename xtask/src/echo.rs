@@ -60,6 +60,7 @@ fn build_config(args: &Args) -> Config {
 
     let chain = FilterChainConfig {
         name: "echo".into(),
+        conditions: Vec::new(),
         filters: vec![entry],
     };
 

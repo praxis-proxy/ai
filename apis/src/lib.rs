@@ -117,6 +117,7 @@ pub(crate) mod test_utils {
             cluster: None,
             current_filter_id: None,
             downstream_tls: false,
+            hedge_policy: None,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
             executed_branch_filters: Vec::new(),
