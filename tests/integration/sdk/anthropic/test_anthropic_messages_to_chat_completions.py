@@ -244,11 +244,14 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
     return path
 
 
-def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
+def _start_client(*, allow_lossy: bool, process_holder=None) -> Iterator[Anthropic]:
     """Start a backend + proxy and yield an Anthropic client plus the proxy port.
 
     `allow_lossy` selects the strict example config (the default) or the same
     config with operator-approved degradation enabled on the translation filter.
+    When `process_holder` is supplied, the live proxy subprocess is published
+    under its ``"proxy"`` key so tests can assert the proxy stays up (e.g. a
+    connection abort must come from a committed-body reset, not a crash).
     """
     backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
@@ -263,6 +266,8 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
     )
     try:
         _wait_for_proxy(proxy_port)
+        if process_holder is not None:
+            process_holder["proxy"] = proc
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="not-needed",
@@ -270,6 +275,8 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
             timeout=10.0,
         )
     finally:
+        if process_holder is not None:
+            process_holder.pop("proxy", None)
         proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=5)
@@ -281,8 +288,14 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
 
 
 @pytest.fixture(scope="module")
-def anthropic_client():
-    yield from _start_client(allow_lossy=False)
+def proxy_process():
+    """Holder populated by `anthropic_client` with the live proxy subprocess."""
+    yield {}
+
+
+@pytest.fixture(scope="module")
+def anthropic_client(proxy_process):
+    yield from _start_client(allow_lossy=False, process_holder=proxy_process)
 
 
 @pytest.fixture(scope="module")
@@ -537,7 +550,9 @@ class TestResponseValidation:
         assert error.body["error"]["type"] == "api_error", "the Anthropic error type must normalize to api_error"
 
     @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
-    def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
+    def test_untranslatable_success_fails_closed(
+        self, anthropic_client, proxy_process, kind
+    ):
         RecordingBackend.untranslatable_reply_once = kind
         try:
             with pytest.raises(
@@ -566,6 +581,12 @@ class TestResponseValidation:
             # empty terminal chunk; the SDK surfaces that as a connection error.
             # Still fail-closed: the client never receives a usable translation.
             assert isinstance(error, APIConnectionError)
+            # A proxy crash would raise the same SDK exception, so confirm the
+            # proxy is still running — the abort must be a deliberate reset.
+            assert proxy_process["proxy"].poll() is None, (
+                "the proxy must stay alive while it aborts the committed "
+                "200 response body"
+            )
 
 
 class TestStreamingResponseValidation:
