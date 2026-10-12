@@ -95,7 +95,10 @@ mod tests {
 
     #[test]
     fn validate_catches_invalid_log_overrides() {
-        let config = Config::from_yaml(
+        // praxis 0.7.4 validates `runtime.log_overrides` during config parsing,
+        // so the invalid module path and level are now rejected by `from_yaml`
+        // itself rather than by `validate_config_for_startup`.
+        let err = Config::from_yaml(
             r#"
 runtime:
   log_overrides:
@@ -110,10 +113,8 @@ filter_chains:
     filters: []
 "#,
         )
-        .unwrap();
-        let result = validate_config_for_startup(&config);
-        assert!(result.is_err(), "invalid log overrides should fail validation");
-        let err = result.err().unwrap().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("invalid module path 'invalid module'"),
             "error should mention invalid module path: {err}"

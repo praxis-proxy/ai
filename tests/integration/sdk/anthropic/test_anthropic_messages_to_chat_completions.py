@@ -36,7 +36,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-from anthropic import APIStatusError, Anthropic, BadRequestError
+from anthropic import APIConnectionError, APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
@@ -540,7 +540,9 @@ class TestResponseValidation:
     def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
         RecordingBackend.untranslatable_reply_once = kind
         try:
-            with pytest.raises((APIStatusError, json.JSONDecodeError)) as excinfo:
+            with pytest.raises(
+                (APIStatusError, json.JSONDecodeError, APIConnectionError)
+            ) as excinfo:
                 anthropic_client.messages.create(
                     model=MODEL,
                     max_tokens=64,
@@ -554,10 +556,16 @@ class TestResponseValidation:
             assert error.status_code == 500
             assert error.body["type"] == "error"
             assert error.body["error"]["type"] == "api_error"
-        else:
+        elif isinstance(error, json.JSONDecodeError):
             # A response-body rejection can abort after 200 headers have been
             # sent. The SDK then fails to parse the empty, aborted body.
             assert error.doc == ""
+        else:
+            # praxis 0.7.4 aborts a rejected response after the 200 headers are
+            # committed by closing the connection mid-body instead of flushing an
+            # empty terminal chunk; the SDK surfaces that as a connection error.
+            # Still fail-closed: the client never receives a usable translation.
+            assert isinstance(error, APIConnectionError)
 
 
 class TestStreamingResponseValidation:
