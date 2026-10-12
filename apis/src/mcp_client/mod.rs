@@ -109,8 +109,9 @@ impl McpDisplayUrl {
         let mut out = String::with_capacity(scheme.len() + host.len() + 16);
         out.push_str(scheme);
         out.push_str("://");
-        // `http::Uri::host()` can return an IPv6 literal without its brackets;
-        // put them back so the value stays a valid URL authority.
+        // `http::Uri::host()` already returns an IPv6 literal bracketed (`[::1]`),
+        // so only an unbracketed literal is wrapped here; re-wrapping a bracketed
+        // host would produce `[[::1]]` and no longer be a valid URL authority.
         if host.contains(':') && !host.starts_with('[') {
             out.push('[');
             out.push_str(host);

@@ -488,6 +488,107 @@ jobs:
             "$PRAXIS_TEST_CODEX_BIN"
 
   # ----------------------------------------------------------------------------
+  # Pinned OpenCode CLI acceptance
+  #
+  # Split out of `test-integration` rather than riding along with the Claude
+  # Code install, because the whole point of this lane is the network
+  # namespace. OpenCode needs no egress beyond Praxis — verified against the
+  # pinned build — and running it with the runner's full network would let a
+  # future startup fetch slip in unnoticed. Isolation is what makes that a
+  # standing guarantee rather than a one-time observation.
+  #
+  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. To bump the
+  # version, update that manifest, OPENCODE_PINNED_VERSION in
+  # tests/integration/tests/suite/harness.rs, and OPENCODE_VERSION below
+  # together; `pin_toml_version_matches_harness_const` and
+  # `opencode_lane_is_wired_in_ci` fail if any of the three drifts.
+  # ----------------------------------------------------------------------------
+
+  opencode-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      OPENCODE_VERSION: "1.18.35"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-cpu-cargo
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          npm install -g "opencode-ai@${OPENCODE_VERSION}"
+          # Resolve the absolute path: the test clears the environment before
+          # spawning, so a bare name on the runner PATH would not be found.
+          opencode_bin="$(command -v opencode)"
+          test -x "$opencode_bin"
+          # The client prints the bare version with no product prefix.
+          test "$("$opencode_bin" --version)" = "${OPENCODE_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_BIN=$opencode_bin" >> "$GITHUB_ENV"
+
+      - name: Build test binary
+        # Compiled outside the namespace, where the network still exists.
+        run: cargo test -p praxis-tests-integration --features store-all --test suite --no-run
+
+      - name: OpenCode acceptance (network namespace)
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            opencode_bin="$6"
+
+            ip link set lo up
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in OpenCode test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in OpenCode test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_OPENCODE_BIN="$opencode_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --features store-all --test suite \
+                    opencode:: -- --nocapture
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_OPENCODE_BIN"
+
+  # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Vertex/Gemini translation (local fake backend)
   # ----------------------------------------------------------------------------
 

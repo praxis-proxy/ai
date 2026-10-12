@@ -285,7 +285,7 @@ def passing_suite_problem(report):
 
 
 def finish(raw, requested, start_result, suite_result, claude_result, codex_result, run_id, attempt, url, sha,
-           claude_raw=None, codex_raw=None):
+           claude_raw=None, codex_raw=None, opencode_result="skipped", opencode_raw=None):
     report = read_json(raw) if raw else None
     raw_valid = (isinstance(report, dict) and report.get("schema_version") == VERSION
                  and report.get("profile") == PROFILE
@@ -312,6 +312,9 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
     report["suites"]["codex_acceptance"] = acceptance(
         codex_raw, codex_result, run_id, attempt, sha,
         "native Responses and translated Chat")
+    report["suites"]["opencode_acceptance"] = acceptance(
+        opencode_raw, opencode_result, run_id, attempt, sha,
+        "native Chat Completions text turn and tool-call round trip")
     if not requested:
         report["status"], report["reason"] = "not_requested", "Responses GPU qualification was not requested"
     elif suite_result != "success" and report["status"] == "passed":
@@ -378,7 +381,7 @@ def render(report, detailed=False):
                          + ", ".join(f"{key} {counts.get(key, 0)}" for key in OUTCOMES) + ".")
         if report.get("suites", {}).get("unclassified", {}).get("selected"):
             lines.append(f"Unclassified selected cases: {len(report['suites']['unclassified']['selected'])} (profile attribution required).")
-        for name in ("credentialed_tools", "claude_acceptance", "codex_acceptance"):
+        for name in ("credentialed_tools", "claude_acceptance", "codex_acceptance", "opencode_acceptance"):
             suite_data = report.get("suites", {}).get(name, {})
             cases = suite_data.get("cases", [])
             suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
@@ -402,7 +405,7 @@ def render(report, detailed=False):
                     lines.append(f"- `{case['id']}`{sdk_info}: {case.get('outcome')} | {reason}")
                 if len(notable) > 20:
                     lines.append(f"- {len(notable) - 20} further cases in the artifact")
-        for suite_name in ("claude_acceptance", "codex_acceptance"):
+        for suite_name in ("claude_acceptance", "codex_acceptance", "opencode_acceptance"):
             cases = report.get("suites", {}).get(suite_name, {}).get("cases", [])
             if cases:
                 lines += ["", f"{suite_name.replace('_', ' ').title()} scenarios:"]
@@ -448,7 +451,8 @@ def choose_run(runs, jobs_by_id):
         if start and start.get("conclusion") == "success" and native and native.get("conclusion") == "skipped":
             acceptance = [job for job in jobs if job.get("name") in (
                 "Claude Code and Anthropic SDK acceptance on real vLLM (GPU)",
-                "Codex acceptance on real vLLM (GPU)")]
+                "Codex acceptance on real vLLM (GPU)",
+                "OpenCode acceptance on real vLLM (GPU)")]
             if acceptance and all(job.get("conclusion") == "skipped" for job in acceptance):
                 return run
     return None
@@ -557,6 +561,9 @@ def main():
     fin.add_argument("--requested", choices=("true", "false"), required=True)
     for field in ("start-result", "suite-result", "claude-result", "codex-result", "run-id", "attempt", "url", "sha", "output", "markdown", "claude-raw", "codex-raw"):
         fin.add_argument("--" + field, required=True)
+    # Optional so a dispatch that predates the OpenCode lane still parses.
+    fin.add_argument("--opencode-result", default="skipped")
+    fin.add_argument("--opencode-raw", default=None)
     rel = sub.add_parser("release-evidence")
     for field in ("repo", "sha", "output-dir"):
         rel.add_argument("--" + field, required=True)
@@ -569,7 +576,7 @@ def main():
     elif args.command == "finish":
         report = finish(args.raw, args.requested == "true", args.start_result, args.suite_result,
                         args.claude_result, args.codex_result, int(args.run_id), int(args.attempt), args.url, args.sha,
-                        args.claude_raw, args.codex_raw)
+                        args.claude_raw, args.codex_raw, args.opencode_result, args.opencode_raw)
         write_json(args.output, report)
         Path(args.markdown).write_text(render(report, detailed=True), encoding="utf-8")
     elif args.command == "release-evidence":
