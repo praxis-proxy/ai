@@ -173,7 +173,10 @@ async fn mapping_clears_stale_selector_and_metadata_before_early_returns() {
             HeaderValue::from_static("spoofed"),
         ));
         let mut body = Some(Bytes::copy_from_slice(raw.as_bytes()));
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ));
         assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
         assert!(ctx.request_headers_to_remove.contains(&PROVIDER_HEADER));
         assert!(
