@@ -127,7 +127,7 @@ async fn mapping_joins_an_already_active_ordered_mutation_log() {
     );
     assert_eq!(
         ctx.pre_read_mutations.len(),
-        2,
+        3,
         "the selector should be appended after the earlier ordered mutation"
     );
     assert!(
@@ -154,4 +154,30 @@ async fn mapping_does_not_activate_the_ordered_mutation_log() {
         ctx.pre_read_mutations.is_empty(),
         "writing the ordered log would make core drop other filters' grouped mutations"
     );
+}
+
+#[tokio::test]
+async fn mapping_clears_stale_selector_and_metadata_before_early_returns() {
+    let filter = build_filter(vertex_config());
+    for (path, raw) in [
+        ("/v1/messages", "not JSON"),
+        ("/v1/messages", "{\"model\":\"unknown\"}"),
+        ("/other", "{\"model\":\"claude-sonnet-4-5\"}"),
+        ("/v1/messages", "{}"),
+    ] {
+        let request = make_request(Method::POST, path);
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "previous-model");
+        ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+            PROVIDER_HEADER,
+            HeaderValue::from_static("spoofed"),
+        ));
+        let mut body = Some(Bytes::copy_from_slice(raw.as_bytes()));
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
+        assert!(ctx.request_headers_to_remove.contains(&PROVIDER_HEADER));
+        assert!(
+            matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER)
+        );
+    }
 }

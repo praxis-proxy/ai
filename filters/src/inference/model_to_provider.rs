@@ -261,6 +261,13 @@ impl HttpFilter for ModelToProviderFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        ctx.request_headers_to_remove.push(PROVIDER_HEADER);
+        if !ctx.pre_read_mutations.is_empty() {
+            ctx.pre_read_mutations
+                .push(TrustedHeaderMutation::Remove(PROVIDER_HEADER));
+        }
+        ctx.filter_metadata.remove(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
+
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
