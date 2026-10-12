@@ -401,11 +401,11 @@ fn handle_json_body(
     provider: ProviderKind,
     max_body_bytes: usize,
 ) {
-    match ctx.response_body_mode {
+    match (ctx.response_body_mode, end_of_stream, body.as_deref()) {
         // A buffered chain hands filters each raw chunk while it accumulates and
         // then re-delivers the frozen whole buffer at end-of-stream, so that body
         // must not be appended to the chunks already captured.
-        BodyMode::StreamBuffer { .. } if end_of_stream && let Some(eos_body) = body.as_deref() => {
+        (BodyMode::StreamBuffer { .. }, true, Some(eos_body)) => {
             record_buffered_eos_usage(ctx, provider, eos_body, max_body_bytes);
             clear_all_metadata(ctx);
         },
