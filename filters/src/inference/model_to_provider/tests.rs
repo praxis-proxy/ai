@@ -59,12 +59,7 @@ async fn mapping_sets_provider_marker_preserves_public_id_and_rewrites_target() 
         "a mapped request must continue with its transformed body"
     );
 
-    assert!(
-        ctx.request_headers_to_set
-            .iter()
-            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") }),
-        "a mapped request must queue the vertex provider selector"
-    );
+    assert_vertex_selector(&ctx);
     assert_eq!(
         ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
         Some("claude-sonnet-4-5"),
@@ -147,12 +142,7 @@ async fn mapping_joins_an_already_active_ordered_mutation_log() {
         matches!(action, FilterAction::Continue),
         "mapping must continue when an ordered mutation log is already active"
     );
-    assert!(
-        ctx.request_headers_to_set
-            .iter()
-            .any(|(name, value)| name == PROVIDER_HEADER && value == "vertex"),
-        "the grouped queue should still carry the provider selector"
-    );
+    assert_vertex_selector(&ctx);
     assert_eq!(
         ctx.pre_read_mutations.len(),
         3,
@@ -211,17 +201,32 @@ async fn mapping_clears_stale_selector_and_metadata_before_early_returns() {
             ),
             "early returns must preserve request processing: {path} {raw}"
         );
-        assert!(
-            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
-            "every early return must clear stale public-model metadata"
-        );
-        assert!(
-            ctx.request_headers_to_remove.contains(&PROVIDER_HEADER),
-            "every early return must queue stale selector removal"
-        );
-        assert!(
-            matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER),
-            "stale selector removal must follow earlier ordered mutations"
-        );
+        assert_stale_mapping_removed(&ctx);
     }
+}
+
+/// Assert the selector the router needs after a mapped request.
+fn assert_vertex_selector(ctx: &HttpFilterContext<'_>) {
+    assert!(
+        ctx.request_headers_to_set
+            .iter()
+            .any(|(name, value)| name == PROVIDER_HEADER && value == "vertex"),
+        "a mapped request must queue the vertex provider selector"
+    );
+}
+
+/// Assert stale mapping state is cleared even when body handling returns early.
+fn assert_stale_mapping_removed(ctx: &HttpFilterContext<'_>) {
+    assert!(
+        ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+        "every early return must clear stale public-model metadata"
+    );
+    assert!(
+        ctx.request_headers_to_remove.contains(&PROVIDER_HEADER),
+        "every early return must queue stale selector removal"
+    );
+    assert!(
+        matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER),
+        "stale selector removal must follow earlier ordered mutations"
+    );
 }
