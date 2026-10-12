@@ -17,6 +17,7 @@
 
 pub mod agentic;
 pub mod cli_process;
+pub mod error_shape;
 pub mod example_config;
 pub mod filters;
 pub mod fips;
@@ -41,6 +42,7 @@ pub use cli_process::{
     CHILD_CLEANUP_TIMEOUT, CapturedChildOutput, DEFAULT_MAX_CAPTURED_STREAM_BYTES, capture_child_output,
     capture_child_output_with_limit, configure_isolated_process_group,
 };
+pub use error_shape::{assert_error_is_anthropic_shaped, assert_error_is_openai_shaped};
 pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
 pub use fips::{approved_mode, assert_fips_host_if_declared, expect_approved_mode, fips_host, fips_host_declared};
 pub use load::{
