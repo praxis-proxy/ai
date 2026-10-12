@@ -314,7 +314,7 @@ fn register_admin_endpoints(
             server.server_mut(),
             admin_addr,
             health::AdminEndpointOptions {
-                health_registry: Some(health_registry.clone()),
+                health_registry: Some(Arc::clone(&health_registry)),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
