@@ -47,26 +47,34 @@ async fn mapping_sets_provider_marker_preserves_public_id_and_rewrites_target() 
         json!({"model":"claude-sonnet-4-5","messages":[]}).to_string(),
     ));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "the request hook must continue until the body is available"
+    );
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "a mapped request must continue with its transformed body"
+    );
 
     assert!(
         ctx.request_headers_to_set
             .iter()
-            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") })
+            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") }),
+        "a mapped request must queue the vertex provider selector"
     );
     assert_eq!(
         ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
-        Some("claude-sonnet-4-5")
+        Some("claude-sonnet-4-5"),
+        "metadata must retain the original public model for metering"
     );
     let parsed: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(parsed["model"], "vertex/claude-sonnet-4-5");
+    assert_eq!(
+        parsed["model"], "vertex/claude-sonnet-4-5",
+        "the backend body must carry the configured target model"
+    );
 }
 
 #[tokio::test]
@@ -82,10 +90,23 @@ async fn mapping_ignores_unknown_models_and_non_matching_paths() {
         let mut body = Some(original.clone());
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-        assert!(matches!(action, FilterAction::Continue));
-        assert_eq!(body.as_ref(), Some(&original), "{path} {model}");
-        assert!(ctx.request_headers_to_set.is_empty());
-        assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "an unmapped request must continue to its fallback"
+        );
+        assert_eq!(
+            body.as_ref(),
+            Some(&original),
+            "an unmapped body must remain unchanged: {path} {model}"
+        );
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "an unmapped request must not acquire a provider selector"
+        );
+        assert!(
+            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+            "an unmapped request must not acquire mapped-model metadata"
+        );
     }
 }
 
@@ -97,11 +118,15 @@ async fn mapping_matches_path_without_query_string() {
     let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "query parameters must not prevent model mapping"
+    );
     assert!(
         ctx.request_headers_to_set
             .iter()
-            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") })
+            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") }),
+        "a mapped path with a query must still select the vertex provider"
     );
 }
 
@@ -118,7 +143,10 @@ async fn mapping_joins_an_already_active_ordered_mutation_log() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "mapping must continue when an ordered mutation log is already active"
+    );
     assert!(
         ctx.request_headers_to_set
             .iter()
@@ -149,7 +177,10 @@ async fn mapping_does_not_activate_the_ordered_mutation_log() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "mapping must continue without activating ordered mutation mode"
+    );
     assert!(
         ctx.pre_read_mutations.is_empty(),
         "writing the ordered log would make core drop other filters' grouped mutations"
@@ -173,14 +204,24 @@ async fn mapping_clears_stale_selector_and_metadata_before_early_returns() {
             HeaderValue::from_static("spoofed"),
         ));
         let mut body = Some(Bytes::copy_from_slice(raw.as_bytes()));
-        assert!(matches!(
-            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-            FilterAction::Continue
-        ));
-        assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
-        assert!(ctx.request_headers_to_remove.contains(&PROVIDER_HEADER));
         assert!(
-            matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER)
+            matches!(
+                filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+                FilterAction::Continue
+            ),
+            "early returns must preserve request processing: {path} {raw}"
+        );
+        assert!(
+            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+            "every early return must clear stale public-model metadata"
+        );
+        assert!(
+            ctx.request_headers_to_remove.contains(&PROVIDER_HEADER),
+            "every early return must queue stale selector removal"
+        );
+        assert!(
+            matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER),
+            "stale selector removal must follow earlier ordered mutations"
         );
     }
 }
