@@ -238,14 +238,15 @@ mod tests {
         let unchanged =
             b": ping\r\nid: second\r\nretry: 2000\r\nevent: content_block_delta\r\ndata: first\r\ndata: second\r\n\r\n"
                 .to_vec();
-        let frames = vec![start, unchanged.clone()];
+        let multiline_json = b"event: content_block_delta\ndata: {\ndata: \"type\":\"content_block_delta\",\ndata: \"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\ndata: }\n\n".to_vec();
+        let frames = vec![start, unchanged.clone(), multiline_json.clone()];
         let out = rebuild_sse_frames(&frames, Some("vertex/model"), true);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"model\":\"vertex/model\""));
         assert!(text.starts_with(": start\nid: first\nretry: 1000\n"));
         assert!(
-            text.as_bytes().ends_with(&unchanged),
-            "unmodified frames must preserve all wire bytes"
+            text.as_bytes().ends_with(&[unchanged, multiline_json].concat()),
+            "unmodified frames must preserve multiline JSON and all wire bytes"
         );
     }
 

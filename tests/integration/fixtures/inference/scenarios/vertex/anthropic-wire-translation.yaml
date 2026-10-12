@@ -1,7 +1,7 @@
 version: 1
 id: vertex/anthropic-wire-translation
 description: Controlled Vertex Google error translation and streaming model restoration
-  preserve SSE identifiers, retry fields, and multiline data.
+  preserve SSE identifiers and retry fields.
 protocol: anthropic_messages
 example_config: vertex/messages-to-anthropic.yaml
 upstream_authority: 127.0.0.1:3000
@@ -13,7 +13,7 @@ turns:
   request:
     method: POST
     path: /v1/messages
-    headers: &id002
+    headers:
       content-type:
       - application/json
     body:
@@ -29,13 +29,15 @@ turns:
     client_body_kind: json
     upstream_path: /v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict
     upstream_body_kind: json
-    client_sse_events: &id001 []
-    upstream_sse_events: *id001
+    client_sse_events: []
+    upstream_sse_events: []
 - name: stream-fields
   request:
     method: POST
     path: /v1/messages
-    headers: *id002
+    headers:
+      content-type:
+      - application/json
     body:
       kind: json
       value:
@@ -50,8 +52,19 @@ turns:
     client_body_kind: sse
     upstream_path: /v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict
     upstream_body_kind: json
-    client_sse_events: &id003
+    client_sse_events:
     - message_start
+    - content_block_start
+    - ping
     - content_block_delta
+    - content_block_stop
+    - message_delta
     - message_stop
-    upstream_sse_events: *id003
+    upstream_sse_events:
+    - message_start
+    - content_block_start
+    - ping
+    - content_block_delta
+    - content_block_stop
+    - message_delta
+    - message_stop

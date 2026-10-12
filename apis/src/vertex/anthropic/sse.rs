@@ -118,6 +118,7 @@ mod tests {
             b": ping\r\nid: 3\r\ndata: hi\r\n\r\n".as_slice(),
             b"data: hi\r\r",
             b"data: hi\n\n",
+            b"event: content_block_delta\ndata: {\ndata: \"type\":\"content_block_delta\",\ndata: \"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\ndata: }\n\n",
         ] {
             for split in 0..=source.len() {
                 let (first, second) = source.split_at(split);

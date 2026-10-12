@@ -10,7 +10,9 @@
   },
   "normalization": {
     "version": 1,
-    "linked_ids": {}
+    "linked_ids": {
+      "msg_recorded_0001": "msg_recorded_0001"
+    }
   },
   "turns": [
     {
@@ -139,15 +141,39 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"message\":{\"model\":\"vertex/claude-sonnet-4-5\"},\"type\":\"message_start\"}",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"vertex/claude-sonnet-4-5\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}},\"type\":\"message_start\"}",
                 "id": "start-one",
                 "retry": 1000
               },
               {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "ping",
+                "data": "{\"type\":\"ping\"}",
+                "id": null,
+                "retry": null
+              },
+              {
                 "event": "content_block_delta",
-                "data": "{\n\"type\":\"content_block_delta\",\n\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\n}",
+                "data": "{\"delta\":{\"text\":\"hi\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": "delta-one",
                 "retry": 2000
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}",
+                "id": null,
+                "retry": null
               },
               {
                 "event": "message_stop",
@@ -196,15 +222,39 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\"}}",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"claude-sonnet-4-5-20250929\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}},\"type\":\"message_start\"}",
                 "id": "start-one",
                 "retry": 1000
               },
               {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "ping",
+                "data": "{\"type\":\"ping\"}",
+                "id": null,
+                "retry": null
+              },
+              {
                 "event": "content_block_delta",
-                "data": "{\n\"type\":\"content_block_delta\",\n\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\n}",
+                "data": "{\"delta\":{\"text\":\"hi\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": "delta-one",
                 "retry": 2000
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}",
+                "id": null,
+                "retry": null
               },
               {
                 "event": "message_stop",
