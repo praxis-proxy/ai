@@ -1942,6 +1942,8 @@ jobs:
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Start keyed vLLM for OpenCode
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
           # Keyed deliberately: the credential-isolation proof requires the
@@ -1960,7 +1962,7 @@ jobs:
           "$CONTAINER_RUNTIME" run -d --name vllm-opencode \
             "${gpu_args[@]}" --ipc=host -p 8000:8000 \
             -v "$cache_mount" \
-            -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
+            -e HUGGING_FACE_HUB_TOKEN \
             -e VLLM_API_KEY="${VLLM_API_KEY}" \
             "${OPENCODE_VLLM_IMAGE}" \
             ${OPENCODE_VLLM_FLAGS} \
@@ -2117,6 +2119,10 @@ jobs:
             ${{ runner.temp }}/opencode-vllm.log
           if-no-files-found: ignore
           retention-days: 7
+          # A failed-job re-run keeps GITHUB_RUN_ID and increments the attempt;
+          # without overwrite the action rejects the existing artifact name and
+          # the summary would consume the previous attempt's stale upload.
+          overwrite: true
 
       - name: Capture OpenCode acceptance scenarios
         if: ${{ always() }}
@@ -2153,6 +2159,9 @@ jobs:
           path: ${{ runner.temp }}/opencode-acceptance.json
           if-no-files-found: ignore
           retention-days: 7
+          # See the diagnostics upload above: a re-run must replace, not collide
+          # with, the prior attempt's results so the summary reads this attempt.
+          overwrite: true
 
       - name: Tear down OpenCode network namespace
         if: ${{ always() }}

@@ -604,9 +604,11 @@ kill "$PRAXIS_PID"
   OpenCode needs no egress beyond Praxis itself, and completes normally in a
   loopback-only network namespace.
 - OpenCode sends requests with no `Authorization` header and the gateway
-  answers `401`, but the client reports success: the `praxis-auth.ts` `config`
-  hook threw and was swallowed. Re-run with `--print-logs` and look for
-  `plugin config hook failed`. Usual causes are an unset
+  answers `401`, with no plugin error in the default output: the
+  `praxis-auth.ts` `config` hook threw and was swallowed, so no auth was
+  attached. The turn fails, but the `401` reads like an ordinary gateway
+  rejection rather than a plugin failure. Re-run with `--print-logs` and look
+  for `plugin config hook failed`. Usual causes are an unset
   `GATEWAY_AUTH_PASSWORD` or a `PRAXIS_BASE_URL` that does not exactly match
   the merged `baseURL`.
 - OpenCode reaches api.openai.com instead of Praxis, or asks for

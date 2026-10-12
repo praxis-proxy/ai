@@ -445,10 +445,18 @@ fn native_vllm_protocol_is_scoped_to_messages() {
         .find(|f| f.filter_type == "anthropic_messages_protocol")
         .expect("chain should contain anthropic_messages_protocol");
 
-    assert!(
-        !protocol.conditions.is_empty(),
+    let condition = protocol.conditions.first().expect(
         "anthropic_messages_protocol must be gated by a path condition so it does not \
-         inject anthropic-version onto the chat-completions path"
+         inject anthropic-version onto the chat-completions path",
+    );
+    let praxis_core::config::Condition::When(predicate) = condition else {
+        panic!("the protocol filter must be gated by a `when` condition, got {condition:?}");
+    };
+    assert_eq!(
+        predicate.path_prefix.as_deref(),
+        Some("/v1/messages"),
+        "anthropic_messages_protocol must be scoped to the native Anthropic path, not the \
+         chat-completions path OpenCode uses"
     );
 }
 
@@ -459,17 +467,19 @@ fn native_vllm_forwards_chat_body_unchanged() {
     let config = native_vllm_config(proxy_port, backend.port());
     let proxy = start_proxy(&config);
 
-    let request = opencode_chat_body();
+    let body = opencode_chat_body().to_string();
     let raw = http_send(
         proxy.addr(),
-        &json_post_with_header(CHAT_PATH, &request.to_string(), &gateway_auth_line()),
+        &json_post_with_header(CHAT_PATH, &body, &gateway_auth_line()),
     );
 
     assert_eq!(parse_status(&raw), 200, "chat-completions request should return 200");
-    let forwarded: serde_json::Value =
-        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    // Compare the raw captured bytes, not reparsed JSON: a Value round-trip would
+    // mask any whitespace or key-order rewrite, which is exactly the translation
+    // this native-passthrough config must never perform.
     assert_eq!(
-        forwarded, request,
+        backend.body(),
+        body,
         "backend must receive the Chat Completions body byte-for-byte, with no translation"
     );
 
@@ -727,13 +737,13 @@ const CHAT_STREAM_FINAL_EVENTS: &str = concat!(
 
 #[test]
 fn native_vllm_streams_chat_sse_incrementally_before_upstream_eof() {
-    // The chat path crosses `anthropic_messages_format`, which reads the body in
-    // `StreamBuffer` mode. If that filter (or anything else on this chain) ever
-    // buffers a chat response to completion, OpenCode's TUI hangs with no other
-    // symptom — no error, no log, just a stalled turn. Same gated-backend
-    // technique as the Anthropic streaming test: the backend only sends EOF
-    // AFTER the client reports seeing a frame, so a buffering proxy deadlocks
-    // and the `observed` receive times out.
+    // The only body-reading AI filter on this chain is `anthropic_messages_request`,
+    // which declares `BodyMode::StreamBuffer` for the *request* body. The SSE risk is
+    // the response direction: if that filter — or anything else on this chain — ever
+    // buffered a chat *response* to completion, OpenCode's TUI would hang with no other
+    // symptom — no error, no log, just a stalled turn. Same gated-backend technique as
+    // the Anthropic streaming test: the backend only sends EOF AFTER the client reports
+    // seeing a frame, so a buffering proxy deadlocks and the `observed` receive times out.
     let (backend_port, first_sent, release, backend_thread) = start_gated_sse_backend(
         vec![CHAT_STREAM_FIRST_EVENTS.to_owned()],
         vec![CHAT_STREAM_FINAL_EVENTS.to_owned()],
