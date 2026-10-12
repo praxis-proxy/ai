@@ -152,6 +152,17 @@ flakes:
   valid exchange, tool_use suppressed) and the turn exits `success`, but the 8B
   model then synthesizes **no** final answer from the results (`result:"\n\n"`).
 
+> Root cause of the Oct 10–12 2026 red run — a test-infra bug, not either model
+> limit above. Issue #1389 moved the Tavily credential from a body `api_key`
+> field to an `Authorization: Bearer` header, but the loopback capture-relay
+> (`tests/utils/src/tavily_relay.rs`) still forwarded only the body, so real
+> Tavily answered **401** and the managed loop fell back to an `is_error` tool
+> result — surfacing as the empty-answer shape above. The relay now forwards the
+> `Authorization` header verbatim and records it, and the oracle validates the
+> resolved key travels there (a **proxy regression**, below, if it is missing or
+> wrong), so a dropped credential fails hard instead of masquerading as a model
+> limit.
+
 Praxis's server-side Tavily resolution is proven on every run by the
 **forced-tool-choice** SDK web-search tests, which set
 `tool_choice={type:tool,name:WebSearch}` to open the loop reliably on a small
@@ -169,8 +180,10 @@ the proxy owns, XFAIL only the model-completion outcome.** The
 - **Proxy regression — hard on every model.** A leaked `WebSearch` tool_use (the
   managed loop must suppress it), an `is_error` flag on an otherwise-successful
   turn, or any Tavily exchange that *did* run being malformed or failed (non-200,
-  wrong key, empty query, empty/relative-URL results). These are checked **first**
-  and always, so a broken managed loop can never hide behind the limitation.
+  the resolved key missing from the forwarded `Authorization: Bearer` header per
+  issue #1389, empty query, empty/relative-URL results). These are checked
+  **first** and always, so a broken managed loop or relay can never hide behind the
+  limitation.
 - **Model incomplete — XFAIL on `WEB_SEARCH_XFAIL_MODEL` (`qwen3-8b`), hard on a
   capable model.** The turn did not converge, the model never called `WebSearch`
   (no Tavily exchange), or it got real results and produced no usable final

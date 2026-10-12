@@ -2510,23 +2510,33 @@ fn redact_api_key(request: &Value) -> Value {
     redacted
 }
 
+/// Describes a forwarded `Authorization` header without ever printing its secret
+/// value. Issue #1389 moved the Tavily credential into this header, so — like
+/// [`redact_api_key`] — the value must never reach a panic or `Err` string that
+/// GitHub tees into an unscrubbed build artifact. Returns a `'static` label, so
+/// no part of the real header can leak through formatting.
+fn redact_authorization(authorization: Option<&str>) -> &'static str {
+    match authorization {
+        None => "no Authorization header",
+        Some(value) if value.starts_with("Bearer ") => "Authorization: Bearer <redacted>",
+        Some(_) => "Authorization: <redacted>",
+    }
+}
+
 /// Why a web-search turn failed its oracle, split by who is responsible.
 ///
 /// The distinction decides whether the failure is a hard error on every model or
 /// an accepted XFAIL on the known-limited backend (see [`run_web_search_flow`]):
 ///
-///   * [`WebSearchFailure::ProxyRegression`] — Praxis did something wrong, and the
-///     turn fails hard on **every** model. These are the invariants the proxy owns
-///     regardless of how capable the backend is: it must suppress the managed
-///     `WebSearch` tool_use, must not report a client-side error on an otherwise
-///     successful turn, and any Tavily search it DID dispatch must be a real,
-///     correct exchange.
-///   * [`WebSearchFailure::ModelIncomplete`] — the backend did not finish the turn:
-///     it never converged, never emitted the `WebSearch` call so no search ran, or
-///     got real results back and still produced no usable final answer. This is the
-///     documented Qwen3-8B limitation (the real client sends `tool_choice: null`
-///     and the 8B model does not reliably drive the loop), so it is an accepted
-///     XFAIL on [`WEB_SEARCH_XFAIL_MODEL`] and a hard failure on a capable model.
+///   * [`WebSearchFailure::ProxyRegression`] — Praxis did something wrong, and the turn fails hard on **every** model.
+///     These are the invariants the proxy owns regardless of how capable the backend is: it must suppress the managed
+///     `WebSearch` tool_use, must not report a client-side error on an otherwise successful turn, and any Tavily search
+///     it DID dispatch must be a real, correct exchange.
+///   * [`WebSearchFailure::ModelIncomplete`] — the backend did not finish the turn: it never converged, never emitted
+///     the `WebSearch` call so no search ran, or got real results back and still produced no usable final answer. This
+///     is the documented Qwen3-8B limitation (the real client sends `tool_choice: null` and the 8B model does not
+///     reliably drive the loop), so it is an accepted XFAIL on [`WEB_SEARCH_XFAIL_MODEL`] and a hard failure on a
+///     capable model.
 #[derive(Debug, PartialEq)]
 enum WebSearchFailure {
     ProxyRegression(String),
@@ -2556,9 +2566,10 @@ impl WebSearchFailure {
 ///     final summary, and no `WebSearch` `tool_use` leaked to the client (the managed loop resolves and suppresses it;
 ///     a leak means Praxis did not take over the tool); and
 ///   * GROUND TRUTH — the capture-relay observed at least one real Tavily exchange: HTTP 200, the resolved API key
-///     carried in the request body, a non-empty reconstructed query, and a non-empty `results` array whose every source
-///     has an absolute URL. This is what a client-only assertion cannot prove, because the managed loop falls back to
-///     an `is_error` tool result on provider failure and the client would still "get an answer".
+///     carried in the `Authorization: Bearer` header (issue #1389), a non-empty reconstructed query, and a non-empty
+///     `results` array whose every source has an absolute URL. This is what a client-only assertion cannot prove,
+///     because the managed loop falls back to an `is_error` tool result on provider failure and the client would still
+///     "get an answer".
 fn check_server_side_web_search(
     stdout: &str,
     captures: &[TavilySearchCapture],
@@ -2597,10 +2608,16 @@ fn check_server_side_web_search(
                 exchange.status, exchange.response,
             )));
         }
-        if exchange.request.get("api_key").and_then(Value::as_str) != Some(tavily_key) {
+        // Issue #1389 moved the Tavily credential from a body `api_key` field to
+        // an `Authorization: Bearer <key>` header; the relay must forward that
+        // header verbatim or real Tavily answers 401. Validate the resolved key
+        // travels there, redacting the value so it never reaches an artifact log.
+        let expected_authorization = format!("Bearer {tavily_key}");
+        if exchange.authorization.as_deref() != Some(expected_authorization.as_str()) {
             return Err(WebSearchFailure::ProxyRegression(format!(
-                "the resolved Tavily key must travel in the forwarded request body; request was {}",
-                redact_api_key(&exchange.request),
+                "the resolved Tavily key must travel as an `Authorization: Bearer` header per issue #1389; \
+                 the relay forwarded {}",
+                redact_authorization(exchange.authorization.as_deref()),
             )));
         }
         let query = exchange
@@ -2756,9 +2773,13 @@ const SUPPRESSED_WEB_SEARCH_STDOUT: &str = r#"{"type":"assistant","message":{"co
 {"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"Argentina won the most recent FIFA World Cup, in 2022."}"#;
 
 /// Builds one observed Tavily exchange for the checker's ground-truth assertions.
-fn tavily_capture(api_key: &str, query: &str, result_url: &str) -> TavilySearchCapture {
+///
+/// `auth_key` is the credential carried in the `Authorization: Bearer` header —
+/// per issue #1389 the key no longer travels in the request body.
+fn tavily_capture(auth_key: &str, query: &str, result_url: &str) -> TavilySearchCapture {
     TavilySearchCapture {
-        request: serde_json::json!({ "api_key": api_key, "query": query }),
+        request: serde_json::json!({ "query": query }),
+        authorization: Some(format!("Bearer {auth_key}")),
         status: 200,
         response: serde_json::json!({ "results": [{ "url": result_url }] }),
     }
@@ -2788,9 +2809,15 @@ fn web_search_check_rejects_leaked_client_side_tool_use() {
     let captures = [tavily_capture("tvly-key", "fifa world cup", "https://fifa.com")];
 
     let error = check_server_side_web_search(stdout, &captures, "tvly-key").expect_err("a leaked WebSearch must fail");
-    assert!(error.reason().contains("suppress its tool_use"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("suppress its tool_use"),
+        "unexpected reason: {error:?}"
+    );
     // A leaked tool_use is the proxy failing its job: hard on every model.
-    assert!(matches!(error, WebSearchFailure::ProxyRegression(_)), "must be a proxy regression: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ProxyRegression(_)),
+        "must be a proxy regression: {error:?}"
+    );
 }
 
 #[test]
@@ -2798,9 +2825,15 @@ fn web_search_check_rejects_missing_tavily_exchange() {
     // The model converged without ever searching: no exchange was observed.
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &[], "tvly-key")
         .expect_err("a converged turn with no search must fail");
-    assert!(error.reason().contains("no Tavily exchange"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("no Tavily exchange"),
+        "unexpected reason: {error:?}"
+    );
     // Never calling WebSearch is the documented model limitation: XFAIL-able.
-    assert!(matches!(error, WebSearchFailure::ModelIncomplete(_)), "must be model-incomplete: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ModelIncomplete(_)),
+        "must be model-incomplete: {error:?}"
+    );
 }
 
 #[test]
@@ -2809,8 +2842,49 @@ fn web_search_check_rejects_mismatched_provider_key() {
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("a mismatched provider key must fail");
     assert!(
-        error.reason().contains("must travel in the forwarded request body"),
+        error
+            .reason()
+            .contains("must travel as an `Authorization: Bearer` header"),
         "unexpected reason: {error:?}"
+    );
+    // The redacted message must never print the real key, live or forwarded.
+    assert!(
+        !error.reason().contains("wrong-key"),
+        "the key must never leak: {error:?}"
+    );
+    // A wrong forwarded credential is proxy-owned ground truth: hard on every model.
+    assert!(
+        matches!(error, WebSearchFailure::ProxyRegression(_)),
+        "must be a proxy regression: {error:?}"
+    );
+}
+
+#[test]
+fn web_search_check_rejects_missing_authorization_header() {
+    // The exact relay regression behind the weekend 401s: issue #1389 moved the
+    // Tavily credential to an `Authorization: Bearer` header, and a relay that
+    // drops it makes real Tavily answer 401. A capture with no forwarded
+    // Authorization must fail hard, and the redacted message must never print a key.
+    let captures = [TavilySearchCapture {
+        request: serde_json::json!({ "query": "fifa world cup" }),
+        authorization: None,
+        status: 200,
+        response: serde_json::json!({ "results": [{ "url": "https://fifa.com" }] }),
+    }];
+    let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
+        .expect_err("a missing Authorization header must fail");
+    assert!(
+        error.reason().contains("`Authorization: Bearer` header"),
+        "unexpected reason: {error:?}"
+    );
+    assert!(
+        !error.reason().contains("tvly-key"),
+        "the key must never leak: {error:?}"
+    );
+    // A dropped credential header is proxy-owned ground truth: hard on every model.
+    assert!(
+        matches!(error, WebSearchFailure::ProxyRegression(_)),
+        "must be a proxy regression: {error:?}"
     );
 }
 
@@ -2835,7 +2909,10 @@ fn web_search_check_rejects_nonconvergent_subtype() {
         "unexpected reason: {error:?}"
     );
     // A non-convergent turn is the backend failing to drive the loop: XFAIL-able.
-    assert!(matches!(error, WebSearchFailure::ModelIncomplete(_)), "must be model-incomplete: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ModelIncomplete(_)),
+        "must be model-incomplete: {error:?}"
+    );
 }
 
 #[test]
@@ -2852,7 +2929,10 @@ fn web_search_check_rejects_client_reported_error() {
         "unexpected reason: {error:?}"
     );
     // A client-reported error on an otherwise-successful turn is proxy-owned: hard.
-    assert!(matches!(error, WebSearchFailure::ProxyRegression(_)), "must be a proxy regression: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ProxyRegression(_)),
+        "must be a proxy regression: {error:?}"
+    );
 }
 
 #[test]
@@ -2869,7 +2949,10 @@ fn web_search_check_rejects_short_final_summary() {
         "unexpected reason: {error:?}"
     );
     // A too-short answer is the backend not synthesizing: XFAIL-able.
-    assert!(matches!(error, WebSearchFailure::ModelIncomplete(_)), "must be model-incomplete: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ModelIncomplete(_)),
+        "must be model-incomplete: {error:?}"
+    );
 }
 
 #[test]
@@ -2881,14 +2964,21 @@ fn web_search_check_classifies_searched_but_empty_answer_as_model_incomplete() {
     // model-completion gap — XFAIL-able on the known-limited backend, not a hard
     // failure that would re-red the nightly.
     let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"\n\n"}"#;
-    let captures = [tavily_capture("tvly-key", "most recent FIFA World Cup winner", "https://fifa.com/worldcup")];
+    let captures = [tavily_capture(
+        "tvly-key",
+        "most recent FIFA World Cup winner",
+        "https://fifa.com/worldcup",
+    )];
     let error = check_server_side_web_search(stdout, &captures, "tvly-key")
         .expect_err("a searched-but-empty answer must still fail the oracle");
     assert!(
         error.reason().contains("must emit a non-empty final answer"),
         "unexpected reason: {error:?}"
     );
-    assert!(matches!(error, WebSearchFailure::ModelIncomplete(_)), "must be model-incomplete: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ModelIncomplete(_)),
+        "must be model-incomplete: {error:?}"
+    );
 }
 
 #[test]
@@ -2896,15 +2986,22 @@ fn web_search_check_rejects_non_200_tavily_status() {
     // The managed loop converged (an `is_error` tool result still "gets an
     // answer"), but the relay saw real Tavily reject the call: ground truth fails.
     let captures = [TavilySearchCapture {
-        request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup" }),
+        request: serde_json::json!({ "query": "fifa world cup" }),
+        authorization: Some("Bearer tvly-key".to_owned()),
         status: 401,
         response: serde_json::json!({ "error": "unauthorized" }),
     }];
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("a non-200 Tavily status must fail");
-    assert!(error.reason().contains("must return HTTP 200"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("must return HTTP 200"),
+        "unexpected reason: {error:?}"
+    );
     // A failed Tavily exchange is proxy-owned ground truth: hard on every model.
-    assert!(matches!(error, WebSearchFailure::ProxyRegression(_)), "must be a proxy regression: {error:?}");
+    assert!(
+        matches!(error, WebSearchFailure::ProxyRegression(_)),
+        "must be a proxy regression: {error:?}"
+    );
 }
 
 #[test]
@@ -2912,13 +3009,17 @@ fn web_search_check_rejects_empty_search_query() {
     // A 200 with the right key but no reconstructed query means no real search
     // was dispatched.
     let captures = [TavilySearchCapture {
-        request: serde_json::json!({ "api_key": "tvly-key", "query": "   " }),
+        request: serde_json::json!({ "query": "   " }),
+        authorization: Some("Bearer tvly-key".to_owned()),
         status: 200,
         response: serde_json::json!({ "results": [{ "url": "https://fifa.com" }] }),
     }];
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("an empty search query must fail");
-    assert!(error.reason().contains("query must be populated"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("query must be populated"),
+        "unexpected reason: {error:?}"
+    );
 }
 
 #[test]
@@ -2926,13 +3027,17 @@ fn web_search_check_rejects_empty_results_array() {
     // A 200 with the right key and a query but no results means Tavily returned
     // nothing to ground the answer on.
     let captures = [TavilySearchCapture {
-        request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup" }),
+        request: serde_json::json!({ "query": "fifa world cup" }),
+        authorization: Some("Bearer tvly-key".to_owned()),
         status: 200,
         response: serde_json::json!({ "results": [] }),
     }];
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("an empty results array must fail");
-    assert!(error.reason().contains("non-empty results array"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("non-empty results array"),
+        "unexpected reason: {error:?}"
+    );
 }
 
 #[test]
@@ -2944,14 +3049,18 @@ fn web_search_check_rejects_a_later_failed_exchange_behind_a_valid_first() {
     let captures = [
         tavily_capture("tvly-key", "fifa world cup", "https://fifa.com"),
         TavilySearchCapture {
-            request: serde_json::json!({ "api_key": "tvly-key", "query": "fifa world cup final score" }),
+            request: serde_json::json!({ "query": "fifa world cup final score" }),
+            authorization: Some("Bearer tvly-key".to_owned()),
             status: 502,
             response: serde_json::json!({ "error": "bad gateway" }),
         },
     ];
     let error = check_server_side_web_search(SUPPRESSED_WEB_SEARCH_STDOUT, &captures, "tvly-key")
         .expect_err("a later failed exchange must fail even behind a valid first");
-    assert!(error.reason().contains("must return HTTP 200"), "unexpected reason: {error:?}");
+    assert!(
+        error.reason().contains("must return HTTP 200"),
+        "unexpected reason: {error:?}"
+    );
 }
 
 #[test]
