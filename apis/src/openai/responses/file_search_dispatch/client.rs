@@ -432,7 +432,7 @@ pub(crate) struct FileSearchClientConfig {
 
 /// Per-request binding of the outbound chain and downstream attributes.
 ///
-/// A [`FileSearchCalloutFilter`](super::FileSearchCalloutFilter) builds one of
+/// A [`FileSearchDispatchFilter`](super::FileSearchDispatchFilter) builds one of
 /// these from its bound outbound pipeline and the live request context, then
 /// hands it to [`FileSearchClient::search`] so the whole fan-out routes through
 /// the same filtered sub-request transport.

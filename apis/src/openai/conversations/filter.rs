@@ -549,7 +549,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         let response_state = ctx.get_filter_state::<ConversationResponseState>();
         if response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted) {
             // This filter is composed with other response-body consumers, such
-            // as `openai_response_store`. Releasing here drains a shared
+            // as `openai_responses_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can
             // turn a complete chunked response into several unpersistable
             // chunks (#1265). A filter that has no work for this exchange must

@@ -291,6 +291,20 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Read complete ordered history from an owner-scoped snapshot. SQL
+    /// backends decode item rows incrementally, without loading the retired cache
+    /// unless the conversation has only legacy cache data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when reading or decoding the history fails.
+    pub async fn conversation_history(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        self.store.conversation_history(&self.owner, conversation_id).await
+    }
+
     /// Return the subset of `item_ids` already present for this owner.
     ///
     /// # Errors
@@ -356,7 +370,7 @@ impl OwnerScopedStore {
         self.store.max_item_position(&self.owner, conversation_id).await
     }
 
-    /// Atomically insert items and rebuild this owner's message cache.
+    /// Atomically insert items and invalidate this owner's retired message cache.
     ///
     /// # Errors
     ///
@@ -375,7 +389,7 @@ impl OwnerScopedStore {
             .await
     }
 
-    /// Atomically delete an item and rebuild this owner's message cache.
+    /// Atomically delete an item and invalidate this owner's retired message cache.
     ///
     /// # Errors
     ///

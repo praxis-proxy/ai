@@ -1870,7 +1870,7 @@ fn make_filter(port: u16, extra: &str) -> Box<dyn HttpFilter> {
     Box::new(make_concrete_filter(port, extra))
 }
 
-fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
+fn make_concrete_filter(port: u16, extra: &str) -> FileSearchDispatchFilter {
     make_concrete_filter_with_outbound(port, extra, test_outbound_pipeline())
 }
 
@@ -1878,7 +1878,7 @@ fn make_concrete_filter_with_outbound(
     port: u16,
     extra: &str,
     outbound: Arc<FilterPipeline>,
-) -> FileSearchCalloutFilter {
+) -> FileSearchDispatchFilter {
     // Parse budgets/policy through the real config path with a DNS placeholder URL,
     // then repoint the client at the in-process `MockServer`. The supplied outbound
     // pipeline decides whether the runtime SSRF hook allows the loopback dial.
@@ -1895,7 +1895,7 @@ fn make_concrete_filter_with_outbound(
         max_total_response_bytes: validated.max_total_response_bytes,
         timeout: validated.timeout,
     });
-    FileSearchCalloutFilter {
+    FileSearchDispatchFilter {
         client,
         outbound,
         max_state_bytes: validated.max_state_bytes,

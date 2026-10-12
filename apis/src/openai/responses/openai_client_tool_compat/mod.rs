@@ -211,10 +211,10 @@ const TOOL_SEARCH_DEFAULT_QUERY_DESCRIPTION: &str = "A concise description of th
 /// Hosted-tool call NAMES a downstream filter silently re-routes by name, so a
 /// client tool may not lower to any of them (see [`reject_reserved_hosted_tool_name`]).
 /// A backend `function_call` named `file_search` is rewritten into a hosted
-/// `file_search_call` (`agentic_loop` → `file_search_callout`); one named
+/// `file_search_call` (`agentic_loop` → `file_search_dispatch`); one named
 /// `web_search` trips the Chat-Completions web-search collision reject and aliases
 /// the proxy's synthesized web-search bridge. These mirror the un-centralized
-/// sentinels in `translation/chat_completions.rs` and `file_search_callout`.
+/// sentinels in `translation/chat_completions.rs` and `file_search_dispatch`.
 const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
 
 // -----------------------------------------------------------------------------
@@ -245,8 +245,8 @@ const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
 ///
 /// - `openai_responses_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`,
 ///   which already holds the lowered tools; or
-/// - `responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c reads the
-///   outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
+/// - `openai_responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c
+///   reads the outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
 ///   `request_body` view, so the backend receives valid `function` declarations while canonical `state.tools` stays
 ///   rich for restore.
 ///
@@ -684,7 +684,7 @@ fn enforce_rewrite_cap(
     original_tool_choice: &Value,
     max_rewritten_body_bytes: usize,
 ) -> Result<Vec<Value>, FilterAction> {
-    let outbound_len = match super::openai_responses_proxy::serialized_outbound_body_len(state) {
+    let outbound_len = match super::responses_proxy::serialized_outbound_body_len(state) {
         Ok(len) => len,
         Err(error) => {
             restore_request_tools_and_choice(state, original_tools, original_tool_choice);
@@ -775,8 +775,10 @@ fn restoration_armed(ctx: &HttpFilterContext<'_>) -> bool {
 /// to genuinely different backend declarations: the correct declaration is then
 /// ambiguous, so lowering it silently could hoist the wrong contract onto the
 /// backend.
-fn collect_discovered_tools(messages: &[Value]) -> Result<Vec<Value>, FilterAction> {
-    let lowered_call_ids = client_executed_call_ids(messages);
+fn collect_discovered_tools<'a>(
+    messages: impl IntoIterator<Item = &'a Value> + Clone + 'a,
+) -> Result<Vec<Value>, FilterAction> {
+    let lowered_call_ids = client_executed_call_ids(messages.clone());
     let mut seen: HashMap<(String, String), Value> = HashMap::new();
     let mut discovered = Vec::new();
     for item in messages {
@@ -1086,7 +1088,7 @@ fn lower_history_only(state: &mut ResponsesState, max_rewritten_body_bytes: usiz
 /// history is not rolled back: the request is rejected before any upstream call,
 /// so the mutated state is discarded rather than sent.
 fn enforce_history_rewrite_cap(state: &ResponsesState, max_rewritten_body_bytes: usize) -> Result<(), FilterAction> {
-    let outbound_len = super::openai_responses_proxy::serialized_outbound_body_len(state).map_err(|error| {
+    let outbound_len = super::responses_proxy::serialized_outbound_body_len(state).map_err(|error| {
         FilterAction::Reject(responses_error_rejection(
             500,
             "server_error",
@@ -2124,12 +2126,26 @@ fn lower_namespaced_tool_choice(
 /// Lower every typed *client-owned* history item to the function shape a
 /// function-only backend accepts. Returns whether any item changed, or fails
 /// closed on a prior history item this adapter cannot lower.
-fn lower_history_items(messages: &mut [Value]) -> Result<bool, FilterAction> {
-    reject_unsupported_history_items(messages)?;
-    let lowered_call_ids = client_executed_call_ids(messages);
+fn lower_history_items(messages: &mut super::history::MessageHistory) -> Result<bool, FilterAction> {
+    reject_unsupported_history_items(messages.iter())?;
+    let lowered_call_ids = client_executed_call_ids(messages.iter());
     let mut changed = false;
-    for item in messages.iter_mut() {
-        changed |= lower_history_item(item, &lowered_call_ids);
+    for index in 0..messages.len() {
+        let needs_lowering = messages
+            .get(index)
+            .is_some_and(|item| match item.get("type").and_then(Value::as_str) {
+                Some("custom_tool_call" | "custom_tool_call_output") => true,
+                Some("shell_call" | "tool_search_call") => is_client_executed_tool_call(item),
+                Some("shell_call_output" | "tool_search_output") => output_call_was_lowered(item, &lowered_call_ids),
+                Some("function_call") => item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .is_some_and(|namespace| !namespace.is_empty()),
+                _ => false,
+            });
+        if needs_lowering && let Some(item) = messages.get_mut(index) {
+            changed |= lower_history_item(item, &lowered_call_ids);
+        }
     }
     Ok(changed)
 }
@@ -2142,7 +2158,9 @@ fn lower_history_items(messages: &mut [Value]) -> Result<bool, FilterAction> {
 /// (`local_shell_call`/`local_shell_call_output`) are rejected here so an earlier
 /// turn's unsupported call can never reach the backend unchanged on a
 /// continuation. Full `local_shell` lowering/restoration is a follow-up.
-fn reject_unsupported_history_items(messages: &[Value]) -> Result<(), FilterAction> {
+fn reject_unsupported_history_items<'a>(
+    messages: impl IntoIterator<Item = &'a Value> + 'a,
+) -> Result<(), FilterAction> {
     for item in messages {
         if matches!(
             item.get("type").and_then(Value::as_str),
@@ -2157,7 +2175,7 @@ fn reject_unsupported_history_items(messages: &[Value]) -> Result<(), FilterActi
 /// Collect the `call_id`s of client-executed `shell_call`/`tool_search_call`
 /// history items so their matching outputs are lowered in lockstep, while
 /// server/container-owned calls (and their outputs) are left untouched.
-fn client_executed_call_ids(messages: &[Value]) -> HashSet<String> {
+fn client_executed_call_ids<'a>(messages: impl IntoIterator<Item = &'a Value> + 'a) -> HashSet<String> {
     let mut ids = HashSet::new();
     for item in messages {
         let is_gated_call = matches!(
@@ -2767,7 +2785,7 @@ fn reject_reserved_top_level_name(tool: &Value) -> Result<(), FilterAction> {
 /// silently re-routes by name ([`RESERVED_HOSTED_TOOL_NAMES`]).
 ///
 /// A backend `function_call` named `file_search` is normalized into a hosted
-/// `file_search_call` by the agentic loop (`file_search_callout`), and one named
+/// `file_search_call` by the agentic loop (`file_search_dispatch`), and one named
 /// `web_search` both trips the Chat-Completions web-search collision reject and
 /// aliases the proxy's synthesized web-search bridge. Lowering a client tool to
 /// either bare name would let a client-owned call be misclassified as hosted. Each

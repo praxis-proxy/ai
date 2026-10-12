@@ -16,7 +16,7 @@ use crate::store::StoreCompressionConfig;
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 
 /// Filter name used in SSRF validation error messages.
-const FILTER_NAME: &str = "openai_response_store";
+const FILTER_NAME: &str = "openai_responses_store";
 
 /// Default cap on the number of SSE events retained in a streamed response's
 /// replay log.

@@ -14,7 +14,7 @@
 #     survives step transitions.
 #   - openai_responses_request.format (metadata) does not.
 #
-# Because responses_to_chat_completions reads both metadata and
+# Because openai_responses_to_chat_completions reads both metadata and
 # extensions, each step must re-run openai_responses_request to
 # repopulate its metadata. Without it the translation filter returns
 # 500: "request pipeline state is unavailable".
@@ -25,7 +25,7 @@
 #                                        cache the parse
 #   2. openai_responses_request (owner)  reuse the parse, set metadata
 #                                        + ResponsesState extension
-#   3. responses_to_chat_completions     translate body using both
+#   3. openai_responses_to_chat_completions  translate body using both
 #   4. path_rewrite                      /v1/responses -> /v1/chat/completions
 #   5. router                            select cluster
 #   6. credential_injection              inject per-cluster credentials
@@ -106,7 +106,7 @@ filter_chains:
                   model: ~
                   stream: ~
                   mode: ~
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
               - filter: path_rewrite
                 replace:
@@ -149,7 +149,7 @@ filter_chains:
                   model: ~
                   stream: ~
                   mode: ~
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
               - filter: path_rewrite
                 replace:

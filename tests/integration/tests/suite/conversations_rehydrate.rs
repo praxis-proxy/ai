@@ -380,7 +380,7 @@ filter_chains:
           stream: ~
           mode: ~
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: test_responses

@@ -25,7 +25,7 @@ use std::{
 use praxis_ai_store::PendingApprovalRecord;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::{StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name};
+use crate::{StateOwner, hash::Sha256, openai::responses::mcp_tool_resolve::encode_function_name};
 
 // -----------------------------------------------------------------------------
 // Approval Response Round Trip
@@ -124,8 +124,10 @@ pub(crate) fn is_approval_response(item: &serde_json::Value) -> bool {
 ///
 /// Returns references into `messages`; the caller only reads the items to
 /// correlate them, so there is no need to clone the request-derived JSON.
-pub(crate) fn extract_approval_responses(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    messages.iter().filter(|m| is_approval_response(m)).collect()
+pub(crate) fn extract_approval_responses<'a>(
+    messages: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Vec<&'a serde_json::Value> {
+    messages.into_iter().filter(|m| is_approval_response(m)).collect()
 }
 
 /// Parse a client-supplied `mcp_approval_response` into its trusted fields.

@@ -67,7 +67,7 @@ fn assert_fips_host_outcome(ok: bool, stderr: &str) {
             stderr.contains("PRAXIS_REQUIRE_FIPS"),
             "the refusal must name the variable, got: {stderr}"
         );
-        for filter in ["`policy` filter", "`openai_response_store` filter"] {
+        for filter in ["`policy` filter", "`openai_responses_store` filter"] {
             assert_eq!(
                 stderr.contains(filter),
                 reason.contains(filter),

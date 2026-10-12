@@ -1,5 +1,9 @@
 name: Build vLLM GPU image
-description: Build the model-baked GPU image used by the container and full-suite workflows.
+description: >-
+  Build the model-baked GPU image used by the container and full-suite
+  workflows, stamping the build inputs onto the image as OCI labels. The labels
+  are what resolve-vllm-gpu-image compares a published image against, so a
+  consumer can tell whether the registry already holds this exact build.
 inputs:
   model:
     description: Hugging Face model ID to bake into the image.
@@ -30,9 +34,21 @@ runs:
         HF_TOKEN: ${{ inputs.hugging-face-token }}
       run: |
         set -euo pipefail
+        # Provenance stamped onto the image so a consumer can decide whether the
+        # published build already matches its checkout without rebuilding it.
+        # The base image is read out of the Containerfile rather than repeated
+        # here, so a FROM bump cannot leave the recorded value behind.
+        containerfile_sha256="$(sha256sum vllm/Containerfile | awk '{print $1}')"
+        base_image="$(awk '/^FROM /{print $2; exit}' vllm/Containerfile)"
         build_args=(
           --build-arg "INFERENCE_MODEL=${INFERENCE_MODEL}"
           --build-arg "INFERENCE_REVISION=${INFERENCE_REVISION}"
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+          --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          --label "praxis.vllm.containerfile-sha256=${containerfile_sha256}"
+          --label "praxis.vllm.base-image=${base_image}"
+          --label "praxis.vllm.inference-model=${INFERENCE_MODEL}"
+          --label "praxis.vllm.inference-revision=${INFERENCE_REVISION}"
           --tag "$IMAGE"
           --file vllm/Containerfile
         )

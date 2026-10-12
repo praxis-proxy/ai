@@ -579,6 +579,9 @@ async fn resolves_history_when_current_input_has_no_file_id() {
     let mut state = ResponsesState::from_request_body(request_body.clone());
     state.messages.insert(0, history.clone());
     state.persisted_messages.insert(0, history);
+    state.messages = state.persisted_messages.clone();
+    let stored_snapshot = state.persisted_messages.clone();
+    let original_history = serde_json::to_value(&stored_snapshot).unwrap();
     ctx.extensions.insert(state);
     let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
     let mut body = Some(original.clone());
@@ -591,6 +594,11 @@ async fn resolves_history_when_current_input_has_no_file_id() {
     );
     assert_eq!(body, Some(original), "current request body should remain unchanged");
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(serde_json::to_value(&stored_snapshot).unwrap(), original_history);
+    let stored_handles: Vec<_> = stored_snapshot.shared_items().collect();
+    let replay_handles: Vec<_> = state.messages.shared_items().collect();
+    assert!(!Arc::ptr_eq(stored_handles[0], replay_handles[0]));
+    assert!(Arc::ptr_eq(stored_handles[1], replay_handles[1]));
     for resolved_history in [&state.messages[0], &state.persisted_messages[0]] {
         let part = &resolved_history["content"][0];
         assert!(

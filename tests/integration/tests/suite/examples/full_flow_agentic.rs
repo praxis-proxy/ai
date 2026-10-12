@@ -579,7 +579,7 @@ fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses()
 /// Streaming persistence and retrieval, end to end. A `stream: true` create
 /// request routes through the IRR, where openai_stream_events accumulates the
 /// native Responses SSE lifecycle into `ResponsesState.response_object`. The
-/// pre-IRR openai_response_store then persists that accumulated object on the
+/// pre-IRR openai_responses_store then persists that accumulated object on the
 /// response path, so the streamed resource is retrievable via
 /// `GET /v1/responses/{id}`. Without the in-IRR accumulator the object stays
 /// null and persistence is silently skipped (the store logs "response_object is
@@ -2026,9 +2026,9 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
         .collect();
 
     for dispatcher in [
-        "openai_web_search",
+        "openai_web_search_dispatch",
         "openai_mcp_dispatch",
-        "openai_file_search_callout",
+        "openai_file_search_dispatch",
         "openai_agentic_loop",
     ] {
         assert!(
@@ -2100,8 +2100,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_web_search"))
-        .expect("IRR inference step should contain openai_web_search");
+        .find(|filter| filter["filter"].as_str() == Some("openai_web_search_dispatch"))
+        .expect("IRR inference step should contain openai_web_search_dispatch");
     assert_eq!(
         web_search["user_credential"].as_str(),
         Some("brave_search"),
@@ -2122,8 +2122,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
-        .expect("IRR inference step should contain openai_file_search_callout");
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_dispatch"))
+        .expect("IRR inference step should contain openai_file_search_dispatch");
     assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
 
     let mcp_resolve = outer_filters

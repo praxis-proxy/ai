@@ -136,7 +136,7 @@ pipeline:
         note: captures the mcp_gateway key AND the mcp_gateway authorization assertion (x-mcp-authorized); both consumed by openai_mcp_tool_resolve + openai_mcp_dispatch
       S7:
         state: active
-        note: captures the brave_search key required by openai_web_search; strips + sets the assertion (web_search does not consume it)
+        note: captures the brave_search key required by openai_web_search_dispatch; strips + sets the assertion (web_search does not consume it)
       S8:
         state: active
         note: strips all provider-key headers and client x-mcp-authorized on GET before the store answers
@@ -618,10 +618,10 @@ pipeline:
       S13:
         state: passthrough
         note: no conversation field
-  - id: openai_response_store
-    name: openai_response_store
+  - id: openai_responses_store
+    name: openai_responses_store
     group: store
-    filter_type: openai_response_store
+    filter_type: openai_responses_store
     phase: request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai
     config:
       backend: sqlite
@@ -894,7 +894,7 @@ pipeline:
       conditions:
       - 'when path_prefix: /v1/responses'
       - 'unless path: /v1/responses'
-    promotes: fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_response_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai
+    promotes: fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_responses_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai
     scenarios:
       S1:
         state: inert
@@ -919,7 +919,7 @@ pipeline:
         note: path is exactly /v1/responses (create); the unless gate excludes it
       S8:
         state: skipped
-        note: openai_response_store already served the GET retrieve
+        note: openai_responses_store already served the GET retrieve
       S9:
         state: skipped
         note: direct-services terminal branch ran first
@@ -1054,7 +1054,7 @@ pipeline:
       max_buffer_bytes: 67108864
       max_events: 200000
       timeout_secs: 600
-    promotes: composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store
+    promotes: composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the openai_responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store
     scenarios:
       S1:
         state: active
@@ -1095,10 +1095,10 @@ pipeline:
       S13:
         state: active
         note: composes the chat-translated lifecycle; populates response_object
-  - id: openai_web_search
-    name: openai_web_search
+  - id: openai_web_search_dispatch
+    name: openai_web_search_dispatch
     group: irr-step
-    filter_type: openai_web_search
+    filter_type: openai_web_search_dispatch
     phase: IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call
     config:
       provider: brave
@@ -1202,10 +1202,10 @@ pipeline:
       S13:
         state: inert
         note: no MCP call emitted
-  - id: openai_file_search_callout
-    name: openai_file_search_callout
+  - id: openai_file_search_dispatch
+    name: openai_file_search_dispatch
     group: irr-step
-    filter_type: openai_file_search_callout
+    filter_type: openai_file_search_dispatch
     phase: IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call
     config:
       vector_store_url: http://127.0.0.1:3002
@@ -1519,10 +1519,10 @@ pipeline:
       S13:
         state: inert
         note: selected upstream is openai_chat_completions, not openai_responses -> gate fails; the body builder does not fire
-  - id: responses_to_chat_completions
-    name: responses_to_chat_completions
+  - id: openai_responses_to_chat_completions
+    name: openai_responses_to_chat_completions
     group: irr-step
-    filter_type: responses_to_chat_completions
+    filter_type: openai_responses_to_chat_completions
     phase: IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Chat Completions; request-phase translates Responses->Chat, response-phase (reverse) translates Chat->Responses
     config:
       max_rewritten_body_bytes: 33554432
@@ -1707,7 +1707,7 @@ pipeline:
     - 127.0.0.1:3001
     definedIn: router route (model vllm-chat) + IRR-step load_balancer (cluster_source:bound_upstream)
     routedBy: router binds this when x-praxis-ai-model is vllm-chat; the IRR inference step resolves it on 3001
-    note: application_provider vllm, application_protocol openai_chat_completions -> responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy
+    note: application_provider vllm, application_protocol openai_chat_completions -> openai_responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy
   - name: prompts-api
     endpoints:
     - 127.0.0.1:9998
@@ -1750,7 +1750,7 @@ pipeline:
   - name: Vector store
     endpoint: http://127.0.0.1:3002
     usedBy:
-    - openai_file_search_callout (vector_store_url)
+    - openai_file_search_dispatch (vector_store_url)
     - vector-stores-backend cluster (/v1/vector_stores direct-services branch)
     credential: user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts
   - name: NeMo Guardrails
@@ -1760,7 +1760,7 @@ pipeline:
   - name: Brave Search
     endpoint: provider:brave (external Brave API)
     usedBy:
-    - openai_web_search
+    - openai_web_search_dispatch
     credential: user_credential brave_search (per-user slot from x-user-brave-key); WEB_SEARCH_API_KEY still required by provider config; missing per-user slot fails closed (no shared-key fallback)
   knobs:
     max_infer_iters: 7
@@ -1796,7 +1796,7 @@ scen_meta:
     - inference-backend
     services: []
   S2:
-    narr: <b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.
+    narr: <b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_responses_store persists on the reverse path.
     clusters:
     - inference-backend
     services: []
@@ -1811,7 +1811,7 @@ scen_meta:
     - inference-backend
     services: []
   S5:
-    narr: <b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.
+    narr: <b>File search loop.</b> The model emits file_search_call; openai_file_search_dispatch queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; ai_guardrails checks the result before model re-entry; the loop owner finalizes with done.
     clusters:
     - inference-backend
     - vector-stores-backend
@@ -1826,14 +1826,14 @@ scen_meta:
     - MCP server
     - NeMo Guardrails
   S7:
-    narr: <b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.
+    narr: <b>Web search loop.</b> The model emits web_search_call; openai_web_search_dispatch executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity; ai_guardrails checks the result before model re-entry.
     clusters:
     - inference-backend
     services:
     - Brave Search
     - NeMo Guardrails
   S8:
-    narr: <b>GET retrieve.</b> openai_response_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
+    narr: <b>GET retrieve.</b> openai_responses_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.
     clusters: []
     services: []
   S9:
@@ -1862,7 +1862,7 @@ scen_meta:
     - openai-responses-backend
     services: []
   S13:
-    narr: <b>Chat Completions backend.</b> A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.
+    narr: <b>Chat Completions backend.</b> A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so openai_responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.
     clusters:
     - chat-completions-backend
     services: []
@@ -1879,12 +1879,12 @@ wire:
     - 'content-type: application/json'
     - 'x-request-id: req_d1561f573ba741d7adf74a0ad57445f0'
     resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_001\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}"
-    notes: 'Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_response_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.'
+    notes: 'Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_responses_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.'
     provenance:
     - examples/configs/openai/responses/full-flow-agentic.yaml:202-205
     - examples/configs/openai/responses/full-flow-agentic.yaml:192-198
     - tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:51-144
-    - tests/integration/tests/suite/examples/openai_response_store.rs:20,48-78
+    - tests/integration/tests/suite/examples/openai_responses_store.rs:20,48-78
   S2:
     reqMethod: POST
     reqPath: /v1/responses
@@ -2014,11 +2014,11 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_final\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"fs_1\",\n      \"type\": \"file_search_call\",\n      \"status\": \"completed\",\n      \"queries\": [\n        \"deployment instructions\"\n      ],\n      \"results\": [\n        {\n          \"file_id\": \"file-readme\",\n          \"filename\": \"README.md\",\n          \"score\": 0.92,\n          \"content\": [\n            {\n              \"type\": \"text\",\n              \"text\": \"Deploy the gateway by building the container image with `make container`, then run it behind an auth boundary.\"\n            }\n          ],\n          \"attributes\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"msg_final\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Deploy by building the container image and running it.\",\n          \"annotations\": [\n            {\n              \"type\": \"file_citation\",\n              \"file_id\": \"file-readme\",\n              \"filename\": \"README.md\",\n              \"index\": 54\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 12,\n    \"total_tokens\": 42\n  }\n}"
-    notes: 'Buffered final composed object after a 2-round model->tool->model loop. Round 1: model emits a pending file_search_call (id fs_1, status "searching", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {"query":"deployment instructions","rewrite_query":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a <|file-readme|> marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:["file_search_call.results"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).'
+    notes: 'Buffered final composed object after a 2-round model->tool->model loop. Round 1: model emits a pending file_search_call (id fs_1, status "searching", queries). openai_file_search_dispatch POSTs a vector-store query to 127.0.0.1:3002 with body {"query":"deployment instructions","rewrite_query":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a <|file-readme|> marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:["file_search_call.results"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:1190-1305
-    - tests/integration/tests/suite/examples/file_search_callout.rs:37-146
-    - apis/src/openai/responses/file_search_callout/citations.rs:158-213
+    - tests/integration/tests/suite/examples/file_search_dispatch.rs:37-146
+    - apis/src/openai/responses/file_search_dispatch/citations.rs:158-213
     - apis/src/openai/include.rs:206-224
     - examples/configs/openai/responses/full-flow-agentic.yaml:585-607
   S6:
@@ -2047,8 +2047,8 @@ wire:
     - tests/integration/tests/suite/examples/openai_agentic_loop.rs:2106-2264
     - tests/integration/tests/suite/examples/openai_agentic_loop.rs:6813-6819
     - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:56-137
-    - apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2606-2635
-    - apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2705-2715
+    - apis/src/openai/responses/mcp_tool_resolve/mod.rs:2606-2635
+    - apis/src/openai/responses/mcp_tool_resolve/mod.rs:2705-2715
     - apis/src/openai/responses/mcp_dispatch/mod.rs:1774-1816
     - apis/src/openai/responses/mcp_dispatch/mod.rs:1630-1716
   S7:
@@ -2065,13 +2065,13 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_0a1b2c3d4e5f60718293a4b5c6\",\n  \"object\": \"response\",\n  \"created_at\": 1783307880,\n  \"status\": \"completed\",\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"output\": [\n    {\n      \"type\": \"web_search_call\",\n      \"id\": \"ws_68a1f0c2d1348190a7c3e5f102\",\n      \"status\": \"completed\",\n      \"action\": {\n        \"type\": \"search\",\n        \"query\": \"latest Toronto Raptors headlines\"\n      }\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_68a1f0c3a2b48190b4d6f70213\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The Raptors are finalizing their rotation ahead of the season opener, with Scottie Barnes expected to take on a larger playmaking role, and the team added frontcourt depth in a roster move this week.\",\n          \"annotations\": [\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.nba.com/raptors/news\",\n              \"title\": \"Toronto Raptors News | NBA.com\",\n              \"start_index\": 0,\n              \"end_index\": 132\n            },\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.sportsnet.ca/nba/toronto-raptors/\",\n              \"title\": \"Toronto Raptors - Sportsnet\",\n              \"start_index\": 134,\n              \"end_index\": 195\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 318,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 96,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 414\n  }\n}"
-    notes: 'Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:["web_search_call.action.sources"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.'
+    notes: 'Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search_dispatch executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:["web_search_call.action.sources"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.'
     provenance:
     - examples/configs/openai/responses/full-flow-agentic.yaml:551-565
     - examples/configs/openai/responses/full-flow-agentic.yaml:326-337
-    - apis/src/openai/responses/web_search/mod.rs:819-856
-    - apis/src/openai/responses/file_search_callout/citations.rs:507-512
-    - apis/src/openai/responses/file_search_callout/citations.rs:563
+    - apis/src/openai/responses/web_search_dispatch/mod.rs:819-856
+    - apis/src/openai/responses/file_search_dispatch/citations.rs:507-512
+    - apis/src/openai/responses/file_search_dispatch/citations.rs:563
     - tests/integration/fixtures/agentic_api/web_search_nonstreaming.json:25-83
     - tests/integration/fixtures/inference/recordings/synthetic/responses/chat-web-search.json:63-92
     - tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:139-175
@@ -2090,15 +2090,15 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}"
-    notes: openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.
+    notes: openai_responses_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.
     provenance:
     - apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)
     - apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)
     - apis/src/openai/responses/store/filter.rs:1034-1037 (owner-scoped via require_state_owner)
-    - tests/integration/tests/suite/examples/openai_response_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)
+    - tests/integration/tests/suite/examples/openai_responses_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:33 (FIRST_RESPONSE_JSON completed shape), 441-452 (GET stored streamed resource, status/output asserted)
     - 'tests/integration/tests/suite/codex_http.rs:1105-1114 (OpenResponses usage: input_tokens_details.cached_tokens + output_tokens_details.reasoning_tokens required)'
-    - examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_response_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)
+    - examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_responses_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)
   S9:
     reqMethod: GET
     reqPath: /v1/responses
@@ -2194,10 +2194,10 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}"
-    notes: 'model vllm-chat makes the pre-routing openai_responses_request publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
+    notes: 'model vllm-chat makes the pre-routing openai_responses_request publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires openai_responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path openai_responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object=="response" and output[0].content[0].text=="translated"; the id shown is gateway-generated (openai_responses_request ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.'
     provenance:
     - tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding: 200, response.object==response + output text "translated"; backend gets one /v1/chat/completions request whose body has messages and no input)
-    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'
+    - 'examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -> chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; openai_responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)'
 timeline:
   S1:
     summary: 'A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -> IRR forwards the create to inference-backend 127.0.0.1:3001 -> the model returns a final assistant message with NO tool-call items -> the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states ''IRR terminates after the first pass via the default `done: true` branch''). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -> next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.'
@@ -2263,7 +2263,7 @@ timeline:
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1320-1321
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1309
   S5:
-    summary: 'Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_callout POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose <|file-q4|> marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.'
+    summary: 'Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_dispatch POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose <|file-q4|> marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.'
     rounds: 2 rounds · hosted file_search
     steps:
     - n: 1
@@ -2313,16 +2313,16 @@ timeline:
       from: gateway
       to: vector-store
       kind: request
-      title: openai_file_search_callout searches the vector store
+      title: openai_file_search_dispatch searches the vector store
       channel: POST http://127.0.0.1:3002/v1/vector_stores/vs_q4/search
-      note: 'VERIFIED. Exactly one POST callout (S5 asserts search_callouts.len()==1 at :1281-1283). Body shape confirmed by the sibling assertion query=="What were the Q4 results?" + rewrite_query==false (file_search_callout.rs:131-133) and by VectorStoreSearchRequest (client.rs:120-143, rewrite_query always false at :138/:159). URL path v1/vector_stores/{store_id}/search built by search_url/resource_url (client.rs:887-903); destination is vector_store_url http://127.0.0.1:3002 (config :586). Headers asserted at :1284-1304: authorization: bearer integration-ogx-key (scoped ogx_files slot, NOT client search-key), x-tenant-id, x-user-id, no x-auth-*. Outbound chain sets X-Vector-Store-Client: praxis-ai-gateway (config :596-599). Request also carries optional filters/max_num_results/ranking_options/search_mode (omitted, skip_serializing_if none, not asserted).'
+      note: 'VERIFIED. Exactly one POST callout (S5 asserts search_callouts.len()==1 at :1281-1283). Body shape confirmed by the sibling assertion query=="What were the Q4 results?" + rewrite_query==false (file_search_dispatch.rs:131-133) and by VectorStoreSearchRequest (client.rs:120-143, rewrite_query always false at :138/:159). URL path v1/vector_stores/{store_id}/search built by search_url/resource_url (client.rs:887-903); destination is vector_store_url http://127.0.0.1:3002 (config :586). Headers asserted at :1284-1304: authorization: bearer integration-ogx-key (scoped ogx_files slot, NOT client search-key), x-tenant-id, x-user-id, no x-auth-*. Outbound chain sets X-Vector-Store-Client: praxis-ai-gateway (config :596-599). Request also carries optional filters/max_num_results/ranking_options/search_mode (omitted, skip_serializing_if none, not asserted).'
       bodyKind: json
       body: '{"query": "What were the Q4 results?", "rewrite_query": false}'
       provenance:
-      - tests/integration/tests/suite/examples/file_search_callout.rs:131-133
+      - tests/integration/tests/suite/examples/file_search_dispatch.rs:131-133
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1281-1304
-      - apis/src/openai/responses/file_search_callout/client.rs:120-143
-      - apis/src/openai/responses/file_search_callout/client.rs:786-902
+      - apis/src/openai/responses/file_search_dispatch/client.rs:120-143
+      - apis/src/openai/responses/file_search_dispatch/client.rs:786-902
       - examples/configs/openai/responses/full-flow-agentic.yaml:585-607
     - n: 5
       round: callout
@@ -2336,8 +2336,8 @@ timeline:
       body: '{"data": [{"file_id": "file-q4", "filename": "q4-results.txt", "score": 0.99, "content": [{"type": "text", "text": "Q4 revenue was $42 million."}], "attributes": null}]}'
       provenance:
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1225-1234
-      - apis/src/openai/responses/file_search_callout/tests.rs:611-612
-      - apis/src/openai/responses/file_search_callout/mod.rs:1339-1366
+      - apis/src/openai/responses/file_search_dispatch/tests.rs:611-612
+      - apis/src/openai/responses/file_search_dispatch/mod.rs:1339-1366
     - n: 6
       round: round 2
       from: gateway
@@ -2349,10 +2349,10 @@ timeline:
       bodyKind: json
       body: '{"model": "gpt-4.1", …, "input": [ …prior items…, {"type": "function_call", "call_id": "file_search_0_<hash16>", "name": "file_search", "arguments": "{\"query\":\"What were the Q4 results?\"}", "status": "completed"}, {"type": "function_call_output", "call_id": "file_search_0_<hash16>", "output": "file_search found 1 chunks for \"What were the Q4 results?\":\n[0] q4-results.txt (score: 0.99) cite as <|file-q4|>\nQ4 revenue was $42 million.\n"}]}'
       provenance:
-      - apis/src/openai/responses/file_search_callout/mod.rs:1339-1366
-      - apis/src/openai/responses/file_search_callout/tests.rs:520-536
-      - apis/src/openai/responses/file_search_callout/model_context.rs:26-29
-      - apis/src/openai/responses/file_search_callout/model_context.rs:382
+      - apis/src/openai/responses/file_search_dispatch/mod.rs:1339-1366
+      - apis/src/openai/responses/file_search_dispatch/tests.rs:520-536
+      - apis/src/openai/responses/file_search_dispatch/model_context.rs:26-29
+      - apis/src/openai/responses/file_search_dispatch/model_context.rs:382
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1261-1279
     - n: 7
       round: round 2
@@ -2374,13 +2374,13 @@ timeline:
       kind: response
       title: Final /v1/responses object returned to client
       channel: 200 http://127.0.0.1:8080/v1/responses
-      note: 'VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The <|file-q4|> marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_callout.rs:117-125: text=="Q4 revenue was $42 million", annotations[0].file_id=="file-q4") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.'
+      note: 'VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The <|file-q4|> marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_dispatch.rs:117-125: text=="Q4 revenue was $42 million", annotations[0].file_id=="file-q4") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.'
       bodyKind: json
       body: '{"id": "resp_final", "object": "response", "status": "completed", "output": [{"id": "fs_1", "type": "file_search_call", "status": "completed", "queries": ["What were the Q4 results?"]}, {"id": "msg_final", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "Q4 revenue was $42 million", "annotations": [{"type": "file_citation", "file_id": "file-q4", "filename": "q4-results.txt", "index": …}]}]}]}'
       provenance:
       - tests/integration/tests/suite/examples/full_flow_agentic.rs:1254-1259
-      - tests/integration/tests/suite/examples/file_search_callout.rs:117-125
-      - apis/src/openai/responses/file_search_callout/citations.rs:209-212
+      - tests/integration/tests/suite/examples/file_search_dispatch.rs:117-125
+      - apis/src/openai/responses/file_search_dispatch/citations.rs:209-212
   S6:
     summary: 'A model-tool-model MCP loop: the gateway resolves MCP tools out of band (initialize/tools/list), lowers them to encoded function tools for round-1 inference, executes the model-selected MCP call via JSON-RPC tools/call, appends the tool result as a function_call_output for round-2 inference, and returns a single composed Responses object. Config STRUCTURE is grounded in full-flow-agentic.yaml (statically validated by full_flow_agentic.rs); WIRE PAYLOADS are faithful trims of the round-trip integration test (openai_agentic_loop.rs), the SSE test (openai_mcp_streaming.rs), the MCP mock-server fixtures (tests/utils agentic/mcp.rs), the mcp_client credential unit tests, and the mcp_dispatch result-construction tests. JSON-RPC id scalars are illustrative/rmcp-generated; only the envelope shapes are grounded.'
     rounds: 2 rounds · MCP tool loop
@@ -2551,7 +2551,7 @@ timeline:
       kind: response
       title: Composed /v1/responses object returned to client
       channel: 200 http://localhost:8080/v1/responses
-      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_response_store (yaml:372-379) persists it for GET /v1/responses/{id}.
+      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_responses_store (yaml:372-379) persists it for GET /v1/responses/{id}.
       bodyKind: json
       body: '{"id":"resp_2","object":"response","status":"completed","output":[…,{"type":"mcp_call","id":"call_abc","server_label":"weather","name":"get_weather","output":"mock result for get_weather"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The weather in SF is 72F and sunny."}]}]}'
       provenance:
@@ -2560,7 +2560,7 @@ timeline:
       - apis/src/openai/responses/mcp_dispatch/tests.rs:546-556
       - examples/configs/openai/responses/full-flow-agentic.yaml:372-379
   S7:
-    summary: 'Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml''s web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml''s own structural guards; hence grounded:false.'
+    summary: 'Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml''s web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search_dispatch Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml''s own structural guards; hence grounded:false.'
     rounds: 2 rounds · web_search (+ fail-closed variant)
     steps:
     - n: 1
@@ -2596,7 +2596,7 @@ timeline:
       kind: response
       title: Round-1 inference emits a web_search_call item
       channel: 200 POST http://127.0.0.1:3001/v1/responses
-      note: openai_agentic_loop parses this, records the web_search_call assignment for the openai_web_search dispatcher, and publishes action=loop.
+      note: openai_agentic_loop parses this, records the web_search_call assignment for the openai_web_search_dispatch dispatcher, and publishes action=loop.
       bodyKind: json
       body: '{"id":"resp_ws_1","object":"response","status":"completed","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Rust 2025 edition"}}]}'
       provenance:
@@ -2606,7 +2606,7 @@ timeline:
       from: gateway
       to: brave
       kind: request
-      title: openai_web_search Brave callout (deferred per-user x-subscription-token)
+      title: openai_web_search_dispatch Brave callout (deferred per-user x-subscription-token)
       channel: GET https://api.search.brave.com/res/v1/web/search?q=Rust%202025%20edition&count=5
       note: 'URL modeled by build_brave_request: {base}/res/v1/web/search?q={percent-encoded query}&count={count}; count=5 from default_context_size Medium (result_count). Only Accept: application/json rides in-chain; the API key is staged as a deferred x-subscription-token injected only at the resolved authority. With user_credential: brave_search the per-user secret from x-user-brave-key is used, not the shared api_key — the slot wiring (brave_search slot, source_header x-user-brave-key, web_search user_credential brave_search) is proven structurally by full_flow_agentic.rs:1409-1457, and the runtime behavior by scoped-credentials: callout carries ''x-subscription-token: alice-brave-secret'', shared ''test-key'' absent, ''x-user-brave-key'' stripped. In the round-trip functional test the provider base_url is patched to a local mock via load_web_search_config (openai_agentic_loop.rs:5506-5509).'
       bodyKind: none
@@ -2644,7 +2644,7 @@ timeline:
       body: '{…, "input":[ …, {"type":"function_call","call_id":"<bridge>","name":"web_search","arguments":"{\"query\":\"Rust 2025 edition\"}","status":"completed"}, {"type":"function_call_output","call_id":"<bridge>","output":"[1] Rust 2025 Edition\nhttps://blog.rust-lang.org/2025\nThe Rust 2025 edition is here."} ]}'
       provenance:
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:3309-3341
-      - apis/src/openai/responses/web_search/mod.rs:876-905
+      - apis/src/openai/responses/web_search_dispatch/mod.rs:876-905
       - apis/src/web_search/mod.rs:66-82
     - n: 7
       round: round 2

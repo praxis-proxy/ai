@@ -215,7 +215,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_response_store" => crate::openai::ResponseStoreFilter::from_config
+            http "openai_responses_store" => crate::openai::ResponseStoreFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
@@ -223,7 +223,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_stream_events" => crate::openai::OpenaiStreamEventsFilter::from_config
+            http "openai_stream_events" => crate::openai::StreamEventsFilter::from_config
         );
         registry
     }

@@ -412,7 +412,7 @@ pub(super) fn is_valid_filename(filename: &str) -> bool {
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::openai::responses::file_search_callout::client::{ContentChunk, ContentChunkType};
+    use crate::openai::responses::file_search_dispatch::client::{ContentChunk, ContentChunkType};
 
     #[test]
     fn template_values_are_not_reinterpreted_as_placeholders() {

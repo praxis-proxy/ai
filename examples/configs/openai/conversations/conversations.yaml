@@ -39,10 +39,18 @@ filter_chains:
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
-        # File-backed:
+        # File-backed (WAL is enabled automatically; use local storage, not NFS):
+        # Use SQLite-aware backups because live changes may remain in the WAL.
         database_url: "sqlite://conversations.db?mode=rwc"
         # conversations_table defaults to "openai_conversations"
         # items_table defaults to "openai_conversation_items"
+        # Item rows preserve complete ordered history; mutations do not rebuild
+        # a second full-history cache. Model context limits belong to the native
+        # Responses backend's truncation policy. Gateway transport/storage limits
+        # and file-search continuation max_state_bytes still apply.
+        # See docs/architecture/response-store.md for legacy cache conversion,
+        # stop-traffic upgrade, and rollback requirements. Do not mix old and new
+        # binaries against the same conversation tables.
         #
         # Connection pool tuning (optional, sqlx defaults apply when omitted):
         #   pool:

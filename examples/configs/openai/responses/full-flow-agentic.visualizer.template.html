@@ -647,9 +647,9 @@
           <circle cx="636" cy="254" r="3.2" fill="#f4713b"/>
 
           <line x1="636" y1="118" x2="702" y2="118" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
-          <g class="flt" data-fid="openai_web_search">
+          <g class="flt" data-fid="openai_web_search_dispatch">
             <rect x="704" y="98" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
-            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search</text>
+            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search_dispatch</text>
             <text x="720" y="133" class="s-mono" fill="#6d8492" font-size="9.5">Brave · per-user brave_search slot</text>
           </g>
           <line x1="636" y1="186" x2="702" y2="186" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
@@ -659,9 +659,9 @@
             <text x="720" y="201" class="s-mono" fill="#6d8492" font-size="9.5">8001 · mcp_gateway cred + assertion · ≤8∥</text>
           </g>
           <line x1="636" y1="254" x2="702" y2="254" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
-          <g class="flt" data-fid="openai_file_search_callout">
+          <g class="flt" data-fid="openai_file_search_dispatch">
             <rect x="704" y="234" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
-            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_callout</text>
+            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_dispatch</text>
             <text x="720" y="269" class="s-mono" fill="#6d8492" font-size="9.5">3002 · ogx_files cred · on_failure closed</text>
           </g>
 
@@ -682,7 +682,7 @@
           <g>
             <rect x="30" y="362" width="330" height="50" rx="8" fill="#0c1319" stroke="#d98cbb"/>
             <text x="46" y="383" class="s-mono" fill="#e2edf3" font-size="11.5">▣ DONE → compose terminal event</text>
-            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_response_store persists</text>
+            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_responses_store persists</text>
           </g>
         </svg>
       </div>
@@ -806,7 +806,7 @@ const GROUPS = @@GROUPS@@;
 function filterColor(f){
   if(f.group!=="irr-step") return GROUPS[f.group].c;
   if(f.id==="openai_agentic_loop") return "var(--c-loop)";
-  if(["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)) return "var(--c-dispatch)";
+  if(["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)) return "var(--c-dispatch)";
   if(f.id==="openai_stream_events") return "var(--c-classification)";
   if(["irr_router","irr_load_balancer","openai_responses_proxy"].includes(f.id)) return "var(--c-backend)";
   return "var(--c-context)";
@@ -827,7 +827,7 @@ function fmtBytes(n){
    ========================================================================= */
 (function renderTiles(){
   const wrap=document.getElementById("tiles");
-  const disp=PIPELINE.filters.filter(f=>["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)).length;
+  const disp=PIPELINE.filters.filter(f=>["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)).length;
   const tiles=[
     ["Filters",PIPELINE.filters.length,""],
     ["Dispatchers",disp,""],
@@ -1080,7 +1080,7 @@ function setDonut(d,v){
   const k=PIPELINE.knobs;
   const foot=document.getElementById("foot");
   foot.innerHTML=
-    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_response_store is pre-IRR (#9) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
+    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_responses_store is pre-IRR (#9) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
     "<b>Trace + scoped credentials.</b> trace_context (#1) establishes a typed correlation identity BEFORE the IRR snapshots request extensions, so every nested web-search / OGX / MCP callout keeps this request's trace while Praxis core mints a fresh span per hop. callout_credentials captures per-user secrets into typed slots (brave_search / ogx_files / mcp_gateway) and STRIPS the raw x-user-* ingress headers; each dispatcher selects only its slot (web_search→brave_search, file_resolve + file_search→ogx_files, MCP→mcp_gateway), and the legacy raw authorization forward has been dropped from the file callouts. Unified in #1341, callout_credentials (#3) also captures the MCP authorization assertion in the same establishing filter: it deletes any client-supplied x-mcp-authorized and sets a verified, opaque, short-lived assertion forwarded unchanged ONLY to configured connector_id targets — the MCP Gateway makes the authorization decision. (The former standalone callout_authorization filter was removed in #1341.)<br><br>"+
     "<b>Timeouts</b> "+k.timeout_ms+" ms loop / "+k.step_timeout_ms+" ms step · "+
     "<b>Byte caps</b> response "+fmtBytes(k.max_response_bytes)+" · state "+fmtBytes(k.max_state_bytes)+" · "+

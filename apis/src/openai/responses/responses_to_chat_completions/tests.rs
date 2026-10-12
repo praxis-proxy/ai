@@ -23,7 +23,7 @@ fn default_config_parses() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
-    assert_eq!(filter.name(), "responses_to_chat_completions");
+    assert_eq!(filter.name(), "openai_responses_to_chat_completions");
     assert_eq!(filter.request_body_access(), BodyAccess::None);
     assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
     assert!(
@@ -526,7 +526,8 @@ async fn canonical_state_is_translated_and_arms_response() {
     state.messages = vec![
         json!({"role": "user", "content": "earlier history"}),
         json!({"role": "user", "content": "current input"}),
-    ];
+    ]
+    .into();
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"current input","stream":false}"#,
@@ -713,7 +714,8 @@ async fn rehydrated_previous_response_id_translates_full_history() {
         json!({"role": "user", "content": "earlier question"}),
         json!({"role": "assistant", "content": "earlier answer"}),
         json!({"role": "user", "content": "current input"}),
-    ];
+    ]
+    .into();
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":false}"#,
@@ -1600,7 +1602,7 @@ async fn chat_file_search_function_call_becomes_responses_function_call() {
 
 #[tokio::test]
 async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
-    // Reproduces the state left by openai_file_search_callout: request_body carries
+    // Reproduces the state left by openai_file_search_dispatch: request_body carries
     // the private lowered `file_search` function destined for the backend, while
     // state.tools/state.tool_choice retain the client's hosted declaration. The
     // client-visible response must echo the hosted file_search tool and forced
@@ -1620,7 +1622,7 @@ async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
     });
     let mut state = ResponsesState::from_request_body(request_value);
     state.response_id = Some("resp_file_search".to_owned());
-    // openai_file_search_callout lowers request_body in place before this filter runs.
+    // openai_file_search_dispatch lowers request_body in place before this filter runs.
     state.request_body["tools"] = json!([{
         "type": "function",
         "name": "file_search",

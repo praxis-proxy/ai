@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Filter configuration for `file_search_callout`.
+//! Filter configuration for `file_search_dispatch`.
 
 use std::time::Duration;
 
@@ -115,7 +115,7 @@ pub(crate) struct FileSearchFilterConfig {
 /// so it never needs to be globally unique.
 fn default_outbound_chain() -> ChainRef {
     ChainRef::Inline {
-        name: "openai_file_search_callout_outbound".to_owned(),
+        name: "openai_file_search_dispatch_outbound".to_owned(),
         filters: Vec::new(),
     }
 }
@@ -161,9 +161,9 @@ pub(crate) fn build_config_with_client(
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let base_url = parse_vector_store_url(&cfg.vector_store_url)?;
-    let credential_authority = credential_authority("openai_file_search_callout", &base_url)?;
+    let credential_authority = credential_authority("openai_file_search_dispatch", &base_url)?;
     if cfg.user_credential.as_ref().is_some_and(String::is_empty) {
-        return Err("openai_file_search_callout: user_credential must not be empty".into());
+        return Err("openai_file_search_dispatch: user_credential must not be empty".into());
     }
     let on_failure = cfg.on_failure.unwrap_or(OnFailure::Closed);
     let (max_response_bytes, max_total_response_bytes) =
@@ -171,14 +171,14 @@ pub(crate) fn build_config_with_client(
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
     let mut forward_headers = cfg.forward_headers.clone();
-    api_client::validate_forward_headers("openai_file_search_callout", &mut forward_headers)?;
+    api_client::validate_forward_headers("openai_file_search_dispatch", &mut forward_headers)?;
     if cfg.user_credential.is_some()
         && forward_headers
             .iter()
             .any(|name| name == http::header::AUTHORIZATION.as_str())
     {
         return Err(
-            "openai_file_search_callout: forward_headers must not include authorization when user_credential is configured"
+            "openai_file_search_dispatch: forward_headers must not include authorization when user_credential is configured"
                 .into(),
         );
     }
@@ -209,10 +209,10 @@ pub(crate) fn build_config_with_client(
 fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError> {
     let limit = configured.unwrap_or(DEFAULT_MAX_STATE_BYTES);
     if limit == 0 {
-        return Err("openai_file_search_callout: max_state_bytes must be greater than 0".into());
+        return Err("openai_file_search_dispatch: max_state_bytes must be greater than 0".into());
     }
     if limit > MAX_STATE_BYTES {
-        return Err(format!("openai_file_search_callout: max_state_bytes must not exceed {MAX_STATE_BYTES}").into());
+        return Err(format!("openai_file_search_dispatch: max_state_bytes must not exceed {MAX_STATE_BYTES}").into());
     }
     Ok(limit)
 }
@@ -222,11 +222,11 @@ fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError
 fn response_limits(per_call: Option<usize>, total: Option<usize>) -> Result<(usize, usize), FilterError> {
     let per_call = per_call.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
     if per_call == 0 {
-        return Err("openai_file_search_callout: max_response_bytes must be greater than 0".into());
+        return Err("openai_file_search_dispatch: max_response_bytes must be greater than 0".into());
     }
     if per_call > MAX_RESPONSE_BYTES {
         return Err(
-            format!("openai_file_search_callout: max_response_bytes must not exceed {MAX_RESPONSE_BYTES}").into(),
+            format!("openai_file_search_dispatch: max_response_bytes must not exceed {MAX_RESPONSE_BYTES}").into(),
         );
     }
 
@@ -235,19 +235,19 @@ fn response_limits(per_call: Option<usize>, total: Option<usize>) -> Result<(usi
         None => per_call
             .checked_mul(MAX_CONCURRENT_SEARCHES)
             .ok_or_else(|| -> FilterError {
-                "openai_file_search_callout: default max_total_response_bytes overflows usize".into()
+                "openai_file_search_dispatch: default max_total_response_bytes overflows usize".into()
             })?
             .min(MAX_TOTAL_RESPONSE_BYTES),
     };
     if total == 0 {
-        return Err("openai_file_search_callout: max_total_response_bytes must be greater than 0".into());
+        return Err("openai_file_search_dispatch: max_total_response_bytes must be greater than 0".into());
     }
     if total < per_call {
-        return Err("openai_file_search_callout: max_total_response_bytes must be at least max_response_bytes".into());
+        return Err("openai_file_search_dispatch: max_total_response_bytes must be at least max_response_bytes".into());
     }
     if total > MAX_TOTAL_RESPONSE_BYTES {
         return Err(format!(
-            "openai_file_search_callout: max_total_response_bytes must not exceed {MAX_TOTAL_RESPONSE_BYTES}"
+            "openai_file_search_dispatch: max_total_response_bytes must not exceed {MAX_TOTAL_RESPONSE_BYTES}"
         )
         .into());
     }
@@ -258,10 +258,10 @@ fn response_limits(per_call: Option<usize>, total: Option<usize>) -> Result<(usi
 fn validated_timeout(configured: Option<u64>) -> Result<u64, FilterError> {
     let timeout_ms = configured.unwrap_or(DEFAULT_TIMEOUT_MS);
     if timeout_ms == 0 {
-        return Err("openai_file_search_callout: timeout_ms must be greater than 0".into());
+        return Err("openai_file_search_dispatch: timeout_ms must be greater than 0".into());
     }
     if timeout_ms > MAX_TIMEOUT_MS {
-        return Err(format!("openai_file_search_callout: timeout_ms must not exceed {MAX_TIMEOUT_MS}").into());
+        return Err(format!("openai_file_search_dispatch: timeout_ms must not exceed {MAX_TIMEOUT_MS}").into());
     }
     Ok(timeout_ms)
 }
@@ -280,9 +280,9 @@ fn validated_timeout(configured: Option<u64>) -> Result<u64, FilterError> {
 /// `apply_insecure_options`), so a literal private target could never be
 /// permitted even with the central opt-in set.
 fn parse_vector_store_url(raw: &str) -> Result<String, FilterError> {
-    api_client::validate_base_url("openai_file_search_callout", raw, true)?;
+    api_client::validate_base_url("openai_file_search_dispatch", raw, true)?;
     let url = Url::parse(raw).map_err(|error| -> FilterError {
-        format!("openai_file_search_callout: vector_store_url is not a valid URL: {error}").into()
+        format!("openai_file_search_dispatch: vector_store_url is not a valid URL: {error}").into()
     })?;
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }

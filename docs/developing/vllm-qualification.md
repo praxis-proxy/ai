@@ -12,18 +12,31 @@ longer term access.
 
 ## Report version and interpretation
 
-The report has `schema_version: 2` and
+The report has `schema_version: 3` and
 `profile: responses-gateway-live-vllm-gpu`. The combined GPU execution records
 native `/v1/responses` and Responses-to-Chat `/v1/chat/completions` results
 separately. `gateway.checkout_sha` comes from `git rev-parse HEAD` inside the
 GPU checkout. The workflow SHA and attempt are
 recorded separately. `gateway.binary_sha256` identifies the locally built
 debug/full gateway binary; it is **not** the separately published release
-container. `backend.local_image_id` is the immutable ID of the locally built
-model-baked vLLM image. Its mutable tag is recorded separately and
-`registry_digest` remains null. The Containerfile hash and model ID are build
-inputs; the resolved model revision is null when the image build cannot expose
-it. Null provenance means unavailable, not an inferred value.
+container.
+
+`backend.local_image_id` is the immutable ID of the model-baked vLLM image the
+suite served, and its mutable tag is recorded separately. The suite reuses the
+build published by `vllm-gpu-container.yaml` when it matches the checkout and
+builds from source otherwise, so the report states which:
+
+| Field | Meaning |
+| --- | --- |
+| `backend.image_source` | `registry` for a pulled image, `local-build` for one built on the runner. |
+| `backend.registry_digest` | The pulled image's digest. Null for a local build, which has none. |
+| `backend.built_from_commit` | Commit the image was built from, read from its `org.opencontainers.image.revision` label. |
+| `backend.containerfile_sha256` | Hash of the `Containerfile` the **image** was built from, read from its label — not a hash of the working tree, which may describe a build that never happened on this runner. |
+| `backend.base_image` | The `FROM` reference the image was built on, read from its label. |
+
+The model ID is a build input; the resolved model revision is null when the
+image build cannot expose it. Null provenance means unavailable, not an
+inferred value.
 
 | Field | Meaning |
 | --- | --- |

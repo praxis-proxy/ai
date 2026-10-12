@@ -287,7 +287,7 @@ fn classify_tools_array(tools_array: &[serde_json::Value], tool_choice: Option<T
 ///
 /// Extracts only the routing-relevant configs that a consumer reads,
 /// without cloning opaque payloads. Filters needing full tool entries
-/// (`openai_mcp_tool_resolve`, `file_search_callout`) parse the body
+/// (`openai_mcp_tool_resolve`, `file_search_dispatch`) parse the body
 /// themselves and read only the promoted presence flags from here.
 fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, serde_json::Value>) {
     match classify_tool_type(entry_obj) {

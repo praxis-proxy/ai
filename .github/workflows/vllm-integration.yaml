@@ -31,9 +31,12 @@ on:
       - "Cargo.lock"
       - "Makefile"
       - "vllm/Containerfile"
+      - "vllm/images.json"
       - ".github/scripts/vllm_qualification.py"
       - "tests/integration/sdk/openai/qualification_plugin.py"
       - ".github/actions/build-vllm-gpu/**"
+      - ".github/actions/resolve-vllm-gpu-image/**"
+      - ".github/actions/vllm-image-spec/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/vllm-integration.yaml"
@@ -112,10 +115,12 @@ env:
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
   # The acceptance jobs still use their pinned upstream image.
   VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
-  # The full suite builds this tag from the checked-out Containerfile and serves
-  # its baked model. The tag is local to the ephemeral runner; no registry pull
-  # or PR publication is needed to validate the current commit.
-  VLLM_BUILT_GPU_IMAGE: "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B"
+  # The full suite's model-baked image is NOT pinned here: it is described by
+  # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
+  # manifest, reuses the published build when it matches this checkout, and
+  # exports the resolved reference as VLLM_BUILT_GPU_IMAGE for the qualification
+  # record.
+  #
   # Model served on the GPU runner. A capable model is required for reliable
   # tool-calling (file_search, MCP) — the 0.6B CPU model above is not. Qwen3-8B
   # fits the A10G (24GB) used by the g5.xlarge GPU runner with FlashAttention-2.
@@ -181,9 +186,12 @@ jobs:
             'Cargo.lock' \
             'Makefile' \
             'vllm/Containerfile' \
+            'vllm/images.json' \
             '.github/scripts/vllm_qualification.py' \
             'tests/integration/sdk/openai/qualification_plugin.py' \
             '.github/actions/build-vllm-gpu/' \
+            '.github/actions/resolve-vllm-gpu-image/' \
+            '.github/actions/vllm-image-spec/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/workflows/vllm-integration.yaml')
@@ -1753,6 +1761,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1775,11 +1784,66 @@ jobs:
           "$CONTAINER_RUNTIME" system prune -af || true
           df -h /
 
+      - name: Read text image spec
+        id: spec
+        uses: ./.github/actions/vllm-image-spec
+        with:
+          key: text
+
+      - name: Export resolved image reference
+        env:
+          SPEC_IMAGE: ${{ steps.spec.outputs.image }}
+          SPEC_MODEL: ${{ steps.spec.outputs.model }}
+        run: |
+          set -euo pipefail
+          # VLLM_GPU_MODEL is shared with the acceptance jobs, which serve the
+          # same model from the pinned upstream image rather than this baked
+          # one. Fail loudly on drift instead of silently rebuilding every run
+          # because the manifest and the workflow env disagree.
+          if [ "$SPEC_MODEL" != "$VLLM_GPU_MODEL" ]; then
+            echo "::error::vllm/images.json serves $SPEC_MODEL but VLLM_GPU_MODEL is $VLLM_GPU_MODEL"
+            exit 1
+          fi
+          echo "VLLM_BUILT_GPU_IMAGE=$SPEC_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR (docker)
+        if: env.CONTAINER_RUNTIME == 'docker'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR (podman)
+        if: env.CONTAINER_RUNTIME == 'podman'
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | podman login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin
+
+      - name: Resolve model-baked GPU image
+        id: image
+        uses: ./.github/actions/resolve-vllm-gpu-image
+        with:
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+
+      # Only reached when GHCR has no image matching this checkout -- the
+      # vllm-full-suite label on a PR that edits vllm/Containerfile, or a
+      # publish that has not landed yet. Building here is what keeps such a PR
+      # validated against the image it actually describes.
       - name: Build model-baked GPU image
+        if: steps.image.outputs.build-required == 'true'
         uses: ./.github/actions/build-vllm-gpu
         with:
-          model: ${{ env.VLLM_GPU_MODEL }}
-          image: ${{ env.VLLM_BUILT_GPU_IMAGE }}
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          image: ${{ steps.spec.outputs.image }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
@@ -1825,13 +1889,18 @@ jobs:
       - name: Start vLLM on GPU (background)
         uses: ./.github/actions/start-vllm
         with:
-          image: ${{ env.VLLM_BUILT_GPU_IMAGE }}
-          model: ${{ env.VLLM_GPU_MODEL }}
-          model-path: /opt/vllm/models/${{ env.VLLM_GPU_MODEL }}
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.served-model-name }}
+          model-path: ${{ steps.spec.outputs.model-path }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
+          # Resolved above, either pulled or built; nothing left to fetch.
           pull: "false"
           device-args: ${{ env.GPU_DEVICE_ARGS }}
+          tool-call-parser: ${{ steps.spec.outputs.tool-call-parser }}
+          reasoning-parser: ${{ steps.spec.outputs.reasoning-parser }}
           gpu-memory-utilization: "0.9"
+          # Suite-specific: the qualification cases need more context than the
+          # publisher's smoke test, so this overrides the manifest default.
           max-model-len: "16384"
 
       - name: Pre-install OGX dependencies

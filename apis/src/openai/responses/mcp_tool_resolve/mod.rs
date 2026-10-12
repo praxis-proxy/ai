@@ -621,7 +621,7 @@ impl HttpFilter for McpToolResolveFilter {
         // `TerminalResponse` returned from a body-phase hook is discarded as
         // `Continue`. Consuming the stash exactly once yields the terminal SSE;
         // routing it through the response phase lets `openai_stream_events` and
-        // `openai_response_store` observe and persist the failed response.
+        // `openai_responses_store` observe and persist the failed response.
         Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
@@ -1269,7 +1269,7 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
 /// to callers; the terminal `response.failed` event carries the request failure
 /// instead. Emitting as a `TerminalResponse` (rather than `Reject`) runs the
 /// already-executed request-phase filters on the response path, so
-/// `openai_stream_events` accumulates the failure and `openai_response_store`
+/// `openai_stream_events` accumulates the failure and `openai_responses_store`
 /// persists it for later retrieval when `store` is enabled.
 #[expect(
     clippy::too_many_lines,
@@ -1285,7 +1285,7 @@ fn build_list_tools_failure_response(
     // Effective storage mirrors the store filter's own gate exactly: persist
     // unless the caller set `store: false`. Explicit-true and omitted both store
     // (the OpenAI default). `openai_stream_events` accumulates this failure into
-    // `ResponsesState` and `openai_response_store` persists it, so this flag must
+    // `ResponsesState` and `openai_responses_store` persists it, so this flag must
     // match what the caller observes on retrieval.
     let store = ctx.get_metadata("openai_responses_request.store") != Some("false");
     let response_id = ctx
@@ -1436,7 +1436,7 @@ fn build_list_tools_failure_response(
     );
 
     // Publish the terminal failed resource directly into the shared state so
-    // `openai_response_store` can persist it. Streaming persistence reads
+    // `openai_responses_store` can persist it. Streaming persistence reads
     // `ResponsesState.response_object`, which is normally populated by
     // `openai_stream_events` accumulating the terminal frame on the response
     // phase. But this filter's short-circuiting `TerminalResponse` means any
@@ -1444,7 +1444,7 @@ fn build_list_tools_failure_response(
     // cannot rely on `openai_stream_events` to populate the field:
     //   * In `agentic-loop.yaml`, `openai_stream_events` is nested in the iterative_request_router that follows this
     //     filter, so it never runs.
-    //   * A pipeline with `openai_response_store` + this filter but without
+    //   * A pipeline with `openai_responses_store` + this filter but without
     //     `openai_responses_request`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
     //     persists purely from `response_object` (the store reads only that field, not `request_body`).
     // `get_or_insert_with` therefore both creates the state when absent and
@@ -1465,7 +1465,7 @@ fn build_list_tools_failure_response(
     // of a failure, so it must pool like any normal Responses stream) and runs
     // the response-phase filters that already executed in the request phase. That
     // response-phase pass is the point: `openai_stream_events` accumulates the
-    // terminal `response.failed` into `ResponsesState` and `openai_response_store`
+    // terminal `response.failed` into `ResponsesState` and `openai_responses_store`
     // persists it, so a caller with `store` enabled can retrieve the failed
     // response afterwards. The failure was stashed during the body pre-read and
     // this response is built once here in the header phase, after the full request

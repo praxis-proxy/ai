@@ -9,6 +9,13 @@ inputs:
     description: Seconds to wait for the container to begin serving. The GPU workflow builds its image locally and so needs no pull window.
     required: false
     default: "900"
+  api-key:
+    description: >-
+      Bearer token to send on the readiness probe. Required whenever start-vllm
+      was given an `api-key`, because /v1/models answers 401 without it and the
+      probe would otherwise never see the server come up.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -17,8 +24,16 @@ runs:
       env:
         VLLM_RUNTIME: ${{ inputs.runtime }}
         VLLM_READY_TIMEOUT: ${{ inputs.timeout }}
+        VLLM_PROBE_API_KEY: ${{ inputs.api-key }}
       run: |
         echo "Waiting for vLLM health and model endpoints..."
+        # /health is unauthenticated, but /v1/models is gated when the server was
+        # started with --api-key; send the token on both so one probe shape works
+        # for an authenticated and an open backend alike.
+        auth_args=()
+        if [ -n "$VLLM_PROBE_API_KEY" ]; then
+          auth_args=(-H "Authorization: Bearer $VLLM_PROBE_API_KEY")
+        fi
         # start-vllm launches `pull && run` in the background so the
         # (model-baked, multi-GB) image pull and model load overlap the caller's
         # build. Join here: poll the serving endpoints, but distinguish the three
@@ -38,8 +53,8 @@ runs:
           fi
         }
         while true; do
-          if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-             curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
+          if curl -sf "${auth_args[@]}" http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+             curl -sf "${auth_args[@]}" http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
             echo "vLLM is ready"
             break
           fi

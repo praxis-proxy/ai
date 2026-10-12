@@ -575,7 +575,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: responses

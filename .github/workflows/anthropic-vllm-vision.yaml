@@ -3,6 +3,12 @@ name: Anthropic Messages vLLM Vision
 # A separate model is required: the Qwen3-8B used by the Claude Code nightly
 # accepts text only. This job proves image requests from the official Anthropic
 # SDK reach a real vision model through both Praxis production example routes.
+#
+# The model-baked image comes from GHCR, published by vllm-gpu-container.yaml.
+# Rebuilding it here nightly would recreate a byte-identical image -- the model
+# and its revision are pinned in vllm/images.json -- so the image is only built
+# when the registry does not already hold one matching this checkout, which is
+# what resolve-vllm-gpu-image decides.
 on:
   pull_request:
     branches: [main]
@@ -24,10 +30,7 @@ concurrency:
 permissions: {}
 
 env:
-  VLLM_IMAGE: "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-VL-4B-Instruct"
-  VISION_MODEL: "Qwen/Qwen3-VL-4B-Instruct"
-  VISION_REVISION: "ebb281ec70b05090aa6165b016eac8ec08e71b17"
-  SERVED_MODEL: "qwen3-vl-4b"
+  REGISTRY: ghcr.io
 
 jobs:
   gpu-start-runner:
@@ -70,6 +73,7 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,8 +84,10 @@ jobs:
           nvidia-smi
           if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            echo "GPU_DEVICE_ARGS=--gpus all" >> "$GITHUB_ENV"
           elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            echo "GPU_DEVICE_ARGS=--device nvidia.com/gpu=all" >> "$GITHUB_ENV"
           else
             echo "Neither Docker nor Podman is usable" >&2
             exit 1
@@ -92,12 +98,49 @@ jobs:
           "$CONTAINER_RUNTIME" system prune -af || true
           df -h /
 
+      - name: Read vision image spec
+        id: spec
+        uses: ./.github/actions/vllm-image-spec
+        with:
+          key: vision
+
+      - name: Log in to GHCR (docker)
+        if: env.CONTAINER_RUNTIME == 'docker'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR (podman)
+        if: env.CONTAINER_RUNTIME == 'podman'
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | podman login "$REGISTRY" \
+            --username "$GHCR_USERNAME" --password-stdin
+
+      - name: Resolve published vision image
+        id: image
+        uses: ./.github/actions/resolve-vllm-gpu-image
+        with:
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+
+      # Only reached when GHCR has no image matching this checkout -- a PR that
+      # edits vllm/Containerfile or repins the model, or a publish that has not
+      # landed yet. vllm-gpu-container.yaml is what normally produces this.
       - name: Build pinned vision GPU image
+        if: steps.image.outputs.build-required == 'true'
         uses: ./.github/actions/build-vllm-gpu
         with:
-          model: ${{ env.VISION_MODEL }}
-          revision: ${{ env.VISION_REVISION }}
-          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          image: ${{ steps.spec.outputs.image }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
@@ -118,53 +161,50 @@ jobs:
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Start pinned vision model on vLLM
-        run: |
-          set -euo pipefail
-          gpu_args=()
-          if [ "$CONTAINER_RUNTIME" = podman ]; then
-            gpu_args=(--device nvidia.com/gpu=all)
-          else
-            gpu_args=(--gpus all)
-          fi
-          "$CONTAINER_RUNTIME" run -d --name vllm --pull=never \
-            "${gpu_args[@]}" -p 8000:8000 \
-            "$VLLM_IMAGE" \
-            --model "/opt/vllm/models/${VISION_MODEL}" \
-            --served-model-name "$SERVED_MODEL" --max-model-len 8192 \
-            --gpu-memory-utilization 0.90 --enforce-eager \
-            --api-key "$VLLM_API_KEY"
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.served-model-name }}
+          model-path: ${{ steps.spec.outputs.model-path }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          # Resolved above, either pulled or built; nothing left to fetch.
+          pull: "false"
+          device-args: ${{ env.GPU_DEVICE_ARGS }}
+          gpu-memory-utilization: ${{ steps.spec.outputs.gpu-memory-utilization }}
+          max-model-len: ${{ steps.spec.outputs.max-model-len }}
+          tool-call-parser: ${{ steps.spec.outputs.tool-call-parser }}
+          reasoning-parser: ${{ steps.spec.outputs.reasoning-parser }}
+          extra-args: ${{ steps.spec.outputs.extra-serve-args }}
+          # vLLM requires the same bearer token Praxis injects, so an
+          # unauthenticated upstream call fails.
+          api-key: ${{ env.VLLM_API_KEY }}
 
-      - name: Wait for native Anthropic Messages endpoint
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
+        with:
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          timeout: "1200"
+          api-key: ${{ env.VLLM_API_KEY }}
+
+      - name: Verify native Anthropic Messages endpoint
+        env:
+          SERVED_MODEL: ${{ steps.spec.outputs.served-model-name }}
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 1200))
-          until curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; do
-            if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
-              "$CONTAINER_RUNTIME" logs vllm 2>&1 || true
-              echo "vLLM exited before readiness" >&2
-              exit 1
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              "$CONTAINER_RUNTIME" logs vllm 2>&1 || true
-              echo "vLLM did not become ready in 1200 seconds" >&2
-              exit 1
-            fi
-            sleep 5
-          done
-          curl -sf -H "Authorization: Bearer ${VLLM_API_KEY}" \
-            http://127.0.0.1:8000/v1/models >/dev/null
+          # wait-vllm proved /health and /v1/models; this additionally proves the
+          # native Messages surface the SDK tests drive is up and token-gated.
           curl -sf -H "Authorization: Bearer ${VLLM_API_KEY}" \
             -H 'content-type: application/json' \
             -d "{\"model\":\"${SERVED_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
             http://127.0.0.1:8000/v1/messages/count_tokens >/dev/null
 
-      - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
-
       - name: Run official Anthropic SDK image tests
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
-          PRAXIS_TEST_VLLM_MODEL: ${{ env.SERVED_MODEL }}
+          PRAXIS_TEST_VLLM_MODEL: ${{ steps.spec.outputs.served-model-name }}
           PRAXIS_TEST_REQUIRE_LIVE: "1"
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k image
 

@@ -5,7 +5,7 @@
 # (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model
 # response, records the `file_search_call` items it sees as assignments, and
 # publishes the single continuation signal (`action=loop|done`).
-# `openai_file_search_callout` is a pure request-phase dispatcher: at request-
+# `openai_file_search_dispatch` is a pure request-phase dispatcher: at request-
 # body EOS on each IRR re-entry it executes the assigned calls against the
 # vector store and reconciles each item in place, then the owner prepares the
 # next inference request. The dispatcher never parses the response body and
@@ -54,10 +54,10 @@
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:8080"
-    filter_chains: [file-search-callout-pipeline]
+    filter_chains: [file-search-dispatch-pipeline]
 
 filter_chains:
-  - name: file-search-callout-pipeline
+  - name: file-search-dispatch-pipeline
     filters:
       # Publishes the typed operation consumed by openai_responses_request.
       - filter: ai_operation
@@ -80,7 +80,7 @@ filter_chains:
               # assigned in the prior response, mutating each in place inside
               # ResponsesState.accumulated_output. It never parses the response
               # body and never decides whether another round runs.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 # Every vector-store sub-request runs through this named
                 # top-level chain. The chain-aware production builder resolves

@@ -567,16 +567,36 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
     state.messages = vec![
         json!({"role": "user", "content": "hist-a"}),
         json!({"role": "user", "content": "from-messages"}),
-    ];
+    ]
+    .into();
     state.persisted_messages = vec![
         json!({"role": "user", "content": "hist-b1"}),
         json!({"role": "user", "content": "hist-b2"}),
         json!({"role": "user", "content": "from-persisted"}),
-    ];
+    ]
+    .into();
 
+    let original_messages = state.messages.clone();
+    let original_persisted = state.persisted_messages.clone();
+    let original_order = serde_json::to_value(&original_persisted).unwrap();
     let compaction_item = build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX);
     replace_messages(&mut state, &compaction_item);
 
+    assert_eq!(serde_json::to_value(&original_persisted).unwrap(), original_order);
+    assert!(
+        std::sync::Arc::ptr_eq(
+            original_messages.shared_items().last().unwrap(),
+            state.messages.shared_items().last().unwrap(),
+        ),
+        "compaction must keep the replay view's current-turn payload shared"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            original_persisted.shared_items().last().unwrap(),
+            state.persisted_messages.shared_items().last().unwrap(),
+        ),
+        "compaction must keep the persistence view's current-turn payload shared"
+    );
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[1]["content"], "from-messages");
     assert_eq!(state.persisted_messages.len(), 2);
@@ -903,7 +923,7 @@ fn should_compact_uses_previous_usage_when_available() {
         "input": "Hello",
         "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
-    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.messages = vec![json!({"role": "user", "content": "Hi"})].into();
     state.previous_usage = Some(json!({"total_tokens": 2000}));
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(result.is_some(), "should compact when previous_usage exceeds threshold");
@@ -916,7 +936,7 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
         "input": "Hello",
         "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
-    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.messages = vec![json!({"role": "user", "content": "Hi"})].into();
     state.previous_usage = Some(json!({"total_tokens": 500}));
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
@@ -962,7 +982,7 @@ fn should_compact_accounts_for_overhead() {
         "instructions": long_instructions,
         "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
-    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.messages = vec![json!({"role": "user", "content": "Hi"})].into();
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(
         result.is_some(),
