@@ -288,10 +288,11 @@ impl HttpFilter for ModelToProviderFilter {
             return Ok(FilterAction::Continue);
         }
 
+        let needs_rewrite = client_model != mapping.target_model;
         queue_provider_header(ctx, &mapping.provider);
         ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
 
-        if object.get("model").and_then(Value::as_str) != Some(mapping.target_model.as_str()) {
+        if needs_rewrite {
             object.insert("model".to_owned(), Value::String(mapping.target_model.clone()));
             replace_json_body(body, &value, self.name(), "model").map_err(|error| {
                 FilterError::from(format!("model_to_provider: request serialization failed: {error}"))
