@@ -1998,11 +1998,14 @@ def _reasoning_capture_session(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
     db_path = str(db_dir / "responses.db")
-    # Converged onto full-flow-agentic.yaml: VLLM_MODEL is aliased to the
-    # Chat Completions backend so the native model routes through the
-    # translator, and full-flow's IRR step already runs openai_agentic_loop
-    # ahead of openai_responses_to_chat_completions (so the "agentic" param needs no
-    # extra wiring). Map that param onto the vLLM dialect; "none" disables it.
+    # Converged onto full-flow-agentic.yaml: the binding router maps model
+    # "vllm-chat" (CHAT_TRANSLATION_MODEL) to the Chat Completions backend, and
+    # model-rewrite then rewrites that body model to VLLM_MODEL. Reasoning tests
+    # MUST send CHAT_TRANSLATION_MODEL to route through the translator; a native
+    # VLLM_MODEL request lands on the Responses backend instead. full-flow's IRR
+    # step already runs openai_agentic_loop ahead of
+    # openai_responses_to_chat_completions (so the "agentic" param needs no extra
+    # wiring). Map that param onto the vLLM dialect; "none" disables it.
     param = getattr(request, "param", "vllm")
     config_path = _write_full_flow_config(
         port,
@@ -4136,7 +4139,7 @@ class TestResponsesReasoningVLLM:
             },
             {"reasoning_content": "42."},
         ]
-        with client.responses.stream(model=VLLM_MODEL, input="Pick a number.", store=True) as stream:
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="Pick a number.", store=True) as stream:
             events = list(stream)
             final = stream.get_final_response()
         deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
@@ -4153,7 +4156,7 @@ class TestResponsesReasoningVLLM:
         assert done.text == item.content[0].text
         stored = client.responses.retrieve(final.id)
         assert stored.output[0].model_dump() == item.model_dump()
-        client.responses.create(model=VLLM_MODEL, previous_response_id=final.id, input="Which number?", store=False)
+        client.responses.create(model=CHAT_TRANSLATION_MODEL, previous_response_id=final.id, input="Which number?", store=False)
         assert forwarded[-1]["messages"][1] == {
             "role": "assistant", "content": None, "reasoning": "I picked 42.",
         }
@@ -4164,7 +4167,7 @@ class TestResponsesReasoningVLLM:
     ):
         client, forwarded = reasoning_capture_client
         ChatCaptureHandler.stream_deltas = [{"content": "Earlier answer."}]
-        with client.responses.stream(model=VLLM_MODEL, input="First turn.", store=True) as stream:
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="First turn.", store=True) as stream:
             list(stream)
             first = stream.get_final_response()
         ChatCaptureHandler.stream_deltas = [{"content": "Done."}, {"reasoning": "I picked 42."}]
@@ -4174,7 +4177,7 @@ class TestResponsesReasoningVLLM:
                 "function": {"name": "lookup", "arguments": "{}"},
             }]})
         with client.responses.stream(
-            model=VLLM_MODEL, previous_response_id=first.id, input="Pick a number.", store=True,
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=first.id, input="Pick a number.", store=True,
         ) as stream:
             list(stream)
             second = stream.get_final_response()
@@ -4189,7 +4192,7 @@ class TestResponsesReasoningVLLM:
         if with_tool_call:
             continuation.insert(0, {"type": "function_call_output", "call_id": "call_lookup", "output": "42"})
         client.responses.create(
-            model=VLLM_MODEL, previous_response_id=second.id, input=continuation, store=False,
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=second.id, input=continuation, store=False,
         )
         messages = forwarded[-1]["messages"]
         assert messages[1] == {"role": "assistant", "content": "Earlier answer."}
@@ -4211,7 +4214,7 @@ class TestResponsesReasoningVLLM:
         client, _ = reasoning_capture_client
         ChatCaptureHandler.stream_deltas = [{"reasoning": "valid prefix"}, bad_delta]
         events = list(client.responses.create(
-            model=VLLM_MODEL, input="Think.", stream=True, store=False,
+            model=CHAT_TRANSLATION_MODEL, input="Think.", stream=True, store=False,
         ))
         assert events[-1].type == "response.failed"
         assert events[-1].response.output == []
@@ -4225,7 +4228,7 @@ class TestResponsesReasoningVLLM:
     def test_live_streaming_reasoning_translation(self, reasoning_client):
         """Exercise the dialect against the configured live vLLM endpoint."""
         with reasoning_client.responses.stream(
-            model=VLLM_MODEL, input="What is 17 times 23? Think before answering.",
+            model=CHAT_TRANSLATION_MODEL, input="What is 17 times 23? Think before answering.",
             max_output_tokens=1024, store=True,
         ) as stream:
             events = list(stream)
@@ -4387,7 +4390,7 @@ class TestResponsesReasoningVLLM:
         thought = "x" * 40_000
         deltas = [{"reasoning": thought}, {"content": "Answer"}]
         ChatCaptureHandler.stream_deltas = list(reversed(deltas)) if late else deltas
-        with client.responses.stream(model=VLLM_MODEL, input="Question", store=True) as stream:
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="Question", store=True) as stream:
             list(stream)
             first = stream.get_final_response()
         assert first.status == "completed"
@@ -4397,7 +4400,7 @@ class TestResponsesReasoningVLLM:
             ["message", "reasoning"] if late else ["reasoning", "message"]
         )
         client.responses.create(
-            model=VLLM_MODEL, previous_response_id=first.id, input="Continue", store=False,
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=first.id, input="Continue", store=False,
         )
         # The forwarded history carries the reasoning exactly once, attached to its answer.
         assistants = [item for item in forwarded[-1]["messages"] if item["role"] == "assistant"]
@@ -4602,6 +4605,78 @@ class TestResponsesCompactionVLLM:
         assert "Repeat the persistent marker" in conversation
 
 
+class _Chat404BackendHandler(BaseHTTPRequestHandler):
+    """Chat Completions backend stub that always returns 404.
+
+    Replaces the pre-convergence ``test_backend_error_is_sdk_compatible``, which
+    relied on live vLLM 404ing an unknown model — a path the full-flow binding
+    router no longer reaches (an unknown model routes to the native Responses
+    backend, not the Chat backend). Sending ``CHAT_TRANSLATION_MODEL`` at this
+    stub instead proves a Chat backend error still surfaces to the SDK.
+    """
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        body = json.dumps(
+            {"error": {"message": "model not found", "type": "not_found_error"}}
+        ).encode()
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture()
+def backend_error_client(tmp_path_factory, request):
+    """Full-flow proxy whose Chat Completions backend always returns 404."""
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), _Chat404BackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-backend-error")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+    )
+    binary = _find_binary()
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Backend-error Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 class TestResponsesToChatCompletionsVLLM:
     """Live SDK coverage for Chat Completions SSE translation."""
 
@@ -4761,7 +4836,13 @@ class TestResponsesToChatCompletionsVLLM:
                 [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
                 "input_image",
             ),
-            ([{"type": "input_file", "file_id": "file_123"}], "input_file"),
+            # Inline file_data skips openai_file_resolve (which would 401 on
+            # full-flow without the ogx_files credential) and still reaches the
+            # translator's input_file rejection, so the scalar cases below run.
+            (
+                [{"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0="}],
+                "input_file",
+            ),
             (42, "must be a string or array of input_text parts"),
             ({"result": 42}, "must be a string or array of input_text parts"),
             (True, "must be a string or array of input_text parts"),
@@ -5085,6 +5166,20 @@ class TestResponsesToChatCompletionsVLLM:
         assert events[-1].type == "response.incomplete"
         assert terminal.status == "incomplete"
         assert terminal.incomplete_details.reason == "max_output_tokens"
+
+    def test_backend_error_is_sdk_compatible(self, backend_error_client):
+        """A Chat backend 404 surfaces through the translation layer as a
+        status-preserving ``NotFoundError`` so backend error propagation stays
+        covered after the convergence onto full-flow-agentic.yaml."""
+        with pytest.raises(NotFoundError) as exc_info:
+            backend_error_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="This request must fail.",
+                store=False,
+            )
+        assert exc_info.value.status_code == 404, (
+            "a Chat backend 404 must surface as a 404 to the SDK"
+        )
 
     @requires_vllm_compat
     def test_web_search_streams_terminal_round_as_one_logical_response(
@@ -9458,9 +9553,11 @@ class _FilesApiStubHandler(BaseHTTPRequestHandler):
 
     Answers metadata and content only when the full-flow outbound chain
     re-projected the trusted owner identity onto the callout
-    (``x-tenant-id``/``x-user-id`` via project_state_owner_headers), so a
-    resolved file proves the bound outbound pipeline executed. Captures the
-    re-projected identity of every callout for the assertions below.
+    (``x-tenant-id``/``x-user-id`` via project_state_owner_headers) AND injected
+    the ``ogx_files`` credential (``Authorization: Bearer test``), so a resolved
+    file proves both the bound outbound pipeline executed and the credential was
+    injected. Captures the re-projected identity and credential of every callout
+    for the assertions below.
     """
 
     callout_headers: ClassVar[list[dict[str, str | None]]] = []
@@ -9469,11 +9566,13 @@ class _FilesApiStubHandler(BaseHTTPRequestHandler):
         identity = {
             "x-tenant-id": self.headers.get("x-tenant-id"),
             "x-user-id": self.headers.get("x-user-id"),
+            "authorization": self.headers.get("Authorization"),
         }
         type(self).callout_headers.append(identity)
         if (
             identity["x-tenant-id"] != TRUSTED_OWNER_HEADERS["x-auth-tenant"]
             or identity["x-user-id"] != TRUSTED_OWNER_HEADERS["x-auth-user"]
+            or identity["authorization"] != "Bearer test"
         ):
             self.send_response(403)
             self.end_headers()
@@ -9518,7 +9617,14 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
         # fails here instead of silently serving content.
         leaked = [
             name
-            for name in ("x-tenant-id", "x-user-id", "authorization", "x-user-ogx-key")
+            for name in (
+                "x-auth-tenant",
+                "x-auth-user",
+                "x-tenant-id",
+                "x-user-id",
+                "authorization",
+                "x-user-ogx-key",
+            )
             if self.headers.get(name) is not None
         ]
         if leaked:
@@ -9687,12 +9793,14 @@ class TestFileResolveOutboundChain:
             f"data:application/pdf;base64,{_FILE_RESOLVE_B64}"
         ), content
 
-        # Every Files API callout carried the re-projected owner identity,
-        # proving the credentialed outbound chain ran for the file_id callout.
+        # Every Files API callout carried the re-projected owner identity and the
+        # injected ogx_files credential, proving the credentialed outbound chain
+        # ran for the file_id callout.
         assert files_stub.callout_headers, "Files API stub should receive callouts"
         assert all(
             h["x-tenant-id"] == TRUSTED_OWNER_HEADERS["x-auth-tenant"]
             and h["x-user-id"] == TRUSTED_OWNER_HEADERS["x-auth-user"]
+            and h["authorization"] == "Bearer test"
             for h in files_stub.callout_headers
         ), files_stub.callout_headers
 
