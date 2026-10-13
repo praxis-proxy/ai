@@ -551,12 +551,17 @@ impl McpToolResolveFilter {
             // the SSRF-rejection invariant. A cache miss instead validates during
             // the actual callout inside the subrequest transport, so exactly one
             // DNS resolution happens per path.
-            mcp_client::validate_mcp_target(server_url, self.timeout, callout.allow_private())
-                .await
-                .map_err(|source| ResolveError::Client {
-                    server_label: label.to_owned(),
-                    source,
-                })?;
+            mcp_client::validate_mcp_target(
+                server_url,
+                self.timeout,
+                callout.allow_private(),
+                mcp_client::mcp_resolution_policy(is_connector),
+            )
+            .await
+            .map_err(|source| ResolveError::Client {
+                server_label: label.to_owned(),
+                source,
+            })?;
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }

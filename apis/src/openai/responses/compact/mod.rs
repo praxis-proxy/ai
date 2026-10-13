@@ -215,16 +215,36 @@ impl CompactFilter {
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let result = self.execute_summarization_callout(request, timeout).await;
         Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
+    }
+
+    /// Dial the operator-configured inference endpoint for a summarization.
+    ///
+    /// The destination is `inference_url` from the filter config, so it resolves
+    /// through the shared DNS cache ([`UrlResolutionPolicy::OperatorCached`]).
+    /// The result is mapped back to [`SubRequestError`] so both callout callers
+    /// share [`handle_subrequest_result`](Self::handle_subrequest_result).
+    ///
+    /// [`UrlResolutionPolicy::OperatorCached`]: subrequest::UrlResolutionPolicy::OperatorCached
+    /// [`SubRequestError`]: subrequest::SubRequestError
+    async fn execute_summarization_callout(
+        &self,
+        request: SubRequest,
+        timeout: Duration,
+    ) -> Result<subrequest::SubResponse, subrequest::SubRequestError> {
+        self.client
+            .execute_url(
+                &self.config.inference_url,
+                request,
+                subrequest::address_policy_hook(self.config.address_policy),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                timeout,
+                MAX_SUMMARIZATION_RESPONSE_BYTES,
+                None,
+            )
+            .await
+            .map_err(subrequest::map_url_error)
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -259,15 +279,7 @@ impl CompactFilter {
         let conversation_text = build_conversation_text(messages);
         let request = build_summarization_request(&conversation_text, req.instructions.as_deref(), &req.model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let result = self.execute_summarization_callout(request, timeout).await;
         self.handle_subrequest_result(result)
     }
 
@@ -327,6 +339,10 @@ impl CompactFilter {
     }
 
     /// Inner logic for explicit compact, using `FilterAction` as the error type.
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the summarization callout embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+    )]
     async fn do_explicit_compact(
         &self,
         ctx: &HttpFilterContext<'_>,

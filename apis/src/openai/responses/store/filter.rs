@@ -179,10 +179,13 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
-        let deleted = store
-            .delete_response(id)
-            .await
-            .map_err(|e| FilterError::from(format!("openai_responses_store: delete failed: {e}")))?;
+        let deleted = match store.delete_response(id).await {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                warn!(response_id = id, error = %e, "response delete failed");
+                return Ok(FilterAction::Reject(reject_store_error()));
+            },
+        };
 
         if deleted {
             debug!(id, "response deleted");

@@ -383,35 +383,41 @@ impl FileUrlResolver {
             body: bytes::Bytes::new(),
         };
 
-        let response = crate::subrequest::execute_url(
-            &self.client,
-            parsed_url.as_str(),
-            request,
-            max_resolved_bytes,
-            remaining,
-            address_policy,
-        )
-        .await
-        .map_err(|e| {
-            use crate::subrequest::SubRequestError;
-            match &e {
-                SubRequestError::DeadlineExceeded => ResolveError::FileUrlFailed {
-                    label: label.clone(),
-                    detail: "fetch timed out".to_owned(),
-                },
-                SubRequestError::Connect(detail) if detail.contains("blocked non-public address") => {
-                    ResolveError::FileUrlBlocked { label: label.clone() }
-                },
-                SubRequestError::ResponseTooLarge { .. } => ResolveError::TooLarge {
-                    reference: label.clone(),
-                    limit: max_resolved_bytes,
-                },
-                _ => ResolveError::FileUrlFailed {
-                    label: label.clone(),
-                    detail: "fetch failed".to_owned(),
-                },
-            }
-        })?;
+        // The file URL comes from the client's request, so resolve it per call
+        // to keep arbitrary hostnames out of the shared DNS cache.
+        let response = self
+            .client
+            .execute_url(
+                parsed_url.as_str(),
+                request,
+                crate::subrequest::address_policy_hook(address_policy),
+                crate::subrequest::UrlResolutionPolicy::ClientPerCall,
+                remaining,
+                max_resolved_bytes,
+                None,
+            )
+            .await
+            .map_err(crate::subrequest::map_url_error)
+            .map_err(|e| {
+                use crate::subrequest::SubRequestError;
+                match &e {
+                    SubRequestError::DeadlineExceeded => ResolveError::FileUrlFailed {
+                        label: label.clone(),
+                        detail: "fetch timed out".to_owned(),
+                    },
+                    SubRequestError::Connect(detail) if detail.contains("blocked non-public address") => {
+                        ResolveError::FileUrlBlocked { label: label.clone() }
+                    },
+                    SubRequestError::ResponseTooLarge { .. } => ResolveError::TooLarge {
+                        reference: label.clone(),
+                        limit: max_resolved_bytes,
+                    },
+                    _ => ResolveError::FileUrlFailed {
+                        label: label.clone(),
+                        detail: "fetch failed".to_owned(),
+                    },
+                }
+            })?;
 
         // Check success status
         let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);

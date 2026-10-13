@@ -15,7 +15,9 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
+use praxis_core::connectivity::{
+    PreparedSubrequest, PreparedTarget, UrlResolutionPolicy, prepare_url_target_with_policy,
+};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, DeferredCredential, FilterError, FilterPipeline, FilteredSubrequestExecutor,
     HttpFilterContext, IterationState, PendingCredentials, RequestExtensions, StagedUpstream, StagedUpstreamFallback,
@@ -205,7 +207,7 @@ fn provider_auth(provider: SearchProvider) -> (http::HeaderName, &'static str) {
 /// from.
 ///
 /// The executor resolves the callout destination from this same URL (via
-/// [`prepare_url_target`]), so binding the credential to the authority derived
+/// [`prepare_url_target_with_policy`]), so binding the credential to the authority derived
 /// here matches the resolved destination by construction while being dropped,
 /// zeroized, on any host *or* port divergence — an exact authority, never a host
 /// wildcard. The port is the URL's explicit port, else the scheme default (443
@@ -405,7 +407,7 @@ impl SearchClient {
     /// Execute a search request through the outbound chain and map the response
     /// to a [`SearchOutcome`].
     ///
-    /// The provider destination is resolved with [`prepare_url_target`] (a
+    /// The provider destination is resolved with [`prepare_url_target_with_policy`] (a
     /// permissive validation hook — private-address/SSRF enforcement is deferred
     /// to the executor's connect-time `build_peer`, gated by
     /// `insecure_options.allow_private_upstreams`) and staged as a
@@ -466,14 +468,19 @@ impl SearchClient {
         identity: &CalloutIdentity,
     ) -> Option<(PreparedSubrequest, RequestExtensions)> {
         // Private-address / SSRF enforcement is deferred to the executor's
-        // connect-time `build_peer`, so this hook is permissive.
-        let target = match prepare_url_target(url, deadline, |_addrs| Ok(())).await {
-            Ok(target) => target,
-            Err(e) => {
-                warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
-                return None;
-            },
-        };
+        // connect-time `build_peer`, so this hook is permissive. The provider
+        // endpoint is operator-configured, so it resolves through the shared
+        // DNS cache.
+        let target =
+            match prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+            {
+                Ok(target) => target,
+                Err(e) => {
+                    warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
+                    return None;
+                },
+            };
         // Assemble the executor extensions while `target` is still owned, then
         // let `bind` consume it into the origin-form request.
         let extensions = self.stage_extensions(&target, url, identity)?;
@@ -1909,10 +1916,14 @@ mod tests {
         let attacker_addr = attacker_listener.local_addr().unwrap();
         let attacker_rx = spawn_recording_server(attacker_listener, 200, "{}");
         let attacker_url = format!("http://{attacker_addr}/");
-        let attacker_target =
-            prepare_url_target(&attacker_url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-                .await
-                .unwrap();
+        let attacker_target = prepare_url_target_with_policy(
+            &attacker_url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let attacker_upstream = StagedUpstream::from_prepared_target(&attacker_target).unwrap().0;
         let url = format!("http://{provider_addr}/res/v1/web/search?q=test&count=5");
         (url, retargeting_outbound(attacker_upstream), provider_rx, attacker_rx)
@@ -2102,9 +2113,14 @@ mod tests {
     async fn stage_extensions_projects_owner_into_child_extensions() {
         let client = test_client_for(SearchProvider::Brave);
         let url = "http://127.0.0.1:9/res/v1/web/search";
-        let target = prepare_url_target(url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-            .await
-            .unwrap();
+        let target = prepare_url_target_with_policy(
+            url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let identity = CalloutIdentity::for_test(
             Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
             None,
@@ -2170,7 +2186,10 @@ mod tests {
     /// [`SearchClient::execute_search`] performs.
     async fn dispatch_with_staged_credential(url: &str, pending: PendingCredentials) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let target = prepare_url_target(url, deadline, |_addrs| Ok(())).await.unwrap();
+        let target =
+            prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+                .unwrap();
         let mut extensions = RequestExtensions::default();
         extensions.insert(StagedUpstream::from_prepared_target(&target).unwrap());
         extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));
