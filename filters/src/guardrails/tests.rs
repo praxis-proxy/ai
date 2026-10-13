@@ -219,6 +219,41 @@ fn assert_redacted_assistant_content(
     );
 }
 
+/// Run `on_response` and record whether the upstream sent `Content-Length`.
+///
+/// The header value is not the buffered body length. Only its presence
+/// selects the committed-length rules. This is a macro so the temporary
+/// response lives in the caller, matching `response_header`'s lifetime.
+macro_rules! note_upstream_content_length {
+    ($filter:expr, $ctx:expr, $committed:expr) => {{
+        $ctx.current_filter_id = Some(0);
+        let mut response = crate::test_utils::make_response();
+        if $committed {
+            response
+                .headers
+                .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("1"));
+        }
+        $ctx.response_header = Some(&mut response);
+        $filter
+            .on_response(&mut $ctx)
+            .await
+            .expect("on_response should note response framing");
+        $ctx.response_header = None;
+        $ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    }};
+}
+
+/// The body is one JSON value and is not space-padded out to a longer length.
+fn assert_natural_json(body: &bytes::Bytes) {
+    let json: serde_json::Value = serde_json::from_slice(body).expect("unpadded body must be valid JSON");
+    let compact = serde_json::to_string(&json).expect("reserialize");
+    assert_eq!(
+        body.as_ref(),
+        compact.as_bytes(),
+        "body should be the serialized JSON with no space padding"
+    );
+}
+
 /// Extract the [`praxis_filter::Rejection`] from a [`praxis_filter::FilterAction`],
 /// failing the test (via `unwrap`) if the action is not `Reject`.
 fn as_rejection(action: praxis_filter::FilterAction) -> praxis_filter::Rejection {
@@ -734,14 +769,16 @@ async fn on_request_body_modified_without_user_message_fails_closed() {
         br#"{"messages":[{"role":"system","content":"Be helpful"}]}"#,
     ));
 
-    let error = filter
-        .on_request_body(&mut ctx, &mut body, true)
-        .await
-        .expect_err("redacting a system-only body should fail closed");
-    let error = error.to_string();
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 502,
+        "a redaction that cannot be applied must be rejected, not failed open"
+    );
+    let body_text = String::from_utf8_lossy(&rejection.body.expect("rejection body"));
     assert!(
-        error.contains("is not a user turn"),
-        "system message must not be rewritten, got: {error}"
+        body_text.contains("is not a user turn"),
+        "system message must not be rewritten, got: {body_text}"
     );
 }
 
@@ -759,14 +796,16 @@ async fn on_request_body_modified_refuses_non_string_content() {
     );
     let mut body = Some(original.clone());
 
-    let error = filter
-        .on_request_body(&mut ctx, &mut body, true)
-        .await
-        .expect_err("array content must not be replaced with a string");
-    let error = error.to_string();
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 502,
+        "array content must be rejected rather than replaced with a string"
+    );
+    let body_text = String::from_utf8_lossy(&rejection.body.expect("rejection body"));
     assert!(
-        error.contains("message content is not a string"),
-        "non-string content should fail closed, got: {error}"
+        body_text.contains("message content is not a string"),
+        "non-string content should fail closed, got: {body_text}"
     );
     assert_eq!(
         body.as_deref(),
@@ -1646,7 +1685,7 @@ async fn on_response_body_blocked_replaces_body() {
     let filter = nemo_filter_response(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    note_upstream_content_length!(filter.as_ref(), ctx, true);
     let original_len = chat_completion_response("something toxic").len();
     let mut body = Some(chat_completion_response("something toxic"));
 
@@ -1675,7 +1714,7 @@ async fn on_response_body_modified_rewrites_assistant_content() {
     let filter = nemo_filter_response(&format!("{}/v1/checks", mock_server.uri()));
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    note_upstream_content_length!(filter.as_ref(), ctx, true);
     let original = chat_completion_response("My SSN is 123-45-6789");
     let original_len = original.len();
     let mut body = Some(original);
@@ -1699,11 +1738,11 @@ fn response_redact_filter() -> AiGuardrailsFilter {
     .expect("test filter")
 }
 
-/// Run response redaction and require a same-length continuation.
-fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
+/// Run response redaction against a committed `Content-Length` and require a same-length continuation.
+async fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    note_upstream_content_length!(filter, ctx, true);
     let original_len = original.len();
     let mut body = Some(original);
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -1731,20 +1770,25 @@ fn assert_evaluation_failed(replaced: &bytes::Bytes, absent: &[&str]) {
     }
 }
 
-/// Completion whose `logprobs` repeat the digits in `message.content`.
-fn completion_with_digit_logprobs() -> bytes::Bytes {
+/// Completion whose side fields repeat the text in `message.content`.
+fn completion_with_recoverable_original_text() -> bytes::Bytes {
     bytes::Bytes::from(
         serde_json::to_vec(&serde_json::json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "123-45-6789"},
+                "message": {
+                    "role": "assistant",
+                    "content": "123-45-6789",
+                    "reasoning": "the user SSN is 123-45-6789"
+                },
                 "logprobs": {"content": [
                     {"token": "123", "logprob": -0.1, "bytes": [49, 50, 51]},
                     {"token": "-45-", "logprob": -0.2, "bytes": [45, 52, 53, 45]},
                     {"token": "6789", "logprob": -0.3, "bytes": [54, 55, 56, 57]}
                 ]},
+                "token_ids": [515051, 424242],
                 "finish_reason": "stop"
             }]
         }))
@@ -1779,7 +1823,7 @@ fn completion_with_array_content() -> bytes::Bytes {
 /// completion with HTTP 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_expanded_redaction_fails_closed() {
-    let replaced = rewritten_response(&response_redact_filter(), chat_completion_response("x"));
+    let replaced = rewritten_response(&response_redact_filter(), chat_completion_response("x")).await;
     assert_evaluation_failed(&replaced, &["[REDACTED]", "chatcmpl-test"]);
 }
 
@@ -1798,7 +1842,7 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
     .expect("test filter");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    note_upstream_content_length!(&filter, ctx, true);
     let original = bytes::Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"SECRET-9"}}]}"#);
     let original_len = original.len();
     let mut body = Some(original);
@@ -1819,23 +1863,53 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
     );
 }
 
-/// Rewriting `message.content` must also drop `logprobs`, which repeat the
-/// original completion tokens.
+/// A redacted choice keeps only `index`, `finish_reason`, and `message.role`
+/// plus the masked `content`. Side fields that quote the original tokens are
+/// dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_modified_clears_logprobs() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_digit_logprobs());
+async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text()).await;
     let json: serde_json::Value =
         serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
+    assert_eq!(
+        json.pointer("/id").and_then(serde_json::Value::as_str),
+        Some("chatcmpl-test"),
+        "fields outside the redacted choice stay"
+    );
     assert_eq!(
         json.pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str),
         Some("[REDACTED]"),
         "assistant content should be the mask"
     );
+    assert_eq!(
+        json.pointer("/choices/0/message/role")
+            .and_then(serde_json::Value::as_str),
+        Some("assistant"),
+        "message role is on the allowlist"
+    );
+    assert_eq!(
+        json.pointer("/choices/0/index").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "choice index is on the allowlist"
+    );
+    assert_eq!(
+        json.pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("stop"),
+        "finish_reason is on the allowlist"
+    );
+    let choice = json
+        .pointer("/choices/0")
+        .and_then(serde_json::Value::as_object)
+        .expect("choice object");
     assert!(
-        json.pointer("/choices/0/logprobs")
-            .is_some_and(serde_json::Value::is_null),
-        "redacted choice logprobs should be null"
+        choice.get("logprobs").is_none() && choice.get("token_ids").is_none(),
+        "logprobs and token_ids must not remain on a redacted choice"
+    );
+    assert!(
+        json.pointer("/choices/0/message/reasoning").is_none(),
+        "message.reasoning must not remain on a redacted choice"
     );
     let rendered = String::from_utf8_lossy(&replaced);
     assert!(
@@ -1843,12 +1917,146 @@ async fn on_response_body_modified_clears_logprobs() {
         "original digits must not reach the client"
     );
     assert!(!rendered.contains("6789"), "logprob tokens must not reach the client");
+    assert!(
+        !rendered.contains("515051"),
+        "return_token_ids values must not reach the client"
+    );
 }
 
 /// A configured redaction that cannot be applied must replace the response
 /// with an `evaluation_failed` document and must not forward the original text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_redaction_failure_replaces_body() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_array_content());
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_array_content()).await;
+    assert_evaluation_failed(&replaced, &["123-45-6789", "image_url"]);
+}
+
+/// `on_response` records whether the upstream response included `Content-Length`.
+#[tokio::test]
+async fn on_response_records_whether_content_length_was_sent() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(filter.as_ref(), ctx, true);
+    assert_eq!(
+        super::filter::recorded_content_length(&ctx),
+        Some(true),
+        "a Content-Length header commits the response length"
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(filter.as_ref(), ctx, false);
+    assert_eq!(
+        super::filter::recorded_content_length(&ctx),
+        Some(false),
+        "responses without Content-Length are not length-limited"
+    );
+}
+
+/// A short name replaced by a longer mask grows the completion. With no
+/// `Content-Length` on the wire, the masked body is forwarded instead of an
+/// `evaluation_failed` error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_growth_without_content_length_is_forwarded() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "<PERSON>".into(), "pii".into()),
+        PhaseConfig {
+            request: false,
+            response: true,
+            tool_results: false,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(&filter, ctx, false);
+    let original = chat_completion_response("Bob");
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, praxis_filter::FilterAction::Continue),
+        "an unbounded rewrite should continue"
+    );
+    let replaced = body.expect("body should be rewritten");
+    assert!(
+        replaced.len() > original_len,
+        "a longer mask is forwarded when the upstream sent no Content-Length"
+    );
+    assert_natural_json(&replaced);
+    let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted JSON");
+    assert_eq!(
+        json.pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str),
+        Some("<PERSON>"),
+        "the mask is forwarded"
+    );
+    assert!(
+        json.pointer("/error/code").is_none(),
+        "growth without Content-Length must stay a completion"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("ai_guardrails")
+            .and_then(|result| result.get("status")),
+        Some("redacted")
+    );
+}
+
+/// A blocked body is the error document itself when no length was committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_block_without_content_length_is_not_padded() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::Block {
+            reason: "toxicity".into(),
+        },
+        PhaseConfig {
+            request: false,
+            response: true,
+            tool_results: false,
+        },
+    )
+    .expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(&filter, ctx, false);
+    let original = chat_completion_response(&"x".repeat(400));
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("blocked body");
+    assert!(
+        replaced.len() < original_len,
+        "the error document is not padded out to the upstream body"
+    );
+    assert_natural_json(&replaced);
+    assert_blocked_body_json(&replaced, "toxicity");
+}
+
+/// A redaction that cannot be applied returns the error document itself when
+/// no length was committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_redaction_failure_without_content_length_is_not_padded() {
+    let filter = response_redact_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(&filter, ctx, false);
+    let original = completion_with_array_content();
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("fail-closed body");
+    assert_ne!(
+        replaced.len(),
+        original_len,
+        "the error document is not fitted to the upstream body"
+    );
+    assert_natural_json(&replaced);
     assert_evaluation_failed(&replaced, &["123-45-6789", "image_url"]);
 }

@@ -244,46 +244,13 @@ fn transient_registry_failure(stderr: &str) -> bool {
 
 /// Whether podman refused the image for a signature or policy reason.
 ///
-/// Download URLs are removed first. `X-Amz-Signature` and `akamai_signature` are request signatures, not an image
-/// signature rejection.
+/// Podman prefixes those refusals with `Source image rejected:`. Matching
+/// that prefix ignores `X-Amz-Signature` query parameters in the CDN URL
+/// quoted by a reconnect error, which are transport failures and are retried.
 fn signature_rejection(stderr: &str) -> bool {
-    const MARKERS: &[&str] = &["signature", "signedby", "gpg", "key expired", "policy"];
-    let lower = without_urls(&stderr.to_ascii_lowercase());
+    const MARKERS: &[&str] = &["source image rejected"];
+    let lower = stderr.to_ascii_lowercase();
     MARKERS.iter().any(|marker| lower.contains(marker))
-}
-
-/// Drop HTTP and HTTPS URLs so their query strings are not scanned for policy words.
-fn without_urls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(ch) = rest.chars().next() {
-        if let Some(scheme_len) = url_scheme_at(rest) {
-            out.push(' ');
-            rest = rest.get(scheme_len..).unwrap_or_default();
-            let end = rest.find(url_terminator).unwrap_or(rest.len());
-            rest = rest.get(end..).unwrap_or_default();
-        } else {
-            out.push(ch);
-            rest = rest.get(ch.len_utf8()..).unwrap_or_default();
-        }
-    }
-    out
-}
-
-/// `https://` or `http://` at the start of `text`, as a byte length.
-fn url_scheme_at(text: &str) -> Option<usize> {
-    if text.starts_with("https://") {
-        Some("https://".len())
-    } else if text.starts_with("http://") {
-        Some("http://".len())
-    } else {
-        None
-    }
-}
-
-/// A character that ends a URL in podman's pull errors.
-fn url_terminator(ch: char) -> bool {
-    !ch.is_ascii() || ch.is_ascii_whitespace() || matches!(ch, '"' | '\'')
 }
 
 /// Describe a failed pull. Transport failures stay transport failures so a
