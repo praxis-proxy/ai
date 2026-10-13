@@ -32,7 +32,7 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::histogram;
-use praxis_ai_apis::{is_event_stream_content_type, promotion::is_promotable_value};
+use praxis_ai_apis::is_event_stream_content_type;
 use praxis_filter::{
     BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -130,32 +130,14 @@ impl HttpFilter for TimeToFirstTokenFilter {
         }
 
         let ttft = ctx.request_start.elapsed().as_secs_f64();
-        let model = resolve_model(ctx);
+        let model = crate::llm_metrics::resolve_model(ctx);
+        let cluster = crate::llm_metrics::cluster(ctx);
 
-        histogram!(METRIC_TTFT_SECONDS, "model" => model).record(ttft);
+        histogram!(METRIC_TTFT_SECONDS, "model" => model, "cluster" => cluster).record(ttft);
         ctx.filter_metadata.remove(META_ACTIVE);
 
         debug!(ttft, "recorded time-to-first-token");
 
         Ok(FilterAction::Continue)
     }
-}
-
-/// Resolve the model label from request metadata with fallback.
-///
-/// Reads the model a Responses, native Chat Completions, or Anthropic filter
-/// promoted on the request path. When no filter published a model, the label
-/// falls back to `unknown`.
-///
-/// Values containing control characters or exceeding the promotion length
-/// cap are treated as unsafe and replaced with `"unknown"` to prevent
-/// malformed Prometheus labels or cardinality pressure.
-fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
-    ctx.get_metadata("openai_responses_request.model")
-        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
-        .filter(|v| is_promotable_value(v))
-        .unwrap_or("unknown")
-        .to_owned()
 }
