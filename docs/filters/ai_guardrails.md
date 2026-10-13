@@ -7,7 +7,9 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 
 ## Configuration Notes
 
-Registered as a security filter. Pipeline validation rejects `failure_mode: open` unless `insecure_options.allow_open_security_filters` is set, so a provider timeout or error cannot silently skip screening.
+Registered as a security filter. Pipeline validation rejects `failure_mode: open` unless `insecure_options.allow_open_security_filters` is set. `insecure_options.skip_pipeline_validation` also bypasses this check. With either option, a provider timeout or error can silently skip screening.
+
+Request `conditions:` are rejected for the same reason: a security filter must not be skipped for non-matching requests. Body hooks do not run inside a branch, so a router branch is not a substitute. A non-empty request body without a Chat Completions `messages` array fails the request with 500. Serve `/v1/responses` and `/v1/embeddings` from a listener that does not include this filter; put `ai_guardrails` only on a listener whose routes are Chat Completions.
 
 Every provider callout runs through Praxis's filtered-subrequest executor. The optional `outbound_chain` adds destination-bound authentication, authorization, audit, and static service credentials; when omitted it defaults to an empty pass-through chain. Parent and child contexts stay isolated; user-scoped credential projection is handled separately in #880.
 

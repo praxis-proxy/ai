@@ -502,9 +502,15 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 
 /// Register `ai_guardrails` as a security-critical chain-binding filter.
 ///
-/// The optional outbound chain is resolved at construction time. The security
-/// class makes `failure_mode: open` fail pipeline validation, so a provider
-/// timeout or error cannot silently skip content screening.
+/// The optional outbound chain is resolved at construction time. Pipeline
+/// validation rejects `failure_mode: open` unless
+/// `insecure_options.allow_open_security_filters` is set.
+/// `insecure_options.skip_pipeline_validation` also bypasses that check.
+/// With either option, a provider timeout or error can skip content
+/// screening. Request `conditions:` are rejected, and body hooks do not run
+/// inside a branch, so a listener that also serves `/v1/responses` or
+/// `/v1/embeddings` needs a separate Chat Completions listener for this
+/// filter.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let isolated_client = crate::isolated_subrequest_client(4);
@@ -770,7 +776,7 @@ provider:
         );
     }
 
-    /// Parse one `ai_guardrails` entry, optionally prefixed with entry-level fields.
+    /// One YAML shape for every failure-mode case, so the tests cannot drift apart.
     fn guardrails_entry(prefix: &str) -> FilterEntry {
         serde_yaml::from_str(&format!(
             "{prefix}\
@@ -783,7 +789,8 @@ provider:
         .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}"))
     }
 
-    /// Build an `ai_guardrails` pipeline and return its ordering diagnostics.
+    /// The same pipeline the server validates. `allow_open_security` is
+    /// `insecure_options.allow_open_security_filters`.
     fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
         let registry = build_ai_registry();
         let mut entries = vec![guardrails_entry(prefix)];
@@ -808,8 +815,8 @@ provider:
     fn ai_guardrails_open_failure_mode_allowed_by_insecure_flag() {
         let errors = guardrails_ordering_errors("failure_mode: open\n", true);
         assert!(
-            !errors.iter().any(|error| error.contains("failure_mode: open")),
-            "allow_open_security_filters should demote the open failure_mode error: {errors:?}"
+            errors.is_empty(),
+            "allow_open_security_filters should allow this configuration: {errors:?}"
         );
     }
 
@@ -817,8 +824,8 @@ provider:
     fn ai_guardrails_closed_failure_mode_passes_security_validation() {
         let errors = guardrails_ordering_errors("", false);
         assert!(
-            !errors.iter().any(|error| error.contains("failure_mode: open")),
-            "the default closed failure mode should not trip the open-security check: {errors:?}"
+            errors.is_empty(),
+            "the default closed failure mode should pass validation: {errors:?}"
         );
     }
 
@@ -887,7 +894,10 @@ provider:
     #[test]
     fn build_ai_registry_marks_security_filters() {
         let registry = build_ai_registry();
-        assert!(registry.is_security_filter("ai_guardrails"));
+        assert!(
+            registry.is_security_filter("ai_guardrails"),
+            "ai_guardrails must be registered as a security filter"
+        );
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         #[cfg(feature = "aws-sigv4-filter")]

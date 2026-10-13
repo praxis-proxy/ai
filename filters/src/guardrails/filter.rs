@@ -38,7 +38,17 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 ///
 /// Registered as a security filter. Pipeline validation rejects
 /// `failure_mode: open` unless `insecure_options.allow_open_security_filters`
-/// is set, so a provider timeout or error cannot silently skip screening.
+/// is set. `insecure_options.skip_pipeline_validation` also bypasses this
+/// check. With either option, a provider timeout or error can silently skip
+/// screening.
+///
+/// Request `conditions:` are rejected for the same reason: a security filter
+/// must not be skipped for non-matching requests. Body hooks do not run
+/// inside a branch, so a router branch is not a substitute. A non-empty
+/// request body without a Chat Completions `messages` array fails the
+/// request with 500. Serve `/v1/responses` and `/v1/embeddings` from a
+/// listener that does not include this filter; put `ai_guardrails` only on
+/// a listener whose routes are Chat Completions.
 ///
 /// Every provider callout runs through Praxis's filtered-subrequest executor.
 /// The optional `outbound_chain` adds destination-bound authentication,
