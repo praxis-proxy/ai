@@ -22,8 +22,7 @@
 #
 # One filter serves every provider: each protocol declares its own
 # operation registry and the classifier aggregates them. This example
-# branches the OpenAI protocols; `anthropic/unified-gateway.yaml` shows
-# the same filter branching Anthropic Messages beside them.
+# branches the OpenAI protocols and Anthropic Messages.
 #
 # Consuming the classification:
 #   The classifier runs in the header phase. Its headers are pending

@@ -304,11 +304,14 @@ Rust source, or maintaining a handwritten implementation specification.
 
 `specs/anthropic-spec.json` is the vendored Anthropic API OpenAPI document,
 used as the authoritative contract when reviewing changes to the Anthropic
-Messages surfaces under `apis/src/anthropic/`. Unlike the OpenAI spec, it is a
-**review reference only**: no `oasdiff` comparison, capability projection,
-runtime suite, or CI gate is wired to it. It exists so the automated PR review
-prompt can cross-reference request and response schemas, field names, types,
-enums, and optionality without a network fetch.
+Messages surfaces under `apis/src/anthropic/`. It serves two purposes: the
+registry drift check (`cargo xtask check-anthropic-messages-registry`, wired
+into `make lint`) verifies that every registered operation's method, path, and
+operation ID match the pinned spec, and the automated PR review prompt
+cross-references request and response schemas, field names, types, enums, and
+optionality without a network fetch. Unlike the OpenAI spec, there is no
+`oasdiff` structural comparison, capability projection, or runtime suite wired
+to it.
 
 ### Source and provenance
 
