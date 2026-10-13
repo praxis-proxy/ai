@@ -2110,7 +2110,7 @@ def compact_client(compact_proxy):
 
 @pytest.fixture(scope="session")
 def web_search_chat_streaming_proxy(
-    tmp_path_factory, request, search_server, backend_endpoint
+    tmp_path_factory, request, search_server, backend_endpoint, nemo_guardrails_server
 ):
     """Start the streaming web-search-through-Chat example."""
     port = _free_port()
@@ -2122,6 +2122,7 @@ def web_search_chat_streaming_proxy(
         backend_endpoint=backend_endpoint,
         search_port=search_server,
         chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -5480,7 +5481,9 @@ def nemo_guardrails_server():
 
 
 @pytest.fixture(scope="session")
-def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
+def agentic_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
     """Start a Praxis proxy with the native Responses agentic loop."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("agentic-responses")
@@ -5489,6 +5492,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
         port,
         db_path,
         backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -5538,6 +5542,7 @@ def translated_agentic_proxy(
     mcp_server,
     search_server,
     backend_endpoint,
+    nemo_guardrails_server,
 ):
     """Start the agentic loop through Responses-to-Chat translation."""
     port = _free_port()
@@ -5549,6 +5554,7 @@ def translated_agentic_proxy(
         backend_endpoint=backend_endpoint,
         search_port=search_server,
         chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -5596,7 +5602,9 @@ def translated_agentic_client(translated_agentic_proxy):
 
 
 @pytest.fixture(scope="session")
-def live_tavily_client(tmp_path_factory, request, backend_endpoint):
+def live_tavily_client(
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
+):
     """Run one credentialed Tavily search through the translated vLLM loop."""
     if VLLM_TEST_BACKEND != "live":
         pytest.skip("credentialed Tavily search requires the live backend")
@@ -5616,6 +5624,7 @@ def live_tavily_client(tmp_path_factory, request, backend_endpoint):
         backend_endpoint=backend_endpoint,
         chat_translation_model=VLLM_MODEL,
         web_search_provider="tavily",
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -8237,7 +8246,9 @@ def file_search_backend(backend_endpoint):
 
 
 @pytest.fixture(scope="session")
-def file_search_proxy(tmp_path_factory, request, file_search_backend):
+def file_search_proxy(
+    tmp_path_factory, request, file_search_backend, nemo_guardrails_server
+):
     """Start a Praxis proxy with the file-search-dispatch pipeline.
 
     The vector-store callout is pointed at an in-process recording shim
@@ -8259,6 +8270,7 @@ def file_search_proxy(tmp_path_factory, request, file_search_backend):
         db_path,
         backend_endpoint=file_search_backend,
         vector_store_endpoint=f"127.0.0.1:{shim_port}",
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -8410,7 +8422,7 @@ class TestFileSearchVLLM:
 
 @pytest.fixture(scope="session")
 def file_search_chat_proxy(
-    tmp_path_factory, request, backend_endpoint
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
 ):
     """Start a Praxis proxy with the file-search Chat Completions pipeline."""
     port = _free_port()
@@ -8422,6 +8434,7 @@ def file_search_chat_proxy(
         backend_endpoint=backend_endpoint,
         vector_store_endpoint=_ogx_endpoint(),
         chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -8582,7 +8595,7 @@ class TestFileSearchChatCompletionsVLLM:
 
 @pytest.fixture(scope="session")
 def file_search_streaming_proxy(
-    tmp_path_factory, request, file_search_backend
+    tmp_path_factory, request, file_search_backend, nemo_guardrails_server
 ):
     """Start a Praxis proxy with the streaming file-search-dispatch pipeline."""
     port = _free_port()
@@ -8593,6 +8606,7 @@ def file_search_streaming_proxy(
         db_path,
         backend_endpoint=file_search_backend,
         vector_store_endpoint=_ogx_endpoint(),
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
