@@ -24,8 +24,11 @@ changes; drift here breaks no build (the guards above do the enforcing).
 
 The proxy ships two profiles and the inventory tracks both:
 
-- **full** — the published container image (`PRAXIS_AI_FEATURES ?= full`:
-  `standard` + `openai-all` + `store-postgres`).
+- **full** — `standard` + `openai-all` + `store-postgres` (`make release`, the
+  production PostgreSQL backend). The **published container image** additionally
+  enables `store-sqlite` (builds `full,store-sqlite`) so it can also serve the
+  SQLite-backed examples. SQLite ships no cryptographic primitive (no SQLCipher),
+  so the crypto surface of the container equals that of `full`.
 - **fips** — the reduced FIPS runtime, built `--no-default-features` with the
   feature set shared from `xtask/src/fips.rs::FIPS_FEATURES`
   (`openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth`).
@@ -38,9 +41,10 @@ asserts validation.
 
 The central decision is **OpenSSL everywhere**:
 
-- All TLS (data plane, listeners, AI callouts, the policy Valkey/Redis store, the
-  PostgreSQL store) runs on **rustls with the installed `rustls_openssl`
+- All TLS **except the PostgreSQL store** (data plane, listeners, AI callouts, the
+  policy Valkey/Redis store) runs on **rustls with the installed `rustls_openssl`
   CryptoProvider** — `custom-provider`, no bundled `ring`/`aws-lc-rs` backend.
+  (The PostgreSQL store uses `native-tls`; see the exception below.)
   The provider is installed process-wide at boot and every subsequent rustls
   primitive (suites, key exchange, signatures, digests, MACs, RNG) executes on
   OpenSSL `libcrypto`.
@@ -60,25 +64,42 @@ Deliberate exceptions, each scoped and documented below:
 
 ### Pinned providers
 
-| Crate | Version | Profiles | Pinned constraint |
-| --- | --- | --- | --- |
-| `quixotic-plecostomus-rustls-openssl` | 0.4.1 | full, fips | requires `tls12`; forbids `fips` |
-| `openssl` | 0.10.81 | full, fips | forbids `vendored` (`OPENSSL_NO_VENDOR=1`) |
-| `rustls` | 0.23.45 | full, fips | requires `custom-provider`; forbids `ring`, `aws_lc_rs` |
-| `aws-lc-rs` | 1.18.1 | full | requires `aws-lc-sys`; forbids `fips` |
-| `jsonwebtoken` | 11.1.0 | full | requires `aws_lc_rs` |
-| `native-tls` | 0.2.18 | full, fips | version pin only |
+| Crate | Version | Profiles | Forbidden features (enforced by `cargo deny`) | Expected-on (not enforced) |
+| --- | --- | --- | --- | --- |
+| `quixotic-plecostomus-rustls-openssl` | 0.4.1 | full, fips | `fips` | `tls12` |
+| `openssl` | 0.10.81 | full, fips | `vendored`, `aws-lc`, `aws-lc-fips`, `unstable_boringssl` | — (`OPENSSL_NO_VENDOR=1`) |
+| `openssl-sys` | 0.9.117 | full, fips | `vendored`, `openssl-src`, `aws-lc`, `aws-lc-fips`, `bssl-sys`, `unstable_boringssl` | — |
+| `rustls` | 0.23.45 | full, fips | `ring`, `aws_lc_rs`, `fips` | `custom-provider` |
+| `aws-lc-rs` | 1.18.1 | full | `fips` | `aws-lc-sys` |
+| `jsonwebtoken` | 11.1.0 | full | — | `aws_lc_rs` |
+| `native-tls` | 0.2.18 | full, fips | — (version pin only) | — |
 
-The `forbid`/`require` columns are exactly the `[[bans.features]]` entries in
-`deny.toml`; unlisted extra features are allowed by design (feature sets grow
-across patch releases).
+Only the **forbidden-features** column is machine-enforced — it mirrors the
+`[[bans.features]]` `deny` lists in `deny.toml`. cargo-deny has **no "require a
+feature" mechanism**, so the *expected-on* features (e.g. `rustls` `custom-provider`,
+`rustls_openssl` `tls12`) are **not** guarded here: removing one would still pass
+`cargo deny check`. They are load-bearing for the OpenSSL routing and are instead
+exercised by the build and the TLS integration tests. Unlisted extra features are
+allowed by design (feature sets grow across patch releases).
 
 ## Operations
 
-Disposition legend: **non-validated** = a FIPS-approvable algorithm, validated
-only on a FIPS-activated host (remediation: `docs/fips.md`, unless noted);
-**n/a** = encoding/identity/non-security use, no validated primitive required;
-**upstream-owned** = implemented and maintained in a Praxis-core/policy crate.
+Disposition legend:
+
+- **non-validated** = a FIPS-approvable algorithm executed by the **system
+  OpenSSL** `libcrypto`; it becomes validated when the operation runs on a
+  FIPS-activated host, so the remediation is host activation (`docs/fips.md`,
+  unless noted).
+- **excluded-from-fips** = the operation executes **outside** the validated
+  OpenSSL module (in `aws-lc-rs` or RustCrypto) **or** uses a **non-approved**
+  algorithm (MD5, ChaCha20). Host activation **cannot** validate it — the only
+  remedies are *replacing* it with an OpenSSL-backed implementation or
+  *excluding/disabling* the feature. Every such operation is confined to the
+  **full** profile and is **absent from the FIPS image**, so it never affects the
+  FIPS build's compliance; the per-row note names the remediation owner.
+- **n/a** = encoding/identity/non-security use, no validated primitive required.
+- **upstream-owned** = implemented and maintained in a Praxis-core/policy crate;
+  its FIPS posture is owned there and is not asserted by this inventory.
 
 ### Transport TLS, certificate verification & handshake RNG
 
@@ -86,11 +107,11 @@ only on a FIPS-activated host (remediation: `docs/fips.md`, unless noted);
 | --- | --- | --- | --- | --- | --- |
 | T1 | rustls CryptoProvider install (process-default) | `rustls_openssl` as the sole provider (no `ring`) | OpenSSL via `quixotic-plecostomus-rustls-openssl` | full, fips | non-validated |
 | T2 | Upstream data-plane TLS (proxy → LLM) | TLS 1.2/1.3 client handshake | OpenSSL (installed provider, pingora connector) | full, fips | non-validated |
-| T3 | AI subrequest callout TLS (web_search, file_search, guardrails, compact) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full, fips | non-validated |
+| T3 | AI subrequest callout TLS (web_search, file_search, guardrails, compact) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full | non-validated |
 | T4 | Downstream listener TLS (client → proxy) | TLS 1.2/1.3 server handshake; optional WebPKI client-cert | OpenSSL (installed provider, `ServerConfig`) | full, fips | non-validated |
 | T5 | `file_resolve` `file_url` download TLS (SSRF-guarded, redirect-free) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full, fips | non-validated |
 | T7 | Policy Valkey/Redis session-store TLS (`rediss://`) | TLS 1.2/1.3 via `redis` `tls-rustls` | OpenSSL (installed provider, `tokio-rustls`) | full | non-validated |
-| T9 | TLS handshake CSPRNG | handshake randoms + key material | OpenSSL `RAND_bytes` (provider `SecureRandom`) | full, fips | non-validated |
+| T9 | TLS handshake CSPRNG | handshake randoms + key material | OpenSSL `RAND_priv_bytes` (provider `SecureRandom::fill`) | full, fips | non-validated |
 | C1 | Upstream + sub-request server-cert chain & hostname verify | X.509 path + `CertificateVerify` + hostname match | `rustls-webpki` (chain) + OpenSSL (signatures) | full, fips | non-validated |
 | C2 | Downstream mTLS client-cert verify | X.509 client-cert path + signature (optional CRL) | `rustls-webpki` + OpenSSL | full, fips | non-validated |
 | C5 | OS native trust-store load | load system CA anchors (no primitive) | `rustls-native-certs` (+ `security-framework` macOS, `schannel` Windows) | full, fips | n/a |
@@ -108,14 +129,14 @@ only on a FIPS-activated host (remediation: `docs/fips.md`, unless noted);
 
 | ID | Operation | Algorithm | Provider | Profiles | Disposition |
 | --- | --- | --- | --- | --- | --- |
-| A1 | JWT signature verification (identity authn) | HS256/RS256/PS256/ES256/EdDSA verify (decode-only) | `aws-lc-rs` 1.18.1 (no `fips`) via `jsonwebtoken` | full | non-validated |
+| A1 | JWT signature verification (identity authn) | HS256/RS256/PS256/ES256/EdDSA verify (decode-only) | `aws-lc-rs` 1.18.1 (no `fips`) via `jsonwebtoken` | full | excluded-from-fips (runs in aws-lc-rs, not OpenSSL; JWT identity authn is absent from the FIPS image — a FIPS JWT path would need an OpenSSL-backed verifier) |
 | A2 | OAuth delegated-token cache-key derivation | keyed HMAC-SHA256 (per-process secret) | RustCrypto `hmac` + `sha2` (upstream policy) | full | upstream-owned |
 | A3 | AWS SigV4 signing-key + request signature | HMAC-SHA256 signing-key chain (RFC 2104) | OpenSSL EVP via `apis::hash` | full, fips | non-validated |
 | A4 | AWS SigV4 payload & canonical-request hash | SHA-256 | OpenSSL EVP via `apis::hash` | full, fips | non-validated |
-| A5 | PostgreSQL SCRAM-SHA-256 SASL auth | SHA-256 / HMAC / PBKDF2 (RFC 5802/7677) | `sqlx-postgres` (RustCrypto `sha2` + `hmac`) | full | non-validated |
+| A5 | PostgreSQL SCRAM-SHA-256 SASL auth | SHA-256 / HMAC / PBKDF2 (RFC 5802/7677) | `sqlx-postgres` (RustCrypto `sha2` + `hmac`) | full | excluded-from-fips (RustCrypto, not OpenSSL; the FIPS store uses certificate auth A10/A11, so password SCRAM is off the FIPS path — #1217) |
 | A6 | PostgreSQL SCRAM SASLprep normalization | RFC 4013 Unicode normalization (no primitive) | `stringprep` via `sqlx-postgres` | full | n/a |
-| A7 | PostgreSQL SCRAM client-nonce RNG | ChaCha20 CSPRNG (OS `getrandom`-seeded) | `rand` → `chacha20` via `sqlx-postgres` | full | non-validated |
-| A8 | PostgreSQL legacy MD5 password auth | `md5(md5(pw‖user)‖salt)` | `md-5` via `sqlx-postgres` | full | non-validated |
+| A7 | PostgreSQL SCRAM client-nonce RNG | ChaCha20 CSPRNG (OS `getrandom`-seeded) | `rand` → `chacha20` via `sqlx-postgres` | full | excluded-from-fips (ChaCha20 is not an approved DRBG, and runs in RustCrypto; full-only, same store path as A5 — #1217) |
+| A8 | PostgreSQL legacy MD5 password auth | `md5(md5(pw‖user)‖salt)` | `md-5` via `sqlx-postgres` | full | excluded-from-fips (MD5 is not FIPS-approved; disable `md5` auth on the server and use SCRAM or cert auth; full-only — #1217) |
 | A9 | PostgreSQL cleartext password auth | cleartext (confidentiality via A10 TLS) | `secrecy`-wrapped (no local primitive) | full | n/a |
 | A10 | PostgreSQL store TLS handshake + cert verify | TLS 1.2/1.3, X.509 chain + hostname (`verify-full`) | `sqlx-postgres` → `native-tls` → OpenSSL / OS TLS | full, fips | non-validated (#1217) |
 | A11 | PostgreSQL store client-cert mutual TLS | TLS mutual auth with client PEM cert/key | `sqlx-postgres` → `native-tls` → platform TLS | full, fips | non-validated (#1217) |
@@ -142,10 +163,10 @@ Non-secret SHA-256 digests via OpenSSL EVP (`apis::hash`) unless noted.
 | ID | Operation | Algorithm | Provider | Profiles | Disposition |
 | --- | --- | --- | --- | --- | --- |
 | R-1 | Load-balancing candidate selection RNG | ChaCha thread-RNG uniform draw | `rand` → `chacha20` → `getrandom` | full, fips | n/a |
-| R-2 | Correlation / idempotency IDs (`resp_`, `conv_`, …) | microsecond clock + one-time seed + counter | praxis-core `IdGenerator` | full, fips | upstream-owned |
+| R-2 | Correlation / idempotency IDs (`resp_`; `conv_` in full only) | microsecond clock + one-time seed + counter | praxis-core `IdGenerator` | full, fips | upstream-owned |
 | R-3 | MCP session id (`mcp-session-id`) | predictable `IdGenerator` id | praxis-core `IdGenerator` | full, fips | upstream-owned |
 | R-4 | OAuth delegator per-process cache-key secret | 32-byte OS CSPRNG draw (keys A2) | `getrandom` (upstream policy) | full | upstream-owned |
-| R-5 | Prometheus metrics-exporter sampling RNG | ChaCha CSPRNG (metrics sampling) | `rand` 0.9 → `rand_chacha` | full, fips | n/a |
+| R-5 | Prometheus metrics-exporter sampling RNG | Xoshiro256** (non-crypto PRNG, reservoir sampling) | `rand_xoshiro` via `metrics-util` | full, fips | n/a |
 
 ## Reviewed non-primitives
 
@@ -154,7 +175,7 @@ standalone operations — support/trait layers (`digest`, `crypto-common`,
 `const-oid`, `untrusted`), build-host code generators (`*-derive`,
 `openssl-macros`, `tiny-keccak`), FFI companions, and naming coincidences
 (`aws-smithy-*`, `openssl-probe`, `spin`, `blake2` as a non-secret Pingora cache
-key, `rand_xoshiro` for metrics sampling). None executes a security primitive on
+key). None executes a security primitive on
 the request path. A crate on the FIPS denylist may never be classified here — a
 denied name is a real primitive and is tracked as an operation or blocked by
 `cargo xtask fips`.

@@ -56,8 +56,13 @@ reason = "rustls must stay on the installed OpenSSL CryptoProvider (custom-provi
 
 [[bans.features]]
 crate = "openssl"
-deny = ["vendored"]
-reason = "The validated module is the system libcrypto (OPENSSL_NO_VENDOR=1); a vendored build would ship an unvalidated bundled OpenSSL."
+deny = ["vendored", "aws-lc", "aws-lc-fips", "unstable_boringssl"]
+reason = "EVP must execute in the system libcrypto (OPENSSL_NO_VENDOR=1). `vendored` ships a bundled OpenSSL; `aws-lc`/`aws-lc-fips` reroute openssl-sys onto AWS-LC; `unstable_boringssl` onto BoringSSL — each moves crypto off the validated module."
+
+[[bans.features]]
+crate = "openssl-sys"
+deny = ["vendored", "openssl-src", "aws-lc", "aws-lc-fips", "bssl-sys", "unstable_boringssl"]
+reason = "openssl-sys is the FFI seam to libcrypto; its backend-selecting features must stay off so every EVP call lands in the system OpenSSL. `vendored`/`openssl-src` bundle OpenSSL; `aws-lc`/`aws-lc-fips` link AWS-LC; `bssl-sys`/`unstable_boringssl` link BoringSSL."
 
 [[bans.features]]
 crate = "aws-lc-rs"
