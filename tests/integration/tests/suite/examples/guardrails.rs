@@ -3,7 +3,11 @@
 
 //! Functional integration tests for the `guardrails.yaml` example config.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use praxis_test_utils::{
     Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, http_send, json_post,
@@ -165,18 +169,16 @@ fn nemo_guardrails_callout_runs_outbound_chain() {
     assert_eq!(payload["guardrails"]["rail_types"], serde_json::json!(["input"]));
 }
 
-/// `service_account_token` re-reads the token file on every callout, so a
-/// Kubernetes-style atomic-rename rotation of the token must be
-/// observed on the very next request, with no config reload or restart.
+/// `service_account_token` serves an in-memory snapshot. A background watcher
+/// reloads the token file after it changes, so a Kubernetes-style atomic-rename
+/// rotation shows up on a later callout without a config reload or restart.
+/// The request immediately after the rename can still carry the previous token.
 #[test]
 fn nemo_guardrails_service_account_token_rotation_is_observed_without_reload() {
     let (_token_dir, token_path) = write_token_file("token-a\n");
     let backend = start_backend_with_shutdown("ok");
-    let nemo = StatefulCapturingBackend::new(vec![
-        (200, r#"{"status":"passed","content":"first"}"#.to_owned()),
-        (200, r#"{"status":"passed","content":"second"}"#.to_owned()),
-    ])
-    .start_with_shutdown();
+    let passed = r#"{"status":"passed","content":"ok"}"#.to_owned();
+    let nemo = StatefulCapturingBackend::new(vec![(200, passed); 128]).start_with_shutdown();
     let proxy_port = free_port();
     let mut config = load_example_config(
         "nemo-guardrails.yaml",
@@ -199,28 +201,42 @@ fn nemo_guardrails_service_account_token_rotation_is_observed_without_reload() {
     std::fs::write(&replacement, "token-b\n").unwrap();
     std::fs::rename(&replacement, &token_path).unwrap();
 
-    let (status, _) = http_post(
-        proxy.addr(),
-        "/v1/checks",
-        r#"{"model":"test","messages":[{"role":"user","content":"second"}]}"#,
-    );
-    assert_eq!(status, 200);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (status, body) = http_post(
+            proxy.addr(),
+            "/v1/checks",
+            r#"{"model":"test","messages":[{"role":"user","content":"after-rotation"}]}"#,
+        );
+        assert_eq!(
+            status, 200,
+            "callout while waiting for the watcher should still pass; body: {body}"
+        );
+        if nemo
+            .requests()
+            .iter()
+            .any(|request| bearer_token(&request.headers, "token-b"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background watcher did not publish token-b within 2s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let requests = nemo.requests();
-    assert_eq!(requests.len(), 2);
+    let rotated = requests
+        .iter()
+        .position(|request| bearer_token(&request.headers, "token-b"))
+        .expect("a later callout must observe the rotated token without a config reload");
+    assert!(rotated >= 1, "the callout from before the rename must still be present");
     assert!(
-        requests[0]
-            .headers
-            .lines()
-            .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer token-a")),
-        "first callout must use the token present at construction time"
-    );
-    assert!(
-        requests[1]
-            .headers
-            .lines()
-            .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer token-b")),
-        "second callout must observe the rotated token without a config reload"
+        requests[..rotated]
+            .iter()
+            .all(|request| bearer_token(&request.headers, "token-a")),
+        "callouts before the watcher publishes token-b must keep the previous token"
     );
 }
 
@@ -491,6 +507,12 @@ fn nemo_guardrails_messages_not_array_does_not_forward() {
 // -----------------------------------------------------------------------------
 // Test utilities
 // -----------------------------------------------------------------------------
+
+/// Whether a captured callout's raw headers carry this bearer token.
+fn bearer_token(headers: &str, token: &str) -> bool {
+    let expected = format!("Authorization: Bearer {token}");
+    headers.lines().any(|line| line.eq_ignore_ascii_case(&expected))
+}
 
 /// Start a mock `NeMo` server that responds with the given JSON body at HTTP
 /// 200. Returns a [`BackendGuard`] that shuts down the server when dropped.

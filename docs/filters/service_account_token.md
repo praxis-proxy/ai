@@ -3,15 +3,15 @@
 
 # `service_account_token`
 
-Reads a bearer token from a file fresh on every request and injects it into the configured header. See the module documentation for the complete rotation and security model.
+Attaches a Kubernetes pod identity token to every outgoing request. See the module documentation for the full behaviour description.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `token_file` | string | yes | Path to the projected token file. Re-read on every request; must exist, be readable, and be non-empty at construction time. |
-| `header` | string | no | Header receiving the assembled value. Defaults to `Authorization`. Can't be a header Praxis already manages internally (`x-praxis-`, `x-mcp-`), or one that controls the HTTP connection itself, like `host`, `content-length`, or `proxy-authorization`. |
-| `prefix` | string | no | Prefix placed before the token in the header value. Defaults to `"Bearer "`. Set to `""` to inject the raw token value. |
+| `token_file` | string | yes | Path to the token file. Must exist and be non-empty at startup. The file is watched for changes after startup. |
+| `header` | string | no | Header to set on outgoing requests. Defaults to `Authorization`. Cannot be an internal Praxis header or a connection-level header (`host`, `content-length`, `proxy-authorization`, etc.). |
+| `prefix` | string | no | Text prepended to the token in the header value. Defaults to `"Bearer "`. Use `""` to send the raw token with no prefix. |
 
 ## Example
 

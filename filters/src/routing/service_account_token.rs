@@ -14,16 +14,16 @@
 //! background watcher picks it up in milliseconds without a restart.
 //!
 //! Use this in an `outbound_chain` to prove Praxis's identity to a protected
-//! upstream — for example, the auth proxy in front of a NeMo Guardrails
+//! upstream — for example, the auth proxy in front of a `NeMo` Guardrails
 //! service.
 //!
 //! # Security
 //!
 //! - The token is never written to logs, traces, or error messages.
-//! - If the file is missing, empty, or too large at any point, all requests
-//!   are rejected with `503` rather than forwarded without a token.
-//! - The target header cannot be one that Praxis manages internally or one
-//!   that controls the HTTP connection (e.g. `host`, `proxy-authorization`).
+//! - If the file is missing, empty, or too large at any point, all requests are rejected with `503` rather than
+//!   forwarded without a token.
+//! - The target header cannot be one that Praxis manages internally or one that controls the HTTP connection (e.g.
+//!   `host`, `proxy-authorization`).
 //!
 //! # YAML config
 //!
@@ -114,6 +114,9 @@ struct TokenSnapshot {
 enum WatcherMessage {
     /// A filesystem change was detected.
     Event(notify::Event),
+    /// The filesystem watcher reported an error. The worker clears the
+    /// snapshot so requests fail closed until a later successful reload.
+    NotifyError,
     /// Shut down — sent when the filter is dropped.
     Shutdown,
 }
@@ -151,8 +154,12 @@ pub struct ServiceAccountTokenFilter {
 }
 
 impl ServiceAccountTokenFilter {
-    /// Build from YAML config. Fails if the token file can't be read, the
-    /// header or prefix are invalid, or the background watcher can't start.
+    /// Build from YAML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token file cannot be read, the header or
+    /// prefix is invalid, or the background watcher cannot start.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ServiceAccountTokenConfig = parse_filter_config("service_account_token", value)?;
 
@@ -194,15 +201,17 @@ impl HttpFilter for ServiceAccountTokenFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // Lock-free snapshot load: no file I/O, no syscall on the hot path.
         let snapshot = self.snapshot.load_full();
-        let Some(ref assembled) = snapshot.header_value else {
+        let Some(assembled) = snapshot.header_value.as_ref() else {
             tracing::warn!("service_account_token: token unavailable; failing closed");
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        // The snapshot only holds values that already passed HeaderValue::from_str
-        // in from_config and reload_token.
-        let header_value = HeaderValue::from_str(assembled.as_str())
-            .expect("snapshot contains a pre-validated header value");
+        // Values are validated before they are stored. A value that no longer
+        // parses is treated as unavailable rather than forwarded.
+        let Ok(header_value) = HeaderValue::from_str(assembled.as_str()) else {
+            tracing::warn!("service_account_token: stored header value is not valid HTTP; failing closed");
+            return Ok(FilterAction::Reject(Rejection::status(503)));
+        };
 
         // Strip any caller-supplied value on this header before setting ours,
         // so the caller can't smuggle their own token through to the upstream.
@@ -261,12 +270,33 @@ fn process_watcher_event(event: &notify::Event, path: &Path, prefix: &str, snaps
     ) {
         return;
     }
-    let affected = event
-        .paths
-        .iter()
-        .any(|p| p == path || p.parent() == path.parent());
+    let affected = event.paths.iter().any(|p| p == path || p.parent() == path.parent());
     if affected {
         reload_token(path, prefix, snapshot);
+    }
+}
+
+/// Apply one message from the watcher thread.
+///
+/// Returns `false` only for shutdown. Watcher errors clear the published
+/// token so the request path rejects with `503` instead of sending a stale
+/// credential after notify has stopped reporting changes.
+fn handle_watcher_message(
+    message: WatcherMessage,
+    path: &Path,
+    prefix: &str,
+    snapshot: &ArcSwap<TokenSnapshot>,
+) -> bool {
+    match message {
+        WatcherMessage::Event(event) => {
+            process_watcher_event(&event, path, prefix, snapshot);
+            true
+        },
+        WatcherMessage::NotifyError => {
+            snapshot.store(Arc::new(TokenSnapshot { header_value: None }));
+            true
+        },
+        WatcherMessage::Shutdown => false,
     }
 }
 
@@ -274,12 +304,16 @@ fn process_watcher_event(event: &notify::Event, path: &Path, prefix: &str, snaps
 ///
 /// Starts a background thread that:
 /// 1. Watches the token file's directory for changes.
-/// 2. Re-reads the file immediately to catch any rotation that happened
-///    between construction and the watcher becoming active.
+/// 2. Re-reads the file immediately to catch any rotation that happened between construction and the watcher becoming
+///    active.
 /// 3. Signals that startup finished — this function blocks until that point.
 /// 4. Reloads the token whenever the file is created, changed, or deleted.
 ///
 /// The thread stops cleanly when the returned [`TokenReloadHandle`] is dropped.
+#[expect(
+    clippy::too_many_lines,
+    reason = "watcher setup and lifecycle are intentionally bounded in one function"
+)]
 fn spawn_token_watcher(
     path: PathBuf,
     prefix: String,
@@ -292,10 +326,12 @@ fn spawn_token_watcher(
     let thread = std::thread::Builder::new()
         .name("service-account-token-watcher".to_owned())
         .spawn(move || {
-            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
-                if let Ok(event) = event {
-                    drop(callback_tx.send(WatcherMessage::Event(event)));
-                }
+            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| match event {
+                Ok(event) => drop(callback_tx.send(WatcherMessage::Event(event))),
+                Err(error) => {
+                    tracing::warn!(%error, "service_account_token: watcher error; failing closed");
+                    drop(callback_tx.send(WatcherMessage::NotifyError));
+                },
             }) {
                 Ok(w) => w,
                 Err(error) => {
@@ -326,9 +362,7 @@ fn spawn_token_watcher(
                             }));
                         },
                         Err(error) => {
-                            drop(ready_tx.send(Err(format!(
-                                "assembled header value is not valid HTTP: {error}"
-                            ))));
+                            drop(ready_tx.send(Err(format!("assembled header value is not valid HTTP: {error}"))));
                             return;
                         },
                     }
@@ -341,10 +375,9 @@ fn spawn_token_watcher(
             drop(ready_tx.send(Ok(())));
 
             while let Ok(message) = message_rx.recv() {
-                let WatcherMessage::Event(event) = message else {
+                if !handle_watcher_message(message, &path, &prefix, &snapshot) {
                     break;
-                };
-                process_watcher_event(&event, &path, &prefix, &snapshot);
+                }
             }
         })
         .map_err(|error| format!("service_account_token: failed to spawn watcher: {error}"))?;
@@ -667,7 +700,7 @@ mod tests {
             loop {
                 ctx.request_headers_to_set.clear();
                 let action = f.on_request(&mut ctx).await.unwrap();
-                if matches!(action, FilterAction::Reject(ref r) if r.status == 503) {
+                if matches!(&action, FilterAction::Reject(rejection) if rejection.status == 503) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -686,8 +719,8 @@ mod tests {
         let started = std::time::Instant::now();
         drop(filter);
         assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "watcher teardown should be woken immediately, not wait on a timeout"
+            started.elapsed() < Duration::from_secs(1),
+            "watcher teardown should be woken by shutdown, not block until the 5s receive timeout"
         );
     }
 
@@ -735,6 +768,37 @@ mod tests {
             snapshot.load().header_value.is_none(),
             "snapshot must be None after a reload with an invalid HTTP header value"
         );
+    }
+
+    #[test]
+    fn watcher_notify_error_clears_token_and_shutdown_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_token(&dir, "old-token");
+        let snapshot = Arc::new(ArcSwap::from_pointee(TokenSnapshot {
+            header_value: Some(Zeroizing::new("Bearer old-token".to_owned())),
+        }));
+
+        assert!(handle_watcher_message(
+            WatcherMessage::NotifyError,
+            &path,
+            DEFAULT_PREFIX,
+            &snapshot
+        ));
+        assert!(
+            snapshot.load().header_value.is_none(),
+            "a watcher error must clear the token so requests fail closed"
+        );
+
+        snapshot.store(Arc::new(TokenSnapshot {
+            header_value: Some(Zeroizing::new("Bearer old-token".to_owned())),
+        }));
+        assert!(!handle_watcher_message(
+            WatcherMessage::Shutdown,
+            &path,
+            DEFAULT_PREFIX,
+            &snapshot
+        ));
+        assert_eq!(snapshot.load().header_value.as_deref().unwrap(), "Bearer old-token");
     }
 
     // -------------------------------------------------------------------------

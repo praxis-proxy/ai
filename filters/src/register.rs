@@ -699,6 +699,7 @@ mod tests {
             "intelligent_route",
             "provider_route",
             "credential_inject",
+            "service_account_token",
             "anthropic_web_search",
             "request_id",
             "openai_chat_completions_to_azureai_chat_completions",
@@ -841,6 +842,7 @@ provider:
         let registry = build_ai_registry();
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
+        assert!(registry.is_security_filter("service_account_token"));
         #[cfg(feature = "aws-sigv4-filter")]
         assert!(registry.is_security_filter("aws_sigv4_sign"));
         assert!(registry.is_security_filter("callout_credentials"));
