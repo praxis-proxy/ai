@@ -1610,6 +1610,239 @@ async fn json_bedrock_anthropic_fallback_records_thinking_tokens() {
 }
 
 // -----------------------------------------------------------------------------
+// StreamBuffer Delivery
+// -----------------------------------------------------------------------------
+
+/// `StreamBuffer` chains deliver each raw chunk to filters *and* re-deliver the
+/// frozen full buffer at end-of-stream. JSON extraction must read the EOS
+/// buffer alone, not the concatenation of both views.
+#[tokio::test]
+async fn json_stream_buffer_double_delivery_extracts_once() {
+    let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    // The runtime upgrade a dialect-translation filter performs for JSON responses.
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::copy_from_slice(json);
+    let mut chunk = Some(raw.clone());
+    drop(filter.on_response_body(&mut ctx, &mut chunk, false).unwrap());
+
+    let mut frozen = Some(raw);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("15"),
+        "the EOS frozen buffer must be parsed exactly once"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("42"),
+        "output tokens should match"
+    );
+}
+
+/// When a buffered chain releases its buffer mid-stream, the EOS call carries
+/// no body; extraction must then fall back to the hex-accumulated raw chunks.
+#[tokio::test]
+async fn json_stream_buffer_released_falls_back_to_chunks() {
+    let json = br#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let mid = json.len() / 2;
+    let mut first = Some(Bytes::copy_from_slice(&json[..mid]));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut second = Some(Bytes::copy_from_slice(&json[mid..]));
+    drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+
+    let mut eos: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("7"),
+        "released buffers must still extract from the streamed chunks"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("11"),
+        "output tokens should match"
+    );
+}
+
+/// After a release, Praxis core still reports `StreamBuffer` but the EOS call
+/// carries only the final chunk. Usage must come from the captured chunks plus
+/// that chunk, not from the final chunk alone.
+#[tokio::test]
+async fn json_stream_buffer_released_final_chunk_extracts_usage() {
+    let json = br#"{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":13}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut last = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("9"),
+        "a released chain's final chunk must be joined to the captured chunks"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("13"),
+        "output tokens should match"
+    );
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "a released chain within the capture limit must not report overflow"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// Another filter may buffer more than `token_count` is allowed to capture, so
+/// the frozen EOS body is held to `max_body_bytes` too, even when it carries
+/// usage that would parse.
+#[tokio::test]
+async fn json_stream_buffer_frozen_body_beyond_limit_sets_overflow_status() {
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = 64;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let padding = "x".repeat(200);
+    let json = format!(
+        r#"{{"id":"resp-1","padding":"{padding}","usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#
+    );
+    let frozen_body = Bytes::from(json.into_bytes());
+
+    let mut first = Some(frozen_body.slice(..32));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut frozen = Some(frozen_body);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a frozen body beyond the capture limit must not be parsed"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "an oversized frozen body must report overflow, not zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// A frozen buffer that reports no usage repeats the captured chunks. Retrying
+/// it as their concatenation would double its size and report a false
+/// overflow for a response that fits the capture limit.
+#[tokio::test]
+async fn json_stream_buffer_frozen_body_without_usage_is_not_overflow() {
+    let json = br#"{"object":"list","data":[{"id":"model-a"},{"id":"model-b"}]}"#;
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = json.len() + json.len() / 2;
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut second = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+    let mut frozen = Some(raw);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a response without usage records no counts"
+    );
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "a frozen body within the capture limit must not report overflow"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// The released-chain fallback joins the captured chunks to the final chunk,
+/// and that joined document is held to `max_body_bytes` like any capture.
+#[tokio::test]
+async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status() {
+    let json = br#"{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":13}}"#;
+    let mut filter = make_filter(ProviderKind::Anthropic);
+    filter.max_body_bytes = json.len() - 1;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut last = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a joined document beyond the capture limit must not be parsed"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "an oversized released capture must report overflow, not zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
