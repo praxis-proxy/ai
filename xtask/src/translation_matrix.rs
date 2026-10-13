@@ -12,6 +12,12 @@
 //!   per-filter notes. A feature added to the catalog fails the check until each surface classifies it.
 //! - A `dropped` cell is a defect, not a support level, and must carry a blocker. Those cells never reach the support
 //!   table; they render into "Known gaps" so the document cannot claim behavior Praxis lacks.
+//!
+//! Two further checks tie the manifest to the checkout it describes: every
+//! filter it names must be registered in `filters/src/register.rs`, and every
+//! `path:lines` citation must point at a file that exists and is long enough.
+//! Neither proves a claim; both catch the rename or refactor that silently
+//! orphans one.
 
 use std::{
     collections::BTreeSet,
@@ -43,6 +49,12 @@ const DOC_REL: &str = "docs/conformance/translation-matrix.md";
 
 /// Manifest schema version this task understands.
 const SUPPORTED_VERSION: u32 = 1;
+
+/// Filter registry the manifest's filter names are checked against.
+const REGISTER_REL: &str = "filters/src/register.rs";
+
+/// Crate the manifest cites for behavior owned by the core protocol layer.
+const PROTOCOL_CRATE: &str = "praxis-proxy-protocol";
 
 // -----------------------------------------------------------------------------
 // Manifest
@@ -242,8 +254,9 @@ struct Manifest {
 pub(crate) fn run(args: &Args) {
     let root = workspace_root();
     let manifest = load_manifest(&root.join(MANIFEST_REL));
+    let checkout = Checkout::load(root);
 
-    let problems = validate(&manifest);
+    let problems = validate(&manifest, &checkout);
     if !problems.is_empty() {
         eprintln!("{MANIFEST_REL} is invalid:");
         for problem in &problems {
@@ -252,12 +265,18 @@ pub(crate) fn run(args: &Args) {
         std::process::exit(1);
     }
 
-    emit(args, &root, &render_doc(&manifest));
+    emit(args, &checkout.root, &render_doc(&manifest));
 }
 
 /// Read and parse the manifest, reporting a schema mismatch and exiting.
 fn load_manifest(path: &Path) -> Manifest {
     let raw = fs::read_to_string(path).expect("failed to read translation matrix manifest");
+    // `cells` is a BTreeMap, which serde fills last-key-wins; parsing through
+    // serde_yaml::Value first rejects duplicate keys anywhere in the file.
+    if let Err(err) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
+        eprintln!("{MANIFEST_REL} is not valid YAML:\n  {err}");
+        std::process::exit(1);
+    }
     match serde_yaml::from_str(&raw) {
         Ok(manifest) => manifest,
         Err(err) => {
@@ -283,12 +302,49 @@ fn emit(args: &Args, root: &Path, content: &str) {
     }
 }
 
+/// Facts about the checkout the manifest must agree with.
+struct Checkout {
+    /// Workspace root.
+    root: PathBuf,
+    /// Filter names registered with the proxy.
+    filters: BTreeSet<String>,
+    /// Directory prefix a citation into the core protocol crate must carry,
+    /// so a dependency bump marks those citations stale.
+    protocol_prefix: String,
+}
+
+impl Checkout {
+    /// Read the filter registry and the pinned core protocol version.
+    fn load(root: PathBuf) -> Self {
+        let registry = fs::read_to_string(root.join(REGISTER_REL)).expect("failed to read filter registry");
+        let filters =
+            regex::Regex::new(r#"(?:\bhttp\s+|register_routing_security_filter\(\s*registry,\s*)"([a-z0-9_]+)""#)
+                .expect("filter registration pattern is valid")
+                .captures_iter(&registry)
+                .map(|found| found[1].to_owned())
+                .collect();
+
+        let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("failed to read workspace Cargo.toml");
+        let version = regex::Regex::new(r#"praxis-protocol\s*=\s*\{[^}]*version\s*=\s*"([^"]+)""#)
+            .expect("dependency pattern is valid")
+            .captures(&cargo)
+            .expect("workspace Cargo.toml pins praxis-protocol")[1]
+            .to_owned();
+
+        Self {
+            root,
+            filters,
+            protocol_prefix: format!("{PROTOCOL_CRATE}-{version}/"),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
 
 /// Collect every schema problem, so one run reports all of them.
-fn validate(m: &Manifest) -> Vec<String> {
+fn validate(m: &Manifest, checkout: &Checkout) -> Vec<String> {
     let mut problems = Vec::new();
 
     if m.version != SUPPORTED_VERSION {
@@ -299,9 +355,9 @@ fn validate(m: &Manifest) -> Vec<String> {
     }
 
     let feature_ids = validate_features(m, &mut problems);
-    let surface_ids = validate_surfaces(m, &feature_ids, &mut problems);
-    validate_native_surfaces(m, &mut problems);
-    validate_preconditions(m, &mut problems);
+    let surface_ids = validate_surfaces(m, &feature_ids, checkout, &mut problems);
+    validate_native_surfaces(m, checkout, &mut problems);
+    validate_preconditions(m, checkout, &mut problems);
     validate_cross_surface_gaps(m, &surface_ids, &mut problems);
 
     problems
@@ -322,6 +378,7 @@ fn validate_features<'a>(m: &'a Manifest, problems: &mut Vec<String>) -> BTreeSe
 fn validate_surfaces<'a>(
     m: &'a Manifest,
     feature_ids: &BTreeSet<&str>,
+    checkout: &Checkout,
     problems: &mut Vec<String>,
 ) -> BTreeSet<&'a str> {
     let mut ids = BTreeSet::new();
@@ -329,18 +386,24 @@ fn validate_surfaces<'a>(
         if !ids.insert(surface.id.as_str()) {
             problems.push(format!("duplicate surface id `{}`", surface.id));
         }
-        validate_surface(surface, feature_ids, problems);
+        validate_surface(surface, feature_ids, checkout, problems);
     }
     ids
 }
 
 /// Check native surface id uniqueness and that each carries a native status.
-fn validate_native_surfaces(m: &Manifest, problems: &mut Vec<String>) {
+fn validate_native_surfaces(m: &Manifest, checkout: &Checkout, problems: &mut Vec<String>) {
     let mut ids = BTreeSet::new();
     for native in &m.native_surfaces {
         if !ids.insert(native.id.as_str()) {
             problems.push(format!("duplicate native surface id `{}`", native.id));
         }
+        validate_evidence(
+            &format!("native surface `{}`", native.id),
+            &native.evidence,
+            checkout,
+            problems,
+        );
         if !matches!(native.status, Status::Native | Status::Passthrough) {
             problems.push(format!(
                 "native surface `{}` has status `{}`; expected native or passthrough",
@@ -351,12 +414,18 @@ fn validate_native_surfaces(m: &Manifest, problems: &mut Vec<String>) {
     }
 }
 
-/// Check that every precondition actually states something.
-fn validate_preconditions(m: &Manifest, problems: &mut Vec<String>) {
+/// Check that every precondition states something and cites real code.
+fn validate_preconditions(m: &Manifest, checkout: &Checkout, problems: &mut Vec<String>) {
     for precondition in &m.preconditions {
         if precondition.summary.trim().is_empty() {
             problems.push(format!("precondition `{}` has an empty summary", precondition.id));
         }
+        validate_evidence(
+            &format!("precondition `{}`", precondition.id),
+            &precondition.evidence,
+            checkout,
+            problems,
+        );
     }
 }
 
@@ -380,8 +449,22 @@ fn validate_cross_surface_gaps(m: &Manifest, surface_ids: &BTreeSet<&str>, probl
     }
 }
 
+/// Check that every filter a surface names is registered with the proxy.
+fn validate_surface_filters(surface: &Surface, checkout: &Checkout, problems: &mut Vec<String>) {
+    for filter in surface.filters.iter().chain(&surface.clean_rejection_requires) {
+        if !checkout.filters.contains(filter) {
+            problems.push(format!(
+                "surface `{}` names filter `{filter}`, which is not registered in {REGISTER_REL}",
+                surface.id
+            ));
+        }
+    }
+}
+
 /// Check one surface's cells against the feature catalog and the cell rules.
-fn validate_surface(surface: &Surface, feature_ids: &BTreeSet<&str>, problems: &mut Vec<String>) {
+fn validate_surface(surface: &Surface, feature_ids: &BTreeSet<&str>, checkout: &Checkout, problems: &mut Vec<String>) {
+    validate_surface_filters(surface, checkout, problems);
+
     let present: BTreeSet<&str> = surface.cells.keys().map(String::as_str).collect();
 
     for missing in feature_ids.difference(&present) {
@@ -396,26 +479,76 @@ fn validate_surface(surface: &Surface, feature_ids: &BTreeSet<&str>, problems: &
 
     for (feature, cell) in &surface.cells {
         let where_ = format!("surface `{}` feature `{feature}`", surface.id);
+        validate_cell(&where_, cell, checkout, problems);
+    }
+}
 
-        match (&cell.blocker, cell.status.is_gap()) {
-            (None, true) => problems.push(format!("{where_} is a gap with no blocker")),
-            (Some(blocker), true) if blocker.trim().is_empty() => {
-                problems.push(format!("{where_} is a gap with an empty blocker"));
-            },
-            (Some(_), false) => problems.push(format!(
-                "{where_} has a blocker but status `{}`; only a gap takes a blocker",
-                cell.status.label()
-            )),
-            _ => {},
-        }
+/// Check one cell's blocker, evidence, and note against its status.
+fn validate_cell(where_: &str, cell: &Cell, checkout: &Checkout, problems: &mut Vec<String>) {
+    match (&cell.blocker, cell.status.is_gap()) {
+        (None, true) => problems.push(format!("{where_} is a gap with no blocker")),
+        (Some(blocker), true) if blocker.trim().is_empty() => {
+            problems.push(format!("{where_} is a gap with an empty blocker"));
+        },
+        (Some(_), false) => problems.push(format!(
+            "{where_} has a blocker but status `{}`; only a gap takes a blocker",
+            cell.status.label()
+        )),
+        _ => {},
+    }
 
-        if cell.status.needs_evidence() && cell.evidence.as_ref().is_none_or(|e| e.trim().is_empty()) {
+    match &cell.evidence {
+        Some(evidence) if !evidence.trim().is_empty() => {
+            validate_evidence(where_, evidence, checkout, problems);
+        },
+        _ if cell.status.needs_evidence() => {
             problems.push(format!("{where_} has status `{}` but no evidence", cell.status.label()));
-        }
+        },
+        _ => {},
+    }
 
-        if cell.status.needs_note() && cell.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
-            problems.push(format!("{where_} has status `{}` but no note", cell.status.label()));
+    if cell.status.needs_note() && cell.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
+        problems.push(format!("{where_} has status `{}` but no note", cell.status.label()));
+    }
+}
+
+/// Check that every `;`-separated `path:lines` citation in `evidence` resolves.
+fn validate_evidence(where_: &str, evidence: &str, checkout: &Checkout, problems: &mut Vec<String>) {
+    for citation in evidence.split(';').map(str::trim) {
+        if let Err(problem) = check_citation(citation, checkout) {
+            problems.push(format!("{where_} evidence `{citation}` {problem}"));
         }
+    }
+}
+
+/// Resolve one `path:lines` citation against the checkout.
+///
+/// A repository path must exist and every cited line must fit in the file. A
+/// citation into the core protocol crate must carry the version this
+/// workspace depends on. Line drift inside a file is not detected; a reader
+/// still has to open the citation.
+fn check_citation(citation: &str, checkout: &Checkout) -> Result<(), String> {
+    let (path, lines) = citation.rsplit_once(':').ok_or("is not `path:lines`")?;
+
+    if path.starts_with(PROTOCOL_CRATE) {
+        return if path.starts_with(&checkout.protocol_prefix) {
+            Ok(())
+        } else {
+            Err(format!("cites a {PROTOCOL_CRATE} version other than the pinned one"))
+        };
+    }
+
+    let source = fs::read_to_string(checkout.root.join(path)).map_err(|_io| "names a file that does not exist")?;
+    let available = source.lines().count();
+    let cited = lines
+        .split([',', '-'])
+        .map(str::parse::<usize>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_parse| "has malformed line numbers")?;
+    if cited.iter().all(|line| (1..=available).contains(line)) {
+        Ok(())
+    } else {
+        Err(format!("cites a line past the end of the file ({available} lines)"))
     }
 }
 
@@ -489,6 +622,23 @@ fn render_doc(m: &Manifest) -> String {
     )
     .unwrap();
     writeln!(out, "linked blocker closes.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "A cell takes the status of the feature's main path. `gap` wins whenever any"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "accepted input is silently wrong and `lossy` wins whenever any accepted input"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "loses information; an explicit rejection of a sub-case is recorded in the"
+    )
+    .unwrap();
+    writeln!(out, "surface notes and does not demote the cell.").unwrap();
     writeln!(out).unwrap();
 
     render_preconditions(m, &mut out);

@@ -22,19 +22,24 @@ what it refuses.
 the stated behavior does not happen — treat it as unsupported until the
 linked blocker closes.
 
+A cell takes the status of the feature's main path. `gap` wins whenever any
+accepted input is silently wrong and `lossy` wins whenever any accepted input
+loses information; an explicit rejection of a sub-case is recorded in the
+surface notes and does not demote the cell.
+
 ## Before you read the matrix
 
 The cells below describe a pipeline that includes the filters named in each
 surface section. These facts change what a cell means in a given deployment.
 
 - **clean-rejection-is-opt-in** — Praxis emits a provider-shaped error only when one of three filters ran and matched. With none installed the proxy emits RFC 9457 application/problem+json, not the client's dialect.
-  - Installers: openai_operation (apis/src/openai/operation_classifier/mod.rs:172-182), openai_responses_format (apis/src/openai/responses/mod.rs:409-421), anthropic_messages_format (apis/src/anthropic/messages_format/mod.rs:181-195).
-  - 63 of 99 configs under examples/configs install none of the three.
-  - Evidence: `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/fail_to_proxy.rs:264-283`
-- **on-invalid-defaults-to-continue** — Malformed or unrecognized bodies are forwarded to the backend and lose the error formatter. 13 of the 20 examples that set on_invalid choose continue.
-  - Evidence: `apis/src/openai/responses/config.rs:117-118`
+  - Installers: ai_operation (apis/src/operation_classifier/mod.rs:280-293, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:523 via apis/src/openai/responses/mod.rs:368-376), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:273-277).
+  - 53 of 105 configs under examples/configs install none of the three.
+  - Evidence: `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/fail_to_proxy.rs:267-283`
+- **on-invalid-defaults-to-continue** — Malformed or unrecognized bodies are forwarded to the backend and lose the error formatter. 21 of the 51 examples that set on_invalid choose continue.
+  - Evidence: `apis/src/openai/responses/config.rs:119-120`
 - **no-deny-unknown-fields-on-the-wire** — No request body is deserialized into a typed struct on any surface. Unknown fields are governed only by hand-written allowlists, where those exist. Absence of an allowlist means silent acceptance.
-  - Evidence: `apis/src/openai/translation/chat_completions.rs:176-216`
+  - Evidence: `apis/src/openai/translation/chat_completions.rs:362-370; apis/src/openai/translation/chat_completions.rs:446-469`
 
 ## Matrix
 
@@ -51,19 +56,20 @@ surface section. These facts change what a cell means in a given deployment.
 | Parallel tool calls | `translated` | `translated` | `rejected` | `passthrough` | `rejected` |
 | Provider-hosted tools (web search, file search, MCP, code interpreter) | `rejected` | `lossy` | `rejected` | `passthrough` | `rejected` |
 | Structured output / JSON schema | `lossy` | `translated` | [`gap`](#known-gaps) | `passthrough` | `rejected` |
-| Streaming | `translated` | `translated` | `translated` | `passthrough` | `translated` |
+| Streaming | `lossy` | `translated` | `translated` | `passthrough` | `translated` |
 | Streaming terminates correctly | [`gap`](#known-gaps) | `translated` | `translated` | `passthrough` | `translated` |
-| Mid-stream upstream failure is surfaced | [`gap`](#known-gaps) | `lossy` | `rejected` | `passthrough` | `rejected` |
+| Mid-stream upstream failure is surfaced | [`gap`](#known-gaps) | `lossy` | `translated` | `passthrough` | `translated` |
 | Content-filter / safety signal reaches the client | [`gap`](#known-gaps) | `translated` | `translated` | [`gap`](#known-gaps) | `translated` |
 | Token usage accounting | [`gap`](#known-gaps) | `lossy` | `lossy` | `passthrough` | `lossy` |
 | Prompt-cache token accounting | `lossy` | `translated` | [`gap`](#known-gaps) | `passthrough` | [`gap`](#known-gaps) |
 | Reasoning / thinking content | [`gap`](#known-gaps) | `rejected` | [`gap`](#known-gaps) | `passthrough` | [`gap`](#known-gaps) |
+| Request-side thinking / prompt-cache controls | `rejected` | `translated` | `rejected` | `passthrough` | `rejected` |
 | Stop sequences | `lossy` | `n/a` | `translated` | `passthrough` | `translated` |
-| Sampling parameters | `translated` | `translated` | `lossy` | `passthrough` | `translated` |
+| Sampling parameters | `lossy` | `translated` | `lossy` | `passthrough` | `translated` |
 | Logprobs | `rejected` | `lossy` | `translated` | `passthrough` | `rejected` |
 | Server-side state continuation | `n/a` | [`gap`](#known-gaps) | `n/a` | `n/a` | `n/a` |
-| Unsupported operations on a supported path | `n/a` | [`gap`](#known-gaps) | `n/a` | [`gap`](#known-gaps) | `n/a` |
-| Error envelope matches the client dialect | `translated` | `lossy` | `lossy` | `translated` | `lossy` |
+| Unsupported operations on a supported path | `n/a` | [`gap`](#known-gaps) | `n/a` | `n/a` | `n/a` |
+| Error envelope matches the client dialect | `lossy` | `lossy` | `lossy` | `lossy` | `lossy` |
 | Oversized request body | [`gap`](#known-gaps) | [`gap`](#known-gaps) | [`gap`](#known-gaps) | [`gap`](#known-gaps) | [`gap`](#known-gaps) |
 
 ## Known gaps
@@ -73,16 +79,16 @@ defects, not support levels.
 
 ### Spanning several surfaces
 
-- **reasoning-and-cache-tokens-vanish** — Reasoning content and cache-token accounting are silently discarded on every translation path that has them. Customers are billed for tokens the matrix would otherwise claim they receive.
+- **reasoning-and-cache-tokens-vanish** — Reasoning content is silently discarded on the Anthropic and Bedrock paths, and its token count on Vertex. Cache-token counters are discarded entirely on Vertex and Bedrock; Anthropic maps cache reads and loses only the cache-write counter. Customers are billed for tokens the matrix would otherwise claim they receive.
   - Affects: anthropic-messages-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse
   - Blocker: TODO-ISSUE systematic handling of reasoning and cache tokens across translators
-- **oversized-body-bare-413** — An oversized body produces Rejection::status(413) with no headers and no body, then short-circuits fail_to_proxy before any formatter runs. This fires for the global body_limits ceiling and for every filter's StreamBuffer{max_bytes}, including both validate filters and both format filters. An SDK receives a content-type-less empty 413 in every dialect.
+- **oversized-body-bare-413** — An oversized body produces Rejection::status(413) with no headers and no body, then short-circuits fail_to_proxy before any formatter runs. This fires for the global body_limits ceiling and for every filter's StreamBuffer{max_bytes}, including the request filters that would otherwise install the formatter. An SDK receives a content-type-less empty 413 in every dialect.
   - Affects: anthropic-messages-to-chat-completions, responses-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-azureai, chat-completions-to-bedrock-converse
   - Blocker: TODO-ISSUE format the 413 produced by the body-limit filter
 - **divergent-error-envelopes** — Three filters emit three different OpenAI-shaped envelopes — Vertex includes param:null, Bedrock omits param and uses code "invalid_request", Azure rewrites whatever Azure returned. One client error handler cannot cover all three.
   - Affects: chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse, chat-completions-to-azureai
   - Blocker: TODO-ISSUE converge on one OpenAI error envelope builder
-- **inverted-token-budget-precedence** — When both max_tokens and max_completion_tokens are present, Vertex prefers max_completion_tokens and Bedrock prefers max_tokens. The same client request gets a different token budget depending on the backend. No test, comment or issue explains the divergence.
+- **inverted-token-budget-precedence** — When both max_tokens and max_completion_tokens are present, Vertex prefers max_completion_tokens and Bedrock prefers max_tokens. The same client request gets a different token budget depending on the backend. Vertex documents and tests its own precedence; nothing explains why the two differ.
   - Affects: chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse
   - Blocker: TODO-ISSUE pick one max-tokens precedence across translators
 
@@ -91,24 +97,23 @@ defects, not support levels.
 | Surface | Feature | Gap | Blocker |
 | --- | --- | --- | --- |
 | Anthropic -> CC | Streaming terminates correctly | Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either. | TODO-ISSUE emit terminal events at end-of-stream |
-| Anthropic -> CC | Mid-stream upstream failure is surfaced | A `data: {"error":{...}}` chunk after a 200 parses as valid JSON, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. | TODO-ISSUE surface mid-stream upstream error objects |
-| Anthropic -> CC | Content-filter / safety signal reaches the client | Non-streaming rejects finish_reason content_filter; streaming silently maps it to end_turn. Identical backend behavior yields opposite client-visible outcomes depending on `stream`. | TODO-ISSUE reconcile content_filter across streaming and finite paths |
+| Anthropic -> CC | Mid-stream upstream failure is surfaced | A `data: {"error":{...}}` chunk after a 200 parses as a valid JSON object, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. Only non-JSON and non-object data fails the stream. | TODO-ISSUE surface mid-stream upstream error objects |
+| Anthropic -> CC | Content-filter / safety signal reaches the client | Non-streaming refuses finish_reason content_filter (the upstream success is rejected with 500); streaming silently maps it to end_turn. Identical backend behavior yields opposite client-visible outcomes depending on `stream`. | TODO-ISSUE reconcile content_filter across streaming and finite paths |
 | Anthropic -> CC | Token usage accounting | message_start.usage.input_tokens is hardcoded 0 rather than null, so clients reading prompt tokens at message_start get a wrong number, not a missing one. Finite-path usage is correct. | TODO-ISSUE populate or null message_start usage |
-| Anthropic -> CC | Reasoning / thinking content | Upstream message.reasoning_content and delta.refusal are never read on either path. Billed output the client never sees. | TODO-ISSUE reject or surface reasoning_content and refusal |
+| Anthropic -> CC | Reasoning / thinking content | Upstream message.reasoning_content is never read on either path, so billed reasoning output vanishes. A non-null finite `refusal` is read and refused (the upstream success is rejected with 500); a streaming delta.refusal is not read. | TODO-ISSUE reject or surface reasoning_content and refusal |
 | Anthropic -> CC | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| Responses -> CC | Server-side state continuation | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, reasoning, compaction or item_reference is filter_map'd away with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | TODO-ISSUE preserve or reject hosted-tool history on continuation |
-| Responses -> CC | Unsupported operations on a supported path | POST /v1/responses/compact and the GET /v1/responses WebSocket upgrade are positively classified as Responses traffic — the compact path is even allocated a resp_ id and state — then forwarded verbatim to a Chat-Completions-only backend because is_responses_create() matches only /v1/responses exactly. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | TODO-ISSUE reject untranslatable Responses operations at the edge |
+| Responses -> CC | Server-side state continuation | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, reasoning, compaction or item_reference is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | TODO-ISSUE preserve or reject hosted-tool history on continuation |
+| Responses -> CC | Unsupported operations on a supported path | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | TODO-ISSUE reject untranslatable Responses operations at the edge |
 | Responses -> CC | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| CC -> Gemini | Structured output / JSON schema | json_schema translates, but the json_schema sub-object has no allowlist: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | TODO-ISSUE reject or honor response_format.json_schema.strict |
+| CC -> Gemini | Structured output / JSON schema | json_schema translates, but only json_schema.schema is read: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | TODO-ISSUE reject or honor response_format.json_schema.strict |
 | CC -> Gemini | Prompt-cache token accounting | cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted. | TODO-ISSUE map Gemini cachedContentTokenCount |
-| CC -> Gemini | Reasoning / thinking content | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A streaming Part carrying only thoughtSignature produces no output and no error. | TODO-ISSUE map Gemini thoughtsTokenCount |
+| CC -> Gemini | Reasoning / thinking content | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A Part with thought:true fails the response, while a Part carrying only thoughtSignature produces an empty delta and no error. | TODO-ISSUE map Gemini thoughtsTokenCount |
 | CC -> Gemini | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| CC -> Azure | Content-filter / safety signal reaches the client | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole. Customers relying on Azure safety metadata lose it entirely. | TODO-ISSUE preserve or document Azure content-filter metadata |
-| CC -> Azure | Unsupported operations on a supported path | A malformed JSON body is forwarded to Azure unchanged — strip_ignored_fields returns None on parse failure and the proxy emits no 400. The body `model` is also silently stripped, so when it disagrees with the deployment name in the URL the client's choice is ignored without a word. | TODO-ISSUE validate or explicitly pass through malformed Azure bodies |
+| CC -> Azure | Content-filter / safety signal reaches the client | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole unless it also carries usage or other top-level metadata, in which case it is forwarded with empty choices. Customers relying on Azure safety metadata lose it entirely. | TODO-ISSUE preserve or document Azure content-filter metadata |
 | CC -> Azure | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
 | CC -> Bedrock | Multi-turn history | Roles and tool results translate correctly and client tool_call ids round-trip. But with no per-message allowlist, messages[].name, refusal, annotations and the deprecated function_call are never read and silently discarded, and a non-"function" tool_call type is accepted and emitted as a toolUse. An assistant turn with no content gets a synthetic empty-string block. | TODO-ISSUE add a per-message field allowlist to the Bedrock translator |
 | CC -> Bedrock | Prompt-cache token accounting | cacheReadInputTokens and cacheWriteInputTokens are discarded. | TODO-ISSUE map Bedrock cache token counters |
-| CC -> Bedrock | Reasoning / thinking content | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation and image deltas take the same path and vanish silently. | TODO-ISSUE reject or surface Bedrock reasoningContent and citations |
+| CC -> Bedrock | Reasoning / thinking content | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation, toolResult and image deltas take the same path and vanish silently. | TODO-ISSUE reject or surface Bedrock reasoningContent and citations |
 | CC -> Bedrock | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
 
 ## Surfaces
@@ -116,70 +121,72 @@ defects, not support levels.
 ### Anthropic Messages to OpenAI Chat Completions
 
 - Filters: anthropic_messages_to_chat_completions, anthropic_messages_to_chat_completions_stream
-- Dialect-shaped rejection also requires: anthropic_messages_format
-- Unrecognized fields: Unrecognized top-level fields are forwarded verbatim to the Chat backend (forward_unmapped_fields), not dropped and not rejected.
+- Dialect-shaped rejection also requires: anthropic_messages_request
+- Unrecognized fields: Sixteen top-level fields are rejected 400: thirteen Chat-only fields (service_tier, container, inference_geo, mcp_servers, n, logprobs, top_logprobs, audio, modalities, functions, function_call, web_search_options, moderation) and three Anthropic-only fields (thinking, context_management, cache_control) unless allow_lossy_features opts them in. Any other unrecognized top-level field is forwarded verbatim to the Chat backend (forward_unmapped_fields); a translated key wins over a forwarded one.
 
 | Feature | Status | Notes | Evidence |
 | --- | --- | --- | --- |
-| Plain text completion | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:447-452` |
-| System / developer instructions | `lossy` | An array of text blocks is joined with newlines into one string; per-block boundaries and per-block cache points are lost. | `apis/src/anthropic/messages_to_chat_completions/request.rs:489-499` |
-| Multi-turn history | `translated` | In-array system messages are accepted deliberately (Claude Code emits them). | `apis/src/anthropic/messages_to_chat_completions/request.rs:161-169` |
-| Image input | `translated` | User messages only. An image in an assistant message, or in any message that also carries tool_use, is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:255-269` |
+| Plain text completion | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:799-860` |
+| System / developer instructions | `lossy` | An array of text blocks is joined with newlines into one string, so per-block boundaries are lost. A block carrying cache_control is rejected 400 by default; with allow_lossy_features: [prompt_caching] the marker is stripped and signalled (see the request-side controls row). | `apis/src/anthropic/messages_to_chat_completions/request.rs:838-860; apis/src/anthropic/messages_to_chat_completions/request.rs:476-481; apis/src/anthropic/messages_to_chat_completions/request.rs:682-690` |
+| Multi-turn history | `translated` | In-array system messages are accepted deliberately (Claude Code emits them). | `apis/src/anthropic/messages_to_chat_completions/request.rs:516-521` |
+| Image input | `translated` | User messages only. An image in an assistant message, or in any message that also carries tool_use, is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:606-620; apis/src/anthropic/messages_to_chat_completions/request.rs:667` |
 | Audio input | `n/a` |  |  |
-| Document / file input | `rejected` | All document source types rejected 400; no PDF support. | `apis/src/anthropic/messages_to_chat_completions/request.rs:315` |
-| Client function tools | `translated` | input_schema is moved verbatim; absent description is synthesized as "". | `apis/src/anthropic/messages_to_chat_completions/request.rs:1113-1140` |
-| Tool choice | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:1181-1201` |
-| Parallel tool calls | `translated` | disable_parallel_tool_use true maps to parallel_tool_calls false. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1147-1159` |
-| Provider-hosted tools (web search, file search, MCP, code interpreter) | `rejected` | Typed server tools (web_search, bash, computer, code_execution) rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:181-188` |
-| Structured output / JSON schema | `lossy` | output_config.format becomes response_format.json_schema with a fabricated name "output_format" and a forced strict:true the client never requested. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1040-1051` |
-| Streaming | `translated` | stream_options.include_usage is force-set true, overriding a client false. | `apis/src/anthropic/messages_to_chat_completions/request.rs:946-964` |
-| Streaming terminates correctly | `gap` | Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either. | `apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:931-948` |
-| Mid-stream upstream failure is surfaced | `gap` | A `data: {"error":{...}}` chunk after a 200 parses as valid JSON, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. | `apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:583-616` |
-| Content-filter / safety signal reaches the client | `gap` | Non-streaming rejects finish_reason content_filter; streaming silently maps it to end_turn. Identical backend behavior yields opposite client-visible outcomes depending on `stream`. | `apis/src/anthropic/messages_to_chat_completions/response.rs:141-144 vs stream/mod.rs:1016-1022` |
+| Document / file input | `rejected` | All document source types rejected 400; no PDF support. | `apis/src/anthropic/messages_to_chat_completions/request.rs:667` |
+| Client function tools | `translated` | input_schema is moved verbatim, strict is forwarded, and an absent description is synthesized as "". Unknown tool keys are rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1465-1491; apis/src/anthropic/messages_to_chat_completions/request.rs:530-562` |
+| Tool choice | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:1514-1555; apis/src/anthropic/messages_to_chat_completions/request.rs:568-600` |
+| Parallel tool calls | `translated` | disable_parallel_tool_use true maps to parallel_tool_calls false. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1499-1511` |
+| Provider-hosted tools (web search, file search, MCP, code interpreter) | `rejected` | tools[].type must be absent or "custom"; typed server tools (web_search, bash, computer, code_execution) are rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:533-540` |
+| Structured output / JSON schema | `lossy` | output_config.format becomes a strict response_format.json_schema, which matches Anthropic's always-constrained output. OpenAI strict mode requires every property in `required`, so a schema with optional properties is rejected upstream by an OpenAI backend. output_config.effort maps to reasoning_effort; any other output_config key is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1392-1403; apis/src/anthropic/messages_to_chat_completions/request.rs:1357-1389` |
+| Streaming | `lossy` | stream_options.include_usage is force-set true, overriding a client false. stream_options without stream:true is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1298-1316; apis/src/anthropic/messages_to_chat_completions/request.rs:487-496` |
+| Streaming terminates correctly | `gap` | Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either. | `apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:539-541; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:931-948; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:344-372` |
+| Mid-stream upstream failure is surfaced | `gap` | A `data: {"error":{...}}` chunk after a 200 parses as a valid JSON object, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. Only non-JSON and non-object data fails the stream. | `apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:559-575; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:583-616` |
+| Content-filter / safety signal reaches the client | `gap` | Non-streaming refuses finish_reason content_filter (the upstream success is rejected with 500); streaming silently maps it to end_turn. Identical backend behavior yields opposite client-visible outcomes depending on `stream`. | `apis/src/anthropic/messages_to_chat_completions/response.rs:123-126; apis/src/anthropic/messages_to_chat_completions/mod.rs:400-411; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1016-1022` |
 | Token usage accounting | `gap` | message_start.usage.input_tokens is hardcoded 0 rather than null, so clients reading prompt tokens at message_start get a wrong number, not a missing one. Finite-path usage is correct. | `apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1011-1013` |
-| Prompt-cache token accounting | `lossy` | cache_read_input_tokens maps correctly; cache_creation_input_tokens is hardcoded null because Chat Completions has no cache-write counter, so cache-write billing is invisible. | `apis/src/anthropic/wire.rs:127-139` |
-| Reasoning / thinking content | `gap` | Upstream message.reasoning_content and delta.refusal are never read on either path. Billed output the client never sees. | `apis/src/anthropic/messages_to_chat_completions/response.rs:107-146` |
-| Stop sequences | `lossy` | A genuine stop-sequence stop is reported as end_turn with stop_sequence null whenever the backend does not surface the matched string. | `apis/src/anthropic/messages_to_chat_completions/response.rs:281-291` |
-| Sampling parameters | `translated` | temperature and top_p move verbatim with no rescaling. top_k is not mapped and is forwarded as a literal non-spec key, which vLLM accepts and OpenAI rejects. | `apis/src/anthropic/messages_to_chat_completions/request.rs:369-373` |
-| Logprobs | `rejected` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:38-46` |
+| Prompt-cache token accounting | `lossy` | cache_read_input_tokens maps correctly; cache_creation_input_tokens is hardcoded null because Chat Completions has no cache-write counter, so cache-write billing is invisible. | `apis/src/anthropic/wire.rs:200-214; apis/src/anthropic/messages_to_chat_completions/response.rs:279-303; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:988-1008` |
+| Reasoning / thinking content | `gap` | Upstream message.reasoning_content is never read on either path, so billed reasoning output vanishes. A non-null finite `refusal` is read and refused (the upstream success is rejected with 500); a streaming delta.refusal is not read. | `apis/src/anthropic/messages_to_chat_completions/response.rs:178-184; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:685-706; apis/src/anthropic/messages_to_chat_completions/response.rs:113-121` |
+| Request-side thinking / prompt-cache controls | `rejected` | thinking, context_management and cache_control are rejected 400 by default. With allow_lossy_features listing extended_thinking and/or prompt_caching, recognized markers are validated then stripped, and each real degradation is reported three ways: an x-degraded-features response header, a WARN log, and the praxis_anthropic_messages_to_chat_completions_degraded_total{feature} counter. Malformed markers and features not listed still return 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:59; apis/src/anthropic/messages_to_chat_completions/request.rs:471-474; apis/src/anthropic/messages_to_chat_completions/request.rs:194-221; apis/src/anthropic/messages_to_chat_completions/request.rs:377-418; apis/src/anthropic/messages_to_chat_completions/mod.rs:95; apis/src/anthropic/messages_to_chat_completions/mod.rs:476-490` |
+| Stop sequences | `lossy` | A genuine stop-sequence stop is reported as end_turn with stop_sequence null whenever the backend does not surface the matched string (vLLM's choice.stop_reason is consulted on both paths). | `apis/src/anthropic/messages_to_chat_completions/response.rs:247-266; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:604-610` |
+| Sampling parameters | `lossy` | temperature and top_p move verbatim with no rescaling. top_k is not mapped and is forwarded as a literal non-spec key, which vLLM accepts and OpenAI rejects. | `apis/src/anthropic/messages_to_chat_completions/request.rs:1319-1328; apis/src/anthropic/messages_to_chat_completions/request.rs:721-725` |
+| Logprobs | `rejected` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:34-48; apis/src/anthropic/messages_to_chat_completions/request.rs:737-750` |
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
-| Error envelope matches the client dialect | `translated` | Upstream errors carrying Anthropic vocabulary are preserved; a foreign error.type is replaced by the HTTP-status mapping and only `message` survives. OpenAI error.code and error.param are not read. | `apis/src/anthropic/messages_to_chat_completions/response.rs:149-194` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Error envelope matches the client dialect | `lossy` | Upstream errors carrying Anthropic vocabulary are preserved; a foreign error.type is replaced by the HTTP-status mapping and only `message` survives. OpenAI error.code and error.param are not read. | `apis/src/anthropic/messages_to_chat_completions/response.rs:22-31; apis/src/anthropic/messages_to_chat_completions/response.rs:131-154; apis/src/anthropic/wire.rs:58-86` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Responses to OpenAI Chat Completions
 
-- Filters: responses_to_chat_completions
-- Dialect-shaped rejection also requires: openai_responses_format
-- Unrecognized fields: No allowlist and no typed deserialization. Every unrecognized top-level field, sub-field, and content-part property is accepted and ignored.
+- Filters: openai_responses_to_chat_completions
+- Dialect-shaped rejection also requires: openai_responses_request
+- Unrecognized fields: No allowlist and no typed deserialization. The Chat request is built field by field, so every unrecognized top-level field, sub-field, and content-part property is accepted and silently dropped. background other than false, truncation other than "disabled", and a non-null moderation are rejected 400.
 
 | Feature | Status | Notes | Evidence |
 | --- | --- | --- | --- |
 | Plain text completion | `translated` |  | `apis/src/openai/translation/chat_completions.rs:769-788` |
-| System / developer instructions | `translated` | instructions becomes a leading system message and is echoed on the response. | `apis/src/openai/translation/chat_completions.rs:642-646` |
+| System / developer instructions | `translated` | instructions becomes a leading system message and is echoed on the response. | `apis/src/openai/translation/chat_completions.rs:643-647; apis/src/openai/translation/chat_completions.rs:1821-1823` |
 | Multi-turn history | `translated` | Adjacent function_calls are batched into one assistant message. | `apis/src/openai/translation/chat_completions.rs:675-703` |
-| Image input | `translated` | input_image with image_url is lowered correctly; file_id-only input is rejected 400. | `apis/src/openai/translation/chat_completions.rs:1030-1052` |
-| Audio input | `rejected` |  | `apis/src/openai/translation/chat_completions.rs:965` |
-| Document / file input | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1055-1078` |
-| Client function tools | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1409-1424` |
-| Tool choice | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1467-1483` |
-| Parallel tool calls | `translated` |  | `apis/src/openai/translation/chat_completions.rs:452` |
-| Provider-hosted tools (web search, file search, MCP, code interpreter) | `lossy` | web_search and file_search are replaced by synthesized private functions taking only a query string. search_context_size, user_location, vector_store_ids, max_num_results, filters and ranking_options are validated but never conveyed to the backend. MCP, code_interpreter and computer_use are rejected 400. | `apis/src/openai/translation/chat_completions.rs:1291-1365` |
-| Structured output / JSON schema | `translated` |  | `apis/src/openai/translation/chat_completions.rs:614-632` |
-| Streaming | `translated` |  | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-740` |
-| Streaming terminates correctly | `translated` |  | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1326-1394` |
-| Mid-stream upstream failure is surfaced | `lossy` | Surfaced as response.failed, which force-empties `output` and contradicts items already announced via output_item.added. The spec's top-level `error` SSE event is never emitted. | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1770-1838` |
-| Content-filter / safety signal reaches the client | `translated` | content_filter maps to incomplete_details.reason. | `apis/src/openai/translation/chat_completions.rs:1809-1815` |
-| Token usage accounting | `lossy` | Missing values become 0 rather than null. audio_tokens and accepted/rejected_prediction_tokens are discarded. | `apis/src/openai/translation/chat_completions.rs:2212-2250` |
-| Prompt-cache token accounting | `translated` |  | `apis/src/openai/translation/chat_completions.rs:2212-2250` |
-| Reasoning / thinking content | `rejected` | Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips, but streaming is then rejected 400 outright. reasoning.summary is rejected unconditionally — no dialect reports supports_safe_summary. | `apis/src/openai/translation/reasoning.rs:30-35,87-96` |
+| Image input | `translated` | input_image with image_url is lowered correctly; file_id-only input is rejected 400. | `apis/src/openai/translation/chat_completions.rs:1031-1052` |
+| Audio input | `rejected` |  | `apis/src/openai/translation/chat_completions.rs:958-968` |
+| Document / file input | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1056-1078` |
+| Client function tools | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1093-1118` |
+| Tool choice | `translated` |  | `apis/src/openai/translation/chat_completions.rs:1440-1485` |
+| Parallel tool calls | `translated` |  | `apis/src/openai/translation/chat_completions.rs:453` |
+| Provider-hosted tools (web search, file search, MCP, code interpreter) | `lossy` | web_search and file_search are replaced by synthesized private functions taking only a query string. search_context_size, user_location, vector_store_ids, max_num_results, filters and ranking_options are validated but never conveyed to the backend. MCP, code_interpreter and computer_use are rejected 400 unless the dispatch filters lower them first. | `apis/src/openai/translation/chat_completions.rs:1291-1312; apis/src/openai/translation/chat_completions.rs:1355-1364; apis/src/openai/translation/chat_completions.rs:1116-1117; apis/src/openai/responses/responses_to_chat_completions/mod.rs:588-595` |
+| Structured output / JSON schema | `translated` |  | `apis/src/openai/translation/chat_completions.rs:563-585` |
+| Streaming | `translated` |  | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-741; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1430-1460; apis/src/openai/responses/responses_to_chat_completions/mod.rs:266-320` |
+| Streaming terminates correctly | `translated` |  | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1430-1460` |
+| Mid-stream upstream failure is surfaced | `lossy` | Surfaced as response.failed, which force-empties `output` and contradicts items already announced via output_item.added. The spec's top-level `error` SSE event is never emitted. | `apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1509-1573; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:1946-1955; apis/src/openai/responses/responses_to_chat_completions/stream/events.rs:228-230` |
+| Content-filter / safety signal reaches the client | `translated` | content_filter maps to incomplete_details.reason. | `apis/src/openai/translation/chat_completions.rs:1802-1816` |
+| Token usage accounting | `lossy` | Missing values become 0 rather than null. audio_tokens and accepted/rejected_prediction_tokens are discarded. | `apis/src/openai/translation/chat_completions.rs:2213-2259` |
+| Prompt-cache token accounting | `translated` | cached_tokens and cache_write_tokens are both carried. | `apis/src/openai/translation/chat_completions.rs:2223-2243` |
+| Reasoning / thinking content | `rejected` | Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips on both the finite and the streaming path (delta.reasoning and delta.reasoning_content become response.reasoning_text events). reasoning.summary is rejected unconditionally — no dialect reports supports_safe_summary. | `apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-205; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-741` |
+| Request-side thinking / prompt-cache controls | `translated` | reasoning.effort maps to reasoning_effort regardless of dialect. prompt_cache_key, prompt_cache_retention and prompt_cache_options are copied verbatim. reasoning.summary is rejected 400 (see reasoning-content). | `apis/src/openai/translation/chat_completions.rs:557-561; apis/src/openai/translation/chat_completions.rs:453-456` |
 | Stop sequences | `n/a` |  |  |
-| Sampling parameters | `translated` |  | `apis/src/openai/translation/chat_completions.rs:446-469` |
-| Logprobs | `lossy` | top_logprobs force-injects logprobs:true into the Chat request, a field the client never set, and the result is surfaced regardless of `include`. | `apis/src/openai/translation/chat_completions.rs:548-553` |
-| Server-side state continuation | `gap` | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, reasoning, compaction or item_reference is filter_map'd away with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | `apis/src/openai/responses/mod.rs:703-738` |
-| Unsupported operations on a supported path | `gap` | POST /v1/responses/compact and the GET /v1/responses WebSocket upgrade are positively classified as Responses traffic — the compact path is even allocated a resp_ id and state — then forwarded verbatim to a Chat-Completions-only backend because is_responses_create() matches only /v1/responses exactly. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | `apis/src/classifier/mod.rs:126-128; responses_to_chat_completions/mod.rs:525-527` |
-| Error envelope matches the client dialect | `lossy` | `type` and `code` are always set to the same string, where OpenAI usually leaves code null or distinct. Provider param, type and extra fields are discarded on upstream errors. | `apis/src/openai/responses/error.rs:21,77-91` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Sampling parameters | `translated` |  | `apis/src/openai/translation/chat_completions.rs:446-470` |
+| Logprobs | `lossy` | top_logprobs force-injects logprobs:true into the Chat request, a field the client never set, and the result is surfaced regardless of `include`. | `apis/src/openai/translation/chat_completions.rs:548-554; apis/src/openai/translation/chat_completions.rs:1792-1799` |
+| Server-side state continuation | `gap` | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, reasoning, compaction or item_reference is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | `apis/src/openai/responses/rehydrate/mod.rs:1252-1277; apis/src/openai/responses/rehydrate/mod.rs:1324-1327` |
+| Unsupported operations on a supported path | `gap` | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | `apis/src/classifier/mod.rs:116-118; apis/src/openai/responses/responses_to_chat_completions/mod.rs:530-533; apis/src/openai/responses/routes/mod.rs:200-208; apis/src/openai/responses/routes/mod.rs:256-264; apis/src/openai/responses/compact/mod.rs:331-376` |
+| Error envelope matches the client dialect | `lossy` | `type` and `code` are always set to the same string, where OpenAI usually leaves code null or distinct. Provider param, type and extra fields are discarded on upstream errors. | `apis/src/openai/responses/error.rs:20-37; apis/src/openai/responses/responses_to_chat_completions/error.rs:42-79` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to Vertex AI Gemini
 
@@ -191,35 +198,36 @@ defects, not support levels.
 | --- | --- | --- | --- |
 | Plain text completion | `translated` |  | `apis/src/vertex/gemini/request.rs:375-386` |
 | System / developer instructions | `translated` | Multiple system/developer messages merge in order into systemInstruction. | `apis/src/vertex/gemini/request.rs:344-368` |
-| Multi-turn history | `translated` | Consecutive tool results are merged into one user turn as Gemini requires. Client tool_call ids are deliberately not sent and do not round-trip; response ids are minted fresh. | `apis/src/vertex/gemini/request.rs:557-562,611-649` |
-| Image input | `lossy` | A base64 data URI translates faithfully. An http URL becomes fileData with the MIME type guessed from the file extension, silently defaulting to image/jpeg for anything not .png/.gif/.webp. | `apis/src/vertex/gemini/request.rs:441-463` |
+| Multi-turn history | `translated` | Consecutive tool results are merged into one user turn as Gemini requires. Client tool_call ids are deliberately not sent and do not round-trip; response ids reuse Vertex's functionCall.id when present and are minted otherwise. | `apis/src/vertex/gemini/request.rs:531-572; apis/src/vertex/gemini/request.rs:591-598; apis/src/vertex/gemini/response.rs:383-395` |
+| Image input | `lossy` | A base64 data URI translates faithfully. An http URL becomes fileData with the MIME type guessed from the file extension, silently defaulting to image/jpeg for anything not .png/.gif/.webp. image_url.detail other than auto is rejected 400. | `apis/src/vertex/gemini/request.rs:405-413; apis/src/vertex/gemini/request.rs:427-463` |
 | Audio input | `rejected` |  | `apis/src/vertex/gemini/request.rs:415` |
 | Document / file input | `rejected` |  | `apis/src/vertex/gemini/request.rs:415` |
-| Client function tools | `lossy` | parameters JSON Schema is copied verbatim with no conversion to Gemini's OpenAPI subset, so unsupported keywords reach Vertex unchanged and fail upstream rather than at the edge. | `apis/src/vertex/gemini/request.rs:835-886` |
-| Tool choice | `translated` |  | `apis/src/vertex/gemini/request.rs:905-923` |
-| Parallel tool calls | `rejected` | Only the default true is accepted and discarded; false is rejected 400. | `apis/src/vertex/gemini/request.rs:120-123` |
+| Client function tools | `lossy` | parameters JSON Schema is copied verbatim with no conversion to Gemini's OpenAPI subset, so unsupported keywords reach Vertex unchanged and fail upstream rather than at the edge. function.strict true is rejected 400. | `apis/src/vertex/gemini/request.rs:835-886` |
+| Tool choice | `translated` |  | `apis/src/vertex/gemini/request.rs:898-927` |
+| Parallel tool calls | `rejected` | Only the default true is accepted and discarded; false is rejected 400. | `apis/src/vertex/gemini/request.rs:119-127` |
 | Provider-hosted tools (web search, file search, MCP, code interpreter) | `rejected` |  | `apis/src/vertex/gemini/request.rs:844-846` |
-| Structured output / JSON schema | `gap` | json_schema translates, but the json_schema sub-object has no allowlist: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | `apis/src/vertex/gemini/request.rs:794-819` |
-| Streaming | `translated` |  | `apis/src/vertex/gemini/response.rs:590-752` |
-| Streaming terminates correctly | `translated` | Gemini never sends [DONE]; it is synthesized proxy-side. | `apis/src/vertex/gemini/mod.rs:312-317` |
-| Mid-stream upstream failure is surfaced | `rejected` | Frames with no candidates but an error or promptFeedback.blockReason become a stream error. | `apis/src/vertex/gemini/response.rs:795-822` |
-| Content-filter / safety signal reaches the client | `translated` | SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII, IMAGE_SAFETY, LANGUAGE, OTHER and MODEL_ARMOR all map to content_filter. Unknown finish reasons are a hard error, not a silent "stop". | `apis/src/vertex/gemini/response.rs:435-482` |
-| Token usage accounting | `lossy` | Token counts map; see cache-accounting and reasoning-content for what does not. | `apis/src/vertex/gemini/response.rs:489-502` |
-| Prompt-cache token accounting | `gap` | cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted. | `apis/src/vertex/gemini/response.rs:489-502` |
-| Reasoning / thinking content | `gap` | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A streaming Part carrying only thoughtSignature produces no output and no error. | `apis/src/vertex/gemini/response.rs:284,489-502` |
-| Stop sequences | `translated` |  | `apis/src/vertex/gemini/request.rs:775-785` |
-| Sampling parameters | `lossy` | Values are copied verbatim with no range validation. top_logprobs is copied even when logprobs is absent or false, which OpenAI forbids; there is no coupling check. | `apis/src/vertex/gemini/request.rs:755-768` |
-| Logprobs | `translated` |  | `apis/src/vertex/gemini/response.rs:517-567` |
+| Structured output / JSON schema | `gap` | json_schema translates, but only json_schema.schema is read: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | `apis/src/vertex/gemini/request.rs:146-151; apis/src/vertex/gemini/request.rs:794-819` |
+| Streaming | `translated` |  | `apis/src/vertex/gemini/response.rs:601-629; apis/src/vertex/gemini/response.rs:731-773; apis/src/vertex/gemini/mod.rs:405-455` |
+| Streaming terminates correctly | `translated` | Gemini never sends [DONE]; it is synthesized proxy-side on a clean finish only, and a provider-sent [DONE] is swallowed. | `apis/src/vertex/gemini/mod.rs:377-386; apis/src/vertex/gemini/mod.rs:428-434` |
+| Mid-stream upstream failure is surfaced | `translated` | Frames with no candidates but an error or promptFeedback.blockReason become a terminal in-band server_error SSE frame with no [DONE]. | `apis/src/vertex/gemini/response.rs:615-622; apis/src/vertex/gemini/response.rs:816-843; apis/src/vertex/gemini/mod.rs:447-451; apis/src/vertex/gemini/mod.rs:462-471` |
+| Content-filter / safety signal reaches the client | `translated` | SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII, IMAGE_SAFETY, LANGUAGE, OTHER and MODEL_ARMOR all map to content_filter. Unknown finish reasons are a hard error, not a silent "stop". | `apis/src/vertex/gemini/response.rs:446-493` |
+| Token usage accounting | `lossy` | completion_tokens comes from candidatesTokenCount, which excludes thoughtsTokenCount, so on thinking models it under-reports billed output and total_tokens no longer equals prompt + completion. | `apis/src/vertex/gemini/response.rs:500-513` |
+| Prompt-cache token accounting | `gap` | cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted. | `apis/src/vertex/gemini/response.rs:500-513` |
+| Reasoning / thinking content | `gap` | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A Part with thought:true fails the response, while a Part carrying only thoughtSignature produces an empty delta and no error. | `apis/src/vertex/gemini/response.rs:302-304; apis/src/vertex/gemini/response.rs:324-336; apis/src/vertex/gemini/response.rs:500-513; apis/src/vertex/gemini/response.rs:876-878` |
+| Request-side thinking / prompt-cache controls | `rejected` | reasoning_effort and prompt_cache_key are outside the top-level allowlist and are rejected 400; there is no thinkingConfig mapping. A null value is accepted and dropped. | `apis/src/vertex/gemini/request.rs:99-127` |
+| Stop sequences | `translated` |  | `apis/src/vertex/gemini/request.rs:129-136; apis/src/vertex/gemini/request.rs:775-785` |
+| Sampling parameters | `lossy` | Values are copied verbatim with no range validation. top_logprobs is copied even when logprobs is absent or false, which OpenAI forbids; there is no coupling check. | `apis/src/vertex/gemini/request.rs:754-771` |
+| Logprobs | `translated` |  | `apis/src/vertex/gemini/response.rs:528-563` |
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | OpenAI-shaped with param:null. Differs from the Bedrock filter's envelope — see the cross-surface gap below. | `apis/src/vertex/wire.rs:151-164` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to Azure AI Chat Completions
 
 - Filters: openai_chat_completions_to_azureai_chat_completions
-- Dialect-shaped rejection also requires: openai_operation
-- Unrecognized fields: None. This filter is not a translator: the entire request-side transform is obj.remove("model"). There is no allowlist, no validation, and no rejection path — on_request_body always returns Continue.
+- Dialect-shaped rejection also requires: ai_operation
+- Unrecognized fields: None. This filter is not a translator: the entire request-side transform is obj.remove("model"). There is no allowlist, no validation, and no rejection path — on_request_body always returns Continue, so a malformed JSON body is forwarded unchanged with no 400, and a body `model` that disagrees with the deployment name in the URL is dropped without a word.
 
 | Feature | Status | Notes | Evidence |
 | --- | --- | --- | --- |
@@ -235,19 +243,20 @@ defects, not support levels.
 | Provider-hosted tools (web search, file search, MCP, code interpreter) | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Structured output / JSON schema | `passthrough` | Support depends entirely on the configured api_version, not on Praxis. | `apis/src/azure/to_openai/request.rs:19-26` |
 | Streaming | `passthrough` | The request `stream` flag is never read; response mode is chosen from the upstream Content-Type. | `apis/src/azure/to_openai/mod.rs:252-269` |
-| Streaming terminates correctly | `passthrough` |  | `apis/src/azure/to_openai/mod.rs:311-396` |
-| Mid-stream upstream failure is surfaced | `passthrough` |  | `apis/src/azure/to_openai/mod.rs:311-396` |
-| Content-filter / safety signal reaches the client | `gap` | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole. Customers relying on Azure safety metadata lose it entirely. | `apis/src/azure/to_openai/response.rs:22,25,44-67` |
-| Token usage accounting | `passthrough` |  | `apis/src/azure/to_openai/response.rs:52-58` |
+| Streaming terminates correctly | `passthrough` |  | `apis/src/azure/to_openai/mod.rs:311-347` |
+| Mid-stream upstream failure is surfaced | `passthrough` |  | `apis/src/azure/to_openai/mod.rs:320-337` |
+| Content-filter / safety signal reaches the client | `gap` | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole unless it also carries usage or other top-level metadata, in which case it is forwarded with empty choices. Customers relying on Azure safety metadata lose it entirely. | `apis/src/azure/to_openai/response.rs:22; apis/src/azure/to_openai/response.rs:25; apis/src/azure/to_openai/response.rs:44-67; apis/src/azure/to_openai/response.rs:114-139; apis/src/azure/to_openai/mod.rs:362-372` |
+| Token usage accounting | `passthrough` |  | `apis/src/azure/to_openai/response.rs:52-57` |
 | Prompt-cache token accounting | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Reasoning / thinking content | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
+| Request-side thinking / prompt-cache controls | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Stop sequences | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Sampling parameters | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Logprobs | `passthrough` |  | `apis/src/azure/to_openai/request.rs:19-26` |
 | Server-side state continuation | `n/a` |  |  |
-| Unsupported operations on a supported path | `gap` | A malformed JSON body is forwarded to Azure unchanged — strip_ignored_fields returns None on parse failure and the proxy emits no 400. The body `model` is also silently stripped, so when it disagrees with the deployment name in the URL the client's choice is ignored without a word. | `apis/src/azure/to_openai/request.rs:19-26` |
-| Error envelope matches the client dialect | `translated` | error.type is filled from the HTTP status; Azure's innererror is stripped. | `apis/src/azure/wire.rs:20-58` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Unsupported operations on a supported path | `n/a` |  |  |
+| Error envelope matches the client dialect | `lossy` | error.type is filled from the HTTP status; Azure's innererror is stripped. | `apis/src/azure/wire.rs:20-58` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to AWS Bedrock Converse
 
@@ -258,40 +267,41 @@ defects, not support levels.
 
 | Feature | Status | Notes | Evidence |
 | --- | --- | --- | --- |
-| Plain text completion | `translated` |  | `apis/src/bedrock/converse/request.rs:374` |
+| Plain text completion | `translated` |  | `apis/src/bedrock/converse/request.rs:371-374` |
 | System / developer instructions | `translated` |  | `apis/src/bedrock/converse/request.rs:266-306` |
-| Multi-turn history | `gap` | Roles and tool results translate correctly and client tool_call ids round-trip. But with no per-message allowlist, messages[].name, refusal, annotations and the deprecated function_call are never read and silently discarded, and a non-"function" tool_call type is accepted and emitted as a toolUse. An assistant turn with no content gets a synthetic empty-string block. | `apis/src/bedrock/converse/request.rs:314-346,449-475` |
+| Multi-turn history | `gap` | Roles and tool results translate correctly and client tool_call ids round-trip. But with no per-message allowlist, messages[].name, refusal, annotations and the deprecated function_call are never read and silently discarded, and a non-"function" tool_call type is accepted and emitted as a toolUse. An assistant turn with no content gets a synthetic empty-string block. | `apis/src/bedrock/converse/request.rs:314-346; apis/src/bedrock/converse/request.rs:415-484` |
 | Image input | `rejected` | Rejected 400 — a translator limitation, not a provider one. Bedrock Converse supports images natively. | `apis/src/bedrock/converse/request.rs:387-389` |
 | Audio input | `rejected` |  | `apis/src/bedrock/converse/request.rs:390-392` |
 | Document / file input | `rejected` |  | `apis/src/bedrock/converse/request.rs:390-392` |
-| Client function tools | `lossy` | strict is forwarded as toolSpec.strict, which is not a documented Bedrock Converse ToolSpecification field; no test asserts Bedrock accepts it. | `apis/src/bedrock/converse/request.rs:626-657` |
-| Tool choice | `lossy` | "none" omits the entire toolConfig, which also drops every tools[] definition — the model loses all tool schema awareness instead of merely being told not to call. | `apis/src/bedrock/converse/request.rs:600-602,690` |
-| Parallel tool calls | `rejected` |  | `apis/src/bedrock/converse/request.rs:220` |
+| Client function tools | `lossy` | strict is forwarded as toolSpec.strict, a documented Converse ToolSpecification field. Whether the model behind the endpoint honours or rejects it is up to Bedrock; no test asserts either. | `apis/src/bedrock/converse/request.rs:626-657` |
+| Tool choice | `lossy` | "none" omits the entire toolConfig, which also drops every tools[] definition — the model loses all tool schema awareness instead of merely being told not to call. | `apis/src/bedrock/converse/request.rs:600-602; apis/src/bedrock/converse/request.rs:690` |
+| Parallel tool calls | `rejected` |  | `apis/src/bedrock/converse/request.rs:141-144; apis/src/bedrock/converse/request.rs:217` |
 | Provider-hosted tools (web search, file search, MCP, code interpreter) | `rejected` |  | `apis/src/bedrock/converse/request.rs:628-630` |
-| Structured output / JSON schema | `rejected` | No structured-output support at all; json_object and json_schema both rejected 400. | `apis/src/bedrock/converse/request.rs:144,216` |
-| Streaming | `translated` |  | `apis/src/bedrock/converse/response.rs:299-510` |
-| Streaming terminates correctly | `translated` | [DONE] is appended only on a clean end of stream; truncation and decode failures become in-band SSE error frames instead. | `apis/src/bedrock/converse/mod.rs:413-436` |
-| Mid-stream upstream failure is surfaced | `rejected` | Exceptions and truncated frames become an in-band SSE error frame with a typed code. | `apis/src/bedrock/converse/mod.rs:413-434,455-470` |
-| Content-filter / safety signal reaches the client | `translated` | content_filtered and guardrail_intervened both map to content_filter. | `apis/src/bedrock/converse/response.rs:70-95` |
+| Structured output / JSON schema | `rejected` | response_format json_object and json_schema are rejected 400 — a translator limitation. Converse supports structured output through outputConfig.textFormat. | `apis/src/bedrock/converse/request.rs:140-145; apis/src/bedrock/converse/request.rs:216` |
+| Streaming | `translated` |  | `apis/src/bedrock/converse/response.rs:286-310; apis/src/bedrock/converse/response.rs:317-511` |
+| Streaming terminates correctly | `translated` | [DONE] is appended only on a clean end of stream; truncation and decode failures become in-band SSE error frames instead. | `apis/src/bedrock/converse/mod.rs:414-434` |
+| Mid-stream upstream failure is surfaced | `translated` | Exception and truncated frames become an in-band SSE error frame with a typed code and no [DONE]. | `apis/src/bedrock/converse/mod.rs:414-430; apis/src/bedrock/converse/mod.rs:453-509; apis/src/bedrock/converse/response.rs:514-552` |
+| Content-filter / safety signal reaches the client | `translated` | content_filtered and guardrail_intervened both map to content_filter. An unknown stopReason fails the response instead of defaulting to stop. | `apis/src/bedrock/converse/response.rs:70-95; apis/src/bedrock/converse/response.rs:122-127` |
 | Token usage accounting | `lossy` | Missing token fields default to 0 rather than erroring. | `apis/src/bedrock/converse/response.rs:221-240` |
 | Prompt-cache token accounting | `gap` | cacheReadInputTokens and cacheWriteInputTokens are discarded. | `apis/src/bedrock/converse/response.rs:221-240` |
-| Reasoning / thinking content | `gap` | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation and image deltas take the same path and vanish silently. | `apis/src/bedrock/converse/response.rs:444-449` |
-| Stop sequences | `translated` |  | `apis/src/bedrock/converse/request.rs:573-586` |
-| Sampling parameters | `translated` | temperature, top_p and max_tokens translate with type validation. seed, user, top_logprobs and reasoning_effort are rejected 400 — reasoning_effort even at OpenAI's default "medium". | `apis/src/bedrock/converse/request.rs:140-145,559-570` |
+| Reasoning / thinking content | `gap` | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation, toolResult and image deltas take the same path and vanish silently. | `apis/src/bedrock/converse/response.rs:441-451` |
+| Request-side thinking / prompt-cache controls | `rejected` | reasoning_effort (even at OpenAI's default "medium") and prompt_cache_key are outside the allowlist and rejected 400. | `apis/src/bedrock/converse/request.rs:140-166` |
+| Stop sequences | `translated` |  | `apis/src/bedrock/converse/request.rs:572-586` |
+| Sampling parameters | `translated` | temperature, top_p and max_tokens translate with type validation. seed, user and top_logprobs are rejected 400. | `apis/src/bedrock/converse/request.rs:140-166; apis/src/bedrock/converse/request.rs:210-223; apis/src/bedrock/converse/request.rs:546-570` |
 | Logprobs | `rejected` |  | `apis/src/bedrock/converse/request.rs:214` |
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
-| Error envelope matches the client dialect | `lossy` | OpenAI-shaped but omits `param` and uses code "invalid_request". Differs from the Vertex filter's envelope — see the cross-surface gap below. | `apis/src/bedrock/wire.rs:61-72` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.3/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Error envelope matches the client dialect | `lossy` | OpenAI-shaped but omits `param` and uses code "invalid_request". Differs from the Vertex filter's envelope — see the cross-surface gap below. | `apis/src/bedrock/wire.rs:61-72; apis/src/bedrock/wire.rs:113-126` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ## Native surfaces
 
 | Surface | Operations | Status | Notes | Evidence |
 | --- | --- | --- | --- | --- |
-| OpenAI Conversations | 8 | `native` | All 8 operations are HandlingMode::Local; Praxis owns the payload and terminates locally. Handlers emit OpenAI-shaped 400/404/500 themselves. | `apis/src/openai/conversations/routes.rs:298-436` |
+| OpenAI Conversations | 8 | `native` | All 8 operations are HandlingMode::Local; Praxis owns the payload and terminates locally. Handlers emit OpenAI-shaped 400/404/500 themselves. | `apis/src/openai/conversations/routes.rs:300-436` |
 | OpenAI Responses | 1 | `native` | POST /v1/responses is HandlingMode::Transform with an owned contract. | `apis/src/openai/responses/routes/mod.rs:187-199` |
-| OpenAI Responses | 3 | `passthrough` | GET /v1/responses/{id}, DELETE, and GET .../input_items are classified passthrough but are terminated locally when openai_response_store is in the chain. Registry mode is a classification default, not a transport guarantee. | `apis/src/openai/responses/store/filter.rs:681,686-689,1564-1567` |
+| OpenAI Responses | 3 | `passthrough` | GET /v1/responses/{id}, DELETE, and GET .../input_items are classified passthrough but are terminated locally when openai_responses_store is in the chain. Registry mode is a classification default, not a transport guarantee. | `apis/src/openai/responses/routes/mod.rs:210-243; apis/src/openai/responses/store/filter.rs:1031-1051; apis/src/openai/responses/store/filter.rs:1188-1230; apis/src/openai/responses/store/filter.rs:172-196` |
 | OpenAI Chat Completions | 6 | `passthrough` | Recognized by the registry with owned_contract: None. Outside conformance scope — no oasdiff, no capability claim, no runtime suite. | `apis/src/openai/chat_completions/routes/mod.rs:104,112-161` |
-| Anthropic Messages | — | `passthrough` | Header-only filter (injects anthropic-version, preserves anthropic-beta); bodies are untouched. No operation registry, no conformance gate. Path match is a /v1/messages prefix test, so count_tokens and batches are not distinguished. | `apis/src/anthropic/protocol/mod.rs:81-87; apis/src/anthropic/messages_format/mod.rs:286-289` |
+| Anthropic Messages | 8 | `passthrough` | A head-based registry declares 8 operations: create-message is inspected, count_tokens and the 6 batch operations pass through with their bodies untouched. The protocol filter only injects anthropic-version and preserves anthropic-beta. No conformance gate. | `apis/src/anthropic/protocol/mod.rs:76-113; apis/src/anthropic/routes.rs:194-259; apis/src/anthropic/messages_request/mod.rs:216-239` |
 
 The report's "15/15, 100%" counts non-beta Conversations and Responses operations only — 7 of 14 projected Responses operations are scored. Publish the qualified number, never the bare percentage.
