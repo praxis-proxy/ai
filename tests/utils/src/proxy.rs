@@ -4,7 +4,6 @@
 //! Proxy startup and configuration test utilities for integration tests.
 
 use std::{
-    collections::HashMap,
     fmt,
     path::PathBuf,
     sync::{Arc, mpsc},
@@ -15,7 +14,7 @@ use std::{
 use arc_swap::ArcSwap;
 use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 use praxis_core::{
-    config::{Config, Listener},
+    config::{Config, ExpandedFilterChains, Listener},
     server::RuntimeOptions,
 };
 use praxis_filter::{FilterFactory, FilterPipeline, FilterRegistry, HttpFilter};
@@ -126,19 +125,15 @@ fn resolve_listener_pipeline(
     client: &praxis_core::subrequest::SubRequestClient,
     store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
 ) -> Arc<FilterPipeline> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Mirror the server: fold each chain's inherited `conditions:` into its
+    // filters before composition so chain-level gates apply to every filter in
+    // the chain (chain gate AND filter gate).
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
-    let mut entries = Vec::new();
-    for chain_name in &listener.filter_chains {
-        let filters = chains
-            .get(chain_name.as_str())
-            .unwrap_or_else(|| panic!("unknown filter chain: {chain_name}"));
-        entries.extend_from_slice(filters);
-    }
+    let mut entries = expanded_chains
+        .for_listener(listener)
+        .unwrap_or_else(|err| panic!("{err}"));
 
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
@@ -222,11 +217,11 @@ const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// harness serves requests. Generous enough for a Postgres pool (and its TLS
 /// handshake) to open under coverage instrumentation. A permanent provisioning
 /// failure falls through so the test's own assertion reports it.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 const STORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between store-readiness polls.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 const STORE_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Harness store-provisioning readiness waiter.
@@ -236,7 +231,7 @@ const STORE_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[derive(Clone, Default)]
 struct HarnessStoreReadiness {
     /// Readiness handle shared with the provisioning background service.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     handle: Option<praxis_ai::store_provision::StoreReadinessHandle>,
 }
 
@@ -245,7 +240,7 @@ impl HarnessStoreReadiness {
     /// elapses. Polls the shared readiness value to observe the provisioner
     /// without a timing assumption. A no-op when no store is configured.
     fn wait(&self) {
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         if let Some(handle) = &self.handle {
             use praxis_ai::store_provision::StoreReadiness;
             let deadline = Instant::now() + STORE_READY_TIMEOUT;
@@ -417,7 +412,7 @@ impl Drop for ProxyGuard {
 ///
 /// [`Server`]: pingora_core::server::Server
 #[cfg_attr(
-    any(feature = "store-postgres", feature = "store-sqlite"),
+    feature = "_store-backend",
     expect(
         clippy::too_many_lines,
         reason = "listener wiring plus store provisioning mirror boot_server"
@@ -434,17 +429,18 @@ fn build_pingora_server(
     // build the per-listener registries plus the background service, install the
     // shared registries into the pipelines, and register the service so
     // store-filter requests through the harness resolve a provisioned backend.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
-    let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
+    #[cfg(not(feature = "_store-backend"))]
+    let store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> =
+        std::collections::HashMap::new();
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let readiness = HarnessStoreReadiness {
         handle: Some(store_readiness),
     };
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let readiness = HarnessStoreReadiness::default();
 
     let mut cert_shutdowns = Vec::new();
@@ -470,7 +466,7 @@ fn build_pingora_server(
         );
     }
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     server.add_service(pingora_core::services::background::background_service(
         "store-provision",
         store_service,
@@ -534,7 +530,11 @@ pub fn start_proxy(config: &Config) -> ProxyGuard {
     let client = configured_subrequest_client(config);
     let registry = praxis_ai::build_full_registry(&client);
     let guard = spawn_proxy_server(config, &registry, &client);
-    crate::net::wait::wait_for_http(&guard.addr);
+    // TCP-only readiness: the listener pipeline is built before `server.run`,
+    // so an accepted connection means the pipeline is installed. An HTTP probe
+    // would send a `GET /` that the operation-aware classifier releases to the
+    // backend, polluting request-count assertions, so avoid issuing one.
+    crate::net::wait::wait_for_tcp(&guard.addr);
     guard.wait_for_store_ready();
     guard
 }
@@ -564,7 +564,8 @@ pub fn start_proxy_no_wait(config: &Config) -> ProxyGuard {
 pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> ProxyGuard {
     let client = configured_subrequest_client(config);
     let guard = spawn_proxy_server(config, registry, &client);
-    crate::net::wait::wait_for_http(&guard.addr);
+    // TCP-only readiness; see `start_proxy` for why no HTTP probe is issued.
+    crate::net::wait::wait_for_tcp(&guard.addr);
     guard.wait_for_store_ready();
     guard
 }

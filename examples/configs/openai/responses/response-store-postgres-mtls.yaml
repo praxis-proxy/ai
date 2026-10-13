@@ -1,5 +1,6 @@
 # Response Store — PostgreSQL with certificate authentication
-# Requires `--features store-postgres` because these filters are opt-in.
+# Requires `--features store-postgres` or the reduced
+# `store-postgres-cert-auth` profile because these filters are opt-in.
 #
 # Persists non-streaming Responses API responses to PostgreSQL over a
 # TLS-verified connection that authenticates with a client certificate
@@ -40,13 +41,16 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
       - filter: openai_responses_request
 
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: postgres
         # No password: the client authenticates with a certificate.
         database_url: "postgres://praxis@db.internal:5432/praxis"

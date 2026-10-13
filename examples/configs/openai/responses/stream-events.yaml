@@ -16,7 +16,7 @@
 # selected peer when needed; `openai_responses_proxy` buffers the request
 # body, so IRR otherwise runs that phase before load balancing.
 #
-# The `openai_response_store` filter runs pre-IRR (registering the
+# The `openai_responses_store` filter runs pre-IRR (registering the
 # store backend) and persists the accumulated ResponsesState once the
 # logical stream terminates. Response body filters run in reverse
 # config order, so the store persists after the step composes the
@@ -97,6 +97,9 @@ filter_chains:
         mode: trusted_owner
         header: x-authenticated-state-owner
 
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -105,7 +108,7 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses

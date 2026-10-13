@@ -64,9 +64,11 @@ mod pressure;
 // -----------------------------------------------------------------------------
 
 /// Serializes the tests in this binary.
+#[cfg(target_os = "linux")]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Hold for the whole test so no other test in this binary runs meanwhile.
+#[cfg(target_os = "linux")]
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

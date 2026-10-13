@@ -130,7 +130,8 @@ use self::{
     },
     config::{
         ActionType, BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EnforcementMode, EstimationConfig,
-        EstimationStrategy, MatchConfig, OverQuotaConfig, RuleAlgorithm, RuleConfig, TierConfig, TokenRateLimitConfig,
+        EstimationStrategy, HierarchyIdentitySource, HierarchyLevel, HierarchyLevelConfig, HierarchySubjectSource,
+        MatchConfig, OverQuotaConfig, RuleAlgorithm, RuleConfig, TierConfig, TokenRateLimitConfig,
     },
     keys::{CompiledKeySpec, KeyDecision, KeyInputs, compile_key_spec},
     ledger::{Budget, DenialReason, Ledger, LedgerConfig},
@@ -202,6 +203,26 @@ const DEFAULT_USED_QUOTA_HEADER: &str = "X-Token-Quota-Used";
 /// by the token bucket's f64 balance. The remaining-budget gauge saturates
 /// here instead of wrapping or reporting backend-dependent precision loss.
 const MAX_REPORTED_REMAINING: u64 = 9_007_199_254_740_991;
+
+/// Metadata: org-level hierarchy reservation ID.
+const META_HIERARCHY_ORG_RESERVATION_ID: &str = "trl.hierarchy.org.reservation_id";
+/// Metadata: org-level hierarchy bucket key.
+const META_HIERARCHY_ORG_BUCKET_KEY: &str = "trl.hierarchy.org.bucket_key";
+/// Metadata: team-level hierarchy reservation ID.
+const META_HIERARCHY_TEAM_RESERVATION_ID: &str = "trl.hierarchy.team.reservation_id";
+/// Metadata: team-level hierarchy bucket key.
+const META_HIERARCHY_TEAM_BUCKET_KEY: &str = "trl.hierarchy.team.bucket_key";
+/// Metadata: user-level hierarchy reservation ID.
+const META_HIERARCHY_USER_RESERVATION_ID: &str = "trl.hierarchy.user.reservation_id";
+/// Metadata: user-level hierarchy bucket key.
+const META_HIERARCHY_USER_BUCKET_KEY: &str = "trl.hierarchy.user.bucket_key";
+
+/// Ordered metadata key pairs for hierarchy levels (org, team, user).
+const HIERARCHY_META_KEYS: [(&str, &str); 3] = [
+    (META_HIERARCHY_ORG_RESERVATION_ID, META_HIERARCHY_ORG_BUCKET_KEY),
+    (META_HIERARCHY_TEAM_RESERVATION_ID, META_HIERARCHY_TEAM_BUCKET_KEY),
+    (META_HIERARCHY_USER_RESERVATION_ID, META_HIERARCHY_USER_BUCKET_KEY),
+];
 
 /// Maximum request body bytes buffered for body-dependent estimation
 /// strategies. 2 MiB -- generous enough for the largest realistic
@@ -277,12 +298,17 @@ fn build_backend_resource(backend: &BackendConfig) -> Result<BackendResource, Fi
 /// # Errors
 ///
 /// Returns [`FilterError`] if the ledger config is invalid.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "builder parameters are the distinct sliding-window accounting fields"
+)]
 fn build_sliding_window_backend(
     backend: &BackendResource,
     rule_name: &str,
     budgets: Vec<Budget>,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
@@ -303,6 +329,7 @@ fn build_sliding_window_backend(
             max_keys,
             valkey,
             namespace.as_str(),
+            accounting,
         ),
     }
 }
@@ -327,6 +354,7 @@ fn build_sw_valkey_backend(
     max_keys: usize,
     valkey: &ValkeyConnection,
     namespace: &str,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     let min_window_ms = budgets.iter().map(|b| b.window_ms).min().unwrap_or(0);
     if reservation_timeout_ms > min_window_ms {
@@ -344,6 +372,7 @@ fn build_sw_valkey_backend(
         reservation_timeout_ms,
         max_keys,
         max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+        accounting: accounting.clone(),
     })))
 }
 
@@ -365,6 +394,7 @@ fn build_token_bucket_backend(
     refill_rate: f64,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
@@ -389,6 +419,7 @@ fn build_token_bucket_backend(
                 reservation_timeout_ms,
                 max_keys,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+                accounting: accounting.clone(),
             })?))
         },
     }
@@ -411,11 +442,514 @@ pub(super) struct BodyProbe {
     pub(super) model: Option<String>,
 }
 
+// -----------------------------------------------------------------------------
+// Hierarchy
+// -----------------------------------------------------------------------------
+
+/// How a hierarchy level resolves the request identity key.
+enum CompiledHierarchyIdentity {
+    /// Read from a request header (org/team levels).
+    Header(HeaderName),
+    /// Read from the `AuthenticatedIdentity` extension (user level).
+    AuthenticatedSubject,
+}
+
+/// One compiled hierarchy level, ready for admission.
+struct CompiledHierarchyLevel {
+    /// This level's own admission state backend.
+    backend: Arc<dyn TokenRateLimitStateBackend>,
+    /// How to resolve the request identity for this level.
+    identity: CompiledHierarchyIdentity,
+    /// Human-readable name for logging (e.g. "org", "team", "user").
+    name: &'static str,
+    /// Prometheus `rule` label. Chosen once at config load.
+    metric_rule: &'static str,
+}
+
+/// Label string for a hierarchy level.
+fn hierarchy_level_name(level: HierarchyLevel) -> &'static str {
+    match level {
+        HierarchyLevel::Org => "org",
+        HierarchyLevel::Team => "team",
+        HierarchyLevel::User => "user",
+    }
+}
+
+/// Validate and compile the hierarchy config into ready-to-use levels.
+///
+/// Enforces: exactly 3 levels, in `[org, team, user]` order, no
+/// duplicates. Org/team must have `identity_header`; user must have
+/// `identity: authenticated_subject`.
+fn compile_hierarchy(
+    levels: &[HierarchyLevelConfig],
+    backend_resource: &BackendResource,
+    max_keys: usize,
+    key_fingerprint: &str,
+) -> Result<Vec<CompiledHierarchyLevel>, FilterError> {
+    let expected = [HierarchyLevel::Org, HierarchyLevel::Team, HierarchyLevel::User];
+
+    if levels.len() != 3 {
+        return Err(format!(
+            "token_rate_limit: hierarchy must have exactly 3 levels (org, team, user), got {}",
+            levels.len()
+        )
+        .into());
+    }
+
+    validate_hierarchy_order(levels, &expected)?;
+
+    let mut compiled = Vec::with_capacity(3);
+    for level_cfg in levels {
+        compiled.push(compile_hierarchy_level(
+            level_cfg,
+            backend_resource,
+            max_keys,
+            key_fingerprint,
+        )?);
+    }
+    Ok(compiled)
+}
+
+/// Verify the hierarchy levels appear in the required order.
+fn validate_hierarchy_order(levels: &[HierarchyLevelConfig], expected: &[HierarchyLevel]) -> Result<(), FilterError> {
+    for (i, (level_cfg, expected_level)) in levels.iter().zip(expected.iter()).enumerate() {
+        if level_cfg.level != *expected_level {
+            return Err(format!(
+                "token_rate_limit: hierarchy level {i} must be {}, got {}",
+                hierarchy_level_name(*expected_level),
+                hierarchy_level_name(level_cfg.level),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Accounting marker for one hierarchy level.
+///
+/// The matched rule supplies the token count. This records the shared key
+/// policy so a replica with a different key spec cannot reuse the level's
+/// Valkey state. The level does not estimate or apply token-type weights.
+fn hierarchy_accounting_policy(key_fingerprint: &str) -> AccountingPolicy {
+    AccountingPolicy {
+        estimation: CompiledEstimation::Fixed { estimate: 1 },
+        weights: TokenWeights::UNITY,
+        key_fingerprint: key_fingerprint.to_owned(),
+    }
+}
+
+/// Compile one hierarchy level config into a [`CompiledHierarchyLevel`].
+fn compile_hierarchy_level(
+    level_cfg: &HierarchyLevelConfig,
+    backend_resource: &BackendResource,
+    max_keys: usize,
+    key_fingerprint: &str,
+) -> Result<CompiledHierarchyLevel, FilterError> {
+    let level_name = hierarchy_level_name(level_cfg.level);
+    let rule_name = format!("hierarchy:{level_name}");
+    let capacity = level_cfg.algorithm.capacity();
+    validate_capacity_safe_integer_bound(&rule_name, capacity)?;
+
+    let reservation_timeout_ms = parse_duration_ms(
+        level_cfg
+            .reservation_timeout
+            .as_deref()
+            .unwrap_or(DEFAULT_RESERVATION_TIMEOUT),
+    )?;
+
+    let accounting = hierarchy_accounting_policy(key_fingerprint);
+    let backend_impl = build_rule_backend(
+        &level_cfg.algorithm,
+        backend_resource,
+        &rule_name,
+        reservation_timeout_ms,
+        max_keys,
+        &accounting,
+    )?;
+    let identity = compile_hierarchy_identity(level_cfg, level_name)?;
+
+    Ok(CompiledHierarchyLevel {
+        backend: backend_impl,
+        identity,
+        name: level_name,
+        metric_rule: hierarchy_metric_rule(level_name),
+    })
+}
+
+/// Require a catch-all rule and an estimate that cannot be absent.
+///
+/// Hierarchy budgets run on the matched rule's estimate. A rule list with
+/// no catch-all, or a body strategy with no `fallback_estimate`, would let
+/// a request skip org, team, and user. Those configs are rejected here.
+fn validate_hierarchy_applies_to_every_request(rules: &[RuleConfig]) -> Result<(), FilterError> {
+    for rule in rules {
+        if matches!(
+            rule.name.as_str(),
+            "hierarchy:org" | "hierarchy:team" | "hierarchy:user"
+        ) {
+            return Err(format!("token_rate_limit: rule name '{}' is reserved for hierarchy", rule.name).into());
+        }
+    }
+    if !rules.iter().any(|rule| rule.r#match.is_none()) {
+        return Err(
+            "token_rate_limit: hierarchy requires a catch-all rule with no match, so every request is checked".into(),
+        );
+    }
+    for rule in rules {
+        let estimate_always_present = rule.reserved_tokens.is_some()
+            || rule
+                .estimation
+                .as_ref()
+                .is_some_and(|estimation| estimation.fallback_estimate.is_some_and(|estimate| estimate > 0));
+        if !estimate_always_present {
+            return Err(format!(
+                "token_rate_limit: hierarchy requires rule '{}' to set reserved_tokens or estimation.fallback_estimate > 0",
+                rule.name
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// A fixed rule estimate that is larger than a hierarchy level can never
+/// be admitted. Reject that at load time instead of 429ing every request.
+fn validate_rule_estimates_fit_hierarchy(
+    rules: &[RuleConfig],
+    levels: &[HierarchyLevelConfig],
+) -> Result<(), FilterError> {
+    for rule in rules {
+        let Some(estimate) = fixed_rule_estimate(rule) else {
+            continue;
+        };
+        for level in levels {
+            let capacity = level.algorithm.capacity();
+            if estimate > capacity {
+                return Err(format!(
+                    "token_rate_limit: rule '{}': estimate {estimate} exceeds hierarchy {} capacity {capacity}",
+                    rule.name,
+                    hierarchy_level_name(level.level),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The estimate a rule charges on every request.
+///
+/// Body strategies can be smaller than their fallback, so only
+/// `reserved_tokens` and `strategy: fixed` are known at load time.
+/// A fixed strategy includes its multiplier, matching admission.
+fn fixed_rule_estimate(rule: &RuleConfig) -> Option<u64> {
+    if let Some(reserved) = rule.reserved_tokens {
+        return Some(reserved);
+    }
+    let estimation = rule.estimation.as_ref()?;
+    match estimation.strategy {
+        EstimationStrategy::Fixed => estimation.fallback_estimate.map(|raw| {
+            let multiplier = estimation.multiplier.unwrap_or(1.0);
+            if multiplier.is_finite() && multiplier > 0.0 {
+                apply_multiplier(raw, multiplier)
+            } else {
+                raw
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve the identity source for one hierarchy level.
+fn compile_hierarchy_identity(
+    level_cfg: &HierarchyLevelConfig,
+    level_name: &str,
+) -> Result<CompiledHierarchyIdentity, FilterError> {
+    match (level_cfg.level, &level_cfg.identity) {
+        (HierarchyLevel::Org | HierarchyLevel::Team, HierarchyIdentitySource::IdentityHeader(header)) => {
+            let header_name = HeaderName::try_from(header).map_err(|e| {
+                FilterError::from(format!(
+                    "token_rate_limit: hierarchy {level_name}: invalid identity_header '{header}': {e}"
+                ))
+            })?;
+            Ok(CompiledHierarchyIdentity::Header(header_name))
+        },
+        (HierarchyLevel::Org | HierarchyLevel::Team, HierarchyIdentitySource::Identity(_)) => {
+            Err(format!("token_rate_limit: hierarchy {level_name} level requires identity_header").into())
+        },
+        (HierarchyLevel::User, HierarchyIdentitySource::Identity(HierarchySubjectSource::AuthenticatedSubject)) => {
+            Ok(CompiledHierarchyIdentity::AuthenticatedSubject)
+        },
+        (HierarchyLevel::User, HierarchyIdentitySource::IdentityHeader(_)) => {
+            Err("token_rate_limit: hierarchy user level requires identity: authenticated_subject".into())
+        },
+    }
+}
+
+/// Build a non-identifying backend key for a hierarchy level + header value.
+fn hierarchy_bucket_key(level_name: &str, header_value: &str) -> String {
+    keys::opaque_part(level_name, header_value.as_bytes())
+}
+
+/// Resolve all three hierarchy identity keys upfront.
+///
+/// Returns the level name whose identity is missing. Blank org and team
+/// headers are missing. The caller returns 401 and charges nothing.
+fn resolve_hierarchy_keys(
+    hierarchy: &[CompiledHierarchyLevel],
+    ctx: &HttpFilterContext<'_>,
+) -> Result<Vec<String>, &'static str> {
+    let mut keys = Vec::with_capacity(hierarchy.len());
+    for level in hierarchy {
+        let key = match &level.identity {
+            CompiledHierarchyIdentity::Header(header_name) => {
+                let Some(value) = keys::header_value(&ctx.request.headers, header_name) else {
+                    return Err(level.name);
+                };
+                hierarchy_bucket_key(level.name, value)
+            },
+            CompiledHierarchyIdentity::AuthenticatedSubject => {
+                let Some(identity) = ctx.extensions.get::<AuthenticatedIdentity>() else {
+                    return Err(level.name);
+                };
+                keys::opaque_part("subject", identity.subject_id().as_bytes())
+            },
+        };
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+/// Prometheus `rule` label for one hierarchy level.
+fn hierarchy_metric_rule(level_name: &str) -> &'static str {
+    match level_name {
+        "org" => "hierarchy:org",
+        "team" => "hierarchy:team",
+        _ => "hierarchy:user",
+    }
+}
+
+/// Reserve hierarchy levels in order (org → team → user). On denial at
+/// level N, reconcile levels 0..N with `actual=Some(0)` (full refund).
+///
+/// Returns `Ok(stashed)` on success — a list of `(reservation_id, key)`
+/// per level — or `Err(action)` with the 429 rejection.
+async fn admit_hierarchy(
+    hierarchy: &[CompiledHierarchyLevel],
+    keys: &[String],
+    estimate: u64,
+    now_ms: u64,
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<Vec<(u64, String)>, FilterAction> {
+    let mut stashed: Vec<(u64, String)> = Vec::with_capacity(hierarchy.len());
+
+    for (level, key) in hierarchy.iter().zip(keys.iter()) {
+        match reserve_hierarchy_level(ctx, level, key, estimate, now_ms).await {
+            Ok(reserved) => stashed.push(reserved),
+            Err(action) => {
+                rollback_hierarchy_sync(hierarchy, &stashed, now_ms);
+                return Err(action);
+            },
+        }
+    }
+
+    Ok(stashed)
+}
+
+/// Reserve one hierarchy level. The caller refunds earlier levels on `Err`.
+async fn reserve_hierarchy_level(
+    ctx: &mut HttpFilterContext<'_>,
+    level: &CompiledHierarchyLevel,
+    key: &str,
+    estimate: u64,
+    now_ms: u64,
+) -> Result<(u64, String), FilterAction> {
+    let outcome = level
+        .backend
+        .reserve(ReserveRequest {
+            key: key.to_owned(),
+            estimate,
+            now_ms,
+        })
+        .await;
+    match outcome {
+        Ok(BackendReserve::Admitted { reservation_id, .. }) => {
+            record_state_metrics(level.metric_rule, level.backend.as_ref());
+            Ok((reservation_id, key.to_owned()))
+        },
+        Ok(BackendReserve::Denied {
+            retry_after_ms, reason, ..
+        }) => Err(hierarchy_denied_action(ctx, level, estimate, retry_after_ms, reason)),
+        Err(error) => Err(hierarchy_backend_error(ctx, level, estimate, &error)),
+    }
+}
+
+/// Build the 429 rejection for a denied hierarchy level.
+fn hierarchy_denied_action(
+    ctx: &mut HttpFilterContext<'_>,
+    level: &CompiledHierarchyLevel,
+    estimate: u64,
+    retry_after_ms: u64,
+    reason: DenialReason,
+) -> FilterAction {
+    tracing::info!(
+        level = level.name,
+        ?reason,
+        "token_rate_limit: hierarchy denied, returning 429"
+    );
+    record_request_metric(level.metric_rule, "denied");
+    record_state_metrics(level.metric_rule, level.backend.as_ref());
+    record_hierarchy_denial_accounting(level, estimate, reason);
+    record_named_admission_span(
+        ctx,
+        level.metric_rule,
+        level.backend.algorithm_name(),
+        estimate,
+        "denied",
+    );
+    let retry_secs = retry_after_ms.saturating_add(999) / 1000;
+    let retry_secs = retry_secs.max(1);
+    FilterAction::Reject(
+        Rejection::status(429)
+            .with_header("Retry-After", retry_secs.to_string())
+            .with_header(HEADER_RATELIMIT_LIMIT_TOKENS, level.backend.limit().to_string())
+            .with_header(HEADER_RATELIMIT_REMAINING_TOKENS, "0")
+            .with_header(HEADER_RATELIMIT_RESET, retry_secs.to_string()),
+    )
+}
+
+/// Record a hierarchy backend failure and reject with 503.
+fn hierarchy_backend_error(
+    ctx: &mut HttpFilterContext<'_>,
+    level: &CompiledHierarchyLevel,
+    estimate: u64,
+    error: &BackendError,
+) -> FilterAction {
+    record_backend_error_metric(level.metric_rule, level.backend.backend_name(), error);
+    record_named_admission_span(
+        ctx,
+        level.metric_rule,
+        level.backend.algorithm_name(),
+        estimate,
+        "error",
+    );
+    tracing::error!(%error, level = level.name, "token_rate_limit: hierarchy backend error");
+    FilterAction::Reject(Rejection::status(503))
+}
+
+/// A missing org, team, or user identity is 401 and charges nothing.
+fn reject_missing_hierarchy_identity(
+    ctx: &mut HttpFilterContext<'_>,
+    hierarchy: &[CompiledHierarchyLevel],
+    level_name: &'static str,
+    estimate: u64,
+) -> FilterAction {
+    let metric_rule = hierarchy_metric_rule(level_name);
+    let algorithm = hierarchy
+        .iter()
+        .find(|level| level.name == level_name)
+        .map_or("sliding_window", |level| level.backend.algorithm_name());
+    tracing::info!(
+        level = level_name,
+        "token_rate_limit: hierarchy identity missing, returning 401"
+    );
+    record_unauthenticated_metric(metric_rule);
+    record_named_admission_span(ctx, metric_rule, algorithm, estimate, "unauthenticated");
+    FilterAction::Reject(Rejection::status(401))
+}
+
+/// Rollback previously admitted hierarchy levels by reconciling with
+/// `actual=Some(0)` (full refund of the estimate).
+fn rollback_hierarchy_sync(hierarchy: &[CompiledHierarchyLevel], stashed: &[(u64, String)], now_ms: u64) {
+    for (level, (reservation_id, key)) in hierarchy.iter().zip(stashed.iter()) {
+        let request = ReconcileRequest {
+            key: key.clone(),
+            reservation_id: *reservation_id,
+            actual: Some(0),
+            now_ms,
+        };
+        if let Some(settlement) = level.backend.reconcile_sync(&request) {
+            record_hierarchy_settlement(level, &settlement);
+        } else if let Err(e) = level.backend.enqueue_reconcile(request) {
+            record_backend_error_metric(level.metric_rule, level.backend.backend_name(), &e);
+            tracing::error!(%e, level = level.name, "token_rate_limit: failed to enqueue hierarchy rollback");
+        }
+    }
+}
+
+/// Reconcile all admitted hierarchy levels with the same actual usage.
+fn reconcile_hierarchy(
+    hierarchy: &[CompiledHierarchyLevel],
+    ctx: &HttpFilterContext<'_>,
+    actual: Option<u64>,
+    now_ms: u64,
+) {
+    for (level, &(meta_rid, meta_key)) in hierarchy.iter().zip(HIERARCHY_META_KEYS.iter()) {
+        let Some(reservation_id) = parse_u64_meta(ctx, meta_rid) else {
+            continue;
+        };
+        let Some(key) = ctx.get_metadata(meta_key).map(str::to_owned) else {
+            continue;
+        };
+        let request = ReconcileRequest {
+            key,
+            reservation_id,
+            actual,
+            now_ms,
+        };
+        if let Some(settlement) = level.backend.reconcile_sync(&request) {
+            record_hierarchy_settlement(level, &settlement);
+        } else if let Err(e) = level.backend.enqueue_reconcile(request) {
+            record_backend_error_metric(level.metric_rule, level.backend.backend_name(), &e);
+            tracing::error!(%e, level = level.name, "token_rate_limit: hierarchy reconciliation enqueue failed");
+        }
+    }
+}
+
+/// Stash hierarchy reservation metadata into the filter context for
+/// later reconciliation.
+fn stash_hierarchy_metadata(ctx: &mut HttpFilterContext<'_>, stashed: &[(u64, String)]) {
+    for ((reservation_id, key), &(meta_rid, meta_key)) in stashed.iter().zip(HIERARCHY_META_KEYS.iter()) {
+        ctx.set_metadata(meta_rid, reservation_id.to_string());
+        ctx.set_metadata(meta_key, key.clone());
+    }
+}
+
+/// Record request and reserved-token metrics for one hierarchy level.
+///
+/// Called only after every level in the admission has accepted, so a
+/// rolled-back hold is not counted as admitted.
+fn record_hierarchy_admission(level: &CompiledHierarchyLevel, estimate: u64) {
+    record_request_metric(level.metric_rule, "admitted");
+    record_reserved_metric(level.metric_rule, estimate);
+}
+
+/// Record an accounting log entry for a hierarchy denial.
+///
+/// `level` stays `org`, `team`, or `user`. `rule` uses the same
+/// `hierarchy:{level}` label as the metrics. `outcome` uses the
+/// filter's existing denial vocabulary.
+fn record_hierarchy_denial_accounting(level: &CompiledHierarchyLevel, estimate: u64, reason: DenialReason) {
+    tracing::info!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "admission",
+        rule = level.metric_rule,
+        level = level.name,
+        algorithm = level.backend.algorithm_name(),
+        backend = level.backend.backend_name(),
+        result = "denied",
+        estimate,
+        outcome = denial_reason_outcome(reason),
+        "token rate limit hierarchy accounting"
+    );
+}
+
 /// Compiled, ready-to-use estimation strategy for one rule.
 ///
 /// Built once at filter construction from the deserialized
 /// [`EstimationConfig`]; all per-request math runs against this
 /// pre-validated form.
+#[derive(Clone)]
 enum CompiledEstimation {
     /// Constant per request (the legacy `reserved_tokens` path, plus
     /// the `estimation: { strategy: fixed }` equivalent).
@@ -497,12 +1031,34 @@ impl CompiledEstimation {
     }
 }
 
+/// Stable policy inputs that affect shared Valkey reservations and
+/// reconciliation. Request-derived values, such as an individual request's
+/// `max_tokens`, remain outside this configuration object.
+#[derive(Clone)]
+struct AccountingPolicy {
+    /// Compiled request-estimation strategy.
+    estimation: CompiledEstimation,
+    /// Effective token-type reconciliation weights.
+    weights: TokenWeights,
+    /// Stable digest of the filter-wide budget-key policy.
+    key_fingerprint: String,
+}
+
 /// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
 /// body probe, falling back to `fallback` if neither is present.
 fn extract_max_tokens(body_probe: Option<&BodyProbe>, fallback: Option<u64>) -> Option<u64> {
-    body_probe
-        .and_then(|bp| bp.max_tokens.or(bp.max_completion_tokens))
-        .or(fallback)
+    // `max_tokens` wins over `max_completion_tokens`, including when it
+    // is zero. A non-positive count uses `fallback` when one is set.
+    // With no fallback the zero is kept. Dropping it would admit the
+    // request with no reservation, so response usage would never be
+    // charged. A zero estimate is rejected by the ledger.
+    let raw = body_probe.and_then(|bp| bp.max_tokens.or(bp.max_completion_tokens));
+    positive_token_count(raw).or(fallback).or(raw)
+}
+
+/// `Some(0)` is not a usable token count.
+fn positive_token_count(value: Option<u64>) -> Option<u64> {
+    value.filter(|count| *count > 0)
 }
 
 /// Apply a safety-margin `multiplier` to a raw token count, rounding up.
@@ -729,12 +1285,17 @@ fn compile_matcher(rule_name: &str, r#match: Option<MatchConfig>) -> Result<Opti
 /// # Errors
 ///
 /// See [`build_sliding_window_backend`]/[`build_token_bucket_backend`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "builder parameters are the distinct rule and accounting inputs"
+)]
 fn build_rule_backend(
     algorithm: &RuleAlgorithm,
     backend: &BackendResource,
     rule_name: &str,
     reservation_timeout_ms: u64,
     max_keys: usize,
+    accounting: &AccountingPolicy,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match algorithm {
         RuleAlgorithm::SlidingWindow { window, capacity } => {
@@ -743,7 +1304,14 @@ fn build_rule_backend(
                 window_ms,
                 capacity: *capacity,
             }];
-            build_sliding_window_backend(backend, rule_name, budgets, reservation_timeout_ms, max_keys)
+            build_sliding_window_backend(
+                backend,
+                rule_name,
+                budgets,
+                reservation_timeout_ms,
+                max_keys,
+                accounting,
+            )
         },
         RuleAlgorithm::TokenBucket { capacity, refill_rate } => build_token_bucket_backend(
             backend,
@@ -752,6 +1320,7 @@ fn build_rule_backend(
             *refill_rate,
             reservation_timeout_ms,
             max_keys,
+            accounting,
         ),
     }
 }
@@ -1403,19 +1972,36 @@ fn compile_single_header_name(rule_name: &str, loc: &str, name: &str) -> Result<
 /// valid durations, a `match` header name is invalid, a weight is
 /// negative or non-finite, or the rule's backend fails to construct
 /// (see [`build_rule_backend`]).
+#[expect(
+    clippy::too_many_lines,
+    reason = "rule compilation keeps the validation and compiled-rule assembly together"
+)]
 fn compile_rule(
     rule: RuleConfig,
     backend: &BackendResource,
     filter_defaults: TokenWeights,
     max_keys: usize,
+    key_fingerprint: &str,
 ) -> Result<CompiledRule, FilterError> {
     let capacity = rule.algorithm.capacity();
     let reservation_timeout_ms = validate_rule_bounds(&rule, capacity)?;
     let estimation = compile_estimation(&rule.name, rule.reserved_tokens, rule.estimation, capacity)?;
-    let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms, max_keys)?;
-    let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let loc = format!("rule '{}'", rule.name);
     let weights = filter_defaults.overlay(&rule.weights, &loc)?;
+    let accounting = AccountingPolicy {
+        estimation,
+        weights,
+        key_fingerprint: key_fingerprint.to_owned(),
+    };
+    let backend = build_rule_backend(
+        &rule.algorithm,
+        backend,
+        &rule.name,
+        reservation_timeout_ms,
+        max_keys,
+        &accounting,
+    )?;
+    let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let tiers = compile_tiers(&rule.name, rule.tiers, capacity)?;
     reject_deny_tier_with_soft_enforcement(&rule.name, rule.enforcement, &tiers)?;
     let mut inject_header_names = collect_inject_header_names(&tiers);
@@ -1432,8 +2018,8 @@ fn compile_rule(
         name: rule.name,
         matcher,
         backend,
-        estimation,
-        weights,
+        estimation: accounting.estimation,
+        weights: accounting.weights,
         tiers,
         inject_header_names,
         enforcement: rule.enforcement,
@@ -1523,6 +2109,9 @@ pub struct TokenRateLimitFilter {
     epoch: Instant,
     /// Whether timestamps must be shared across replicas.
     valkey_clock: bool,
+
+    /// Optional compiled hierarchy levels (org, team, user).
+    hierarchy: Option<Vec<CompiledHierarchyLevel>>,
 }
 
 impl TokenRateLimitFilter {
@@ -1533,6 +2122,10 @@ impl TokenRateLimitFilter {
     /// Returns [`FilterError`] if the YAML config is invalid, `rules` is
     /// empty, two rules share a `name`, or any individual rule fails to
     /// compile (see `compile_rule`).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "filter construction validates names, keys, rules, and the optional hierarchy together"
+    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: TokenRateLimitConfig = parse_filter_config("token_rate_limit", config)?;
         if cfg.rules.is_empty() {
@@ -1551,14 +2144,25 @@ impl TokenRateLimitFilter {
         if max_keys == 0 {
             return Err("token_rate_limit: max_keys must be greater than 0".into());
         }
+        if let Some(levels) = cfg.hierarchy.as_deref() {
+            validate_hierarchy_applies_to_every_request(&cfg.rules)?;
+            validate_rule_estimates_fit_hierarchy(&cfg.rules, levels)?;
+        }
         let key_spec = compile_key_spec(cfg.key)?;
+        let key_fingerprint = key_spec.config_fingerprint();
         let rules = cfg
             .rules
             .into_iter()
-            .map(|rule| compile_rule(rule, &backend, filter_defaults, max_keys))
+            .map(|rule| compile_rule(rule, &backend, filter_defaults, max_keys, &key_fingerprint))
             .collect::<Result<Vec<_>, _>>()?;
 
         let needs_body = rules.iter().any(|r| r.estimation.needs_body());
+
+        let hierarchy = cfg
+            .hierarchy
+            .as_deref()
+            .map(|levels| compile_hierarchy(levels, &backend, max_keys, &key_fingerprint))
+            .transpose()?;
 
         Ok(Box::new(Self {
             rules,
@@ -1566,6 +2170,7 @@ impl TokenRateLimitFilter {
             key_spec,
             epoch: Instant::now(),
             valkey_clock: matches!(backend, BackendResource::Valkey { .. }),
+            hierarchy,
         }))
     }
 
@@ -1647,13 +2252,91 @@ impl TokenRateLimitFilter {
         FilterAction::Reject(Rejection::status(status))
     }
 
-    /// Shared admission path for header-only and body-buffered requests so
-    /// hard/soft enforcement cannot diverge between the two `HttpFilter` hooks.
+    /// Reserve org, then team, then user when hierarchy is configured.
+    ///
+    /// `Ok(())` means those reservations are stashed, or hierarchy is absent.
+    /// `Err` is the rejection to return immediately.
+    async fn reserve_hierarchy(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        estimate: u64,
+        now_ms: u64,
+    ) -> Result<(), FilterAction> {
+        let Some(hierarchy) = &self.hierarchy else {
+            return Ok(());
+        };
+        let keys = match resolve_hierarchy_keys(hierarchy, ctx) {
+            Ok(keys) => keys,
+            Err(level_name) => {
+                return Err(reject_missing_hierarchy_identity(ctx, hierarchy, level_name, estimate));
+            },
+        };
+        if estimate == 0 {
+            tracing::info!("token_rate_limit: hierarchy estimate is zero, returning 400");
+            return Err(FilterAction::Reject(Rejection::status(400)));
+        }
+        match admit_hierarchy(hierarchy, &keys, estimate, now_ms, ctx).await {
+            Ok(stashed) => {
+                stash_hierarchy_metadata(ctx, &stashed);
+                Ok(())
+            },
+            Err(action) => Err(action),
+        }
+    }
+
+    /// Release hierarchy reservations taken earlier in this admission.
+    fn release_hierarchy(&self, ctx: &mut HttpFilterContext<'_>, now_ms: u64) {
+        let Some(hierarchy) = &self.hierarchy else {
+            return;
+        };
+        let stashed = Self::collect_hierarchy_stash(ctx);
+        rollback_hierarchy_sync(hierarchy, &stashed, now_ms);
+        Self::clear_hierarchy_metadata(ctx);
+    }
+
+    /// Drop hierarchy holds on a rule denial. A soft forward keeps them and
+    /// records the rule index when the rule itself stored no reservation.
+    ///
+    /// Admitted and reserved counters run only when the holds stay. A rule
+    /// denial rolls them back, so counting earlier would over-report.
     #[expect(
         clippy::too_many_arguments,
-        reason = "admission needs rule context, estimate, clock, and optional body probe for keying"
+        reason = "the rule index, estimate, and action are all needed to finish one admission"
     )]
-    async fn admit_estimated(
+    fn finish_hierarchy_after_rule(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        rule_index: usize,
+        estimate: u64,
+        now_ms: u64,
+        action: &FilterAction,
+    ) {
+        if self.hierarchy.is_none() {
+            return;
+        }
+        match action {
+            FilterAction::Reject(_) => self.release_hierarchy(ctx, now_ms),
+            FilterAction::Continue => {
+                if ctx.get_metadata(META_RULE_INDEX).is_none() {
+                    ctx.set_metadata(META_RULE_INDEX, rule_index.to_string());
+                }
+                if let Some(hierarchy) = &self.hierarchy {
+                    for level in hierarchy {
+                        record_hierarchy_admission(level, estimate);
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Reserve the matched rule. A missing key releases any hierarchy holds
+    /// taken earlier in this admission.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the rule reservation needs the same admission context as hierarchy"
+    )]
+    async fn reserve_matched_rule(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
@@ -1664,7 +2347,10 @@ impl TokenRateLimitFilter {
     ) -> FilterAction {
         let key = match self.resolve_key_or_record_rejection(ctx, rule, estimate, body_probe) {
             Ok(key) => key,
-            Err(status) => return Self::reject_missing_key(ctx, rule, estimate, status),
+            Err(status) => {
+                self.release_hierarchy(ctx, now_ms);
+                return Self::reject_missing_key(ctx, rule, estimate, status);
+            },
         };
         let outcome = rule
             .backend
@@ -1686,6 +2372,51 @@ impl TokenRateLimitFilter {
         )
     }
 
+    /// Run hierarchy admission when configured, then the rule reservation.
+    ///
+    /// Hard and soft rule enforcement stay on [`Self::handle_reserve_outcome`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "admission needs rule context, estimate, clock, and optional body probe for keying"
+    )]
+    async fn admit_estimated(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        rule_index: usize,
+        rule: &CompiledRule,
+        estimate: u64,
+        now_ms: u64,
+        body_probe: Option<&BodyProbe>,
+    ) -> FilterAction {
+        if let Err(action) = self.reserve_hierarchy(ctx, estimate, now_ms).await {
+            return action;
+        }
+        let action = self
+            .reserve_matched_rule(ctx, rule_index, rule, estimate, now_ms, body_probe)
+            .await;
+        self.finish_hierarchy_after_rule(ctx, rule_index, estimate, now_ms, &action);
+        action
+    }
+
+    /// Collect stashed hierarchy reservation metadata from the context.
+    fn collect_hierarchy_stash(ctx: &HttpFilterContext<'_>) -> Vec<(u64, String)> {
+        let mut stashed = Vec::new();
+        for &(meta_rid, meta_key) in &HIERARCHY_META_KEYS {
+            if let (Some(rid), Some(key)) = (parse_u64_meta(ctx, meta_rid), ctx.get_metadata(meta_key)) {
+                stashed.push((rid, key.to_owned()));
+            }
+        }
+        stashed
+    }
+
+    /// Clear hierarchy metadata from the filter context.
+    fn clear_hierarchy_metadata(ctx: &mut HttpFilterContext<'_>) {
+        for &(meta_rid, meta_key) in &HIERARCHY_META_KEYS {
+            ctx.filter_metadata.remove(meta_rid);
+            ctx.filter_metadata.remove(meta_key);
+        }
+    }
+
     /// Reclaim idle/orphaned in-process state for one rule and publish
     /// its gauges.
     ///
@@ -1697,6 +2428,20 @@ impl TokenRateLimitFilter {
             return;
         };
         record_cleanup_metrics(&rule.name, report);
+    }
+
+    /// Reclaim idle state on each hierarchy backend. Same scan as a rule:
+    /// in-process ledgers drop expired reservations, Valkey returns `None`.
+    fn cleanup_hierarchy(&self, now_ms: u64) {
+        let Some(hierarchy) = &self.hierarchy else {
+            return;
+        };
+        for level in hierarchy {
+            let Some(report) = level.backend.cleanup(now_ms, CLEANUP_SCAN_LIMIT) else {
+                continue;
+            };
+            record_cleanup_metrics(level.metric_rule, report);
+        }
     }
 
     /// Record metrics/metadata for an admitted reservation.
@@ -1808,7 +2553,7 @@ impl TokenRateLimitFilter {
         estimate: u64,
         error: &BackendError,
     ) -> FilterAction {
-        record_backend_error_metric(&rule.name, rule.backend.backend_name());
+        record_backend_error_metric(&rule.name, rule.backend.backend_name(), error);
         record_accounting_failure(rule, "reserve", error);
         record_admission_span(ctx, rule, estimate, "error");
         tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
@@ -2037,7 +2782,7 @@ impl TokenRateLimitFilter {
             return;
         }
         if let Err(error) = rule.backend.enqueue_reconcile(request) {
-            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_backend_error_metric(&rule.name, rule.backend.backend_name(), &error);
             record_accounting_failure(rule, "enqueue_reconcile", &error);
             tracing::error!(%error, rule = rule.name, "token_rate_limit: failed to enqueue reconciliation");
         }
@@ -2103,11 +2848,21 @@ fn record_reserved_metric(rule_name: &str, estimate: u64) {
     counter!("praxis_trl_tokens_reserved_total", "rule" => rule_name.to_owned()).increment(estimate);
 }
 
+/// Map backend failures to the bounded Prometheus label vocabulary.
+fn backend_error_kind(error: &BackendError) -> &'static str {
+    match error {
+        BackendError::Unavailable(_) => "unavailable",
+        BackendError::InvalidResponse => "invalid_response",
+        BackendError::ConfigurationMismatch => "configuration_mismatch",
+    }
+}
+
 /// Count one bounded backend failure.
-fn record_backend_error_metric(rule_name: &str, backend: &'static str) {
+fn record_backend_error_metric(rule_name: &str, backend: &'static str, error: &BackendError) {
     counter!(
         "praxis_trl_backend_errors_total",
         "backend" => backend,
+        "error" => backend_error_kind(error),
         "rule" => rule_name.to_owned(),
     )
     .increment(1);
@@ -2221,14 +2976,35 @@ fn record_accounting_failure(rule: &CompiledRule, operation: &'static str, error
     );
 }
 
+/// Emit counters, gauges, and the accounting line for one hierarchy settlement.
+fn record_hierarchy_settlement(level: &CompiledHierarchyLevel, settlement: &BackendSettlement) {
+    record_settlement_metrics(level.metric_rule, settlement);
+    record_state_metrics(level.metric_rule, level.backend.as_ref());
+    record_accounting_settlement(level.metric_rule, level.backend.as_ref(), settlement);
+    tracing::debug!(
+        ?settlement,
+        level = level.name,
+        "token_rate_limit: hierarchy reconciled"
+    );
+}
+
 /// Attach the bounded admission decision to this request's trace.
 #[cfg(feature = "opentelemetry")]
 fn record_admission_span(ctx: &mut HttpFilterContext<'_>, rule: &CompiledRule, estimate: u64, decision: &'static str) {
+    record_named_admission_span(ctx, &rule.name, rule.backend.algorithm_name(), estimate, decision);
+}
+
+/// Attach a hierarchy or rule admission decision to this request's trace.
+#[cfg(feature = "opentelemetry")]
+fn record_named_admission_span(
+    ctx: &mut HttpFilterContext<'_>,
+    rule_name: &str,
+    algorithm: &'static str,
+    estimate: u64,
+    decision: &'static str,
+) {
     ctx.extensions.insert(crate::opentelemetry::token_rate_limit_span(
-        &rule.name,
-        rule.backend.algorithm_name(),
-        estimate,
-        decision,
+        rule_name, algorithm, estimate, decision,
     ));
 }
 
@@ -2237,6 +3013,17 @@ fn record_admission_span(ctx: &mut HttpFilterContext<'_>, rule: &CompiledRule, e
 fn record_admission_span(
     _ctx: &mut HttpFilterContext<'_>,
     _rule: &CompiledRule,
+    _estimate: u64,
+    _decision: &'static str,
+) {
+}
+
+/// No-op when semantic tracing is not compiled in.
+#[cfg(not(feature = "opentelemetry"))]
+fn record_named_admission_span(
+    _ctx: &mut HttpFilterContext<'_>,
+    _rule_name: &str,
+    _algorithm: &'static str,
     _estimate: u64,
     _decision: &'static str,
 ) {
@@ -2298,6 +3085,7 @@ impl HttpFilter for TokenRateLimitFilter {
         // forward client-spoofed inject / over_quota headers.
         Self::strip_spoofable_headers(ctx, rule);
         Self::cleanup_and_record_state(rule, now_ms);
+        self.cleanup_hierarchy(now_ms);
         let Some(estimate) = rule.estimation.estimate(&ctx.request.headers, None) else {
             return Ok(FilterAction::Continue);
         };
@@ -2323,6 +3111,7 @@ impl HttpFilter for TokenRateLimitFilter {
         // forward client-spoofed inject / over_quota headers.
         Self::strip_spoofable_headers(ctx, rule);
         Self::cleanup_and_record_state(rule, now_ms);
+        self.cleanup_hierarchy(now_ms);
         let body_probe = parse_body_probe(body);
         let Some(estimate) = rule.estimation.estimate(&ctx.request.headers, body_probe.as_ref()) else {
             return Ok(FilterAction::Continue);
@@ -2339,6 +3128,15 @@ impl HttpFilter for TokenRateLimitFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
+            if let Some(hierarchy) = &self.hierarchy {
+                let rule = ctx
+                    .get_metadata(META_RULE_INDEX)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .and_then(|index| self.rules.get(index));
+                let actual = rule.and_then(|r| weighted_cost(UsageCounts::from_context(ctx), r.weights));
+                reconcile_hierarchy(hierarchy, ctx, actual, self.now_ms());
+                Self::clear_hierarchy_metadata(ctx);
+            }
             self.reconcile(ctx);
             ctx.filter_metadata.remove(META_RESERVATION_ID);
             ctx.filter_metadata.remove(META_BUCKET_KEY);
@@ -2449,8 +3247,8 @@ mod backend_injection_tests {
             BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReserveRequest,
             TokenRateLimitStateBackend,
         },
-        record_backend_error_metric, record_request_metric, record_reserved_metric, record_settlement_metrics,
-        record_state_metrics, record_unauthenticated_metric,
+        backend_error_kind, record_backend_error_metric, record_request_metric, record_reserved_metric,
+        record_settlement_metrics, record_state_metrics, record_unauthenticated_metric,
     };
 
     #[test]
@@ -2461,6 +3259,7 @@ mod backend_injection_tests {
             key_spec: super::CompiledKeySpec::global(),
             epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
             valkey_clock: false,
+            hierarchy: None,
         };
         assert!(
             (5_000..6_000).contains(&filter.now_ms()),
@@ -2470,6 +3269,25 @@ mod backend_injection_tests {
         assert!(
             filter.now_ms() > 1_000_000_000_000,
             "shared Valkey timestamps use Unix time"
+        );
+    }
+
+    #[test]
+    fn backend_error_metric_kind_uses_only_bounded_values() {
+        assert_eq!(
+            backend_error_kind(&BackendError::Unavailable("backend detail".to_owned())),
+            "unavailable",
+            "unavailable backend errors map to the unavailable label"
+        );
+        assert_eq!(
+            backend_error_kind(&BackendError::InvalidResponse),
+            "invalid_response",
+            "invalid backend responses map to the invalid_response label"
+        );
+        assert_eq!(
+            backend_error_kind(&BackendError::ConfigurationMismatch),
+            "configuration_mismatch",
+            "configuration mismatches map to the configuration_mismatch label"
         );
     }
 
@@ -2553,6 +3371,7 @@ mod backend_injection_tests {
             key_spec: super::CompiledKeySpec::global(),
             epoch: std::time::Instant::now(),
             valkey_clock: false,
+            hierarchy: None,
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -2599,7 +3418,11 @@ mod backend_injection_tests {
                 },
             );
             record_state_metrics(&rule.name, rule.backend.as_ref());
-            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_backend_error_metric(
+                &rule.name,
+                rule.backend.backend_name(),
+                &BackendError::Unavailable("test".to_owned()),
+            );
             record_unauthenticated_metric(&rule.name);
         });
 
@@ -2650,7 +3473,7 @@ mod backend_injection_tests {
         );
         assert_eq!(
             labels_for("praxis_trl_backend_errors_total"),
-            vec![vec!["backend".to_owned(), "rule".to_owned()]]
+            vec![vec!["backend".to_owned(), "error".to_owned(), "rule".to_owned()]]
         );
     }
 }

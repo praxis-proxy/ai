@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_responses_format` mode routing.
+//! Integration tests for the `openai_responses_request` mode routing.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -81,7 +81,7 @@ fn mode_branch_rejects_prompt_before_upstream() {
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(
         response["error"]["message"],
-        "prompt templates are supported only for OpenAI-owned upstreams"
+        "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
     );
 }
 
@@ -194,12 +194,14 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         branch_chains:
           - name: stateful_branch
             on_result:
-              filter: openai_responses_format
+              filter: openai_responses_request
               key: mode
               result: stateful
             rejoin: shared_load_balancer
@@ -211,8 +213,14 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "stateful"
       # Classification preserves provider-owned fields. The managed-path
-      # validator owns rejection of unsupported background execution.
-      - filter: openai_responses_validate
+      # request filter owns rejection of unsupported background execution.
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: router
         routes:
           - path_prefix: "/"

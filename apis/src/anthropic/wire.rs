@@ -11,6 +11,81 @@ use serde_json::{Map, Value};
 /// Fallback error body used only if Serde serialization fails.
 const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":"api_error","message":"failed to serialize error response"},"request_id":null}"#;
 
+/// Error types allowed by the pinned Anthropic `ErrorType` schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ErrorType {
+    /// Wire value: `invalid_request_error`.
+    InvalidRequest,
+    /// Wire value: `authentication_error`.
+    Authentication,
+    /// Wire value: `permission_error`.
+    Permission,
+    /// Wire value: `not_found_error`.
+    NotFound,
+    /// Wire value: `rate_limit_error`.
+    RateLimit,
+    /// Wire value: `timeout_error`.
+    Timeout,
+    /// Wire value: `overloaded_error`.
+    Overloaded,
+    /// Wire value: `api_error`.
+    Api,
+    /// Wire value: `billing_error`.
+    Billing,
+}
+
+impl ErrorType {
+    /// Map the error type to its Anthropic wire representation.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Authentication => "authentication_error",
+            Self::Permission => "permission_error",
+            Self::NotFound => "not_found_error",
+            Self::RateLimit => "rate_limit_error",
+            Self::Timeout => "timeout_error",
+            Self::Overloaded => "overloaded_error",
+            Self::Api => "api_error",
+            Self::Billing => "billing_error",
+        }
+    }
+
+    /// Map an HTTP status to the nearest pinned Anthropic error type.
+    ///
+    /// Status-specific names such as `conflict_error` and `request_too_large`
+    /// are not part of the pinned Anthropic schema and therefore use the
+    /// generic invalid-request category.
+    pub(crate) const fn from_status(status: u16) -> Self {
+        match status {
+            401 => Self::Authentication,
+            402 => Self::Billing,
+            403 => Self::Permission,
+            404 => Self::NotFound,
+            429 => Self::RateLimit,
+            504 => Self::Timeout,
+            529 => Self::Overloaded,
+            500..=599 => Self::Api,
+            _ => Self::InvalidRequest,
+        }
+    }
+
+    /// Parse a pinned Anthropic error type, rejecting future or provider-specific values.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "invalid_request_error" => Self::InvalidRequest,
+            "authentication_error" => Self::Authentication,
+            "permission_error" => Self::Permission,
+            "not_found_error" => Self::NotFound,
+            "rate_limit_error" => Self::RateLimit,
+            "timeout_error" => Self::Timeout,
+            "overloaded_error" => Self::Overloaded,
+            "api_error" => Self::Api,
+            "billing_error" => Self::Billing,
+            _ => return None,
+        })
+    }
+}
+
 /// Return whether an Anthropic tool-use identifier satisfies the wire schema.
 pub(crate) fn is_valid_tool_use_id(id: &str) -> bool {
     !id.is_empty()
@@ -187,15 +262,15 @@ struct ErrorDetail<'a> {
     /// Human-readable diagnostic.
     message: &'a str,
     /// Anthropic error category.
-    r#type: &'a str,
+    r#type: &'static str,
 }
 
 /// Serialize a schema-complete Anthropic error response.
-pub(crate) fn error_body(error_type: &str, message: &str, request_id: Option<&str>) -> Vec<u8> {
+pub(crate) fn error_body(error_type: ErrorType, message: &str, request_id: Option<&str>) -> Vec<u8> {
     serde_json::to_vec(&ErrorResponse {
         error: ErrorDetail {
             message,
-            r#type: error_type,
+            r#type: error_type.as_str(),
         },
         request_id,
         r#type: "error",
@@ -204,7 +279,7 @@ pub(crate) fn error_body(error_type: &str, message: &str, request_id: Option<&st
 }
 
 /// Build a schema-complete Anthropic error rejection with an explicit status.
-pub(crate) fn error_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
+pub(crate) fn error_rejection(status: u16, error_type: ErrorType, message: &str) -> Rejection {
     Rejection::status(status)
         .with_header("content-type", "application/json")
         .with_body(Bytes::from(error_body(error_type, message, None)))
@@ -212,7 +287,7 @@ pub(crate) fn error_rejection(status: u16, error_type: &str, message: &str) -> R
 
 /// Build a schema-complete Anthropic invalid-request rejection.
 pub(crate) fn invalid_request_rejection(message: &str) -> Rejection {
-    error_rejection(400, "invalid_request_error", message)
+    error_rejection(400, ErrorType::InvalidRequest, message)
 }
 
 #[cfg(test)]
@@ -224,7 +299,7 @@ mod tests {
 
     #[test]
     fn error_body_is_schema_complete_and_json_safe() {
-        let body = error_body("invalid_request_error", "bad \"model\"\nvalue", None);
+        let body = error_body(ErrorType::InvalidRequest, "bad \"model\"\nvalue", None);
         let parsed: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(parsed["type"], "error");
@@ -236,7 +311,7 @@ mod tests {
 
     #[test]
     fn error_body_preserves_request_id() {
-        let body = error_body("rate_limit_error", "rate limited", Some("req_01"));
+        let body = error_body(ErrorType::RateLimit, "rate limited", Some("req_01"));
         let parsed: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(parsed["request_id"], "req_01");

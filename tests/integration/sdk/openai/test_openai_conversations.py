@@ -152,7 +152,7 @@ def _write_config(
         },
     ]
     if include_operation_classifier:
-        filters.append({"filter": "openai_operation"})
+        filters.append({"filter": "ai_operation"})
     filters.append(_conversations_filter(f"sdk_{port}", db_path))
 
     config = {
@@ -194,7 +194,7 @@ def _write_tenant_config(port: int, db_path: str) -> str:
                 "name": "tenant-conversations-pipeline",
                 "filters": [
                     {"filter": "test_tenant_identity"},
-                    {"filter": "openai_operation"},
+                    {"filter": "ai_operation"},
                     conversations_filter,
                 ],
             }
@@ -252,6 +252,90 @@ class _ChunkedResponsesBackend(http.server.BaseHTTPRequestHandler):
         return
 
 
+class _RecordingResponsesBackend(http.server.BaseHTTPRequestHandler):
+    """Return a Responses object and record the request the proxy forwarded."""
+
+    protocol_version = "HTTP/1.1"
+    forwarded: list[dict] = []
+    response_body = json.dumps(
+        {
+            "id": "resp_passthrough",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(content_length)
+        type(self).forwarded.append(
+            {"path": self.path, "body": json.loads(raw) if raw else None}
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.response_body)))
+        self.end_headers()
+        self.wfile.write(self.response_body)
+        self.wfile.flush()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def _write_passthrough_config(port: int, backend_port: int) -> str:
+    """Write a chain that classifies and routes but initializes no state."""
+    config = {
+        "listeners": [
+            {
+                "name": "passthrough",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["passthrough-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "passthrough-pipeline",
+                "filters": [
+                    {"filter": "ai_operation"},
+                    {
+                        "filter": "openai_responses_request",
+                        "on_invalid": "continue",
+                        "initialize_state": False,
+                    },
+                    {
+                        "filter": "router",
+                        "routes": [{"path_prefix": "/", "cluster": "backend"}],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
 def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
     """Build matching filters for the listener-level regression test."""
     tables = {
@@ -274,7 +358,7 @@ def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict
 
     conversations = {"filter": "openai_conversations", **store, **tables}
     response_store = {
-        "filter": "openai_response_store",
+        "filter": "openai_responses_store",
         **store,
         "responses_table": f"chunked_{port}_responses",
         "conversations_table": tables["conversations_table"],
@@ -296,13 +380,14 @@ def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -
             {
                 "name": "responses-test-pipeline",
                 "filters": [
+                    {"filter": "ai_operation"},
                     {
                         "filter": "state_owner",
                         "mode": "trusted_owner",
                         "header": OWNER_HEADER,
                     },
                     conversations_filter,
-                    {"filter": "openai_responses_format"},
+                    {"filter": "openai_responses_request", "initialize_state": False},
                     response_store_filter,
                     {
                         "filter": "router",
@@ -466,7 +551,43 @@ def openai_client(praxis_proxy):
 
 
 @pytest.fixture
-def chunked_response_client():
+def passthrough_client():
+    """Start a stateless passthrough proxy and a recording backend."""
+    _RecordingResponsesBackend.forwarded = []
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _RecordingResponsesBackend
+    )
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    config_path = _write_passthrough_config(port, backend.server_address[1])
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_proxy(port, proc)
+        yield OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        backend.shutdown()
+        os.unlink(config_path)
+
+
+@pytest.fixture
+def chunked_response_store():
     """Start a composed response-store/Conversations proxy and chunked backend."""
     backend = http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0), _ChunkedResponsesBackend
@@ -492,13 +613,14 @@ def chunked_response_client():
         try:
             _wait_for_proxy(proxy_port, proc)
             _wait_for_store_ready(readiness_port, proc)
-            yield OpenAI(
+            client = OpenAI(
                 api_key="not-needed",
                 base_url=f"http://127.0.0.1:{proxy_port}/v1",
                 default_headers={OWNER_HEADER: _owner_assertion("alice")},
                 max_retries=0,
                 timeout=10.0,
             )
+            yield client, db_path, f"chunked_{proxy_port}_responses"
         finally:
             proc.send_signal(signal.SIGINT)
             try:
@@ -510,6 +632,13 @@ def chunked_response_client():
             backend.shutdown()
             backend.server_close()
             backend_thread.join(timeout=5)
+
+
+@pytest.fixture
+def chunked_response_client(chunked_response_store):
+    """Return the SDK client from the composed response-store fixture."""
+    client, _, _ = chunked_response_store
+    return client
 
 
 @pytest.fixture(scope="session")
@@ -659,6 +788,28 @@ class TestOpenAIConversations:
         assert isinstance(conversation.created_at, int)
         assert conversation.created_at > 0
 
+    def test_passthrough_chain_forwards_create_without_initializing_state(
+        self, passthrough_client
+    ):
+        """A chain with initialize_state disabled still classifies and routes.
+
+        The request reaches the backend unchanged and its response reaches the
+        client, so disabling state costs nothing a passthrough chain uses.
+        """
+        response = passthrough_client.responses.create(
+            model="gpt-4.1",
+            input="Hello",
+        )
+
+        assert response.id == "resp_passthrough", "the backend response must reach the client unaltered"
+        assert response.status == "completed", "the passthrough chain must not rewrite the response status"
+
+        forwarded = _RecordingResponsesBackend.forwarded
+        assert len(forwarded) == 1, "exactly one request should reach the backend"
+        assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
+        assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
+        assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
+
     def test_chunked_response_is_retrievable_with_composed_filters(
         self, chunked_response_client
     ):
@@ -671,6 +822,41 @@ class TestOpenAIConversations:
         retrieved = chunked_response_client.responses.retrieve(response.id)
         assert retrieved.id == response.id
         assert retrieved.status == "completed"
+
+    @pytest.mark.skipif(
+        DATABASE_URL.startswith("postgres"),
+        reason="deterministic response-store outage uses a temporary SQLite table",
+    )
+    def test_response_delete_store_failure_returns_server_error_envelope(
+        self, chunked_response_store
+    ):
+        """DELETE maps a live store failure to the Responses error envelope."""
+        client, db_path, responses_table = chunked_response_store
+        database = sqlite3.connect(db_path)
+        try:
+            database.execute(f'DROP TABLE "{responses_table}"')
+            database.commit()
+        finally:
+            database.close()
+
+        with pytest.raises(InternalServerError) as exc_info:
+            client.responses.delete("resp_delete_store_failure")
+
+        error = exc_info.value
+        assert error.status_code == 500, (
+            "a DELETE store failure must return HTTP 500"
+        )
+        assert error.response.headers["content-type"].startswith(
+            "application/json"
+        ), "a DELETE store failure must return a JSON response"
+        assert error.response.json() == {
+            "error": {
+                "code": "server_error",
+                "message": "Internal server error.",
+                "param": None,
+                "type": "server_error",
+            }
+        }, "a DELETE store failure must return the standard server_error envelope"
 
     def test_conversation_create_no_metadata(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -1027,6 +1213,49 @@ class TestOpenAIConversations:
             "item_page_1",
             "item_page_0",
         ]
+
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    def test_complete_history_order_after_deletes_and_appends(
+        self, openai_client, order
+    ):
+        """#532: paging must preserve append order across deleted sequence gaps."""
+        conversation = openai_client.conversations.create()
+        try:
+            expected = []
+            for batch in range(6):
+                items = _message_items(f"item_history_{order}_{batch}", 20)
+                openai_client.conversations.items.create(conversation.id, items=items)
+                expected.extend(item["id"] for item in items)
+
+            # Remove the head, a page boundary, and the tail before appending.
+            for item_id in [expected[0], expected[19], expected[-1]]:
+                openai_client.conversations.items.delete(
+                    item_id, conversation_id=conversation.id
+                )
+                expected.remove(item_id)
+            appended = _message_items(f"item_history_{order}_final", 8)
+            openai_client.conversations.items.create(conversation.id, items=appended)
+            expected.extend(item["id"] for item in appended)
+
+            seen = []
+            after = None
+            while True:
+                page = openai_client.conversations.items.list(
+                    conversation.id, order=order, limit=17, after=after
+                )
+                assert page.data, "nonterminal pagination must make progress"
+                ids = [item.id for item in page.data]
+                assert page.first_id == ids[0]
+                assert page.last_id == ids[-1]
+                assert not set(ids).intersection(seen), "cursor repeated history"
+                seen.extend(ids)
+                if not page.has_more:
+                    break
+                after = page.last_id
+
+            assert seen == (expected if order == "asc" else expected[::-1])
+        finally:
+            openai_client.conversations.delete(conversation.id)
 
     def test_item_crud_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()

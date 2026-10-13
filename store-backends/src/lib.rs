@@ -11,43 +11,43 @@
 //! [`ResponseStore`]: praxis_ai_store::ResponseStore
 //! [`StoreBackendFactory`]: praxis_ai_store::StoreBackendFactory
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 mod pool;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 mod postgres;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 mod postgres_tls;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub mod postgres_url;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 mod provisioning;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 mod schemas;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
 // Pool tuning, TLS mode, and the compression codec live in the SQL-free
 // praxis-ai-store crate; aliased here so the backends reach them through `super`.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub use postgres::PostgresResponseStore;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub use postgres::to_pg_ssl_mode;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub use postgres_tls::PgTlsConfig;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub(crate) use praxis_ai_store::PoolConfig;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub(crate) use praxis_ai_store::SslMode;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub(crate) use praxis_ai_store::compression;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
     ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
 };
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub use provisioning::store_backend_factories;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 pub use schemas::{validate_postgres_table_identifiers, validate_postgres_table_set_identifiers};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteResponseStore;
@@ -59,7 +59,7 @@ pub use sqlite::SqliteResponseStore;
 /// which reach it through `super::`.
 ///
 /// [`StoreError::Database`]: praxis_ai_store::StoreError::Database
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
     let base = message.replace(url, "<redacted database url>");
     // Best effort for a `scheme://user:pass@host` credential echoed separately

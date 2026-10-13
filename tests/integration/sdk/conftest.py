@@ -90,9 +90,11 @@ listeners:
 filter_chains:
   - name: classify_refused
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:
@@ -106,9 +108,11 @@ filter_chains:
 
   - name: classify_timeout
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:
@@ -125,7 +129,7 @@ filter_chains:
   # operation classifier, which resolves the protocol from the request head.
   - name: classify_from_head
     filters:
-      - filter: openai_operation
+      - filter: ai_operation
       - filter: router
         routes:
           - path_prefix: "/"

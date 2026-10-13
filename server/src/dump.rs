@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, io::Write as _};
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry};
+use praxis_core::config::{ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry};
 use serde::Serialize;
 
 // -----------------------------------------------------------------------------
@@ -78,11 +78,11 @@ pub(crate) fn build_dump(
     config: &Config,
     config_source: &str,
 ) -> Result<EffectiveConfigDump, Box<dyn std::error::Error + Send + Sync>> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Resolve against expanded entries so the dump reflects the effective
+    // filters that run, with chain-level `conditions:` inherited on both the
+    // listener path and named branch/outbound references.
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
     Ok(EffectiveConfigDump {
         config_source: config_source.to_owned(),
@@ -551,7 +551,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: postgres
         database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
         responses_table: openai_responses
@@ -590,7 +590,7 @@ filter_chains:
             chains:
               - name: inline_store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_responses_store
                     backend: postgres
                     database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
                     responses_table: openai_responses
@@ -672,12 +672,13 @@ filter_chains:
     #[test]
     fn redact_sensitive_keys_api_key() {
         let mut value: serde_yaml::Value =
-            serde_yaml::from_str("openai_web_search:\n  api_key: brave-secret-key-123").expect("test YAML must parse");
+            serde_yaml::from_str("openai_web_search_dispatch:\n  api_key: brave-secret-key-123")
+                .expect("test YAML must parse");
         redact_sensitive_keys(&mut value);
         let redacted = value
             .as_mapping()
             .unwrap()
-            .get(serde_yaml::Value::String("openai_web_search".to_owned()))
+            .get(serde_yaml::Value::String("openai_web_search_dispatch".to_owned()))
             .unwrap()
             .as_mapping()
             .unwrap()

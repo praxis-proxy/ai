@@ -10,8 +10,8 @@
 //! Classifies each round's output by dispatch target to make the
 //! loop decision, but does **not** execute any call — MCP execution
 //! is handled by `openai_mcp_dispatch`, web search by
-//! `openai_web_search`, and file search by
-//! `openai_file_search_callout`. As the sole owner it runs before
+//! `openai_web_search_dispatch`, and file search by
+//! `openai_file_search_dispatch`. As the sole owner it runs before
 //! every dispatcher in the response phase, so it is the central
 //! authority that decides loop-vs-done; dispatchers only consume the
 //! calls the owner has already routed to them.
@@ -45,8 +45,8 @@
 //! items are **not** valid `OpenResponses` input (issue #808), so they
 //! never enter `state.messages`; `web_search_call`s remain in
 //! `state.web_search_calls` and `file_search_call`s are reached by index
-//! through `state.file_search_assignments`, for `openai_web_search` /
-//! `openai_file_search_callout` to dispatch and bridge into backend
+//! through `state.file_search_assignments`, for `openai_web_search_dispatch` /
+//! `openai_file_search_dispatch` to dispatch and bridge into backend
 //! history, and reach the client only through `state.accumulated_output`.
 //!
 //! For streaming responses, `stream_events` populates
@@ -62,8 +62,8 @@
 //!
 //! # Filter order
 //!
-//! For tool execution, it must appear after `openai_web_search`,
-//! `openai_mcp_dispatch`, and `openai_file_search_callout` and before
+//! For tool execution, it must appear after `openai_web_search_dispatch`,
+//! `openai_mcp_dispatch`, and `openai_file_search_dispatch` and before
 //! `openai_responses_proxy`. Response filters execute in reverse
 //! order, so the owner parses and classifies each round's output
 //! *before* the dispatchers run, routing every call to the vector the
@@ -79,11 +79,11 @@
 //! steps:
 //!   - name: inference
 //!     filters:
-//!       - filter: openai_web_search
+//!       - filter: openai_web_search_dispatch
 //!         provider: brave
 //!         api_key: ${WEB_SEARCH_API_KEY}
 //!       - filter: openai_mcp_dispatch
-//!       - filter: openai_file_search_callout
+//!       - filter: openai_file_search_dispatch
 //!       - filter: openai_agentic_loop
 //!         max_infer_iters: 10
 //!       - filter: openai_responses_proxy
@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_responses_validate` for every Responses API create
+//! `openai_responses_request` for every Responses API create
 //! request.
 
 mod config;
@@ -140,7 +140,7 @@ use self::config::{AgenticLoopConfig, build_config};
 use super::{
     arm_agentic_stream_guard, enforce_agentic_stream_guard,
     error::responses_error_rejection,
-    file_search_callout::{
+    file_search_dispatch::{
         ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
         is_pending_file_search_call, translate_function_calls_to_file_search,
     },
@@ -150,13 +150,13 @@ use super::{
     },
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
-    web_search::configured_max_calls_per_round as configured_web_max_calls,
+    web_search_dispatch::configured_max_calls_per_round as configured_web_max_calls,
 };
 #[cfg(feature = "openai-mcp-tools")]
 use super::{
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -311,7 +311,7 @@ impl HttpFilter for AgenticLoopFilter {
             return convert_dispatch_failure(ctx, state, &failure);
         }
 
-        // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
+        // A request-phase dispatcher (e.g. `openai_file_search_dispatch`) that failed
         // records a shared terminal outcome instead of committing a second terminal
         // response. The sole loop owner converts it here — before preparing another
         // inference request — into a buffered JSON rejection (pre-commitment) or a
@@ -319,6 +319,11 @@ impl HttpFilter for AgenticLoopFilter {
         if let Some(failure) = state.dispatch_failure.take() {
             return convert_dispatch_failure(ctx, state, &failure);
         }
+
+        // Every request-body filter in this IRR step has now run. Clear the
+        // shared suffix boundary only here, after all configured tool-result
+        // guardrails had an opportunity to inspect it.
+        state.pending_local_tool_guardrail_start = None;
 
         if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
             return finish_deferred_local_response(ctx, state);
@@ -775,6 +780,10 @@ fn evaluate_loop_decision(
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
 /// remaining `max_tool_calls` budget, and drop them from dispatch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "update output and shared persistence views before clearing queued calls"
+)]
 fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
@@ -785,23 +794,27 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
-        }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
-        };
-        if matches && let Some(obj) = item.as_object_mut() {
-            obj.insert("status".to_owned(), json!("incomplete"));
-        }
+    let needs_mark = |item: &Value| {
+        item.get("type").and_then(Value::as_str) == Some("tool_search_call")
+            && item.get("status").and_then(Value::as_str) != Some("incomplete")
+            && match item.get("id").and_then(Value::as_str) {
+                Some(id) => queued_ids.iter().any(|queued| queued == id),
+                None => mark_unidentified,
+            }
     };
     for item in &mut state.accumulated_output {
-        mark(item);
+        if needs_mark(item)
+            && let Some(obj) = item.as_object_mut()
+        {
+            obj.insert("status".to_owned(), json!("incomplete"));
+        }
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
+    for index in 0..state.persisted_messages.len() {
+        if state.persisted_messages.get(index).is_some_and(&needs_mark)
+            && let Some(obj) = state.persisted_messages.get_mut(index).and_then(Value::as_object_mut)
+        {
+            obj.insert("status".to_owned(), json!("incomplete"));
+        }
     }
     state.tool_search_calls.clear();
 }
@@ -933,6 +946,18 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     (false, !state.tool_calls.is_empty())
 }
 
+/// Share one owned item between replay and persistence; mutation detaches it.
+///
+/// Records the same `(accumulated_output index, persisted_messages index)`
+/// provenance as [`ResponsesState::persist_collected_output`] so storage
+/// assembly can drop the later wholesale append of this item without guessing by
+/// value, while still sharing the single allocation with the replay projection.
+fn append_shared_history(state: &mut ResponsesState, accumulated_index: usize, item: Value) {
+    let item = std::sync::Arc::new(item);
+    state.messages.push_shared(std::sync::Arc::clone(&item));
+    state.persist_collected_output_shared(accumulated_index, item);
+}
+
 /// Distribute output items from a parsed response into the accumulator and state vectors.
 ///
 /// `private_indices` holds the ascending round-local indices that
@@ -947,7 +972,9 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
     let Some(Value::Array(output)) = response.get("output") else {
         return;
     };
-    state.current_round_output_start = Some(state.accumulated_output.len());
+    let output_start = state.accumulated_output.len();
+    let persisted_start = state.persisted_messages.len();
+    state.current_round_output_start = Some(output_start);
     let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
     for (round_index, item) in output.iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
@@ -955,12 +982,10 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") if is_dispatchable_function_call(item) => {
                 state.tool_calls.push(item.clone());
-                state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                append_shared_history(state, absolute_index, item.clone());
             },
             Some("reasoning") => {
-                state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                append_shared_history(state, absolute_index, item.clone());
             },
             Some("compaction") => {
                 // Provider compaction items are valid replayable input. Keep
@@ -968,7 +993,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // the opaque provider state back instead of translating it
                 // into an assistant summary.
                 state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -978,30 +1003,30 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             Some("web_search_call") => {
                 // A hosted web_search_call is not a valid OpenResponses input
                 // item (issue #808), so it must not enter `messages`. The
-                // openai_web_search dispatch consumes `web_search_calls` and
+                // openai_web_search_dispatch dispatch consumes `web_search_calls` and
                 // appends a backend-valid function_call/function_call_output
                 // bridge for the next inference step.
                 state.web_search_calls.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(item) => {
                 // Only a completed hosted search may trigger deferred
                 // `tools/list`. Client-executed searches return to the caller
                 // without listing or another inference round.
                 state.tool_search_calls.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
             },
             Some("tool_search_call") if is_completed_output_item(item) => {
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
             },
             Some("file_search_call") => {
                 // Like a hosted web_search_call, a file_search_call is not valid
                 // OpenResponses input, so it must not enter `messages`. The sole
                 // parse owner records its absolute index as a
-                // `FileSearchAssignment`; openai_file_search_callout drains those
+                // `FileSearchAssignment`; openai_file_search_dispatch drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 if is_pending_file_search_call(item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
                         SynthesisKind::Private
@@ -1014,6 +1039,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             _ => {},
         }
     }
+    state.record_collected_round(output_start, persisted_start);
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
 }
@@ -1110,6 +1136,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     // round into the accumulator (issue #955), mirroring the buffered path.
     ensure_public_output_item_ids_in_response(&mut state.response_object);
     let base = state.accumulated_output.len();
+    let persisted_start = state.persisted_messages.len();
     state.current_round_output_start = Some(base);
     // Move the round out (leaving a valid `[]`), so each item is routed to its
     // last consumer by move; only earlier consumers of a shared item clone.
@@ -1119,8 +1146,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
             Some("function_call" | "reasoning") => {
-                state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                append_shared_history(state, absolute_index, item.clone());
                 state.accumulated_output.push(item);
             },
             Some("compaction") => {
@@ -1128,7 +1154,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // in both state projections before moving the item into the
                 // public streamed output accumulator.
                 state.messages.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1139,11 +1165,11 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
             Some("web_search_call") => {
                 // Mirror `collect_output_items`: a hosted web_search_call is not
                 // a valid OpenResponses input item (issue #808), so it must not
-                // enter `messages`. The openai_web_search dispatch consumes
+                // enter `messages`. The openai_web_search_dispatch dispatch consumes
                 // `web_search_calls` and appends a backend-valid
                 // function_call/function_call_output bridge for the next round.
                 state.web_search_calls.push(item.clone());
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state.accumulated_output.push(item);
             },
             Some("file_search_call") => {
@@ -1167,7 +1193,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if is_pending_file_search_call(&item) {
                     pending_file_search.push((absolute_index, synthesis));
                 }
-                state.persisted_messages.push(item.clone());
+                state.persist_collected_output(absolute_index, item.clone());
                 state.accumulated_output.push(item);
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
@@ -1177,19 +1203,20 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // `tool_search_calls` to list deferred connectors.
                 state.tool_search_calls.push(item.clone());
                 state.accumulated_output.push(item.clone());
-                state.persisted_messages.push(item);
+                state.persist_collected_output(absolute_index, item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
                 // Client-executed searches stay client-visible and stored, but
                 // must not queue server-side connector discovery.
                 state.accumulated_output.push(item.clone());
-                state.persisted_messages.push(item);
+                state.persist_collected_output(absolute_index, item);
             },
             _ => {
                 state.accumulated_output.push(item);
             },
         }
     }
+    state.record_collected_round(base, persisted_start);
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
 }

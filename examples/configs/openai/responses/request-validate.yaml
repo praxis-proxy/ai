@@ -10,7 +10,7 @@
 # the request head, then deserializes the body exactly once. That single
 # parse produces every downstream fact: it buffers the body, classifies the
 # request as Responses API, promotes model/stream/store/background to
-# openai_responses_format.* metadata, extracts conversation.id when present,
+# openai_responses_request.* metadata, extracts conversation.id when present,
 # generates response and conversation IDs, and writes responses.* metadata
 # for downstream pipeline filters.
 #
@@ -39,6 +39,9 @@ listeners:
 filter_chains:
   - name: validate-and-route
     filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
       - filter: openai_responses_request
         on_invalid: reject
       - filter: router

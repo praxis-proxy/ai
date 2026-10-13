@@ -15,7 +15,7 @@
 // those filters off concrete-store construction.
 
 #[cfg(test)]
-#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(all(feature = "_store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -43,17 +43,17 @@ pub use praxis_ai_store::{
 };
 #[cfg(feature = "store-sqlite")]
 pub use praxis_ai_store_backends::SqliteResponseStore;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub(crate) use praxis_ai_store_backends::postgres_url;
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
 pub use praxis_ai_store_backends::store_backend_factories;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use praxis_ai_store_backends::to_pg_ssl_mode;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub(crate) use praxis_ai_store_backends::validate_postgres_table_identifiers;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+#[cfg(all(feature = "_store-postgres", feature = "openai-conversations"))]
 pub(crate) use praxis_ai_store_backends::validate_postgres_table_set_identifiers;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use praxis_ai_store_backends::{PgTlsConfig, PostgresResponseStore};
 
 use crate::StateOwner;
@@ -147,7 +147,7 @@ pub use crate::openai::responses::DEFAULT_STORE_NAME;
 
 /// Filter type that configures the response store. The serving runtime scans
 /// filter chains for this type to provision the backends the store filter reads.
-pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_response_store";
+pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_responses_store";
 
 /// Filter type that configures the conversations store. The serving runtime
 /// scans filter chains for this type to provision the conversations backend the

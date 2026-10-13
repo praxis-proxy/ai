@@ -25,10 +25,17 @@ backends and applies policy.
   [Anthropic](examples/configs/anthropic/messages-to-openai.yaml)
   and [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)
   examples.
-- **Code harness support.** Run Codex through OpenAI Responses and Claude Code
-  through Anthropic Messages. The
-  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows both
-  clients reaching native vLLM endpoints or Chat Completions through translation.
+- **Reach managed cloud models.** Adapt OpenAI Chat Completions traffic to the
+  managed-provider wire formats of Azure OpenAI, AWS Bedrock Converse, and
+  Google Vertex AI Gemini — streaming included — and authenticate each upstream
+  with AWS SigV4, Entra ID, or Google ADC. See the
+  [Azure](examples/configs/azure/chat-completions-to-openai.yaml),
+  [Bedrock](examples/configs/bedrock/chat-completions-to-converse.yaml), and
+  [Vertex](examples/configs/vertex/chat-completions-to-gemini.yaml) examples.
+- **Code harness support.** Run Codex through OpenAI Responses, Claude Code
+  through Anthropic Messages, and OpenCode through Chat Completions. The
+  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
+  client reaching native vLLM endpoints or Chat Completions through translation.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
   serve Conversations endpoints locally, and use PostgreSQL or SQLite for
   storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
@@ -38,9 +45,12 @@ backends and applies policy.
   [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
   [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
   [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
-- **Apply policy and measure usage.** Inject upstream credentials, enrich
-  prompts, call external guardrails, expose token usage, and report metering
-  data. See the [feature overview](docs/features.md) for details.
+- **Apply policy and control cost.** Inject upstream credentials, enrich
+  prompts, call external guardrails, enforce token rate limits and ceilings,
+  expose token usage, and report metering data. See the
+  [token rate limit](examples/configs/token-rate-limit.yaml) and
+  [external metering](examples/configs/external-metering.yaml) examples, and the
+  [feature overview](docs/features.md) for the full list.
 - **Extend the pipeline** with custom Rust filters built on Praxis's
   `HttpFilter` interface.
 

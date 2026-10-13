@@ -36,7 +36,10 @@ listeners:
 filter_chains:
   - name: openai
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/v1"

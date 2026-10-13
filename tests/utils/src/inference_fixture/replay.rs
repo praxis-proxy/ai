@@ -416,27 +416,26 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
 fn is_replay_contained_filter(filter_type: &str) -> bool {
     matches!(
         filter_type,
-        "openai_agentic_loop"
-            | "anthropic_messages_format"
+        "ai_operation"
+            | "openai_agentic_loop"
+            | "anthropic_messages_request"
             | "anthropic_messages_protocol"
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"
             | "iterative_request_router"
             | "openai_responses_proxy"
             | "path_rewrite"
-            | "openai_responses_format"
             | "openai_responses_request"
-            | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
-            | "openai_response_store"
+            | "openai_responses_store"
             | "openai_responses_rehydrate"
             | "openai_stream_events"
             | "openai_tool_parse"
             | "openai_chat_completions_to_bedrock_converse"
             | "openai_chat_completions_to_azureai_chat_completions"
             | "openai_chat_completions_to_vertexai_gemini"
-            | "responses_to_chat_completions"
+            | "openai_responses_to_chat_completions"
             | "aws_sigv4_sign"
             | "router"
             | "load_balancer"
@@ -2697,7 +2696,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: openai_chat_completions_to_azureai_chat_completions\n      - filter: openai_chat_completions_to_vertexai_gemini\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_request\n        initialize_state: false\n      - filter: openai_responses_request\n        on_invalid: reject\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_responses_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: openai_responses_to_chat_completions\n      - filter: openai_chat_completions_to_azureai_chat_completions\n      - filter: openai_chat_completions_to_vertexai_gemini\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

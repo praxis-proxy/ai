@@ -58,6 +58,9 @@ listeners:
 filter_chains:
   - name: mcp-streaming-pipeline
     filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -71,7 +74,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses

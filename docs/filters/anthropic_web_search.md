@@ -14,7 +14,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
-| `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily, which authenticates via the request body. |
+| `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Supported for every provider: each stages the secret as a destination-bound header credential the executor injects after pinning the provider authority (Brave and You.com under their provider header, Tavily as an `Authorization: Bearer` token). |
 | `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |

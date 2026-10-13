@@ -14,10 +14,11 @@ Drives the Chat Completions backend path of the shipped
 live model in two provider modes:
 
     * Mode A (``test_web_search_loop_with_stubbed_provider``): a live vLLM model
-      with a LOCAL body-authenticated search stub that fabricates a fixed result.
-      Deterministic and secret-free, so it proves the request-side wiring — forced
-      ``tool_choice`` -> translation -> managed classification -> provider dispatch
-      — with the credential travelling in the Tavily request body.
+      with a LOCAL search stub that fabricates a fixed result. Deterministic and
+      secret-free, so it proves the request-side wiring — forced ``tool_choice``
+      -> translation -> managed classification -> provider dispatch — with the
+      credential travelling in the Tavily ``Authorization`` header (issue #1389),
+      never the request body.
     * Mode B (``test_live_tavily_web_search_returns_real_sources``): the same loop
       against the REAL Tavily provider, exercising the live provider request
       format and response parsing end to end.
@@ -139,7 +140,12 @@ def _wait_for_proxy(port: int, process: subprocess.Popen, log_path: Path) -> Non
 
 
 class _TavilyStub:
-    """A threaded body-authenticated Tavily stub exposing its captured bodies."""
+    """A threaded header-authenticated Tavily stub exposing its captured requests.
+
+    Each captured entry is ``{"authorization": <str|None>, "body": {...}}``: Tavily
+    authenticates with an ``Authorization: Bearer`` header (issue #1389), so the
+    stub records that header alongside the parsed JSON body.
+    """
 
     def __init__(self):
         self.port = _free_port()
@@ -152,10 +158,12 @@ class _TavilyStub:
             def do_POST(self):  # noqa: N802 (http.server API)
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length) if length else b""
+                authorization = self.headers.get("Authorization")
                 try:
-                    captured.append(json.loads(raw))
+                    body = json.loads(raw)
                 except json.JSONDecodeError:
-                    captured.append({})
+                    body = {}
+                captured.append({"authorization": authorization, "body": body})
                 body = json.dumps(
                     {
                         "results": [
@@ -200,11 +208,13 @@ class _TavilyStub:
 class _TavilyRelay:
     """Forward each search to the real Tavily API and capture the upstream result.
 
-    Each captured entry is ``{"request": <sent body>, "status": <upstream code>,
-    "response": <parsed upstream body>}``. A failed forward (auth, rate limit,
-    timeout, TLS, schema drift) is captured with a non-200 status and surfaced to
-    Praxis, so Mode B can assert an observed *successful* provider result rather
-    than trusting the model's fallback answer.
+    Each captured entry is ``{"request": <sent body>, "authorization": <str|None>,
+    "status": <upstream code>, "response": <parsed upstream body>}``. Tavily
+    authenticates with an ``Authorization: Bearer`` header (issue #1389), so the
+    relay forwards that header to the real API and records it. A failed forward
+    (auth, rate limit, timeout, TLS, schema drift) is captured with a non-200
+    status and surfaced to Praxis, so Mode B can assert an observed *successful*
+    provider result rather than trusting the model's fallback answer.
     """
 
     def __init__(self):
@@ -213,12 +223,26 @@ class _TavilyRelay:
         captured = self.captured
         context = ssl.create_default_context()
 
-        def relay(raw: bytes) -> tuple[int, bytes]:
-            request = urllib.request.Request(
-                TAVILY_UPSTREAM, data=raw, headers={"Content-Type": "application/json"}, method="POST"
-            )
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            # Never follow redirects: urllib copies non-content headers (including
+            # Authorization) onto the redirected request, which would leak the real
+            # Tavily key to another authority or an http:// URL. A 3xx instead
+            # surfaces as an HTTPError and fails the run loudly.
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(
+            _NoRedirect,
+            urllib.request.HTTPSHandler(context=context),
+        )
+
+        def relay(raw: bytes, authorization: str | None) -> tuple[int, bytes]:
+            headers = {"Content-Type": "application/json"}
+            if authorization:
+                headers["Authorization"] = authorization
+            request = urllib.request.Request(TAVILY_UPSTREAM, data=raw, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(request, timeout=20, context=context) as response:
+                with opener.open(request, timeout=20) as response:
                     return response.status, response.read()
             except urllib.error.HTTPError as exc:
                 # Surface the real upstream status (e.g. 401/429) so a broken
@@ -233,16 +257,24 @@ class _TavilyRelay:
             def do_POST(self):  # noqa: N802 (http.server API)
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length) if length else b""
+                authorization = self.headers.get("Authorization")
                 try:
                     request_body = json.loads(raw)
                 except json.JSONDecodeError:
                     request_body = {}
-                status, payload = relay(raw)
+                status, payload = relay(raw, authorization)
                 try:
                     response_body = json.loads(payload)
                 except json.JSONDecodeError:
                     response_body = payload.decode("utf-8", "replace")
-                captured.append({"request": request_body, "status": status, "response": response_body})
+                captured.append(
+                    {
+                        "request": request_body,
+                        "authorization": authorization,
+                        "status": status,
+                        "response": response_body,
+                    }
+                )
                 self.close_connection = True
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -380,7 +412,7 @@ def _assert_terminal_message(response) -> str:
 
 @pytest.fixture(scope="module")
 def stubbed_search_stack(request):
-    """Live vLLM model + local body-authenticated Tavily stub (Mode A)."""
+    """Live vLLM model + local header-authenticated Tavily stub (Mode A)."""
     authority, model, backend_key = _live_config()
     search = _TavilyStub().start()
     proxy_port = _free_port()
@@ -470,12 +502,15 @@ def test_web_search_loop_with_stubbed_provider(stubbed_search_stack):
     text = _assert_terminal_message(response)
     assert text, response.model_dump_json()
 
-    # The managed loop dispatched at least one provider callout, body-authenticated
-    # with the configured key and a non-empty reconstructed query.
+    # The managed loop dispatched at least one provider callout, header-authenticated
+    # with the configured key (issue #1389) and a non-empty reconstructed query. The
+    # key must ride the Authorization header, never the request body.
     assert search.requests, "the forced tool call must dispatch a managed search"
     first = search.requests[0]
-    assert first.get("api_key") == STUB_SEARCH_KEY, f"Tavily key must travel in the body: {first}"
-    assert isinstance(first.get("query"), str) and first["query"].strip(), f"query must be populated: {first}"
+    assert first["authorization"] == f"Bearer {STUB_SEARCH_KEY}", f"Tavily key must travel in the header: {first}"
+    assert "api_key" not in first["body"], f"Tavily key must not appear in the body: {first}"
+    query = first["body"].get("query")
+    assert isinstance(query, str) and query.strip(), f"query must be populated: {first}"
 
 
 def test_live_tavily_web_search_returns_real_sources(live_tavily_stack):
@@ -485,8 +520,8 @@ def test_live_tavily_web_search_returns_real_sources(live_tavily_stack):
     to an ``is_error`` tool result on provider failure, so a terminal text answer
     alone does not prove the integration works. The capture relay lets the test
     assert the observed provider result: the resolved real key travelled in the
-    body, Tavily returned HTTP 200, and the parsed payload carried real
-    absolute-URL sources.
+    Authorization header, Tavily returned HTTP 200, and the parsed payload carried
+    real absolute-URL sources.
     """
     relay = live_tavily_stack["relay"]
     relay.captured.clear()
@@ -506,7 +541,10 @@ def test_live_tavily_web_search_returns_real_sources(live_tavily_stack):
     assert result["status"] == 200, f"real Tavily must return 200, not {result['status']}: {result['response']}"
 
     sent = result["request"]
-    assert sent.get("api_key") == live_tavily_stack["tavily_key"], "the resolved real key must travel in the body"
+    assert result["authorization"] == f"Bearer {live_tavily_stack['tavily_key']}", (
+        "the resolved real key must travel in the Authorization header"
+    )
+    assert "api_key" not in sent, f"the Tavily key must not appear in the request body: {sent}"
     assert isinstance(sent.get("query"), str) and sent["query"].strip(), f"query must be populated: {sent}"
 
     upstream = result["response"]

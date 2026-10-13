@@ -37,11 +37,14 @@ fn streaming_examples_override_short_irr_default_deadline() {
     for (example, minimum_timeout_ms) in STREAMING_EXAMPLES {
         let yaml = std::fs::read_to_string(example_config_path(example)).expect("example config should exist");
         let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("example config should be valid YAML");
-        let filters = config["filter_chains"][0]["filters"]
+        // Some examples (e.g. full-flow-agentic) express the pipeline as several
+        // named chains composed by the listener, so search every chain's filters
+        // for the IRR rather than assuming it lives in the first chain.
+        let irr = config["filter_chains"]
             .as_sequence()
-            .expect("filter chain should contain filters");
-        let irr = filters
+            .expect("config should declare filter_chains")
             .iter()
+            .flat_map(|chain| chain["filters"].as_sequence().map(Vec::as_slice).unwrap_or(&[]))
             .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
             .unwrap_or_else(|| panic!("{example} should contain an iterative_request_router"));
         let overall_timeout_ms = irr["timeout_ms"]
@@ -553,14 +556,14 @@ async fn stream_events_replays_stored_event_log() {
     cleanup_sqlite_files(&db_path);
 }
 
-/// A legacy `openai_responses_format` classifier pipeline promotes
-/// `openai_responses_format.format=openai_responses` for a replay GET (a GET to
+/// A classifier-only `openai_responses_request` pass promotes
+/// `openai_responses_request.format=openai_responses` for a replay GET (a GET to
 /// /v1/responses/{id} is a Responses endpoint) with `stream=false` (no request
 /// body). The store filter must force streaming mode for the replay GET instead
 /// of selecting the buffered Responses-format response mode, which the runtime
 /// would reject with a 500 against the streaming replay body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
+async fn stream_events_replay_streams_under_classifier_only_pipeline() {
     let sse_body = [
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_example\",\"status\":\"in_progress\"}}\n\n",
@@ -578,14 +581,14 @@ async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
     let (db_url, db_path) = temp_sqlite_url("stream_events_replay_legacy");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
         .expect("example config should exist");
-    // Add the legacy `openai_responses_format` classifier alongside the modern
-    // header-promoting classifier (both run before the store filter). The modern
-    // classifier still drives create-time persistence via `responses.*` metadata
-    // and `x-praxis-*` headers, while the legacy classifier promotes
-    // `openai_responses_format.format=openai_responses` (with `stream=false` for
+    // Add a classifier-only `openai_responses_request` pass alongside the managed
+    // owner (both run before the store filter). The owner drives create-time
+    // persistence via `responses.*` metadata and `x-praxis-*` headers, while the
+    // classifier-only pass (`initialize_state: false`) promotes
+    // `openai_responses_request.format=openai_responses` (with `stream=false` for
     // the body-less replay GET) that `is_responses_format` reads -- reproducing
     // the buffered-mode trap the fix targets without disabling persistence.
-    let modern_classifier = concat!(
+    let owner_classifier = concat!(
         "      - filter: openai_responses_request\n",
         "        on_invalid: reject\n",
         "        headers:\n",
@@ -594,11 +597,11 @@ async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
         "          stream: x-praxis-ai-stream\n",
         "          mode: x-praxis-responses-mode\n",
     );
-    let legacy_classifier = "      - filter: openai_responses_format\n";
-    let yaml = yaml.replace(modern_classifier, &format!("{modern_classifier}\n{legacy_classifier}"));
+    let facts_classifier = "      - filter: openai_responses_request\n        initialize_state: false\n";
+    let yaml = yaml.replace(owner_classifier, &format!("{owner_classifier}\n{facts_classifier}"));
     assert!(
-        yaml.contains("filter: openai_responses_format") && yaml.contains("filter: openai_responses_request"),
-        "both classifiers must be present so create persists and the replay GET is trapped"
+        yaml.contains("initialize_state: false") && yaml.contains("filter: openai_responses_request"),
+        "both the managed owner and the classifier-only pass must be present so create persists and the replay GET is trapped"
     );
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),

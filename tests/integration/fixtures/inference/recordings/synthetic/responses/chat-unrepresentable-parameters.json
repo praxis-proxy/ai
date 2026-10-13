@@ -112,7 +112,7 @@
             "value": {
               "error": {
                 "code": "invalid_request_error",
-                "message": "prompt templates are supported only for OpenAI-owned upstreams",
+                "message": "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)",
                 "param": null,
                 "type": "invalid_request_error"
               }

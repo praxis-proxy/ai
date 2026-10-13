@@ -336,6 +336,13 @@ enum AffinityOutcome<'a> {
 /// overlay's selection mode within the first viable producer-defined group.
 /// Missing group or policy metadata uses deterministic first-admitted ordering.
 /// Praxis AI does not recompute source geography, load, or score.
+/// `weightedRandom` is overlay-only: every non-empty weighted candidate list
+/// must supply a selection group and an integer `traffic_weight` from 1 through
+/// 1000. Weights are applied only among candidates in the first viable group.
+/// Inline static candidates cannot enable weighted selection. A validated
+/// versioned overlay may have no candidates in any selection mode; matching
+/// requests are rejected with HTTP 404. Static candidate lists and legacy
+/// flat overlays remain non-empty.
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
@@ -426,7 +433,8 @@ enum AffinityOutcome<'a> {
 /// - **rendered:** The producer constructed the envelope.
 /// - **distributed:** The producer applied it to the destination `ConfigMap`.
 /// - **accepted:** Praxis AI parsed, scope-checked, and digest-verified it.
-/// - **serving:** a request selected a route from that exact snapshot.
+/// - **serving:** the active snapshot used for new routing decisions, including an authoritative no-route decision from
+///   an empty candidate list.
 ///
 /// Invalid cold-start envelopes fail filter construction. Invalid reloads
 /// retain the same-process last-known-good snapshot. Envelope-mode provider
@@ -434,9 +442,11 @@ enum AffinityOutcome<'a> {
 /// candidate selection.
 ///
 /// **Scope:** overlay hot reload swaps the candidate list and `local_site`
-/// only.  It cannot add or remove `load_balancer` clusters, change
-/// cluster endpoints or TLS configuration, or inject credential values.
-/// Those changes require a full pipeline reload or pod restart.
+/// only. It cannot add or remove `load_balancer` clusters or change cluster
+/// endpoints or TLS configuration; those changes require a full pipeline
+/// reload or pod restart. Overlay files never carry credential values. An
+/// already-configured projected credential resolver can use a newly selected,
+/// already-mounted Secret without rebuilding the filter pipeline.
 /// Every cluster name that may appear in any overlay version must
 /// already be configured in the downstream `load_balancer` filter.
 /// An overlay that references an unknown cluster will cause
@@ -476,7 +486,7 @@ impl IntelligentRouteFilter {
     /// - both `overlay_file` and `candidates` are set
     /// - neither `overlay_file` nor `candidates` is set
     /// - the overlay file cannot be read or parsed
-    /// - the candidate list is empty or invalid
+    /// - static or legacy candidates are empty, or any candidate is invalid
     /// - the model header is invalid
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let mut cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
@@ -645,6 +655,14 @@ fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Optio
     let local_site_str = local_site
         .ok_or_else(|| FilterError::from("intelligent_route: local_site is required when candidates is set"))?;
     descriptor::validate_local_site(&local_site_str)?;
+    if candidates_raw
+        .iter()
+        .any(|candidate| candidate.traffic_weight.is_some())
+    {
+        return Err(
+            "intelligent_route: traffic_weight requires overlay mode with selection_policy.mode=weightedRandom".into(),
+        );
+    }
     let candidates = descriptor::validate_candidates(candidates_raw)?;
     let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
@@ -1189,8 +1207,52 @@ fn write_provider_context(
 )]
 mod tests {
     use http::Method;
+    use praxis_ai_apis::hash::{Sha256, hex};
 
     use super::*;
+
+    fn versioned_envelope(candidates: &serde_json::Value) -> String {
+        let overlay = serde_json::json!({
+            "network": "test-net",
+            "local_site": "site-a",
+            "candidates": candidates,
+        });
+        let semantic = serde_json::json!({
+            "candidates": overlay["candidates"],
+            "local_site": overlay["local_site"],
+            "network": overlay["network"],
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&semantic).unwrap();
+        let digest = hex(&Sha256::digest(&canonical));
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "revision": {
+                "kind": "content_addressed",
+                "algorithm": "sha256",
+                "value": digest,
+            },
+            "content_digest": {
+                "algorithm": "sha256",
+                "value": digest,
+            },
+            "scope": {
+                "network": "test-net",
+                "gateway": "gw",
+                "namespace": "ns",
+                "local_site": "site-a",
+            },
+            "provenance": {
+                "producer": "test",
+                "producer_version": "0.1.0",
+                "source_name": "test-net",
+                "source_uid": "test-uid",
+                "source_generation": 1,
+                "rendered_at": "2026-10-02T00:00:00Z",
+            },
+            "overlay": overlay,
+        }))
+        .unwrap()
+    }
 
     // ---- Config validation ----
 
@@ -1198,6 +1260,26 @@ mod tests {
     fn valid_minimal_config() {
         let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n";
         assert!(parse(yaml).is_ok(), "minimal valid config should parse");
+    }
+
+    #[test]
+    fn static_candidates_reject_ignored_traffic_weights() {
+        let err = parse_err(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    traffic_weight: 70\n",
+        );
+        assert!(
+            err.to_string().contains("traffic_weight requires overlay mode"),
+            "static weights must fail clearly instead of being ignored: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_selection_policy_is_rejected() {
+        let error = parse_err("local_site: site-a\nselection_policy:\n  mode: weightedRandom\ncandidates: []\n");
+        assert!(
+            error.to_string().contains("selection_policy"),
+            "selection policy must be supplied by the overlay: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1233,6 +1315,119 @@ mod tests {
             err.to_string().contains("empty"),
             "empty candidates should be rejected: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_start_with_empty_versioned_overlay_rejects_without_selecting_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, versioned_envelope(&serde_json::json!([]))).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": false },
+        });
+        let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
+        let (action, cluster) = route_path_model(filter.as_ref(), "/v1/chat/completions", "llama-3").await;
+
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 404));
+        assert!(cluster.is_none(), "cold empty overlay must not select a backend");
+    }
+
+    #[tokio::test]
+    async fn versioned_overlay_hot_reload_withdraws_and_restores_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let candidate = serde_json::json!([{
+            "kind": "inference_model",
+            "name": "llama-3",
+            "site": "site-a",
+            "cluster": "provider-a",
+            "fresh": true,
+            "stable_id": "provider-a-llama-3"
+        }]);
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": true, "debounce_ms": 10 },
+            "session_affinity": { "enabled": true, "header": "x-session-id" },
+        });
+        let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
+
+        let mut request = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
+        request.headers.insert("X-Model", HeaderValue::from_static("llama-3"));
+        request
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("session-1"));
+        let mut context = crate::test_utils::make_filter_context(&request);
+        let action = filter.on_request(&mut context).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(context.cluster.as_deref(), Some("provider-a"));
+
+        std::fs::write(&path, versioned_envelope(&serde_json::json!([]))).unwrap();
+        let withdrawn = poll_request_until(
+            filter.as_ref(),
+            "llama-3",
+            "session-1",
+            |action| matches!(action, FilterAction::Reject(rejection) if rejection.status == 404),
+        )
+        .await;
+        assert!(
+            withdrawn.1.is_none(),
+            "withdrawn affinity binding must not resurrect the old backend"
+        );
+
+        std::fs::write(&path, "{ malformed").unwrap();
+        // The watcher waits for the configured 10 ms debounce before parsing
+        // the update; allow it to retain the last-known-good snapshot first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let retained = route_path_model_with_session(filter.as_ref(), "llama-3", "session-1").await;
+        assert!(matches!(retained.0, FilterAction::Reject(rejection) if rejection.status == 404));
+        assert!(
+            retained.1.is_none(),
+            "invalid update must retain the empty last-known-good snapshot"
+        );
+
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
+        let restored = poll_request_until(filter.as_ref(), "llama-3", "session-1", |action| {
+            matches!(action, FilterAction::Continue)
+        })
+        .await;
+        assert!(matches!(restored.0, FilterAction::Continue));
+        assert_eq!(restored.1.as_deref(), Some("provider-a"));
+    }
+
+    #[tokio::test]
+    async fn withdrawing_one_model_keeps_other_models_routable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let candidates = serde_json::json!([
+            {"kind": "inference_model", "name": "model-a", "site": "site-a", "cluster": "provider-a", "fresh": true},
+            {"kind": "inference_model", "name": "model-b", "site": "site-a", "cluster": "provider-b", "fresh": true}
+        ]);
+        std::fs::write(&path, versioned_envelope(&candidates)).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": true, "debounce_ms": 10 },
+        });
+        let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
+        let before = route_path_model(filter.as_ref(), "/v1/chat/completions", "model-a").await;
+        assert_eq!(before.1.as_deref(), Some("provider-a"));
+
+        let remaining = serde_json::json!([
+            {"kind": "inference_model", "name": "model-b", "site": "site-a", "cluster": "provider-b", "fresh": true}
+        ]);
+        std::fs::write(&path, versioned_envelope(&remaining)).unwrap();
+        let withdrawn = poll_request_until(
+            filter.as_ref(),
+            "model-a",
+            "session-model-a",
+            |action| matches!(action, FilterAction::Reject(rejection) if rejection.status == 404),
+        )
+        .await;
+        assert!(withdrawn.1.is_none(), "removed model has no selected backend");
+        let retained = route_path_model(filter.as_ref(), "/v1/chat/completions", "model-b").await;
+        assert!(matches!(retained.0, FilterAction::Continue));
+        assert_eq!(retained.1.as_deref(), Some("provider-b"));
     }
 
     #[test]
@@ -1309,6 +1504,40 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         (action, ctx.cluster.as_deref().map(str::to_owned))
+    }
+
+    async fn route_path_model_with_session(
+        filter: &dyn HttpFilter,
+        model: &str,
+        session: &str,
+    ) -> (FilterAction, Option<String>) {
+        let mut req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
+        req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
+        req.headers
+            .insert("x-session-id", HeaderValue::from_str(session).unwrap());
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        (action, ctx.cluster.as_deref().map(str::to_owned))
+    }
+
+    async fn poll_request_until<F>(
+        filter: &dyn HttpFilter,
+        model: &str,
+        session: &str,
+        predicate: F,
+    ) -> (FilterAction, Option<String>)
+    where
+        F: Fn(&FilterAction) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = route_path_model_with_session(filter, model, session).await;
+            if predicate(&result.0) {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "overlay did not converge before timeout");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
@@ -2895,6 +3124,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn weighted_affinity_keeps_binding_when_overlay_weights_change() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_weighted_snapshot(90, 10)));
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(make_test_affinity()));
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let _unused = filter.on_request(&mut first_ctx).await.unwrap();
+        let first_cluster = first_ctx.cluster.clone().expect("weighted route selects a candidate");
+
+        shared.store(Arc::new(make_weighted_snapshot(10, 90)));
+
+        let mut second = crate::test_utils::make_request(Method::POST, "/chat");
+        second.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        second
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut second_ctx = crate::test_utils::make_filter_context(&second);
+        let _unused = filter.on_request(&mut second_ctx).await.unwrap();
+
+        assert_eq!(
+            second_ctx.cluster.as_deref(),
+            Some(first_cluster.as_ref()),
+            "affinity must preserve the selected cluster when overlay weights change"
+        );
+        assert_eq!(
+            second_ctx.get_metadata("intelligent_route.session.reused"),
+            Some("true"),
+            "the existing affinity binding must be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_weighted_overlay_does_not_reuse_an_existing_affinity_binding() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_weighted_snapshot(90, 10)));
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(make_test_affinity()));
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let first_action = filter.on_request(&mut first_ctx).await.unwrap();
+        assert!(
+            matches!(first_action, FilterAction::Continue),
+            "the initial weighted route must continue"
+        );
+        assert!(first_ctx.cluster.is_some(), "initial route selects a provider");
+        assert_eq!(
+            first_ctx.get_metadata("intelligent_route.session.bound"),
+            Some("true"),
+            "the initial route must create an affinity binding"
+        );
+        assert_eq!(
+            first_ctx.get_metadata("intelligent_route.session.reused"),
+            Some("false"),
+            "the initial route must not report a reused binding"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
+        overlay::handle_overlay_reload(&path, &shared, None);
+
+        let serving = shared.load();
+        assert!(
+            serving.candidates.is_empty(),
+            "the empty overlay must withdraw every candidate"
+        );
+
+        let mut bound = crate::test_utils::make_request(Method::POST, "/chat");
+        bound.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        bound.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut bound_ctx = crate::test_utils::make_filter_context(&bound);
+        let action = filter.on_request(&mut bound_ctx).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Reject(rejection) if rejection.status == 404),
+            "an existing affinity binding must not route through an empty serving revision"
+        );
+        assert!(
+            bound_ctx.cluster.is_none(),
+            "the withdrawn provider must not be selected from stale affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_weighted_overlay_reload_advances_revision_and_denies_new_requests() {
+        let initial = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
+        let initial_snapshot = RouteSnapshot::from_overlay(initial).unwrap();
+        let initial_revision = initial_snapshot
+            .semantic_revision
+            .as_deref()
+            .expect("fixture has semantic revision")
+            .to_owned();
+        let shared = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+        let filter = make_affinity_filter(Arc::clone(&shared), None);
+
+        let mut before_req = crate::test_utils::make_request(Method::POST, "/chat");
+        before_req
+            .headers
+            .insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut before_ctx = crate::test_utils::make_filter_context(&before_req);
+        let before_action = filter.on_request(&mut before_ctx).await.unwrap();
+        assert!(
+            matches!(before_action, FilterAction::Continue),
+            "the initial overlay must route requests"
+        );
+        assert!(
+            before_ctx.cluster.is_some(),
+            "the initial overlay must select a provider"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
+        overlay::handle_overlay_reload(&path, &shared, None);
+
+        let serving = shared.load();
+        let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
+        assert_ne!(
+            serving_revision, initial_revision,
+            "the empty overlay must advance the serving revision"
+        );
+        assert!(
+            serving.candidates.is_empty(),
+            "the new serving revision must withdraw all candidates"
+        );
+
+        let mut after_req = crate::test_utils::make_request(Method::POST, "/chat");
+        after_req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut after_ctx = crate::test_utils::make_filter_context(&after_req);
+        let after_action = filter.on_request(&mut after_ctx).await.unwrap();
+        assert!(
+            matches!(after_action, FilterAction::Reject(rejection) if rejection.status == 404),
+            "requests after withdrawal must receive 404"
+        );
+        assert!(
+            after_ctx.cluster.is_none(),
+            "withdrawn requests must not select a provider"
+        );
+    }
+
     // ---- Overlay revision header ----
 
     #[tokio::test]
@@ -3189,5 +3562,48 @@ mod tests {
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
+    }
+
+    fn make_weighted_snapshot(weight_a: u32, weight_b: u32) -> RouteSnapshot {
+        let json = serde_json::json!({
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": [
+                {"kind": "inference_model", "name": "llama", "site": "site-a", "cluster": "c-a", "selection_group": 0, "traffic_weight": weight_a},
+                {"kind": "inference_model", "name": "llama", "site": "site-b", "cluster": "c-b", "selection_group": 0, "traffic_weight": weight_b}
+            ]
+        });
+        RouteSnapshot::from_overlay(serde_json::to_vec(&json).unwrap().as_slice()).unwrap()
+    }
+
+    fn make_empty_weighted_envelope_json() -> String {
+        let overlay_payload = serde_json::json!({
+            "local_site": "site-a",
+            "network": "test-net",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": []
+        });
+        let digest = overlay::compute_semantic_digest(&overlay_payload).unwrap();
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "revision": {"kind": "content_addressed", "algorithm": "sha256", "value": digest},
+            "content_digest": {"algorithm": "sha256", "value": digest},
+            "scope": {
+                "network": "test-net",
+                "gateway": "gw",
+                "namespace": "ns",
+                "local_site": "site-a"
+            },
+            "provenance": {
+                "producer": "test",
+                "producer_version": "0.1.0",
+                "source_name": "test-net",
+                "source_uid": "test-uid",
+                "source_generation": 1,
+                "rendered_at": "2026-10-01T00:00:00Z"
+            },
+            "overlay": overlay_payload
+        }))
+        .unwrap()
     }
 }

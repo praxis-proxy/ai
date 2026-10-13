@@ -10,7 +10,7 @@
 //! reporting healthy. It cannot be a route on the protocol admin service, which
 //! owns its own route set, so it binds its own listener.
 
-#![cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#![cfg(feature = "_store-backend")]
 
 use async_trait::async_trait;
 use http::{Response, StatusCode, header};

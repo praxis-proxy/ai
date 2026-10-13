@@ -329,7 +329,7 @@ class TestAnthropicMessagesLLMKatan:
 
 
     def test_malformed_json_rejected(self, anthropic_client, praxis_proxy):
-        """Verify anthropic_validate rejects malformed JSON end-to-end."""
+        """Verify anthropic_messages_request rejects malformed JSON end-to-end."""
         import httpx
 
         resp = httpx.post(

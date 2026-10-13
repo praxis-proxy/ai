@@ -31,6 +31,31 @@ inputs:
     description: Maximum served context length.
     required: false
     default: "4096"
+  tool-call-parser:
+    description: >-
+      vLLM tool-call parser. Implies --enable-auto-tool-choice. Set to the empty
+      string for models served without tool calling (for example the vision
+      model, whose parsers are text-model specific).
+    required: false
+    default: hermes
+  reasoning-parser:
+    description: >-
+      vLLM reasoning parser, or the empty string to leave reasoning text in the
+      assistant message. Must match the served model family.
+    required: false
+    default: deepseek_r1
+  api-key:
+    description: >-
+      Bearer token vLLM requires on every request. Set it when the test needs to
+      prove Praxis injects the backend credential and unauthenticated upstream
+      calls fail; pass the same value to wait-vllm so its readiness probe can
+      authenticate.
+    required: false
+    default: ""
+  extra-args:
+    description: Additional `vllm serve` flags, word-split by the shell.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -45,6 +70,10 @@ runs:
         VLLM_DEVICE_ARGS: ${{ inputs.device-args }}
         VLLM_GPU_MEMORY_UTILIZATION: ${{ inputs.gpu-memory-utilization }}
         VLLM_MAX_MODEL_LEN: ${{ inputs.max-model-len }}
+        VLLM_TOOL_CALL_PARSER: ${{ inputs.tool-call-parser }}
+        VLLM_REASONING_PARSER: ${{ inputs.reasoning-parser }}
+        VLLM_SERVE_API_KEY: ${{ inputs.api-key }}
+        VLLM_EXTRA_ARGS: ${{ inputs.extra-args }}
       run: |
         # Pull the (multi-GB, model-baked) image and start the container in the
         # background so the pull + model load overlap the caller's next steps
@@ -54,9 +83,9 @@ runs:
         # background start); its pid and log let wait-vllm tell "still pulling"
         # apart from a real pull/start failure.
         #
-        # $VLLM_DEVICE_ARGS is deliberately unquoted inside the launcher: it
-        # carries one or more separate flags (e.g. "--gpus all") that must be
-        # word-split into distinct argv entries.
+        # $VLLM_DEVICE_ARGS and $VLLM_EXTRA_ARGS are deliberately unquoted inside
+        # the launcher: each carries one or more separate flags (e.g.
+        # "--gpus all") that must be word-split into distinct argv entries.
         nohup bash -c '
           set -euo pipefail
           pull_args=()
@@ -65,18 +94,31 @@ runs:
           else
             pull_args=(--pull=never)
           fi
+          serve_args=(
+            --model "$VLLM_MODEL_PATH"
+            --max-model-len "$VLLM_MAX_MODEL_LEN"
+            --served-model-name "$VLLM_MODEL"
+            --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
+          )
+          if [ -n "$VLLM_TOOL_CALL_PARSER" ]; then
+            serve_args+=(--enable-auto-tool-choice --tool-call-parser "$VLLM_TOOL_CALL_PARSER")
+          fi
+          if [ -n "$VLLM_REASONING_PARSER" ]; then
+            serve_args+=(--reasoning-parser "$VLLM_REASONING_PARSER")
+          fi
+          if [ -n "$VLLM_EXTRA_ARGS" ]; then
+            # shellcheck disable=SC2206 # word splitting is the point: one input, several flags
+            serve_args+=($VLLM_EXTRA_ARGS)
+          fi
+          if [ -n "$VLLM_SERVE_API_KEY" ]; then
+            serve_args+=(--api-key "$VLLM_SERVE_API_KEY")
+          fi
           "$VLLM_RUNTIME" run -d --name vllm \
             "${pull_args[@]}" \
             -p 8000:8000 \
             $VLLM_DEVICE_ARGS \
             "$VLLM_IMAGE" \
-            --model "$VLLM_MODEL_PATH" \
-            --max-model-len "$VLLM_MAX_MODEL_LEN" \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
+            "${serve_args[@]}"
         ' > /tmp/vllm-start.log 2>&1 &
         echo $! > /tmp/vllm-start.pid
         echo "vLLM launch backgrounded (launcher pid $(cat /tmp/vllm-start.pid)); join with the wait-vllm action"

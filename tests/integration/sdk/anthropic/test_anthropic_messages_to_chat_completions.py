@@ -32,10 +32,11 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-from anthropic import APIStatusError, Anthropic, BadRequestError
+from anthropic import APIConnectionError, APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
@@ -78,12 +79,31 @@ class RecordingBackend(BaseHTTPRequestHandler):
     bodies: list[dict] = []
     response_content_type = "application/json"
     send_tool_reply_once = False
+    tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
+    error_response_once = False
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
+        if RecordingBackend.error_response_once:
+            RecordingBackend.error_response_once = False
+            reply = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "stubbed upstream failure",
+                        "type": "future_error",
+                    }
+                }
+            ).encode()
+            self.send_response(500)
+            self.send_header("content-type", self.response_content_type)
+            self.send_header("content-length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+            return
         if body.get("stream"):
             self._send_invalid_tool_id_stream()
             return
@@ -95,13 +115,15 @@ class RecordingBackend(BaseHTTPRequestHandler):
         }
         if RecordingBackend.send_tool_reply_once:
             RecordingBackend.send_tool_reply_once = False
+            arguments = RecordingBackend.tool_call_arguments
+            RecordingBackend.tool_call_arguments = "{}"
             choice["message"] = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
+                    "function": {"name": "lookup", "arguments": arguments},
                 }],
             }
             choice["finish_reason"] = "tool_calls"
@@ -193,7 +215,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
         pass
 
 
-def _write_config(proxy_port: int, backend_port: int) -> str:
+def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
     for old, new in [
@@ -203,20 +225,40 @@ def _write_config(proxy_port: int, backend_port: int) -> str:
         replaced = config.replace(old, new)
         assert replaced != config, f"example drift: {old} not found in {CONFIG_PATH}"
         config = replaced
+    if allow_lossy:
+        # Opt the strict example into operator-approved degradation by adding the
+        # allowlist to the translation filter block.
+        marker = "      - filter: anthropic_messages_to_chat_completions\n        max_body_bytes: 1048576\n"
+        replacement = (
+            marker
+            + "        allow_lossy_features:\n"
+            + "          - prompt_caching\n"
+            + "          - extended_thinking\n"
+        )
+        replaced = config.replace(marker, replacement)
+        assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
+        config = replaced
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
         f.write(config)
     return path
 
 
-@pytest.fixture(scope="module")
-def anthropic_client():
+def _start_client(*, allow_lossy: bool, process_holder=None) -> Iterator[Anthropic]:
+    """Start a backend + proxy and yield an Anthropic client plus the proxy port.
+
+    `allow_lossy` selects the strict example config (the default) or the same
+    config with operator-approved degradation enabled on the translation filter.
+    When `process_holder` is supplied, the live proxy subprocess is published
+    under its ``"proxy"`` key so tests can assert the proxy stays up (e.g. a
+    connection abort must come from a committed-body reset, not a crash).
+    """
     backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
 
     proxy_port = _free_port()
-    config_path = _write_config(proxy_port, backend_port)
+    config_path = _write_config(proxy_port, backend_port, allow_lossy=allow_lossy)
     proc = subprocess.Popen(
         [_find_binary(), "-c", config_path],
         stdout=subprocess.DEVNULL,
@@ -224,6 +266,8 @@ def anthropic_client():
     )
     try:
         _wait_for_proxy(proxy_port)
+        if process_holder is not None:
+            process_holder["proxy"] = proc
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="not-needed",
@@ -231,6 +275,8 @@ def anthropic_client():
             timeout=10.0,
         )
     finally:
+        if process_holder is not None:
+            process_holder.pop("proxy", None)
         proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=5)
@@ -239,6 +285,22 @@ def anthropic_client():
             proc.wait()
         backend.shutdown()
         os.unlink(config_path)
+
+
+@pytest.fixture(scope="module")
+def proxy_process():
+    """Holder populated by `anthropic_client` with the live proxy subprocess."""
+    yield {}
+
+
+@pytest.fixture(scope="module")
+def anthropic_client(proxy_process):
+    yield from _start_client(allow_lossy=False, process_holder=proxy_process)
+
+
+@pytest.fixture(scope="module")
+def degrading_client():
+    yield from _start_client(allow_lossy=True)
 
 
 class TestRequestFieldHandling:
@@ -361,6 +423,26 @@ class TestRequestFieldHandling:
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
 
+    def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.send_tool_reply_once = True
+        RecordingBackend.tool_call_arguments = ""
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+        )
+
+        tool_use = next(block for block in response.content if block.type == "tool_use")
+        assert tool_use.name == "lookup"
+        assert tool_use.input == {}, (
+            'empty-string arguments ("arguments":"") are absent arguments, per the '
+            "vLLM tool parser / OpenAI streaming spec encoding, and must become input "
+            "{} rather than failing as a 500"
+        )
+        assert response.stop_reason == "tool_use"
+
     def test_empty_citations_in_history_reach_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -451,11 +533,31 @@ class TestResponseUsage:
 
 
 class TestResponseValidation:
+    def test_unrecognized_upstream_error_type_is_normalized(self, anthropic_client):
+        RecordingBackend.error_response_once = True
+        try:
+            with pytest.raises(APIStatusError) as excinfo:
+                anthropic_client.messages.create(
+                    model=MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+        finally:
+            RecordingBackend.error_response_once = False
+
+        error = excinfo.value
+        assert error.status_code == 500, "an unrecognized upstream error must surface as HTTP 500"
+        assert error.body["error"]["type"] == "api_error", "the Anthropic error type must normalize to api_error"
+
     @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
-    def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
+    def test_untranslatable_success_fails_closed(
+        self, anthropic_client, proxy_process, kind
+    ):
         RecordingBackend.untranslatable_reply_once = kind
         try:
-            with pytest.raises((APIStatusError, json.JSONDecodeError)) as excinfo:
+            with pytest.raises(
+                (APIStatusError, json.JSONDecodeError, APIConnectionError)
+            ) as excinfo:
                 anthropic_client.messages.create(
                     model=MODEL,
                     max_tokens=64,
@@ -469,10 +571,22 @@ class TestResponseValidation:
             assert error.status_code == 500
             assert error.body["type"] == "error"
             assert error.body["error"]["type"] == "api_error"
-        else:
+        elif isinstance(error, json.JSONDecodeError):
             # A response-body rejection can abort after 200 headers have been
             # sent. The SDK then fails to parse the empty, aborted body.
             assert error.doc == ""
+        else:
+            # praxis 0.7.4 aborts a rejected response after the 200 headers are
+            # committed by closing the connection mid-body instead of flushing an
+            # empty terminal chunk; the SDK surfaces that as a connection error.
+            # Still fail-closed: the client never receives a usable translation.
+            assert isinstance(error, APIConnectionError)
+            # A proxy crash would raise the same SDK exception, so confirm the
+            # proxy is still running — the abort must be a deliberate reset.
+            assert proxy_process["proxy"].poll() is None, (
+                "the proxy must stay alive while it aborts the committed "
+                "200 response body"
+            )
 
 
 class TestStreamingResponseValidation:
@@ -503,6 +617,166 @@ class TestStreamingResponseValidation:
         ), "aborted stream must not start a tool_use block"
         [upstream] = RecordingBackend.bodies
         assert upstream["stream"] is True, "forwarded request must have been a stream"
+
+
+DEGRADED_HEADER = "x-degraded-features"
+
+
+class TestOperatorApprovedDegradation:
+    """`allow_lossy_features` degrades the listed features instead of a 400."""
+
+    def test_prompt_caching_is_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+            messages=[{
+                "role": "user",
+                "content": [{"type": "text", "text": "What is 2+2?", "cache_control": {"type": "ephemeral"}}],
+            }],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "prompt_caching" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        serialized = json.dumps(upstream)
+        assert "cache_control" not in serialized, f"cache_control must be stripped: {serialized}"
+        # The prompt content survives the degradation.
+        assert any(m["role"] == "system" and m["content"] == "Be brief" for m in upstream["messages"])
+
+    def test_extended_thinking_is_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "extended_thinking" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        assert "thinking" not in upstream, f"thinking must be stripped: {upstream}"
+
+    def test_both_features_reported_together(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert raw.http_response.status_code == 200
+        reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
+        assert "prompt_caching" in reported and "extended_thinking" in reported, reported
+
+    def test_streaming_request_is_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        # The degraded-feature header is set in the response-header phase, before
+        # the body streams, so it is observable on a streaming response even
+        # though this backend's stream aborts mid-body.
+        with degrading_client.messages.with_streaming_response.create(
+            model=MODEL,
+            # `budget_tokens` must stay below `max_tokens` per the Anthropic schema.
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            messages=[{"role": "user", "content": "Use the weather tool"}],
+            stream=True,
+        ) as response:
+            assert response.status_code == 200
+            assert "extended_thinking" in response.headers.get(DEGRADED_HEADER, "")
+
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stream"] is True, "forwarded request must have been a stream"
+        assert "thinking" not in upstream, f"thinking must be stripped from the streamed request: {upstream}"
+
+    def test_malformed_cache_control_is_still_rejected(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            degrading_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "persistent"}}],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert RecordingBackend.bodies == [], "a malformed marker must not reach the backend"
+
+    def test_unlisted_feature_is_still_rejected(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            degrading_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                service_tier="standard_only",
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert "`service_tier` is not supported" in str(excinfo.value)
+        assert RecordingBackend.bodies == [], "an unlisted feature must still fail closed"
+
+    def test_requests_without_lossy_features_report_no_header(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert DEGRADED_HEADER not in raw.http_response.headers, "a clean request must not be flagged as degraded"
+
+    def test_empty_context_management_is_served_as_a_no_op(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        # `edits` is optional in the Anthropic schema, so an empty
+        # `context_management` is a valid no-op: it is stripped and served, not
+        # rejected, and removing a no-op is not itself a degradation.
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            extra_body={"context_management": {}},
+        )
+
+        assert raw.http_response.status_code == 200
+        assert DEGRADED_HEADER not in raw.http_response.headers, "an empty context_management is a no-op, not a degradation"
+        [upstream] = RecordingBackend.bodies
+        assert "context_management" not in upstream, f"empty context_management must be stripped: {upstream}"
+
+    def test_malformed_clear_thinking_keep_is_still_rejected(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        # The `keep` union carries no null, so an explicit null is malformed and
+        # must fail closed rather than be stripped as a clean degradation.
+        with pytest.raises(BadRequestError) as excinfo:
+            degrading_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+                extra_body={"context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": None}]}},
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "context_management" in str(excinfo.value)
+        assert RecordingBackend.bodies == [], "a malformed edit must not reach the backend"
 
 
 if __name__ == "__main__":

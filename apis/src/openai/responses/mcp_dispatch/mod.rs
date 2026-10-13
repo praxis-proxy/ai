@@ -75,7 +75,7 @@ use super::{
     DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
-    openai_mcp_tool_resolve::{
+    mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
@@ -334,8 +334,10 @@ impl McpDispatchFilter {
             return;
         };
         for result in results {
+            let result_start = state.messages.len();
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
+            state.mark_local_tool_results_from(result_start);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
             // lifecycle.
@@ -751,8 +753,10 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
     } else {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
+        let result_start = state.messages.len();
         state.messages.push(denial.clone());
         state.persisted_messages.push(denial);
+        state.mark_local_tool_results_from(result_start);
     }
 }
 
@@ -1017,7 +1021,7 @@ async fn discover_pending_connectors(
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
             let streaming = ctx
-                .get_metadata("openai_responses_format.stream")
+                .get_metadata("openai_responses_request.stream")
                 .is_some_and(|v| v == "true");
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },

@@ -493,7 +493,7 @@ insecure_options:
     )
 }
 
-/// Branch on has_web_search with `openai_responses_format` preceding `openai_tool_parse`.
+/// Branch on has_web_search with `openai_responses_request` preceding `openai_tool_parse`.
 ///
 /// Verifies that filter_results and branch conditions work correctly
 /// when openai_tool_parse is NOT the first body-reading filter in the chain.
@@ -507,7 +507,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
         branch_chains:

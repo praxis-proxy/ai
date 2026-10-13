@@ -1,0 +1,32 @@
+version: 1
+id: messages/empty-string-tool-arguments
+description: An empty-string Chat Completions tool-call argument (a parameterless call from vLLM tool parsers) becomes an Anthropic tool_use block with empty input, not an HTTP 500.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.response.empty_string_tool_arguments
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: user
+              content: Call the now tool.
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

@@ -309,8 +309,8 @@ fn conditionally_skipped_classifier_cannot_bypass_conversations() {
     let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace(
-        "      - filter: openai_operation\n",
-        "      - filter: openai_operation\n        conditions:\n          - when:\n              path_prefix: /never-matches\n",
+        "      - filter: ai_operation\n",
+        "      - filter: ai_operation\n        conditions:\n          - when:\n              path_prefix: /never-matches\n",
     );
     let patched = patch_yaml(
         &yaml.replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:"),

@@ -41,7 +41,8 @@
 # with the same request/trace IDs and a fresh outbound span ID.
 #
 # Requires WEB_SEARCH_API_KEY (the search provider key; this example uses Tavily,
-# whose key travels in the request body) and, for the Chat Completions backend,
+# whose key is injected as an `Authorization: Bearer` header per issue #1389
+# rather than in the request body) and, for the Chat Completions backend,
 # VLLM_API_KEY (the backend Bearer token injected toward that cluster). The native
 # Messages backend listens on 127.0.0.1:8000 and the Chat Completions backend on
 # 127.0.0.1:8001.
@@ -78,10 +79,8 @@ filter_chains:
         # Establish typed correlation before IRR snapshots request extensions;
         # Praxis core creates a fresh span ID for each search callout hop.
 
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: reject
-      - filter: anthropic_validate
-
       # Top-level binding router: classify the request and freeze ONE logical
       # cluster for it so the inference step resolves the same backend on every
       # re-entry. The classifier promotes the model to `x-praxis-ai-model`.
@@ -144,6 +143,18 @@ filter_chains:
               # Messages. Also strips the client's native Anthropic auth header.
               - filter: anthropic_messages_to_chat_completions
                 max_body_bytes: 1048576
+                # Operator-approved degradation so an unmodified Claude Code
+                # client (which sends `thinking` and `cache_control`) is not
+                # rejected with a 400 on the Chat path. The translator strips the
+                # unrepresentable wire markers and reports the loss (one WARN log
+                # per request, the
+                # praxis_anthropic_messages_to_chat_completions_degraded_total
+                # counter, and an x-degraded-features response header). Malformed
+                # markers and any feature not listed here still fail closed. See
+                # messages-to-openai-vllm.yaml for the full per-feature notes.
+                allow_lossy_features:
+                  - prompt_caching
+                  - extended_thinking
                 conditions:
                   - when:
                       selected_upstream:

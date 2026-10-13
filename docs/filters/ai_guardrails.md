@@ -11,7 +11,7 @@ Every provider callout runs through Praxis's filtered-subrequest executor. The o
 
 Because this filter reads the request body before the header-phase security filters on the main chain run, operators should treat the pre-read body as untrusted input and configure an outbound chain whenever the provider requires destination-bound policy enforcement.
 
-**Wire format:** Chat Completions only (`messages` on requests, `choices[].message` on responses). Responses API, Anthropic Messages, and MCP are not supported yet (see ai#1043).
+**Wire format:** client request/response evaluation supports Chat Completions only (`messages` on requests, `choices[].message` on responses). `phase.tool_results` separately evaluates canonical local Responses tool results inside an IRR step. Other Responses content, Anthropic Messages, and MCP wire bodies are not supported yet (see ai#1043). For `phase.tool_results`, a provider `modified` verdict fails closed with `502 guardrail_error`; sanitized text is not forwarded because it cannot yet be safely mapped back to the canonical tool-result items. Only a `passed` verdict permits model re-entry.
 
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
 
@@ -25,6 +25,7 @@ For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configur
 | `phase` | PhaseConfig | no | Which phases to evaluate. |
 | `phase.request` | bool | no | Evaluate client requests before forwarding to the upstream. |
 | `phase.response` | bool | no | Evaluate upstream responses before forwarding to the client. |
+| `phase.tool_results` | bool | no | Evaluate newly produced local Responses tool results before the next inference round. Intended for placement inside an IRR step after its local dispatchers and before `openai_agentic_loop`. |
 
 ## Example
 
@@ -40,4 +41,5 @@ provider:
 phase:
   request: true
   response: true
+  tool_results: false
 ```

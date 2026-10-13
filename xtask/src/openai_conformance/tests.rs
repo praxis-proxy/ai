@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use clap::Parser as _;
 use serde_json::{Value, json};
 
 use super::{
@@ -121,7 +122,6 @@ fn registered_supported_operations() -> Vec<SupportedOperation> {
 
 fn test_args() -> Args {
     Args {
-        openai_spec: "openai-test".to_owned(),
         areas: Vec::new(),
         include_deprecated: false,
         include_beta: false,
@@ -133,6 +133,22 @@ fn test_args() -> Args {
         fail_under: None,
         fail_oasdiff_under: None,
     }
+}
+
+#[test]
+fn rejects_openai_spec_override() {
+    let error = Args::try_parse_from(["openai-conformance", "--openai-spec", "openai-test"])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::UnknownArgument,
+        "alternate reference paths must be rejected as unknown arguments"
+    );
+    assert!(
+        error.to_string().contains("--openai-spec"),
+        "rejected argument should be identified: {error}"
+    );
 }
 
 #[test]

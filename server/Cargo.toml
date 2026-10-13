@@ -40,8 +40,12 @@ openai-responses = ["praxis-ai-filters/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-filters/openai-file-resolve-filter"]
 # Response store support; installs the response store pipeline extension.
 store = ["openai-responses", "praxis-ai-filters/store"]
-store-postgres = ["store", "praxis-ai-filters/store-postgres"]
-store-sqlite = ["store", "praxis-ai-filters/store-sqlite"]
+# Internal marker for builds with a concrete store backend. This keeps server
+# lifecycle wiring independent of which backend profile selected it.
+_store-backend = []
+store-postgres = ["store", "_store-backend", "praxis-ai-filters/store-postgres"]
+store-postgres-cert-auth = ["store", "_store-backend", "praxis-ai-filters/store-postgres-cert-auth"]
+store-sqlite = ["store", "_store-backend", "praxis-ai-filters/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-filters/openai-conversations"]
 openai-compact = ["store", "praxis-ai-filters/openai-compact"]

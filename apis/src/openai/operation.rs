@@ -4,7 +4,7 @@
 //! Shared operation metadata and generated `OpenAPI` support.
 //!
 //! The runtime half ([`OpenAiOperationSpec`]) is always compiled so the
-//! `openai_operation` classifier can identify requests. The `OpenAPI` contract
+//! `ai_operation` classifier can identify requests. The `OpenAPI` contract
 //! half lives in the `openapi` submodule and depends on `utoipa`.
 
 #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]

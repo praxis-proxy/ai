@@ -45,15 +45,16 @@ use redis::aio::MultiplexedConnection;
 
 use super::{
     super::{
+        AccountingPolicy,
         backend::{
             BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReconcileWorker,
             ReserveRequest, TokenRateLimitStateBackend,
         },
         ledger::{Budget, DenialReason},
     },
-    RuleTelemetry, ValkeyConnection, amount,
+    RuleTelemetry, ValkeyConnection, accounting_config_key, amount,
     connection::{AbortRetry, command_error, unwatch},
-    count, extend_shared_ttl, key_hash, parse_reservation,
+    count, ensure_accounting_config, extend_shared_ttl, key_hash, parse_reservation, sliding_window_config_fingerprint,
     window::{BucketRange, bucket_index, bucket_ms, retry_after_ms},
 };
 
@@ -73,6 +74,8 @@ pub(in crate::token_rate_limit) struct ValkeySlidingWindowConfig {
     pub(in crate::token_rate_limit) max_keys: usize,
     /// Maximum unsettled reservations per namespace and algorithm.
     pub(in crate::token_rate_limit) max_active_reservations: usize,
+    /// Stable policy inputs used for reservations and reconciliation.
+    pub(in crate::token_rate_limit) accounting: AccountingPolicy,
 }
 
 /// Sliding-window admission state shared across replicas.
@@ -93,10 +96,11 @@ pub(in crate::token_rate_limit) struct ValkeySlidingWindowBackend {
     max_active_reservations: usize,
     /// Smallest capacity, for rate-limit headers.
     limit: u64,
-    /// Longest window, for TTLs.
-    max_window_ms: u64,
     /// Distinct sub-window widths across `budgets`, each written once.
     widths: Vec<CounterWidth>,
+    /// Persistent marker preventing replicas with incompatible accounting
+    /// semantics from sharing this rule's state.
+    config_fingerprint: String,
     /// Background reconciliation queue.
     worker: ReconcileWorker,
     /// Last observed state for gauges, shared with the worker clone.
@@ -129,8 +133,14 @@ impl ValkeySlidingWindowBackend {
     /// Build a rule's backend over the filter's shared connection.
     pub(in crate::token_rate_limit) fn new(config: ValkeySlidingWindowConfig) -> Self {
         let limit = config.budgets.iter().map(|budget| budget.capacity).min().unwrap_or(0);
-        let max_window_ms = config.budgets.iter().map(|budget| budget.window_ms).max().unwrap_or(0);
         let widths = counter_widths(&config.budgets, config.reservation_timeout_ms);
+        let config_fingerprint = sliding_window_config_fingerprint(
+            &config.budgets,
+            config.reservation_timeout_ms,
+            config.max_keys,
+            config.max_active_reservations,
+            &config.accounting,
+        );
         Self {
             valkey: config.valkey,
             namespace: config.namespace,
@@ -140,8 +150,8 @@ impl ValkeySlidingWindowBackend {
             max_keys: config.max_keys,
             max_active_reservations: config.max_active_reservations,
             limit,
-            max_window_ms,
             widths,
+            config_fingerprint,
             worker: ReconcileWorker::new(),
             telemetry: Arc::new(RuleTelemetry::default()),
         }
@@ -160,8 +170,8 @@ impl ValkeySlidingWindowBackend {
             max_keys: self.max_keys,
             max_active_reservations: self.max_active_reservations,
             limit: self.limit,
-            max_window_ms: self.max_window_ms,
             widths: self.widths.clone(),
+            config_fingerprint: self.config_fingerprint.clone(),
             worker: ReconcileWorker::detached(),
             telemetry: Arc::clone(&self.telemetry),
         }
@@ -237,11 +247,30 @@ impl ValkeySlidingWindowBackend {
         format!("{}:v2:keys:{}", self.namespace, key_hash(&[self.rule.as_bytes()]))
     }
 
-    /// TTL for the bookkeeping keys.
+    /// TTL for the bookkeeping keys. It covers every usage-counter TTL, so a
+    /// retained-key index cannot expire while a counter still carries quota.
     fn state_ttl_ms(&self) -> u64 {
-        self.max_window_ms
-            .saturating_add(self.reservation_timeout_ms)
-            .max(1_000)
+        self.widths.iter().map(|width| width.ttl_ms).max().unwrap_or(1_000)
+    }
+
+    /// Persistent marker for this rule's sliding-window accounting semantics.
+    fn accounting_config_key(&self) -> String {
+        accounting_config_key(&self.namespace, "sw", &self.rule)
+    }
+
+    /// Initialize or validate the marker before reading or mutating quota
+    /// state. This is deliberately a separate pipeline so a mismatched
+    /// writer does not even trim shared indexes.
+    async fn ensure_accounting_config(&self) -> Result<(), BackendError> {
+        let state_index = self.keys_key();
+        ensure_accounting_config(
+            &self.valkey,
+            &self.namespace,
+            &self.accounting_config_key(),
+            &self.config_fingerprint,
+            &state_index,
+        )
+        .await
     }
 
     // -------------------------------------------------------------------------
@@ -422,10 +451,17 @@ impl ValkeySlidingWindowBackend {
             .arg(format!("{key_id}|{id}"))
             .ignore();
         extend_shared_ttl(pipe, &active_index, self.state_ttl_ms());
+        self.retain_key(pipe, key_id, request.now_ms);
+    }
+
+    /// Record a key's latest state deadline without shortening an existing
+    /// deadline, and keep the shared index alive for the same state lifetime.
+    fn retain_key(&self, pipe: &mut redis::Pipeline, key_id: &str, now_ms: u64) {
         let keys = self.keys_key();
         pipe.cmd("ZADD")
             .arg(&keys)
-            .arg(request.now_ms.saturating_add(self.state_ttl_ms()))
+            .arg("GT")
+            .arg(now_ms.saturating_add(self.state_ttl_ms()))
             .arg(key_id)
             .ignore();
         extend_shared_ttl(pipe, &keys, self.state_ttl_ms());
@@ -493,15 +529,18 @@ impl ValkeySlidingWindowBackend {
     )]
     fn settlement_pipeline(
         &self,
+        key_id: &str,
         prefix: &str,
         reservation: &str,
         active_member: &str,
         admitted_at_ms: u64,
+        now_ms: u64,
         delta: i64,
     ) -> redis::Pipeline {
         let mut pipe = redis::pipe();
         pipe.atomic();
         self.add_usage_delta(&mut pipe, prefix, admitted_at_ms, delta);
+        self.retain_key(&mut pipe, key_id, now_ms);
         pipe.cmd("DEL").arg(reservation).ignore();
         pipe.cmd("ZREM")
             .arg(self.active_index_key())
@@ -512,6 +551,10 @@ impl ValkeySlidingWindowBackend {
 
     /// One settlement attempt; `None` means another writer changed the
     /// reservation before `EXEC`, so the caller retries within its deadline.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one settlement attempt keeps the watched read and atomic write together"
+    )]
     async fn reconcile_attempt(
         &self,
         connection: &mut MultiplexedConnection,
@@ -530,7 +573,15 @@ impl ValkeySlidingWindowBackend {
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(estimate).unwrap_or(i64::MAX));
         let active_member = format!("{id}|{}", request.reservation_id);
-        let pipe = self.settlement_pipeline(&prefix, &reservation, &active_member, admitted_at_ms, delta);
+        let pipe = self.settlement_pipeline(
+            &id,
+            &prefix,
+            &reservation,
+            &active_member,
+            admitted_at_ms,
+            request.now_ms,
+            delta,
+        );
         let executed: Option<()> = pipe
             .query_async(connection)
             .await
@@ -604,8 +655,9 @@ fn next_i64(values: &mut impl Iterator<Item = redis::Value>) -> Result<i64, Back
 #[async_trait]
 impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
     async fn reserve(&self, request: ReserveRequest) -> Result<BackendReserve, BackendError> {
+        Box::pin(self.ensure_accounting_config()).await?;
         let id = self.key_id(&request.key);
-        let reads = self.read_window(&id, request.now_ms).await?;
+        let reads = Box::pin(self.read_window(&id, request.now_ms)).await?;
         let (keys_after, active_after) = (reads.keys, reads.active);
         match self.decide(&reads, request.estimate, request.now_ms) {
             Decision::Denied {
@@ -621,7 +673,7 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
                 })
             },
             Decision::Admit { max_usage, remaining } => {
-                let reservation_id = self.admit(&id, &request).await?;
+                let reservation_id = Box::pin(self.admit(&id, &request)).await?;
                 let keys_after = keys_after.saturating_add(usize::from(!reads.key_known));
                 self.telemetry
                     .record(remaining, active_after.saturating_add(1), keys_after);
@@ -640,6 +692,7 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
         reason = "transaction.finish() consumes the connection after the borrowed attempt"
     )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
+        Box::pin(self.ensure_accounting_config()).await?;
         let mut retry = AbortRetry::start();
         loop {
             let mut transaction = self.valkey.transaction().await?;
@@ -697,7 +750,7 @@ mod tests {
         BucketRange, CounterWidth, DenialReason, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig, counter_widths,
         retry_after_ms,
     };
-    use crate::token_rate_limit::ledger::Budget;
+    use crate::token_rate_limit::{AccountingPolicy, CompiledEstimation, ledger::Budget, weights::TokenWeights};
 
     fn backend(
         namespace: &str,
@@ -739,6 +792,11 @@ mod tests {
             reservation_timeout_ms,
             max_keys: 2,
             max_active_reservations: 2,
+            accounting: AccountingPolicy {
+                estimation: CompiledEstimation::Fixed { estimate: 1 },
+                weights: TokenWeights::UNITY,
+                key_fingerprint: "test-key-policy".to_owned(),
+            },
         }))
     }
 
@@ -749,6 +807,10 @@ mod tests {
         ttl
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the no-local-state backend contract assertions together"
+    )]
     #[test]
     fn valkey_sliding_window_backend_has_no_local_state_to_reconcile_or_clean_up_synchronously() {
         let backend = ValkeySlidingWindowBackend::new(ValkeySlidingWindowConfig {
@@ -762,6 +824,11 @@ mod tests {
             reservation_timeout_ms: 1_000,
             max_keys: 8,
             max_active_reservations: 8,
+            accounting: AccountingPolicy {
+                estimation: CompiledEstimation::Fixed { estimate: 1 },
+                weights: TokenWeights::UNITY,
+                key_fingerprint: "test-key-policy".to_owned(),
+            },
         });
         assert!(
             backend.cleanup(0, 8).is_none(),
@@ -1043,6 +1110,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the reconciliation test verifies exactly-once settlement and index lifetime together"
+    )]
     async fn live_valkey_reconcile_refunds_the_unused_estimate_exactly_once() {
         let Some(backend) = backend("sw-reconcile", 100, 60_000, 5_000) else {
             return;
@@ -1052,6 +1123,9 @@ mod tests {
         else {
             panic!("admitted");
         };
+        let mut shorten = redis::pipe();
+        shorten.cmd("PEXPIRE").arg(backend.keys_key()).arg(50).ignore();
+        let () = backend.valkey.pipeline(&shorten).await.unwrap();
         let applied = BackendSettlement::Applied {
             actual: 40,
             refund: 20,
@@ -1062,6 +1136,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settled, applied, "20 tokens come back");
+        let keys_ttl = pttl(&backend, &backend.keys_key()).await;
+        let expected_min = i64::try_from(backend.state_ttl_ms())
+            .unwrap_or(i64::MAX)
+            .saturating_sub(1_000);
+        assert!(
+            keys_ttl > expected_min,
+            "settlement must re-arm the retained-key index with live quota state: {keys_ttl} <= {expected_min}"
+        );
         let again = backend
             .reconcile(reconcile("alice", reservation_id, 40, now + 20))
             .await
@@ -1111,7 +1193,7 @@ mod tests {
             .ignore();
         let () = backend.valkey.pipeline(&concurrent).await.unwrap();
         let member = format!("{id}|{reservation_id}");
-        let pipe = backend.settlement_pipeline(&prefix, &reservation, &member, now, 40);
+        let pipe = backend.settlement_pipeline(&id, &prefix, &reservation, &member, now, now, 40);
         let executed: Option<()> = pipe.query_async(transaction.inner()).await.unwrap();
         assert!(executed.is_none(), "a changed reservation aborts the whole settlement");
         transaction.finish().await;

@@ -51,6 +51,21 @@ on:
         required: false
         default: "32768"
         type: string
+      reasoning_parser:
+        description: >-
+          vLLM --reasoning-parser. Must match the served model family; qwen3
+          suits the default Qwen3 model.
+        required: false
+        default: qwen3
+        type: string
+      enable_thinking:
+        description: >-
+          Serve with the model's thinking mode left on. Keep this off for
+          agentic clients such as Claude Code, whose plan mode loops when the
+          model thinks out loud.
+        required: false
+        default: false
+        type: boolean
       instance_type:
         description: EC2 GPU instance type.
         required: false
@@ -123,6 +138,8 @@ jobs:
           MODEL: ${{ inputs.model }}
           SERVED_MODEL_NAME: ${{ inputs.served_model_name }}
           MAX_MODEL_LEN: ${{ inputs.max_model_len }}
+          REASONING_PARSER: ${{ inputs.reasoning_parser }}
+          ENABLE_THINKING: ${{ inputs.enable_thinking }}
           VLLM_GPU_IMAGE: docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2
         run: |
           # Background the image pull + container launch so the multi-GB CUDA
@@ -131,7 +148,10 @@ jobs:
           # chained in one detached subshell; the readiness wait joins on the
           # serving port. Mirrors the GPU test suite's launch, minus the test
           # harness, with the tool/reasoning parsers kept so this endpoint
-          # behaves like the CI backend.
+          # behaves like the CI backend. The reasoning parser and thinking mode
+          # are inputs rather than CI's fixed deepseek_r1 pair: this endpoint
+          # serves interactive coding clients, which need the parser to match
+          # the model family and thinking off by default.
           gpu_args=()
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             gpu_args=(--device nvidia.com/gpu=all)
@@ -142,22 +162,30 @@ jobs:
           # shellcheck disable=SC2016
           nohup bash -c '
             set -euo pipefail
-            runtime="$1"; image="$2"; model="$3"; served_model="$4"; max_len="$5"; shift 5
+            runtime="$1"; image="$2"; model="$3"; served_model="$4"; max_len="$5"
+            parser="$6"; thinking="$7"; shift 7
+            serve_args=(
+              --model "$model"
+              --max-model-len "$max_len"
+              --served-model-name "$served_model"
+              --enable-auto-tool-choice
+              --tool-call-parser hermes
+              --reasoning-parser "$parser"
+              --gpu-memory-utilization 0.97
+              --enforce-eager
+            )
+            if [ "$thinking" != "true" ]; then
+              serve_args+=(--default-chat-template-kwargs "{\"enable_thinking\":false}")
+            fi
             "$runtime" pull "$image"
             "$runtime" run -d --name vllm \
               "$@" \
               -p 8000:8000 \
               -e HUGGING_FACE_HUB_TOKEN \
               "$image" \
-              --model "$model" \
-              --max-model-len "$max_len" \
-              --served-model-name "$served_model" \
-              --enable-auto-tool-choice \
-              --tool-call-parser hermes \
-              --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.97 \
-              --enforce-eager
-          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$MODEL" "$SERVED_MODEL_NAME" "$MAX_MODEL_LEN" "${gpu_args[@]}" \
+              "${serve_args[@]}"
+          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$MODEL" "$SERVED_MODEL_NAME" "$MAX_MODEL_LEN" \
+            "$REASONING_PARSER" "$ENABLE_THINKING" "${gpu_args[@]}" \
             > /tmp/vllm-launch.log 2>&1 &
           echo $! > /tmp/vllm-launch.pid
           echo "vLLM launch (pull + run) started in background, pid $(cat /tmp/vllm-launch.pid)"

@@ -513,9 +513,10 @@ mod tests {
         },
     ];
 
-    /// The slice below is hand-built. It shows the matcher does not branch on
-    /// protocol; it is not evidence that two shipped registries share it. Only
-    /// OpenAI registries exist today.
+    /// The slice below is hand-built, so it proves only that the matcher does
+    /// not branch on protocol. That the shipped OpenAI and Anthropic registries
+    /// actually share one matcher is covered by the `ai_operation` classifier
+    /// tests, which drive the real registries.
     #[test]
     fn the_matcher_does_not_branch_on_protocol() {
         let responses = match_operation(SPECS, "POST", "/v1/responses", Transport::Http).unwrap();

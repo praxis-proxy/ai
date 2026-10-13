@@ -27,7 +27,7 @@ use crate::{
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search`,
+/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search_dispatch`,
 /// `anthropic_web_search`, `external_metering`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
@@ -290,7 +290,7 @@ fn register_routing_security_filter(
 fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_messages_format" => praxis_ai_apis::anthropic::AnthropicMessagesFormatFilter::from_config
+        http "anthropic_messages_request" => praxis_ai_apis::anthropic::AnthropicMessagesRequestFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -303,10 +303,6 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     praxis_filter::register_filters!(
         @register registry,
         http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "anthropic_validate" => praxis_ai_apis::anthropic::AnthropicValidateFilter::from_config
     );
     register_anthropic_web_search(registry, subrequest_client);
 }
@@ -323,10 +319,6 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
 fn register_openai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
         http "openai_responses_model_rewrite" => praxis_ai_apis::openai::ModelRewriteFilter::from_config
     );
     praxis_filter::register_filters!(
@@ -340,7 +332,11 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_operation" => praxis_ai_apis::openai::OpenaiOperationFilter::from_config
+        http "openai_chat_completions_request" => praxis_ai_apis::openai::OpenaiChatCompletionsRequestFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "ai_operation" => praxis_ai_apis::operation_classifier::AiOperationFilter::from_config
     );
 }
 
@@ -397,10 +393,6 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
         @register registry,
         http "openai_responses_request" => praxis_ai_apis::openai::OpenaiResponsesRequestFilter::from_config
     );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_responses_validate" => praxis_ai_apis::openai::OpenaiResponsesValidateFilter::from_config
-    );
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
         @register registry,
@@ -408,7 +400,7 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
     );
     #[cfg(feature = "openai-compact")]
     register_compact(registry, subrequest_client);
-    register_file_search_callout(registry, subrequest_client);
+    register_file_search_dispatch(registry, subrequest_client);
     register_openai_response_filters(registry, subrequest_client);
 }
 
@@ -418,11 +410,11 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_response_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
+        http "openai_responses_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_stream_events" => praxis_ai_apis::openai::OpenaiStreamEventsFilter::from_config
+        http "openai_stream_events" => praxis_ai_apis::openai::StreamEventsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -430,7 +422,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
+        http "openai_responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
     );
     #[cfg(feature = "openai-mcp-tools")]
     register_mcp_callout_filters(registry);
@@ -438,7 +430,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         @register registry,
         http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
     );
-    register_web_search(registry, subrequest_client);
+    register_web_search_dispatch(registry, subrequest_client);
     register_openai_agentic_filters(registry);
 }
 
@@ -562,7 +554,7 @@ fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_clien
 /// build/hot-reload time via [`ChainBindingContext::bind_chain`]. The chain is
 /// optional: when omitted the config layer substitutes an empty inline chain
 /// (pure passthrough), so registration binds it and callouts still route
-/// through the bound pipeline — matching `openai_file_search_callout`.
+/// through the bound pipeline — matching `openai_file_search_dispatch`.
 /// Registration only fails the build when a provided chain cannot be bound.
 /// The shared [`SubRequestClient`] is captured when available; otherwise the
 /// filter falls back to an isolated per-filter connector.
@@ -611,7 +603,7 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
     }
 }
 
-/// Register `openai_file_search_callout` as a chain-binding filter.
+/// Register `openai_file_search_dispatch` as a chain-binding filter.
 ///
 /// The filter resolves its configured `outbound_chain` into a prebuilt pipeline
 /// at registration time and routes every vector-store sub-request through it.
@@ -619,21 +611,21 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
 /// dedicated per-filter connector with a pool size of 4.
 #[cfg(feature = "openai-responses")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
-fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+fn register_file_search_dispatch(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let client = subrequest_client
         .cloned()
         .unwrap_or_else(|| crate::isolated_subrequest_client(4));
     registry
         .register_chain_binding(
-            "openai_file_search_callout",
+            "openai_file_search_dispatch",
             std::sync::Arc::new(move |config, ctx| {
-                praxis_ai_apis::openai::FileSearchCalloutFilter::from_config_with_binding(config, client.clone(), ctx)
+                praxis_ai_apis::openai::FileSearchDispatchFilter::from_config_with_binding(config, client.clone(), ctx)
             }),
         )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_callout'"));
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_dispatch'"));
 }
 
-/// Register `openai_web_search` with the shared client when
+/// Register `openai_web_search_dispatch` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
 ///
 /// Registered as a chain-binding filter so each provider callout executes
@@ -643,20 +635,20 @@ fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client
 /// upstream-selecting filter of its own.
 #[cfg(feature = "openai-responses")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
-fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+fn register_web_search_dispatch(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
         std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
+            praxis_ai_apis::openai::WebSearchDispatchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
         })
     } else {
         std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding(config, ctx)
+            praxis_ai_apis::openai::WebSearchDispatchFilter::from_chain_binding(config, ctx)
         })
     };
     registry
-        .register_chain_binding("openai_web_search", factory)
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search'"));
+        .register_chain_binding("openai_web_search_dispatch", factory)
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search_dispatch'"));
 }
 
 // -----------------------------------------------------------------------------
@@ -693,15 +685,14 @@ mod tests {
             "state_owner",
             "project_state_owner_headers",
             "callout_credentials",
-            "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
-            "openai_operation",
+            "openai_chat_completions_request",
+            "ai_operation",
             "a2a",
             "intelligent_route",
             "provider_route",
             "credential_inject",
-            "anthropic_validate",
             "anthropic_web_search",
             "request_id",
             "openai_chat_completions_to_azureai_chat_completions",
@@ -717,12 +708,10 @@ mod tests {
     fn build_ai_registry_includes_responses_request_when_enabled() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        for name in ["openai_responses_request", "openai_responses_validate"] {
-            assert!(
-                names.contains(&name),
-                "expected {name} in registry when openai-responses is enabled"
-            );
-        }
+        assert!(
+            names.contains(&"openai_responses_request"),
+            "expected openai_responses_request in registry when openai-responses is enabled"
+        );
     }
 
     #[cfg(feature = "policy-engine")]
@@ -810,17 +799,19 @@ provider:
     /// Every opt-in filter paired with whether its cargo feature is enabled.
     const OPTIONAL_FILTERS: &[(&str, bool)] = &[
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
-        ("openai_responses_validate", cfg!(feature = "openai-responses")),
         ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
-        ("responses_to_chat_completions", cfg!(feature = "openai-responses")),
+        (
+            "openai_responses_to_chat_completions",
+            cfg!(feature = "openai-responses"),
+        ),
         ("openai_doc_extract", cfg!(feature = "openai-responses")),
         ("openai_client_tool_compat", cfg!(feature = "openai-responses")),
         ("openai_agentic_loop", cfg!(feature = "openai-responses")),
-        ("openai_file_search_callout", cfg!(feature = "openai-responses")),
-        ("openai_web_search", cfg!(feature = "openai-responses")),
+        ("openai_file_search_dispatch", cfg!(feature = "openai-responses")),
+        ("openai_web_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_file_resolve", cfg!(feature = "openai-file-resolve-filter")),
-        ("openai_response_store", cfg!(feature = "store")),
+        ("openai_responses_store", cfg!(feature = "store")),
         ("openai_responses_rehydrate", cfg!(feature = "store")),
         ("openai_conversations", cfg!(feature = "openai-conversations")),
         ("openai_responses_compact", cfg!(feature = "openai-compact")),
@@ -853,13 +844,13 @@ provider:
         assert!(registry.is_security_filter("gcp_adc"));
     }
 
-    /// Deserialize one `openai_file_search_callout` filter entry from YAML.
+    /// Deserialize one `openai_file_search_dispatch` filter entry from YAML.
     #[cfg(feature = "openai-responses")]
     fn file_search_entry(yaml: &str) -> FilterEntry {
-        serde_yaml::from_str(yaml).expect("file_search_callout entry parses")
+        serde_yaml::from_str(yaml).expect("file_search_dispatch entry parses")
     }
 
-    /// `openai_file_search_callout` is a chain-binding filter: it resolves its
+    /// `openai_file_search_dispatch` is a chain-binding filter: it resolves its
     /// `outbound_chain` into a prebuilt pipeline at build time. An inline chain
     /// referencing an unknown filter type cannot be built, so the whole pipeline
     /// build must fail closed rather than register a filter whose outbound
@@ -870,7 +861,7 @@ provider:
         let registry = build_ai_registry();
         let mut entries = vec![file_search_entry(
             "\
-filter: openai_file_search_callout
+filter: openai_file_search_dispatch
 vector_store_url: https://8.8.8.8
 outbound_chain:
   name: broken-outbound
@@ -893,7 +884,7 @@ outbound_chain:
     }
 
     /// `openai_file_resolve` is a chain-binding filter, but `outbound_chain` is
-    /// optional (matching `openai_file_search_callout`). Omitting it must default
+    /// optional (matching `openai_file_search_dispatch`). Omitting it must default
     /// to an empty inline chain (pure passthrough) that binds cleanly, so the
     /// pipeline build succeeds rather than rejecting the filter as misconfigured.
     #[cfg(feature = "openai-file-resolve-filter")]
@@ -947,7 +938,7 @@ outbound_chain:
         let registry = build_ai_registry();
         let mut entries = vec![file_search_entry(
             "\
-filter: openai_file_search_callout
+filter: openai_file_search_dispatch
 vector_store_url: https://8.8.8.8
 outbound_chain:
   name: ok-outbound
@@ -983,7 +974,7 @@ outbound_chain:
   steps:
     - name: inference
       filters:
-        - filter: openai_file_search_callout
+        - filter: openai_file_search_dispatch
           vector_store_url: https://8.8.8.8
           outbound_chain: vector-store-outbound
       on_result:

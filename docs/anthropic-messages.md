@@ -9,8 +9,7 @@ Anthropic requests to reach any backend.
 
 | Filter | Purpose |
 | ------ | ------- |
-| `anthropic_messages_format` | Classify requests and promote routing facts to headers |
-| `anthropic_validate` | Validate the JSON request envelope before forwarding |
+| `anthropic_messages_request` | Process the create-message body once: validate the envelope and promote routing facts |
 | `anthropic_messages_protocol` | Header management for native `/v1/messages` backends |
 | `anthropic_messages_to_chat_completions` | Bidirectional body transformation to the Chat Completions wire shape |
 | `anthropic_messages_to_chat_completions_stream` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
@@ -30,10 +29,8 @@ listeners:
 filter_chains:
   - name: anthropic
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
@@ -101,8 +98,32 @@ three-boundary credential isolation but adds the
 `path_rewrite` that maps `POST /v1/messages` to `/v1/chat/completions`. The
 client still speaks the Anthropic wire format; Praxis rewrites both the request
 and the response, so vLLM only ever sees OpenAI Chat Completions.
-Claude Code must disable thinking and prompt caching for this translated route;
-see the [Claude Code setup](developing/cli-vllm-through-praxis.md#4-connect-claude-code).
+
+Chat Completions cannot represent the Anthropic-only features an unmodified
+Claude Code client always sends — prompt caching (`cache_control` markers) and
+extended thinking (`thinking`). The example enables **operator-approved
+degradation** on the translation filter so those requests succeed instead of
+failing closed with a 400:
+
+```yaml
+- filter: anthropic_messages_to_chat_completions
+  allow_lossy_features:
+    - prompt_caching
+    - extended_thinking
+```
+
+Each listed feature's wire markers are validated and then stripped, and the
+degradation is reported to the operator — one `WARN` log per request, a
+`praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
+feature, and an `x-degraded-features` response header. `prompt_caching`
+preserves all prompt and tool content but does not honor explicit cache
+breakpoints, so cost and latency may differ; `extended_thinking` means the
+translated response carries no thinking blocks. Remove an entry to make that
+feature fail closed again. Malformed markers, other `context_management` edits,
+and every feature not listed are still rejected with a 400. Leaving the
+allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
+keeps the strict reject behavior, which an operator who would rather see the
+unsupported request fail than silently lose the feature should prefer.
 
 `/v1/messages/count_tokens` has no Chat Completions equivalent, so the
 `path_rewrite` is anchored to `^/v1/messages$` and leaves it unrewritten. A
@@ -186,7 +207,12 @@ setup, the vLLM image digest, served model, and startup request matrix live in
 The `vllm-gpu-claude-acceptance` job in
 [`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
 runs all four scenarios sequentially against one shared vLLM container, each
-exactly once (no retry), on every nightly GPU run. It can also run independently
+exactly once (no retry), on every nightly GPU run. A fifth scenario on the same
+container drives a read-only planning turn over the native path and fails if the
+run exhausts its turn budget instead of answering, or if reasoning-channel text
+reaches the user-visible answer — the nightly regression guard for issue #1418,
+where a mismatched `--reasoning-parser` made Claude Code loop and render its
+reasoning as the plan. It can also run independently
 through the `run_claude_acceptance` workflow-dispatch input. Runtime pins must be
 complete; the job fails fast with an explanatory error if any required value is
 empty or still contains `TBD`.
@@ -249,10 +275,8 @@ listeners:
 filter_chains:
   - name: anthropic
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
@@ -312,10 +336,8 @@ listeners:
 filter_chains:
   - name: transform
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_validate
 
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
@@ -379,11 +401,18 @@ The `anthropic_messages_to_chat_completions` filter:
   `moderation`); a `null` or the field's documented
   default (for example `n: 1`) is dropped instead
 - Rejects non-null `thinking` and `context_management`
-  because Chat Completions has no equivalent
+  because Chat Completions has no equivalent, unless
+  `extended_thinking` is in `allow_lossy_features`, which
+  strips `thinking` and thinking-only `context_management`
+  edits and reports the degradation instead (other
+  `context_management` edits are still rejected)
 - Forwards every other field untouched (for example
   `top_k`) and leaves its validation to the backend
 - Rejects `thinking` content blocks and content blocks
-  carrying non-empty citations or prompt-cache controls
+  carrying non-empty citations or prompt-cache controls,
+  unless `prompt_caching` is in `allow_lossy_features`,
+  which strips `cache_control` markers (preserving the
+  prompt and tool content) and reports the degradation
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and
@@ -407,15 +436,15 @@ path.
 
 ## Filter Configuration Reference
 
-### `anthropic_messages_format`
+### `anthropic_messages_request`
 
-Classifies requests by body structure, then promotes
-ambiguous `/v1/messages` or `anthropic-version`
-requests to Anthropic Messages when the body otherwise
-looks like Chat Completions.
+Owns the Anthropic create-message body. The Messages operation registry decides
+from the request head whether this filter applies, so `POST /v1/messages` is
+processed and every other operation — token counting, the batch family — and
+every other path is released untouched.
 
 ```yaml
-filter: anthropic_messages_format
+filter: anthropic_messages_request
 on_invalid: continue      # continue | reject
 max_body_bytes: 1048576    # 1 MiB
 headers:
@@ -424,29 +453,35 @@ headers:
   stream: x-praxis-ai-stream
 ```
 
-Body classification precedence:
-1. `input` or object-valued `prompt` → OpenAI Responses
-2. `messages` + `max_tokens` + Anthropic structural
-   signals → Anthropic Messages
-3. `messages` alone → OpenAI Chat Completions
+The matched body is deserialized once. That parse produces the routing
+metadata, the promoted headers, the filter results, and the typed
+`AnthropicMessagesState`. The forwarded bytes are never rewritten here.
 
-`anthropic-version` and `/v1/messages` upgrade only the
-ambiguous Chat Completions result to Anthropic Messages;
-they do not override Responses-shaped bodies.
+Body classification precedence no longer applies to this surface. The filter
+this replaced ranked `input`, then `messages` plus `max_tokens` with Anthropic
+structural signals, then `messages` alone — so an ordinary Anthropic body could
+be read as Chat Completions until a `/v1/messages` or `anthropic-version`
+tiebreak corrected it. The registry removes that guesswork.
 
-### `anthropic_validate`
+The endpoint is the authority on protocol. A Chat Completions-shaped body on
+`/v1/messages` is still the create-message operation, and an Anthropic-shaped
+body on another path is not. `anthropic-version` is contract validation rather
+than operation identity, so its absence changes nothing.
 
-Validates the proxy-owned JSON envelope before forwarding.
-Backend-owned Anthropic semantics such as model availability,
-message shape, role ordering, and token limits are deferred
-to the backend.
+This replaced a pair of filters that inferred the protocol from body structure
+and broke ties on `/v1/messages` or `anthropic-version`. That precedence is
+gone: the body no longer votes on which protocol a request belongs to.
 
-```yaml
-filter: anthropic_validate
-max_body_bytes: 1048576    # 1 MiB
-```
+`on_invalid` governs the envelope — a missing, malformed, or non-object body:
 
-Checks: request body is present, valid JSON, and a JSON object.
+| Value | Behavior |
+| ----- | -------- |
+| `continue` (default) | Forward the body and let the backend answer |
+| `reject` | Refuse at the gateway with an Anthropic-compatible client error |
+
+Those were previously separate filters with contradictory answers, and which
+one applied depended on whether a chain included the validator. Choose
+explicitly.
 
 ### `anthropic_messages_protocol`
 

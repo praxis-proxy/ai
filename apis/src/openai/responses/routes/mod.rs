@@ -10,7 +10,7 @@
 //! Operation IDs are the official ones from the pinned OpenAI specification,
 //! reproduced verbatim including upstream's casing.
 //!
-//! Under the transformed profile (`responses_to_chat_completions`), Praxis owns
+//! Under the transformed profile (`openai_responses_to_chat_completions`), Praxis owns
 //! the `POST /v1/responses` request and response contract, translating requests
 //! and resources for a Chat Completions backend. In native Responses passthrough
 //! deployments, the upstream provider owns the contract and continuations while
@@ -40,7 +40,7 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 ///
 /// Declared beside the registry that owns it, so registering a protocol
 /// never edits a shared list.
-const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_responses");
+pub(crate) const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_responses");
 
 /// Static metadata for one Responses operation.
 #[derive(Clone, Copy)]
@@ -302,6 +302,23 @@ pub(crate) fn match_route<'a>(method: &str, path: &'a str, transport: Transport)
         spec: matched.spec,
         params: matched.params,
     })
+}
+
+/// Resolve the runtime operation from the stable operation ID.
+///
+/// The `ai_operation` classifier publishes an [`AiOperationMatch`] whose
+/// `operation_id` is this registry's own string. Consumers that branch on the
+/// runtime [`ResponsesOperation`] map it back here rather than re-matching the
+/// route, so operation identity stays sourced from the one head classification.
+/// Operation IDs are unique across the registry, so at most one operation
+/// matches; an ID from another protocol yields `None`.
+///
+/// [`AiOperationMatch`]: crate::operation_classifier::AiOperationMatch
+pub(crate) fn operation_for_id(operation_id: &str) -> Option<ResponsesOperation> {
+    OPERATION_SPECS
+        .iter()
+        .find(|spec| spec.operation_id() == operation_id)
+        .map(|spec| spec.operation)
 }
 
 #[cfg(test)]

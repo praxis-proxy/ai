@@ -214,6 +214,19 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
     assert_eq!(search_requests.len(), 1);
     assert!(search_requests[0].uri.contains("q=Praxis%20Proxy%20latest%20release"));
     assert!(search_requests[0].uri.contains("count=10"));
+    // The request's `user_location.country` must reach the provider rather than
+    // being silently discarded (issue #1548). Brave carries the client's location
+    // in the `X-Loc-Country` header, not the result-market query param.
+    assert!(
+        search_requests[0].headers.to_lowercase().contains("x-loc-country: fr"),
+        "user_location country must be forwarded as the X-Loc-Country header: {}",
+        search_requests[0].headers
+    );
+    assert!(
+        !search_requests[0].uri.contains("country="),
+        "country must not be forwarded as a query param: {}",
+        search_requests[0].uri
+    );
 }
 
 #[test]
@@ -386,7 +399,7 @@ fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
 
 #[test]
 fn web_search_chat_completions_streaming_fails_closed_without_stream_events() {
-    // responses_to_chat_completions always advertises the streaming subrequest
+    // openai_responses_to_chat_completions always advertises the streaming subrequest
     // capability and selects the streaming transport for an effective
     // `"stream": true` request. Without `openai_stream_events` in the inference
     // step nothing publishes the `responses.logical_stream` marker, so typed
