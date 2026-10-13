@@ -965,6 +965,61 @@ pipeline:
       S13:
         state: inert
         note: no input_file parts to convert
+  - id: openai_responses_compact
+    name: openai_responses_compact
+    group: context
+    filter_type: openai_responses_compact
+    phase: request-phase pre-security summarization callout in the bound-body managed-responses chain, after rehydrate and file_resolve/doc_extract; fires only when a request carries context_management compaction and its token count exceeds the threshold; declares the experimental bound-upstream request-body phase (bound_upstream_request_body_access) so it can carry managed-responses' inherited bound_upstream condition; OpenAI-bound requests skip it with the rest of the chain
+    config:
+      inference_url: http://127.0.0.1:3001/v1/chat/completions
+      allow_private_inference_url: true
+      allow_pre_security_callout: true
+      default_model: gpt-4o-mini
+      timeout_ms: 60000
+    promotes: summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management
+    scenarios:
+      S1:
+        state: passthrough
+        note: managed create without context_management; the summarizer is inert
+      S2:
+        state: passthrough
+        note: streaming create without context_management; inert
+      S3:
+        state: passthrough
+        note: stateless create without context_management; inert
+      S4:
+        state: passthrough
+        note: multi-turn create without context_management; inert (history is rehydrated but not summarized)
+      S5:
+        state: passthrough
+        note: file_search create without context_management; inert
+      S6:
+        state: passthrough
+        note: MCP create without context_management; inert
+      S7:
+        state: passthrough
+        note: web_search create without context_management; inert
+      S8:
+        state: skipped
+        note: GET retrieve short-circuits at the store before this filter
+      S9:
+        state: skipped
+        note: direct-services terminal branch; never reached
+      S10:
+        state: passthrough
+        note: "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
+      S11:
+        state: skipped
+        note: direct-services terminal branch; never reached
+      S12:
+        state: skipped
+        note: direct-openai terminal branch ran first
+      S13:
+        state: passthrough
+        note: managed chat create without context_management; the summarizer is inert
+      S14:
+        state: skipped
+        note: native chat direct-services terminal branch; never reached
   - id: openai_mcp_tool_resolve
     name: openai_mcp_tool_resolve
     group: context
@@ -1074,61 +1129,6 @@ pipeline:
       S13:
         state: inert
         note: path is exactly /v1/responses (create); the unless gate excludes it
-  - id: openai_responses_compact
-    name: openai_responses_compact
-    group: context
-    filter_type: openai_responses_compact
-    phase: request-phase pre-security summarization callout in the terminal managed-execution chain, just before the IRR; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; owns an ordinary pre-read request-body hook so it cannot carry managed-responses' inherited bound_upstream condition (core rejects that combination); OpenAI-bound requests skip it structurally via the direct-openai terminal branch
-    config:
-      inference_url: http://127.0.0.1:3001/v1/chat/completions
-      allow_private_inference_url: true
-      allow_pre_security_callout: true
-      default_model: gpt-4o-mini
-      timeout_ms: 60000
-    promotes: summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management
-    scenarios:
-      S1:
-        state: passthrough
-        note: managed create without context_management; the summarizer is inert
-      S2:
-        state: passthrough
-        note: streaming create without context_management; inert
-      S3:
-        state: passthrough
-        note: stateless create without context_management; inert
-      S4:
-        state: passthrough
-        note: multi-turn create without context_management; inert (history is rehydrated but not summarized)
-      S5:
-        state: passthrough
-        note: file_search create without context_management; inert
-      S6:
-        state: passthrough
-        note: MCP create without context_management; inert
-      S7:
-        state: passthrough
-        note: web_search create without context_management; inert
-      S8:
-        state: skipped
-        note: GET retrieve short-circuits at the store before this filter
-      S9:
-        state: skipped
-        note: direct-services terminal branch; never reached
-      S10:
-        state: passthrough
-        note: "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
-      S11:
-        state: skipped
-        note: direct-services terminal branch; never reached
-      S12:
-        state: skipped
-        note: direct-openai terminal branch stops the parent chain before this filter; never reached
-      S13:
-        state: passthrough
-        note: managed chat create without context_management; the summarizer is inert
-      S14:
-        state: skipped
-        note: native chat direct-services terminal branch; never reached
   - id: iterative_request_router
     name: iterative_request_router
     group: irr
