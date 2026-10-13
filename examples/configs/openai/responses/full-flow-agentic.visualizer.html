@@ -2089,83 +2089,10 @@ const PIPELINE = {
       }
     },
     {
-      "id": "openai_responses_compact",
-      "name": "openai_responses_compact",
-      "group": "context",
-      "order": 19,
-      "phase": "request-phase pre-security summarization callout; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; owns an ordinary pre-read request-body hook so it cannot carry a bound_upstream condition (core rejects that combination); OpenAI-bound requests skip it structurally via the direct-openai terminal branch",
-      "config": {
-        "inference_url": "http://127.0.0.1:3001/v1/chat/completions",
-        "allow_private_inference_url": true,
-        "allow_pre_security_callout": true,
-        "default_model": "gpt-4o-mini",
-        "timeout_ms": 60000
-      },
-      "promotes": "summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management",
-      "scenarios": {
-        "S1": {
-          "state": "passthrough",
-          "note": "managed create without context_management; the summarizer is inert"
-        },
-        "S2": {
-          "state": "passthrough",
-          "note": "streaming create without context_management; inert"
-        },
-        "S3": {
-          "state": "passthrough",
-          "note": "stateless create without context_management; inert"
-        },
-        "S4": {
-          "state": "passthrough",
-          "note": "multi-turn create without context_management; inert (history is rehydrated but not summarized)"
-        },
-        "S5": {
-          "state": "passthrough",
-          "note": "file_search create without context_management; inert"
-        },
-        "S6": {
-          "state": "passthrough",
-          "note": "MCP create without context_management; inert"
-        },
-        "S7": {
-          "state": "passthrough",
-          "note": "web_search create without context_management; inert"
-        },
-        "S8": {
-          "state": "skipped",
-          "note": "GET retrieve short-circuits at the store before this filter"
-        },
-        "S9": {
-          "state": "skipped",
-          "note": "direct-services terminal branch; never reached"
-        },
-        "S10": {
-          "state": "passthrough",
-          "note": "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
-        },
-        "S11": {
-          "state": "skipped",
-          "note": "direct-services terminal branch; never reached"
-        },
-        "S12": {
-          "state": "skipped",
-          "note": "direct-openai terminal branch stops the parent chain before this filter; never reached"
-        },
-        "S13": {
-          "state": "passthrough",
-          "note": "managed chat create without context_management; the summarizer is inert"
-        },
-        "S14": {
-          "state": "skipped",
-          "note": "native chat direct-services terminal branch; never reached"
-        }
-      }
-    },
-    {
       "id": "openai_mcp_tool_resolve",
       "name": "openai_mcp_tool_resolve",
       "group": "context",
-      "order": 20,
+      "order": 19,
       "phase": "request-phase; resolves MCP tools/list from operator connectors; gated unless bound_upstream.application_provider=openai",
       "config": {
         "user_credential": "mcp_gateway",
@@ -2244,7 +2171,7 @@ const PIPELINE = {
       "id": "static_response",
       "name": "static_response (unsupported subpath 404)",
       "group": "routing",
-      "order": 21,
+      "order": 20,
       "phase": "request-phase terminal guard; returns 404 for a managed Responses request on an unsupported /v1/responses subpath",
       "config": {
         "status": 404,
@@ -2307,6 +2234,79 @@ const PIPELINE = {
         "S13": {
           "state": "inert",
           "note": "path is exactly /v1/responses (create); the unless gate excludes it"
+        }
+      }
+    },
+    {
+      "id": "openai_responses_compact",
+      "name": "openai_responses_compact",
+      "group": "context",
+      "order": 21,
+      "phase": "request-phase pre-security summarization callout in the terminal managed-execution chain, just before the IRR; fires only when a request carries context_management compaction and its token count exceeds the threshold; runs after rehydrate and file_resolve/doc_extract; owns an ordinary pre-read request-body hook so it cannot carry managed-responses' inherited bound_upstream condition (core rejects that combination); OpenAI-bound requests skip it structurally via the direct-openai terminal branch",
+      "config": {
+        "inference_url": "http://127.0.0.1:3001/v1/chat/completions",
+        "allow_private_inference_url": true,
+        "allow_pre_security_callout": true,
+        "default_model": "gpt-4o-mini",
+        "timeout_ms": 60000
+      },
+      "promotes": "summarizes prior history via an anonymous Chat callout to inference_url when context_management compaction is present and the token budget is exceeded, preserving the rewritten current-turn tail; transparent passthrough on requests without context_management",
+      "scenarios": {
+        "S1": {
+          "state": "passthrough",
+          "note": "managed create without context_management; the summarizer is inert"
+        },
+        "S2": {
+          "state": "passthrough",
+          "note": "streaming create without context_management; inert"
+        },
+        "S3": {
+          "state": "passthrough",
+          "note": "stateless create without context_management; inert"
+        },
+        "S4": {
+          "state": "passthrough",
+          "note": "multi-turn create without context_management; inert (history is rehydrated but not summarized)"
+        },
+        "S5": {
+          "state": "passthrough",
+          "note": "file_search create without context_management; inert"
+        },
+        "S6": {
+          "state": "passthrough",
+          "note": "MCP create without context_management; inert"
+        },
+        "S7": {
+          "state": "passthrough",
+          "note": "web_search create without context_management; inert"
+        },
+        "S8": {
+          "state": "skipped",
+          "note": "GET retrieve short-circuits at the store before this filter"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "direct-services terminal branch; never reached"
+        },
+        "S10": {
+          "state": "passthrough",
+          "note": "managed create (chat/anthropic body routed by #1602); no context_management, summarizer inert"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch; never reached"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch stops the parent chain before this filter; never reached"
+        },
+        "S13": {
+          "state": "passthrough",
+          "note": "managed chat create without context_management; the summarizer is inert"
+        },
+        "S14": {
+          "state": "skipped",
+          "note": "native chat direct-services terminal branch; never reached"
         }
       }
     },
@@ -3813,31 +3813,6 @@ const PIPELINE = {
       {
         "order": 19,
         "depth": 0,
-        "filter_type": "openai_responses_compact",
-        "name": null,
-        "irr_step": null,
-        "conditions": [
-          {
-            "unless": {
-              "grpc": null,
-              "path": null,
-              "path_prefix": null,
-              "methods": null,
-              "headers": null,
-              "headers_present": null,
-              "bound_upstream": {
-                "application_protocol": null,
-                "application_provider": "openai"
-              },
-              "selected_upstream": null
-            }
-          }
-        ],
-        "branch_chains": []
-      },
-      {
-        "order": 20,
-        "depth": 0,
         "filter_type": "openai_mcp_tool_resolve",
         "name": null,
         "irr_step": null,
@@ -3861,7 +3836,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 21,
+        "order": 20,
         "depth": 0,
         "filter_type": "static_response",
         "name": null,
@@ -3892,6 +3867,15 @@ const PIPELINE = {
             }
           }
         ],
+        "branch_chains": []
+      },
+      {
+        "order": 21,
+        "depth": 0,
+        "filter_type": "openai_responses_compact",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
         "branch_chains": []
       },
       {

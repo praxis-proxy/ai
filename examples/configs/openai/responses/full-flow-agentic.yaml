@@ -31,10 +31,12 @@
 # Two openai_responses_model_rewrite instances sit before the router: one
 # retargets the Responses body `model` for the managed Chat-translation route
 # without touching the router key, and one applies native Chat Completions model
-# policy on POST /v1/chat/completions. The bound-body barrier also runs
-# openai_responses_compact (summarize history on context_management requests),
-# and the IRR step runs openai_client_tool_compat (lower rich client tools to
-# backend function tools, restore on the response path) plus the
+# policy on POST /v1/chat/completions. openai_responses_compact (summarize
+# history on context_management requests) runs in the terminal managed-execution
+# chain just before the IRR — like the IRR it owns a pre-read request-body hook
+# and so cannot carry the bound-body barrier's inherited bound_upstream
+# condition. The IRR step runs openai_client_tool_compat (lower rich client
+# tools to backend function tools, restore on the response path) plus the
 # openai_responses_to_chat_completions vLLM reasoning dialect.
 #
 # ResponsesState created on the managed path persists across all IRR
@@ -674,29 +676,6 @@ filter_chains:
         allow_pre_security_callout: true
         on_unsupported: continue
 
-      # Summarize history when a request carries context_management compaction
-      # and its token count exceeds the threshold. Runs after rehydrate (history
-      # is present) and after file_resolve/doc_extract (so the rewritten
-      # current-turn tail is preserved, not restored to file_url/input_file).
-      # Inert on requests without context_management. Its anonymous summarization
-      # callout targets the gateway's own Chat backend; a deployment points
-      # inference_url at whatever summarizer it trusts.
-      #
-      # Like the IRR below, this filter owns an ordinary pre-read request-body
-      # hook that runs before the binding router publishes a decision, so it
-      # cannot carry a `bound_upstream` condition (core rejects that combination
-      # at build time). OpenAI-bound requests skip it structurally instead: the
-      # terminal direct-openai branch above stops the parent chain before it
-      # reaches this filter.
-      - filter: openai_responses_compact
-        allow_pre_security_callout: true
-        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
-        allow_private_inference_url: true
-        # Summarizer model served by inference_url. Deployments set this to the
-        # model their summarization endpoint serves (tests substitute it).
-        default_model: gpt-4o-mini
-        timeout_ms: 60000
-
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
         authorization_assertion: mcp_gateway
@@ -734,6 +713,31 @@ filter_chains:
               path_prefix: "/v1/responses"
           - unless:
               path: "/v1/responses"
+
+      # Summarize history when a request carries context_management compaction
+      # and its token count exceeds the threshold. Placed here in the terminal
+      # managed-execution chain — not in the bound-body managed-responses chain
+      # above — because, like the IRR below, it owns an ordinary pre-read
+      # request-body hook that runs before the binding router publishes a
+      # decision, so it cannot carry managed-responses' inherited bound_upstream
+      # condition (core rejects that combination at build time). OpenAI-bound
+      # traffic already left through the direct-openai terminal branch, so this
+      # chain's lack of a shared condition never exposes compaction to it. It
+      # still runs after rehydrate and file_resolve/doc_extract (all in the
+      # preceding managed-responses chain), so history is present and the
+      # rewritten current-turn tail is preserved, not restored to
+      # file_url/input_file; it is inert on requests without context_management.
+      # Its anonymous summarization callout targets the gateway's own Chat
+      # backend; a deployment points inference_url at whatever summarizer it
+      # trusts.
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        # Summarizer model served by inference_url. Deployments set this to the
+        # model their summarization endpoint serves (tests substitute it).
+        default_model: gpt-4o-mini
+        timeout_ms: 60000
 
       # Gateway-owned Responses requests flow here after both terminal direct
       # branches have been considered. OpenAI-bound requests skip the IRR
