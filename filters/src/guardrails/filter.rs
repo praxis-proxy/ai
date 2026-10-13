@@ -698,9 +698,7 @@ fn apply_response_redaction(
 /// `Content-Length` still fits.
 fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
     ensure_redactable_choice(choice, replacement.index)?;
-    let original = choice.take();
-    *choice = allowlisted_choice(original, replacement.modified_text)?;
-    Ok(())
+    write_allowlisted_choice(choice, replacement.modified_text)
 }
 
 /// Confirm the choice is an object whose message has text `content` and a string `role`.
@@ -713,36 +711,14 @@ fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<
     };
     ensure_text_content(message)?;
     if message.get("role").is_some_and(serde_json::Value::is_string) {
-        Ok(())
-    } else {
-        Err("ai_guardrails: cannot redact: message role is not a string".into())
+        return Ok(());
     }
+    Err("ai_guardrails: cannot redact: message role is not a string".into())
 }
 
-/// Rebuild a choice from the fields `redact_choice` is allowed to keep.
-fn allowlisted_choice(choice: serde_json::Value, modified_text: String) -> Result<serde_json::Value, FilterError> {
-    let serde_json::Value::Object(mut choice_object) = choice else {
-        return Err("ai_guardrails: choice is not a JSON object".into());
-    };
-    let index = choice_object.remove("index");
-    let finish_reason = choice_object.remove("finish_reason");
-    let Some(role) = choice_object
-        .get_mut("message")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|message| message.remove("role"))
-    else {
-        return Err("ai_guardrails: cannot redact: message role is not a string".into());
-    };
-    Ok(rebuilt_choice(index, role, modified_text, finish_reason))
-}
-
-/// Choice containing only `index`, `finish_reason`, and a message of `role` plus `content`.
-fn rebuilt_choice(
-    index: Option<serde_json::Value>,
-    role: serde_json::Value,
-    modified_text: String,
-    finish_reason: Option<serde_json::Value>,
-) -> serde_json::Value {
+/// Replace `choice` with `index`, `finish_reason`, and a message of `role` plus `content`.
+fn write_allowlisted_choice(choice: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
+    let (index, finish_reason, role) = allowlisted_choice_fields(choice)?;
     let mut message = serde_json::Map::new();
     message.insert("role".to_owned(), role);
     message.insert("content".to_owned(), serde_json::Value::String(modified_text));
@@ -755,7 +731,27 @@ fn rebuilt_choice(
     if let Some(finish_reason) = finish_reason {
         rebuilt.insert("finish_reason".to_owned(), finish_reason);
     }
-    serde_json::Value::Object(rebuilt)
+    *choice = serde_json::Value::Object(rebuilt);
+    Ok(())
+}
+
+/// Move the allowlisted fields out of `choice`.
+fn allowlisted_choice_fields(
+    choice: &mut serde_json::Value,
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>, serde_json::Value), FilterError> {
+    let Some(choice_object) = choice.as_object_mut() else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
+    let index = choice_object.remove("index");
+    let finish_reason = choice_object.remove("finish_reason");
+    let Some(role) = choice_object
+        .get_mut("message")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|message| message.remove("role"))
+    else {
+        return Err("ai_guardrails: cannot redact: message role is not a string".into());
+    };
+    Ok((index, finish_reason, role))
 }
 
 /// Apply each replacement to `messages[index]`, requiring `expected_role`.
