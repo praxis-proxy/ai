@@ -147,6 +147,12 @@ fn build_listener_pipelines(
     gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
+    // Hand the shared sub-request connector to the policy filters this registry
+    // builds. Mirrors praxis core's per-runtime `runtime_registry`: a policy
+    // filter needs the connector while it is constructed by `build_with_chains`,
+    // too early for `FilterPipeline::set_subrequest_client`, and cloning keeps
+    // the caller's registry free of this build's connector.
+    let registry = runtime_registry_with_policy_connector(registry, subrequest_client);
     // Expand each chain's inherited `conditions:` into its filters before
     // composition, so a chain-level gate applies to every filter in the chain
     // (chain gate evaluated first, AND-composed with each filter's own gate).
@@ -177,7 +183,7 @@ fn build_listener_pipelines(
         let _ = &gate_store_traffic;
 
         let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
         attach(listener, &mut pipeline);
 
@@ -188,6 +194,24 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Clone `registry` and hand it the proxy's shared sub-request `connector` as
+/// its policy connector, so every `policy` filter `build_with_chains`
+/// constructs from the returned registry dials through one runtime's keepalive
+/// pool, admission limit, and circuit breaker instead of opening its own.
+///
+/// Cloning (rather than mutating the caller's registry) keeps the connector
+/// scoped to this build: praxis core's per-runtime `runtime_registry` has the
+/// same shape, and the server sets the connector on its own copy each time it
+/// resolves pipelines.
+fn runtime_registry_with_policy_connector(
+    registry: &FilterRegistry,
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
+) -> FilterRegistry {
+    let mut runtime = registry.clone();
+    runtime.set_policy_connector(subrequest_client.connector());
+    runtime
 }
 
 /// Build the server-owned gate placed before store consumers on a listener
@@ -454,6 +478,76 @@ mod tests {
         assert!(
             pipelines.get("web").is_some(),
             "pipeline should exist for 'web' listener"
+        );
+    }
+
+    #[test]
+    fn build_registry_hands_policy_filters_the_shared_connector() {
+        // Build-time contract for `policy` filters: pipeline construction must
+        // hand the proxy's shared sub-request connector to the registry it
+        // builds filters from, so a `policy` filter's outbound calls (JWKS
+        // fetches, token exchanges) share one runtime's pool rather than each
+        // opening its own. praxis core moved this from a process-global to a
+        // per-registry connector, so the contract is now observable directly on
+        // the build registry instead of through a registered probe filter.
+        let registry = FilterRegistry::with_builtins();
+        assert!(
+            registry.policy_connector().is_none(),
+            "a freshly built registry must not carry a policy connector"
+        );
+
+        let client = test_client();
+        let runtime = runtime_registry_with_policy_connector(&registry, &client);
+
+        let handed = runtime
+            .policy_connector()
+            .expect("pipeline construction must register a policy connector");
+        assert!(
+            std::ptr::eq(handed.connector(), client.connector().connector()),
+            "policy filters must receive the proxy's shared connector"
+        );
+        assert!(
+            registry.policy_connector().is_none(),
+            "cloning must keep the caller's registry free of this build's connector"
+        );
+    }
+
+    #[test]
+    fn resolve_pipelines_does_not_mutate_callers_registry() {
+        // Clone-discipline contract, asserted through the real production entry
+        // point rather than the helper in isolation: `resolve_pipelines` ->
+        // `build_listener_pipelines` hands `build_with_chains` a *cloned* runtime
+        // registry carrying the connector, so the caller's registry must still
+        // have no policy connector after a full build. This catches a regression
+        // that set the connector on the caller's registry (or reordered the clone
+        // so the shared registry is mutated in place) while
+        // `build_registry_hands_policy_filters_the_shared_connector` proves the
+        // cloned registry actually carries it. A built policy filter's own
+        // connector is `pub(super)` in core and cannot be inspected from here, so
+        // the shared-connector contract is asserted at the registry boundary,
+        // exactly as praxis core tests its own `runtime_registry`.
+        let registry = FilterRegistry::with_builtins();
+        assert!(
+            registry.policy_connector().is_none(),
+            "a freshly built registry must not carry a policy connector"
+        );
+
+        let pipelines = resolve_pipelines(
+            &valid_config(),
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &test_client(),
+        )
+        .expect("the production build path must succeed");
+        assert!(
+            pipelines.get("web").is_some(),
+            "the build must still produce a pipeline"
+        );
+
+        assert!(
+            registry.policy_connector().is_none(),
+            "resolve_pipelines must build from a clone and never mutate the caller's registry"
         );
     }
 
