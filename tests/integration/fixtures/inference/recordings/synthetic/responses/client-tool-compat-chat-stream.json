@@ -68,7 +68,7 @@
               },
               {
                 "event": "response.output_item.added",
-                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"ctc_call_recorded_0002\",\"name\":\"apply_patch\",\"status\":\"in_progress\",\"type\":\"custom_tool_call\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"ctc_call_recorded_0002\",\"input\":\"\",\"name\":\"apply_patch\",\"status\":\"in_progress\",\"type\":\"custom_tool_call\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
                 "id": null,
                 "retry": null
               },

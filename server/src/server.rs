@@ -300,18 +300,41 @@ fn register_admin_endpoints(
     health_registry: HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
+    use praxis_protocol::http::pingora::health;
+
+    // praxis 0.7.4 splits the admin API (`/api/*`) from the health/metrics
+    // listener (`/healthy`, `/ready`, `/metrics`), each bound to its own
+    // address. Install the Prometheus recorder once when either listener is
+    // configured, then register its upkeep and bind the two services.
+    let prometheus_recorder = (config.admin.address.is_some() || config.admin.metrics_address.is_some())
+        .then(health::install_prometheus_admin_recorder);
+
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+        health::add_admin_api_to_pingora_server(
             server.server_mut(),
             admin_addr,
-            praxis_protocol::http::pingora::health::AdminEndpointOptions {
-                health_registry: Some(health_registry),
+            health::AdminEndpointOptions {
+                health_registry: Some(Arc::clone(&health_registry)),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
                 stats: None,
                 verbose: config.admin.verbose,
             },
+        );
+    }
+
+    if let Some(recorder) = prometheus_recorder {
+        health::add_prometheus_upkeep_to_pingora_server(server.server_mut(), recorder);
+    }
+
+    if let Some(metrics_addr) = &config.admin.metrics_address {
+        health::add_health_endpoint_to_pingora_server_with_pipelines(
+            server.server_mut(),
+            metrics_addr,
+            Some(health_registry),
+            config.admin.verbose,
+            None,
         );
     }
 }

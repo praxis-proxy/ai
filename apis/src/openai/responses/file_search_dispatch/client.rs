@@ -818,7 +818,8 @@ impl FileSearchClient {
     /// inflating the caller's.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one sub-request threads the shared executor, chain, bound request, and deadline clock"
+        clippy::large_stack_frames,
+        reason = "one sub-request threads the shared executor, chain, bound request, and deadline clock; the executor future is inherently large"
     )]
     async fn run_outbound(
         &self,

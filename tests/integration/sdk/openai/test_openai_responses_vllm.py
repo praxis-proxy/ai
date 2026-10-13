@@ -49,6 +49,7 @@ from openai import (
     OpenAI,
     PermissionDeniedError,
 )
+from openai.types.responses import ResponseCustomToolCall
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -6087,9 +6088,14 @@ class TestClientToolCompatVLLM:
         )
 
         event_types = []
+        added_items = []
         final_response = None
         for event in stream:
             event_types.append(event.type)
+            if event.type == "response.output_item.added":
+                if event.item.type == "custom_tool_call":
+                    ResponseCustomToolCall.model_validate(event.item.model_dump())
+                added_items.append(event.item)
             if event.type == "response.completed":
                 final_response = event.response
 
@@ -6112,6 +6118,17 @@ class TestClientToolCompatVLLM:
         )
         assert custom_calls[0].name == "apply_patch"
         assert isinstance(custom_calls[0].input, str)
+        custom_added_items = [
+            item for item in added_items if item.type == "custom_tool_call"
+        ]
+        assert custom_added_items, (
+            "stream must announce the restored call with a custom_tool_call "
+            f"output_item.added frame; got: {[item.type for item in added_items]}"
+        )
+        assert all(item.input == "" for item in custom_added_items), (
+            "each restored custom_tool_call added frame must start with an empty "
+            f"input: {[item.model_dump() for item in custom_added_items]}"
+        )
         # No un-restored private function_call item may leak to the client.
         assert "function_call" not in output_types, (
             f"lowered function must not leak on the stream: {output_types}"

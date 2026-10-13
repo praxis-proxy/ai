@@ -79,6 +79,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.response.empty_string_tool_arguments
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/empty-string-tool-arguments
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.invalid_tool_id
     scopes:
       - messages_to_chat_completions

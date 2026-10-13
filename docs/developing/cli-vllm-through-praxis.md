@@ -11,6 +11,9 @@ Claude Code -> Praxis /v1/messages         -> vLLM /v1/chat/completions (transla
 OpenCode    -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
 ```
 
+One gateway can serve all three clients over their native paths at once; see
+[Serving all three clients from one gateway](#serving-all-three-clients-from-one-gateway).
+
 Use the native paths when vLLM exposes the corresponding Responses or
 Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
 and lowers only client-owned tool types that vLLM does not understand. Use a
@@ -152,10 +155,61 @@ cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
 
 OpenCode was tested with the
 [native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
-Its catch-all route forwards `/v1/chat/completions` to vLLM without body
-translation, and Anthropic validation is scoped to `/v1/messages`.
+It declares an explicit `/v1/chat/completions` route that forwards to vLLM
+without body translation, and Anthropic validation is scoped to `/v1/messages`.
 The same gateway can serve both Claude Code and OpenCode, provided vLLM
 supports their respective endpoints.
+
+### Serving all three clients from one gateway
+
+One proxy process can serve all three CLIs over their native paths at once.
+There is no example config for this, because it is the two native examples
+above placed in one file: the Claude Code and OpenCode chain from
+`anthropic/messages-native-vllm.yaml` and the Codex chain from
+`openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
+the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
+
+```yaml
+listeners:
+  # Claude Code (/v1/messages) and OpenCode (/v1/chat/completions).
+  - name: messages-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [claude-and-opencode]
+
+  # Codex (/v1/responses).
+  - name: responses-gateway
+    address: "127.0.0.1:8081"
+    filter_chains: [codex-responses]
+
+filter_chains:
+  - name: claude-and-opencode
+    filters: # ... from anthropic/messages-native-vllm.yaml
+  - name: codex-responses
+    # Prefix with the same basic_auth filter the chain above uses, so one
+    # shared credential gates both listeners. Give this chain's cluster its
+    # own name; the endpoint is the same vLLM server.
+    filters: # ... from openai/responses/client-tool-compat.yaml
+```
+
+Keep Codex on a listener of its own. Its rich client tools need
+`openai_client_tool_compat`, which needs `openai_stream_events`, which fails
+closed outside an `iterative_request_router` step. The IRR is a terminal filter
+that cannot share a chain with a top-level `load_balancer`, so everything on
+that listener would have to route through it — and the IRR buffers a
+sub-request response unless a filter selects streaming, which the native
+`/v1/messages` and `/v1/chat/completions` paths do not. Routing them through it
+would hold each turn's SSE until the turn finished, so Claude Code and OpenCode
+would render nothing until completion. Because every CLI configures its own
+base URL, the second port costs one line of client config.
+
+Point Claude Code and OpenCode at `http://127.0.0.1:8080` and Codex at
+`http://127.0.0.1:8081/v1`, then follow sections 3 to 5 unchanged with two
+exceptions: Codex now sits behind `basic_auth` and must present the shared
+Basic credential rather than a Bearer key — see
+[Codex behind the gateway's Basic auth](#codex-behind-the-gateways-basic-auth) —
+and from the container image the store needs the same absolute `database_url`
+as the native Codex example, see
+[the writable database path note](#the-native-codex-example-needs-a-writable-database-path).
 
 The native Codex example uses `127.0.0.1:3001` as its fixture backend; change
 that endpoint to `127.0.0.1:8000` for the local vLLM server. The other examples
@@ -365,6 +419,40 @@ If you selected the translated Codex example instead, set
 Chat Completions, injects `VLLM_API_KEY`, and streams the translated response
 back.
 
+### Codex behind the gateway's Basic auth
+
+The native Codex example has no `basic_auth` filter, so the client credential
+above *is* the backend credential. Put Codex behind a gateway that
+authenticates clients — as the Claude examples do, and as the
+[all-in-one gateway](#serving-all-three-clients-from-one-gateway) does — and it
+must present the Basic credential instead. Codex builds its provider headers
+from `http_headers` and `env_http_headers` independently of `env_key`, and
+applies the `env_key` bearer by *appending* `Authorization` rather than
+replacing it, so setting both sends two `Authorization` headers. Omit `env_key`
+entirely and carry the credential in `env_http_headers`:
+
+```console
+export PRAXIS_GATEWAY_AUTH="Basic $(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
+```
+
+```toml
+[model_providers.praxis]
+name = "Local Praxis"
+base_url = "http://127.0.0.1:8081/v1"
+wire_api = "responses"
+env_http_headers = { Authorization = "PRAXIS_GATEWAY_AUTH" }
+```
+
+With no `env_key`, no `experimental_bearer_token`, and `requires_openai_auth`
+left at its default, Codex resolves an unauthenticated provider and contributes
+no auth headers of its own. The isolated `CODEX_HOME` is load-bearing rather
+than merely tidy here: a logged-in Codex home would supply ambient credentials
+that this provider would otherwise inherit.
+
+`basic_auth` then verifies the client credential and strips it, and
+`credential_injection` supplies `VLLM_API_KEY` toward vLLM — the same
+three-credential separation the Claude examples use.
+
 ## 4. Connect Claude Code
 
 The Claude examples authenticate the client with Basic auth and independently
@@ -493,9 +581,21 @@ export default async () => ({
 ```
 
 The plugin checks the merged provider URL before attaching Basic auth with
-username `gateway`. It rejects project overrides that change the destination.
-Set `PRAXIS_BASE_URL` only to a gateway you trust; it must exactly match
-`baseURL`, including any trailing slash.
+username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you trust; it must
+exactly match `baseURL`, including any trailing slash.
+
+> **The guard withholds the credential; it does not stop the request.**
+> Verified against OpenCode 1.18.35: when the `config` hook throws — a
+> `baseURL` mismatch, or an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs
+> `plugin config hook failed` and **continues**, sending the turn with no
+> `Authorization` header. It exits `0` and the event stream ends in
+> `step_finish`, so the run looks successful. The error is only visible if you
+> passed `--print-logs`.
+>
+> Against a real Praxis gateway the unauthenticated request is rejected with
+> `401`, so the turn does fail — but it fails as a gateway error rather than as
+> a plugin error. Treat the destination check as defence in depth, not as an
+> enforcing control, and read a sudden `401` as a possible plugin failure.
 
 Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
 section 2. It must match the password in the Praxis process environment;
@@ -507,6 +607,72 @@ opencode --model "praxis/$VLLM_MODEL"
 
 Quit and restart OpenCode after changing its configuration or plugin. You can
 also select the configured model with `/models`.
+
+### Headless invocation
+
+`opencode run` drives a single turn non-interactively, which is what CI and
+scripts want:
+
+```console
+opencode run --model "praxis/$VLLM_MODEL" --format json -- "Summarize README.md"
+```
+
+The prompt is a **positional argument**. There is no `-p` prompt flag: on `run`,
+`-p`/`--password` is the OpenCode *server* Basic-auth password, so copying the
+`claude -p "..."` habit silently passes your prompt as a password. Use `--` to
+separate the prompt from the flags.
+
+`--format json` emits raw JSON events, one per line, instead of formatted
+output. A successful turn emits `step_start`, one or more `text` events
+(assistant text is at `part.text`), then `step_finish`; a failed turn emits an
+`error` event carrying `statusCode` and the resolved request URL. `--print-logs`
+and `--log-level DEBUG` are global flags (not `run` flags) and send diagnostics
+to stderr — use them to confirm which `baseURL` the provider actually resolved,
+and to surface plugin failures, which are otherwise silent.
+
+**Redirect stdin from `/dev/null`.** If stdin stays open, `opencode run` blocks
+indefinitely after logging `init` — before it issues a single request — even
+though the prompt was supplied as an argument. In a script or CI job that
+presents as a hang with no output and no network activity.
+
+### Alternative: per-model headers without a plugin
+
+The plugin above exists because `provider.<id>.options` has no `headers` key —
+it accepts only `apiKey`, `baseURL`, `enterpriseUrl`, `setCacheKey`, `timeout`,
+`headerTimeout`, and `chunkTimeout`. But a **per-model** `headers` map is part
+of the published schema, so the gateway credential can be attached declaratively
+and the plugin skipped entirely:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "praxis": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 },
+          "headers": { "Authorization": "Basic <base64 of gateway:password>" }
+        }
+      }
+    }
+  }
+}
+```
+
+Pair it with `opencode --pure`, which runs without external plugins. The model
+object rejects unknown keys, so a misspelling is a hard startup error rather
+than a silently ignored setting.
+
+**Prefer the plugin for interactive use.** It reads the password from the
+environment at runtime and refuses to attach the credential if a project-level
+config has repointed `baseURL` at another host. The `headers` map does neither:
+it bakes a base64 credential into a file on disk and will send it wherever
+`baseURL` happens to point. Use it for CI and ephemeral credentials, not for a
+developer's `~/.config`.
 
 ## Cleanup
 
@@ -521,7 +687,29 @@ kill "$PRAXIS_PID"
 - `401` from Praxis on the Claude or OpenCode path: verify the Basic
   authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
   the gateway's password.
+- `opencode run` hangs after logging `init` and nothing reaches Praxis: stdin
+  is still open. Redirect it from `/dev/null`. This is not a network problem —
+  OpenCode needs no egress beyond Praxis itself, and completes normally in a
+  loopback-only network namespace.
+- OpenCode sends requests with no `Authorization` header and the gateway
+  answers `401`, with no plugin error in the default output: the
+  `praxis-auth.ts` `config` hook threw and was swallowed, so no auth was
+  attached. The turn fails, but the `401` reads like an ordinary gateway
+  rejection rather than a plugin failure. Re-run with `--print-logs` and look
+  for `plugin config hook failed`. Usual causes are an unset
+  `GATEWAY_AUTH_PASSWORD` or a `PRAXIS_BASE_URL` that does not exactly match
+  the merged `baseURL`.
+- OpenCode reaches api.openai.com instead of Praxis, or asks for
+  `OPENAI_API_KEY`: the provider `options` were not applied, which upstream has
+  reported for both the bundled adapter and sub-sessions. Confirm the resolved
+  `baseURL` with `--print-logs --log-level DEBUG` and pin a known-good version.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
+- `401` from Praxis on a Codex path gated by `basic_auth`: `env_key` is
+  probably still set alongside `env_http_headers`. Codex appends the `env_key`
+  bearer rather than replacing the configured header, so the request carries
+  two `Authorization` headers and `basic_auth` does not see the Basic one it
+  expects. Remove `env_key` from the provider block. A stale logged-in
+  `CODEX_HOME` can do the same thing; use the `mktemp -d` home from section 3.
 - Model not found: use the exact slash-free served name, normally `qwen3-8b`.
 - `400` with `request body is not JSON` on a request that has no body, such as
   `GET /v1/models`, logged as
@@ -538,11 +726,18 @@ kill "$PRAXIS_PID"
   forwards genuinely malformed Responses bodies to vLLM rather than rejecting
   them at the gateway.
 - RFC 9457 `application/problem+json` where an OpenAI client expects
-  `{"error": {...}}`: `openai_responses_request` resolves Responses operations
-  only, so it does not own the protocol decision for the Chat Completions and
-  other OpenAI traffic a coding client also sends. Put `ai_operation` ahead
-  of it, as both Codex examples do; it classifies from the request head and
-  installs the OpenAI error formatter for every OpenAI protocol.
+  `{"error": {...}}`: the chain is missing `ai_operation`. The body
+  classifiers each resolve one protocol — `openai_responses_request` covers
+  Responses, and `anthropic_messages_request` installs its formatter only on
+  the Anthropic Messages surface — so neither owns the protocol decision for
+  the Chat Completions traffic a coding client also sends, and the
+  request reaches core's error path with no formatter installed. `ai_operation`
+  classifies from the request head and installs the matching formatter for
+  every OpenAI and Anthropic protocol; put it directly after `basic_auth`, as
+  the Codex examples and the native Claude Code and OpenCode example do.
+  This bites OpenCode hardest: it is the one client whose traffic
+  (`/v1/chat/completions`) shares a listener with another protocol, so a config
+  derived from an older copy sends it problem details its SDK cannot parse.
 - `400` with `maximum context length is 32768 tokens` and a requested output
   count near 21,000: Claude Code's default output budget does not fit the
   window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.
@@ -574,7 +769,12 @@ kill "$PRAXIS_PID"
   the host firewall; a loopback-only listener refuses the connection
   immediately, whereas a blocked port usually hangs or reports no route. Binding
   to `0.0.0.0` exposes the gateway to the network, so keep the authentication
-  filter in place.
+  filter in place and terminate TLS in front of it — the shared Basic password
+  is otherwise readable on the wire. A second listener, such as the Codex one
+  in the
+  [all-in-one gateway](#serving-all-three-clients-from-one-gateway), needs the
+  same treatment plus its own `-p 8081:8081` under the published-port container
+  path.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.

@@ -210,9 +210,9 @@ fn provider_auth(provider: SearchProvider) -> (http::HeaderName, &'static str) {
 /// zeroized, on any host *or* port divergence — an exact authority, never a host
 /// wildcard. The port is the URL's explicit port, else the scheme default (443
 /// for `https` or a scheme-less URL, 80 for `http`) — the same effective port the
-/// executor pins. `IPv6` literals are re-bracketed because `Uri::host` strips the
-/// brackets but [`DeferredCredential::new`] requires bracketed `IPv6` to separate
-/// host from port.
+/// executor pins. `Uri::host` already returns `IPv6` literals bracketed, so only
+/// an unbracketed literal is re-bracketed here; [`DeferredCredential::new`]
+/// requires bracketed `IPv6` to separate host from port.
 ///
 /// # Errors
 ///

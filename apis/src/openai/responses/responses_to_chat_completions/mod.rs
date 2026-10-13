@@ -29,7 +29,6 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     SelectedUpstreamBodyOutcome, SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
-use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::{
@@ -165,6 +164,10 @@ pub struct ResponsesToChatCompletionsFilter {
     config: ResponsesToChatCompletionsConfig,
 }
 
+/// Serialized outbound Chat Completions body paired with its effective `stream`
+/// bit, captured during translation so transport selection never re-parses it.
+type TranslatedRequest = (Vec<u8>, bool);
+
 impl ResponsesToChatCompletionsFilter {
     /// Create the filter from YAML configuration.
     ///
@@ -183,15 +186,26 @@ impl ResponsesToChatCompletionsFilter {
         }))
     }
 
-    /// Build and size-check the owned Chat Completions request body.
+    /// Build and size-check the owned Chat Completions request body, returning
+    /// it alongside the effective outbound `stream` bit.
+    ///
+    /// The `stream` flag is read once from the in-memory translated value rather
+    /// than re-deserializing the serialized bytes: translation copies `stream`
+    /// verbatim from the client request (`map_stream_options`), so this is the
+    /// same bit the backend sees, and the outbound body can carry multi-MB of
+    /// rehydrated history we must not parse twice.
     fn translated_request_bytes(
         &self,
         ctx: &HttpFilterContext<'_>,
-    ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+    ) -> Result<Result<TranslatedRequest, SelectedUpstreamBodyOutcome>, FilterError> {
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        let stream = translated
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -204,7 +218,7 @@ impl ResponsesToChatCompletionsFilter {
                 rewritten_body_too_large_rejection(serialized.len(), self.config.max_rewritten_body_bytes),
             )));
         }
-        Ok(Ok(serialized))
+        Ok(Ok((serialized, stream)))
     }
 
     /// Transform one fully buffered finite provider response.
@@ -468,14 +482,14 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             return Ok(outcome);
         }
 
-        let serialized = match self.translated_request_bytes(ctx)? {
-            Ok(bytes) => bytes,
+        let (serialized, stream) = match self.translated_request_bytes(ctx)? {
+            Ok(result) => result,
             Err(outcome) => return Ok(outcome),
         };
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
-        select_terminal_response_mode(ctx, body);
+        select_terminal_response_mode(ctx, stream);
         if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
             return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
         }
@@ -490,33 +504,20 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 }
 
-/// Narrow deserialization target for the provider-visible stream bit.
+/// Align the typed Praxis response transport with the effective outbound
+/// `stream` bit.
 ///
-/// Only `stream` participates in transport selection; every other translated
-/// request field is intentionally ignored.
-#[derive(Deserialize)]
-struct EffectiveResponseMode {
-    /// Whether the translated outbound Chat Completions request asks for SSE.
-    #[serde(default)]
-    stream: bool,
-}
-
-/// Align the typed Praxis response transport with the translated outbound body.
-///
-/// The translated Chat Completions body carries the effective `stream` bit
-/// copied from the client Responses request, so this selects the transport
-/// matching the bytes it leaves for the backend: incremental typed streaming for
-/// an SSE request, buffered otherwise. Selecting streaming is what keeps each
-/// translated per-round stream internal to the iterative router — buffering it
-/// would deliver the whole SSE body to `openai_agentic_loop` as an opaque blob
-/// it cannot parse as a Responses resource, so the loop would terminate before
-/// `openai_web_search_dispatch` ever dispatches.
-fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
-    let mode = if body
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<EffectiveResponseMode>(bytes).ok())
-        .is_some_and(|selection| selection.stream)
-    {
+/// `stream` is the bit copied verbatim from the client Responses request into
+/// the translated Chat Completions body, captured during translation instead of
+/// re-deserializing the (potentially multi-MB) outbound body. It selects the
+/// transport matching the bytes left for the backend: incremental typed
+/// streaming for an SSE request, buffered otherwise. Selecting streaming is what
+/// keeps each translated per-round stream internal to the iterative router —
+/// buffering it would deliver the whole SSE body to `openai_agentic_loop` as an
+/// opaque blob it cannot parse as a Responses resource, so the loop would
+/// terminate before `openai_web_search_dispatch` ever dispatches.
+fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, stream: bool) {
+    let mode = if stream {
         SubRequestResponseMode::Streaming
     } else {
         SubRequestResponseMode::Buffered

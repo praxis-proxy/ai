@@ -97,6 +97,10 @@ pub fn build_full_registry(
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> praxis_filter::FilterRegistry {
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    // Hand the shared sub-request connector to the registry's `policy` filters so
+    // their outbound calls share this runtime's keepalive pool and admission
+    // limit (praxis 0.7.4 moved this off a process-global onto the registry).
+    registry.set_policy_connector(subrequest_client.connector());
     praxis_ai_filters::register_ai_filters(&mut registry, Some(subrequest_client));
     register_llmd_ext_proc(&mut registry);
     register_external_filters(&mut registry);

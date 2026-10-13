@@ -16,6 +16,8 @@ const ERROR_SCENARIO: &str = "messages/upstream-error";
 const ERROR_PROVIDER: &str = "synthetic";
 const MALFORMED_TOOL_ARGUMENTS_SCENARIO: &str = "messages/malformed-tool-arguments";
 const MALFORMED_TOOL_ARGUMENTS_PROVIDER: &str = "synthetic";
+const EMPTY_STRING_TOOL_ARGUMENTS_SCENARIO: &str = "messages/empty-string-tool-arguments";
+const EMPTY_STRING_TOOL_ARGUMENTS_PROVIDER: &str = "synthetic";
 const MALFORMED_COMPACTION_SCENARIO: &str = "responses/chat-malformed-compaction";
 const MALFORMED_COMPACTION_PROVIDER: &str = "synthetic";
 const NATIVE_ANTHROPIC_PROVIDER: &str = "anthropic";
@@ -57,6 +59,7 @@ async fn all_inference_fixtures_replay() {
     let mut saw_stream_representative = false;
     let mut saw_error_representative = false;
     let mut saw_malformed_tool_arguments = false;
+    let mut saw_empty_string_tool_arguments = false;
     let mut saw_malformed_compaction = false;
     let mut saw_agentic_parallel_tool_calls = false;
     let mut saw_agentic_status_less_function_call = false;
@@ -100,6 +103,10 @@ async fn all_inference_fixtures_replay() {
         if scenario_id == MALFORMED_TOOL_ARGUMENTS_SCENARIO && provider == MALFORMED_TOOL_ARGUMENTS_PROVIDER {
             assert_malformed_tool_arguments_error(&report.actual, scenario_id, provider);
             saw_malformed_tool_arguments = true;
+        }
+        if scenario_id == EMPTY_STRING_TOOL_ARGUMENTS_SCENARIO && provider == EMPTY_STRING_TOOL_ARGUMENTS_PROVIDER {
+            assert_empty_string_tool_arguments(&report.actual, scenario_id, provider);
+            saw_empty_string_tool_arguments = true;
         }
         if scenario_id == MALFORMED_COMPACTION_SCENARIO && provider == MALFORMED_COMPACTION_PROVIDER {
             assert_malformed_compaction_error(&report.actual, scenario_id, provider);
@@ -155,6 +162,10 @@ async fn all_inference_fixtures_replay() {
     assert!(
         saw_malformed_tool_arguments,
         "missing representative recording for scenario `{MALFORMED_TOOL_ARGUMENTS_SCENARIO}` and provider `{MALFORMED_TOOL_ARGUMENTS_PROVIDER}`"
+    );
+    assert!(
+        saw_empty_string_tool_arguments,
+        "missing representative recording for scenario `{EMPTY_STRING_TOOL_ARGUMENTS_SCENARIO}` and provider `{EMPTY_STRING_TOOL_ARGUMENTS_PROVIDER}`"
     );
     assert!(
         saw_malformed_compaction,
@@ -279,6 +290,41 @@ fn assert_malformed_tool_arguments_error(actual: &WireFixture, scenario_id: &str
     assert_eq!(
         client, &client_expected,
         "malformed tool arguments must convert to an Anthropic api_error envelope for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_empty_string_tool_arguments(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    assert_eq!(
+        turn.client.response.status, 200,
+        "client status changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a client JSON body");
+    };
+    let content = value["content"].as_array().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay Anthropic content blocks");
+    });
+    let tool_use = content
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .unwrap_or_else(|| {
+            panic!("scenario `{scenario_id}` and provider `{provider}` must replay a tool_use content block");
+        });
+    assert_eq!(
+        tool_use["name"], "now",
+        "tool name changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    assert_eq!(
+        tool_use["input"],
+        json!({}),
+        "empty-string tool arguments must become an empty tool_use input for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    assert_eq!(
+        value["stop_reason"], "tool_use",
+        "stop reason changed for scenario `{scenario_id}` and provider `{provider}`"
     );
 }
 
