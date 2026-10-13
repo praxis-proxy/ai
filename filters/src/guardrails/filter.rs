@@ -585,13 +585,12 @@ fn record_verdict(
             body,
             reason,
             phase,
-            phase_label,
             verdict,
             content_length_committed(ctx),
         )),
         GuardResult::Redact { replacements, reason } => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
-            apply_redaction(ctx, body, replacements, phase)
+            Ok(apply_redaction(ctx, body, replacements, phase))
         },
     }
 }
@@ -614,16 +613,16 @@ fn apply_redaction(
     body: &mut Option<Bytes>,
     replacements: Vec<MessageRedaction>,
     phase: GuardPhase,
-) -> Result<FilterAction, FilterError> {
+) -> FilterAction {
     match phase {
         GuardPhase::Request => {
             if let Err(error) = apply_request_redaction(body, replacements) {
                 tracing::error!(%error, "ai_guardrails: request-phase redaction failed");
-                return Ok(FilterAction::Reject(
+                return FilterAction::Reject(
                     Rejection::status(502).with_body(format!("Guardrail redaction failed: {error}")),
-                ));
+                );
             }
-            Ok(FilterAction::Continue)
+            FilterAction::Continue
         },
         GuardPhase::Response => {
             let content_length_committed = content_length_committed(ctx);
@@ -637,7 +636,7 @@ fn apply_redaction(
                     content_length_committed,
                 );
             }
-            Ok(FilterAction::Continue)
+            FilterAction::Continue
         },
     }
 }
@@ -698,24 +697,33 @@ fn apply_response_redaction(
 /// completion. Dropping them only shrinks the body, so a committed
 /// `Content-Length` still fits.
 fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
-    let Some(choice_object) = choice.as_object_mut() else {
+    ensure_redactable_choice(choice, replacement.index)?;
+    let original = choice.take();
+    *choice = allowlisted_choice(original, replacement.modified_text)?;
+    Ok(())
+}
+
+/// Confirm the choice is an object whose message has text `content` and a string `role`.
+fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<(), FilterError> {
+    let Some(choice_object) = choice.as_object() else {
         return Err("ai_guardrails: choice is not a JSON object".into());
     };
-    let role_is_string = {
-        let Some(message) = choice_object.get("message") else {
-            return Err(format!(
-                "ai_guardrails: cannot redact: choice index {} has no message",
-                replacement.index
-            )
-            .into());
-        };
-        ensure_text_content(message)?;
-        message.get("role").is_some_and(serde_json::Value::is_string)
+    let Some(message) = choice_object.get("message") else {
+        return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
     };
-    if !role_is_string {
-        return Err("ai_guardrails: cannot redact: message role is not a string".into());
+    ensure_text_content(message)?;
+    if message.get("role").is_some_and(serde_json::Value::is_string) {
+        Ok(())
+    } else {
+        Err("ai_guardrails: cannot redact: message role is not a string".into())
     }
+}
 
+/// Rebuild a choice from the fields `redact_choice` is allowed to keep.
+fn allowlisted_choice(choice: serde_json::Value, modified_text: String) -> Result<serde_json::Value, FilterError> {
+    let serde_json::Value::Object(mut choice_object) = choice else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
     let index = choice_object.remove("index");
     let finish_reason = choice_object.remove("finish_reason");
     let Some(role) = choice_object
@@ -725,13 +733,19 @@ fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) 
     else {
         return Err("ai_guardrails: cannot redact: message role is not a string".into());
     };
+    Ok(rebuilt_choice(index, role, modified_text, finish_reason))
+}
 
+/// Choice containing only `index`, `finish_reason`, and a message of `role` plus `content`.
+fn rebuilt_choice(
+    index: Option<serde_json::Value>,
+    role: serde_json::Value,
+    modified_text: String,
+    finish_reason: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut message = serde_json::Map::new();
     message.insert("role".to_owned(), role);
-    message.insert(
-        "content".to_owned(),
-        serde_json::Value::String(replacement.modified_text),
-    );
+    message.insert("content".to_owned(), serde_json::Value::String(modified_text));
 
     let mut rebuilt = serde_json::Map::new();
     if let Some(index) = index {
@@ -741,8 +755,7 @@ fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) 
     if let Some(finish_reason) = finish_reason {
         rebuilt.insert("finish_reason".to_owned(), finish_reason);
     }
-    *choice = serde_json::Value::Object(rebuilt);
-    Ok(())
+    serde_json::Value::Object(rebuilt)
 }
 
 /// Apply each replacement to `messages[index]`, requiring `expected_role`.
@@ -818,10 +831,10 @@ fn enforce_block(
     body: &mut Option<Bytes>,
     reason: String,
     phase: GuardPhase,
-    phase_label: &str,
     verdict: &str,
     content_length_committed: bool,
 ) -> FilterAction {
+    let phase_label = phase.label();
     match phase {
         GuardPhase::Request => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
