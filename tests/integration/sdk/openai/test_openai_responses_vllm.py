@@ -349,9 +349,12 @@ def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint:
     """Patch the TTFT example to target the test backend and expose /metrics.
 
     The shipped example forwards every path to one backend and records the
-    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` listener is appended so the
-    test can scrape that histogram and confirm the model label
-    ``openai_chat_completions_request`` published for a native chat completion.
+    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` block with a
+    ``metrics_address`` listener is appended so the test can scrape that histogram
+    and confirm the model label ``openai_chat_completions_request`` published for a
+    native chat completion. Since praxis 0.7.4 the admin ``address`` serves only
+    ``/api/*``; ``/metrics`` (and ``/healthy``, ``/ready``) moved to the separate
+    ``metrics_address`` listener.
     """
     with open(TTFT_CONFIG_PATH) as f:
         config = f.read()
@@ -359,7 +362,7 @@ def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3000", backend_endpoint)
 
-    admin_block = f'\nadmin:\n  address: "127.0.0.1:{metrics_port}"\n'
+    admin_block = f'\nadmin:\n  metrics_address: "127.0.0.1:{metrics_port}"\n'
     anchor = "\ninsecure_options:\n"
     assert config.count(anchor) == 1, "TTFT example should declare insecure_options once"
     config = config.replace(anchor, admin_block + anchor, 1)
@@ -368,7 +371,7 @@ def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint:
 
 
 def _scrape_metrics(metrics_port: int) -> str:
-    """Fetch the Prometheus exposition text from the admin endpoint."""
+    """Fetch the Prometheus exposition text from the metrics endpoint."""
     response = httpx.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
     response.raise_for_status()
     return response.text
