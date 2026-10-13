@@ -3816,7 +3816,23 @@ const PIPELINE = {
         "filter_type": "openai_responses_compact",
         "name": null,
         "irr_step": null,
-        "conditions": [],
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "headers_present": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
         "branch_chains": []
       },
       {

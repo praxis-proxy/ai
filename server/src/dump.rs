@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, io::Write as _};
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry};
+use praxis_core::config::{ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry};
 use serde::Serialize;
 
 // -----------------------------------------------------------------------------
@@ -78,11 +78,11 @@ pub(crate) fn build_dump(
     config: &Config,
     config_source: &str,
 ) -> Result<EffectiveConfigDump, Box<dyn std::error::Error + Send + Sync>> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Resolve against expanded entries so the dump reflects the effective
+    // filters that run, with chain-level `conditions:` inherited on both the
+    // listener path and named branch/outbound references.
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
     Ok(EffectiveConfigDump {
         config_source: config_source.to_owned(),

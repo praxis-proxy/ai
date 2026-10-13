@@ -587,7 +587,7 @@ def passthrough_client():
 
 
 @pytest.fixture
-def chunked_response_client():
+def chunked_response_store():
     """Start a composed response-store/Conversations proxy and chunked backend."""
     backend = http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0), _ChunkedResponsesBackend
@@ -613,13 +613,14 @@ def chunked_response_client():
         try:
             _wait_for_proxy(proxy_port, proc)
             _wait_for_store_ready(readiness_port, proc)
-            yield OpenAI(
+            client = OpenAI(
                 api_key="not-needed",
                 base_url=f"http://127.0.0.1:{proxy_port}/v1",
                 default_headers={OWNER_HEADER: _owner_assertion("alice")},
                 max_retries=0,
                 timeout=10.0,
             )
+            yield client, db_path, f"chunked_{proxy_port}_responses"
         finally:
             proc.send_signal(signal.SIGINT)
             try:
@@ -631,6 +632,13 @@ def chunked_response_client():
             backend.shutdown()
             backend.server_close()
             backend_thread.join(timeout=5)
+
+
+@pytest.fixture
+def chunked_response_client(chunked_response_store):
+    """Return the SDK client from the composed response-store fixture."""
+    client, _, _ = chunked_response_store
+    return client
 
 
 @pytest.fixture(scope="session")
@@ -814,6 +822,41 @@ class TestOpenAIConversations:
         retrieved = chunked_response_client.responses.retrieve(response.id)
         assert retrieved.id == response.id
         assert retrieved.status == "completed"
+
+    @pytest.mark.skipif(
+        DATABASE_URL.startswith("postgres"),
+        reason="deterministic response-store outage uses a temporary SQLite table",
+    )
+    def test_response_delete_store_failure_returns_server_error_envelope(
+        self, chunked_response_store
+    ):
+        """DELETE maps a live store failure to the Responses error envelope."""
+        client, db_path, responses_table = chunked_response_store
+        database = sqlite3.connect(db_path)
+        try:
+            database.execute(f'DROP TABLE "{responses_table}"')
+            database.commit()
+        finally:
+            database.close()
+
+        with pytest.raises(InternalServerError) as exc_info:
+            client.responses.delete("resp_delete_store_failure")
+
+        error = exc_info.value
+        assert error.status_code == 500, (
+            "a DELETE store failure must return HTTP 500"
+        )
+        assert error.response.headers["content-type"].startswith(
+            "application/json"
+        ), "a DELETE store failure must return a JSON response"
+        assert error.response.json() == {
+            "error": {
+                "code": "server_error",
+                "message": "Internal server error.",
+                "param": None,
+                "type": "server_error",
+            }
+        }, "a DELETE store failure must return the standard server_error envelope"
 
     def test_conversation_create_no_metadata(self, openai_client):
         conversation = openai_client.conversations.create()
