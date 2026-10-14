@@ -466,6 +466,16 @@ fn has_literal_replay_credentials(config: &serde_yaml::Mapping) -> bool {
         })
 }
 
+/// Rejects credential mappings without explicit literal replay values.
+fn validate_replay_literal_credentials(mapping: &serde_yaml::Mapping) -> Result<(), FixtureError> {
+    if mapping.get("filter").and_then(serde_yaml::Value::as_str) == Some("credential_injection")
+        && !has_literal_replay_credentials(mapping)
+    {
+        return Err(runtime_error("scenario credentials are not replay-contained"));
+    }
+    Ok(())
+}
+
 /// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
 ///
 /// The filter type is admitted so deferred-connector sanitization (no
@@ -561,11 +571,7 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 
 /// Contains file-backed fields and one dynamically nested database target.
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
-    if mapping.get("filter").and_then(serde_yaml::Value::as_str) == Some("credential_injection")
-        && !has_literal_replay_credentials(mapping)
-    {
-        return Err(runtime_error("scenario credentials are not replay-contained"));
-    }
+    validate_replay_literal_credentials(mapping)?;
     contain_sigv4_credentials(mapping);
     if mapping
         .iter()
