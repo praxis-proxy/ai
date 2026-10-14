@@ -17,8 +17,9 @@ use praxis_core::{
 use praxis_filter::parse_filter_config;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, IterationState,
-    Rejection, SubrequestRuntime,
+    Rejection, SubrequestRuntime, body::MAX_JSON_BODY_BYTES,
 };
+use serde::Deserialize;
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
@@ -27,6 +28,10 @@ use super::{
 
 /// Maximum request body size to buffer (1 MiB).
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+
+/// Rejection body used when response guardrails cannot inspect streaming output.
+const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
+    "ai_guardrails: streaming responses are not supported while a response guardrail is active";
 
 // -----------------------------------------------------------------------------
 // AiGuardrailsFilter
@@ -70,6 +75,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// `502 guardrail_error`; sanitized text is not forwarded because it cannot
 /// yet be safely mapped back to the canonical tool-result items. Only a
 /// `passed` verdict permits model re-entry.
+///
+/// When `phase.response` is enabled, Chat Completions requests with
+/// `"stream": true` are rejected with HTTP 422 until incremental SSE
+/// response evaluation is supported (see #1108).
 ///
 /// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
 /// configurations. When `provider.guardrails` is omitted, the request omits
@@ -224,6 +233,7 @@ fn test_outbound_chain() -> Result<Arc<FilterPipeline>, FilterError> {
     Ok(Arc::new(pipeline))
 }
 
+#[expect(clippy::too_many_lines, reason = "implements the complete filter lifecycle")]
 #[async_trait]
 impl HttpFilter for AiGuardrailsFilter {
     fn name(&self) -> &'static str {
@@ -251,18 +261,26 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if self.phase.response && !is_event_stream(ctx) {
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
-            });
+        if !self.phase.response {
+            return Ok(FilterAction::Continue);
         }
+
+        if is_event_stream(ctx) {
+            return Ok(FilterAction::Reject(
+                Rejection::status(502).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+            ));
+        }
+
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+        });
         Ok(FilterAction::Continue)
     }
 
     fn request_body_access(&self) -> BodyAccess {
         if self.phase.request {
             BodyAccess::ReadWrite
-        } else if self.phase.tool_results {
+        } else if self.phase.response || self.phase.tool_results {
             BodyAccess::ReadOnly
         } else {
             BodyAccess::None
@@ -273,6 +291,12 @@ impl HttpFilter for AiGuardrailsFilter {
         if self.phase.request {
             BodyMode::StreamBuffer {
                 max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+            }
+        } else if self.phase.response {
+            // Response-only guardrails buffer every request up to `MAX_JSON_BODY_BYTES`
+            // before forwarding to inspect `stream`. They do not deserialize request messages.
+            BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
             }
         } else {
             // Tool-result evaluation reads canonical Responses state at EOS;
@@ -304,11 +328,6 @@ impl HttpFilter for AiGuardrailsFilter {
                 Ok(_) => {},
             }
         }
-
-        if !self.phase.request {
-            return Ok(FilterAction::Continue);
-        }
-
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
@@ -317,7 +336,33 @@ impl HttpFilter for AiGuardrailsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let messages = extract_messages(bytes)?;
+        if !self.phase.request {
+            // The current response-phase guardrail implementation cannot inspect a
+            // streamed response because SSE responses remain in streaming mode.
+            // Rather than let it stream through unevaluated, reject the request
+            // before the model is invoked.
+            if self.phase.response {
+                match requests_streaming(bytes) {
+                    Ok(true) => {
+                        return Ok(FilterAction::Reject(
+                            Rejection::status(422).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+                        ));
+                    },
+                    Ok(false) => {},
+                    Err(_) => return Ok(FilterAction::Reject(Rejection::status(400))),
+                }
+            }
+            return Ok(FilterAction::Continue);
+        }
+
+        let request = parse_request(bytes)?;
+        if self.phase.response && stream_requested(request.stream.as_ref()) {
+            return Ok(FilterAction::Reject(
+                Rejection::status(422).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+            ));
+        }
+
+        let messages = request.into_messages()?;
         let runtime = self.callout_runtime(ctx);
         let result = self.provider.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
@@ -573,18 +618,63 @@ pub(super) fn fit_to_committed_length(replacement: String, original_body: &Optio
     }
 }
 
-/// Extract messages from an OpenAI Chat Completion request body.
-fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
-    let mut json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| -> FilterError { format!("ai_guardrails: request body is not valid JSON: {e}").into() })?;
+/// Request fields needed by response-only guardrails.
+#[derive(Deserialize)]
+struct StreamingRequest {
+    /// Whether the upstream should stream its response.
+    #[serde(default)]
+    stream: Option<serde_json::Value>,
+}
 
-    if let Some(messages) = json.get_mut("messages").filter(|m| m.is_array())
-        && let serde_json::Value::Array(messages) = std::mem::take(messages)
-    {
-        return Ok(messages);
+/// Request fields needed by request-phase guardrails.
+#[derive(Deserialize)]
+struct GuardrailsRequest {
+    /// Whether the upstream should stream its response.
+    #[serde(default)]
+    stream: Option<serde_json::Value>,
+    /// Chat Completion messages evaluated by request guardrails.
+    messages: Option<serde_json::Value>,
+}
+
+impl GuardrailsRequest {
+    /// Extract the request messages for guardrail evaluation.
+    fn into_messages(self) -> Result<Vec<serde_json::Value>, FilterError> {
+        match self.messages {
+            Some(serde_json::Value::Array(messages)) => Ok(messages),
+            _ => Err("ai_guardrails: request body does not contain recognizable messages".into()),
+        }
     }
+}
 
-    Err("ai_guardrails: request body does not contain recognizable messages".into())
+/// Whether the stream field requests a streamed response.
+fn stream_requested(stream: Option<&serde_json::Value>) -> bool {
+    stream.and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+/// Whether the request asks the upstream for a streamed response via
+/// `"stream": true`.
+///
+/// A malformed body returns an error, allowing the pipeline's failure mode
+/// to handle it consistently with request-phase parsing.
+fn requests_streaming(body: &Bytes) -> Result<bool, FilterError> {
+    let request: StreamingRequest = serde_json::from_slice(body).map_err(|error| request_body_parse_error(&error))?;
+
+    Ok(stream_requested(request.stream.as_ref()))
+}
+
+/// Parse request fields for request-phase guardrails in one pass.
+fn parse_request(body: &Bytes) -> Result<GuardrailsRequest, FilterError> {
+    serde_json::from_slice(body).map_err(|error| request_body_parse_error(&error))
+}
+
+/// Build a parse error without including request body content.
+fn request_body_parse_error(error: &serde_json::Error) -> FilterError {
+    format!(
+        "ai_guardrails: could not parse request body at line {} column {}",
+        error.line(),
+        error.column()
+    )
+    .into()
 }
 
 /// Extract assistant messages from an OpenAI Chat Completion response body.
@@ -625,6 +715,85 @@ fn is_event_stream(ctx: &HttpFilterContext<'_>) -> bool {
                 .next()
                 .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
         })
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod streaming_tests {
+    use bytes::Bytes;
+
+    use super::{parse_request, requests_streaming, stream_requested};
+
+    #[test]
+    fn stream_true_is_detected() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":true}"#);
+        assert!(
+            requests_streaming(&body).unwrap(),
+            "stream=true should request streaming"
+        );
+    }
+
+    #[test]
+    fn stream_false_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":false}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "stream=false should not request streaming"
+        );
+    }
+
+    #[test]
+    fn absent_stream_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[]}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "an absent stream field should not request streaming"
+        );
+    }
+
+    #[test]
+    fn malformed_body_fails_closed() {
+        let body = Bytes::from_static(b"not json");
+        assert!(
+            requests_streaming(&body).is_err(),
+            "malformed JSON should return an error"
+        );
+    }
+
+    #[test]
+    fn request_parse_errors_do_not_include_body_content() {
+        let body = Bytes::from_static(br#""unique-request-secret""#);
+
+        let streaming_error = requests_streaming(&body).unwrap_err();
+        let request_error = parse_request(&body).err().unwrap();
+        for error in [streaming_error, request_error] {
+            let error = error.to_string();
+            assert!(
+                error.contains("line 1 column"),
+                "error should include the parse location: {error}"
+            );
+            assert!(
+                !error.contains("unique-request-secret"),
+                "error must not include request body content: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_phase_parses_stream_and_messages_together() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true}"#);
+        let request = parse_request(&body).unwrap();
+
+        assert!(
+            stream_requested(request.stream.as_ref()),
+            "stream=true should request streaming"
+        );
+        assert_eq!(
+            request.into_messages().unwrap().len(),
+            1,
+            "messages should be available from the same parse"
+        );
+    }
 }
 
 #[cfg(test)]

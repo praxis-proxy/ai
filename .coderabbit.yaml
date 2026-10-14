@@ -24,7 +24,8 @@
 #
 # CodeRabbit supplements human review; it does not replace it. Every
 # contributor remains responsible for the code they submit, per the Code
-# Responsibility section of .github/CONTRIBUTING.md.
+# Responsibility section of
+# https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#code-responsibility.
 
 inheritance: true
 
@@ -53,7 +54,8 @@ reviews:
         Comments answer WHY, not WHAT. Flag comments that narrate runtime
         behavior ("parse the config", "reject the request", "skip this
         filter") — that narration belongs in a tracing::debug!/trace!/info!
-        call, not a comment (see .github/CONTRIBUTING.md, Comments vs Tracing).
+        call, not a comment (see
+        https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#comments-vs-tracing).
 
     - path: "apis/src/json_body.rs"
       instructions: |

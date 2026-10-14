@@ -3572,6 +3572,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "notify",
+ "openssl",
  "percent-encoding",
  "praxis-ai-apis",
  "praxis-proxy-core",

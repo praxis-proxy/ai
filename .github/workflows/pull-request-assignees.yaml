@@ -1,0 +1,194 @@
+name: Pull Request Assignees
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+#
+# Gives each PR one maintainer and one reviewer as assignees once it's ready
+# for review, so every PR has two named people looking after it. Drafts are
+# left alone until they're marked ready.
+#
+# Maintainers come from MAINTAINER_TEAMS and reviewers from REVIEWER_TEAMS
+# below. The PR author and bot accounts are never picked, and the two roles
+# always go to two different people. A role is only filled when it's missing:
+# if someone from the matching team is already assigned, they keep it, and
+# nobody is ever unassigned. When a role is missing, the pick is whoever is
+# assigned to the fewest open PRs in this repository, with ties broken at
+# random.
+#
+# This runs on pull_request_target so fork PRs get the praxis-bot token too.
+# Everything goes through the GitHub API; PR code is never checked out, and
+# the job's own GITHUB_TOKEN gets no permissions.
+#
+# The praxis-bot GitHub App token needs these permissions for this to work:
+#   - Repository "Pull requests": read & write (read PRs, add assignees)
+#   - Organization "Members": read             (team membership lookups)
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Assign a Maintainer and a Reviewer
+  # ----------------------------------------------------------------------------
+
+  assign:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Assign a maintainer and a reviewer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Comma-separated org team slugs. Project leads count as maintainers
+          # for every repository (see MAINTAINERS.md). Every slug must be a
+          # real team: a lookup that fails stops the run.
+          MAINTAINER_TEAMS: ai-maintainers,project-leads
+          REVIEWER_TEAMS: ai-reviewers
+        run: |
+          set -euo pipefail
+
+          # --------------------------------------------------------------------
+          # Helpers
+          # --------------------------------------------------------------------
+
+          # Succeeds when login $1 is one of the lines of $2.
+          listed() { [ -n "$1" ] && grep -qxF -e "$1" <<< "$2"; }
+
+          # Prints the lines of $1 other than login $2.
+          without() { grep -vxF -e "$2" <<< "$1" || true; }
+
+          # Prints how many open PRs login $1 is assigned to.
+          load_of() { grep -cxF -e "$1" <<< "$load" || true; }
+
+          # Prints the members of the comma-separated teams in $1, one login
+          # per line, leaving out the PR author and bot accounts. A lookup
+          # that fails stops the run, because quietly assigning nobody would
+          # hide a mistyped or deleted team.
+          pool() {
+            local members="" slug slugs page
+            IFS=',' read -ra slugs <<< "$1"
+            for slug in "${slugs[@]}"; do
+              slug="$(echo "$slug" | xargs)"
+              [ -n "$slug" ] || continue
+              page="$(gh api --paginate "orgs/${ORG}/teams/${slug}/members?per_page=100" \
+                --jq '.[] | select(.type == "User") | .login')" || {
+                echo "::error::could not list the members of team '${slug}'" >&2
+                return 1
+              }
+              members+="${page}"$'\n'
+            done
+            grep -vxF -e "$PR_AUTHOR" -e '' <<< "$members" | grep -v '\[bot\]$' | sort -u || true
+          }
+
+          # Prints whichever login in $1 is assigned to the fewest open PRs,
+          # breaking ties at random, or nothing when $1 is empty.
+          least_loaded() {
+            local login
+            while read -r login; do
+              [ -n "$login" ] || continue
+              printf '%s %s\n' "$(load_of "$login")" "$login"
+            done <<< "$1" | shuf | sort -s -n -k1,1 | awk 'NR == 1 { print $2 }'
+          }
+
+          # --------------------------------------------------------------------
+          # Who is eligible, and who is already assigned
+          # --------------------------------------------------------------------
+
+          maintainers="$(pool "$MAINTAINER_TEAMS")"
+          reviewers="$(pool "$REVIEWER_TEAMS")"
+          assignees="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.assignees[].login')"
+          load="$(gh api --paginate "repos/${GH_REPO}/pulls?state=open&per_page=100" \
+            --jq '.[].assignees[].login')"
+
+          # An assigned maintainer already fills the maintainer role. Prefer
+          # one who isn't also a reviewer, so that someone in both teams is
+          # still free to fill the reviewer role.
+          maintainer=""
+          while read -r login; do
+            listed "$login" "$maintainers" || continue
+            if [ -z "$maintainer" ] || ! listed "$login" "$reviewers"; then
+              maintainer="$login"
+            fi
+          done <<< "$assignees"
+
+          # Any other assigned reviewer already fills the reviewer role.
+          reviewer=""
+          while read -r login; do
+            if [ "$login" != "$maintainer" ] && listed "$login" "$reviewers"; then
+              reviewer="$login"
+              break
+            fi
+          done <<< "$assignees"
+
+          # --------------------------------------------------------------------
+          # Fill in whichever roles are missing
+          # --------------------------------------------------------------------
+
+          declare -A role=()
+          if [ -n "$maintainer" ]; then
+            echo "::notice::${maintainer} is already assigned as the maintainer"
+          else
+            maintainer="$(least_loaded "$(without "$maintainers" "$reviewer")")"
+            if [ -n "$maintainer" ]; then
+              echo "Picked maintainer ${maintainer} ($(load_of "$maintainer") open PRs assigned)"
+              role[$maintainer]=maintainer
+            else
+              echo "::notice::nobody on ${MAINTAINER_TEAMS} can be assigned as the maintainer; skipping"
+            fi
+          fi
+
+          if [ -n "$reviewer" ]; then
+            echo "::notice::${reviewer} is already assigned as the reviewer"
+          else
+            reviewer="$(least_loaded "$(without "$reviewers" "$maintainer")")"
+            if [ -n "$reviewer" ]; then
+              echo "Picked reviewer ${reviewer} ($(load_of "$reviewer") open PRs assigned)"
+              role[$reviewer]=reviewer
+            else
+              echo "::notice::nobody on ${REVIEWER_TEAMS} can be assigned as the reviewer; skipping"
+            fi
+          fi
+
+          if [ "${#role[@]}" -eq 0 ]; then
+            exit 0
+          fi
+
+          # GitHub can reject the whole request, or quietly drop people it can't
+          # assign (for example, someone without access to this repository), so
+          # assign one person per request and check who actually stuck. A
+          # request that fails outright fails the step once both are tried, since
+          # it needs a maintainer to look (often a token permission problem).
+          failed=0
+          for login in "${!role[@]}"; do
+            if ! after="$(gh api -X POST "repos/${GH_REPO}/issues/${PR_NUMBER}/assignees" \
+                -f "assignees[]=${login}" --jq '.assignees[].login')"; then
+              echo "::error::could not assign ${login} as the ${role[$login]}; see the API error above"
+              failed=1
+            elif listed "$login" "$after"; then
+              echo "::notice::assigned ${login} as the ${role[$login]}"
+            else
+              echo "::warning::GitHub did not assign ${login} as the ${role[$login]}" \
+                "(they may not have access to ${GH_REPO})"
+            fi
+          done
+          exit "$failed"

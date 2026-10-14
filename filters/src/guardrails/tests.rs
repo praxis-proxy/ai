@@ -42,6 +42,22 @@ phase:
     AiGuardrailsFilter::from_config(&yaml).unwrap()
 }
 
+/// Build an `ai_guardrails` filter with request and response phases enabled.
+fn nemo_filter_request_and_response(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+provider:
+  type: nemo
+  endpoint: "{endpoint}"
+phase:
+  request: true
+  response: true
+"#,
+    ))
+    .unwrap();
+    AiGuardrailsFilter::from_config(&yaml).unwrap()
+}
+
 /// A valid OpenAI Chat Completion response body for testing.
 fn chat_completion_response(content: &str) -> bytes::Bytes {
     bytes::Bytes::from(
@@ -378,6 +394,30 @@ provider:
     );
 }
 
+#[test]
+fn response_only_body_mode_uses_json_body_limit() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+phase:
+  request: false
+  response: true
+"#,
+    )
+    .unwrap();
+
+    let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
+    assert_eq!(
+        filter.request_body_mode(),
+        praxis_filter::body::BodyMode::StreamBuffer {
+            max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+        },
+        "response-only guardrails should use the absolute JSON body limit"
+    );
+}
+
 #[tokio::test]
 async fn on_request_continues() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
@@ -639,6 +679,77 @@ phase:
     assert!(
         !ctx.filter_results.contains_key("ai_guardrails"),
         "no verdict should be recorded when request-phase evaluation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_response_guardrails_reject_streaming() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 422,
+        "streaming must be rejected with response guardrails enabled"
+    );
+    assert_eq!(
+        rejection.body.as_deref(),
+        Some(&b"ai_guardrails: streaming responses are not supported while a response guardrail is active"[..]),
+        "streaming rejection must return the documented response-guardrail error body",
+    );
+    assert!(
+        !ctx.filter_results.contains_key("ai_guardrails"),
+        "the request must be rejected before any provider evaluation"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_response_guardrails_reject_malformed_json() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(b"{not-json"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 400,
+        "malformed request JSON must be rejected as a client error"
+    );
+    assert!(
+        !ctx.filter_results.contains_key("ai_guardrails"),
+        "malformed request JSON must be rejected before any provider evaluation"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_both_guardrails_reject_streaming() {
+    let filter = nemo_filter_request_and_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(action);
+    assert_eq!(
+        rejection.status, 422,
+        "streaming must be rejected when request and response guardrails are enabled"
+    );
+    assert_eq!(
+        rejection.body.as_deref(),
+        Some(&b"ai_guardrails: streaming responses are not supported while a response guardrail is active"[..]),
+        "streaming rejection must return the documented response-guardrail error body",
+    );
+    assert!(
+        !ctx.filter_results.contains_key("ai_guardrails"),
+        "the request must be rejected before any provider evaluation"
     );
 }
 
@@ -1067,7 +1178,7 @@ fn on_response_body_empty_continues() {
 }
 
 #[tokio::test]
-async fn on_response_sse_does_not_upgrade_to_stream_buffer() {
+async fn on_response_sse_is_rejected() {
     let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1076,13 +1187,19 @@ async fn on_response_sse_does_not_upgrade_to_stream_buffer() {
     resp.headers
         .insert("content-type", http::HeaderValue::from_static("text/event-stream"));
     ctx.response_header = Some(&mut resp);
-    drop(filter.on_response(&mut ctx).await.unwrap());
+    let rejection = as_rejection(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
+    assert_eq!(rejection.status, 502, "SSE responses must fail closed");
+    assert_eq!(
+        rejection.body.as_deref(),
+        Some(&b"ai_guardrails: streaming responses are not supported while a response guardrail is active"[..]),
+        "SSE rejection must return the documented response-guardrail error body",
+    );
     assert_eq!(
         ctx.response_body_mode,
         praxis_filter::BodyMode::Stream,
-        "SSE responses should stay in Stream mode (no buffering)"
+        "rejected SSE responses must not be buffered"
     );
 }
 
