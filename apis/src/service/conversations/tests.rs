@@ -158,6 +158,44 @@ fn function_output_nullable_call_id_normalizes_and_validates() {
 }
 
 #[test]
+fn legacy_mcp_error_normalizes_before_append_back_validation() {
+    for error in [
+        json!("legacy tool failure"),
+        json!({"type": "mcp_tool_execution_error", "content": "legacy tool failure"}),
+    ] {
+        let (_, output) = normalize_item(
+            json!({
+                "type": "mcp_call", "id": "mcp_legacy", "status": "failed",
+                "server_label": "weather", "name": "lookup", "arguments": "{}",
+                "error": error,
+            }),
+            &mut counter(),
+        )
+        .unwrap();
+        assert_eq!(
+            output["error"],
+            json!({"type": "mcp_tool_execution_error", "content": "legacy tool failure"}),
+            "legacy strings normalize and already structured errors retain their contract"
+        );
+        assert!(
+            validate_output_item(&output).is_ok(),
+            "append-back output must satisfy the current schema"
+        );
+    }
+    assert!(
+        normalize_item(
+            json!({
+                "type": "mcp_call", "id": "mcp_invalid", "status": "failed",
+                "server_label": "weather", "name": "lookup", "arguments": "{}", "error": 42,
+            }),
+            &mut counter(),
+        )
+        .is_err(),
+        "non-string invalid errors must not be repaired into valid output"
+    );
+}
+
+#[test]
 fn reasoning_item_with_null_status_normalizes_and_validates() {
     // Backends such as vLLM emit `status: null` on reasoning output items;
     // the status must be defaulted before it satisfies the item contract.

@@ -107,6 +107,7 @@ fn normalize_item(item: Value, generate_item_id: &mut impl FnMut() -> String) ->
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
     strip_known_nullable_nulls(&mut map);
+    normalize_legacy_mcp_error(&mut map);
     default_item_status(&mut map);
     let item = Value::Object(map);
     validate_output_item(&item).map_err(StoreError::InvalidInput)?;
@@ -122,6 +123,22 @@ fn strip_known_nullable_nulls(map: &mut Map<String, Value>) {
             }
         }
     }
+}
+
+/// Historical records predate the tagged MCP error contract. Move legacy
+/// string content into that shape before validation so append-back output and
+/// response projection agree on the current schema.
+pub(crate) fn normalize_legacy_mcp_error(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) != Some("mcp_call") {
+        return;
+    }
+    let Some(content) = map.get("error").filter(|error| error.is_string()).cloned() else {
+        return;
+    };
+    let mut tagged = Map::new();
+    tagged.insert("type".to_owned(), Value::String("mcp_tool_execution_error".to_owned()));
+    tagged.insert("content".to_owned(), content);
+    map.insert("error".to_owned(), Value::Object(tagged));
 }
 
 /// Default a missing or `null` item `status` to `completed`.

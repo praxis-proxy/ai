@@ -40,7 +40,6 @@ import threading
 import time
 
 import httpx
-import openai
 import pytest
 from openai import (
     AuthenticationError,
@@ -158,7 +157,6 @@ def _write_config(
     port: int,
     db_path: str,
     include_operation_classifier: bool = True,
-    requests_per_minute: int | None = None,
 ) -> str:
     filters = [
         {
@@ -170,10 +168,6 @@ def _write_config(
     if include_operation_classifier:
         filters.append({"filter": "ai_operation"})
     conversations_filter = _conversations_filter(f"sdk_{port}", db_path)
-    if requests_per_minute is not None:
-        conversations_filter["rate_limit"] = {
-            "requests_per_minute": requests_per_minute
-        }
     filters.append(conversations_filter)
 
     config = {
@@ -530,13 +524,13 @@ def praxis_proxy():
 
 
 @pytest.fixture
-def rate_limited_clients():
-    """Isolated three-request window with distinct authenticated SDK owners."""
+def legacy_sqlite_record_clients():
+    """Isolated SQLite store for tests that inject legacy database records."""
     with tempfile.TemporaryDirectory() as db_dir:
         port = _free_port()
         readiness_port = _free_port()
-        db_path = os.path.join(db_dir, "limited.db")
-        config_path = _write_config(port, db_path, requests_per_minute=3)
+        db_path = os.path.join(db_dir, "legacy.db")
+        config_path = _write_config(port, db_path)
         proc = subprocess.Popen(
             [_find_binary(), "-c", config_path],
             stdout=subprocess.DEVNULL,
@@ -547,23 +541,14 @@ def rate_limited_clients():
         try:
             _wait_for_proxy(port, proc)
             _wait_for_store_ready(readiness_port, proc)
-            with (
-                OpenAI(
-                    api_key="not-needed",
-                    base_url=f"http://127.0.0.1:{port}/v1",
-                    default_headers={OWNER_HEADER: _owner_assertion("alice")},
-                    max_retries=0,
-                    timeout=10.0,
-                ) as alice,
-                OpenAI(
-                    api_key="not-needed",
-                    base_url=f"http://127.0.0.1:{port}/v1",
-                    default_headers={OWNER_HEADER: _owner_assertion("bob")},
-                    max_retries=0,
-                    timeout=10.0,
-                ) as bob,
-            ):
-                yield alice, bob, db_path, f"sdk_{port}_conversation_items"
+            with OpenAI(
+                api_key="not-needed",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                max_retries=0,
+                timeout=10.0,
+            ) as alice:
+                yield alice, db_path, f"sdk_{port}_conversation_items"
         finally:
             proc.send_signal(signal.SIGINT)
             try:
@@ -576,28 +561,10 @@ def rate_limited_clients():
             os.unlink(config_path)
 
 
-def test_conversations_rate_limit_is_owner_scoped(rate_limited_clients):
-    alice, bob, _, _ = rate_limited_clients
-    conversation = alice.conversations.create()
-    assert alice.conversations.retrieve(conversation.id).id == conversation.id
-    assert alice.conversations.items.list(conversation.id).data == []
-    with pytest.raises(openai.RateLimitError) as exc:
-        alice.conversations.retrieve(conversation.id)
-    error = exc.value
-    assert error.status_code == 429
-    assert 1 <= int(error.response.headers["retry-after"]) <= 60
-    body = error.response.json()["error"]
-    assert body["type"] == "rate_limit_error"
-    assert body["code"] == "rate_limit_exceeded"
-    assert body["param"] is None
-    assert "retry after" in body["message"]
-    # Alice's exhausted window must not consume Bob's quota.
-    assert bob.conversations.create().id.startswith("conv_")
-
-
 @pytest.mark.skipif(bool(DATABASE_URL), reason="requires a legacy SQLite record")
-def test_legacy_mcp_error_is_normalized_on_list_and_retrieve(rate_limited_clients):
-    alice, _, db_path, items_table = rate_limited_clients
+def test_legacy_mcp_error_is_normalized_on_list_and_retrieve(legacy_sqlite_record_clients):
+    """Legacy string MCP errors are repaired to objects at the read boundary."""
+    alice, db_path, items_table = legacy_sqlite_record_clients
     conversation = alice.conversations.create(
         items=[
             {
@@ -631,15 +598,15 @@ def test_legacy_mcp_error_is_normalized_on_list_and_retrieve(rate_limited_client
         "mcp_legacy", conversation_id=conversation.id
     )
     expected = {"type": "mcp_tool_execution_error", "content": "legacy failure"}
-    assert listed.model_dump()["error"] == expected
-    assert retrieved.model_dump()["error"] == expected
+    assert listed.model_dump()["error"] == expected, "list must repair legacy string errors to objects"
+    assert retrieved.model_dump()["error"] == expected, "retrieve must repair legacy string errors to objects"
     # Read-boundary repair must not mutate the historical database record.
     with sqlite3.connect(db_path) as db:
         raw = db.execute(
             f'SELECT item_data FROM "{items_table}" WHERE item_id = ?',
             ("mcp_legacy",),
         ).fetchone()[0]
-    assert json.loads(raw)["error"] == "legacy failure"
+    assert json.loads(raw)["error"] == "legacy failure", "repair must stay read-only over stored history"
 
 
 @pytest.fixture(scope="session")
@@ -2061,8 +2028,10 @@ class TestConversationTenantIsolation:
         assert exc_info.value.status_code == 404, "spoofed tenant header must not grant access and must return 404"
 
     # --------------------------------------------------------------------
-    # PR1362 regression tests: configuration_update reasoning, nullable
-    # function_output normalization, structured MCP failure append-back.
+    # PR1362 regression tests: nullable function_output normalization and
+    # structured MCP failure round-trip on the shared inference fixture.
+    # Configuration-update replay and append-back storage run at module
+    # level against the parametrized conversation_backend lanes below.
     # --------------------------------------------------------------------
 
     def test_nullable_function_output_fields_are_omitted(self, openai_client):
@@ -2140,7 +2109,9 @@ class TestConversationTenantIsolation:
                 input="weather?",
                 store=True,
             )
-            assert response.status == "completed"
+            assert (
+                response.status == "completed"
+            ), "a structured MCP failure must not fail the response"
             mcp_items = [
                 item
                 for item in response.output
@@ -2156,30 +2127,312 @@ class TestConversationTenantIsolation:
         finally:
             client.conversations.delete(conversation.id)
 
-    def test_configuration_update_affects_subsequent_responses(
-        self, conversation_responses_client
-    ):
-        """A configuration_update item's reasoning carries to the next Responses request."""
-        client, backend = conversation_responses_client
-        conversation = client.conversations.create(
-            items=[{"type": "configuration_update", "reasoning": {"effort": "high"}}]
+
+# ---------------------------------------------------------------------------
+# Loopback conversation lanes: native Responses passthrough vs translated
+# Chat Completions. Each lane captures the actual forwarded request so wire
+# projections are asserted, never inferred from SDK responses alone.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=[False, True], ids=["native", "translated"])
+def conversation_backend(request, tmp_path):
+    """Capture inference requests without contacting a model or using credentials."""
+    captured = []
+    output = []
+    translated = request.param
+
+    class Backend(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.headers.get("Transfer-Encoding") == "chunked":
+                chunks = []
+                while size := int(self.rfile.readline().strip(), 16):
+                    chunks.append(self.rfile.read(size))
+                    self.rfile.read(2)
+                self.rfile.readline()
+                data = b"".join(chunks)
+            else:
+                data = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(data)
+            captured.append((self.path, body))
+            if translated:
+                response = {
+                    "id": "chatcmpl_regression",
+                    "object": "chat.completion",
+                    "created": 1000,
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "done",
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            else:
+                response = {
+                    "id": f"resp_regression_{len(captured)}",
+                    "object": "response",
+                    "created_at": 1000,
+                    "model": "test-model",
+                    "status": "completed",
+                    "output": output
+                    or [
+                        {
+                            "id": f"msg_regression_{len(captured)}",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "done",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            data = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    backend = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    port = _free_port()
+    conversations, store = _chunked_response_store_filters(
+        str(tmp_path / "store.db"), port
+    )
+    filters = [
+        {"filter": "state_owner", "mode": "trusted_owner", "header": OWNER_HEADER},
+        {"filter": "ai_operation"},
+        conversations,
+        {"filter": "openai_responses_request"},
+        store,
+        {"filter": "openai_responses_rehydrate"},
+    ]
+    if translated:
+        filters.extend(
+            [
+                {"filter": "responses_to_chat_completions"},
+                {
+                    "filter": "path_rewrite",
+                    "replace": {
+                        "pattern": "^/v1/responses/?$",
+                        "replacement": "/v1/chat/completions",
+                    },
+                },
+            ]
         )
+    else:
+        filters.append({"filter": "openai_responses_proxy"})
+    filters.extend(
+        [
+            {
+                "filter": "router",
+                "routes": [{"path_prefix": "/", "cluster": "backend"}],
+            },
+            {
+                "filter": "load_balancer",
+                "clusters": [
+                    {
+                        "name": "backend",
+                        "endpoints": [f"127.0.0.1:{backend.server_port}"],
+                    }
+                ],
+            },
+        ]
+    )
+    config = tmp_path / "proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "listeners": [
+                    {
+                        "name": "test",
+                        "address": f"127.0.0.1:{port}",
+                        "filter_chains": ["test"],
+                    }
+                ],
+                "filter_chains": [{"name": "test", "filters": filters}],
+                "insecure_options": {"allow_private_endpoints": True},
+            }
+        )
+    )
+    readiness_port = _free_port()
+    process = subprocess.Popen(
+        [_find_binary(), "-c", str(config)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_proxy_env(readiness_port),
+    )
+    try:
+        _wait_for_proxy(port, process)
+        _wait_for_store_ready(readiness_port, process)
+        with OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            default_headers={OWNER_HEADER: _owner_assertion("alice")},
+            max_retries=0,
+            timeout=10,
+        ) as client:
+            yield client, captured, output, translated
+    finally:
+        process.send_signal(signal.SIGINT)
         try:
-            response = client.responses.create(
-                model="gpt-4.1",
-                conversation=conversation.id,
-                input="Hello",
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        backend.shutdown()
+        backend.server_close()
+        thread.join(timeout=5)
+
+
+def test_configuration_update_controls_subsequent_inference(conversation_backend):
+    """configuration_update reasoning controls later turns on both lanes."""
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "configuration_update",
+                "reasoning": {"effort": "low"},
+            }
+        ]
+    )
+    client.conversations.items.create(
+        conversation.id,
+        items=[
+            {
+                "type": "configuration_update",
+                "reasoning": {"effort": "high"},
+            }
+        ],
+    )
+    for explicit, expected in [(None, "high"), ("medium", "medium"), (None, "high")]:
+        kwargs = {} if explicit is None else {"reasoning": {"effort": explicit}}
+        response = client.responses.create(
+            model="test-model",
+            conversation=conversation.id,
+            input="hello",
+            **kwargs,
+        )
+        assert (
+            response.status == "completed"
+        ), "replayed configuration must not fail inference"
+        path, body = captured[-1]
+        assert path == (
+            "/v1/chat/completions" if translated else "/v1/responses"
+        ), "the lane's upstream API must receive the turn"
+        effort = (
+            body.get("reasoning_effort")
+            if translated
+            else body.get("reasoning", {}).get("effort")
+        )
+        assert (
+            effort == expected
+        ), f"forwarded reasoning effort must be {expected}, got {effort}"
+        assert "configuration_update" not in json.dumps(
+            body.get("messages" if translated else "input")
+        ), "configuration_update must be consumed, not forwarded as history"
+    assert len(captured) == 3, "each of the three turns must reach the backend once"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"name": None},
+        {"namespace": None},
+        {"name": None, "namespace": None},
+        {"call_id": None},
+        {"call_id": None, "name": None, "namespace": None},
+    ],
+)
+def test_nullable_function_output_fields(conversation_backend, fields):
+    """Null optional fields on items.create round-trip as omissions on both lanes."""
+    client, _, _, _ = conversation_backend
+    conversation = client.conversations.create()
+    created = client.conversations.items.create(
+        conversation.id,
+        items=[
+            {
+                "type": "function_call_output",
+                "call_id": "call_nullable",
+                "output": "done",
+                **fields,
+            }
+        ],
+    )
+    item = created.data[0]
+    assert item.type == "function_call_output"
+    assert item.call_id == fields.get("call_id", "call_nullable")
+    assert item.output == "done"
+    retrieved = client.conversations.items.retrieve(
+        item.id, conversation_id=conversation.id
+    )
+    listed = client.conversations.items.list(conversation.id).data[0]
+    for value in [item, retrieved, listed]:
+        wire = value.model_dump(exclude_unset=True)
+        for field in fields:
+            assert field not in value.model_fields_set, (
+                f"{field} must stay unset after null normalization"
             )
-            assert response.status == "completed"
-            forwarded = backend.requests[-1]
-            assert forwarded["reasoning"]["effort"] == "high"
-            # configuration_update is consumed, not forwarded as an input item
-            assert all(
-                item.get("type") != "configuration_update"
-                for item in forwarded.get("input", [])
+            assert field not in wire, (
+                f"null {field} must be omitted from the wire, not serialized as null"
             )
-        finally:
-            client.conversations.delete(conversation.id)
+
+
+def test_structured_mcp_failure_append_back(conversation_backend):
+    """Failed native MCP items round-trip into stored conversation history."""
+    client, _, output, translated = conversation_backend
+    if translated:
+        pytest.skip("Chat Completions cannot emit native MCP failure items")
+    # Controlled native-provider evidence isolates append-back schema validation.
+    output.append(
+        {
+            "id": "mcp_failure_regression",
+            "type": "mcp_call",
+            "name": "weather",
+            "server_label": "weather",
+            "arguments": "{}",
+            "status": "failed",
+            "error": {
+                "type": "mcp_tool_execution_error",
+                "content": "controlled tool failure",
+            },
+        }
+    )
+    conversation = client.conversations.create()
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="weather?"
+    )
+    assert response.status == "completed", "a failed MCP item must not fail the response"
+    failure = next(item for item in response.output if item.type == "mcp_call")
+    assert (
+        failure.error.type == "mcp_tool_execution_error"
+    ), "the structured error type must survive the SDK boundary"
+    page = client.conversations.items.list(conversation.id, order="asc")
+    stored = next(item for item in page.data if item.type == "mcp_call")
+    assert stored.id == failure.id, "append-back must retain the provider item ID"
+    assert (
+        stored.error.model_dump() == failure.error.model_dump()
+    ), "append-back must retain the structured error verbatim"
 
 
 class _CapturingResponsesBackend(_ChunkedResponsesBackend):
@@ -2211,8 +2464,22 @@ class _CapturingResponsesBackend(_ChunkedResponsesBackend):
         self.wfile.write(encoded)
 
 
+def _framing_name(chunked: bool) -> str:
+    """Return the RFC 9112 framing label used in assertion messages."""
+    return "chunked" if chunked else "content-length"
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_capturing_backend_records_both_request_framings(chunked):
+    """The capturing backend decodes both HTTP/1.1 request body framings.
+
+    Praxis forwards upstream bodies with chunked transfer coding (RFC 9112
+    section 7.1, Transfer-Encoding) while SDK clients also issue
+    Content-Length framed bodies (RFC 9112 section 6.3, Message Body
+    Length). The test backend must decode either framing so captured
+    request bodies stay comparable.
+    https://datatracker.ietf.org/doc/html/rfc9112
+    """
     backend = http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0), _CapturingResponsesBackend
     )
@@ -2229,8 +2496,12 @@ def test_capturing_backend_records_both_request_framings(chunked):
             content=content,
             timeout=5.0,
         )
-        assert response.status_code == 200
-        assert backend.requests == [payload]
+        assert (
+            response.status_code == 200
+        ), f"{framing_name(chunked)} request must be served"
+        assert backend.requests == [payload], (
+            f"{framing_name(chunked)} request body must be captured intact"
+        )
     finally:
         backend.shutdown()
         backend.server_close()

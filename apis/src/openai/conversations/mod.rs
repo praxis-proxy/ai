@@ -19,8 +19,6 @@ mod handlers;
 pub(crate) mod item_schema;
 #[cfg(feature = "openai-conversations")]
 pub mod openapi;
-#[cfg(feature = "openai-conversations")]
-mod rate_limit;
 pub(crate) mod routes;
 #[cfg(feature = "openai-conversations")]
 mod validate;

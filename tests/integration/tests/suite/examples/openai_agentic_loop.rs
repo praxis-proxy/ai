@@ -1125,7 +1125,7 @@ fn mcp_calls_execute_regardless_of_max_tool_calls() {
     assert_eq!(mcp_calls.len(), 2, "both MCP calls appear in the output: {output:#?}");
     assert!(
         mcp_calls.iter().all(|item| {
-            item["error"]
+            item["error"]["content"]
                 .as_str()
                 .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
@@ -4167,7 +4167,7 @@ fn web_over_budget_fails_while_mcp_sibling_executes() {
     assert!(
         output.iter().any(|item| {
             item["type"] == "mcp_call"
-                && item["error"]
+                && item["error"]["content"]
                     .as_str()
                     .is_none_or(|error| !error.contains("max_tool_calls"))
         }),

@@ -26,7 +26,7 @@ use super::{
 use crate::{
     openai::include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
     service::{
-        conversations::{build_item_records, duplicate_item_id, validate_item_count},
+        conversations::{build_item_records, duplicate_item_id, normalize_legacy_mcp_error, validate_item_count},
         responses::{MAX_PAGE_LIMIT, input_items::DEFAULT_PAGE_LIMIT},
     },
     store::OwnerScopedResponseStore,
@@ -598,17 +598,8 @@ fn conversation_items_response(
 
 /// Project stored items for list and retrieve without copying their JSON.
 fn conversation_item_response(mut item: Value, includes: IncludeFields) -> ConversationItem {
-    if item.get("type").and_then(Value::as_str) == Some("mcp_call")
-        && let Some(map) = item.as_object_mut()
-        && map.get("error").is_some_and(Value::is_string)
-        && let Some(content) = map.remove("error")
-    {
-        // Historical records predate the tagged MCP error contract. Move the
-        // legacy content into that shape only at the response boundary.
-        let mut tagged = Map::new();
-        tagged.insert("type".to_owned(), Value::String("mcp_tool_execution_error".to_owned()));
-        tagged.insert("content".to_owned(), content);
-        map.insert("error".to_owned(), Value::Object(tagged));
+    if let Some(map) = item.as_object_mut() {
+        normalize_legacy_mcp_error(map);
     }
     project_item(&mut item, includes);
     ConversationItem::from_value(item)
