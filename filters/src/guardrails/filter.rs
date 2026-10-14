@@ -716,19 +716,29 @@ fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<
     Err("ai_guardrails: cannot redact: message role is not a string".into())
 }
 
+/// `index`, `finish_reason`, and message `role` copied from one choice.
+struct AllowlistedChoiceFields {
+    /// Choice `index`, when the upstream object included it.
+    index: Option<serde_json::Value>,
+    /// Choice `finish_reason`, when the upstream object included it.
+    finish_reason: Option<serde_json::Value>,
+    /// Message `role`.
+    role: serde_json::Value,
+}
+
 /// Replace `choice` with `index`, `finish_reason`, and a message of `role` plus `content`.
 fn write_allowlisted_choice(choice: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
-    let (index, finish_reason, role) = allowlisted_choice_fields(choice)?;
+    let fields = allowlisted_choice_fields(choice)?;
     let mut message = serde_json::Map::new();
-    message.insert("role".to_owned(), role);
+    message.insert("role".to_owned(), fields.role);
     message.insert("content".to_owned(), serde_json::Value::String(modified_text));
 
     let mut rebuilt = serde_json::Map::new();
-    if let Some(index) = index {
+    if let Some(index) = fields.index {
         rebuilt.insert("index".to_owned(), index);
     }
     rebuilt.insert("message".to_owned(), serde_json::Value::Object(message));
-    if let Some(finish_reason) = finish_reason {
+    if let Some(finish_reason) = fields.finish_reason {
         rebuilt.insert("finish_reason".to_owned(), finish_reason);
     }
     *choice = serde_json::Value::Object(rebuilt);
@@ -736,9 +746,7 @@ fn write_allowlisted_choice(choice: &mut serde_json::Value, modified_text: Strin
 }
 
 /// Move the allowlisted fields out of `choice`.
-fn allowlisted_choice_fields(
-    choice: &mut serde_json::Value,
-) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>, serde_json::Value), FilterError> {
+fn allowlisted_choice_fields(choice: &mut serde_json::Value) -> Result<AllowlistedChoiceFields, FilterError> {
     let Some(choice_object) = choice.as_object_mut() else {
         return Err("ai_guardrails: choice is not a JSON object".into());
     };
@@ -751,7 +759,11 @@ fn allowlisted_choice_fields(
     else {
         return Err("ai_guardrails: cannot redact: message role is not a string".into());
     };
-    Ok((index, finish_reason, role))
+    Ok(AllowlistedChoiceFields {
+        index,
+        finish_reason,
+        role,
+    })
 }
 
 /// Apply each replacement to `messages[index]`, requiring `expected_role`.
