@@ -222,10 +222,11 @@ fn assert_redacted_assistant_content(
 /// Run `on_response` and record whether the upstream sent `Content-Length`.
 ///
 /// The header value is not the buffered body length. Only its presence
-/// selects the committed-length rules. The response binding lives only for
-/// the `on_response` call; `response_header` is cleared before the macro ends.
+/// selects the committed-length rules. The response binding is expanded into
+/// the caller so it outlives later uses of the context. `response_header`
+/// borrows that response for the context's lifetime.
 macro_rules! note_upstream_content_length {
-    ($filter:expr, $ctx:expr, $committed:expr) => {{
+    ($filter:expr, $ctx:expr, $committed:expr) => {
         $ctx.current_filter_id = Some(0);
         let mut response = crate::test_utils::make_response();
         if $committed {
@@ -244,7 +245,7 @@ macro_rules! note_upstream_content_length {
         );
         $ctx.response_header = None;
         $ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    }};
+    };
 }
 
 /// The body is one JSON value and is not space-padded out to a longer length.
