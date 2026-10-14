@@ -207,13 +207,25 @@ async fn mapping_clears_a_previous_grouped_selector_without_changing_other_heade
     ctx.request_headers_to_set
         .push((tenant.clone(), HeaderValue::from_static("acme")));
     let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#));
-    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "the initial mapping must continue before retrying its rewritten body"
+    );
     ctx.extra_request_headers
         .push((MODEL_PROVIDER_HEADER.into(), "stale".to_owned()));
     ctx.extra_request_headers
         .push(("x-trusted-mode".into(), "preserved".to_owned()));
 
-    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "an unmapped provider target must continue through the existing route"
+    );
 
     assert_eq!(
         ctx.pending_header_value(&PROVIDER_HEADER).unwrap(),
@@ -243,7 +255,13 @@ async fn mapping_without_a_body_clears_stale_state() {
         HeaderValue::from_static("stale"),
     ));
 
-    filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "an absent body must continue while clearing stale state"
+    );
 
     assert_stale_mapping_removed(&ctx);
 }
@@ -256,7 +274,13 @@ async fn mapping_defers_partial_bodies_until_end_of_stream() {
     let original = Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#);
     let mut body = Some(original.clone());
 
-    filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut body, false).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "partial requests must continue until their buffered body is complete"
+    );
 
     assert_eq!(body, Some(original));
     assert!(ctx.request_headers_to_set.is_empty());
@@ -288,7 +312,9 @@ async fn mapping_latency_microbenchmark() {
             // Each invocation owns the body it may replace; Bytes shares the fixture allocation.
             let mut body = Some(original.clone());
             let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-            std::hint::black_box((action, body, ctx.filter_metadata));
+            let (observed_action, _observed_body, _observed_metadata) =
+                std::hint::black_box((action, body, ctx.filter_metadata));
+            assert!(matches!(observed_action, FilterAction::Continue));
         }
         let nanos_per_request = started.elapsed().as_nanos().checked_div(10_000).unwrap();
         eprintln!(
