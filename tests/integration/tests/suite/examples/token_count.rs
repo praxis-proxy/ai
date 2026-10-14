@@ -119,13 +119,20 @@ fn token_count_extracts_buffered_azure_json_once() {
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(parse_status(&raw), 200, "the Azure response should succeed");
     let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    assert!(
-        body.get("prompt_filter_results").is_none(),
-        "Azure fields should be removed"
-    );
-    assert_eq!(body["usage"]["total_tokens"], 57, "the adapter should preserve usage");
+    let expected_body = serde_json::json!({
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 15,
+            "completion_tokens": 42,
+            "total_tokens": 57
+        }
+    });
+    assert_eq!(body, expected_body, "the adapter should return the complete response");
 
-    let (counts, mode, saw_raw, _) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (counts, mode, saw_raw, final_body) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frozen_body: serde_json::Value =
+        serde_json::from_slice(final_body.as_deref().expect("Azure EOS must contain frozen JSON")).unwrap();
+    assert_eq!(frozen_body, expected_body, "Azure EOS should contain the complete adapted JSON");
     assert!(
         matches!(mode, BodyMode::StreamBuffer { .. }),
         "Azure should enable buffering"
