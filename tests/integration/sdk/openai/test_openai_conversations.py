@@ -2181,9 +2181,18 @@ class TestConversationTenantIsolation:
 @pytest.fixture(params=[False, True], ids=["native", "translated"])
 def conversation_backend(request, tmp_path):
     """Capture inference requests without contacting a model or using credentials."""
+    yield from _run_conversation_proxy(tmp_path, request.param)
+
+
+def _run_conversation_proxy(tmp_path, translated, extra_request_filters=()):
+    """Run the loopback conversation proxy and yield the SDK client.
+
+    Yields ``(client, captured, output, translated)``. ``extra_request_filters``
+    are inserted after ``openai_responses_rehydrate``, so they edit the live
+    request body after the rehydrated state snapshot was taken.
+    """
     captured = []
     output = []
-    translated = request.param
 
     class Backend(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
@@ -2268,6 +2277,7 @@ def conversation_backend(request, tmp_path):
         {"filter": "openai_responses_request"},
         store,
         {"filter": "openai_responses_rehydrate"},
+        *extra_request_filters,
     ]
     if translated:
         filters.extend(
@@ -2395,6 +2405,50 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
             body.get("messages" if translated else "input")
         ), "configuration_update must be consumed, not forwarded as history"
     assert len(captured) == 3, "each of the three turns must reach the backend once"
+
+
+@pytest.fixture(params=["/reasoning", "/reasoning/effort"], ids=["member", "effort"])
+def conversation_backend_reasoning_strip(request, tmp_path):
+    """Native-lane proxy with a post-rehydrate filter removing reasoning."""
+    removed = request.param
+    yield from (
+        (client, captured, output, translated, removed)
+        for client, captured, output, translated in _run_conversation_proxy(
+            tmp_path, False, [{"filter": "json_body", "request_remove": [removed]}]
+        )
+    )
+
+
+def test_later_reasoning_removal_stands(conversation_backend_reasoning_strip):
+    """A post-rehydrate filter's reasoning removal must stand on the native lane.
+
+    The stored configuration default may fill only what the request itself
+    omitted; it must not resurrect reasoning, or an effort, that a later
+    filter removed after the rehydrated state snapshot was taken.
+    """
+    client, captured, _, _, removed = conversation_backend_reasoning_strip
+    conversation = client.conversations.create(
+        items=[{"type": "configuration_update", "reasoning": {"effort": "high"}}]
+    )
+    response = client.responses.create(
+        model="test-model",
+        conversation=conversation.id,
+        input="hello",
+        reasoning={"effort": "medium", "summary": "auto"},
+    )
+    assert response.status == "completed", "a stripped reasoning field must not fail inference"
+    path, body = captured[-1]
+    assert path == "/v1/responses", "the native lane's upstream API must receive the turn"
+    if removed == "/reasoning":
+        assert "reasoning" not in body, (
+            "a later filter's removal of the reasoning member must stand; "
+            "neither the client's nor the stored effort may reappear"
+        )
+    else:
+        assert body.get("reasoning") == {"summary": "auto"}, (
+            "a later filter's removal of the effort must stand; "
+            "neither the client's nor the stored effort may reappear"
+        )
 
 
 @pytest.mark.parametrize(

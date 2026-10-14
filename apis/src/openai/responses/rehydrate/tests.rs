@@ -1780,6 +1780,47 @@ fn configuration_update_preserves_other_request_reasoning_fields() {
     );
 }
 
+#[test]
+fn build_state_records_request_reasoning_presence() {
+    let config = vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})];
+    for (request, expected) in [
+        (
+            json!({"model": "m", "input": "hello"}),
+            RequestReasoningPresence::Absent,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": null}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {}}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"summary": "auto"}}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"effort": "low"}}),
+            RequestReasoningPresence::ExplicitEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"effort": null}}),
+            RequestReasoningPresence::ExplicitEffort,
+        ),
+    ] {
+        let state = build_state(request, config.clone(), vec![], None);
+        assert_eq!(
+            state.request_reasoning, expected,
+            "presence must be captured before the stored default merges into the body"
+        );
+    }
+    // The captured presence is provenance only; the merge itself is unchanged.
+    let state = build_state(json!({"model": "m", "input": "hello"}), config, vec![], None);
+    assert_eq!(state.request_reasoning, RequestReasoningPresence::Absent);
+    assert_eq!(state.request_body["reasoning"]["effort"], json!("high"));
+}
+
 #[tokio::test]
 async fn rejects_when_conversation_not_found() {
     let store = MockStore::empty();

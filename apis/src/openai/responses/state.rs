@@ -600,6 +600,18 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// What the rehydrated request itself specified for `reasoning`, captured
+    /// before `rehydrate` merged the stored configuration default into
+    /// [`Self::request_body`].
+    ///
+    /// The proxy's selected-phase rebuild uses this to separate the stored
+    /// default, which must still reach a request that omits reasoning, from a
+    /// later filter's removal, which must stand: an `effort` may be filled only
+    /// when the request carried no `effort` of its own, and the `reasoning`
+    /// member may be created only when the request carried none. Only
+    /// [`Self::history_rehydrated`] states carry a meaningful value.
+    pub request_reasoning: RequestReasoningPresence,
+
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
 
@@ -943,6 +955,34 @@ pub(crate) enum RequestBodyRebuild {
     Required,
 }
 
+/// What a rehydrated request itself specified for `reasoning`, captured before
+/// the stored `configuration_update` default was merged into
+/// [`ResponsesState::request_body`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestReasoningPresence {
+    /// No top-level `reasoning` member.
+    #[default]
+    Absent,
+
+    /// A `reasoning` member without an `effort` key (a `null` member counts).
+    OmittedEffort,
+
+    /// A `reasoning` member with an explicit `effort` key (null counts).
+    ExplicitEffort,
+}
+
+impl RequestReasoningPresence {
+    /// Whether the request carried a `reasoning` member at all.
+    pub(crate) fn carried_member(self) -> bool {
+        self != Self::Absent
+    }
+
+    /// Whether the request carried an `effort` key of its own.
+    pub(crate) fn carried_effort(self) -> bool {
+        self == Self::ExplicitEffort
+    }
+}
+
 impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
@@ -986,6 +1026,7 @@ impl Default for ResponsesState {
             response_created_at: None,
             response_id: None,
             request_body: serde_json::Value::Null,
+            request_reasoning: RequestReasoningPresence::Absent,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,

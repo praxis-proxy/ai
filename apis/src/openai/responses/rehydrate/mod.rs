@@ -49,7 +49,7 @@ use super::{
     error::responses_error_rejection,
     extract_conversation_id,
     history::MessageHistory,
-    state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
+    state::{LOCAL_COMPACTION_MARKER, RequestReasoningPresence, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -1208,11 +1208,13 @@ fn build_state(
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
 ) -> ResponsesState {
+    let request_reasoning = request_reasoning_presence(&parsed_body);
     apply_stored_configuration(&mut parsed_body, &stored);
     let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
+    state.request_reasoning = request_reasoning;
     state.messages.prepend_shared(replay);
     state
         .provider_compaction_ids
@@ -1221,6 +1223,23 @@ fn build_state(
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
+}
+
+/// Capture what the request itself specified for `reasoning` before
+/// [`apply_stored_configuration`] merges the stored default into the body.
+///
+/// The proxy's selected-phase rebuild compares the live body against this
+/// recording so a later filter's removal of the `reasoning` member or its
+/// `effort` stands instead of being refilled from the merged default.
+fn request_reasoning_presence(body: &Value) -> RequestReasoningPresence {
+    let Some(reasoning) = body.get("reasoning") else {
+        return RequestReasoningPresence::Absent;
+    };
+    if reasoning.get("effort").is_some() {
+        RequestReasoningPresence::ExplicitEffort
+    } else {
+        RequestReasoningPresence::OmittedEffort
+    }
 }
 
 /// Configuration items are persisted, not replayed as model input. The latest

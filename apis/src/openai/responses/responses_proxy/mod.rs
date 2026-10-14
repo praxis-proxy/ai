@@ -341,8 +341,12 @@ fn selected_state_field(state: &ResponsesState, field: TopLevelField) -> Result<
         .map_err(|error| format!("openai_responses_proxy: {error}").into())
 }
 
-/// Fill only an omitted effort in locally rehydrated requests. Live settings,
-/// including explicit nulls and later filter edits, take precedence over state.
+/// Apply the stored reasoning default only to what the rehydrated request
+/// itself omitted. Live settings, including explicit nulls, take precedence
+/// over state, and a later filter's removal of `reasoning` or its `effort`
+/// must stand: an `effort` may be filled only when the request carried no
+/// `effort` of its own, and the `reasoning` member may be created only when
+/// the request carried none.
 fn selected_reasoning_default(state: &ResponsesState, live: Option<&[u8]>) -> Result<Option<Vec<u8>>, FilterError> {
     if !state.history_rehydrated {
         return Ok(None);
@@ -360,13 +364,20 @@ fn selected_reasoning_default(state: &ResponsesState, live: Option<&[u8]>) -> Re
         let Some(object) = reasoning.as_object_mut() else {
             return Ok(None);
         };
-        if object.contains_key("effort") {
+        // An effort the request carried was removed by a later filter; the
+        // removal stands instead of being refilled from state.
+        if object.contains_key("effort") || state.request_reasoning.carried_effort() {
             return Ok(None);
         }
         // Only the small default needs ownership in the newly parsed reasoning object.
         object.insert("effort".to_owned(), effort.clone());
         reasoning
     } else {
+        // The request carried a reasoning member a later filter removed; the
+        // removal stands instead of the member being recreated from state.
+        if state.request_reasoning.carried_member() {
+            return Ok(None);
+        }
         serde_json::json!({"effort": effort})
     };
     serde_json::to_vec(&reasoning)
