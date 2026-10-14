@@ -16,8 +16,8 @@ On `POST /v1/responses` Praxis **forwards the request to the backend
 essentially unchanged**. The outbound body is only rebuilt when state
 genuinely requires it — rehydrated history must be replayed, the agentic loop
 appended tool results, or a rewrite filter changed a provider-visible field
-(`openai_responses_proxy::request_needs_rebuild` in
-`apis/src/openai/responses/openai_responses_proxy/mod.rs`). Otherwise the
+(`responses_proxy::request_needs_rebuild` in
+`apis/src/openai/responses/responses_proxy/mod.rs`). Otherwise the
 client bytes pass through to the backend verbatim
 (`SelectedUpstreamBodyOutcome::Continue`).
 
@@ -44,7 +44,7 @@ handled by a separate per-frame path; see the `stream` row). The backend itself
 is always driven statelessly.
 
 > **Out of scope — Chat-translation profile.** The
-> `responses_to_chat_completions` translation filter is a *separate* deployment
+> `openai_responses_to_chat_completions` translation filter is a *separate* deployment
 > for Chat-native backends. It rewrites/rejects many flags
 > (`max_output_tokens`→`max_completion_tokens`, `reasoning.effort`→
 > `reasoning_effort`, `instructions`→system message, `text.format`→

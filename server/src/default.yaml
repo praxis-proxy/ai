@@ -8,8 +8,10 @@
 #   cargo run -p praxis-ai-proxy
 #   curl http://localhost:8080/
 
+# The health and metrics endpoints (/healthy, /ready, /metrics) bind to
+# `metrics_address`; the container health check probes /healthy here.
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 
 listeners:
   - name: default

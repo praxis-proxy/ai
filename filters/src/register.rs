@@ -27,7 +27,7 @@ use crate::{
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search`,
+/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search_dispatch`,
 /// `anthropic_web_search`, `external_metering`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
@@ -400,7 +400,7 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
     );
     #[cfg(feature = "openai-compact")]
     register_compact(registry, subrequest_client);
-    register_file_search_callout(registry, subrequest_client);
+    register_file_search_dispatch(registry, subrequest_client);
     register_openai_response_filters(registry, subrequest_client);
 }
 
@@ -410,11 +410,11 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     #[cfg(feature = "store")]
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_response_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
+        http "openai_responses_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_stream_events" => praxis_ai_apis::openai::OpenaiStreamEventsFilter::from_config
+        http "openai_stream_events" => praxis_ai_apis::openai::StreamEventsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -422,7 +422,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
+        http "openai_responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
     );
     #[cfg(feature = "openai-mcp-tools")]
     register_mcp_callout_filters(registry);
@@ -430,7 +430,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         @register registry,
         http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
     );
-    register_web_search(registry, subrequest_client);
+    register_web_search_dispatch(registry, subrequest_client);
     register_openai_agentic_filters(registry);
 }
 
@@ -500,15 +500,24 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
 
-/// Register `ai_guardrails` as a chain-binding filter that resolves its
-/// optional outbound chain at construction time.
+/// Register `ai_guardrails` as a security-critical chain-binding filter.
+///
+/// The optional outbound chain is resolved at construction time. Pipeline
+/// validation rejects `failure_mode: open` unless
+/// `insecure_options.allow_open_security_filters` is set.
+/// `insecure_options.skip_pipeline_validation` also bypasses that check.
+/// With either option, a provider timeout or error can skip content
+/// screening. Request `conditions:` are rejected, and body hooks do not run
+/// inside a branch, so a listener that also serves `/v1/responses` or
+/// `/v1/embeddings` needs a separate Chat Completions listener for this
+/// filter.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let isolated_client = crate::isolated_subrequest_client(4);
     let shared_client = subrequest_client.cloned();
 
     registry
-        .register_chain_binding(
+        .register_chain_binding_with_class(
             "ai_guardrails",
             std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
                 let cfg: crate::guardrails::config::AiGuardrailsConfig =
@@ -517,6 +526,7 @@ fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Opti
                 let client = shared_client.clone().unwrap_or_else(|| isolated_client.clone());
                 AiGuardrailsFilter::build(cfg, outbound, client)
             }),
+            praxis_filter::SecurityClass::Security,
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'ai_guardrails'"));
 }
@@ -554,7 +564,7 @@ fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_clien
 /// build/hot-reload time via [`ChainBindingContext::bind_chain`]. The chain is
 /// optional: when omitted the config layer substitutes an empty inline chain
 /// (pure passthrough), so registration binds it and callouts still route
-/// through the bound pipeline — matching `openai_file_search_callout`.
+/// through the bound pipeline — matching `openai_file_search_dispatch`.
 /// Registration only fails the build when a provided chain cannot be bound.
 /// The shared [`SubRequestClient`] is captured when available; otherwise the
 /// filter falls back to an isolated per-filter connector.
@@ -603,7 +613,7 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
     }
 }
 
-/// Register `openai_file_search_callout` as a chain-binding filter.
+/// Register `openai_file_search_dispatch` as a chain-binding filter.
 ///
 /// The filter resolves its configured `outbound_chain` into a prebuilt pipeline
 /// at registration time and routes every vector-store sub-request through it.
@@ -611,21 +621,21 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
 /// dedicated per-filter connector with a pool size of 4.
 #[cfg(feature = "openai-responses")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
-fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+fn register_file_search_dispatch(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let client = subrequest_client
         .cloned()
         .unwrap_or_else(|| crate::isolated_subrequest_client(4));
     registry
         .register_chain_binding(
-            "openai_file_search_callout",
+            "openai_file_search_dispatch",
             std::sync::Arc::new(move |config, ctx| {
-                praxis_ai_apis::openai::FileSearchCalloutFilter::from_config_with_binding(config, client.clone(), ctx)
+                praxis_ai_apis::openai::FileSearchDispatchFilter::from_config_with_binding(config, client.clone(), ctx)
             }),
         )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_callout'"));
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_dispatch'"));
 }
 
-/// Register `openai_web_search` with the shared client when
+/// Register `openai_web_search_dispatch` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
 ///
 /// Registered as a chain-binding filter so each provider callout executes
@@ -635,20 +645,20 @@ fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client
 /// upstream-selecting filter of its own.
 #[cfg(feature = "openai-responses")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
-fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+fn register_web_search_dispatch(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
         std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
+            praxis_ai_apis::openai::WebSearchDispatchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
         })
     } else {
         std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-            praxis_ai_apis::openai::WebSearchFilter::from_chain_binding(config, ctx)
+            praxis_ai_apis::openai::WebSearchDispatchFilter::from_chain_binding(config, ctx)
         })
     };
     registry
-        .register_chain_binding("openai_web_search", factory)
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search'"));
+        .register_chain_binding("openai_web_search_dispatch", factory)
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search_dispatch'"));
 }
 
 // -----------------------------------------------------------------------------
@@ -667,10 +677,8 @@ fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<
 mod tests {
     use std::collections::HashMap;
 
-    use praxis_core::config::InsecureOptions;
-    #[cfg(feature = "openai-responses")]
-    use praxis_filter::FilterEntry;
-    use praxis_filter::FilterPipeline;
+    use praxis_core::config::{InsecureOptions, SkipPipelineChecks};
+    use praxis_filter::{FilterEntry, FilterPipeline};
 
     use super::build_ai_registry;
 
@@ -768,6 +776,59 @@ provider:
         );
     }
 
+    /// One YAML shape for every failure-mode case, so the tests cannot drift apart.
+    fn guardrails_entry(prefix: &str) -> FilterEntry {
+        serde_yaml::from_str(&format!(
+            "{prefix}\
+filter: ai_guardrails
+provider:
+  type: nemo
+  endpoint: \"http://nemo:8000/v1/checks\"
+"
+        ))
+        .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}"))
+    }
+
+    /// The same pipeline the server validates. `allow_open_security` is
+    /// `insecure_options.allow_open_security_filters`.
+    fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
+        let registry = build_ai_registry();
+        let mut entries = vec![guardrails_entry(prefix)];
+        let pipeline =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &HashMap::new(), &InsecureOptions::default())
+                .expect("ai_guardrails should build");
+        pipeline.ordering_errors(&entries, allow_open_security, &SkipPipelineChecks::default())
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_fails_pipeline_validation() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", false);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("failure_mode: open") && error.contains("ai_guardrails")),
+            "open ai_guardrails should fail security validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_allowed_by_insecure_flag() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", true);
+        assert!(
+            errors.is_empty(),
+            "allow_open_security_filters should allow this configuration: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_closed_failure_mode_passes_security_validation() {
+        let errors = guardrails_ordering_errors("", false);
+        assert!(
+            errors.is_empty(),
+            "the default closed failure mode should pass validation: {errors:?}"
+        );
+    }
+
     /// Assert `name` is registered iff its cargo feature is `enabled`.
     fn assert_experimental_registration(names: &[&str], name: &str, enabled: bool) {
         if enabled {
@@ -801,14 +862,17 @@ provider:
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
         ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
-        ("responses_to_chat_completions", cfg!(feature = "openai-responses")),
+        (
+            "openai_responses_to_chat_completions",
+            cfg!(feature = "openai-responses"),
+        ),
         ("openai_doc_extract", cfg!(feature = "openai-responses")),
         ("openai_client_tool_compat", cfg!(feature = "openai-responses")),
         ("openai_agentic_loop", cfg!(feature = "openai-responses")),
-        ("openai_file_search_callout", cfg!(feature = "openai-responses")),
-        ("openai_web_search", cfg!(feature = "openai-responses")),
+        ("openai_file_search_dispatch", cfg!(feature = "openai-responses")),
+        ("openai_web_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_file_resolve", cfg!(feature = "openai-file-resolve-filter")),
-        ("openai_response_store", cfg!(feature = "store")),
+        ("openai_responses_store", cfg!(feature = "store")),
         ("openai_responses_rehydrate", cfg!(feature = "store")),
         ("openai_conversations", cfg!(feature = "openai-conversations")),
         ("openai_responses_compact", cfg!(feature = "openai-compact")),
@@ -830,6 +894,10 @@ provider:
     #[test]
     fn build_ai_registry_marks_security_filters() {
         let registry = build_ai_registry();
+        assert!(
+            registry.is_security_filter("ai_guardrails"),
+            "ai_guardrails must be registered as a security filter"
+        );
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         #[cfg(feature = "aws-sigv4-filter")]
@@ -841,13 +909,13 @@ provider:
         assert!(registry.is_security_filter("gcp_adc"));
     }
 
-    /// Deserialize one `openai_file_search_callout` filter entry from YAML.
+    /// Deserialize one `openai_file_search_dispatch` filter entry from YAML.
     #[cfg(feature = "openai-responses")]
     fn file_search_entry(yaml: &str) -> FilterEntry {
-        serde_yaml::from_str(yaml).expect("file_search_callout entry parses")
+        serde_yaml::from_str(yaml).expect("file_search_dispatch entry parses")
     }
 
-    /// `openai_file_search_callout` is a chain-binding filter: it resolves its
+    /// `openai_file_search_dispatch` is a chain-binding filter: it resolves its
     /// `outbound_chain` into a prebuilt pipeline at build time. An inline chain
     /// referencing an unknown filter type cannot be built, so the whole pipeline
     /// build must fail closed rather than register a filter whose outbound
@@ -858,7 +926,7 @@ provider:
         let registry = build_ai_registry();
         let mut entries = vec![file_search_entry(
             "\
-filter: openai_file_search_callout
+filter: openai_file_search_dispatch
 vector_store_url: https://8.8.8.8
 outbound_chain:
   name: broken-outbound
@@ -881,7 +949,7 @@ outbound_chain:
     }
 
     /// `openai_file_resolve` is a chain-binding filter, but `outbound_chain` is
-    /// optional (matching `openai_file_search_callout`). Omitting it must default
+    /// optional (matching `openai_file_search_dispatch`). Omitting it must default
     /// to an empty inline chain (pure passthrough) that binds cleanly, so the
     /// pipeline build succeeds rather than rejecting the filter as misconfigured.
     #[cfg(feature = "openai-file-resolve-filter")]
@@ -935,7 +1003,7 @@ outbound_chain:
         let registry = build_ai_registry();
         let mut entries = vec![file_search_entry(
             "\
-filter: openai_file_search_callout
+filter: openai_file_search_dispatch
 vector_store_url: https://8.8.8.8
 outbound_chain:
   name: ok-outbound
@@ -971,7 +1039,7 @@ outbound_chain:
   steps:
     - name: inference
       filters:
-        - filter: openai_file_search_callout
+        - filter: openai_file_search_dispatch
           vector_store_url: https://8.8.8.8
           outbound_chain: vector-store-outbound
       on_result:

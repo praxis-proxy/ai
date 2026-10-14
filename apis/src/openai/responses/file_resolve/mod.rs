@@ -88,7 +88,7 @@ use self::{
 };
 use super::{
     body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts,
-    history::MessageHistory, openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    history::MessageHistory, responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -631,6 +631,10 @@ fn rewrite_body(
 ///
 /// Takes `resolved_body` by value and moves it into `request_body`
 /// rather than deep-cloning a tree that may carry inlined file data.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "history resolution embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+)]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: serde_json::Value,
@@ -680,6 +684,10 @@ async fn sync_state(
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "history resolution embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+)]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     resolver: HistoryResolver<'_>,

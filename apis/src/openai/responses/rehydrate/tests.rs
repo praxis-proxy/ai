@@ -484,7 +484,7 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -1701,10 +1701,8 @@ async fn configuration_update_applies_to_native_and_translated_conversation_requ
                 )
                 .unwrap()
             } else {
-                crate::openai::responses::openai_responses_proxy::ResponsesProxyFilter::from_config(
-                    &serde_yaml::Value::Null,
-                )
-                .unwrap()
+                crate::openai::responses::responses_proxy::ResponsesProxyFilter::from_config(&serde_yaml::Value::Null)
+                    .unwrap()
             };
             let outcome = filter
                 .on_selected_upstream_request_body(&mut ctx, &mut body)

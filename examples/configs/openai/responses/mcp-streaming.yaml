@@ -74,7 +74,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses

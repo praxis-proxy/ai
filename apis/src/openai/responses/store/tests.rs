@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_response_store` filter.
+//! Unit tests for the `openai_responses_store` filter.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -53,7 +53,7 @@ conversations_table: conversations
     let filter = ResponseStoreFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
+        "openai_responses_store",
         "filter should parse successfully"
     );
 }
@@ -72,7 +72,7 @@ compression:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).expect("valid zstd compression config should validate");
     let compression = cfg.compression.expect("compression should be present");
     assert_eq!(compression.level, Some(5), "configured level should round-trip");
@@ -92,7 +92,7 @@ compression:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     let err = validate_config(&cfg).expect_err("level with algorithm none should be rejected");
     assert!(
         format!("{err}").contains("level"),
@@ -267,12 +267,12 @@ unknown_extra_field: true
 // -----------------------------------------------------------------------------
 
 #[test]
-fn name_returns_openai_response_store() {
+fn name_returns_openai_responses_store() {
     let filter = make_filter();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
-        "name should be openai_response_store"
+        "openai_responses_store",
+        "name should be openai_responses_store"
     );
 }
 
@@ -805,26 +805,35 @@ async fn on_response_body_releases_streaming_request_before_eos() {
 /// exactly once (before the frame is released) and fails closed when that
 /// persistence errors. The real `SqliteResponseStore` cannot force an upsert
 /// failure or observe call counts.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecordingStoreFailure {
+    None,
+    Upsert,
+    Delete,
+    Events,
+}
+
 struct RecordingResponseStore {
     upserts: std::sync::atomic::AtomicUsize,
-    fail: bool,
+    failure: RecordingStoreFailure,
     records: std::sync::Mutex<std::collections::HashMap<String, ResponseRecord>>,
     /// In-memory replay logs keyed by response id, kept ordered by
     /// `sequence_number`. Mirrors the real backend's owner-gated, insert-if-absent
     /// semantics so replay seam tests observe truthful behavior.
     events: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::store::ResponseEventRecord>>>,
-    /// When true, `append_events` fails to prove the terminal seam fails closed.
-    fail_events: bool,
 }
 
 impl RecordingResponseStore {
     fn new(fail: bool) -> Self {
         Self {
             upserts: std::sync::atomic::AtomicUsize::new(0),
-            fail,
+            failure: if fail {
+                RecordingStoreFailure::Upsert
+            } else {
+                RecordingStoreFailure::None
+            },
             records: std::sync::Mutex::new(std::collections::HashMap::new()),
             events: std::sync::Mutex::new(std::collections::HashMap::new()),
-            fail_events: false,
         }
     }
 
@@ -832,7 +841,15 @@ impl RecordingResponseStore {
     /// used to prove the replay flush fails closed after the record is durable.
     fn new_failing_events() -> Self {
         Self {
-            fail_events: true,
+            failure: RecordingStoreFailure::Events,
+            ..Self::new(false)
+        }
+    }
+
+    /// A provisioned store whose DELETE operation fails.
+    fn new_failing_delete() -> Self {
+        Self {
+            failure: RecordingStoreFailure::Delete,
             ..Self::new(false)
         }
     }
@@ -859,7 +876,7 @@ impl RecordingResponseStore {
 impl crate::store::ResponseStore for RecordingResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), crate::store::StoreError> {
         self.upserts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.fail {
+        if self.failure == RecordingStoreFailure::Upsert {
             return Err(crate::store::StoreError::Unavailable(
                 "recording store: forced failure".to_owned(),
             ));
@@ -886,6 +903,11 @@ impl crate::store::ResponseStore for RecordingResponseStore {
     }
 
     async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, crate::store::StoreError> {
+        if self.failure == RecordingStoreFailure::Delete {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced delete failure".to_owned(),
+            ));
+        }
         Ok(false)
     }
 
@@ -932,7 +954,7 @@ impl crate::store::ResponseStore for RecordingResponseStore {
         response_id: &str,
         events: &[crate::store::ResponseEventRecord],
     ) -> Result<(), crate::store::StoreError> {
-        if self.fail_events {
+        if self.failure == RecordingStoreFailure::Events {
             return Err(crate::store::StoreError::Unavailable(
                 "recording store: forced event-log failure".to_owned(),
             ));
@@ -1867,7 +1889,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -1973,7 +1995,7 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 - filter: ai_operation
 - filter: openai_responses_request
   initialize_state: false
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2087,7 +2109,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2216,7 +2238,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2309,7 +2331,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2451,7 +2473,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
   routes:
     - path_prefix: "/"
       cluster: test-backend
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
@@ -2583,7 +2605,7 @@ conversations_table: conversations
     let filter = ResponseStoreFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "openai_response_store",
+        "openai_responses_store",
         "postgres config should parse successfully"
     );
 }
@@ -4751,6 +4773,29 @@ async fn delete_rejects_when_store_unavailable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_store_failure_returns_server_error_envelope() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new_failing_delete());
+
+    let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_gone");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store_dyn: Arc<dyn PersistedStateBackend> = store;
+    install_recording_store(&mut ctx, store_dyn);
+
+    let action = filter
+        .on_request(&mut ctx)
+        .await
+        .expect("store failures should be mapped to a rejection");
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 500, "DELETE store failures should return 500");
+    assert_has_json_content_type(&rejection);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["message"], "Internal server error.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_continues_when_store_unavailable() {
     let filter = make_filter();
 
@@ -6645,7 +6690,7 @@ pool:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
 
     let pool = cfg.pool.expect("pool config should be present");
@@ -6668,7 +6713,7 @@ pool:
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
 
     let pool = cfg.pool.expect("pool config should be present");
@@ -6689,7 +6734,7 @@ conversations_table: conversations
 "#,
     )
     .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_responses_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
     assert!(cfg.pool.is_none(), "omitted pool should be None");
 }

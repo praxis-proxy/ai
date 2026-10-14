@@ -6,7 +6,7 @@
 # IRR run only on the original client request and cannot protect continuations.
 #
 # This focused example uses MCP dispatch. The same ai_guardrails placement also
-# covers results appended by openai_web_search and openai_file_search_callout
+# covers results appended by openai_web_search_dispatch and openai_file_search_dispatch
 # when those dispatchers are added before it.
 #
 # NeMo's /v1/checks endpoint evaluates Chat-style user messages. Praxis converts

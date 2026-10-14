@@ -203,7 +203,7 @@ runtime:
         // client without dialing.
         let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
             "
-- filter: openai_file_search_callout
+- filter: openai_file_search_dispatch
   vector_store_url: http://vector-store.test
   on_failure: closed
 ",

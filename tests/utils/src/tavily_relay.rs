@@ -7,15 +7,17 @@
 //! every POST verbatim to the real Tavily upstream (default
 //! [`TAVILY_UPSTREAM`]) over a public-root HTTPS client, and streams the real
 //! upstream status and body back to the caller. On the way through it records
-//! `{request, status, response}` for each exchange so a test can prove a live
-//! search actually happened — the managed `anthropic_web_search` loop suppresses
+//! `{request, authorization, status, response}` for each exchange so a test can
+//! prove a live search actually happened — the managed `anthropic_web_search`
+//! loop suppresses
 //! the `WebSearch` `tool_use` and falls back to an `is_error` tool result on
 //! provider failure, so a client-only "got an answer" assertion would pass even
 //! against a broken integration. Observing the real call closes that gap.
 //!
 //! Point a filter's `base_url` at [`TavilyRelayGuard::base_url`] and give it the
-//! real Tavily API key; the relay carries the request (key and all) to Tavily
-//! and hands back exactly what Tavily returned.
+//! real Tavily API key; the relay carries the request — body plus the
+//! `Authorization: Bearer` provider credential (issue #1389) — to Tavily and
+//! hands back exactly what Tavily returned.
 
 use std::{
     convert::Infallible,
@@ -44,6 +46,11 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct TavilySearchCapture {
     /// The request body the proxy sent to the relay (forwarded to Tavily).
     pub request: Value,
+    /// The `Authorization` header the proxy sent to the relay (forwarded to
+    /// Tavily), or `None` when absent. Issue #1389 moved the Tavily credential
+    /// from a body `api_key` field to `Authorization: Bearer <key>`, so this is
+    /// where the resolved provider key now travels.
+    pub authorization: Option<String>,
     /// The HTTP status the real Tavily upstream returned (`0` on a transport
     /// failure reaching Tavily).
     pub status: u16,
@@ -186,21 +193,30 @@ async fn forward(
     upstream: Arc<str>,
     captures: Arc<Mutex<Vec<TavilySearchCapture>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Capture the provider credential BEFORE consuming the body. Issue #1389
+    // moved Tavily auth from a body `api_key` field to an `Authorization: Bearer`
+    // header, so the relay must forward it verbatim or real Tavily answers 401.
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
     let request_bytes = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => Bytes::new(),
     };
     let request_json = serde_json::from_slice::<Value>(&request_bytes).unwrap_or(Value::Null);
 
-    // Carry the original body straight to Tavily; no clone of the payload.
-    let forwarded = client
-        .post(&*upstream)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(request_bytes)
-        .send()
-        .await;
+    // Carry the original body AND the provider credential straight to Tavily; no
+    // clone of the payload.
+    let mut builder = client.post(&*upstream).header(header::CONTENT_TYPE, "application/json");
+    if let Some(authorization) = &authorization {
+        builder = builder.header(header::AUTHORIZATION, authorization);
+    }
+    let forwarded = builder.body(request_bytes).send().await;
 
-    Ok(record_and_respond(&captures, request_json, forwarded).await)
+    Ok(record_and_respond(&captures, request_json, authorization, forwarded).await)
 }
 
 /// Records one exchange against the capture log and builds the client response.
@@ -211,6 +227,7 @@ async fn forward(
 async fn record_and_respond(
     captures: &Mutex<Vec<TavilySearchCapture>>,
     request_json: Value,
+    authorization: Option<String>,
     forwarded: Result<reqwest::Response, reqwest::Error>,
 ) -> Response<Full<Bytes>> {
     match forwarded {
@@ -223,6 +240,7 @@ async fn record_and_respond(
                 .expect("tavily relay capture lock")
                 .push(TavilySearchCapture {
                     request: request_json,
+                    authorization,
                     status: status.as_u16(),
                     response: response_json,
                 });
@@ -239,6 +257,7 @@ async fn record_and_respond(
                 .expect("tavily relay capture lock")
                 .push(TavilySearchCapture {
                     request: request_json,
+                    authorization,
                     status: 0,
                     response: Value::String(message.clone()),
                 });
@@ -257,17 +276,27 @@ mod tests {
 
     use super::*;
 
-    /// Minimal raw-TCP HTTP/1.1 stub that answers every request with a fixed
-    /// JSON body. Stands in for Tavily so the relay's forward-and-capture path
-    /// is exercised offline.
-    fn spawn_json_stub(body: &'static str) -> u16 {
+    /// Minimal raw-TCP HTTP/1.1 stub that echoes back the `Authorization` header
+    /// it received in its JSON body. Stands in for Tavily so the relay's
+    /// forward-and-capture path is exercised offline AND the forwarded provider
+    /// credential (issue #1389) can be proven to have crossed to the upstream.
+    fn spawn_echo_auth_stub() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().expect("stub port").port();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.expect("accept stub connection");
                 let mut scratch = [0_u8; 4096];
-                let _ = stream.read(&mut scratch);
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]);
+                let observed = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .and_then(|line| line.split_once(':'))
+                    .map_or("", |(_, value)| value.trim());
+                let body = format!(
+                    r#"{{"results":[{{"url":"https://example.com/a"}}],"observed_authorization":"{observed}"}}"#
+                );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -279,8 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn relay_forwards_and_captures_the_exchange() {
-        let stub_port = spawn_json_stub(r#"{"results":[{"url":"https://example.com/a"}]}"#);
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one request exercises forward, auth-header forwarding, capture, and clear end to end"
+    )]
+    fn relay_forwards_the_auth_header_and_captures_the_exchange() {
+        let stub_port = spawn_echo_auth_stub();
         let relay = start_tavily_relay_to(&format!("http://127.0.0.1:{stub_port}/search"));
 
         let client = crate::inference_fixture::http_client();
@@ -292,7 +325,8 @@ mod tests {
             client
                 .post(relay.base_url())
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(r#"{"api_key":"tvly-test","query":"praxis proxy"}"#)
+                .header(header::AUTHORIZATION, "Bearer tvly-test")
+                .body(r#"{"query":"praxis proxy"}"#)
                 .send()
                 .await
                 .expect("relay request")
@@ -300,14 +334,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = runtime.block_on(async { response.text().await.expect("relay body") });
-        assert!(body.contains("example.com"), "relay returned upstream body: {body}");
+        // The stub echoes the Authorization header it received, proving the relay
+        // forwarded the provider credential to the upstream (issue #1389); a relay
+        // that dropped it would make real Tavily answer 401.
+        assert!(
+            body.contains(r#""observed_authorization":"Bearer tvly-test""#),
+            "relay must forward the auth header to Tavily: {body}"
+        );
 
         let captures = relay.captures();
         assert_eq!(captures.len(), 1, "exactly one exchange recorded");
         let exchange = &captures[0];
         assert_eq!(exchange.status, 200);
-        assert_eq!(exchange.request["api_key"], "tvly-test");
         assert_eq!(exchange.request["query"], "praxis proxy");
+        assert_eq!(exchange.authorization.as_deref(), Some("Bearer tvly-test"));
         assert_eq!(exchange.response["results"][0]["url"], "https://example.com/a");
 
         relay.clear();

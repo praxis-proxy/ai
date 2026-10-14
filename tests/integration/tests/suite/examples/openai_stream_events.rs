@@ -37,11 +37,14 @@ fn streaming_examples_override_short_irr_default_deadline() {
     for (example, minimum_timeout_ms) in STREAMING_EXAMPLES {
         let yaml = std::fs::read_to_string(example_config_path(example)).expect("example config should exist");
         let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("example config should be valid YAML");
-        let filters = config["filter_chains"][0]["filters"]
+        // Some examples (e.g. full-flow-agentic) express the pipeline as several
+        // named chains composed by the listener, so search every chain's filters
+        // for the IRR rather than assuming it lives in the first chain.
+        let irr = config["filter_chains"]
             .as_sequence()
-            .expect("filter chain should contain filters");
-        let irr = filters
+            .expect("config should declare filter_chains")
             .iter()
+            .flat_map(|chain| chain["filters"].as_sequence().map(Vec::as_slice).unwrap_or(&[]))
             .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
             .unwrap_or_else(|| panic!("{example} should contain an iterative_request_router"));
         let overall_timeout_ms = irr["timeout_ms"]

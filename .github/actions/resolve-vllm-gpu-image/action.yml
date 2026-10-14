@@ -1,0 +1,94 @@
+name: Resolve vLLM GPU image
+description: >-
+  Make the model-baked GPU image available locally under `image`, preferring the
+  build vllm-gpu-container.yaml already published to GHCR. The published image is
+  kept only when its provenance labels match this checkout exactly -- same
+  Containerfile, same model, same pinned model revision -- because a stale tag
+  would otherwise qualify a backend the commit under test never described.
+  Anything else (no published tag, a registry that cannot be reached, differing
+  provenance) reports `build-required=true` and leaves no image behind, so the
+  caller falls back to build-vllm-gpu. Either way the tag is local afterwards, so
+  start-vllm should always be passed `pull: "false"`.
+inputs:
+  image:
+    description: Fully qualified image reference to resolve (registry tag).
+    required: true
+  model:
+    description: Hugging Face model ID the image must have baked in.
+    required: true
+  revision:
+    description: Pinned Hugging Face model revision, or empty when unpinned.
+    required: false
+    default: ""
+  runtime:
+    description: Container runtime binary (docker or podman).
+    required: false
+    default: docker
+outputs:
+  build-required:
+    description: '"true" when the caller must build the image from source.'
+    value: ${{ steps.resolve.outputs.build-required }}
+  digest:
+    description: Registry digest of the pulled image, empty when building.
+    value: ${{ steps.resolve.outputs.digest }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve image
+      id: resolve
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        EXPECTED_MODEL: ${{ inputs.model }}
+        EXPECTED_REVISION: ${{ inputs.revision }}
+        CONTAINER_RUNTIME: ${{ inputs.runtime }}
+      run: |
+        set -euo pipefail
+
+        expected_containerfile="$(sha256sum vllm/Containerfile | awk '{print $1}')"
+
+        # podman prints "<no value>" for a label docker reports as empty; treat
+        # both as absent so an image built before labels existed simply fails
+        # the comparison instead of erroring.
+        label() {
+          local value
+          value="$("$CONTAINER_RUNTIME" image inspect "$IMAGE" \
+            --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null || true)"
+          if [ "$value" = "<no value>" ]; then
+            value=""
+          fi
+          printf '%s' "$value"
+        }
+
+        reject() {
+          echo "::notice::Building $IMAGE from source: $1"
+          # Drop the tag so the stale pull cannot shadow the local build.
+          "$CONTAINER_RUNTIME" rmi -f "$IMAGE" > /dev/null 2>&1 || true
+          echo "build-required=true" >> "$GITHUB_OUTPUT"
+          echo "digest=" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        if ! "$CONTAINER_RUNTIME" pull "$IMAGE"; then
+          reject "no published image could be pulled"
+        fi
+
+        got_containerfile="$(label praxis.vllm.containerfile-sha256)"
+        got_model="$(label praxis.vllm.inference-model)"
+        got_revision="$(label praxis.vllm.inference-revision)"
+
+        if [ "$got_containerfile" != "$expected_containerfile" ]; then
+          reject "published Containerfile ${got_containerfile:-<unlabelled>} != checkout $expected_containerfile"
+        fi
+        if [ "$got_model" != "$EXPECTED_MODEL" ]; then
+          reject "published model ${got_model:-<unlabelled>} != expected $EXPECTED_MODEL"
+        fi
+        if [ "$got_revision" != "$EXPECTED_REVISION" ]; then
+          reject "published model revision ${got_revision:-<unpinned>} != expected ${EXPECTED_REVISION:-<unpinned>}"
+        fi
+
+        digest="$("$CONTAINER_RUNTIME" image inspect "$IMAGE" \
+          --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null || true)"
+        echo "Reusing published $IMAGE (${digest:-digest unavailable})"
+        echo "build-required=false" >> "$GITHUB_OUTPUT"
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"

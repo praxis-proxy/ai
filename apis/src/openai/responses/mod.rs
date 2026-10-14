@@ -43,23 +43,22 @@ pub(crate) mod error;
 pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
 #[cfg(feature = "openai-responses")]
-pub(crate) mod file_search_callout;
+pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_tool_resolve;
 pub(crate) mod model_rewrite;
 /// Lowers rich client-owned tools to private functions for a function-only
 /// Responses backend and restores the typed items on the response (#1131).
 #[cfg(feature = "openai-responses")]
 pub(crate) mod openai_client_tool_compat;
-#[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod openai_mcp_tool_resolve;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod openai_responses_proxy;
-pub(crate) mod openai_tool_parse;
+pub(crate) mod responses_proxy;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod responses_to_chat_completions;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
@@ -74,6 +73,7 @@ pub(crate) mod state;
 pub(crate) mod store;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod stream_events;
+pub(crate) mod tool_parse;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
@@ -84,17 +84,17 @@ pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
 #[cfg(feature = "openai-responses")]
-pub use file_search_callout::FileSearchCalloutFilter;
+pub use file_search_dispatch::FileSearchDispatchFilter;
 #[cfg(feature = "openai-mcp-tools")]
 pub use mcp_dispatch::McpDispatchFilter;
+#[cfg(feature = "openai-mcp-tools")]
+pub use mcp_tool_resolve::McpToolResolveFilter;
 pub use model_rewrite::ModelRewriteFilter;
 #[cfg(feature = "openai-responses")]
 pub use openai_client_tool_compat::ClientToolCompatFilter;
-#[cfg(feature = "openai-mcp-tools")]
-pub use openai_mcp_tool_resolve::McpToolResolveFilter;
-pub use openai_tool_parse::ToolParseFilter;
 #[cfg(feature = "store")]
 pub use store::ResponseStoreFilter;
+pub use tool_parse::ToolParseFilter;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -772,7 +772,7 @@ pub(crate) mod rehydrate;
 pub(crate) mod request;
 #[cfg(feature = "openai-responses")]
 #[cfg(feature = "openai-responses")]
-pub(crate) mod web_search;
+pub(crate) mod web_search_dispatch;
 
 #[cfg(feature = "openai-responses-openapi")]
 pub(crate) mod contracts;
@@ -787,5 +787,4 @@ pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]
 pub use request::OpenaiResponsesRequestFilter;
 #[cfg(feature = "openai-responses")]
-#[cfg(feature = "openai-responses")]
-pub use web_search::WebSearchFilter;
+pub use web_search_dispatch::WebSearchDispatchFilter;

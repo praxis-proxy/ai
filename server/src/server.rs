@@ -300,18 +300,41 @@ fn register_admin_endpoints(
     health_registry: HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
+    use praxis_protocol::http::pingora::health;
+
+    // praxis 0.7.4 splits the admin API (`/api/*`) from the health/metrics
+    // listener (`/healthy`, `/ready`, `/metrics`), each bound to its own
+    // address. Install the Prometheus recorder once when either listener is
+    // configured, then register its upkeep and bind the two services.
+    let prometheus_recorder = (config.admin.address.is_some() || config.admin.metrics_address.is_some())
+        .then(health::install_prometheus_admin_recorder);
+
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+        health::add_admin_api_to_pingora_server(
             server.server_mut(),
             admin_addr,
-            praxis_protocol::http::pingora::health::AdminEndpointOptions {
-                health_registry: Some(health_registry),
+            health::AdminEndpointOptions {
+                health_registry: Some(Arc::clone(&health_registry)),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
                 stats: None,
                 verbose: config.admin.verbose,
             },
+        );
+    }
+
+    if let Some(recorder) = prometheus_recorder {
+        health::add_prometheus_upkeep_to_pingora_server(server.server_mut(), recorder);
+    }
+
+    if let Some(metrics_addr) = &config.admin.metrics_address {
+        health::add_health_endpoint_to_pingora_server_with_pipelines(
+            server.server_mut(),
+            metrics_addr,
+            Some(health_registry),
+            config.admin.verbose,
+            None,
         );
     }
 }
@@ -600,10 +623,10 @@ const FIPS_SAFE_STORE_PROFILE: bool = cfg!(all(
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
 ///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
+/// - `openai_responses_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
 ///   bring cryptography outside the system `OpenSSL`; the isolated `store-postgres-cert-auth` profile does not, so
 ///   [`fips_blocker`] excludes this name only for that exact profile.
-const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_responses_store"];
 
 /// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
 ///
@@ -617,7 +640,7 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
     let registered: Vec<String> = NON_FIPS_FILTERS
         .iter()
         .copied()
-        .filter(|name| *name != "openai_response_store" || !FIPS_SAFE_STORE_PROFILE)
+        .filter(|name| *name != "openai_responses_store" || !FIPS_SAFE_STORE_PROFILE)
         .filter(|name| available.contains(name))
         .map(|name| format!("`{name}` filter"))
         .collect();
@@ -791,9 +814,9 @@ mod tests {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
             if store_is_blocked {
-                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(reason.contains("`openai_responses_store` filter"), "{reason}");
             } else {
-                assert!(!reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(!reason.contains("`openai_responses_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");

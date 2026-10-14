@@ -7,7 +7,7 @@
 //! This is the `#957` seam: instead of dialing the MCP server with an inline
 //! `reqwest` client, the [`rmcp`] [`StreamableHttpClient`] adapter here targets
 //! the dynamic MCP URL through praxis's URL-aware target preparation
-//! ([`prepare_url_target`]) and runs the request through a bound outbound
+//! ([`prepare_url_target_with_policy`]) and runs the request through a bound outbound
 //! [`FilteredSubrequestExecutor`] chain. The chain reuses praxis's own SSRF/DNS
 //! validation, TLS/SNI handling, Host binding, deadline, and response-size
 //! guardrails rather than reimplementing them per call.
@@ -30,7 +30,7 @@ use futures::stream::BoxStream;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use praxis_core::{
     config::ChainRef,
-    connectivity::{UrlTargetError, prepare_url_target},
+    connectivity::{UrlResolutionPolicy, UrlTargetError, prepare_url_target_with_policy},
     subrequest::{DEPTH_HEADER, SubRequestClient},
 };
 use praxis_filter::{
@@ -51,7 +51,7 @@ use rmcp::{
 use sse_stream::{Error as SseError, Sse};
 
 use super::{McpClientError, McpDisplayUrl};
-use crate::{StateOwner, callout_target::AddressPolicy};
+use crate::{StateOwner, callout_target::AddressPolicy, is_event_stream_content_type};
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -559,6 +559,12 @@ pub(crate) struct McpSubrequestClient {
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
+    /// DNS resolution policy for the dial target, chosen by the target's
+    /// provenance: [`UrlResolutionPolicy::OperatorCached`] for an operator-
+    /// configured connector, [`UrlResolutionPolicy::ClientPerCall`] for a
+    /// client-selected `server_url` so a client cannot prime or probe the
+    /// shared operator DNS cache.
+    resolution_policy: UrlResolutionPolicy,
     /// Trusted owner projected only for configured connector exchanges.
     owner: Option<StateOwner>,
     /// Replaceable out-of-band record of a typed classification observed on a
@@ -581,12 +587,18 @@ impl McpSubrequestClient {
     ///
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
-    pub(crate) fn control(callout: McpCallout, step_timeout: Duration, owner: Option<StateOwner>) -> Self {
+    pub(crate) fn control(
+        callout: McpCallout,
+        step_timeout: Duration,
+        resolution_policy: UrlResolutionPolicy,
+        owner: Option<StateOwner>,
+    ) -> Self {
         Self::with_wire_cap(
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            resolution_policy,
             owner,
         )
     }
@@ -604,6 +616,7 @@ impl McpSubrequestClient {
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
+        resolution_policy: UrlResolutionPolicy,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
@@ -612,17 +625,23 @@ impl McpSubrequestClient {
             step_timeout,
             wire,
             wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            resolution_policy,
             owner,
         )
     }
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
     /// ceiling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor threads the callout, both byte ceilings, the target's resolution policy, and the optional state owner"
+    )]
     fn with_wire_cap(
         callout: McpCallout,
         step_timeout: Duration,
         tool_result_bytes: usize,
         stream_cumulative_cap: usize,
+        resolution_policy: UrlResolutionPolicy,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
@@ -630,6 +649,7 @@ impl McpSubrequestClient {
             tool_result_bytes,
             step_timeout,
             stream_cumulative_cap,
+            resolution_policy,
             owner,
             signal_state: Arc::new(TransportSignalState::new()),
         }
@@ -703,7 +723,14 @@ impl McpSubrequestClient {
     > {
         let deadline = self.callout.deadline(Instant::now(), self.step_timeout);
         let allow_private = self.callout.allow_private;
-        let target = match prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+        let target = match prepare_url_target_with_policy(
+            uri,
+            deadline,
+            move |addrs| ssrf_validate(addrs, allow_private),
+            self.resolution_policy,
+        )
+        .await
+        {
             Ok(target) => target,
             Err(error) => {
                 if let Some(classification) = prepare_error_signal(&error) {
@@ -754,7 +781,7 @@ impl McpSubrequestClient {
     /// Prepare, validate, and dial `uri`, returning the buffered response.
     ///
     /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
-    /// are enforced by [`prepare_url_target`] and the executor.
+    /// are enforced by [`prepare_url_target_with_policy`] and the executor.
     #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     #[expect(
         clippy::too_many_arguments,
@@ -1536,9 +1563,9 @@ pub(crate) fn transport_signal_error(
 ///
 /// On a cache miss the resolved addresses are validated during the actual
 /// callout by [`McpSubrequestClient::execute`] (which runs the same
-/// [`prepare_url_target`] + [`ssrf_validate`] pair), so this is the *only* extra
+/// [`prepare_url_target_with_policy`] + [`ssrf_validate`] pair), so this is the *only* extra
 /// DNS resolution the resolver performs — and only when a cached listing lets it
-/// skip the dial entirely. Reusing [`prepare_url_target`] makes a cache hit
+/// skip the dial entirely. Reusing [`prepare_url_target_with_policy`] makes a cache hit
 /// enforce exactly the policy a live callout would: scheme/userinfo/fragment
 /// rejection, DNS resolution, and the [`ssrf_validate`] address hook.
 ///
@@ -1555,18 +1582,42 @@ pub(crate) async fn validate_mcp_target(
     url: &str,
     timeout: Duration,
     allow_private: bool,
+    resolution_policy: UrlResolutionPolicy,
 ) -> Result<(), McpClientError> {
     let display_url = super::parse_display_url(url);
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return Err(McpClientError::Connection { url: display_url });
     };
-    match prepare_url_target(url, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+    match prepare_url_target_with_policy(
+        url,
+        deadline,
+        move |addrs| ssrf_validate(addrs, allow_private),
+        resolution_policy,
+    )
+    .await
+    {
         Ok(_target) => Ok(()),
         Err(error) => Err(classify_prepare_error(&error, display_url)),
     }
 }
 
-/// Classify a [`prepare_url_target`] failure into the caller-facing
+/// Select the DNS resolution policy for an MCP dial target by its provenance.
+///
+/// An operator-configured connector (`connector_id` present in the request's MCP
+/// tool entry) targets an operator-managed host, so it resolves through the
+/// shared DNS cache ([`UrlResolutionPolicy::OperatorCached`]). A client-selected
+/// `server_url` resolves per call ([`UrlResolutionPolicy::ClientPerCall`]) so a
+/// client cannot prime or probe the operator cache with a hostname it chose.
+#[must_use]
+pub(crate) fn mcp_resolution_policy(is_connector: bool) -> UrlResolutionPolicy {
+    if is_connector {
+        UrlResolutionPolicy::OperatorCached
+    } else {
+        UrlResolutionPolicy::ClientPerCall
+    }
+}
+
+/// Classify a [`prepare_url_target_with_policy`] failure into the caller-facing
 /// [`McpClientError`], distinguishing permanent target rejections that must fail
 /// hard from transient dial-time failures.
 ///
@@ -1591,7 +1642,7 @@ fn classify_prepare_error(error: &UrlTargetError, url: McpDisplayUrl) -> McpClie
     }
 }
 
-/// Record the out-of-band [`TransportSignal`] for a [`prepare_url_target`]
+/// Record the out-of-band [`TransportSignal`] for a [`prepare_url_target_with_policy`]
 /// failure, if the failure is a permanent hard rejection.
 ///
 /// Mirrors the permanent/transient split in [`classify_prepare_error`]: an SSRF
@@ -1636,12 +1687,12 @@ fn map_prepare_error(error: &UrlTargetError) -> StreamableHttpError<McpTransport
 
 /// Whether a `Content-Type` value denotes JSON.
 fn is_json_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("application/json")
-}
-
-/// Whether a `Content-Type` value denotes an SSE event stream.
-fn is_event_stream_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("text/event-stream")
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// Parse a JSON-RPC error message from a response body, if it is one.
@@ -1725,6 +1776,18 @@ mod tests {
 
     fn test_signal() -> Arc<OnceLock<TransportSignal>> {
         Arc::new(OnceLock::new())
+    }
+
+    #[test]
+    fn mcp_resolution_policy_follows_target_provenance() {
+        assert!(
+            matches!(mcp_resolution_policy(true), UrlResolutionPolicy::OperatorCached),
+            "an operator-configured connector must resolve through the shared cache"
+        );
+        assert!(
+            matches!(mcp_resolution_policy(false), UrlResolutionPolicy::ClientPerCall),
+            "a client-selected server_url must resolve per call, not through the operator cache"
+        );
     }
 
     #[test]
@@ -1845,14 +1908,36 @@ mod tests {
 
     // -- Content-type classification -------------------------------------------
 
+    /// [RFC 9110 Section 8.3.1] defines media types as case-insensitive
+    /// type/subtype tokens.
+    ///
+    /// [RFC 9110 Section 8.3.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-8.3.1
     #[test]
-    fn content_type_classification_tolerates_parameters_and_whitespace() {
-        assert!(is_json_content_type("application/json"));
-        assert!(is_json_content_type(" application/json; charset=utf-8"));
-        assert!(!is_json_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type(" text/event-stream; charset=utf-8"));
-        assert!(!is_event_stream_content_type("application/json"));
+    fn content_type_classification_is_case_insensitive_and_exact() {
+        for value in [
+            "application/json",
+            " Application/JSON; charset=utf-8",
+            "application/json ; charset=utf-8",
+        ] {
+            assert!(is_json_content_type(value), "expected JSON media type: {value}");
+        }
+        for value in ["application/jsonp", "application/json-patch+json", "text/event-stream"] {
+            assert!(!is_json_content_type(value), "expected non-JSON media type: {value}");
+        }
+
+        for value in [
+            "text/event-stream",
+            " Text/Event-Stream; charset=utf-8",
+            "text/event-stream ; charset=utf-8",
+        ] {
+            assert!(is_event_stream_content_type(value), "expected SSE media type: {value}");
+        }
+        for value in ["text/event-streamish", "text/event-stream+json", "application/json"] {
+            assert!(
+                !is_event_stream_content_type(value),
+                "expected non-SSE media type: {value}"
+            );
+        }
     }
 
     // -- Response-limit tiers (codex finding: response-limit regressions) -------
@@ -1879,6 +1964,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1898,6 +1984,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1950,7 +2037,12 @@ mod tests {
             .clone();
         let pipeline = build_bare_outbound_pipeline(true).expect("outbound pipeline");
         let callout = McpCallout::from_context(&context, pipeline).expect("MCP callout context");
-        let client = McpSubrequestClient::control(callout, Duration::from_secs(5), None);
+        let client = McpSubrequestClient::control(
+            callout,
+            Duration::from_secs(5),
+            UrlResolutionPolicy::OperatorCached,
+            None,
+        );
         let signal = client.signal_handle();
 
         let (_executor, _request, extensions, _deadline) = client
@@ -2157,6 +2249,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         // per-event GET cap == the client's tool-result wire cap, which for the
@@ -2177,6 +2270,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2206,6 +2300,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            UrlResolutionPolicy::OperatorCached,
             None,
         )
     }
@@ -2300,6 +2395,75 @@ mod tests {
         );
         let out = classify_buffered_post_response(response, &message, false).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    #[test]
+    fn buffered_post_selects_only_exact_json_and_sse_media_types() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+
+        let json = sub_response(
+            200,
+            Some(" Application/JSON; charset=utf-8"),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        );
+        let out = classify_buffered_post_response(json, &message, false).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let sse = sub_response(
+            200,
+            Some(" Text/Event-Stream; charset=utf-8"),
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        );
+        let out = classify_buffered_post_response(sse, &message, false).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let response = sub_response(200, Some(content_type), br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+            let error = classify_buffered_post_response(response, &message, false).unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_post_selects_only_exact_json_and_sse_media_types() {
+        let (body, _) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+        let response = sub_response(200, Some(" Application/JSON; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let (body, cancelled) = fake_body([Bytes::from_static(
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        )]);
+        let response = sub_response(200, Some(" Text/Event-Stream; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let (body, cancelled) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+            let response = sub_response(200, Some(content_type), b"");
+            let error = client()
+                .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+            assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
 
     // -- collect_body fail-closed (F4) --

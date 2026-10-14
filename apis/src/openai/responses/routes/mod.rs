@@ -10,7 +10,7 @@
 //! Operation IDs are the official ones from the pinned OpenAI specification,
 //! reproduced verbatim including upstream's casing.
 //!
-//! Under the transformed profile (`responses_to_chat_completions`), Praxis owns
+//! Under the transformed profile (`openai_responses_to_chat_completions`), Praxis owns
 //! the `POST /v1/responses` request and response contract, translating requests
 //! and resources for a Chat Completions backend. In native Responses passthrough
 //! deployments, the upstream provider owns the contract and continuations while

@@ -27,7 +27,7 @@ Do not update only the schema-version row, and do not reuse v0.4.1 tables
 unchanged. Their v3 layout lacks the owner-scoped conversation-item identity
 and uniqueness constraints required by v4.
 
-The same recreate-only policy applies to standalone `openai_response_store`,
+The same recreate-only policy applies to standalone `openai_responses_store`,
 standalone `openai_conversations`, and compatible deployments where the two
 filters share one backend. When a PostgreSQL database contains unrelated data,
 create a new database for Praxis AI rather than dropping the shared database.

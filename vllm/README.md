@@ -6,6 +6,17 @@ latency.
 
 Published to `ghcr.io/praxis-proxy/vllm-gpu`.
 
+Every image this repository publishes is described by
+[`images.json`](images.json), which is the single source of truth for each
+one's tag, model, and pinned model revision. `vllm-gpu-container.yaml` expands
+that manifest into its build matrix, and the consuming workflows read their
+entry from it rather than keeping their own copy of the pins.
+
+| Key | Tag | Model | Consumed by |
+| --- | --- | --- | --- |
+| `text` | `:Qwen3-8B` | `Qwen/Qwen3-8B` | `vllm-integration.yaml` full GPU Responses suite |
+| `vision` | `:Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` (revision-pinned) | `anthropic-vllm-vision.yaml` nightly |
+
 ## Requirements
 
 - Docker with [BuildKit](https://docs.docker.com/build/buildkit/) enabled
@@ -20,7 +31,8 @@ Published to `ghcr.io/praxis-proxy/vllm-gpu`.
 
 CI defaults to [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B), the same
 model the full GPU suite in `vllm-integration.yaml` serves (`VLLM_GPU_MODEL`).
-The suite builds the image from its checked-out commit and tests that build.
+The suite reuses the published build of that image when it matches its
+checkout, and builds from source when it does not.
 
 The 8.19 B bf16 checkpoint is ~15.3 GiB of weights. It needs a card with enough
 VRAM left over for a KV cache; the CI runner is a `g5.xlarge` (A10G, 24 GiB,
@@ -52,9 +64,9 @@ docker build \
 ```
 
 To bake a specific model revision, pass `INFERENCE_REVISION` with the full
-Hugging Face commit hash. The Anthropic vision GPU workflow does this for
-`Qwen/Qwen3-VL-4B-Instruct` and runs its SDK image tests against the local
-built image.
+Hugging Face commit hash. The `vision` entry in [`images.json`](images.json)
+pins `Qwen/Qwen3-VL-4B-Instruct` this way, so the nightly Anthropic SDK image
+tests compare against fixed weights.
 
 ```console
 docker build \
@@ -132,45 +144,82 @@ VLLM_TEST_BACKEND=live VLLM_MODEL=Qwen/Qwen3-8B \
 ```
 
 Drop `-m "critical_vllm"` to run the complete live Responses suite. The
-nightly GPU job builds this image from its checkout and runs that full suite
-with a PostgreSQL response store.
+nightly GPU job runs that full suite with a PostgreSQL response store, against
+the published image when it matches the checkout.
 
 ## CI
 
-The `.github/workflows/vllm-gpu-container.yaml` workflow builds, tests, and
-publishes the image on a GPU runner, in that order — a failing test skips the
-push, so an image is never published untested.
+The `.github/workflows/vllm-gpu-container.yaml` workflow is the **sole
+publisher** of `ghcr.io/praxis-proxy/vllm-gpu`. It builds, tests, and publishes
+every image in [`images.json`](images.json) on a GPU runner, in that order — a
+failing test skips the push, so an image is never published untested. The two
+images build as separate matrix legs, one at a time (a single self-hosted agent
+runs one job at a time, and each leg wants the whole GPU and most of the disk).
+`fail-fast` is off, so one model's failure does not withhold the other's build.
 
-The test stage is not a bespoke smoke check: it starts the freshly built image
-on the GPU, builds Praxis, starts OGX, and runs
-`tests/integration/sdk/openai/test_openai_responses_vllm.py -m critical_vllm`
-with `VLLM_TEST_BACKEND=live`. That is the same suite, same marker, and same
-[`start-vllm`](../.github/actions/start-vllm/action.yml) /
-[`wait-vllm`](../.github/actions/wait-vllm/action.yml) actions the
-`vllm-live-cpu` job in `vllm-integration.yaml` uses against the CPU image, so
-GPU and CPU images are held to one standard.
+The test stage is not a bespoke smoke check, and it is matched to the model:
 
-The scheduled and `vllm-full-suite` label runs in `vllm-integration.yaml` also
-build this image from the checked-out commit and exercise the complete live
-Responses suite against that local build. The PR image job and full-suite job
-are separate builds; neither publishes an image from a PR.
+- **text** — starts the freshly built image on the GPU, builds Praxis, starts
+  OGX, and runs
+  `tests/integration/sdk/openai/test_openai_responses_vllm.py -m critical_vllm`
+  with `VLLM_TEST_BACKEND=live`. That is the same suite, same marker, and same
+  [`start-vllm`](../.github/actions/start-vllm/action.yml) /
+  [`wait-vllm`](../.github/actions/wait-vllm/action.yml) actions the
+  `vllm-live-cpu` job in `vllm-integration.yaml` uses against the CPU image, so
+  GPU and CPU images are held to one standard.
+- **vision** — serves the image behind a bearer token and runs the official
+  Anthropic SDK image requests in
+  `tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -k image`,
+  the only tests that exercise a vision model at all.
 
 Triggers:
 
-- **Push to `main`** (when `Containerfile`, the GPU build action, the vLLM
-  start/wait actions, the EC2 runner actions, or the workflow changes) —
-  builds, tests, and pushes both
-  `:<model>` (e.g. `:Qwen3-8B`) and `:latest`.
+- **Push to `main`** (when `Containerfile`, `images.json`, the GPU build or
+  image-resolution actions, the vLLM start/wait actions, the EC2 runner
+  actions, or the workflow changes) — builds, tests, and pushes.
 - **Same-repository pull request** / **merge queue** — builds and tests only;
   nothing is pushed. Fork and Dependabot PRs skip the secret-backed GPU runner.
-- **Manual (`workflow_dispatch`)** — accepts an `inference_model` input to
-  build an arbitrary HuggingFace model and a `gpu_instance_type` input to
-  override the EC2 instance type; pushes `:<model>` but not `:latest`. Defaults
-  to `Qwen/Qwen3-8B`.
+- **Manual (`workflow_dispatch`)** — an `images` input selects `both` (default),
+  `text`, or `vision`, so a single image can be republished without paying for
+  the other; `gpu_instance_type` overrides the EC2 instance type. Pushes the
+  moving and commit-pinned tags but not `:latest`.
 
-The image tag is derived from the model ID with the org prefix stripped
+### Published tags
+
+Each image publishes the same three coordinates:
+
+| Tag | Mutability | Purpose |
+| --- | --- | --- |
+| `:<tag>` (e.g. `:Qwen3-8B`) | moves | Newest validated build. What the consuming workflows resolve. |
+| `:<tag>-<commit sha>` | immutable | Keeps one exact build addressable after `:<tag>` moves — qualification evidence and bisects need to name a specific image. |
+| `:latest` | moves | Push to `main` only, and only for the manifest's default (`text`) image, so two models cannot race to clobber it. |
+
+The tag is derived from the model ID with the org prefix stripped
 (`Qwen/Qwen3-8B` → `Qwen3-8B`). Gated models are supported via the
 `HUGGING_FACE_HUB_TOKEN` repository secret.
+
+### How consumers reuse a published image
+
+`vllm-integration.yaml` (full GPU suite) and `anthropic-vllm-vision.yaml` both
+consume rather than rebuild. Each calls
+[`resolve-vllm-gpu-image`](../.github/actions/resolve-vllm-gpu-image/action.yml),
+which pulls `:<tag>` and keeps it **only** when the image's provenance labels
+match that checkout:
+
+| Label | Compared against |
+| --- | --- |
+| `praxis.vllm.containerfile-sha256` | `sha256sum vllm/Containerfile` in the checkout |
+| `praxis.vllm.inference-model` | the manifest entry's `model` |
+| `praxis.vllm.inference-revision` | the manifest entry's `revision` |
+
+Anything else — no published tag, an unreachable registry, or differing
+provenance — falls back to building from source, so a PR that edits the
+`Containerfile` or repins a model is still validated against the image it
+actually describes, and a lagging or broken publish never breaks a consumer.
+[`build-vllm-gpu`](../.github/actions/build-vllm-gpu/action.yml) stamps those
+labels, along with `org.opencontainers.image.revision` and
+`praxis.vllm.base-image` (read out of the `FROM` line rather than repeated, so
+a base bump cannot leave the recorded value behind).
 
 ### GPU runner
 
@@ -195,4 +244,7 @@ the multi-gigabyte build starts, and detects Docker or Podman to select
 ## Dependabot
 
 The `FROM` directive in `Containerfile` is monitored by Dependabot for
-weekly base image updates (see `.github/dependabot.yaml`).
+weekly base image updates (see `.github/dependabot.yaml`). A base bump changes
+the Containerfile hash, so every consumer's provenance check stops matching the
+published images until `vllm-gpu-container.yaml` republishes them — consumers
+build from source in the meantime rather than serving a stale base.

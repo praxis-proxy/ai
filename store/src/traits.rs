@@ -228,7 +228,7 @@ pub trait ResponseStore: Send + Sync {
     /// Append normalized SSE events to a response's durable event log.
     ///
     /// Called from the proxy **output** path at the terminal seam of a streamed
-    /// response: `openai_response_store` holds the sequence-stamped events in
+    /// response: `openai_responses_store` holds the sequence-stamped events in
     /// request scope, upserts the parent record, then flushes them here in one
     /// batch before releasing the terminal frame. This builds the log that
     /// `GET /v1/responses/{id}?stream=true` replays.

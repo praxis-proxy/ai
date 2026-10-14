@@ -23,7 +23,10 @@ jobs:
 
   ci-status:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # A merge group entry is abandoned by GitHub after the ruleset's
+    # check_response_timeout_minutes (60), so a job that outlives that window
+    # only burns a runner on an entry nothing is waiting for.
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 55 || 180 }}
     permissions:
       checks: read
       pull-requests: read
@@ -101,6 +104,24 @@ jobs:
                 core.info(`  ⏳ ${cr.name}: ${cr.status}`);
               }
 
+              const failed = completed.filter(cr => failureConclusions.has(cr.conclusion));
+
+              // A merge group has nobody to re-run a failed job: the
+              // gh-readonly-queue ref is ephemeral and the entry is gated on
+              // this check alone. Fail on the first failure, without waiting
+              // for the remaining checks, so GitHub ejects the pull request and
+              // builds the next entry rather than holding the queue until the
+              // merge-queue check-response timeout.
+              if (context.eventName === 'merge_group' && failed.length > 0) {
+                const summary = failed
+                  .map(cr => `${cr.name}: ${cr.conclusion}`)
+                  .join(', ');
+                core.setFailed(
+                  `${failed.length} check(s) failed in the merge queue — ${summary}`
+                );
+                return;
+              }
+
               if (pending.length > 0) {
                 core.info('Waiting 30s for pending checks...');
                 await new Promise(r => setTimeout(r, 30000));
@@ -108,8 +129,6 @@ jobs:
               }
 
               // All checks completed — evaluate conclusions
-              const failed = completed.filter(cr => failureConclusions.has(cr.conclusion));
-
               if (failed.length > 0) {
                 for (const cr of failed) {
                   core.warning(`${cr.name} concluded with: ${cr.conclusion} — waiting for re-run`);

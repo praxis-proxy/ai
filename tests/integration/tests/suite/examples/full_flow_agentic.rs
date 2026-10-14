@@ -485,6 +485,125 @@ fn full_flow_managed_chat_backend_translates_after_binding() {
     );
 }
 
+/// Native Chat Completions ingress reaches the direct Chat backend raw. A
+/// `POST /v1/chat/completions` body is bound by the EXACT-path route to
+/// `chat-ingress-backend` (application_provider direct) and dispatched through
+/// the direct-services terminal branch — no Responses translation, no IRR. The
+/// native model-rewrite instance (B) rewrites the body `model` via its
+/// `codex-*` alias before the bind, so the backend receives the Chat-shaped body
+/// verbatim with the rewritten target and the client gets the backend response
+/// unchanged. This is the witness the shared gateway goal depends on: a Chat
+/// request must land on the Chat backend, not fall through to the Responses path.
+#[test]
+fn full_flow_native_chat_ingress_reaches_chat_backend_raw() {
+    let chat_response = json!({
+        "id": "chatcmpl_native",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "llama-3.3-70b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "pong"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_native_chat_ingress");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"codex-mini","messages":[{"role":"user","content":"ping"}]}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "native chat ingress should complete: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(
+        response, chat_response,
+        "direct chat passthrough must return the backend response verbatim"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "native chat ingress makes exactly one backend request"
+    );
+    assert_eq!(
+        requests[0].uri, "/v1/chat/completions",
+        "native chat ingress must reach the Chat backend path unchanged"
+    );
+    let forwarded: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert!(
+        forwarded.get("messages").is_some(),
+        "the raw Chat body must pass through without Responses translation"
+    );
+    assert!(
+        forwarded.get("input").is_none(),
+        "no Responses translation runs on the native Chat path"
+    );
+    assert_eq!(
+        forwarded["model"], "llama-3.3-70b",
+        "native model-rewrite (instance B) must retarget the codex-* alias before the bind"
+    );
+}
+
+/// The identity model-rewrite (instance A) is semantically unchanged end to end.
+/// A `vllm-chat` Responses create matches the identity alias `vllm-chat ->
+/// vllm-chat`: the rewrite marks the body mutated and re-serializes it, but the
+/// model VALUE is preserved. The witness confirms the backend still receives
+/// `model: vllm-chat` after Responses->Chat translation — the identity rewrite
+/// neither drops nor rewrites the model the deployment advertises.
+#[test]
+fn full_flow_identity_model_rewrite_preserves_model_value() {
+    let chat_response = json!({
+        "id": "chatcmpl_identity",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "vllm-chat",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_identity_rewrite");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"vllm-chat","input":"hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "identity-aliased request should complete: {raw}"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "single-pass IRR should make one inference request");
+    assert_eq!(requests[0].uri, "/v1/chat/completions");
+    let translated: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert_eq!(
+        translated["model"], "vllm-chat",
+        "the identity alias must preserve the advertised model value end to end"
+    );
+}
+
 #[test]
 fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
     // #1602: a matched `POST /v1/responses` keeps the application protocol and
@@ -579,7 +698,7 @@ fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses()
 /// Streaming persistence and retrieval, end to end. A `stream: true` create
 /// request routes through the IRR, where openai_stream_events accumulates the
 /// native Responses SSE lifecycle into `ResponsesState.response_object`. The
-/// pre-IRR openai_response_store then persists that accumulated object on the
+/// pre-IRR openai_responses_store then persists that accumulated object on the
 /// response path, so the streamed resource is retrievable via
 /// `GET /v1/responses/{id}`. Without the in-IRR accumulator the object stays
 /// null and persistence is silently skipped (the store logs "response_object is
@@ -2003,6 +2122,32 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
     );
 }
 
+/// Flatten every filter the gateway listener composes, in the listener's
+/// declared chain order, into one owned sequence. The full-flow config expresses
+/// its pipeline as three named chains (`ingress-and-binding`, `managed-responses`,
+/// `managed-execution`) so the shared managed-provider gate is inherited once at
+/// the chain level (praxis #1280). Tests that reason about the whole pipeline —
+/// filter presence, relative order across the binding boundary — must see that
+/// composed view rather than a single chain.
+fn flatten_listener_pipeline(config: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
+    let chains = config["filter_chains"]
+        .as_sequence()
+        .expect("config should declare filter_chains");
+    config["listeners"][0]["filter_chains"]
+        .as_sequence()
+        .expect("listener should declare filter_chains")
+        .iter()
+        .flat_map(|name| {
+            let name = name.as_str().expect("chain name should be a string");
+            let chain = chains
+                .iter()
+                .find(|chain| chain["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("listener references unknown chain '{name}'"));
+            chain["filters"].as_sequence().cloned().unwrap_or_default()
+        })
+        .collect()
+}
+
 #[test]
 fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     // The agentic IRR must execute every hosted tool the loop owner can
@@ -2012,9 +2157,8 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let irr = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("filter chain should contain filters")
+    let pipeline = flatten_listener_pipeline(&config);
+    let irr = pipeline
         .iter()
         .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
         .expect("config should contain an iterative_request_router");
@@ -2026,9 +2170,9 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
         .collect();
 
     for dispatcher in [
-        "openai_web_search",
+        "openai_web_search_dispatch",
         "openai_mcp_dispatch",
-        "openai_file_search_callout",
+        "openai_file_search_dispatch",
         "openai_agentic_loop",
     ] {
         assert!(
@@ -2043,9 +2187,7 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let outer_filters = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("outer filter chain should contain filters");
+    let outer_filters = flatten_listener_pipeline(&config);
     let credentials_index = outer_filters
         .iter()
         .position(|filter| filter["filter"].as_str() == Some("callout_credentials"))
@@ -2100,8 +2242,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_web_search"))
-        .expect("IRR inference step should contain openai_web_search");
+        .find(|filter| filter["filter"].as_str() == Some("openai_web_search_dispatch"))
+        .expect("IRR inference step should contain openai_web_search_dispatch");
     assert_eq!(
         web_search["user_credential"].as_str(),
         Some("brave_search"),
@@ -2122,8 +2264,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
-        .expect("IRR inference step should contain openai_file_search_callout");
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_dispatch"))
+        .expect("IRR inference step should contain openai_file_search_dispatch");
     assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
 
     let mcp_resolve = outer_filters

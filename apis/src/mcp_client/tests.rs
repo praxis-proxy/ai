@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+use praxis_core::connectivity::UrlResolutionPolicy;
+
 use super::{
     session_pool::{MAX_IDLE_PER_KEY, MAX_TOTAL_IDLE, close_sessions},
     *,
@@ -19,7 +21,7 @@ use super::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
-    validate_mcp_target(url, TEST_TIMEOUT, false).await
+    validate_mcp_target(url, TEST_TIMEOUT, false, UrlResolutionPolicy::ClientPerCall).await
 }
 
 fn display_url(url: &str) -> McpDisplayUrl {
@@ -824,14 +826,24 @@ async fn ssrf_blocks_private_rfc1918_by_default() {
 #[tokio::test]
 async fn ssrf_allows_private_rfc1918_when_private_permitted() {
     assert!(
-        validate_mcp_target("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://10.0.0.5/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
     assert!(
-        validate_mcp_target("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://192.168.1.100/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
@@ -908,36 +920,56 @@ async fn ssrf_blocks_ipv6_unique_local() {
 #[tokio::test]
 async fn allow_loopback_permits_ipv4_loopback() {
     assert!(
-        validate_mcp_target("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://127.0.0.1/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
 #[tokio::test]
 async fn allow_loopback_permits_localhost_hostname() {
     assert!(
-        validate_mcp_target("http://localhost/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://localhost/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
 #[tokio::test]
 async fn allow_private_still_blocks_metadata() {
     assert!(
-        validate_mcp_target("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_err()
+        validate_mcp_target(
+            "http://169.254.169.254/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_err()
     );
 }
 
 #[tokio::test]
 async fn allow_private_permits_ipv6_unique_local() {
     assert!(
-        validate_mcp_target("http://[fc00::1]/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok(),
+        validate_mcp_target(
+            "http://[fc00::1]/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok(),
         "an explicit private-target opt-in should permit IPv6 unique-local addresses"
     );
 }
@@ -945,9 +977,14 @@ async fn allow_private_permits_ipv6_unique_local() {
 #[tokio::test]
 async fn allow_private_permits_non_metadata_link_local() {
     assert!(
-        validate_mcp_target("http://169.254.1.1/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok(),
+        validate_mcp_target(
+            "http://169.254.1.1/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok(),
         "an explicit private-target opt-in should permit non-metadata link-local addresses"
     );
 }
@@ -955,9 +992,14 @@ async fn allow_private_permits_non_metadata_link_local() {
 #[tokio::test]
 async fn allow_loopback_still_blocks_unspecified() {
     assert!(
-        validate_mcp_target("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_err()
+        validate_mcp_target(
+            "http://0.0.0.0/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_err()
     );
 }
 

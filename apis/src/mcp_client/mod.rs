@@ -47,7 +47,8 @@ use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPON
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
-        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, mcp_resolution_policy,
+        transport_signal_error, validate_mcp_target,
     },
 };
 use crate::StateOwner;
@@ -109,8 +110,9 @@ impl McpDisplayUrl {
         let mut out = String::with_capacity(scheme.len() + host.len() + 16);
         out.push_str(scheme);
         out.push_str("://");
-        // `http::Uri::host()` can return an IPv6 literal without its brackets;
-        // put them back so the value stays a valid URL authority.
+        // `http::Uri::host()` already returns an IPv6 literal bracketed (`[::1]`),
+        // so only an unbracketed literal is wrapped here; re-wrapping a bracketed
+        // host would produce `[[::1]]` and no longer be a valid URL authority.
         if host.contains(':') && !host.starts_with('[') {
             out.push('[');
             out.push_str(host);
@@ -374,6 +376,7 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     let mcp_client = subrequest_transport::McpSubrequestClient::control(
         callout.clone(),
         timeout,
+        mcp_resolution_policy(connector_context.is_some()),
         connector_context.map(|context| context.owner.clone()),
     );
     // Take the signal handle before the client is moved into the rmcp
@@ -494,6 +497,7 @@ async fn open_tool_session(
         callout.clone(),
         timeout,
         max_result_bytes,
+        mcp_resolution_policy(connector_context.is_some()),
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();

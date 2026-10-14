@@ -147,7 +147,7 @@ pub use crate::openai::responses::DEFAULT_STORE_NAME;
 
 /// Filter type that configures the response store. The serving runtime scans
 /// filter chains for this type to provision the backends the store filter reads.
-pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_response_store";
+pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_responses_store";
 
 /// Filter type that configures the conversations store. The serving runtime
 /// scans filter chains for this type to provision the conversations backend the
