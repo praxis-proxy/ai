@@ -1257,6 +1257,9 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
         if scripted_tool is not None:
             self._send_scripted_chat_response(request_body, scripted_tool)
             return
+        if self._wants_service_tier_response(request_body):
+            self._send_service_tier_chat_response(request_body)
+            return
 
         headers = {
             key: value
@@ -1296,6 +1299,51 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
             if hosted_tool in tool_names:
                 return hosted_tool
         return None
+
+    def _wants_service_tier_response(self, request_body: dict[str, Any]) -> bool:
+        if not self.path.rstrip("/").endswith("/v1/chat/completions"):
+            return False
+        return any(
+            message.get("content") == "STREAM-SERVICE-TIER-1549"
+            for message in request_body.get("messages", [])
+            if isinstance(message, dict)
+        )
+
+    def _send_service_tier_chat_response(self, request_body: dict[str, Any]) -> None:
+        completion_id = f"chatcmpl_service_tier_{time.time_ns()}"
+        chunks = [
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+            },
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "service_tier": "scale",
+                "choices": [{"index": 0, "delta": {"content": "Service tier recorded"}}],
+            },
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "service_tier": "scale",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        payload = b"".join(
+            f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks
+        ) + b"data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send_scripted_chat_response(
         self, request_body: dict[str, Any], tool_name: str
@@ -9401,6 +9449,43 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
                 },
             }
         ]
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
+    reason="the service-tier provider response is deterministically scripted",
+)
+def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_client):
+    """Opening and terminal snapshots agree on the provider service tier."""
+    request_start = len(SimulatorBackendHandler.recorded_requests)
+    events = list(
+        chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            service_tier="auto",
+            store=False,
+            stream=True,
+        )
+    )
+
+    snapshots = [
+        event.response
+        for event in events
+        if event.type in {"response.created", "response.in_progress", "response.completed"}
+    ]
+    event_types = [event.type for event in events]
+    assert event_types.count("response.created") == 1, event_types
+    assert event_types.count("response.in_progress") == 1, event_types
+    assert len(snapshots) == 3, event_types
+    assert all(response.service_tier == "scale" for response in snapshots)
+
+    recorded = [
+        body
+        for path, body in SimulatorBackendHandler.recorded_requests[request_start:]
+        if path.rstrip("/").endswith("/v1/chat/completions")
+    ]
+    assert len(recorded) == 1, recorded
+    assert recorded[0]["service_tier"] == "auto", recorded[0]
 
 
 @pytest.mark.parametrize(
