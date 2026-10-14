@@ -18,7 +18,7 @@
 
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead as _, BufReader, Write as _},
     net::TcpListener,
     sync::{Arc, mpsc},
     thread::{self, JoinHandle},
