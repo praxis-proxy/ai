@@ -222,11 +222,10 @@ fn assert_redacted_assistant_content(
 /// Run `on_response` and record whether the upstream sent `Content-Length`.
 ///
 /// The header value is not the buffered body length. Only its presence
-/// selects the committed-length rules. The response binding is expanded into
-/// the caller so it outlives later uses of the context. `response_header`
-/// borrows that response for the context's lifetime.
+/// selects the committed-length rules. The response binding lives only for
+/// the `on_response` call; `response_header` is cleared before the macro ends.
 macro_rules! note_upstream_content_length {
-    ($filter:expr, $ctx:expr, $committed:expr) => {
+    ($filter:expr, $ctx:expr, $committed:expr) => {{
         $ctx.current_filter_id = Some(0);
         let mut response = crate::test_utils::make_response();
         if $committed {
@@ -235,13 +234,17 @@ macro_rules! note_upstream_content_length {
                 .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("1"));
         }
         $ctx.response_header = Some(&mut response);
-        $filter
+        let action = $filter
             .on_response(&mut $ctx)
             .await
             .expect("on_response should note response framing");
+        assert!(
+            matches!(action, praxis_filter::FilterAction::Continue),
+            "recording response framing should continue"
+        );
         $ctx.response_header = None;
         $ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    };
+    }};
 }
 
 /// The body is one JSON value and is not space-padded out to a longer length.
@@ -1728,10 +1731,10 @@ async fn on_response_body_modified_rewrites_assistant_content() {
     assert_redacted_assistant_content(&ctx, &replaced, original_len, "My SSN is [REDACTED]");
 }
 
-/// Response-phase filter that masks choice 0 as `[REDACTED]`.
-fn response_redact_filter() -> AiGuardrailsFilter {
+/// Response-phase filter that masks choice 0 as `mask`.
+fn response_mask_filter(mask: &str) -> AiGuardrailsFilter {
     AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
+        GuardResult::redact_message(0, mask.into(), "pii".into()),
         PhaseConfig {
             request: false,
             response: true,
@@ -1739,6 +1742,11 @@ fn response_redact_filter() -> AiGuardrailsFilter {
         },
     )
     .expect("test filter")
+}
+
+/// Response-phase filter that masks choice 0 as `[REDACTED]`.
+fn response_redact_filter() -> AiGuardrailsFilter {
+    response_mask_filter("[REDACTED]")
 }
 
 /// Run response redaction against a committed `Content-Length` and require a same-length continuation.
@@ -1791,7 +1799,7 @@ fn completion_with_recoverable_original_text() -> bytes::Bytes {
                     {"token": "-45-", "logprob": -0.2, "bytes": [45, 52, 53, 45]},
                     {"token": "6789", "logprob": -0.3, "bytes": [54, 55, 56, 57]}
                 ]},
-                "token_ids": [515051, 424242],
+                "token_ids": [515_051, 424_242],
                 "finish_reason": "stop"
             }]
         }))
@@ -1866,28 +1874,20 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
     );
 }
 
-/// A redacted choice keeps only `index`, `finish_reason`, and `message.role`
-/// plus the masked `content`. Side fields that quote the original tokens are
-/// dropped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text()).await;
-    let json: serde_json::Value =
-        serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
+/// Allowlisted choice fields survive redaction.
+fn assert_allowlisted_choice(json: &serde_json::Value) {
     assert_eq!(
-        json.pointer("/id").and_then(serde_json::Value::as_str),
+        json_str(json, "/id"),
         Some("chatcmpl-test"),
         "fields outside the redacted choice stay"
     );
     assert_eq!(
-        json.pointer("/choices/0/message/content")
-            .and_then(serde_json::Value::as_str),
+        json_str(json, "/choices/0/message/content"),
         Some("[REDACTED]"),
         "assistant content should be the mask"
     );
     assert_eq!(
-        json.pointer("/choices/0/message/role")
-            .and_then(serde_json::Value::as_str),
+        json_str(json, "/choices/0/message/role"),
         Some("assistant"),
         "message role is on the allowlist"
     );
@@ -1897,11 +1897,14 @@ async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
         "choice index is on the allowlist"
     );
     assert_eq!(
-        json.pointer("/choices/0/finish_reason")
-            .and_then(serde_json::Value::as_str),
+        json_str(json, "/choices/0/finish_reason"),
         Some("stop"),
         "finish_reason is on the allowlist"
     );
+}
+
+/// Side fields that quote the original tokens are absent after redaction.
+fn assert_redacted_choice_drops_original(json: &serde_json::Value, replaced: &bytes::Bytes) {
     let choice = json
         .pointer("/choices/0")
         .and_then(serde_json::Value::as_object)
@@ -1914,7 +1917,7 @@ async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
         json.pointer("/choices/0/message/reasoning").is_none(),
         "message.reasoning must not remain on a redacted choice"
     );
-    let rendered = String::from_utf8_lossy(&replaced);
+    let rendered = String::from_utf8_lossy(replaced);
     assert!(
         !rendered.contains("123-45-6789"),
         "original digits must not reach the client"
@@ -1924,6 +1927,18 @@ async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
         !rendered.contains("515051"),
         "return_token_ids values must not reach the client"
     );
+}
+
+/// A redacted choice keeps only `index`, `finish_reason`, and `message.role`
+/// plus the masked `content`. Side fields that quote the original tokens are
+/// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text()).await;
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
+    assert_allowlisted_choice(&json);
+    assert_redacted_choice_drops_original(&json, &replaced);
 }
 
 /// A configured redaction that cannot be applied must replace the response
@@ -1961,42 +1976,16 @@ async fn on_response_records_whether_content_length_was_sent() {
     }
 }
 
-/// A short name replaced by a longer mask grows the completion. With no
-/// `Content-Length` on the wire, the masked body is forwarded instead of an
-/// `evaluation_failed` error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_growth_without_content_length_is_forwarded() {
-    let filter = AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(0, "<PERSON>".into(), "pii".into()),
-        PhaseConfig {
-            request: false,
-            response: true,
-            tool_results: false,
-        },
-    )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(&filter, ctx, false);
-    let original = chat_completion_response("Bob");
-    let original_len = original.len();
-    let mut body = Some(original);
-
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(
-        matches!(action, praxis_filter::FilterAction::Continue),
-        "an unbounded rewrite should continue"
-    );
-    let replaced = body.expect("body should be rewritten");
+/// A longer mask is forwarded as a completion when no length was committed.
+fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, original_len: usize) {
     assert!(
         replaced.len() > original_len,
         "a longer mask is forwarded when the upstream sent no Content-Length"
     );
-    assert_natural_json(&replaced);
-    let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted JSON");
+    assert_natural_json(replaced);
+    let json: serde_json::Value = serde_json::from_slice(replaced).expect("redacted JSON");
     assert_eq!(
-        json.pointer("/choices/0/message/content")
-            .and_then(serde_json::Value::as_str),
+        json_str(&json, "/choices/0/message/content"),
         Some("<PERSON>"),
         "the mask is forwarded"
     );
@@ -2010,6 +1999,27 @@ async fn on_response_body_growth_without_content_length_is_forwarded() {
             .and_then(|result| result.get("status")),
         Some("redacted")
     );
+}
+
+/// A short name replaced by a longer mask grows the completion. With no
+/// `Content-Length` on the wire, the masked body is forwarded instead of an
+/// `evaluation_failed` error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_growth_without_content_length_is_forwarded() {
+    let filter = response_mask_filter("<PERSON>");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    note_upstream_content_length!(&filter, ctx, false);
+    let original = chat_completion_response("Bob");
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, praxis_filter::FilterAction::Continue),
+        "an unbounded rewrite should continue"
+    );
+    assert_forwarded_mask(&ctx, &body.expect("body should be rewritten"), original_len);
 }
 
 /// A blocked body is the error document itself when no length was committed.
