@@ -227,21 +227,7 @@ async fn mapping_clears_a_previous_grouped_selector_without_changing_other_heade
         "an unmapped provider target must continue through the existing route"
     );
 
-    assert_eq!(
-        ctx.pending_header_value(&PROVIDER_HEADER).unwrap(),
-        praxis_filter::PendingHeaderResult::Removed,
-        "a later unmapped decision must revoke earlier grouped selector sets and adds"
-    );
-    assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
-    assert_eq!(ctx.request_headers_to_set, [(tenant, HeaderValue::from_static("acme"))]);
-    assert_eq!(
-        ctx.extra_request_headers,
-        [("x-trusted-mode".into(), "preserved".to_owned())]
-    );
-    assert!(
-        ctx.pre_read_mutations.is_empty(),
-        "grouped cleanup must preserve grouped mode"
-    );
+    assert_grouped_mapping_cleared(&ctx, tenant);
 }
 
 #[tokio::test]
@@ -361,5 +347,24 @@ fn assert_stale_mapping_removed(ctx: &HttpFilterContext<'_>) {
     assert!(
         matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER),
         "stale selector removal must follow earlier ordered mutations"
+    );
+}
+
+/// Assert grouped selector removal while retaining unrelated header writes.
+fn assert_grouped_mapping_cleared(ctx: &HttpFilterContext<'_>, tenant: HeaderName) {
+    assert_eq!(
+        ctx.pending_header_value(&PROVIDER_HEADER).unwrap(),
+        praxis_filter::PendingHeaderResult::Removed,
+        "a later unmapped decision must revoke earlier grouped selector sets and adds"
+    );
+    assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
+    assert_eq!(ctx.request_headers_to_set, [(tenant, HeaderValue::from_static("acme"))]);
+    assert_eq!(
+        ctx.extra_request_headers,
+        [("x-trusted-mode".into(), "preserved".to_owned())]
+    );
+    assert!(
+        ctx.pre_read_mutations.is_empty(),
+        "grouped cleanup must preserve grouped mode"
     );
 }
