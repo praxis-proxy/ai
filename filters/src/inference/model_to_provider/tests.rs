@@ -268,10 +268,16 @@ async fn mapping_defers_partial_bodies_until_end_of_stream() {
         "partial requests must continue until their buffered body is complete"
     );
 
-    assert_eq!(body, Some(original));
-    assert!(ctx.request_headers_to_set.is_empty());
-    assert!(ctx.request_headers_to_remove.is_empty());
-    assert!(ctx.filter_metadata.is_empty());
+    assert_eq!(body, Some(original), "a partial body must stay unchanged");
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "a partial body must not set headers"
+    );
+    assert!(
+        ctx.request_headers_to_remove.is_empty(),
+        "a partial body must not remove headers"
+    );
+    assert!(ctx.filter_metadata.is_empty(), "a partial body must not write metadata");
 }
 
 #[tokio::test]

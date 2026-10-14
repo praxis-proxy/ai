@@ -2069,20 +2069,41 @@ mod tests {
         assert_eq!(native_stream.turns[0].expect.upstream_sse_interleaved_events, ["ping"]);
 
         let model_provider = InferenceScenario::load(&root.join("scenarios/messages/model-provider-map.yaml")).unwrap();
-        assert_eq!(model_provider.id, "messages/model-provider-map");
+        assert_eq!(model_provider.id, "messages/model-provider-map", "model_provider.id");
         assert_eq!(
             model_provider.description,
-            "Stable client model ID is routed to its provider with a provider-specific request model."
+            "Stable client model ID is routed to its provider with a provider-specific request model.",
+            "model_provider.description"
         );
-        assert_eq!(model_provider.protocol, InferenceProtocol::AnthropicMessages);
-        assert_eq!(model_provider.example_config, "model-to-provider.yaml");
-        assert_eq!(model_provider.upstream_authority, "127.0.0.1:9001");
-        assert_eq!(model_provider.features, ["messages.model_provider.request_target"]);
-        assert_eq!(model_provider.turns[0].request.path, "/v1/messages");
+        assert_eq!(
+            model_provider.protocol,
+            InferenceProtocol::AnthropicMessages,
+            "model_provider.protocol"
+        );
+        assert_eq!(
+            model_provider.example_config, "model-to-provider.yaml",
+            "model_provider.example_config"
+        );
+        assert_eq!(
+            model_provider.upstream_authority, "127.0.0.1:9001",
+            "model_provider.upstream_authority"
+        );
+        assert_eq!(
+            model_provider.features,
+            ["messages.model_provider.request_target"],
+            "model_provider.features"
+        );
+        assert_eq!(
+            model_provider.turns[0].request.path, "/v1/messages",
+            "model_provider.turns[0].request.path"
+        );
         let RecordedBody::Json { value } = &model_provider.turns[0].request.body else {
             panic!("model-to-provider request must be JSON");
         };
-        assert_eq!(value["model"], "claude-sonnet-4-5");
+        assert_eq!(
+            value["model"], "claude-sonnet-4-5",
+            "model_provider.turns[0].request.body.model"
+        );
 
         let responses_nonstream =
             InferenceScenario::load(&root.join("scenarios/responses/native-basic-nonstream.yaml")).unwrap();
