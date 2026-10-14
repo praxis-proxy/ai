@@ -66,7 +66,7 @@ rmcp = { version = "3.4.0", default-features = false, features = ["client", "tra
 # Without default features: `aws_lc_rs` on by default would silently link
 # aws-lc-rs into every test binary, and `prefer-post-quantum` implies
 # `aws_lc_rs`. The provider is whatever the process installed.
-rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
