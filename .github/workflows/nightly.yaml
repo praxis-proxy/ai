@@ -105,7 +105,7 @@ jobs:
 
 
       - name: Supply chain audit
-        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@47bb6d185b3dcf6e19a24bf85fb4397e5e8224e2 # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@5a796d2ccca59b76a6c32eabb59f6e3e78101f44 # v0.1.0
 
   # ----------------------------------------------------------------------------
   # Coverage gate
