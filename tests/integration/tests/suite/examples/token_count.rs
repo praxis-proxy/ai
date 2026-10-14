@@ -132,7 +132,10 @@ fn token_count_extracts_buffered_azure_json_once() {
     let (counts, mode, saw_raw, final_body) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
     let frozen_body: serde_json::Value =
         serde_json::from_slice(final_body.as_deref().expect("Azure EOS must contain frozen JSON")).unwrap();
-    assert_eq!(frozen_body, expected_body, "Azure EOS should contain the complete adapted JSON");
+    assert_eq!(
+        frozen_body, expected_body,
+        "Azure EOS should contain the complete adapted JSON"
+    );
     assert!(
         matches!(mode, BodyMode::StreamBuffer { .. }),
         "Azure should enable buffering"
