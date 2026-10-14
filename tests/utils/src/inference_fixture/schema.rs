@@ -304,6 +304,9 @@ pub struct InferenceScenario {
     pub example_config: String,
     /// The authority expected for upstream requests.
     pub upstream_authority: String,
+    /// Additional exact example endpoints bound to the same owned replay backend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_upstream_aliases: Vec<String>,
     /// Features exercised by this scenario.
     pub features: Vec<String>,
     /// Ordered requests and expectations in the scenario.

@@ -166,10 +166,11 @@ This peek-then-stream pattern avoids the latency of
 external processor architectures while providing body
 visibility where it matters.
 
-Filters declare `BodyAccess::ReadOnly` +
+Filters declare body access and
 `BodyMode::StreamBuffer { max_bytes }` to opt in.
-Only `PromptEnrichFilter` uses `ReadWrite` (it
-modifies the messages array).
+Body writers such as `model_to_provider` and
+`prompt_enrich` use `BodyAccess::ReadWrite` to replace
+the buffered request before forwarding it.
 
 ## Filters
 
@@ -199,6 +200,20 @@ routing cannot be spoofed. When a trusted hop in front
 of Praxis already sets the header, an
 `unless: {headers_present: [...]}` condition on the
 filter skips it entirely, preserving the incoming value.
+
+### `model_to_provider`
+
+Maps an exact client model and request path to a provider
+selector and target model. The reserved
+`x-praxis-ai-provider` header lets the existing router
+select a cluster; the JSON request carries the provider
+target model. Unknown models and paths continue through
+the configured fallback route unchanged.
+
+The original client model stays in request metadata for
+metering and optional provider response adapters. The
+filter itself leaves responses unchanged. The example
+uses distinct provider and fallback backends.
 
 ### `openai_responses_request`
 
@@ -256,6 +271,8 @@ Persists non-streaming Responses API responses. See
   `OpenaiResponsesRequestFilter`
 - `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
+- `filters/src/inference/model_to_provider.rs`:
+  `ModelToProviderFilter`
 - `filters/src/prompt_enrich/`:
   prompt enrichment filter
 - `apis/src/anthropic/`:
