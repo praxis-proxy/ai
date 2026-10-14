@@ -233,7 +233,9 @@ impl HttpFilter for TokenObserver {
     fn response_body_mode(&self) -> BodyMode {
         self.release
             .as_ref()
-            .map_or(BodyMode::Stream, |_| BodyMode::StreamBuffer { max_bytes: 65_536 })
+            .map_or(BodyMode::Stream, |_| BodyMode::StreamBuffer {
+                max_bytes: Some(65_536),
+            })
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
