@@ -222,10 +222,11 @@ fn assert_redacted_assistant_content(
 /// Run `on_response` and record whether the upstream sent `Content-Length`.
 ///
 /// The header value is not the buffered body length. Only its presence
-/// selects the committed-length rules. This is a macro so the temporary
-/// response lives in the caller, matching `response_header`'s lifetime.
+/// selects the committed-length rules. The response binding is expanded into
+/// the caller so it outlives later uses of the context. `response_header`
+/// borrows that response for the context's lifetime.
 macro_rules! note_upstream_content_length {
-    ($filter:expr, $ctx:expr, $committed:expr) => {{
+    ($filter:expr, $ctx:expr, $committed:expr) => {
         $ctx.current_filter_id = Some(0);
         let mut response = crate::test_utils::make_response();
         if $committed {
@@ -240,7 +241,7 @@ macro_rules! note_upstream_content_length {
             .expect("on_response should note response framing");
         $ctx.response_header = None;
         $ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    }};
+    };
 }
 
 /// The body is one JSON value and is not space-padded out to a longer length.
@@ -775,7 +776,8 @@ async fn on_request_body_modified_without_user_message_fails_closed() {
         rejection.status, 502,
         "a redaction that cannot be applied must be rejected, not failed open"
     );
-    let body_text = String::from_utf8_lossy(&rejection.body.expect("rejection body"));
+    let rejection_body = rejection.body.expect("rejection body");
+    let body_text = String::from_utf8_lossy(&rejection_body);
     assert!(
         body_text.contains("is not a user turn"),
         "system message must not be rewritten, got: {body_text}"
@@ -802,7 +804,8 @@ async fn on_request_body_modified_refuses_non_string_content() {
         rejection.status, 502,
         "array content must be rejected rather than replaced with a string"
     );
-    let body_text = String::from_utf8_lossy(&rejection.body.expect("rejection body"));
+    let rejection_body = rejection.body.expect("rejection body");
+    let body_text = String::from_utf8_lossy(&rejection_body);
     assert!(
         body_text.contains("message content is not a string"),
         "non-string content should fail closed, got: {body_text}"
@@ -1937,21 +1940,25 @@ async fn on_response_records_whether_content_length_was_sent() {
     let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(filter.as_ref(), ctx, true);
-    assert_eq!(
-        super::filter::recorded_content_length(&ctx),
-        Some(true),
-        "a Content-Length header commits the response length"
-    );
+    {
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        note_upstream_content_length!(filter.as_ref(), ctx, true);
+        assert_eq!(
+            super::filter::recorded_content_length(&ctx),
+            Some(true),
+            "a Content-Length header commits the response length"
+        );
+    }
 
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(filter.as_ref(), ctx, false);
-    assert_eq!(
-        super::filter::recorded_content_length(&ctx),
-        Some(false),
-        "responses without Content-Length are not length-limited"
-    );
+    {
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        note_upstream_content_length!(filter.as_ref(), ctx, false);
+        assert_eq!(
+            super::filter::recorded_content_length(&ctx),
+            Some(false),
+            "responses without Content-Length are not length-limited"
+        );
+    }
 }
 
 /// A short name replaced by a longer mask grows the completion. With no
