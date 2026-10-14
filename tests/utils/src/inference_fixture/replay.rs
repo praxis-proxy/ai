@@ -420,6 +420,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_agentic_loop"
             | "anthropic_messages_request"
             | "anthropic_messages_protocol"
+            | "anthropic_messages_to_vertexai_anthropic"
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"
             | "iterative_request_router"
@@ -442,10 +443,27 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
     )
 }
 
-/// Whether one filter entry is replay-contained, including the deferred-only
-/// `openai_mcp_tool_resolve` exception.
+/// Whether one filter entry is replay-contained, including literal credentials
+/// and the deferred-only `openai_mcp_tool_resolve` exception.
 fn filter_is_replay_contained(filter: &FilterEntry) -> bool {
+    if filter.filter_type == "credential_injection" {
+        return filter.config.as_mapping().is_some_and(has_literal_replay_credentials);
+    }
     filter.filter_type == "openai_mcp_tool_resolve" || is_replay_contained_filter(filter.filter_type.as_str())
+}
+
+/// Allows literal fixture credentials without reading the recording process's environment.
+fn has_literal_replay_credentials(config: &serde_yaml::Mapping) -> bool {
+    config
+        .get("clusters")
+        .and_then(serde_yaml::Value::as_sequence)
+        .filter(|clusters| !clusters.is_empty())
+        .is_some_and(|clusters| {
+            clusters.iter().all(|cluster| {
+                cluster.get("env_var").is_none_or(serde_yaml::Value::is_null)
+                    && cluster.get("value").and_then(serde_yaml::Value::as_str).is_some()
+            })
+        })
 }
 
 /// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
@@ -543,6 +561,11 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 
 /// Contains file-backed fields and one dynamically nested database target.
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
+    if mapping.get("filter").and_then(serde_yaml::Value::as_str) == Some("credential_injection")
+        && !has_literal_replay_credentials(mapping)
+    {
+        return Err(runtime_error("scenario credentials are not replay-contained"));
+    }
     contain_sigv4_credentials(mapping);
     if mapping
         .iter()
@@ -2752,6 +2775,27 @@ mod tests {
         let source = replay_config_source("openai/responses/agentic-loop-deferred-mcp-fixture.yaml");
         let config = Config::from_yaml(&source).expect("deferred MCP fixture config should parse");
         validate_replay_filters(&config).expect("deferred MCP fixture contains only replay-safe filters");
+    }
+
+    #[test]
+    fn replay_vertex_credentials_require_literal_values_before_config_construction() {
+        let source = replay_config_source("vertex/messages-to-anthropic.yaml");
+        build_replay_config(&source, 19_001, "127.0.0.1:3000", 19_002)
+            .expect("literal fixture credentials and owned targets must remain replayable");
+        assert!(
+            !is_replay_contained_filter("credential_injection"),
+            "the filter must not be admitted without inspecting its credential source"
+        );
+        for replacement in [
+            "env_var: VERTEX_REPLAY_DUMMY_CREDENTIAL",
+            "value: null",
+            "value: literal\n            env_var: VERTEX_REPLAY_DUMMY_CREDENTIAL",
+        ] {
+            let source = source.replace("value: \"ya29.example-static-token\"", replacement);
+            let error = build_replay_config(&source, 19_001, "127.0.0.1:3000", 19_002)
+                .expect_err("ambient or missing credentials must fail before filter construction");
+            assert_eq!(error.to_string(), "scenario credentials are not replay-contained");
+        }
     }
 
     #[test]

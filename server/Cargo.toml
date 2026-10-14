@@ -60,6 +60,9 @@ http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 # Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
+# Experimental: the anthropic_messages_to_vertexai_anthropic (Anthropic Messages
+# to Vertex AI rawPredict) translation filter (see praxis-ai-filters).
+vertex-anthropic-filter = ["praxis-ai-filters/vertex-anthropic-filter", "experimental"]
 # Experimental: the released Praxis Basic Auth filter, which publishes
 # AuthenticatedIdentity for downstream filters.
 basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]

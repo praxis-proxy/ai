@@ -83,8 +83,8 @@ what is left out and why.
 The store-backed groups need a backend at runtime, so pair them with
 `store-postgres`, `store-postgres-cert-auth`, or `store-sqlite` (for example
 `--features openai-all,store-sqlite`). The experimental `http-callout-filter`,
-`azure-ad-filter`, `gcp-adc-filter`, `token-rate-limit-filter`, and
-`basic-auth-filter` features, and the `llmd-ext-proc` and `opentelemetry`
+`azure-ad-filter`, `gcp-adc-filter`, `token-rate-limit-filter`,
+`vertex-anthropic-filter`, and `basic-auth-filter` features, and the `llmd-ext-proc` and `opentelemetry`
 features, are opt-in as before. A configuration that names a filter the binary
 was built without fails at startup with an unknown filter type error.
 

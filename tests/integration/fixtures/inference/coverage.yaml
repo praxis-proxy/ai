@@ -9,6 +9,7 @@ scope:
   - responses_client_tool_compat
   - openai_chat_completions_to_azureai_chat_completions
   - openai_chat_completions_to_vertexai_gemini
+  - anthropic_messages_to_vertexai_anthropic
 features:
   - id: bedrock.converse.request.text
     scopes:
@@ -678,6 +679,24 @@ features:
     status: synthetic_only
     scenarios:
       - messages/malformed-success
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.anthropic.error.google_envelope
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.anthropic.streaming.wire_fields
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
     providers:
       synthetic:
         status: synthetic_only
