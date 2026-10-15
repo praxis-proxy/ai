@@ -31,12 +31,17 @@ struct Model<'a>(#[serde(borrow)] Cow<'a, str>);
 struct ModelVisitor;
 
 impl<'de> Visitor<'de> for ModelVisitor {
+    /// Last root model value, borrowed without interpreting its JSON type.
     type Value = Option<&'de RawValue>;
 
+    /// Describe the required root object when serde encounters another JSON type.
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON request object")
     }
 
+    /// Retain the last raw model so an earlier non-string value cannot mask a later string.
+    ///
+    /// Consume every member before decoding the model to preserve duplicate-key precedence.
     fn visit_map<Access: MapAccess<'de>>(self, mut map: Access) -> Result<Self::Value, Access::Error> {
         let mut model = None;
         while let Some(field) = map.next_key::<Field>()? {
