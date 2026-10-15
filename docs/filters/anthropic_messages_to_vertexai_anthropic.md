@@ -7,7 +7,9 @@ Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex resp
 
 ## Configuration Notes
 
-Responses carry the model id the client sent: the prefixed Vertex target, or a public id recorded by an earlier adapter in the `model_to_provider.client_model` metadata. The optional model-to-provider routing filter is a separate capability.
+Activates after upstream selection only for clusters whose HTTP metadata declares `application_provider: vertex`. The earlier `model_to_provider` filter owns upstream selection and the exact target model, including snapshot suffixes. This adapter never selects a provider or maps model names.
+
+Responses restore the original client model from `model_to_provider.client_model` metadata, falling back to the target model when no mapping recorded a public alias.
 
 Streaming preserves SSE comments, event IDs, and retry fields. Oversized or incomplete frames emit an Anthropic error event after complete events and suppress the remaining stream.
 
@@ -19,8 +21,6 @@ Experimental: requires the `vertex-anthropic-filter` cargo feature, which is off
 |-------|------|---------|-------------|
 | `project` | string | yes | GCP project the upstream URL is built against. |
 | `location` | string | no | Vertex location; `global` routes through the multi-region endpoint and is the recommended default. |
-| `model_prefix` | string | no | Prefix stripped from the request body's `model` to obtain the Vertex publisher model id. Defaults to `vertex/`. |
-| `model_pins` | object<string, string> | no | Snapshot suffixes keyed by Vertex publisher model id, e.g. `claude-sonnet-4-5: "@20250929"`. A pin is appended to the model id in the URL only when the publisher id matches its key exactly, so each model keeps its own snapshot and an alias cannot move to a new snapshot underneath a stable user-facing name. Models without an entry are sent unpinned. |
 | `beta_allowlist` | string[] | no | Allowed `anthropic-beta` flag values. An empty list (the default) forwards the header untouched; a non-empty list keeps only the listed comma-separated flags and drops the header if nothing remains. |
 | `max_body_bytes` | integer | no | Maximum buffered request or JSON response size, and maximum in-flight SSE frame size, in bytes. |
 
@@ -39,9 +39,6 @@ project: my-gcp-project
 filter: anthropic_messages_to_vertexai_anthropic
 project: my-gcp-project
 location: global
-model_prefix: "vertex/"
-model_pins:
-  claude-sonnet-4-5: "@20250929"
 beta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]
 max_body_bytes: 33554432
 ```

@@ -86,24 +86,16 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-/// The rewritten request: body bytes, upstream path, and the original
-/// user-facing model id (needed to restore the model in responses).
+/// The rewritten request: body bytes, upstream path, and the resolved
+/// target model (the response identity when no public alias was recorded).
 #[derive(Debug)]
 pub(crate) struct TransformedRequest {
     /// Transformed request body.
     pub body: Vec<u8>,
     /// Vertex `rawPredict` path to send upstream.
     pub path: String,
-    /// User-facing model id as the client sent it (prefix included).
-    pub user_model: String,
-}
-
-/// Strip the user-facing prefix to obtain the Vertex publisher model id.
-/// Models sent without the prefix (e.g. plain `claude-sonnet-4-5`) pass
-/// through unchanged, so a gateway can expose the same id on both the
-/// direct-Anthropic and Vertex backends.
-fn publisher_model<'a>(user_model: &'a str, prefix: &str) -> &'a str {
-    user_model.strip_prefix(prefix).unwrap_or(user_model)
+    /// Exact provider target from the request body.
+    pub target_model: String,
 }
 
 /// Validate a publisher model id against the URL-path character
@@ -125,22 +117,19 @@ pub(crate) fn transform_request(
     body: &[u8],
     operation: Operation,
     cfg: &VertexAnthropicConfig,
-) -> Result<Option<TransformedRequest>, RequestError> {
+) -> Result<TransformedRequest, RequestError> {
     let mut value: Value =
         serde_json::from_slice(body).map_err(|error| RequestError::InvalidJson(error.to_string()))?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| RequestError::InvalidJson("expected a JSON object".to_owned()))?;
 
-    let user_model = obj
+    let target_model = obj
         .get("model")
         .and_then(Value::as_str)
         .ok_or(RequestError::MissingModel)?
         .to_owned();
-    if !user_model.starts_with(&cfg.model_prefix) {
-        return Ok(None);
-    }
-    let publisher = publisher_model(&user_model, &cfg.model_prefix);
+    let publisher = target_model.as_str();
     validate_publisher_model(publisher)?;
 
     let path = match operation {
@@ -148,9 +137,8 @@ pub(crate) fn transform_request(
         Operation::CountTokens => {
             // count_tokens takes the model in the body, unlike
             // :rawPredict which takes it in the URL. No `anthropic_version`
-            // is injected: Google's count-tokens request body carries only
-            // `model` and `messages`.
-            obj.insert("model".to_owned(), Value::String(publisher.to_owned()));
+            // is injected. The exact resolved model stays in the body,
+            // together with all other provider-owned request fields.
             format!(
                 "/v1/projects/{}/locations/{}/publishers/anthropic/models/count-tokens:rawPredict",
                 cfg.project, cfg.location
@@ -160,7 +148,11 @@ pub(crate) fn transform_request(
 
     let body = serde_json::to_vec(&value)
         .map_err(|error| RequestError::InvalidJson(format!("re-serializing the request failed: {error}")))?;
-    Ok(Some(TransformedRequest { body, path, user_model }))
+    Ok(TransformedRequest {
+        body,
+        path,
+        target_model,
+    })
 }
 
 /// Rewrite the Messages body in place and build its `rawPredict` path.
@@ -184,11 +176,8 @@ fn transform_messages(
         "anthropic_version".to_owned(),
         Value::String(VERTEX_ANTHROPIC_VERSION.to_owned()),
     );
-    // Pins apply on an exact publisher-id match only, so one model's
-    // snapshot never leaks onto another model that shares the prefix.
-    let pin = cfg.model_pins.get(publisher).map_or("", String::as_str);
     format!(
-        "/v1/projects/{}/locations/{}/publishers/anthropic/models/{publisher}{pin}{verb}",
+        "/v1/projects/{}/locations/{}/publishers/anthropic/models/{publisher}{verb}",
         cfg.project, cfg.location,
     )
 }
@@ -201,8 +190,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> VertexAnthropicConfig {
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str("project: demo-project\nmodel_pins: {claude-sonnet-4-5: '@20250929'}").unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: demo-project").unwrap();
         let cfg: VertexAnthropicConfig = serde_yaml::from_value(yaml).unwrap();
         crate::vertex::anthropic::config::build_config(cfg).unwrap()
     }
@@ -218,16 +206,14 @@ mod tests {
 
     #[test]
     fn messages_move_model_to_url_and_inject_version() {
-        let body = json!({"model": "vertex/claude-sonnet-4-5", "max_tokens": 8, "messages": []}).to_string();
-        let out = transform_request(body.as_bytes(), Operation::Messages, &cfg())
-            .unwrap()
-            .unwrap();
+        let body = json!({"model": "claude-sonnet-4-5@20250929", "max_tokens": 8, "messages": []}).to_string();
+        let out = transform_request(body.as_bytes(), Operation::Messages, &cfg()).unwrap();
 
         assert_eq!(
             out.path,
             "/v1/projects/demo-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict"
         );
-        assert_eq!(out.user_model, "vertex/claude-sonnet-4-5");
+        assert_eq!(out.target_model, "claude-sonnet-4-5@20250929");
         let parsed: Value = serde_json::from_slice(&out.body).unwrap();
         assert!(
             parsed.get("model").is_none(),
@@ -239,9 +225,8 @@ mod tests {
 
     #[test]
     fn stream_flag_selects_stream_verb() {
-        let body = json!({"model": "vertex/claude-sonnet-4-5", "stream": true, "messages": []}).to_string();
+        let body = json!({"model": "claude-sonnet-4-5@20250929", "stream": true, "messages": []}).to_string();
         let out = transform_request(body.as_bytes(), Operation::Messages, &cfg()).unwrap();
-        let out = out.unwrap();
         assert!(out.path.ends_with(":streamRawPredict"), "got {}", out.path);
         assert!(
             out.path.contains("models/claude-sonnet-4-5@20250929"),
@@ -251,20 +236,18 @@ mod tests {
     }
 
     #[test]
-    fn pins_apply_only_to_their_exact_publisher_model() {
+    fn target_models_are_used_without_mapping_or_snapshot_changes() {
         for (model, expected) in [
             (
-                "vertex/claude-sonnet-4-5",
+                "claude-sonnet-4-5@20250929",
                 "models/claude-sonnet-4-5@20250929:rawPredict",
             ),
-            ("vertex/claude-opus-4-1", "models/claude-opus-4-1:rawPredict"),
-            ("vertex/claude-sonnet-4-5-1m", "models/claude-sonnet-4-5-1m:rawPredict"),
-            ("vertex/claude-sonnet-4", "models/claude-sonnet-4:rawPredict"),
+            ("claude-opus-4-1", "models/claude-opus-4-1:rawPredict"),
+            ("claude-sonnet-4-5-1m", "models/claude-sonnet-4-5-1m:rawPredict"),
+            ("claude-sonnet-4", "models/claude-sonnet-4:rawPredict"),
         ] {
             let body = json!({"model": model, "messages": []}).to_string();
-            let out = transform_request(body.as_bytes(), Operation::Messages, &cfg())
-                .unwrap()
-                .unwrap();
+            let out = transform_request(body.as_bytes(), Operation::Messages, &cfg()).unwrap();
             assert!(
                 out.path.ends_with(expected),
                 "{model} must route to {expected}, got {}",
@@ -274,28 +257,16 @@ mod tests {
     }
 
     #[test]
-    fn non_vertex_models_are_not_transformed() {
-        let body = json!({"model": "claude-sonnet-5", "messages": []}).to_string();
-        assert!(
-            transform_request(body.as_bytes(), Operation::Messages, &cfg())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
     fn count_tokens_keeps_model_in_body() {
-        let body = json!({"model": "vertex/claude-sonnet-4-5", "messages": []}).to_string();
-        let out = transform_request(body.as_bytes(), Operation::CountTokens, &cfg())
-            .unwrap()
-            .unwrap();
+        let body = json!({"model": "claude-sonnet-4-5@20250929", "messages": []}).to_string();
+        let out = transform_request(body.as_bytes(), Operation::CountTokens, &cfg()).unwrap();
         assert_eq!(
             out.path,
             "/v1/projects/demo-project/locations/global/publishers/anthropic/models/count-tokens:rawPredict"
         );
         let parsed: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(
-            parsed["model"], "claude-sonnet-4-5",
+            parsed["model"], "claude-sonnet-4-5@20250929",
             "count_tokens takes the publisher model in the body"
         );
     }
@@ -303,12 +274,13 @@ mod tests {
     #[test]
     fn rejects_model_path_injection() {
         for model in [
-            "vertex/../../secrets",
-            "vertex/model:rawPredict",
-            "vertex/model?x=1",
-            "vertex/model#f",
-            "vertex/model name",
-            "vertex/",
+            "../../secrets",
+            "model:rawPredict",
+            "model?x=1",
+            "model#f",
+            "model name",
+            "",
+            "vertex/claude-sonnet-4-5",
         ] {
             let body = json!({"model": model, "messages": []}).to_string();
             let out = transform_request(body.as_bytes(), Operation::Messages, &cfg());

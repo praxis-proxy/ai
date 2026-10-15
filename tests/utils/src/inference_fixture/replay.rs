@@ -2829,8 +2829,10 @@ mod tests {
     #[test]
     fn replay_vertex_credentials_require_literal_values_before_config_construction() {
         let source = replay_config_source("vertex/messages-to-anthropic.yaml");
-        build_replay_config(&source, 19_001, "127.0.0.1:3000", 19_002)
-            .expect("literal fixture credentials and owned targets must remain replayable");
+        let build = |source: &str| {
+            build_replay_config_with_aliases(source, 19_001, "127.0.0.1:3000", &["127.0.0.1:3001".to_owned()], 19_002)
+        };
+        build(&source).expect("literal fixture credentials and owned targets must remain replayable");
         assert!(
             !is_replay_contained_filter("credential_injection"),
             "the filter must not be admitted without inspecting its credential source"
@@ -2841,8 +2843,8 @@ mod tests {
             "value: literal\n            env_var: VERTEX_REPLAY_DUMMY_CREDENTIAL",
         ] {
             let source = source.replace("value: \"ya29.example-static-token\"", replacement);
-            let error = build_replay_config(&source, 19_001, "127.0.0.1:3000", 19_002)
-                .expect_err("ambient or missing credentials must fail before filter construction");
+            let error =
+                build(&source).expect_err("ambient or missing credentials must fail before filter construction");
             assert_eq!(error.to_string(), "scenario credentials are not replay-contained");
         }
     }

@@ -1304,6 +1304,7 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["anthropic_messages_to_vertexai_anthropic"],
             ]
         );
         assert_eq!(
@@ -1388,9 +1389,10 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 75, "manifest feature inventory count");
+        assert_eq!(report.features_total, 76, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 62, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 67, "manifest recording inventory count");
         assert_eq!(
@@ -1460,7 +1462,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 75, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 76, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1814,6 +1816,10 @@ mod tests {
                     &"vertex.anthropic.streaming.wire_fields".to_owned(),
                     &vec!["vertex/anthropic-wire-translation".to_owned()]
                 ),
+                (
+                    &"vertex.anthropic.request.resolved_target".to_owned(),
+                    &vec!["vertex/anthropic-wire-translation".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -1976,7 +1982,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[58..75] {
+        for feature in &manifest.features[58..76] {
             assert_eq!(
                 feature
                     .providers

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
+    Backend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
     start_header_echo_backend, start_uri_echo_backend,
 };
 
@@ -35,7 +35,7 @@ fn patched_example(proxy_port: u16, backend_port: u16) -> Config {
     super::load_example_config(
         "vertex/messages-to-anthropic.yaml",
         proxy_port,
-        HashMap::from([("127.0.0.1:3000", backend_port)]),
+        HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:3001", backend_port)]),
     )
 }
 
@@ -44,7 +44,7 @@ fn vertex_anthropic_config_parses() {
     let config = super::load_example_config(
         "vertex/messages-to-anthropic.yaml",
         29930,
-        HashMap::from([("127.0.0.1:3000", 29931_u16)]),
+        HashMap::from([("127.0.0.1:3000", 29931_u16), ("127.0.0.1:3001", 29932_u16)]),
     );
 
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
@@ -62,9 +62,7 @@ fn messages_request_is_stripped_upstream_and_response_model_restored() {
 
     let raw = http_send(
         proxy.addr(),
-        &anthropic_request(
-            r#"{"model":"vertex/claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
-        ),
+        &anthropic_request(r#"{"model":"public-claude","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#),
     );
     assert_eq!(parse_status(&raw), 200);
 
@@ -84,7 +82,7 @@ fn messages_request_is_stripped_upstream_and_response_model_restored() {
 
     let to_client = parse_body(&raw);
     assert!(
-        to_client.contains(r#""model":"vertex/claude-sonnet-4-5""#),
+        to_client.contains(r#""model":"public-claude""#),
         "the user-facing model id must come back, got: {to_client}"
     );
     assert!(
@@ -104,14 +102,14 @@ fn stream_true_sends_stream_rawpredict_upstream() {
     let proxy = praxis_test_utils::start_proxy(&patched_example(proxy_port, backend.port()));
 
     let request = anthropic_request(
-        r#"{"model":"vertex/claude-sonnet-4-5","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"public-claude","stream":true,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
     );
     let raw = http_send(proxy.addr(), &request);
     assert_eq!(parse_status(&raw), 200);
 
     let echoed = parse_body(&raw);
     assert!(
-        echoed.starts_with("/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict"),
+        echoed.starts_with("/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"),
         "model must move into the URL with the stream verb, got: {echoed}"
     );
 }
@@ -124,9 +122,7 @@ fn handled_request_reaches_vertex_without_client_key_or_encoding() {
 
     let raw = http_send(
         proxy.addr(),
-        &anthropic_request(
-            r#"{"model":"vertex/claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
-        ),
+        &anthropic_request(r#"{"model":"public-claude","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#),
     );
     assert_eq!(parse_status(&raw), 200, "header echo should succeed: {raw}");
 
@@ -149,14 +145,13 @@ fn handled_request_reaches_vertex_without_client_key_or_encoding() {
 fn count_tokens_preserves_the_count_response_without_injecting_a_model() {
     let backend = start_capturing_backend(r#"{"input_tokens":5}"#);
     let proxy = praxis_test_utils::start_proxy(&patched_example(free_port(), backend.port()));
-    let request =
-        anthropic_request(r#"{"model":"vertex/claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#)
-            .replace("POST /v1/messages HTTP", "POST /v1/messages/count_tokens HTTP");
+    let request = anthropic_request(r#"{"model":"public-claude","messages":[{"role":"user","content":"hi"}]}"#)
+        .replace("POST /v1/messages HTTP", "POST /v1/messages/count_tokens HTTP");
     let raw = http_send(proxy.addr(), &request);
     assert_eq!(parse_status(&raw), 200, "token counting must reach the provider");
     let forwarded: serde_json::Value = serde_json::from_str(&backend.body()).unwrap();
     assert_eq!(
-        forwarded["model"], "claude-sonnet-4-5",
+        forwarded["model"], "claude-sonnet-4-5@20250929",
         "counting retains the publisher model"
     );
     assert!(
@@ -175,31 +170,78 @@ fn count_tokens_preserves_the_count_response_without_injecting_a_model() {
 }
 
 #[test]
-fn model_pins_select_only_the_configured_publishers_snapshot() {
+fn mapped_targets_select_exact_publisher_snapshots() {
     let backend = start_uri_echo_backend();
-    let source = std::fs::read_to_string(example_config_path("vertex/messages-to-anthropic.yaml"))
-        .expect("the Vertex example must load")
-        .replace("# model_pins:", "model_pins:")
-        .replace("#   claude-sonnet-4-5:", "  claude-sonnet-4-5:");
-    let source = patch_yaml(
-        &source,
-        free_port(),
-        &HashMap::from([("127.0.0.1:3000", backend.port())]),
-    );
-    let config = Config::from_yaml(&source).expect("the example with optional model pins must parse");
-    let proxy = praxis_test_utils::start_proxy(&config);
+    let proxy = praxis_test_utils::start_proxy(&patched_example(free_port(), backend.port()));
     for (model, target) in [
-        ("claude-sonnet-4-5", "claude-sonnet-4-5@20250929:rawPredict"),
-        ("claude-opus-4-1", "claude-opus-4-1:rawPredict"),
+        ("public-claude", "claude-sonnet-4-5@20250929:rawPredict"),
+        ("public-claude-snapshot", "claude-sonnet-4-5@20250929:rawPredict"),
     ] {
-        let body = format!(r#"{{"model":"vertex/{model}","max_tokens":8,"messages":[]}}"#);
+        let body = format!(r#"{{"model":"{model}","max_tokens":8,"messages":[]}}"#);
         let raw = http_send(proxy.addr(), &anthropic_request(&body));
         assert_eq!(parse_status(&raw), 200, "{model} must reach its configured publisher");
         assert!(
             parse_body(&raw).ends_with(target),
-            "a model pin must apply only to its exact key: {raw}"
+            "the exact mapped target must reach Vertex: {raw}"
         );
     }
+}
+
+#[test]
+fn count_tokens_keeps_the_mapped_snapshot_in_the_body() {
+    let backend = start_capturing_backend(r#"{"input_tokens":5}"#);
+    let proxy = praxis_test_utils::start_proxy(&patched_example(free_port(), backend.port()));
+    let request = anthropic_request(r#"{"model":"public-claude-snapshot","messages":[]}"#)
+        .replace("POST /v1/messages HTTP", "POST /v1/messages/count_tokens HTTP");
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    let body: serde_json::Value = serde_json::from_str(&backend.body()).unwrap();
+    assert_eq!(body["model"], "claude-sonnet-4-5@20250929");
+    assert!(body.get("anthropic_version").is_none());
+}
+
+#[test]
+fn unknown_models_and_malformed_bodies_reach_fallback_unchanged() {
+    let vertex = start_capturing_backend("unexpected Vertex response");
+    let fallback = start_capturing_backend("fallback response");
+    let config = super::load_example_config(
+        "vertex/messages-to-anthropic.yaml",
+        free_port(),
+        HashMap::from([("127.0.0.1:3000", vertex.port()), ("127.0.0.1:3001", fallback.port())]),
+    );
+    let proxy = praxis_test_utils::start_proxy(&config);
+    for body in [r#"{"model":"vertex/claude-sonnet-4-5","messages":[]}"#, "not json"] {
+        let raw = http_send(proxy.addr(), &anthropic_request(body));
+        assert_eq!(parse_status(&raw), 200);
+        assert_eq!(parse_body(&raw), "fallback response");
+        assert_eq!(fallback.body(), body);
+        assert!(vertex.body().is_empty(), "fallback traffic must not reach Vertex");
+    }
+}
+
+#[test]
+fn split_sse_restores_the_mapped_public_alias() {
+    let first = "id: split-event\nretry: 1000\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-son";
+    let second =
+        "net-4-5-20250929\",\"id\":\"msg_split\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let backend = Backend::chunked(vec![first.to_owned(), second.to_owned()])
+        .header("Content-Type", "text/event-stream")
+        .stall_after_first_chunk(std::time::Duration::from_millis(30))
+        .start_with_shutdown();
+    let proxy = praxis_test_utils::start_proxy(&patched_example(free_port(), backend.port()));
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_request(r#"{"model":"public-claude-snapshot","stream":true,"max_tokens":8,"messages":[]}"#),
+    );
+    assert_eq!(parse_status(&raw), 200);
+    let body = parse_body(&raw);
+    assert!(
+        body.contains(r#""model":"public-claude-snapshot""#),
+        "alias must survive a split frame: {body}"
+    );
+    assert!(body.contains("id: split-event") && body.contains("retry: 1000"));
+    assert!(body.contains("event: message_stop"));
+    assert!(!body.contains("20250929"));
 }
 
 /// Preserve repeated beta flags per [RFC 9110 Section 5.3].
@@ -218,7 +260,7 @@ fn beta_allowlist_keeps_allowed_flags_from_later_header_lines() {
     );
     let config = Config::from_yaml(&source).expect("the example with its optional allowlist must parse");
     let proxy = praxis_test_utils::start_proxy(&config);
-    let request = anthropic_request(r#"{"model":"vertex/claude-sonnet-4-5","max_tokens":8,"messages":[]}"#).replace(
+    let request = anthropic_request(r#"{"model":"public-claude","max_tokens":8,"messages":[]}"#).replace(
         "x-api-key: client-key\r\n",
         "anthropic-beta: unknown\r\nanthropic-beta: context-1m-2025-08-07\r\n",
     );

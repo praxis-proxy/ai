@@ -9,12 +9,10 @@
 //!
 //! Vertex serves Claude through the Anthropic Messages wire format but
 //! with a dialect seam on each side of the request. This filter closes
-//! both so a single client-facing model id can route to either backend:
-//! requests whose model does not start with the configured `model_prefix`
-//! pass through unchanged, so this filter can share an Anthropic chain with
-//! other suppliers. Matching requests receive the internal
-//! `x-praxis-ai-vertex-route: vertex` marker for the router; the marker must
-//! be removed before forwarding upstream.
+//! both after the load balancer selects a cluster whose HTTP metadata declares
+//! `application_provider: vertex`. Other providers pass through unchanged.
+//! Place `model_to_provider` earlier in the pipeline to select the upstream
+//! and rewrite the body to its exact target model, including any snapshot.
 //!
 //! **Request**: the body's `model` moves into the URL
 //! (`…/publishers/anthropic/models/{model}:rawPredict`,
@@ -47,8 +45,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TrustedHeaderMutation,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    SelectedUpstreamBodyOutcome, parse_filter_config,
 };
 use tracing::debug;
 
@@ -85,19 +83,17 @@ const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
 /// token set by the credential filters, so the client's Anthropic key must
 /// never reach Google.
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
-/// Internal route marker read by the unified router. Client-supplied
-/// `x-praxis-*` headers are rejected at the protocol boundary.
-pub(crate) const ROUTE_HEADER: HeaderName = HeaderName::from_static("x-praxis-ai-vertex-route");
-/// Route marker value emitted for requests handled by the Vertex supplier.
-const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
-
 /// Translates Anthropic Messages requests to Vertex AI `rawPredict` and
 /// Vertex responses back to the Anthropic dialect.
 ///
-/// Responses carry the model id the client sent: the prefixed Vertex target,
-/// or a public id recorded by an earlier adapter in the
-/// `model_to_provider.client_model` metadata. The optional model-to-provider
-/// routing filter is a separate capability.
+/// Activates after upstream selection only for clusters whose HTTP metadata
+/// declares `application_provider: vertex`. The earlier `model_to_provider`
+/// filter owns upstream selection and the exact target model, including snapshot
+/// suffixes. This adapter never selects a provider or maps model names.
+///
+/// Responses restore the original client model from
+/// `model_to_provider.client_model` metadata, falling back to the target model
+/// when no mapping recorded a public alias.
 ///
 /// Streaming preserves SSE comments, event IDs, and retry fields. Oversized or
 /// incomplete frames emit an Anthropic error event after complete events and
@@ -121,9 +117,6 @@ const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 /// filter: anthropic_messages_to_vertexai_anthropic
 /// project: my-gcp-project
 /// location: global
-/// model_prefix: "vertex/"
-/// model_pins:
-///   claude-sonnet-4-5: "@20250929"
 /// beta_allowlist: [context-1m-2025-08-07, interleaved-thinking-2025-05-14]
 /// max_body_bytes: 33554432
 /// ```
@@ -161,19 +154,11 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
     /// remains, since Vertex rejects beta flags it does not support, and
     /// clients like Claude Code send several on every request.
     fn filter_beta_flags(&self, ctx: &mut HttpFilterContext<'_>) {
-        if self.config.beta_allowlist.is_empty() {
+        if self.config.beta_allowlist.is_empty() || !has_beta_header(ctx) {
             return;
         }
-        let request = ctx.request;
-        if !request.headers.contains_key(&ANTHROPIC_BETA) {
-            return;
-        }
-
-        let kept: Vec<&str> = request
-            .headers
-            .get_all(&ANTHROPIC_BETA)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
+        let kept: Vec<&str> = effective_beta_values(ctx)
+            .into_iter()
             .flat_map(|value| value.split(','))
             .map(str::trim)
             .filter(|flag| !flag.is_empty() && self.config.beta_allowlist.iter().any(|allowed| allowed == flag))
@@ -186,7 +171,7 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         }
     }
 
-    /// Install a translated request: header hygiene, the route marker, the
+    /// Install a translated request: header hygiene, the
     /// metadata the response side keys on, and the rewritten body.
     fn apply_transformed(
         &self,
@@ -204,17 +189,15 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         // is the one responses must carry back.
         let user_model = ctx
             .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
-            .map_or(transformed.user_model, str::to_owned);
+            .map_or(transformed.target_model, str::to_owned);
         debug!(
             model = %user_model,
             path = %transformed.path,
             "translated Anthropic request to Vertex rawPredict"
         );
         ctx.rewritten_path = Some(transformed.path);
-        queue_header_set(ctx, ROUTE_HEADER, ROUTE_VALUE);
         // Marks "this request was transformed"; response-side transforms only
-        // run for marked requests. Set here (not in on_request) because the
-        // pre-read body phase may run before the request phase.
+        // run for marked requests after selected-upstream translation succeeds.
         ctx.set_metadata(OPERATION_KEY, operation.as_str());
         ctx.set_metadata(MODEL_KEY, user_model);
         *body = Some(Bytes::from(transformed.body));
@@ -227,7 +210,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         "anthropic_messages_to_vertexai_anthropic"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
@@ -246,9 +229,8 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     fn needs_request_context(&self) -> bool {
-        // The body phase classifies from the request path: with a
-        // StreamBuffer pre-read the body hook can run ahead of
-        // on_request, so metadata hand-off would be unreliable.
+        // The selected-upstream hook classifies the original Anthropic path
+        // and reads request headers for provider-specific header hygiene.
         true
     }
 
@@ -256,29 +238,28 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         Ok(FilterAction::Continue)
     }
 
-    async fn on_request_body(
+    async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        if ctx.selected_application_provider() != Some("vertex") {
+            return Ok(SelectedUpstreamBodyOutcome::Continue);
         }
-
         let Some(operation) = classify(current_path(ctx)) else {
-            return Ok(FilterAction::Continue);
+            return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
-        let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
-            return Ok(FilterAction::Continue);
+        let Some(bytes) = body.as_ref().filter(|bytes| !bytes.is_empty()) else {
+            return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
         match transform_request(bytes, operation, &self.config) {
-            Ok(Some(transformed)) => {
+            Ok(transformed) => {
                 self.apply_transformed(ctx, body, operation, transformed);
-                Ok(FilterAction::Continue)
+                Ok(SelectedUpstreamBodyOutcome::Continue)
             },
-            Ok(None) => Ok(FilterAction::Continue),
-            Err(error) => Ok(FilterAction::Reject(invalid_request_rejection(&error.to_string()))),
+            Err(error) => Ok(SelectedUpstreamBodyOutcome::Reject(invalid_request_rejection(
+                &error.to_string(),
+            ))),
         }
     }
 
@@ -341,26 +322,63 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
 // Request Header Helpers
 // -----------------------------------------------------------------------------
 
-/// Queue a request header removal from the body phase.
-///
-/// Core discards a pre-read pass's grouped header queues once an earlier
-/// filter in that pass has written the ordered `pre_read_mutations` log, so
-/// the removal joins that log when it is active. The log is never started
-/// here: activating it would discard every other filter's grouped mutations.
-fn queue_header_removal(ctx: &mut HttpFilterContext<'_>, name: HeaderName) {
-    if !ctx.pre_read_mutations.is_empty() {
-        ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(name.clone()));
+/// Whether any original or pending request value supplies beta flags.
+fn has_beta_header(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.request.headers.contains_key(&ANTHROPIC_BETA)
+        || ctx
+            .request_headers_to_set
+            .iter()
+            .any(|(name, _)| *name == ANTHROPIC_BETA)
+        || ctx
+            .extra_request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(ANTHROPIC_BETA.as_str()))
+}
+
+/// Read beta values after the request phase's pending remove/set/add mutations.
+/// Only this header's borrowed values are collected; the full header map stays borrowed.
+fn effective_beta_values<'a>(ctx: &'a HttpFilterContext<'_>) -> Vec<&'a str> {
+    let mut values: Vec<_> = ctx
+        .request
+        .headers
+        .get_all(&ANTHROPIC_BETA)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    if ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA) {
+        values.clear();
     }
+    if let Some((_, value)) = ctx
+        .request_headers_to_set
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == ANTHROPIC_BETA)
+    {
+        values.clear();
+        values.extend(value.to_str().ok());
+    }
+    for (name, value) in &ctx.extra_request_headers {
+        if name.eq_ignore_ascii_case(ANTHROPIC_BETA.as_str()) && HeaderValue::from_str(value).is_ok() {
+            values.clear();
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// Remove a selected-upstream request header, including earlier pending writes.
+fn queue_header_removal(ctx: &mut HttpFilterContext<'_>, name: HeaderName) {
+    ctx.request_headers_to_set.retain(|(pending, _)| *pending != name);
+    ctx.extra_request_headers
+        .retain(|(pending, _)| !pending.eq_ignore_ascii_case(name.as_str()));
     ctx.request_headers_to_remove.push(name);
 }
 
-/// Queue a request header overwrite from the body phase, joining the ordered
-/// `pre_read_mutations` log when it is active (see [`queue_header_removal`]).
+/// Replace a selected-upstream request header after earlier pending mutations.
 fn queue_header_set(ctx: &mut HttpFilterContext<'_>, name: HeaderName, value: HeaderValue) {
-    if !ctx.pre_read_mutations.is_empty() {
-        ctx.pre_read_mutations
-            .push(TrustedHeaderMutation::Set(name.clone(), value.clone()));
-    }
+    ctx.request_headers_to_set.retain(|(pending, _)| *pending != name);
+    ctx.extra_request_headers
+        .retain(|(pending, _)| !pending.eq_ignore_ascii_case(name.as_str()));
     ctx.request_headers_to_set.push((name, value));
 }
 
@@ -517,7 +535,7 @@ mod tests {
 
     fn messages_body(extra: &str) -> Bytes {
         Bytes::from(format!(
-            r#"{{"model":"vertex/claude-sonnet-4-5",{extra},"messages":[{{"role":"user","content":"hi"}}]}}"#
+            r#"{{"model":"claude-sonnet-4-5",{extra},"messages":[{{"role":"user","content":"hi"}}]}}"#
         ))
     }
 
@@ -525,12 +543,31 @@ mod tests {
         filter: &dyn HttpFilter,
         ctx: &mut HttpFilterContext<'_>,
         body: Bytes,
-    ) -> Result<FilterAction, FilterError> {
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        if ctx.upstream.is_none() {
+            select_provider(ctx, Some("vertex")).await;
+        }
+        assert!(matches!(filter.on_request(ctx).await?, FilterAction::Continue));
         let mut body = Some(body);
-        let action = filter.on_request_body(ctx, &mut body, true).await?;
+        let action = filter.on_selected_upstream_request_body(ctx, &mut body).await?;
         ctx.buffered_request_body = body;
-        debug_assert!(matches!(filter.on_request(ctx).await?, FilterAction::Continue));
         Ok(action)
+    }
+
+    /// Publish provider metadata through the real load-balancer boundary.
+    async fn select_provider(ctx: &mut HttpFilterContext<'_>, provider: Option<&str>) {
+        let http = provider.map_or_else(String::new, |provider| {
+            format!("\n    http: {{application_provider: {provider}}}")
+        });
+        let config = serde_yaml::from_str(&format!(
+            "clusters:\n  - name: target{http}\n    endpoints: [127.0.0.1:3000]"
+        ))
+        .unwrap();
+        let balancer = praxis_filter::LoadBalancerFilter::from_config(&config).unwrap();
+        ctx.cluster = Some("target".into());
+        ctx.upstream = None;
+        balancer.on_request(ctx).await.unwrap();
+        balancer.on_response(ctx).await.unwrap();
     }
 
     #[tokio::test]
@@ -542,7 +579,7 @@ mod tests {
         let action = run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
         assert_eq!(
             ctx.rewritten_path.as_deref(),
             Some("/v1/projects/demo/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict")
@@ -551,36 +588,57 @@ mod tests {
             serde_json::from_slice(ctx.buffered_request_body.as_ref().unwrap().as_ref()).unwrap();
         assert!(body.get("model").is_none());
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
-        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("vertex/claude-sonnet-4-5"));
+        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("claude-sonnet-4-5"));
         assert_eq!(ctx.get_metadata(OPERATION_KEY), Some("messages"));
         assert!(
-            ctx.request_headers_to_set
-                .iter()
-                .any(|(name, value)| name == ROUTE_HEADER && value == ROUTE_VALUE)
+            ctx.request_headers_to_set.is_empty(),
+            "the adapter must not select a route"
         );
     }
 
+    #[test]
+    fn body_translation_waits_for_upstream_selection() {
+        let filter = filter("project: demo");
+        assert_eq!(filter.request_body_access(), BodyAccess::None);
+        assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
+    }
+
     #[tokio::test]
-    async fn non_vertex_model_passes_through_without_route_marker() {
+    async fn non_vertex_and_untagged_upstreams_pass_through_even_malformed_bodies() {
+        let filter = filter("project: demo");
+        for provider in [Some("anthropic"), None] {
+            for raw in ["not json", r#"{"model":"vertex/claude-sonnet-4-5","messages":[]}"#] {
+                let request = make_request(Method::POST, "/v1/messages");
+                let mut ctx = make_filter_context(&request);
+                select_provider(&mut ctx, provider).await;
+                let original = Bytes::from(raw);
+                let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
+                    .await
+                    .unwrap();
+                assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+                assert_eq!(ctx.buffered_request_body.as_ref(), Some(&original));
+                assert!(ctx.rewritten_path.is_none());
+                assert!(ctx.get_metadata(OPERATION_KEY).is_none());
+                assert!(ctx.request_headers_to_set.is_empty());
+                assert!(ctx.request_headers_to_remove.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_selection_does_not_activate_translation() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        let original = Bytes::from_static(
-            br#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
-        );
-
-        let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
-            .await
-            .unwrap();
-        assert!(matches!(action, FilterAction::Continue));
-        assert_eq!(ctx.buffered_request_body.as_ref(), Some(&original));
+        let mut body = Some(Bytes::from_static(b"not json"));
+        assert!(matches!(
+            filter
+                .on_selected_upstream_request_body(&mut ctx, &mut body)
+                .await
+                .unwrap(),
+            SelectedUpstreamBodyOutcome::Continue
+        ));
         assert!(ctx.rewritten_path.is_none());
-        assert!(ctx.get_metadata(OPERATION_KEY).is_none());
-        assert!(!ctx.request_headers_to_set.iter().any(|(name, _)| name == ROUTE_HEADER));
-        assert!(
-            ctx.request_headers_to_remove.is_empty(),
-            "pass-through requests keep every client header"
-        );
     }
 
     #[tokio::test]
@@ -627,56 +685,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_mutations_join_an_active_ordered_log() {
-        let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07]");
+    async fn selected_header_hygiene_replaces_pending_writes() {
+        let filter = filter("project: demo\nbeta_allowlist: [allowed]");
         let mut request = make_request(Method::POST, "/v1/messages");
         request
             .headers
-            .insert(ANTHROPIC_BETA, HeaderValue::from_static("tool-search-2025-04-14"));
+            .insert(ANTHROPIC_BETA, HeaderValue::from_static("original"));
         let mut ctx = make_filter_context(&request);
-        ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
-            HeaderName::from_static("x-earlier-filter"),
-            HeaderValue::from_static("1"),
-        ));
-
+        ctx.request_headers_to_set
+            .push((X_API_KEY, HeaderValue::from_static("earlier-key")));
+        ctx.extra_request_headers
+            .push(("accept-encoding".into(), "gzip".to_owned()));
+        ctx.extra_request_headers
+            .push(("anthropic-beta".into(), "allowed, unknown".to_owned()));
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-
-        let log = &ctx.pre_read_mutations;
+        assert!(ctx.request_headers_to_set.iter().all(|(name, _)| *name != X_API_KEY));
+        assert!(ctx.extra_request_headers.is_empty());
         assert!(
-            log.iter().any(|mutation| matches!(
-                mutation,
-                TrustedHeaderMutation::Set(name, value) if name == ROUTE_HEADER && value == ROUTE_VALUE
-            )),
-            "core drops the grouped queues once the ordered log is active, so the route marker must join it: {log:?}"
+            ctx.request_headers_to_set
+                .iter()
+                .any(|(name, value)| *name == ANTHROPIC_BETA && value == "allowed")
         );
-        for removed in [ANTHROPIC_BETA, X_API_KEY, header::ACCEPT_ENCODING] {
-            assert!(
-                log.iter()
-                    .any(|mutation| matches!(mutation, TrustedHeaderMutation::Remove(name) if *name == removed)),
-                "{removed:?} removal must join the ordered log: {log:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn header_mutations_never_start_the_ordered_log() {
-        let filter = filter("project: demo");
-        let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-
-        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
-            .await
-            .unwrap();
-        assert!(
-            ctx.pre_read_mutations.is_empty(),
-            "starting core's exclusive ordered mode would discard other filters' grouped mutations"
-        );
-        assert!(
-            ctx.request_headers_to_set.iter().any(|(name, _)| name == ROUTE_HEADER),
-            "the grouped queue still carries the route marker"
-        );
+        assert!(ctx.request_headers_to_remove.contains(&X_API_KEY));
+        assert!(ctx.request_headers_to_remove.contains(&header::ACCEPT_ENCODING));
     }
 
     #[tokio::test]
@@ -735,7 +768,7 @@ mod tests {
             let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
                 .await
                 .unwrap();
-            assert!(matches!(action, FilterAction::Continue));
+            assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
             assert!(ctx.rewritten_path.is_none(), "{path} must not be rewritten");
             assert_eq!(
                 ctx.buffered_request_body.as_ref().unwrap(),
@@ -752,7 +785,7 @@ mod tests {
         let mut ctx = make_filter_context(&request);
         let evil = Bytes::from_static(br#"{"model":"vertex/../../secrets","messages":[]}"#);
         let action = run_request_body(filter.as_ref(), &mut ctx, evil).await.unwrap();
-        let FilterAction::Reject(rejection) = action else {
+        let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
             panic!("path-injecting model must be rejected, got {action:?}");
         };
         assert_eq!(rejection.status, 400);
@@ -948,7 +981,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -979,7 +1012,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1036,7 +1069,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1067,7 +1100,7 @@ mod tests {
         ));
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
         let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
-        assert_eq!(out["model"], "vertex/claude-sonnet-4-5");
+        assert_eq!(out["model"], "claude-sonnet-4-5");
     }
 
     #[tokio::test]
@@ -1076,7 +1109,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1090,7 +1123,7 @@ mod tests {
         ));
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
         let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
-        assert_eq!(out["model"], "vertex/claude-sonnet-4-5");
+        assert_eq!(out["model"], "claude-sonnet-4-5");
         assert_eq!(out["usage"]["input_tokens"], 2, "metering payload preserved");
     }
 
@@ -1099,9 +1132,8 @@ mod tests {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        // model_to_provider mapped the public id onto the prefixed target
-        // before this filter ran.
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+        // model_to_provider mapped a public alias before upstream selection.
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -1109,9 +1141,9 @@ mod tests {
         assert_eq!(
             ctx.rewritten_path.as_deref(),
             Some("/v1/projects/demo/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict"),
-            "the prefixed target still selects the publisher model"
+            "the resolved target supplies the publisher model"
         );
-        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("claude-sonnet-4-5"));
+        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("public-claude"));
 
         let mut response = make_response();
         response
@@ -1126,7 +1158,7 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
         let out: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
         assert_eq!(
-            out["model"], "claude-sonnet-4-5",
+            out["model"], "public-claude",
             "the client's public id must come back, not the Vertex target"
         );
     }
@@ -1141,7 +1173,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+        ctx.set_metadata(MODEL_KEY, "public-claude");
 
         let mut response = make_response();
         response
@@ -1172,7 +1204,7 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body2, true).unwrap();
         let emitted2 = String::from_utf8(body2.unwrap().to_vec()).unwrap();
         assert!(
-            emitted2.contains("\"model\":\"vertex/claude-sonnet-4-5\""),
+            emitted2.contains("\"model\":\"public-claude\""),
             "restored after reassembly: {emitted2}"
         );
         assert!(

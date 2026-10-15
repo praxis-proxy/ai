@@ -718,3 +718,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: vertex.anthropic.request.resolved_target
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only

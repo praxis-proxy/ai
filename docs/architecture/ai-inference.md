@@ -252,6 +252,25 @@ registry decides the operation from the request head, then
 the body is deserialized once for envelope validation,
 routing facts, and canonical state.
 
+### `anthropic_messages_to_vertexai_anthropic`
+
+Translates the Anthropic wire format only after the load
+balancer selects a cluster tagged with HTTP
+`application_provider: vertex`. Its selected-upstream body
+hook receives the buffered body already rewritten by
+`model_to_provider`; provider selection and public-to-target
+model mapping stay in that earlier filter.
+
+The exact target model, including any snapshot suffix, moves
+into the Messages URL or stays in the count-tokens body.
+Responses restore the public model recorded by the mapper,
+including `message_start` frames processed incrementally.
+Without that metadata the target model is the response
+identity. Other selected providers and untagged clusters
+pass through without Vertex translation. The
+[Vertex example](../../examples/configs/vertex/messages-to-anthropic.yaml)
+includes both aliases and a separate fallback upstream.
+
 ### `prompt_enrich`
 
 Injects system or user messages into

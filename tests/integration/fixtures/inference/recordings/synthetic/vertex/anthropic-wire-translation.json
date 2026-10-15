@@ -5,7 +5,7 @@
   "provenance": {
     "kind": "synthetic",
     "provider": "synthetic",
-    "model": "vertex/claude-sonnet-4-5",
+    "model": "public-claude",
     "source_id": "controlled-vertex-wire-translation"
   },
   "normalization": {
@@ -29,7 +29,7 @@
           "body": {
             "kind": "json",
             "value": {
-              "model": "vertex/claude-sonnet-4-5",
+              "model": "public-claude",
               "max_tokens": 8,
               "messages": [
                 {
@@ -63,7 +63,7 @@
       "upstream": {
         "request": {
           "method": "POST",
-          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict",
           "headers": {
             "content-type": [
               "application/json"
@@ -117,7 +117,7 @@
           "body": {
             "kind": "json",
             "value": {
-              "model": "vertex/claude-sonnet-4-5",
+              "model": "public-claude-snapshot",
               "max_tokens": 8,
               "messages": [
                 {
@@ -141,7 +141,7 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"vertex/claude-sonnet-4-5\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}},\"type\":\"message_start\"}",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"public-claude-snapshot\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}},\"type\":\"message_start\"}",
                 "id": "start-one",
                 "retry": 1000
               },
@@ -189,7 +189,7 @@
       "upstream": {
         "request": {
           "method": "POST",
-          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict",
           "headers": {
             "content-type": [
               "application/json"
@@ -264,6 +264,83 @@
               }
             ],
             "done": false
+          }
+        }
+      }
+    },
+    {
+      "name": "count-snapshot",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages/count_tokens",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "public-claude-snapshot",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input_tokens": 5
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/count-tokens:rawPredict",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "claude-sonnet-4-5@20250929",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "hi"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input_tokens": 5
+            }
           }
         }
       }

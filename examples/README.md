@@ -174,4 +174,4 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
-| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Translates Anthropic Messages requests into Vertex AI rawPredict form and Vertex responses back to the Anthropic dialect |
+| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Translates Anthropic Messages requests into Vertex AI rawPredict form and Vertex responses back to the Anthropic dialect after model_to_provider selects an upstream and resolves its exact target model |
