@@ -11,7 +11,7 @@
 //! Kubernetes resources or perform request-time control-plane lookups.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 
@@ -24,6 +24,8 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+
+mod model;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -123,6 +125,8 @@ struct ModelProviderMapping {
 pub struct ModelToProviderFilter {
     /// Exact public model ID to upstream mapping table.
     models: HashMap<String, ModelProviderMapping>,
+    /// Configured paths indexed once to bypass unrelated request bodies.
+    paths: HashSet<String>,
     /// Optional cluster for requests that match no mapping.
     fallback_upstream: Option<Arc<str>>,
     /// Maximum buffered request body size.
@@ -160,8 +164,14 @@ impl ModelToProviderFilter {
         if let Some(upstream) = &config.fallback_upstream {
             validate_mapping_value("fallback_upstream", upstream)?;
         }
+        let models = build_model_mappings(config.models)?;
+        let paths = models
+            .values()
+            .flat_map(|mapping| mapping.paths.iter().cloned())
+            .collect();
         Ok(Box::new(Self {
-            models: build_model_mappings(config.models)?,
+            models,
+            paths,
             fallback_upstream: config.fallback_upstream.map(Arc::from),
             max_body_bytes: config.max_body_bytes,
         }))
@@ -306,9 +316,24 @@ impl HttpFilter for ModelToProviderFilter {
         ctx.remove_filter_state::<ResolvedUpstream>();
         ctx.filter_metadata.remove(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
 
+        let path = ctx.request.uri.path();
+        if !self.paths.contains(path) {
+            return Ok(FilterAction::Continue);
+        }
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
+        let Some(client_model) = model::peek(raw) else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some(mapping) = self.models.get(client_model.as_ref()) else {
+            return Ok(FilterAction::Continue);
+        };
+        if !mapping.paths.iter().any(|configured| configured == path) {
+            return Ok(FilterAction::Continue);
+        }
+        // Validate matched requests with Value before publishing any selection:
+        // skipped fields may contain out-of-range numbers or invalid UTF-8.
         let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
             return Ok(FilterAction::Continue);
         };
@@ -318,14 +343,6 @@ impl HttpFilter for ModelToProviderFilter {
         let Some(client_model) = object.get("model").and_then(Value::as_str) else {
             return Ok(FilterAction::Continue);
         };
-        let Some(mapping) = self.models.get(client_model) else {
-            return Ok(FilterAction::Continue);
-        };
-        let path = ctx.request.uri.path();
-        if !mapping.paths.iter().any(|configured| configured == path) {
-            return Ok(FilterAction::Continue);
-        }
-
         let needs_rewrite = client_model != mapping.target_model;
         ctx.insert_filter_state(ResolvedUpstream(Arc::clone(&mapping.upstream)));
         ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
