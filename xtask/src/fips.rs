@@ -21,7 +21,7 @@ mod assets;
 mod binary;
 mod certified;
 mod environment;
-pub(crate) mod graph;
+mod graph;
 mod guards;
 mod host_check;
 mod openpgp;

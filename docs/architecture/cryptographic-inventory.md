@@ -75,12 +75,14 @@ Deliberate exceptions, each scoped and documented below:
 | `native-tls` | 0.2.18 | full, fips | — (version pin only) | — |
 
 Only the **forbidden-features** column is machine-enforced — it mirrors the
-`[[bans.features]]` `deny` lists in `deny.toml`. cargo-deny has **no "require a
-feature" mechanism**, so the *expected-on* features (e.g. `rustls` `custom-provider`,
-`rustls_openssl` `tls12`) are **not** guarded here: removing one would still pass
-`cargo deny check`. They are load-bearing for the OpenSSL routing and are instead
-exercised by the build and the TLS integration tests. Unlisted extra features are
-allowed by design (feature sets grow across patch releases).
+`[[bans.features]]` `deny` lists in `deny.toml`. cargo-deny can require an
+enabled feature set with `allow` plus `exact = true`, but that would also reject
+every unlisted feature enabled by future dependency updates. We allow those
+features by design and guard only the backend-changing features. The
+*expected-on* features (e.g. `rustls` `custom-provider`, `rustls_openssl`
+`tls12`) are therefore **not** guarded here: removing one would still pass
+`cargo deny check`. They are load-bearing for the OpenSSL routing and are
+instead exercised by the build and the TLS integration tests.
 
 ## Operations
 
@@ -107,7 +109,7 @@ Disposition legend:
 | --- | --- | --- | --- | --- | --- |
 | T1 | rustls CryptoProvider install (process-default) | `rustls_openssl` as the sole provider (no `ring`) | OpenSSL via `quixotic-plecostomus-rustls-openssl` | full, fips | non-validated |
 | T2 | Upstream data-plane TLS (proxy → LLM) | TLS 1.2/1.3 client handshake | OpenSSL (installed provider, pingora connector) | full, fips | non-validated |
-| T3 | AI subrequest callout TLS (web_search, file_search, guardrails, compact) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full | non-validated |
+| T3 | AI subrequest callout TLS (OpenAI web/file search, guardrails, external metering, Anthropic web search; compaction and OpenAI MCP tool callouts in full only) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full, fips | non-validated |
 | T4 | Downstream listener TLS (client → proxy) | TLS 1.2/1.3 server handshake; optional WebPKI client-cert | OpenSSL (installed provider, `ServerConfig`) | full, fips | non-validated |
 | T5 | `file_resolve` `file_url` download TLS (SSRF-guarded, redirect-free) | TLS 1.2/1.3 over `SubRequestConnector` | OpenSSL (installed provider) | full, fips | non-validated |
 | T7 | Policy Valkey/Redis session-store TLS (`rediss://`) | TLS 1.2/1.3 via `redis` `tls-rustls` | OpenSSL (installed provider, `tokio-rustls`) | full | non-validated |
@@ -166,7 +168,6 @@ Non-secret SHA-256 digests via OpenSSL EVP (`apis::hash`) unless noted.
 | R-2 | Correlation / idempotency IDs (`resp_`; `conv_` in full only) | microsecond clock + one-time seed + counter | praxis-core `IdGenerator` | full, fips | upstream-owned |
 | R-3 | MCP session id (`mcp-session-id`) | predictable `IdGenerator` id | praxis-core `IdGenerator` | full, fips | upstream-owned |
 | R-4 | OAuth delegator per-process cache-key secret | 32-byte OS CSPRNG draw (keys A2) | `getrandom` (upstream policy) | full | upstream-owned |
-| R-5 | Prometheus metrics-exporter sampling RNG | Xoshiro256** (non-crypto PRNG, reservoir sampling) | `rand_xoshiro` via `metrics-util` | full, fips | n/a |
 
 ## Reviewed non-primitives
 
@@ -179,3 +180,8 @@ key). None executes a security primitive on
 the request path. A crate on the FIPS denylist may never be classified here — a
 denied name is a real primitive and is tracked as an operation or blocked by
 `cargo xtask fips`.
+
+`rand_xoshiro` is present through `metrics-util`, but the pinned
+`metrics-exporter-prometheus` uses `AtomicBucketInstant` for histograms and
+never constructs the `AtomicSamplingReservoir` that draws from Xoshiro256**.
+There is no Prometheus sampling RNG operation to inventory.
