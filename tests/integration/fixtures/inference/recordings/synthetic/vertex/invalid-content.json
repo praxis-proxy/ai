@@ -126,12 +126,13 @@
                   "index": 0,
                   "message": {
                     "role": "assistant",
-                    "content": "Hello"
+                    "content": "Hello",
+                    "refusal": null
                   },
-                  "finish_reason": "stop"
+                  "finish_reason": "stop",
+                  "logprobs": null
                 }
-              ],
-              "usage": {}
+              ]
             }
           }
         }

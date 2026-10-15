@@ -536,7 +536,11 @@ class TestVertexGeminiChatCompletions:
         assert response.model == "gemini-2.0-flash"
         assert len(response.choices) == 1
         assert response.choices[0].message.content == "The answer is 4."
+        assert "refusal" in response.choices[0].message.model_fields_set
+        assert response.choices[0].message.refusal is None
         assert response.choices[0].finish_reason == "stop"
+        assert "logprobs" in response.choices[0].model_fields_set
+        assert response.choices[0].logprobs is None
         assert response.usage.prompt_tokens == 10
         assert response.usage.completion_tokens == 5
         assert response.usage.total_tokens == 15
@@ -645,6 +649,8 @@ class TestVertexGeminiChatCompletions:
         )
 
         assert response.choices[0].finish_reason == "tool_calls"
+        assert "usage" not in response.model_fields_set
+        assert response.usage is None
         tool_call = response.choices[0].message.tool_calls[0]
         assert tool_call.type == "function"
         assert tool_call.function.name == "get_weather"

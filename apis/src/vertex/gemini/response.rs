@@ -188,18 +188,21 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     let choices = convert_candidates(candidates)?;
 
-    let usage = obj
-        .and_then(|o| o.get("usageMetadata"))
-        .map_or_else(|| json!({}), convert_usage);
-
-    let response = json!({
+    let mut response = json!({
         "id": id,
         "object": "chat.completion",
         "created": created_timestamp(),
         "model": model,
         "choices": choices,
-        "usage": usage,
     });
+
+    if let Some(usage) = obj
+        .and_then(|o| o.get("usageMetadata"))
+        .filter(|usage| usage.is_object())
+        && let Some(response) = response.as_object_mut()
+    {
+        response.insert("usage".to_owned(), convert_usage(usage));
+    }
 
     serde_json::to_vec(&response).map_err(|e| format!("serialization failed: {e}"))
 }
@@ -223,12 +226,10 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
         .get("index")
         .and_then(Value::as_u64)
         .unwrap_or(default_index as u64);
-
     let parts = candidate
         .get("content")
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array);
-
     let (content, tool_calls) = extract_content_and_tool_calls(parts)?;
     let has_tool_calls = !tool_calls.is_empty();
 
@@ -236,18 +237,13 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
     validate_finish_reason(raw_finish_reason)?;
     let finish_reason = convert_finish_reason(raw_finish_reason, has_tool_calls);
 
-    let mut message = Map::new();
-    message.insert("role".to_owned(), Value::String("assistant".to_owned()));
-    message.insert("content".to_owned(), content);
-
-    if has_tool_calls {
-        message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
-    }
+    let message = convert_message(content, tool_calls);
 
     let mut choice = json!({
         "index": index,
         "message": message,
         "finish_reason": finish_reason,
+        "logprobs": null,
     });
 
     if let Some(logprobs) = candidate.get("logprobsResult").and_then(convert_logprobs_result)
@@ -257,6 +253,19 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
     }
 
     Ok(choice)
+}
+
+/// Build the schema-complete assistant message for one finite choice.
+fn convert_message(content: Value, tool_calls: Vec<Value>) -> Value {
+    let mut message = Map::from_iter([
+        ("role".to_owned(), Value::String("assistant".to_owned())),
+        ("content".to_owned(), content),
+        ("refusal".to_owned(), Value::Null),
+    ]);
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+    }
+    Value::Object(message)
 }
 
 // -----------------------------------------------------------------------------
@@ -530,36 +539,38 @@ fn convert_logprobs_result(logprobs_result: &Value) -> Option<Value> {
     if chosen.is_empty() {
         return None;
     }
-
     let top = logprobs_result.get("topCandidates").and_then(Value::as_array);
-
     let content: Vec<Value> = chosen
         .iter()
         .enumerate()
-        .map(|(i, chosen_token)| {
-            let token = chosen_token.get("token").and_then(Value::as_str).unwrap_or("");
-            let logprob = chosen_token
-                .get("logProbability")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-
-            let top_logprobs: Vec<Value> = top
-                .and_then(|t| t.get(i))
-                .and_then(|tc| tc.get("candidates"))
-                .and_then(Value::as_array)
-                .map(|candidates| candidates.iter().map(convert_logprob_entry).collect())
-                .unwrap_or_default();
-
-            json!({
-                "token": token,
-                "logprob": logprob,
-                "bytes": token_utf8_bytes(token),
-                "top_logprobs": top_logprobs,
-            })
-        })
+        .map(|(i, chosen_token)| convert_chosen_logprob(chosen_token, top.and_then(|entries| entries.get(i))))
         .collect();
 
-    Some(json!({ "content": content }))
+    Some(json!({
+        "content": content,
+        "refusal": null,
+    }))
+}
+
+/// Merge one chosen Gemini token with the alternatives at the same step.
+fn convert_chosen_logprob(chosen_token: &Value, top: Option<&Value>) -> Value {
+    let token = chosen_token.get("token").and_then(Value::as_str).unwrap_or("");
+    let logprob = chosen_token
+        .get("logProbability")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let top_logprobs: Vec<Value> = top
+        .and_then(|entry| entry.get("candidates"))
+        .and_then(Value::as_array)
+        .map(|candidates| candidates.iter().map(convert_logprob_entry).collect())
+        .unwrap_or_default();
+
+    json!({
+        "token": token,
+        "logprob": logprob,
+        "bytes": token_utf8_bytes(token),
+        "top_logprobs": top_logprobs,
+    })
 }
 
 /// Convert a single Gemini token candidate to an OpenAI `top_logprobs` entry.
@@ -1099,8 +1110,10 @@ mod tests {
         assert_eq!(parsed["model"], "gemini-1.5-pro");
         assert_eq!(parsed["choices"][0]["message"]["role"], "assistant");
         assert_eq!(parsed["choices"][0]["message"]["content"], "Hello!");
+        assert!(parsed["choices"][0]["message"]["refusal"].is_null());
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
         assert_eq!(parsed["choices"][0]["index"], 0);
+        assert!(parsed["choices"][0]["logprobs"].is_null());
         assert_eq!(parsed["usage"]["prompt_tokens"], 5);
         assert_eq!(parsed["usage"]["completion_tokens"], 2);
         assert_eq!(parsed["usage"]["total_tokens"], 7);
@@ -1506,12 +1519,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_returns_empty_object() {
+    fn missing_usage_is_omitted() {
         let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert!(parsed["usage"].is_object());
+        assert!(parsed.get("usage").is_none());
+    }
+
+    #[test]
+    fn null_usage_is_omitted() {
+        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}], "usageMetadata": null}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert!(parsed.get("usage").is_none());
     }
 
     #[test]
@@ -1542,15 +1564,16 @@ mod tests {
         assert_eq!(lp["bytes"], json!([72, 105]));
         assert_eq!(lp["top_logprobs"].as_array().unwrap().len(), 2);
         assert_eq!(lp["top_logprobs"][1]["token"], "Hello");
+        assert!(parsed["choices"][0]["logprobs"]["refusal"].is_null());
     }
 
     #[test]
-    fn logprobs_absent_when_not_requested() {
+    fn logprobs_is_null_when_not_requested() {
         let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert!(parsed["choices"][0].get("logprobs").is_none());
+        assert!(parsed["choices"][0]["logprobs"].is_null());
     }
 
     #[test]
