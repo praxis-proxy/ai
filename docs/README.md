@@ -17,6 +17,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Response store](architecture/response-store.md)
 - [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md)
 - [Outbound callout security](architecture/outbound-callouts.md)
+- [Cryptographic operations inventory](architecture/cryptographic-inventory.md)
 
 ## Provider guides
 

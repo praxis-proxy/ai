@@ -301,6 +301,7 @@ lint-xtask:
 	cargo xtask check-files-registry
 	cargo xtask check-vector-stores-registry
 	cargo xtask openresponses-coverage
+	cargo xtask translation-matrix
 
 # Lint the product crates with only the default-on gates. `-p` without
 # `--workspace` keeps test-crate features from unifying in and hiding leaks.

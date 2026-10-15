@@ -227,7 +227,8 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 |---|---|---|
 | rustls, rustls-webpki, rustls-pki-types, rustls-pemfile, rustls-native-certs, tokio-rustls | TLS protocol engine, X.509 path building, PEM parsing, system roots; no cryptography of their own | compliant through the OpenSSL provider |
 | rustls-openssl (published from the Pingora fork as `quixotic-plecostomus-rustls-openssl`), openssl, openssl-sys, openssl-probe | the provider and the bindings; dynamic link to the system `libcrypto.so.3` | compliant |
-| rand, rand_chacha, rand_xoshiro, chacha20 | request ids, load-balancer picks, jitter (rand's ChaCha-based RNG) | not security functions |
+| rand, rand_chacha, chacha20 | load-balancer picks and jitter (rand's ChaCha-based RNG) | not security functions |
+| rand_xoshiro | transitive `metrics-util` dependency; its sampling reservoir is not constructed by the Prometheus exporter | no runtime operation |
 | ahash, crc32fast, blake2, digest, crypto-common | hash maps, gzip checksums, Pingora cache keys | not security functions |
 | x509-parser, asn1-rs, der-parser, oid-registry (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
