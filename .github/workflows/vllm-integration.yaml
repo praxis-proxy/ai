@@ -949,7 +949,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -1567,7 +1567,7 @@ jobs:
 
       - name: Build Praxis and Codex acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted Codex network namespace
@@ -1995,8 +1995,8 @@ jobs:
       - name: Build Praxis and OpenCode acceptance test
         run: |
           set -euo pipefail
-          cargo build -p praxis-ai-proxy --features full
-          cargo test -p praxis-tests-integration --features store-all --test suite --no-run
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
 
       - name: Create restricted OpenCode network namespace
         id: opencode_namespace
@@ -2053,7 +2053,7 @@ jobs:
         id: opencode_test_binary
         run: |
           set -uo pipefail
-          TEST_BIN=$(cargo test -p praxis-tests-integration --features store-all --test suite --no-run \
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run \
               --message-format=json 2>/dev/null \
             | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
           if [ -z "$TEST_BIN" ]; then
@@ -2406,7 +2406,7 @@ jobs:
 
       - name: Build Praxis
         id: qualification_build
-        run: cargo build -p praxis-ai-proxy --features full
+        run: cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
 
       - name: Wait for vLLM readiness
         id: qualification_vllm_ready
@@ -2784,7 +2784,7 @@ jobs:
 
       - name: Build Praxis
         run: |
-          cargo build -p praxis-ai-proxy --features full
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
           cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
       - name: Wait for inference simulator readiness

@@ -10,6 +10,9 @@ cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
 curl http://localhost:8080/
 ```
 
+The command explicitly enables experimental Responses and agentic loops. They
+are absent from default builds; see [Cargo features](../docs/features.md#cargo-features).
+
 Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.

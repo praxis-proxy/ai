@@ -1,4 +1,5 @@
 # HTTP-only Responses API passthrough
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # The strict-HTTP acceptance test for pinned Codex CLI
 # for GitHub issue #870 drives the proxy over

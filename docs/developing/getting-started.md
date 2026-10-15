@@ -48,6 +48,12 @@ make test-integration
 
 Praxis AI maintains compatibility with both OpenAI Python SDK 2.x and 3.x releases. Local and CI test runs validate both SDK major versions independently.
 
+These suites require an explicit build with the experimental OpenAI filters:
+
+```console
+cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
+```
+
 To run `test_openai_responses_vllm.py` in simulator mode locally, start the `inference-sim` container first:
 ```console
 podman run --detach --name inference-sim --network host \
@@ -85,6 +91,7 @@ storage backend or OpenAI SDK lane) and pins `openai-agents` via its PEP 723
 header:
 
 ```console
+cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
 ```
 

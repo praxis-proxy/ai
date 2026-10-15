@@ -36,10 +36,7 @@ listeners:
 filter_chains:
   - name: openai
     filters:
-      # Publishes the typed operation consumed by openai_responses_request.
       - filter: ai_operation
-      - filter: openai_responses_request
-        initialize_state: false
       - filter: router
         routes:
           - path_prefix: "/v1"
@@ -72,6 +69,9 @@ curl http://127.0.0.1:8080/v1/responses \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{"model": "gpt-4o", "input": "Hello"}'
 ```
+
+Managed Responses and agentic loops require an explicit experimental build; see
+[Cargo features](features.md#cargo-features).
 
 ## Next steps
 

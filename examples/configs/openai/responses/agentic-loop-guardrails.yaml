@@ -1,4 +1,5 @@
 # Responses Agentic Loop with NeMo Tool-Result Guardrails
+# Requires `--features openai-agentic-loop,openai-mcp-tools` (experimental and off by default).
 #
 # Screens each newly produced local tool result before it can enter the next
 # inference request. The guardrail belongs inside the IRR step, after every

@@ -15,15 +15,14 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
     cargo build -p praxis-test-utils --example conversations_tenant_proxy \
-        --features full,store-sqlite
+        --features full,openai-all,store-sqlite
     PRAXIS_AI_BIN=target/debug/praxis-ai \
         uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 
-Both builds need `store-sqlite` explicitly: each crate's `full` feature selects
-`store-postgres` only, so the tenant-isolation proxy below would otherwise
-start with the SQLite backend compiled out and fail to bind.
+Both builds explicitly opt into experimental OpenAI filters and `store-sqlite`.
+The default `full` feature includes neither.
 """
 
 import base64
@@ -85,7 +84,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite` first"
     )
 
 
@@ -930,6 +929,41 @@ class TestOpenAIConversations:
         assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
         assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
         assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
+
+    @pytest.mark.skipif(
+        os.environ.get("PRAXIS_TEST_RESPONSES_ONLY") != "1",
+        reason="requires the Responses-only build from make test-responses-features",
+    )
+    def test_agentic_loop_requires_separate_feature(self, tmp_path):
+        """Responses-only builds must reject agent orchestration at startup."""
+        config = {
+            "listeners": [{
+                "name": "test",
+                "address": f"127.0.0.1:{_free_port()}",
+                "filter_chains": ["agent"],
+            }],
+            "filter_chains": [{
+                "name": "agent",
+                "filters": [{"filter": "openai_agentic_loop"}],
+            }],
+        }
+        config_path = tmp_path / "agent.yaml"
+        config_path.write_text(json.dumps(config))
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", str(config_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            output, _ = proc.communicate(timeout=PROXY_STARTUP_TIMEOUT)
+            assert proc.returncode != 0, "an unavailable agent must fail startup"
+            assert "openai_agentic_loop" in output, output
+            assert "unknown filter" in output.lower(), output
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
     def test_chunked_response_is_retrievable_with_composed_filters(
         self, chunked_response_client

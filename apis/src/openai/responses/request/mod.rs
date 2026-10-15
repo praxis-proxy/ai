@@ -72,6 +72,9 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
+/// Enable Cargo feature `openai-responses` to compile and register this
+/// experimental filter. Default and `full` builds exclude it.
+///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
 /// token counts. Bodyless operations — fetch, delete, cancel, list input items,

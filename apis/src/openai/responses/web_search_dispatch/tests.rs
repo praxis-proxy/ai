@@ -949,6 +949,7 @@ async fn on_request_body_appends_backend_valid_continuation() {
     assert_eq!(public["id"], "ws_bridge_1");
 }
 
+#[cfg(feature = "openai-agentic-loop")]
 #[tokio::test]
 async fn web_search_continuation_serializes_backend_valid_input() {
     use praxis_filter::SelectedUpstreamBodyOutcome;

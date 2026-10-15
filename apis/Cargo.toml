@@ -16,9 +16,11 @@ name = "praxis_ai_apis"
 default = []
 # Stateful OpenAI Responses subsystem: request state kernel, validation, body
 # rebuild, stream composition, Chat Completions translation filter, document
-# extraction, client-tool compatibility, agentic loop, file search and web
-# search dispatch. Adds no crates; gated because of its size and coupling.
-openai-responses = []
+# extraction, client-tool compatibility, file search and web search dispatch.
+# Experimental and off by default because of its size and coupling.
+openai-responses = ["experimental"]
+# Ephemeral agent orchestration, separately opted in from the Responses API.
+openai-agentic-loop = ["openai-responses", "experimental"]
 # Generated OpenAPI description and utoipa contract schemas for Responses API.
 openai-responses-openapi = ["openai-responses", "dep:utoipa"]
 # openai_file_resolve: downloads referenced files via SubRequestClient.
@@ -40,10 +42,12 @@ openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
 openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
-# Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
-# Every non-experimental opt-in; equals the pre-feature-split capability.
-full = ["openai-all", "store-postgres"]
+# Every OpenAI group, including experimental capabilities, without a backend.
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
+# Every non-experimental capability. Experimental OpenAI groups stay opt-in.
+full = []
+# Passive marker activated by experimental capabilities; enables none itself.
+experimental = []
 praxis-main = []
 
 [lints]
