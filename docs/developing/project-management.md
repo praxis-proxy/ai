@@ -99,3 +99,26 @@ across milestones. Use boards to track issues through
 their lifecycle (backlog, in progress, in review,
 done). Boards are the primary tool for stand-ups and
 status checks.
+
+## Pull Request Assignees
+
+Every pull request gets two assignees once it is ready
+for review: a maintainer from `ai-maintainers` or
+`project-leads`, and a reviewer from `ai-reviewers`. A
+bot assigns them when the PR is opened, reopened, or
+marked ready for review, so drafts wait until they are
+marked ready.
+
+The bot never picks the PR author, never gives both
+roles to the same person, and goes for whoever is
+assigned to the fewest open PRs, so the review load
+stays spread out. If someone from the right team is
+already assigned, it counts them and only fills the
+role that is missing.
+
+Changing the assignees by hand is fine. The bot never
+removes anyone, and it only runs again if the PR is
+reopened, or goes back to draft and is marked ready.
+See [pull-request-assignees.yaml] for the details.
+
+[pull-request-assignees.yaml]: ../../.github/workflows/pull-request-assignees.yaml

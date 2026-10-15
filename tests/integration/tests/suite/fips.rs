@@ -327,10 +327,13 @@ fn start_binary(config: &Path, addr: &str, client_config: &Arc<ClientConfig>, en
     let dir = tempfile::tempdir().expect("temp dir");
     let stdout = dir.path().join("stdout.log");
     let stderr = dir.path().join("stderr.log");
+    // When the harness runs as root, inject allow_root into a temp copy so the
+    // product binary can start; the caller's on-disk fixture stays locked down.
+    let config_path = praxis_test_utils::config_path_for_harness(config, dir.path());
     let mut command = Command::new(praxis_ai_bin());
     command
         .arg("-c")
-        .arg(config)
+        .arg(&config_path)
         .env_remove("PRAXIS_REQUIRE_FIPS")
         .env_remove("PRAXIS_CONFIG")
         .stdin(Stdio::null())

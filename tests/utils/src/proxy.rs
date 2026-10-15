@@ -572,6 +572,8 @@ pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> 
 
 /// Start a full proxy server (HTTP + TCP protocols) in a background thread.
 pub fn start_full_proxy(config: Config) {
+    let mut config = config;
+    crate::allow_root_on_config(&mut config);
     std::thread::spawn(move || {
         praxis_ai::run_server(config, None);
     });
@@ -610,11 +612,15 @@ impl ReloadableProxyGuard {
 
     /// Rewrite the config file with new YAML content.
     ///
+    /// Injects `allow_root` when the harness is root so a reload cannot put
+    /// an unpatched config back on disk under UID 0.
+    ///
     /// # Panics
     ///
     /// Panics if the file cannot be written.
     pub fn write_config(&self, yaml: &str) {
-        std::fs::write(&self.config_path, yaml).expect("failed to write config file");
+        let yaml = crate::allow_root_for_test_harness(yaml);
+        std::fs::write(&self.config_path, yaml.as_ref()).expect("failed to write config file");
     }
 
     /// Rewrite config and wait for the debounce window.
@@ -642,7 +648,8 @@ const RELOAD_SETTLE: Duration = Duration::from_millis(1500);
 ///
 /// [`ReloadableProxyGuard::reload`]: ReloadableProxyGuard::reload
 pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
-    let config = Config::from_yaml(yaml).expect("test config should parse");
+    let yaml = crate::allow_root_for_test_harness(yaml);
+    let config = Config::from_yaml(yaml.as_ref()).expect("test config should parse");
     let addr = config
         .listeners
         .first()
