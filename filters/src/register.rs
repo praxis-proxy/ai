@@ -21,7 +21,8 @@ use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    ProviderRouteFilter, ServiceAccountTokenFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -264,6 +265,11 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
     );
     register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
     register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+    register_routing_security_filter(
+        registry,
+        "service_account_token",
+        ServiceAccountTokenFilter::from_config,
+    );
 }
 
 /// Register a routing HTTP filter as security-critical.
@@ -701,6 +707,7 @@ mod tests {
             "intelligent_route",
             "provider_route",
             "credential_inject",
+            "service_account_token",
             "anthropic_web_search",
             "request_id",
             "openai_chat_completions_to_azureai_chat_completions",
@@ -900,6 +907,7 @@ provider:
         );
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
+        assert!(registry.is_security_filter("service_account_token"));
         #[cfg(feature = "aws-sigv4-filter")]
         assert!(registry.is_security_filter("aws_sigv4_sign"));
         assert!(registry.is_security_filter("callout_credentials"));

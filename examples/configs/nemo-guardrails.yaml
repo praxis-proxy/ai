@@ -10,6 +10,31 @@
 #
 # Start a local NeMo Guardrails instance before running this config.
 #
+# The nemo-outbound chain proves Praxis's identity to NeMo on every callout
+# using a short-lived token that Kubernetes automatically writes to a file in
+# the pod and rotates before it expires. Praxis watches the file for changes
+# and picks up each new token automatically — no restart needed.
+#
+# Use this config when NeMo is protected by an auth proxy (kube-rbac-proxy).
+# The TrustyAI Service Operator adds that proxy automatically when it deploys
+# NeMo. The proxy checks the token to confirm that the calling service account
+# has permission to reach NeMo, then forwards the request if the check passes.
+#
+# Add this to your Pod spec to mount the token:
+#
+#   volumes:
+#     - name: nemo-token
+#       projected:
+#         sources:
+#           - serviceAccountToken:
+#               path: token
+#               expirationSeconds: 3600   # Kubernetes rotates before expiry
+#   containers:
+#     - volumeMounts:
+#         - name: nemo-token
+#           mountPath: /var/run/secrets/tokens/nemo
+#           readOnly: true
+#
 # Example requests:
 #
 #   # Clean prompt - passes request-side guardrails and is forwarded upstream
@@ -32,14 +57,14 @@ filter_chains:
   - name: nemo-guardrails
     filters:
       - filter: ai_guardrails
-        # Optional. Omit for an empty pass-through chain; configure one when
-        # NeMo callouts need credentials, tracing, or destination policy.
+        # Points to the chain below that attaches the identity token to
+        # every outgoing NeMo request. Remove if NeMo is open (no auth proxy).
         outbound_chain: nemo-outbound
         provider:
           type: nemo
-          # NeMo callouts are anonymous; no downstream authentication
-          # headers are forwarded to this endpoint.
           # Requires NeMo Guardrails 0.24.0 or newer.
+          # In production, point this at the auth proxy in front of NeMo
+          # rather than NeMo directly.
           endpoint: "http://127.0.0.1:3001/v1/checks"
           guardrails:
             config_ids: ["your-config"] # replace with a configuration deployed in NeMo
@@ -60,10 +85,13 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
-  # Every NeMo callout traverses this independently built chain. Add
-  # destination-bound authentication, authorization, and audit filters here.
+  # Outbound chain applied to every NeMo callout.
+  # Attaches the current pod identity token as a Bearer header so the
+  # auth proxy in front of NeMo can verify who is calling.
   - name: nemo-outbound
     filters:
+      - filter: service_account_token
+        token_file: /var/run/secrets/tokens/nemo/token
       - filter: request_id
 
 insecure_options:
