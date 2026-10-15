@@ -46,7 +46,7 @@ phase:
 }
 
 /// Build an `ai_guardrails` filter with request and response phases enabled.
-fn nemo_filter_request_and_response(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+fn nemo_filter_request_and_response(endpoint: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
