@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Routing-decision metrics for `intelligent_route`, read from the admin
-//! `/metrics` endpoint after real requests through the proxy.
+//! Routing-decision metrics for `intelligent_route`, read from the
+//! health/metrics listener after real requests through the proxy.
 //!
 //! Part of the praxis-proxy/ai#74 observability baseline: every decision the
 //! filter makes is counted by outcome, and every fresh selection by cluster,
@@ -58,10 +58,16 @@ fn metric_value(body: &str, name: &str, labels: &[(&str, &str)]) -> Option<u64> 
     })
 }
 
-/// Scrape the admin `/metrics` endpoint.
-fn scrape(admin_port: u16) -> String {
-    let (status, body) = http_get_retry(&format!("127.0.0.1:{admin_port}"), "/metrics", None);
-    assert_eq!(status, 200, "admin /metrics must be served; got {status}\n{body}");
+/// Scrape `/metrics` from the health/metrics listener.
+///
+/// Praxis 0.7.4 serves `/metrics` on `admin.metrics_address`, not on the
+/// `/api` admin address the example configures.
+fn scrape(metrics_address: &str) -> String {
+    let (status, body) = http_get_retry(metrics_address, "/metrics", None);
+    assert_eq!(
+        status, 200,
+        "/metrics must be served on the metrics listener; got {status}\n{body}"
+    );
     body
 }
 
@@ -73,12 +79,13 @@ fn scrape(admin_port: u16) -> String {
 /// start their own proxies, so the test asserts on the delta between two
 /// scrapes rather than on absolute counts.
 #[test]
-fn decisions_are_counted_on_the_admin_metrics_endpoint() {
+fn decisions_are_counted_on_the_metrics_listener() {
     let granite = start_backend_with_shutdown("granite-backend");
     let llama = start_backend_with_shutdown("llama-backend");
     let (proxy_port, admin_port) = (free_port(), free_port());
+    let metrics_address = format!("127.0.0.1:{}", free_port());
 
-    let config = load_example_config(
+    let mut config = load_example_config(
         INFERENCE_EXAMPLE,
         proxy_port,
         HashMap::from([
@@ -87,8 +94,9 @@ fn decisions_are_counted_on_the_admin_metrics_endpoint() {
             (ADMIN_ENDPOINT, admin_port),
         ]),
     );
+    config.admin.metrics_address = Some(metrics_address.clone());
     let proxy = start_proxy(&config);
-    let before = scrape(admin_port);
+    let before = scrape(&metrics_address);
 
     let routed = http_send(proxy.addr(), &chat_post(r#"{"model":"granite-3.3-8b","messages":[]}"#));
     assert_eq!(parse_status(&routed), 200, "known model must route: {routed}");
@@ -98,7 +106,7 @@ fn decisions_are_counted_on_the_admin_metrics_endpoint() {
     );
     assert_eq!(parse_status(&unknown), 404, "unknown model must fail closed: {unknown}");
 
-    let after = scrape(admin_port);
+    let after = scrape(&metrics_address);
     let delta = |name: &str, labels: &[(&str, &str)]| {
         metric_value(&after, name, labels).unwrap_or(0) - metric_value(&before, name, labels).unwrap_or(0)
     };
