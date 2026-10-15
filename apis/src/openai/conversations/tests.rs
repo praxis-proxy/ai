@@ -1196,6 +1196,16 @@ fn valid_metadata() {
 }
 
 #[test]
+fn metadata_character_boundaries_are_valid() {
+    for character in ["a", "é", "界", "🦀"] {
+        let key = character.repeat(64);
+        let value = character.repeat(512);
+        let metadata = serde_json::json!({key: value});
+        validate_metadata(&metadata).unwrap();
+    }
+}
+
+#[test]
 fn null_metadata_is_valid() {
     validate_metadata(&Value::Null).unwrap();
 }
@@ -1219,18 +1229,22 @@ fn reject_too_many_keys() {
 
 #[test]
 fn reject_long_key() {
-    let long_key = "k".repeat(65);
-    let metadata = serde_json::json!({long_key: "value"});
-    let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.to_string().contains("exceeds 64 bytes"), "got: {err}");
+    for character in ["k", "é", "界", "🦀"] {
+        let long_key = character.repeat(65);
+        let metadata = serde_json::json!({long_key: "value"});
+        let err = validate_metadata(&metadata).unwrap_err();
+        assert!(err.to_string().contains("exceeds 64 characters"), "got: {err}");
+    }
 }
 
 #[test]
 fn reject_long_value() {
-    let long_value = "v".repeat(513);
-    let metadata = serde_json::json!({"key": long_value});
-    let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.to_string().contains("exceeds 512 bytes"), "got: {err}");
+    for character in ["v", "é", "界", "🦀"] {
+        let long_value = character.repeat(513);
+        let metadata = serde_json::json!({"key": long_value});
+        let err = validate_metadata(&metadata).unwrap_err();
+        assert!(err.to_string().contains("exceeds 512 characters"), "got: {err}");
+    }
 }
 
 #[test]
