@@ -121,10 +121,9 @@ legacy cache data, not reconstructed item history.
 
 ## Backend Features
 
-The default `praxis-ai-proxy` build uses `full`, so PostgreSQL-backed Responses
-and Conversations are available in the production binary while SQLite remains
-opt-in. Explicit `--no-default-features` builds provide the four supported
-persistence profiles:
+Responses, Conversations and their stores are experimental and absent from the
+default `praxis-ai-proxy` build. Explicit feature selections provide the four
+supported persistence profiles:
 
 | Profile | Feature selection | SQL backends |
 |---------|-------------------|--------------|
@@ -133,9 +132,10 @@ persistence profiles:
 | SQLite-only | `standard,openai-all,store-sqlite` | SQLite |
 | Combined | `standard,openai-all,store-all` | PostgreSQL and SQLite |
 
-The released container image builds `full,store-sqlite`, so it carries both
-backends. SQLite configurations use a database path under the image's writable
-state directory, as described below.
+The released container image builds `full` without Responses or stores. Build
+with `--build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite` to opt in.
+SQLite configurations use a database path under the image's writable state
+directory, as described below.
 
 The backend-free profile is an internal composition and testing lane. A config
 that selects an implementation absent from the binary is rejected during

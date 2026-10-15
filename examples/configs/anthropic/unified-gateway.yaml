@@ -1,4 +1,5 @@
 # Unified AI Gateway
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # Routes traffic by classifier-promoted headers so a single
 # listener handles Anthropic Messages, OpenAI Chat Completions,

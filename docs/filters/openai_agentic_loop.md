@@ -7,6 +7,8 @@ Agentic loop controller for the Responses API pipeline.
 
 ## Configuration Notes
 
+Enable Cargo feature `openai-agentic-loop` to compile and register this experimental filter. It also enables `openai-responses` and the `experimental` marker; default and `full` builds exclude the loop.
+
 Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non-streaming response bodies, and evaluates loop control in `on_response_body` (end-of-stream), writing `filter_results` for `iterative_request_router` transitions.
 
 Also extracts `tool_search_call` items into `ResponsesState.tool_search_calls` so `openai_mcp_dispatch` can load deferred connectors on the next iteration without forwarding those items to the inference backend.

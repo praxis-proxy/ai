@@ -1,5 +1,5 @@
 # Responses API Full Flow — Unified Agentic Gateway
-# Requires `--features openai-file-resolve-filter,openai-conversations,openai-compact,openai-mcp-tools,store-sqlite` because these filters are opt-in.
+# Requires `--features openai-agentic-loop,openai-file-resolve-filter,openai-conversations,openai-compact,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
 # iterative_request_router that executes hosted file_search, web_search,
@@ -335,7 +335,7 @@
 #   validation, local persistence/rehydration, or agentic iteration.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
+#   cargo build -p praxis-ai-proxy --features openai-agentic-loop,openai-file-resolve-filter,openai-conversations,openai-compact,openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway

@@ -141,6 +141,7 @@ fn run_git_cmd(args: &[&str], dir: &Path) {
 
 /// Seed `count` uniquely-filled ballast files (`chapter_01.txt`, ...) of roughly
 /// `approx_bytes` each in `dir` and return their names in deterministic order.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io::Result<Vec<String>> {
     const WORDS: &[&str] = &[
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima",
@@ -181,11 +182,13 @@ fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io:
 /// wire (the client's summarization POST), and the result write is proven to
 /// follow the compaction boundary; the on-disk source makes the final write
 /// reliable regardless of whether the model happened to retain the token verbatim.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 pub(crate) struct CodexCompactionWorkspace {
     dir: TempDir,
     marker: String,
 }
 
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 impl CodexCompactionWorkspace {
     /// Create a workspace whose marker lives in `secret.txt`, with a marker-free
     /// hash-based `verify.sh`.

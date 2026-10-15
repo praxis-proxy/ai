@@ -7,6 +7,8 @@ Processes a Responses request body once and initializes state.
 
 ## Configuration Notes
 
+Enable Cargo feature `openai-responses` to compile and register this experimental filter. Default and `full` builds exclude it.
+
 The operation is recognized from the request head, and the registry decides which operations carry a body worth parsing: create, compact, and input token counts. Bodyless operations — fetch, delete, cancel, list input items, and the `WebSocket` handshake — are released untouched, as is Conversations API traffic. `on_invalid` governs only bodies that fail to parse.
 
 Rejects `background=true` and non-null `prompt` with a 400, the managed-path policy this filter now owns. A non-null `prompt` is the deprecated OpenAI reusable prompt object (`{ id, version, variables }`); OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients should move its content into `input` rather than rely on the gateway to resolve the saved object. Prefer `input` over top-level `instructions`, which managed-path content-policy extraction does not screen.

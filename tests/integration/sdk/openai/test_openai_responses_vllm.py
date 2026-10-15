@@ -17,7 +17,7 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
@@ -145,7 +145,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite` first"
     )
 
 

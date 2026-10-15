@@ -668,6 +668,7 @@ impl HttpFilter for WebSearchDispatchFilter {
 }
 
 /// Return the response fan-out cap this dispatcher published for the owner.
+#[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
 }

@@ -218,6 +218,7 @@ fn record_valid_marker(
 /// Replace citation markers in every assistant output-text part.
 ///
 /// Returns whether the response was modified.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn annotate_response(
     response: &mut Value,
     citation_files: &HashMap<String, String>,

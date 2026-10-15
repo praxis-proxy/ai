@@ -182,6 +182,10 @@ const META_STATUS: &str = "responses.status";
 
 /// Agentic loop controller for the Responses API pipeline.
 ///
+/// Enable Cargo feature `openai-agentic-loop` to compile and register this
+/// experimental filter. It also enables `openai-responses` and the
+/// `experimental` marker; default and `full` builds exclude the loop.
+///
 /// Manages iteration bookkeeping in `on_request_body`, extracts tool
 /// calls from non-streaming response bodies, and evaluates loop
 /// control in `on_response_body` (end-of-stream), writing

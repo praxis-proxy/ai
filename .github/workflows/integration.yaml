@@ -331,8 +331,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
 
-      - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+      - name: Check Responses and agentic feature boundaries
+        run: make test-responses-features
+
+      - name: Build Praxis with experimental Responses
+        run: cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 
       - name: Run OpenAI Agents SDK Responses compatibility test
         run: uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
@@ -538,7 +541,7 @@ jobs:
 
       - name: Build test binary
         # Compiled outside the namespace, where the network still exists.
-        run: cargo test -p praxis-tests-integration --features store-all --test suite --no-run
+        run: cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
 
       - name: OpenCode acceptance (network namespace)
         run: |
@@ -577,7 +580,7 @@ jobs:
                 PATH="$runner_path" \
                 PRAXIS_TEST_OPENCODE_BIN="$opencode_bin" \
                 bash -ceu "
-                  cargo test --offline -p praxis-tests-integration --features store-all --test suite \
+                  cargo test --offline -p praxis-tests-integration --features openai-all,store-all --test suite \
                     opencode:: -- --nocapture
                 "
           ' bash \
@@ -699,5 +702,5 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --features store-sqlite --test suite \
+          cargo test -p praxis-tests-integration --features openai-all,store-sqlite --test suite \
             codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact
