@@ -1687,8 +1687,9 @@ const UPSTREAM_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 /// Feed `chunk` to the proxy until it closes this upstream connection, and
 /// report whether it did so within [`UPSTREAM_CLOSE_DEADLINE`].
 ///
-/// Closure is observed directly: a read that hits EOF, or a read or write that
-/// fails with a reset or broken pipe. A successful write proves nothing, since
+/// Closure is observed directly when a read or write fails with a reset or
+/// broken pipe. Read EOF only proves the peer closed its request write-half,
+/// so keep probing response writes. A successful write proves nothing, since
 /// loopback buffers absorb megabytes after the proxy stops reading. A write
 /// timeout ends the feeding, because the partial frame it may leave behind
 /// would give the proxy a framing error to close on, but the backend still
@@ -1713,7 +1714,8 @@ fn feed_until_upstream_closes(stream: &mut TcpStream, chunk: &str) -> bool {
             }
         }
         match stream.read(&mut probe) {
-            Ok(0) => return true,
+            // EOF is inconclusive; pace repeated reads even after feeding stops.
+            Ok(0) => thread::sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()))),
             // The proxy sends nothing after the request; ignore stray bytes.
             Ok(_) => {},
             Err(error) if is_connection_closed(&error) => return true,
