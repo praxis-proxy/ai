@@ -4,13 +4,13 @@
 //! Time-to-first-token (TTFT) measurement filter.
 //!
 //! Records the elapsed time from request receipt to the first non-empty
-//! SSE response body chunk as a Prometheus histogram labeled by model.
-//! The filter is transparent: response bodies and status codes pass
-//! through unchanged.
+//! SSE response body chunk as a Prometheus histogram labeled by `model` and
+//! `cluster`. The filter is transparent: response bodies and status codes
+//! pass through unchanged.
 //!
 //! # Metric
 //!
-//! `praxis_ai_ttft_seconds` — histogram with a `model` label.
+//! `praxis_ai_ttft_seconds` — histogram with `model` and `cluster` labels.
 //!
 //! # YAML
 //!
@@ -55,9 +55,13 @@ const META_ACTIVE: &str = "time_to_first_token.active";
 /// The histogram's `model` label is read from metadata set by an upstream
 /// request fact filter: `openai_responses_request` (Responses create bodies),
 /// `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies),
-/// `anthropic_messages_request`, or `anthropic_messages_to_chat_completions`
-/// (Anthropic, including Anthropic-to-Chat translation). If none runs before this
-/// filter, all TTFT samples are labeled `unknown`.
+/// `anthropic_messages_request`, `anthropic_messages_to_chat_completions`
+/// (Anthropic, including Anthropic-to-Chat translation), or the
+/// `model_to_header`-published `model_to_header.model` value. If none runs
+/// before this filter, all TTFT samples are labeled `unknown`.
+///
+/// The `cluster` label is the upstream cluster the request was routed to
+/// (`HttpFilterContext::cluster_name`), falling back to `unknown`.
 ///
 /// Chat traffic that originates as a Responses or Anthropic request and is
 /// translated downstream keeps the model its originating classifier promoted.

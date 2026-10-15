@@ -7,6 +7,8 @@ Promotes the JSON `"model"` field from the request body to a request header.
 
 ## Configuration Notes
 
+The promoted value is also published to `model_to_header.model` metadata for downstream consumers (e.g. the `llm_metrics` model label), so those readers use the server-validated value instead of a client-supplied request header.
+
 Promotion is deferred until end-of-stream so a later body-writing filter (for example `llmisvc_model_provider_resolver`) can observe the pending header in the same `StreamBuffer` pre-read pass.
 
 ## Configuration

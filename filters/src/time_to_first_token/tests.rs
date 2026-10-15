@@ -286,15 +286,19 @@ fn resolve_model_unknown_fallback() {
 }
 
 #[test]
-fn resolve_model_falls_back_to_x_model_header() {
+fn resolve_model_ignores_raw_x_model_header() {
     let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     req.headers.insert(
         http::header::HeaderName::from_static("x-model"),
-        HeaderValue::from_static("gpt-5.6-luna"),
+        HeaderValue::from_static("client-claimed-model"),
     );
     let ctx = crate::test_utils::make_filter_context(&req);
 
-    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-5.6-luna");
+    assert_eq!(
+        crate::llm_metrics::resolve_model(&ctx),
+        "unknown",
+        "a raw client X-Model request header must never become a metric label"
+    );
 }
 
 #[test]
