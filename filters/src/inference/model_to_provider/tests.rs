@@ -350,7 +350,7 @@ async fn mapping_latency_microbenchmark() {
             let action = filter.on_request(&mut ctx).await.unwrap();
             let (observed_action, _observed_body, _observed_metadata, _observed_cluster) =
                 std::hint::black_box((action, body, ctx.filter_metadata, ctx.cluster));
-            assert!(matches!(observed_action, FilterAction::Continue));
+            assert_continue(&observed_action);
         }
         let nanos_per_request = started.elapsed().as_nanos().checked_div(10_000).unwrap();
         eprintln!(

@@ -273,7 +273,7 @@ Run the model-to-provider request-body benchmark with
 command in its filter job. It executes the ignored benchmark in the
 release profile and reports nanoseconds per request over 10,000
 iterations for mapped models with 64-byte, 1 KiB, and 16 KiB prompts,
-plus an unknown model with a 1 KiB prompt.
+plus an unknown model with 1 KiB and 16 KiB prompts.
 
 These timings include request-context construction, shared body
 ownership, the filter call, and cleanup. They measure local filter
