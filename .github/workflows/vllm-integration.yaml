@@ -2785,7 +2785,7 @@ jobs:
       - name: Build Praxis
         run: |
           cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
-          cargo build -p praxis-test-utils --example conversations_tenant_proxy
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy --features full,openai-all,store-postgres
 
       - name: Wait for inference simulator readiness
         run: |
