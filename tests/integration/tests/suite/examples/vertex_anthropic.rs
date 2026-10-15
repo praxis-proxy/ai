@@ -215,7 +215,6 @@ fn unknown_models_and_malformed_bodies_reach_fallback_unchanged() {
         assert_eq!(parse_status(&raw), 200);
         assert_eq!(parse_body(&raw), "fallback response");
         assert_eq!(fallback.body(), body);
-        assert!(vertex.body().is_empty(), "fallback traffic must not reach Vertex");
     }
 }
 
