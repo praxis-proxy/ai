@@ -600,16 +600,17 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
-    /// What the rehydrated request itself specified for `reasoning`, captured
-    /// before `rehydrate` merged the stored configuration default into
-    /// [`Self::request_body`].
+    /// What the request itself specified for `reasoning`.
     ///
-    /// The proxy's selected-phase rebuild uses this to separate the stored
-    /// default, which must still reach a request that omits reasoning, from a
-    /// later filter's removal, which must stand: an `effort` may be filled only
-    /// when the request carried no `effort` of its own, and the `reasoning`
-    /// member may be created only when the request carried none. Only
-    /// [`Self::history_rehydrated`] states carry a meaningful value.
+    /// `from_request_body` computes this from the parsed body, and the
+    /// rehydrate filter replaces it with a capture taken before the stored
+    /// configuration default merges into [`Self::request_body`]. The proxy's
+    /// selected-phase rebuild uses it to separate the stored default, which
+    /// must still reach a request that omits reasoning, from a later filter's
+    /// removal, which must stand: an `effort` may be filled only when the
+    /// request carried no `effort` of its own, and the `reasoning` member may
+    /// be created only when the request carried none. Readers only consult it
+    /// for [`Self::history_rehydrated`] states.
     pub request_reasoning: RequestReasoningPresence,
 
     /// Whether provider-visible request fields require outbound serialization.
@@ -983,6 +984,24 @@ impl RequestReasoningPresence {
     }
 }
 
+/// Capture what a request itself specified for `reasoning`.
+///
+/// The rehydrate filter records this before merging the stored configuration
+/// default into the body, so the proxy's selected-phase rebuild can distinguish
+/// what the request omitted (the default may fill it) from a later filter's
+/// removal of the `reasoning` member or its `effort` (it must stand instead of
+/// being refilled from the merged default).
+pub(crate) fn request_reasoning_presence(body: &serde_json::Value) -> RequestReasoningPresence {
+    let Some(reasoning) = body.get("reasoning") else {
+        return RequestReasoningPresence::Absent;
+    };
+    if reasoning.get("effort").is_some() {
+        RequestReasoningPresence::ExplicitEffort
+    } else {
+        RequestReasoningPresence::OmittedEffort
+    }
+}
+
 impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
@@ -1055,6 +1074,7 @@ impl Default for ResponsesState {
 
 impl ResponsesState {
     /// Create initial state from a parsed request body.
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
         let input = messages.clone();
@@ -1080,6 +1100,7 @@ impl ResponsesState {
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
+            request_reasoning: request_reasoning_presence(&body),
             request_body: body,
             tool_choice,
             tools,

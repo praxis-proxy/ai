@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
-use super::*;
+use super::{super::state::RequestReasoningPresence, *};
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{

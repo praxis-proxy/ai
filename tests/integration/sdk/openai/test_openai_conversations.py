@@ -2521,14 +2521,20 @@ def test_structured_mcp_failure_append_back(conversation_backend):
     )
     assert response.status == "completed", "a failed MCP item must not fail the response"
     failure = next(item for item in response.output if item.type == "mcp_call")
+    failure_error = (
+        failure.error if isinstance(failure.error, dict) else failure.error.model_dump()
+    )
     assert (
-        failure.error.type == "mcp_tool_execution_error"
+        failure_error["type"] == "mcp_tool_execution_error"
     ), "the structured error type must survive the SDK boundary"
     page = client.conversations.items.list(conversation.id, order="asc")
     stored = next(item for item in page.data if item.type == "mcp_call")
     assert stored.id == failure.id, "append-back must retain the provider item ID"
+    stored_error = (
+        stored.error if isinstance(stored.error, dict) else stored.error.model_dump()
+    )
     assert (
-        stored.error.model_dump() == failure.error.model_dump()
+        stored_error == failure_error
     ), "append-back must retain the structured error verbatim"
 
 
@@ -2595,9 +2601,9 @@ def test_capturing_backend_records_both_request_framings(chunked):
         )
         assert (
             response.status_code == 200
-        ), f"{framing_name(chunked)} request must be served"
+        ), f"{_framing_name(chunked)} request must be served"
         assert backend.requests == [payload], (
-            f"{framing_name(chunked)} request body must be captured intact"
+            f"{_framing_name(chunked)} request body must be captured intact"
         )
     finally:
         backend.shutdown()
