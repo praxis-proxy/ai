@@ -9460,7 +9460,7 @@ def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_clie
     request_start = len(SimulatorBackendHandler.recorded_requests)
     events = list(
         chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="STREAM-SERVICE-TIER-1549",
             service_tier="auto",
             store=False,

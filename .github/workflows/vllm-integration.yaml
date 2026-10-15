@@ -1288,7 +1288,7 @@ jobs:
 
       - name: Upload acceptance diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: claude-code-vllm-diagnostics
           # The gateway and native secrets are test constants and Praxis does not
@@ -1348,7 +1348,7 @@ jobs:
 
       - name: Upload Claude and Anthropic acceptance results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: claude-vllm-acceptance-results
           path: ${{ runner.temp }}/claude-acceptance.json
@@ -1715,7 +1715,7 @@ jobs:
 
       - name: Upload Codex acceptance diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: codex-vllm-gpu-diagnostics
           path: |
@@ -1749,7 +1749,7 @@ jobs:
 
       - name: Upload Codex acceptance results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: codex-vllm-acceptance-results
           path: ${{ runner.temp }}/codex-acceptance.json
@@ -2111,7 +2111,7 @@ jobs:
 
       - name: Upload OpenCode acceptance diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: opencode-vllm-gpu-diagnostics
           path: |
@@ -2153,7 +2153,7 @@ jobs:
 
       - name: Upload OpenCode acceptance results
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: opencode-vllm-acceptance-results
           path: ${{ runner.temp }}/opencode-acceptance.json
@@ -2548,7 +2548,7 @@ jobs:
 
       - name: Upload Responses gateway GPU results and diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vllm-gpu-responses-raw
           path: |
@@ -2659,7 +2659,7 @@ jobs:
 
       - name: Upload structured qualification report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vllm-qualification
           path: ${{ runner.temp }}/qualification.json

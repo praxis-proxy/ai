@@ -19,6 +19,7 @@ first.
 7. Update `examples/README.md` to list any new or
    renamed example configs.
 
-All testing requirements from
-[CONTRIBUTING.md](../../.github/CONTRIBUTING.md#testing) apply. A
-feature without tests and an example is not complete.
+All [testing requirements] in the shared development conventions apply.
+A feature without tests and an example is not complete.
+
+[testing requirements]: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#testing

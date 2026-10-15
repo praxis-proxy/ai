@@ -433,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_one_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_five_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(nodes.len(), 31, "19 main + 12 IRR-step filters");
+        assert_eq!(nodes.len(), 35, "22 main + 13 IRR-step filters");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -446,22 +446,62 @@ mod tests {
     fn full_flow_node_types_and_depths_match_yaml() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(nodes[0].filter_type, "trace_context");
-        assert_eq!(nodes[18].filter_type, IRR_FILTER, "IRR is the 19th filter");
-        assert_eq!(nodes[18].depth, 0, "the IRR itself is main-chain");
-        assert_eq!(nodes[19].depth, 1, "first inference-step filter is nested");
-        assert_eq!(nodes[19].irr_step.as_deref(), Some("inference"));
-        assert_eq!(nodes[19].filter_type, "project_state_owner_headers");
+        let filter_types: Vec<_> = nodes.iter().map(|node| node.filter_type.as_str()).collect();
         assert_eq!(
-            nodes[24].filter_type, "ai_guardrails",
-            "guardrails precede the loop owner"
+            filter_types,
+            [
+                "trace_context",
+                "state_owner",
+                "callout_credentials",
+                "project_state_owner_headers",
+                "ai_operation",
+                "openai_responses_request",
+                "openai_responses_model_rewrite",
+                "openai_responses_model_rewrite",
+                "router",
+                "headers",
+                "headers",
+                "openai_responses_request",
+                "openai_tool_parse",
+                "openai_conversations",
+                "openai_responses_store",
+                "openai_responses_rehydrate",
+                "openai_file_resolve",
+                "openai_doc_extract",
+                "openai_responses_compact",
+                "openai_mcp_tool_resolve",
+                "static_response",
+                IRR_FILTER,
+                "project_state_owner_headers",
+                "openai_stream_events",
+                "openai_web_search_dispatch",
+                "openai_mcp_dispatch",
+                "openai_file_search_dispatch",
+                "ai_guardrails",
+                "openai_agentic_loop",
+                "openai_client_tool_compat",
+                "headers",
+                "load_balancer",
+                "openai_responses_proxy",
+                "openai_responses_to_chat_completions",
+                "path_rewrite",
+            ],
+            "all main and inference-step filter types must retain their declared order"
         );
-        assert_eq!(nodes[25].filter_type, "openai_agentic_loop");
-        assert_eq!(
-            nodes[28].filter_type, "openai_responses_proxy",
-            "proxy after the step load balancer"
+        assert!(
+            nodes
+                .iter()
+                .take(22)
+                .all(|node| node.depth == 0 && node.irr_step.is_none()),
+            "all main-chain filters, including the IRR, have depth zero and no step owner"
         );
-        assert_eq!(nodes[30].filter_type, "path_rewrite", "last step filter");
+        assert!(
+            nodes
+                .iter()
+                .skip(22)
+                .all(|node| node.depth == 1 && node.irr_step.as_deref() == Some("inference")),
+            "all inference-step filters have depth one and retain their step owner"
+        );
     }
 
     #[test]
