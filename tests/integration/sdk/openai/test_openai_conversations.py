@@ -1294,6 +1294,53 @@ class TestOpenAIConversations:
                 conversation_id=conversation.id,
             )
 
+    @pytest.mark.parametrize("initial_items", [True, False], ids=["create", "append"])
+    @pytest.mark.parametrize("call_id", ["omitted", None, "call_preserved"])
+    @pytest.mark.parametrize(
+        "item_type,payload_field,payload",
+        [
+            ("tool_search_call", "arguments", {}),
+            ("tool_search_output", "tools", []),
+        ],
+    )
+    def test_tool_search_call_id_round_trip(
+        self, openai_client, initial_items, call_id, item_type, payload_field, payload
+    ):
+        item = {"type": item_type, "execution": "server", payload_field: payload}
+        if call_id != "omitted":
+            item["call_id"] = call_id
+        expected_call_id = None if call_id == "omitted" else call_id
+
+        conversation = openai_client.conversations.create(
+            items=[item] if initial_items else [],
+        )
+        try:
+            if not initial_items:
+                created = openai_client.conversations.items.create(
+                    conversation.id, items=[item],
+                )
+                assert len(created.data) == 1, "append must return the created item"
+                assert created.data[0].model_dump(exclude_unset=True)["call_id"] == expected_call_id
+
+            page = openai_client.conversations.items.list(conversation.id)
+            assert len(page.data) == 1, "the tool-search item must be stored"
+            stored = page.data[0]
+            stored_json = stored.model_dump(exclude_unset=True)
+            assert stored_json["call_id"] == expected_call_id, "call_id must be present and preserve supplied values"
+            assert stored.type == item_type, "normalization must preserve the tool-search type"
+            assert stored.id.startswith("item_"), "omitted item IDs must still be generated"
+            assert stored.status == "completed", "omitted status must still default to completed"
+            assert stored_json[payload_field] == payload, "normalization must preserve the tool-search payload"
+
+            retrieved = openai_client.conversations.items.retrieve(
+                stored.id, conversation_id=conversation.id,
+            )
+            assert retrieved.model_dump(exclude_unset=True) == stored_json, (
+                "list and retrieve must return the same item"
+            )
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
     def test_encoded_item_id_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
 
