@@ -257,6 +257,9 @@ fn configure_pipeline(
     // every (re)build.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
+    // Per-filter duration histograms are opt-in; without this the
+    // `metrics.filter_duration` flag would parse but never take effect.
+    pipeline.set_record_filter_duration_metrics(config.metrics.filter_duration);
     Ok(())
 }
 
@@ -462,6 +465,39 @@ mod tests {
     use praxis_filter::FilterRegistry;
 
     use super::*;
+
+    #[test]
+    fn filter_duration_flag_enables_per_filter_histograms() {
+        let yaml = format!("metrics:\n  filter_duration: true\n{VALID_CONFIG_YAML}");
+        let config = Config::from_yaml(&yaml).unwrap();
+        let registry = FilterRegistry::with_builtins();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &test_client(),
+        )
+        .unwrap();
+        assert!(
+            pipelines.get("web").unwrap().load().records_filter_duration_metrics(),
+            "metrics.filter_duration must reach the pipeline"
+        );
+
+        let config = valid_config();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &test_client(),
+        )
+        .unwrap();
+        assert!(
+            !pipelines.get("web").unwrap().load().records_filter_duration_metrics(),
+            "per-filter histograms stay off by default"
+        );
+    }
 
     #[test]
     fn resolve_pipelines_builds_for_each_listener() {
@@ -1158,9 +1194,7 @@ filter_chains:
     }
 
     /// Minimal valid config with one listener for pipeline tests.
-    fn valid_config() -> Config {
-        Config::from_yaml(
-            r#"
+    const VALID_CONFIG_YAML: &str = r#"
 listeners:
   - name: web
     address: "127.0.0.1:8080"
@@ -1178,9 +1212,10 @@ filter_chains:
             endpoints: ["10.0.0.1:80"]
 insecure_options:
   allow_private_endpoints: true
-"#,
-        )
-        .unwrap()
+"#;
+
+    fn valid_config() -> Config {
+        Config::from_yaml(VALID_CONFIG_YAML).unwrap()
     }
 
     /// Parse one listener and return its resolved top-level filter entries.
