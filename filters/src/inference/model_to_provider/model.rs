@@ -6,7 +6,7 @@
 use std::{borrow::Cow, fmt};
 
 use serde::{
-    Deserialize, Deserializer,
+    Deserialize, Deserializer as _,
     de::{IgnoredAny, MapAccess, Visitor},
 };
 use serde_json::value::RawValue;
