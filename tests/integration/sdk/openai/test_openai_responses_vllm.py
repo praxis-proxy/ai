@@ -5256,6 +5256,8 @@ class TestResponsesToChatCompletionsVLLM:
                 "/no_think"
             ),
             tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -6889,13 +6891,18 @@ class TestAgenticLoopVLLM:
         request_count = len(BraveSearchHandler.request_paths)
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
-            input=("You MUST use web search, then report the result title. /no_think"),
+            input=(
+                "Use web search to find the latest Praxis Proxy release, "
+                "then report the result title. /no_think"
+            ),
             tools=[
                 {
                     "type": "web_search",
                     "search_context_size": "low",
                 }
             ],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
