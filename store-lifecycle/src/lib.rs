@@ -3,6 +3,10 @@
 
 //! Backend provisioning and lifecycle for praxis-ai persisted state.
 //!
+//! Internal, unstable implementation crate: unpublished (`publish = false`), a
+//! first-party workspace detail with no external API surface and no semver
+//! promise.
+//!
 //! Backend-agnostic and crypto-free: it depends only on the praxis-ai-store
 //! interface and routes inline configuration to injected [`StoreBackendFactory`]
 //! implementations that binaries supply. It builds and validates backends

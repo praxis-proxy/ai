@@ -6,14 +6,12 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
+use praxis_ai_store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
+#[cfg(feature = "_store-postgres")]
+use praxis_ai_store_backends::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
-
-use crate::store::StoreCompressionConfig;
-#[cfg(feature = "_store-postgres")]
-use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_responses_store";

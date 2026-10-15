@@ -59,8 +59,11 @@ impl PraxisProcess {
     /// Panics if the process cannot be spawned or never becomes ready.
     pub fn spawn_with_ulimit(config_yaml: &str, ready_addr: &str, ulimit: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join("praxis.yaml");
-        fs::write(&config_path, config_yaml).expect("write config");
+        // The product binary refuses UID 0 unless the config opts in. When the
+        // harness itself is root (some agent/CI environments), inject the
+        // override into the temp config only so spawned subprocess tests can
+        // start without rewriting every example YAML.
+        let config_path = crate::write_praxis_yaml_for_harness(dir.path(), config_yaml);
         let stdout = fs::File::create(dir.path().join("stdout.log")).expect("create stdout log");
         let stderr = fs::File::create(dir.path().join("stderr.log")).expect("create stderr log");
 

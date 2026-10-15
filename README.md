@@ -142,7 +142,7 @@ with a `-fips` suffix (for example `latest-fips`); see
 
 Contributions are welcome, from bug reports and documentation fixes to new
 filters and protocol support. Before opening a pull request, please read the
-[contributing guide](.github/CONTRIBUTING.md) and
+[contributing guide](CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the

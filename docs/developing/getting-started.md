@@ -24,7 +24,7 @@ cover code style, testing requirements, file
 organization, and security practices. Submissions
 that do not follow these conventions will be rejected.
 
-[CONTRIBUTING.md]:../../.github/CONTRIBUTING.md
+[CONTRIBUTING.md]:../../CONTRIBUTING.md
 
 ## Build
 
