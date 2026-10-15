@@ -4,7 +4,7 @@
 # Stage 1: Build
 # ------------------------------------------------------------------------------
 
-FROM rust:1.98-alpine3.24 AS builder
+FROM rust:1.99-alpine3.24 AS builder
 
 # Cargo features for the published binary. `full` keeps every non-experimental
 # filter; the proxy crate defaults to `full` while the library crates default

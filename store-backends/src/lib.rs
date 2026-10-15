@@ -3,6 +3,10 @@
 
 //! SQL storage backends for praxis-ai: Postgres and Sqlite.
 //!
+//! Internal, unstable implementation crate: unpublished (`publish = false`), a
+//! first-party workspace detail with no external API surface and no semver
+//! promise.
+//!
 //! The concrete [`ResponseStore`] backends, their connection pool, TLS and URL
 //! validation, schema management, and the [`StoreBackendFactory`] provisioning.
 //! This is the only crate that carries the SQL client crypto, so a consumer

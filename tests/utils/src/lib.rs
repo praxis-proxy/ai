@@ -25,6 +25,7 @@ pub mod fips;
 pub mod inference_fixture;
 pub mod load;
 pub mod net;
+pub mod openapi;
 pub mod process;
 pub mod proxy;
 pub mod recording;
@@ -43,7 +44,10 @@ pub use cli_process::{
     capture_child_output_with_limit, configure_isolated_process_group,
 };
 pub use error_shape::{assert_error_is_anthropic_shaped, assert_error_is_openai_shaped};
-pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
+pub use example_config::{
+    allow_loopback_endpoints, allow_root_for_test_harness, allow_root_on_config, config_path_for_harness,
+    example_config_path, harness_is_root, load_example_config, patch_yaml, write_praxis_yaml_for_harness,
+};
 pub use fips::{approved_mode, assert_fips_host_if_declared, expect_approved_mode, fips_host, fips_host_declared};
 pub use load::{
     LoadReport, collect_responses, concurrent_gets, idle_keepalive_connections, is_closed_by_peer, open_requests,

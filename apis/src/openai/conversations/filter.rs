@@ -573,10 +573,13 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // A malformed buffered success body is an extraction failure, not a
+        // no-op: releasing it would report success while dropping the turn
+        // (#950). It propagates here so the failure mode below governs it.
         let items = if streaming {
             extract_streaming_append_back_items(ctx, append_owner)
         } else {
-            extract_append_back_items(ctx, body, append_owner)
+            extract_append_back_items(ctx, body, append_owner)?
         };
         let Some(items) = items else {
             return Ok(FilterAction::Continue);
@@ -643,22 +646,32 @@ struct AppendBackItems {
 }
 
 /// Extract and merge input+output items from the response body for
-/// append-back. Returns `None` when there is nothing to persist.
+/// append-back.
+///
+/// `Ok(None)` is reserved for a well-formed exchange that intentionally has
+/// nothing to persist. A body that cannot be parsed is `Err`, so the caller's
+/// fail-closed path withholds the success instead of dropping the items.
 fn extract_append_back_items(
     ctx: &HttpFilterContext<'_>,
     body: &Option<Bytes>,
     owner: StateOwner,
-) -> Option<AppendBackItems> {
-    let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-    let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
+) -> Result<Option<AppendBackItems>, FilterError> {
+    let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(conv_id) = ctx.get_metadata("responses.conversation_id").map(str::to_owned) else {
+        return Ok(None);
+    };
 
-    let all_items = merge_input_output_items(ctx, bytes)?;
+    let Some(all_items) = merge_input_output_items(ctx, bytes)? else {
+        return Ok(None);
+    };
 
-    Some(AppendBackItems {
+    Ok(Some(AppendBackItems {
         conversation_id: conv_id,
         owner,
         all_items,
-    })
+    }))
 }
 
 /// Use the stream composer's canonical terminal resource. The event bytes stay
@@ -685,23 +698,21 @@ fn extract_streaming_append_back_items(ctx: &HttpFilterContext<'_>, owner: State
     })
 }
 
-/// Parse the response body and combine request input items with
-/// response output items. Returns `None` when both are empty.
-fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<Vec<Value>> {
-    let mut response_json: Value = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "conversation append-back: invalid response JSON");
-            return None;
-        },
-    };
+/// Parse the response body and combine request input items with response
+/// output items.
+///
+/// Returns `Ok(None)` when the response is not completed or both item lists
+/// are empty, and `Err` when the body is not valid JSON.
+fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Result<Option<Vec<Value>>, FilterError> {
+    let mut response_json: Value = serde_json::from_slice(bytes).map_err(|e| {
+        warn!(error = %e, "conversation append-back: invalid response JSON");
+        FilterError::from(format!("conversation append-back: invalid response JSON: {e}"))
+    })?;
 
-    {
-        let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
-        if status != "completed" {
-            trace!(status, "conversation append-back skipped (response not completed)");
-            return None;
-        }
+    let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
+    if status != "completed" {
+        trace!(status, "conversation append-back skipped (response not completed)");
+        return Ok(None);
     }
 
     let output_items = match response_json.get_mut("output").map(Value::take) {
@@ -716,12 +727,12 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
         .unwrap_or_default();
 
     if input_items.is_empty() && output_items.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut all_items = input_items;
     all_items.extend(output_items);
-    Some(all_items)
+    Ok(Some(all_items))
 }
 
 /// Persist items and refresh the denormalized message cache.

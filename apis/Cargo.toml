@@ -66,10 +66,11 @@ openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }
-# Transitional: apis re-exports the SQL backends at crate::store::* so the
-# conversations and responses filters keep compiling. Removed once #1259b and
-# #1262 take those filters off concrete-store construction. default-features off
-# so a per-backend apis build forwards only the backend it selects.
+# apis uses the SQL backends directly in the responses and conversations store
+# config (URL, TLS, and table-identifier validation) and re-exports the concrete
+# stores and provisioning factory at crate::store::* for the server provisioning
+# bridge and the store test suites. default-features off so a per-backend apis
+# build forwards only the backend it selects.
 praxis-ai-store-backends = { path = "../store-backends", optional = true, default-features = false }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,

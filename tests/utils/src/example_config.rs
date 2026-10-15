@@ -3,7 +3,11 @@
 
 //! Test utilities for loading and patching example configuration files.
 
-use std::collections::HashMap;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use praxis_core::config::Config;
 
@@ -57,6 +61,70 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// ```
 pub fn allow_loopback_endpoints(yaml: &str) -> String {
     ensure_insecure_option_bool(yaml, "allow_private_endpoints", true)
+}
+
+/// Whether the test process is running as UID 0.
+///
+/// `nix` is a `cfg(unix)` dependency of this crate; non-unix targets always
+/// report false so callers never need their own `#[cfg(unix)]` gates.
+#[cfg(unix)]
+pub fn harness_is_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+/// Whether the test process is running as UID 0.
+#[cfg(not(unix))]
+pub fn harness_is_root() -> bool {
+    false
+}
+
+/// Set `insecure_options.allow_root: true` when the harness is root and the
+/// key is absent; otherwise return `yaml` unchanged.
+///
+/// Used by subprocess and reload helpers so UID-0 environments can start the
+/// product binary without rewriting every shipped example YAML.
+pub fn allow_root_for_test_harness(yaml: &str) -> Cow<'_, str> {
+    if !harness_is_root() {
+        return Cow::Borrowed(yaml);
+    }
+    Cow::Owned(ensure_insecure_option_bool(yaml, "allow_root", true))
+}
+
+/// Set `insecure_options.allow_root` on an in-memory [`Config`] when the
+/// harness is root.
+pub fn allow_root_on_config(config: &mut Config) {
+    if harness_is_root() {
+        config.insecure_options.allow_root = true;
+    }
+}
+
+/// Write `yaml` to `dir/praxis.yaml`, injecting `allow_root` when the harness
+/// is root.
+///
+/// Shared by [`crate::PraxisProcess`] and binary-spawn helpers so the
+/// read/patch/write sequence cannot drift.
+///
+/// # Panics
+///
+/// Panics if the file cannot be written.
+pub fn write_praxis_yaml_for_harness(dir: &Path, yaml: &str) -> PathBuf {
+    let path = dir.join("praxis.yaml");
+    std::fs::write(&path, allow_root_for_test_harness(yaml).as_ref()).expect("write harness config");
+    path
+}
+
+/// Return `source` when not root; otherwise copy a root-allowed YAML into
+/// `work_dir/praxis.yaml` so the caller's on-disk fixture stays locked down.
+///
+/// # Panics
+///
+/// Panics if the source cannot be read or the copy cannot be written.
+pub fn config_path_for_harness(source: &Path, work_dir: &Path) -> PathBuf {
+    if !harness_is_root() {
+        return source.to_path_buf();
+    }
+    let yaml = std::fs::read_to_string(source).expect("read harness config source");
+    write_praxis_yaml_for_harness(work_dir, &yaml)
 }
 
 /// Set `insecure_options.<key>` when absent, via the parsed mapping.
@@ -280,7 +348,7 @@ mod tests {
     #[test]
     fn example_config_path_resolves() {
         let path = example_config_path("model-to-header-routing.yaml");
-        assert!(std::path::Path::new(&path).exists(), "expected {path} to exist");
+        assert!(Path::new(&path).exists(), "expected {path} to exist");
     }
 
     #[test]
@@ -320,5 +388,67 @@ mod tests {
     #[should_panic(expected = "example config root must be a mapping")]
     fn allow_loopback_panics_when_root_is_not_a_mapping() {
         let _ = allow_loopback_endpoints("- just\n- a\n- list\n");
+    }
+
+    #[test]
+    fn allow_root_for_test_harness_is_a_noop_when_not_root() {
+        if harness_is_root() {
+            return;
+        }
+        let yaml = "listeners: []\n";
+        match allow_root_for_test_harness(yaml) {
+            Cow::Borrowed(borrowed) => assert_eq!(borrowed, yaml, "non-root must borrow the input"),
+            Cow::Owned(_) => panic!("non-root must not rewrite the YAML"),
+        }
+    }
+
+    #[test]
+    fn write_praxis_yaml_for_harness_writes_praxis_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_praxis_yaml_for_harness(dir.path(), "listeners: []\n");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("praxis.yaml"),
+            "harness write helper must use praxis.yaml"
+        );
+        assert!(path.is_file(), "harness config file should exist");
+        let written = std::fs::read_to_string(&path).expect("read harness config");
+        if harness_is_root() {
+            assert!(
+                insecure_options_has_key(&written, "allow_root"),
+                "root branch must inject insecure_options.allow_root"
+            );
+            assert_eq!(
+                yaml_allow_root_flag(&written),
+                Some(true),
+                "root-patched YAML must set allow_root: true"
+            );
+        } else {
+            assert!(
+                !insecure_options_has_key(&written, "allow_root"),
+                "non-root write must leave the YAML unpatched"
+            );
+        }
+    }
+
+    /// The rewrite the root branch of [`allow_root_for_test_harness`] applies;
+    /// always covered even when the harness is not UID 0.
+    #[test]
+    fn root_branch_yaml_rewrite_sets_allow_root() {
+        let patched = ensure_insecure_option_bool("listeners: []\n", "allow_root", true);
+        assert!(
+            insecure_options_has_key(&patched, "allow_root"),
+            "root rewrite must insert allow_root"
+        );
+        assert_eq!(
+            yaml_allow_root_flag(&patched),
+            Some(true),
+            "rewritten YAML must set allow_root: true"
+        );
+    }
+
+    fn yaml_allow_root_flag(yaml: &str) -> Option<bool> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+        root.get("insecure_options")?.get("allow_root")?.as_bool()
     }
 }

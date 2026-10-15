@@ -752,13 +752,19 @@ kill "$PRAXIS_PID"
   unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
 - Claude Code never finishes a turn — plan mode keeps looping, or reasoning
-  text appears in the answer or the rendered plan: the server is emitting
-  thinking that the client is not meant to see. Serve Qwen3 with
+  text appears in the answer or the rendered plan: the server may be emitting
+  thinking that the client is not meant to see, which can desynchronize the
+  agentic loop. Serve Qwen3 with
   `--reasoning-parser qwen3` and
   `--default-chat-template-kwargs '{"enable_thinking":false}'` as shown in
   section 1, and restart vLLM; the reasoning parser is a server flag, so
   nothing on the Praxis or client side changes it. On the on-demand endpoint,
   check the `reasoning_parser` and `enable_thinking` inputs of the run.
+- Auto mode fails with `Error: You are not in plan mode. To enter plan mode,
+  call the EnterPlanMode tool first.`: treat this as a symptom, not a root
+  cause. It can be a plain Claude Code plan-state failure, or reasoning text
+  bleeding into the response and desynchronizing the agentic loop. Check whether
+  reasoning text is also present before applying the Qwen3 settings above.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Connection refused on 8080 from another machine, while vLLM on 8000 answers:

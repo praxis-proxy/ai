@@ -1299,6 +1299,7 @@ mod tests {
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["messages_to_chat_completions"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
@@ -1384,9 +1385,10 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 73, "manifest feature inventory count");
+        assert_eq!(report.features_total, 74, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 61, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 66, "manifest recording inventory count");
         assert_eq!(
@@ -1455,7 +1457,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 73, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 74, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1782,6 +1784,10 @@ mod tests {
                     &vec!["vertex/invalid-content".to_owned()]
                 ),
                 (
+                    &"vertex.gemini.response.schema_complete".to_owned(),
+                    &vec!["vertex/invalid-content".to_owned()]
+                ),
+                (
                     &"vertex.gemini.streaming.candidate_limit".to_owned(),
                     &vec!["vertex/bounded-stream-limits".to_owned()]
                 ),
@@ -1961,7 +1967,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[57..73] {
+        for feature in &manifest.features[57..74] {
             assert_eq!(
                 feature
                     .providers

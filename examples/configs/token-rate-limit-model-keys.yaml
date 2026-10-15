@@ -1,0 +1,76 @@
+# Token Rate Limiting -- Per-Model Bucket Keys
+#
+# Extends token-rate-limit.yaml with M5 model dimensions (ai#123): each
+# distinct model identity gets its own token budget under the same
+# catch-all rule.
+#
+# `model_to_header` promotes the JSON body `model` into `X-Model` and
+# strips a client-supplied copy so the budget key cannot be rotated
+# independently of the requested model. Missing model identity is
+# rejected (400) unless you set `missing: fallback`.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- -c examples/configs/token-rate-limit-model-keys.yaml
+#   curl -i http://localhost:8080/v1/chat/completions \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# With `reserved_tokens`, `token_rate_limit` keys only from the header
+# (it never reads the body). That is why `model_to_header` sits ahead:
+# the key comes from the body's `model`, and a conflicting client
+# `X-Model` is dropped. `max_keys` bounds key-table memory and rejects
+# new model keys with HTTP 429 (`KeyCapacity`) after the cap; it does
+# not stop clients from inventing body model names.
+#
+# See token-rate-limit.yaml for reservation-based admission (M2),
+# reconciliation, M4 token-type weights, and the `rules:` schema.
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      # Promote body `model` → X-Model and strip a client-supplied copy
+      # so reserved_tokens admission cannot be spoofed via the header.
+      - filter: model_to_header
+
+      - filter: token_rate_limit
+        key: model
+        max_keys: 100000
+        default_weights:
+          input: 1.0
+          output: 1.0
+          cached_input: 0.1
+          cache_write: 1.25
+          reasoning: 0.9
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+            reserved_tokens: 500
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true
