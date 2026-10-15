@@ -109,6 +109,14 @@ fn normalize_item(item: Value, generate_item_id: &mut impl FnMut() -> String) ->
     strip_known_nullable_nulls(&mut map);
     normalize_legacy_mcp_error(&mut map);
     default_item_status(&mut map);
+    if matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("tool_search_call" | "tool_search_output")
+    ) && !map.contains_key("call_id")
+    {
+        // Tool-search input permits omission, but the resource requires a nullable call_id.
+        map.insert("call_id".to_owned(), Value::Null);
+    }
     let item = Value::Object(map);
     validate_output_item(&item).map_err(StoreError::InvalidInput)?;
     Ok((item_id, item))

@@ -1,13 +1,12 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Lossless-enough YAML tree for semantic OpenAPI projection.
-//!
-//! The upstream OpenAI document contains integer schema bounds outside `i64`.
-//! The generic YAML value used elsewhere in the workspace cannot represent
-//! those scalars, so this tree retains signed and unsigned 128-bit integers.
+//! Semantic `OpenAPI` helpers shared by development tooling and integration tests.
 
-use std::fmt;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -16,13 +15,16 @@ use serde::{
 };
 
 /// One semantic YAML value.
+///
+/// Unlike the generic YAML value, this preserves integer schema bounds outside
+/// `i64`, as used by the pinned OpenAI document.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Value {
+pub enum Value {
     /// YAML null.
     Null,
     /// YAML boolean.
     Bool(bool),
-    /// Signed integer, including `OpenAPI` bounds outside `i64`.
+    /// Signed integer.
     Signed(i128),
     /// Unsigned integer.
     Unsigned(u128),
@@ -38,7 +40,7 @@ pub(super) enum Value {
 
 impl Value {
     /// Borrow this value as a mapping.
-    pub(super) fn as_mapping(&self) -> Option<&Mapping> {
+    pub const fn as_mapping(&self) -> Option<&Mapping> {
         if let Self::Mapping(value) = self {
             Some(value)
         } else {
@@ -47,7 +49,7 @@ impl Value {
     }
 
     /// Mutably borrow this value as a mapping.
-    pub(super) fn as_mapping_mut(&mut self) -> Option<&mut Mapping> {
+    pub const fn as_mapping_mut(&mut self) -> Option<&mut Mapping> {
         if let Self::Mapping(value) = self {
             Some(value)
         } else {
@@ -56,7 +58,7 @@ impl Value {
     }
 
     /// Borrow this value as a sequence.
-    pub(super) fn as_sequence(&self) -> Option<&[Self]> {
+    pub fn as_sequence(&self) -> Option<&[Self]> {
         if let Self::Sequence(value) = self {
             Some(value)
         } else {
@@ -65,7 +67,7 @@ impl Value {
     }
 
     /// Borrow this value as a string.
-    pub(super) fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         if let Self::String(value) = self {
             Some(value)
         } else {
@@ -76,16 +78,16 @@ impl Value {
 
 /// Ordered YAML mapping.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct Mapping(Vec<(Value, Value)>);
+pub struct Mapping(Vec<(Value, Value)>);
 
 impl Mapping {
     /// Create an empty mapping.
-    pub(super) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self(Vec::new())
     }
 
     /// Insert or replace one mapping entry.
-    pub(super) fn insert(&mut self, key: Value, value: Value) {
+    pub fn insert(&mut self, key: Value, value: Value) {
         if let Some((_existing_key, existing_value)) = self.0.iter_mut().find(|(candidate, _value)| *candidate == key) {
             *existing_value = value;
         } else {
@@ -94,12 +96,12 @@ impl Mapping {
     }
 
     /// Return whether the mapping contains a key.
-    pub(super) fn contains_key(&self, key: &Value) -> bool {
+    pub fn contains_key(&self, key: &Value) -> bool {
         self.0.iter().any(|(candidate, _value)| candidate == key)
     }
 
     /// Borrow one mapping value.
-    pub(super) fn get(&self, key: &Value) -> Option<&Value> {
+    pub fn get(&self, key: &Value) -> Option<&Value> {
         self.0
             .iter()
             .find(|(candidate, _value)| candidate == key)
@@ -107,7 +109,7 @@ impl Mapping {
     }
 
     /// Mutably borrow one mapping value.
-    pub(super) fn get_mut(&mut self, key: &Value) -> Option<&mut Value> {
+    pub fn get_mut(&mut self, key: &Value) -> Option<&mut Value> {
         self.0
             .iter_mut()
             .find(|(candidate, _value)| candidate == key)
@@ -115,22 +117,22 @@ impl Mapping {
     }
 
     /// Iterate over mapping entries in source order.
-    pub(super) fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
         self.0.iter().map(|(key, value)| (key, value))
     }
 
     /// Iterate over mapping keys.
-    pub(super) fn keys(&self) -> impl Iterator<Item = &Value> {
+    pub fn keys(&self) -> impl Iterator<Item = &Value> {
         self.0.iter().map(|(key, _value)| key)
     }
 
     /// Iterate over mapping values.
-    pub(super) fn values(&self) -> impl Iterator<Item = &Value> {
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
         self.0.iter().map(|(_key, value)| value)
     }
 
     /// Return whether the mapping has no entries.
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -139,6 +141,81 @@ impl FromIterator<(Value, Value)> for Mapping {
     fn from_iter<T: IntoIterator<Item = (Value, Value)>>(iter: T) -> Self {
         Self(iter.into_iter().collect())
     }
+}
+
+/// Parse a complete `OpenAPI` YAML document without truncating wide integers.
+///
+/// # Errors
+///
+/// Returns an error when the YAML is malformed or contains duplicate mapping keys.
+pub fn parse_document(source: &str) -> Result<Value, String> {
+    serde_yaml::from_str(source).map_err(|error| format!("failed to parse pinned OpenAI schema: {error}"))
+}
+
+/// Resolve root component schemas and their complete local-reference closure.
+///
+/// # Errors
+///
+/// Returns an error when `components.schemas`, a requested root, or a referenced
+/// local component is missing, or when a `$ref` is malformed or non-local.
+pub fn component_schema_closure<'a>(
+    document: &'a Value,
+    roots: &[&str],
+) -> Result<BTreeMap<String, &'a Value>, String> {
+    let schemas = document
+        .as_mapping()
+        .and_then(|root| yaml_get(root, "components"))
+        .and_then(Value::as_mapping)
+        .and_then(|components| yaml_get(components, "schemas"))
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| "pinned OpenAI schema has no components.schemas object".to_owned())?;
+
+    let mut pending = roots.iter().map(|root| (*root).to_owned()).collect::<BTreeSet<_>>();
+    let mut selected = BTreeMap::new();
+    while let Some(name) = pending.pop_first() {
+        if selected.contains_key(&name) {
+            continue;
+        }
+        let schema = schemas
+            .get(&Value::String(name.clone()))
+            .ok_or_else(|| format!("schema references missing component {name}"))?;
+        collect_schema_references(schema, &mut pending)?;
+        selected.insert(name, schema);
+    }
+    Ok(selected)
+}
+
+/// Add local component references found below one semantic YAML value.
+fn collect_schema_references(value: &Value, references: &mut BTreeSet<String>) -> Result<(), String> {
+    match value {
+        Value::Sequence(values) => {
+            for value in values {
+                collect_schema_references(value, references)?;
+            }
+        },
+        Value::Mapping(fields) => {
+            for (name, value) in fields.iter() {
+                if name.as_str() == Some("$ref") {
+                    let reference = value
+                        .as_str()
+                        .ok_or_else(|| "schema contains a non-string $ref".to_owned())?;
+                    let component = reference
+                        .strip_prefix("#/components/schemas/")
+                        .ok_or_else(|| format!("schema contains unsupported reference {reference}"))?;
+                    references.insert(component.to_owned());
+                } else {
+                    collect_schema_references(value, references)?;
+                }
+            }
+        },
+        Value::Bool(_) | Value::Float(_) | Value::Null | Value::Signed(_) | Value::String(_) | Value::Unsigned(_) => {},
+    }
+    Ok(())
+}
+
+/// Borrow one string-keyed YAML mapping value.
+fn yaml_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a Value> {
+    mapping.get(&Value::String(key.to_owned()))
 }
 
 impl<'de> Deserialize<'de> for Value {
@@ -264,15 +341,12 @@ impl Serialize for Value {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
     #[test]
     fn preserves_signed_schema_bounds_outside_i64() {
-        let source = "minimum: -9223372036854776000\n";
-        let value: Value = serde_yaml::from_str(source).unwrap();
+        let value = parse_document("minimum: -9223372036854776000\n").unwrap();
         let rendered = serde_yaml::to_string(&value).unwrap();
 
         assert!(rendered.contains("-9223372036854776000"));
@@ -280,7 +354,21 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_mapping_keys() {
-        let error = serde_yaml::from_str::<Value>("key: first\nkey: second\n").unwrap_err();
-        assert!(error.to_string().contains("duplicate YAML mapping key"));
+        let error = parse_document("key: first\nkey: second\n").unwrap_err();
+        assert!(error.contains("duplicate YAML mapping key"));
+    }
+
+    #[test]
+    fn resolves_transitive_component_references() {
+        let document = parse_document(
+            "components:\n  schemas:\n    Root:\n      $ref: '#/components/schemas/Child'\n    Child:\n      type: string\n",
+        )
+        .unwrap();
+        let selected = component_schema_closure(&document, &["Root"]).unwrap();
+
+        assert_eq!(
+            selected.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Child", "Root"]
+        );
     }
 }

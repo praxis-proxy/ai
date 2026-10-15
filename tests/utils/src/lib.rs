@@ -25,6 +25,7 @@ pub mod fips;
 pub mod inference_fixture;
 pub mod load;
 pub mod net;
+pub mod openapi;
 pub mod process;
 pub mod proxy;
 pub mod recording;

@@ -6,6 +6,7 @@
 use std::{collections::BTreeSet, path::Path};
 
 use clap::Parser;
+use praxis_test_utils::openapi::{Mapping as YamlMapping, Value as YamlValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -13,7 +14,6 @@ use super::{
     HTTP_METHODS,
     area::{OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC},
     model::{OperationKey, OperationScope, ReferenceProvenance, SpecOperation},
-    semantic_yaml::{Mapping as YamlMapping, Value as YamlValue},
     spec::repo_root,
 };
 

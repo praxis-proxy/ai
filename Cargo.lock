@@ -3984,6 +3984,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "metrics",
  "nix",
  "openssl",
  "praxis-ai-apis",

@@ -264,6 +264,59 @@ fn build_item_records_generates_ids_for_items_without_them() {
 }
 
 #[test]
+fn build_item_records_defaults_missing_tool_search_call_ids_to_null() {
+    for item in [
+        json!({"type": "tool_search_call", "execution": "server", "arguments": {}}),
+        json!({"type": "tool_search_output", "execution": "server", "tools": []}),
+    ] {
+        let records = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap();
+
+        assert_eq!(
+            records[0].item_data.get("call_id"),
+            Some(&serde_json::Value::Null),
+            "stored tool-search items must contain an explicit null call_id"
+        );
+    }
+}
+
+#[test]
+fn build_item_records_preserves_supplied_tool_search_call_ids() {
+    for item_type in ["tool_search_call", "tool_search_output"] {
+        for call_id in [json!(null), json!("call_preserved")] {
+            let mut item = json!({"type": item_type, "execution": "server", "call_id": call_id});
+            if item_type == "tool_search_call" {
+                item["arguments"] = json!({});
+            } else {
+                item["tools"] = json!([]);
+            }
+            let records = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap();
+
+            assert_eq!(
+                records[0].item_data.get("call_id"),
+                Some(&call_id),
+                "normalization must preserve an explicit null or string call_id"
+            );
+        }
+    }
+}
+
+#[test]
+fn build_item_records_rejects_invalid_tool_search_and_missing_function_call_ids() {
+    for item in [
+        json!({"type": "tool_search_call", "execution": "server", "arguments": {}, "call_id": 17}),
+        json!({"type": "tool_search_output", "execution": "server", "tools": [], "call_id": 17}),
+        json!({"type": "function_call", "name": "lookup", "arguments": "{}"}),
+    ] {
+        let error = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap_err();
+
+        assert!(
+            matches!(error, StoreError::InvalidInput(_)),
+            "normalization must not repair invalid call IDs or relax other item types"
+        );
+    }
+}
+
+#[test]
 fn build_item_records_normalizes_easy_input_message_without_type() {
     let records = build_item_records(
         &owner("alice"),
