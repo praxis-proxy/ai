@@ -43,7 +43,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
-	test-schema test-integration test-inference-fixtures \
+	test-schema test-integration test-inference-fixtures bench-model-to-provider \
 	test-store-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
@@ -122,6 +122,11 @@ test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+
+bench-model-to-provider:
+	cargo test --locked --release -p praxis-ai-filters --lib \
+		inference::model_to_provider::tests::mapping_latency_microbenchmark \
+		-- --ignored --exact --nocapture
 
 test-unit-proxy:
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
@@ -849,6 +854,7 @@ help:
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
+	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"

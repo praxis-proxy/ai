@@ -1396,6 +1396,7 @@ fn scenario(prompt: &str) -> InferenceScenario {
         protocol: InferenceProtocol::AnthropicMessages,
         example_config: "anthropic/messages-to-openai.yaml".to_owned(),
         upstream_authority: "127.0.0.1:8000".to_owned(),
+        replay_upstream_aliases: Vec::new(),
         features: vec!["messages.basic".to_owned()],
         turns: vec![ScenarioTurn {
             name: "initial".to_owned(),

@@ -166,10 +166,11 @@ This peek-then-stream pattern avoids the latency of
 external processor architectures while providing body
 visibility where it matters.
 
-Filters declare `BodyAccess::ReadOnly` +
+Filters declare body access and
 `BodyMode::StreamBuffer { max_bytes }` to opt in.
-Only `PromptEnrichFilter` uses `ReadWrite` (it
-modifies the messages array).
+Body writers such as `model_to_provider` and
+`prompt_enrich` use `BodyAccess::ReadWrite` to replace
+the buffered request before forwarding it.
 
 ## Filters
 
@@ -199,6 +200,29 @@ routing cannot be spoofed. When a trusted hop in front
 of Praxis already sets the header, an
 `unless: {headers_present: [...]}` condition on the
 filter skips it entirely, preserving the incoming value.
+
+### `model_to_provider`
+
+Maps an exact client model and request path to an existing
+load-balancer cluster and target model. It stages the cluster
+during body pre-read and selects it during the request phase.
+The load balancer chooses endpoints and owns health checks
+and retries. No header-matching router or provider registry
+is needed. This is ordinary cluster selection: it does not
+publish the frozen binding read by `bound_upstream` conditions.
+
+Unknown models and paths retain their bodies and select
+`fallback_upstream` when configured. Without a fallback, the
+filter leaves cluster selection unchanged; a subsequent load
+balancer still needs a cluster to forward the request. Normal
+pipeline validation checks mapped and fallback cluster names
+against load-balancer declarations at startup and reload.
+
+The original client model stays in request metadata for
+metering and optional provider response adapters. The filter
+itself leaves responses unchanged. Cluster application-provider
+metadata is optional for routing; an adapter that uses it must
+run after selection and require the appropriate tags.
 
 ### `openai_responses_request`
 
@@ -256,6 +280,8 @@ Persists non-streaming Responses API responses. See
   `OpenaiResponsesRequestFilter`
 - `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
+- `filters/src/inference/model_to_provider.rs`:
+  `ModelToProviderFilter`
 - `filters/src/prompt_enrich/`:
   prompt enrichment filter
 - `apis/src/anthropic/`:

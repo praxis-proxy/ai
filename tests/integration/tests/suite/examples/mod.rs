@@ -53,6 +53,7 @@ mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod model_to_header_trust_existing;
+mod model_to_provider;
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;
 #[cfg(feature = "store-sqlite")]

@@ -100,10 +100,11 @@ impl ScenarioRunner {
 
         let listener = free_port_guard();
         let listener_port = listener.port();
-        let config = build_replay_config(
+        let config = build_replay_config_with_aliases(
             &config_source,
             listener_port,
             &bound.upstream_authority,
+            &bound.replay_upstream_aliases,
             backend.addr().port(),
         )?;
         let released_port = listener.release();
@@ -322,10 +323,12 @@ pub(super) fn load_and_validate_config_source(scenario: &InferenceScenario) -> R
     let value =
         serde_json::to_value(config).map_err(|_source| runtime_error("scenario config could not be inspected"))?;
     validate_mcp_resolve_replay_requests(&value, scenario)?;
-    if !config_contains_endpoint_address(&value, &scenario.upstream_authority)? {
-        return Err(runtime_error(
-            "scenario upstream authority was not found in example config",
-        ));
+    for authority in std::iter::once(&scenario.upstream_authority).chain(&scenario.replay_upstream_aliases) {
+        if !config_contains_endpoint_address(&value, authority)? {
+            return Err(runtime_error(
+                "scenario upstream authority was not found in example config",
+            ));
+        }
     }
     Ok(source)
 }
@@ -375,17 +378,28 @@ fn has_only_normal_relative_components(path: &Path) -> bool {
 }
 
 /// Applies the exact known authority patch and proves every network surface is local.
+#[cfg(test)]
 pub(super) fn build_replay_config(
     source: &str,
     listener_port: u16,
     upstream_authority: &str,
     backend_port: u16,
 ) -> Result<Config, FixtureError> {
-    let patched = patch_yaml(
-        source,
-        listener_port,
-        &HashMap::from([(upstream_authority, backend_port)]),
-    );
+    build_replay_config_with_aliases(source, listener_port, upstream_authority, &[], backend_port)
+}
+
+/// Binds declared endpoint aliases before enforcing unchanged replay containment.
+pub(super) fn build_replay_config_with_aliases(
+    source: &str,
+    listener_port: u16,
+    upstream_authority: &str,
+    aliases: &[String],
+    backend_port: u16,
+) -> Result<Config, FixtureError> {
+    let port_map: HashMap<_, _> = std::iter::once((upstream_authority, backend_port))
+        .chain(aliases.iter().map(|alias| (alias.as_str(), backend_port)))
+        .collect();
+    let patched = patch_yaml(source, listener_port, &port_map);
     let contained = contain_replay_external_resources(&patched)?;
     let config =
         Config::from_yaml(&contained).map_err(|_source| runtime_error("patched scenario config is invalid"))?;
@@ -438,6 +452,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_chat_completions_to_vertexai_gemini"
             | "openai_responses_to_chat_completions"
             | "aws_sigv4_sign"
+            | "model_to_provider"
             | "router"
             | "load_balancer"
     )
@@ -1779,9 +1794,10 @@ mod tests {
             ScenarioExpectation, ScenarioTurn, SseFrame, WireFixture, bounds::MAX_SCENARIO_REQUEST_BODY_BYTES,
             sanitize::RedactionRules,
         },
-        ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, compare_imported_requests,
-        finish_backend_after_proxy_shutdown, fixture_comparison_value, has_only_normal_relative_components,
-        is_network_value_key, is_replay_contained_filter, load_and_validate_config_source, resolve_example_config_path,
+        ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, build_replay_config_with_aliases,
+        compare_imported_requests, config_contains_endpoint_address, finish_backend_after_proxy_shutdown,
+        fixture_comparison_value, has_only_normal_relative_components, is_network_value_key,
+        is_replay_contained_filter, load_and_validate_config_source, resolve_example_config_path,
         send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
         validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
         validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
@@ -2562,6 +2578,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_aliases_bind_exact_endpoints_without_allowing_unowned_targets() {
+        let source = replay_config_source("model-to-provider.yaml");
+        let aliases = vec!["127.0.0.1:9002".to_owned()];
+        let config = build_replay_config_with_aliases(&source, 19_001, "127.0.0.1:9001", &aliases, 19_002)
+            .expect("the declared fallback alias must select the owned recording backend");
+        let value = serde_json::to_value(config).unwrap();
+        assert!(
+            config_contains_endpoint_address(&value, "127.0.0.1:19002").unwrap(),
+            "the declared aliases must bind the owned backend"
+        );
+        assert!(
+            !config_contains_endpoint_address(&value, "127.0.0.1:9002").unwrap(),
+            "no original alias may survive binding"
+        );
+        for unexpected in ["127.0.0.1:19003", "192.0.2.1:443"] {
+            let source = source.replace("127.0.0.1:9002", unexpected);
+            let error = build_replay_config_with_aliases(&source, 19_001, "127.0.0.1:9001", &aliases, 19_002)
+                .expect_err("an undeclared target must remain rejected even with an alias");
+            assert_eq!(
+                error.to_string(),
+                "scenario outbound target is not replay-owned",
+                "arbitrary loopback and remote endpoints must both fail containment"
+            );
+        }
+    }
+
+    #[test]
     fn replay_config_rejects_a_nonloopback_secondary_listener() {
         let source = replay_config_source("openai/responses/responses-proxy.yaml").replace(
             "    filter_chains: [responses-proxy]\n",
@@ -2802,6 +2845,13 @@ mod tests {
                 .expect_err("ambient or missing credentials must fail before filter construction");
             assert_eq!(error.to_string(), "scenario credentials are not replay-contained");
         }
+    }
+
+    #[test]
+    fn replay_config_allows_model_to_provider_fixture() {
+        let source = replay_config_source("model-to-provider.yaml");
+        let config = Config::from_yaml(&source).expect("model-to-provider example config should parse");
+        validate_replay_filters(&config).expect("model-to-provider example contains only replay-safe filters");
     }
 
     #[test]
@@ -3737,6 +3787,7 @@ mod tests {
             protocol: InferenceProtocol::AnthropicMessages,
             example_config: "anthropic/messages-to-openai.yaml".to_owned(),
             upstream_authority: "127.0.0.1:8000".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["messages.request.minimal".to_owned()],
             turns,
         }
@@ -3750,6 +3801,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/responses-proxy.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.request.minimal".to_owned()],
             turns: vec![ScenarioTurn {
                 name: "redirect".to_owned(),
@@ -3785,6 +3837,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/agentic-loop-deferred-mcp-fixture.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.agentic.deferred_mcp_connectors".to_owned()],
             turns: vec![ScenarioTurn {
                 name: "initial".to_owned(),
@@ -3824,6 +3877,7 @@ mod tests {
             protocol: InferenceProtocol::AnthropicMessages,
             example_config: "anthropic/messages-to-openai.yaml".to_owned(),
             upstream_authority: "127.0.0.1:8000".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["messages.request.minimal".to_owned()],
             turns: vec![ScenarioTurn {
                 name: "root".to_owned(),
@@ -3862,6 +3916,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/responses-proxy.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.streaming".to_owned()],
             turns: vec![ScenarioTurn {
                 name: "stream".to_owned(),
@@ -3989,6 +4044,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/responses-to-chat-completions.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.chat.malformed_compaction".to_owned()],
             turns: vec![ScenarioTurn {
                 name: "initial".to_owned(),
