@@ -9924,17 +9924,21 @@ def file_resolve_stub_env(tmp_path_factory, request):
     _FileUrlStubHandler.requests = 0
     _FileResolveBackendHandler.captured = []
 
-    files_port = _free_port()
-    backend_port = _free_port()
-    file_url_port = _free_port()
-
-    servers = [
-        HTTPServer(("127.0.0.1", files_port), _FilesApiStubHandler),
-        HTTPServer(("127.0.0.1", backend_port), _FileResolveBackendHandler),
-        HTTPServer(("127.0.0.1", file_url_port), _FileUrlStubHandler),
-    ]
-    for server in servers:
+    servers = []
+    for handler in (
+        _FilesApiStubHandler,
+        _FileResolveBackendHandler,
+        _FileUrlStubHandler,
+    ):
+        # Keep each ephemeral port bound instead of probing and releasing it.
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        request.addfinalizer(server.server_close)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        request.addfinalizer(server.shutdown)
+        servers.append(server)
+    files_port, backend_port, file_url_port = (
+        server.server_port for server in servers
+    )
 
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("file-resolve-stub")
@@ -9979,8 +9983,6 @@ def file_resolve_stub_env(tmp_path_factory, request):
             proc.kill()
             proc.wait()
         log_file.close()
-        for server in servers:
-            server.shutdown()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
