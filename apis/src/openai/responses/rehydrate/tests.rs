@@ -1751,12 +1751,16 @@ fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
         json!({"type": "configuration_update", "reasoning": {}}),
         json!({"type": "configuration_update", "reasoning": {"effort": null}}),
     ] {
+        let shape = replacement.to_string();
         let stored = vec![
             json!({"type": "configuration_update", "reasoning": {"effort": "high"}}),
             replacement,
         ];
         let state = build_state(json!({"model": "m", "input": "hello"}), stored, vec![], None);
-        assert!(state.request_body["reasoning"]["effort"].is_null());
+        assert!(
+            state.request_body["reasoning"]["effort"].is_null(),
+            "replacement {shape} must not resurrect the stored effort"
+        );
         assert_eq!(
             state.persisted_messages.len(),
             3,
@@ -1776,7 +1780,8 @@ fn configuration_update_preserves_other_request_reasoning_fields() {
     );
     assert_eq!(
         state.request_body["reasoning"],
-        json!({"summary": "auto", "effort": "high"})
+        json!({"summary": "auto", "effort": "high"}),
+        "request-supplied reasoning fields must survive beside the inherited effort"
     );
 }
 

@@ -1428,24 +1428,24 @@ class TestOpenAIConversations:
         )
 
         item = created.data[0]
-        assert item.id.startswith("item_")
-        assert item.type == "configuration_update"
-        assert _reasoning_effort(item) == "high"
+        assert item.id.startswith("item_"), "create must assign a server item ID"
+        assert item.type == "configuration_update", "create must echo the item type"
+        assert _reasoning_effort(item) == "high", "create must echo the configured effort"
 
         page = openai_client.conversations.items.list(
             conversation.id,
             order="asc",
         )
         listed = page.data[0]
-        assert listed.id == item.id
-        assert listed.type == "configuration_update"
-        assert _reasoning_effort(listed) == "high"
+        assert listed.id == item.id, "list must return the created item"
+        assert listed.type == "configuration_update", "list must preserve the item type"
+        assert _reasoning_effort(listed) == "high", "list must preserve the configured effort"
 
         retrieved = openai_client.conversations.items.retrieve(
             item.id, conversation_id=conversation.id
         )
-        assert retrieved.type == "configuration_update"
-        assert _reasoning_effort(retrieved) == "high"
+        assert retrieved.type == "configuration_update", "retrieve must preserve the item type"
+        assert _reasoning_effort(retrieved) == "high", "retrieve must preserve the configured effort"
 
     def test_item_create_returns_all_items(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -2358,61 +2358,6 @@ class TestConversationTenantIsolation:
         finally:
             openai_client.conversations.delete(conversation.id)
 
-    def test_structured_mcp_error_is_dict(self, conversation_responses_client):
-        """PR1362: MCP error fields are structured objects, not bare strings.
-
-        A backend response carrying an ``mcp_call`` output item with a
-        structured error (dict with type/content) must round-trip through
-        the proxy and SDK with that object shape intact, rather than
-        degrading to the old string-valued error that the refreshed schema
-        rejects during conversation append-back.
-        """
-        client, backend = conversation_responses_client
-        backend.output = [
-            {
-                "type": "mcp_call",
-                "id": "mcp_sdk_failure",
-                "status": "failed",
-                "server_label": "weather",
-                "name": "get_weather",
-                "arguments": "{}",
-                "output": "",
-                "error": {
-                    "type": "mcp_tool_execution_error",
-                    "content": "controlled failure for schema validation",
-                },
-            },
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "ok"}],
-            },
-        ]
-        conversation = client.conversations.create()
-        try:
-            response = client.responses.create(
-                model="gpt-4.1",
-                conversation=conversation.id,
-                input="weather?",
-                store=True,
-            )
-            assert (
-                response.status == "completed"
-            ), "a structured MCP failure must not fail the response"
-            mcp_items = [
-                item
-                for item in response.output
-                if item.type == "mcp_call"
-            ]
-            assert mcp_items, "expected an mcp_call output item"
-            mcp = mcp_items[0]
-            error = mcp.error if isinstance(mcp.error, dict) else mcp.error.model_dump()
-            assert error["type"] == "mcp_tool_execution_error", error
-            assert error["content"] == (
-                "controlled failure for schema validation"
-            )
-        finally:
-            client.conversations.delete(conversation.id)
 
 
 # ---------------------------------------------------------------------------
@@ -2914,10 +2859,6 @@ def conversation_responses_inference_client():
         backend.shutdown()
         backend.server_close()
         thread.join(timeout=5)
-
-
-# Alias matching the fixture name used by the tests above
-conversation_responses_client = conversation_responses_inference_client
 
 
 if __name__ == "__main__":

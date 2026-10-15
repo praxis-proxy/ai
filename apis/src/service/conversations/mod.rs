@@ -140,12 +140,12 @@ pub(crate) fn normalize_legacy_mcp_error(map: &mut Map<String, Value>) {
     if map.get("type").and_then(Value::as_str) != Some("mcp_call") {
         return;
     }
-    let Some(content) = map.get("error").filter(|error| error.is_string()).cloned() else {
+    let Some(error) = map.get_mut("error").filter(|error| error.is_string()) else {
         return;
     };
     let mut tagged = Map::new();
     tagged.insert("type".to_owned(), Value::String("mcp_tool_execution_error".to_owned()));
-    tagged.insert("content".to_owned(), content);
+    tagged.insert("content".to_owned(), std::mem::take(error));
     map.insert("error".to_owned(), Value::Object(tagged));
 }
 
