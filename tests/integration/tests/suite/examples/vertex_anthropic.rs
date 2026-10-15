@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
-    start_header_echo_backend, start_uri_echo_backend,
+    Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml,
+    start_capturing_backend, start_header_echo_backend, start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
