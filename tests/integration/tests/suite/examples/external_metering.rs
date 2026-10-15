@@ -304,13 +304,9 @@ filter_chains:
       - filter: model_to_provider
         models:
           - model: claude-sonnet-4-5
-            provider: vertex
-            target_model: vertex/claude-sonnet-4-5
+            upstream: backend
+            target_model: claude-sonnet-4-5@20250929
             paths: [/v1/messages]
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: backend
       - filter: load_balancer
         clusters:
           - name: backend
@@ -338,7 +334,7 @@ insecure_options:
     assert_eq!(forwarded.len(), 1, "the metered request must reach its provider once");
     let body: serde_json::Value = serde_json::from_str(&forwarded[0].body).expect("provider body must be JSON");
     assert_eq!(
-        body["model"], "vertex/claude-sonnet-4-5",
+        body["model"], "claude-sonnet-4-5@20250929",
         "the provider must receive the rewritten target"
     );
 

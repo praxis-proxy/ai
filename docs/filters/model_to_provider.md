@@ -3,11 +3,15 @@
 
 # `model_to_provider`
 
-Maps stable client-facing model IDs to an internal provider selector and provider-specific target model.
+Maps stable client-facing model IDs to existing upstream clusters and provider-specific target models.
 
 ## Configuration Notes
 
-An exact model/path match sets `x-praxis-ai-provider` for the `router`, rewrites the JSON body model, and records the client ID in filter metadata for provider response adapters. Unknown models and paths pass through. Configuration is pipeline-local: the filter performs no Kubernetes or other control-plane lookups.
+An exact model/path match rewrites the JSON body model and records the client ID for metering and provider response adapters. During the request phase, the filter selects the mapping's `upstream` cluster. A following `load_balancer` owns endpoint selection, health checks, and retries; no header-matching `router` or provider registry is needed.
+
+Unknown models and paths keep their bodies unchanged and select `fallback_upstream` when configured. Without it, this filter leaves cluster selection unchanged; a load balancer still needs a selected cluster to forward the request. Do not combine this selector with a competing router before the same load balancer.
+
+The normal server pipeline validation checks mapped and fallback cluster names against the load balancers on startup and reload. Cluster application metadata is optional for routing. Provider adapters can read `selected_application_provider()` after load balancing and must separately declare any application metadata they require on those clusters.
 
 The filter does not restore the client-facing model ID in responses, so a provider that echoes the model it served returns `target_model` to the client unless a provider response adapter reads the client-facing ID back from the `model_to_provider.client_model` metadata key.
 
@@ -17,9 +21,10 @@ The filter does not restore the client-facing model ID in responses, so a provid
 |-------|------|---------|-------------|
 | `models` | ModelProviderMappingConfig[] | yes | Exact client-facing model mappings. |
 | `models[].model` | string | yes | Exact model ID sent by the client. |
-| `models[].provider` | string | yes | Provider selector consumed by the unified `router` configuration. |
+| `models[].upstream` | string | yes | Existing load-balancer cluster selected for this model. |
 | `models[].target_model` | string | yes | Provider-specific model written into the request body. |
 | `models[].paths` | string[] | yes | Exact inference paths on which this mapping applies. |
+| `fallback_upstream` | string | no | Existing load-balancer cluster selected when no model/path mapping matches. |
 | `max_body_bytes` | integer | no | Maximum JSON request body buffered to inspect the model field. |
 
 ## Example
@@ -28,7 +33,7 @@ The filter does not restore the client-facing model ID in responses, so a provid
 filter: model_to_provider
 models:
   - model: claude-sonnet-4-5
-    provider: vertex
-    target_model: vertex/claude-sonnet-4-5
+    upstream: vertex-prod
+    target_model: claude-sonnet-4-5@20250929
     paths: [/v1/messages, /v1/messages/count_tokens]
 ```

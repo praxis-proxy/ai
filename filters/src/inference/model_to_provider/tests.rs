@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Tests for stable model ID resolution.
+//! Tests for stable model ID resolution and staged cluster selection.
 
 use bytes::Bytes;
 use http::Method;
@@ -15,11 +15,12 @@ use crate::test_utils::{make_filter_context, make_request};
 fn config_rejects_empty_duplicates_and_invalid_entries() {
     for yaml in [
         "models: []",
-        "models:\n  - model: same\n    provider: vertex\n    target_model: vertex/a\n    paths: [/v1/messages]\n  - model: same\n    provider: other\n    target_model: other/a\n    paths: [/v1/messages]",
-        "models:\n  - model: claude\n    provider: ''\n    target_model: vertex/a\n    paths: [/v1/messages]",
-        "models:\n  - model: claude\n    provider: vertex\n    target_model: vertex/a\n    paths: []",
-        "models:\n  - model: claude\n    provider: vertex\n    target_model: vertex/a\n    paths: [relative/path]",
-        "models:\n  - model: claude\n    provider: vertex\n    target_model: vertex/a\n    paths: [/v1/messages, /v1/messages]",
+        "models: [{model: same, upstream: vertex, target_model: a, paths: [/v1/messages]}, {model: same, upstream: other, target_model: b, paths: [/v1/messages]}]",
+        "models: [{model: claude, upstream: '', target_model: a, paths: [/v1/messages]}]",
+        "models: [{model: claude, upstream: vertex, target_model: a, paths: []}]",
+        "models: [{model: claude, upstream: vertex, target_model: a, paths: [relative/path]}]",
+        "models: [{model: claude, upstream: vertex, target_model: a, paths: [/v1/messages, /v1/messages]}]",
+        "models: [{model: claude, provider: vertex, target_model: a, paths: [/v1/messages]}]",
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(
@@ -27,71 +28,130 @@ fn config_rejects_empty_duplicates_and_invalid_entries() {
             "must reject: {yaml}"
         );
     }
+    let value = serde_yaml::from_str(&format!("{}\nfallback_upstream: ''", vertex_config())).unwrap();
+    assert!(
+        ModelToProviderFilter::from_config(&value).is_err(),
+        "an explicit fallback must name a cluster"
+    );
+}
+
+#[test]
+fn declares_every_mapped_and_fallback_cluster() {
+    let filter = build_filter(&format!("{}\nfallback_upstream: fallback", vertex_config()));
+    assert!(filter.selects_cluster(), "pipeline checks must recognize this selector");
+    assert_eq!(
+        filter.selected_clusters(),
+        ["fallback", "vertex"],
+        "validation must see every possible target"
+    );
+    let same = build_filter(&format!("{}\nfallback_upstream: vertex", vertex_config()));
+    assert_eq!(
+        same.selected_clusters(),
+        ["vertex"],
+        "shared targets need only one declaration"
+    );
 }
 
 #[tokio::test]
-async fn mapping_sets_provider_marker_preserves_public_id_and_rewrites_target() {
+async fn mapping_stages_cluster_preserves_public_id_and_rewrites_target() {
     let filter = build_filter(vertex_config());
     let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
-    let mut body = Some(Bytes::from(
-        json!({"model":"claude-sonnet-4-5","messages":[]}).to_string(),
-    ));
-
-    assert!(
-        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
-        "the request hook must continue until the body is available"
-    );
-    assert!(
-        matches!(
-            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "a mapped request must continue with its transformed body"
-    );
-
-    assert_vertex_selector(&ctx);
+    let mut ctx = context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
+    assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(ctx.cluster.is_none(), "pre-read only stages selection");
+    let public_model = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
     assert_eq!(
-        ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
+        public_model,
         Some("claude-sonnet-4-5"),
-        "metadata must retain the original public model for metering"
+        "keep the client model for metering"
     );
     let parsed: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(
-        parsed["model"], "vertex/claude-sonnet-4-5",
-        "the backend body must carry the configured target model"
+        parsed["model"], "claude-sonnet-4-5@20250929",
+        "use the exact target model"
     );
+    assert_continue(&filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(ctx.cluster.as_deref(), Some("vertex"), "publish the mapped cluster");
+    assert!(ctx.upstream.is_none(), "the load balancer selects the endpoint");
+    assert!(ctx.request_headers_to_set.is_empty(), "routing needs no header");
 }
 
 #[tokio::test]
-async fn mapping_ignores_unknown_models_and_non_matching_paths() {
-    let filter = build_filter(vertex_config());
+async fn mapping_uses_explicit_fallback_without_changing_unmatched_bodies() {
+    let filter = build_filter(&format!("{}\nfallback_upstream: fallback", vertex_config()));
     for (path, model) in [
-        ("/v1/messages", "claude-opus-4-5"),
+        ("/v1/messages", "unknown-model"),
         ("/v1/chat/completions", "claude-sonnet-4-5"),
     ] {
         let request = make_request(Method::POST, path);
-        let mut ctx = make_filter_context(&request);
-        let original = Bytes::from(json!({"model":model,"messages":[]}).to_string());
+        let mut ctx = context(&request);
+        let original = Bytes::from(json!({"model": model, "messages": []}).to_string());
         let mut body = Some(original.clone());
-
-        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-        assert!(
-            matches!(action, FilterAction::Continue),
-            "an unmapped request must continue to its fallback"
+        assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_continue(&filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("fallback"),
+            "unmatched requests use explicit fallback"
         );
         assert_eq!(
             body.as_ref(),
             Some(&original),
-            "an unmapped body must remain unchanged: {path} {model}"
-        );
-        assert!(
-            ctx.request_headers_to_set.is_empty(),
-            "an unmapped request must not acquire a provider selector"
+            "unmatched bodies retain the client model"
         );
         assert!(
             ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
-            "an unmapped request must not acquire mapped-model metadata"
+            "no match means no alias metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_match_without_fallback_preserves_existing_selection() {
+    let filter = build_filter(vertex_config());
+    let request = make_request(Method::POST, "/v1/messages");
+    for initial in [None, Some(Arc::from("preselected"))] {
+        let mut ctx = context(&request);
+        ctx.cluster.clone_from(&initial);
+        ctx.metrics_route = Some("original-route".into());
+        let mut body = Some(Bytes::from_static(br#"{"model":"unknown"}"#));
+        assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_continue(&filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(ctx.cluster, initial, "no match without fallback makes no selection");
+        assert_eq!(
+            ctx.metrics_route.as_deref(),
+            Some("original-route"),
+            "an untouched route retains its metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mapping_and_fallback_clear_previous_route_overrides() {
+    let filter = build_filter(&format!("{}\nfallback_upstream: fallback", vertex_config()));
+    let request = make_request(Method::POST, "/v1/messages");
+    for model in ["claude-sonnet-4-5", "unknown"] {
+        let mut ctx = context(&request);
+        ctx.route_retry_policy = Some(Arc::new(serde_yaml::from_str("max_retries: 9").unwrap()));
+        ctx.hedge_policy = Some(Arc::new(
+            serde_yaml::from_str("initial_requests: 2\nmax_attempts: 2\nbudget_percent: 50").unwrap(),
+        ));
+        ctx.metrics_route = Some("old-route".into());
+        let mut body = Some(Bytes::from(json!({"model": model}).to_string()));
+        assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_continue(&filter.on_request(&mut ctx).await.unwrap());
+        assert!(
+            ctx.route_retry_policy.is_none(),
+            "the selected cluster must use its own retry policy"
+        );
+        assert!(
+            ctx.hedge_policy.is_none(),
+            "an old route must not impose hedging on this cluster"
+        );
+        assert!(
+            ctx.metrics_route.is_none(),
+            "the old router label must not describe this selection"
         );
     }
 }
@@ -100,184 +160,64 @@ async fn mapping_ignores_unknown_models_and_non_matching_paths() {
 async fn mapping_matches_path_without_query_string() {
     let filter = build_filter(vertex_config());
     let request = make_request(Method::POST, "/v1/messages/count_tokens?client=cli");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = context(&request);
     let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "query parameters must not prevent model mapping"
-    );
-    assert!(
-        ctx.request_headers_to_set
-            .iter()
-            .any(|(name, value)| { name == PROVIDER_HEADER && value == HeaderValue::from_static("vertex") }),
-        "a mapped path with a query must still select the vertex provider"
-    );
-}
-
-#[tokio::test]
-async fn mapping_joins_an_already_active_ordered_mutation_log() {
-    let filter = build_filter(vertex_config());
-    let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
-    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
-        HeaderName::from_static("x-trusted-tenant"),
-        HeaderValue::from_static("acme"),
-    ));
-    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "mapping must continue when an ordered mutation log is already active"
-    );
-    assert_vertex_selector(&ctx);
+    assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_continue(&filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(
-        ctx.pre_read_mutations.len(),
-        3,
-        "the selector should be appended after the earlier ordered mutation"
-    );
-    assert!(
-        matches!(
-            ctx.pre_read_mutations.last(),
-            Some(TrustedHeaderMutation::Set(name, value)) if *name == PROVIDER_HEADER && value == "vertex"
-        ),
-        "core ignores grouped queues once the ordered log is active, so the selector must be in it: {:?}",
-        ctx.pre_read_mutations
+        ctx.cluster.as_deref(),
+        Some("vertex"),
+        "queries must not prevent a configured path match"
     );
 }
 
 #[tokio::test]
-async fn mapping_does_not_activate_the_ordered_mutation_log() {
-    let filter = build_filter(vertex_config());
-    let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
-    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "mapping must continue without activating ordered mutation mode"
-    );
-    assert!(
-        ctx.pre_read_mutations.is_empty(),
-        "writing the ordered log would make core drop other filters' grouped mutations"
-    );
-}
-
-#[tokio::test]
-async fn mapping_clears_stale_selector_and_metadata_before_early_returns() {
+async fn unmatched_complete_bodies_clear_staged_state() {
     let filter = build_filter(vertex_config());
     for (path, raw) in [
-        ("/v1/messages", "not JSON"),
-        ("/v1/messages", "{\"model\":\"unknown\"}"),
-        ("/other", "{\"model\":\"claude-sonnet-4-5\"}"),
-        ("/v1/messages", "{}"),
-        ("/v1/messages", "[]"),
-        ("/v1/messages", "{\"model\":42}"),
+        ("/v1/messages", Some("not JSON")),
+        ("/v1/messages", Some("{}")),
+        ("/v1/messages", Some("[]")),
+        ("/v1/messages", Some("{\"model\":42}")),
+        ("/v1/messages", Some("{\"model\":\"unknown\"}")),
+        ("/other", Some("{\"model\":\"claude-sonnet-4-5\"}")),
+        ("/v1/messages", None),
     ] {
         let request = make_request(Method::POST, path);
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "previous-model");
-        ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
-            PROVIDER_HEADER,
-            HeaderValue::from_static("spoofed"),
-        ));
-        let mut body = Some(Bytes::copy_from_slice(raw.as_bytes()));
+        let mut ctx = context(&request);
+        ctx.insert_filter_state(ResolvedUpstream(Arc::from("stale")));
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "stale-model");
+        let mut body = raw.map(|value| Bytes::copy_from_slice(value.as_bytes()));
+        assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_continue(&filter.on_request(&mut ctx).await.unwrap());
         assert!(
-            matches!(
-                filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-                FilterAction::Continue
-            ),
-            "early returns must preserve request processing: {path} {raw}"
+            ctx.cluster.is_none(),
+            "stale state must not select a cluster for an unmatched body"
         );
-        assert_stale_mapping_removed(&ctx);
+        assert!(
+            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+            "stale aliases must be cleared"
+        );
     }
-}
-
-#[tokio::test]
-async fn mapping_clears_a_previous_grouped_selector_without_changing_other_headers() {
-    let filter = build_filter(vertex_config());
-    let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
-    let tenant = HeaderName::from_static("x-trusted-tenant");
-    ctx.request_headers_to_set
-        .push((tenant.clone(), HeaderValue::from_static("acme")));
-    let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#));
-    assert!(
-        matches!(
-            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "the initial mapping must continue before retrying its rewritten body"
-    );
-    ctx.extra_request_headers
-        .push((MODEL_PROVIDER_HEADER.into(), "stale".to_owned()));
-    ctx.extra_request_headers
-        .push(("x-trusted-mode".into(), "preserved".to_owned()));
-
-    assert!(
-        matches!(
-            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "an unmapped provider target must continue through the existing route"
-    );
-
-    assert_grouped_mapping_cleared(&ctx, tenant);
-}
-
-#[tokio::test]
-async fn mapping_without_a_body_clears_stale_state() {
-    let filter = build_filter(vertex_config());
-    let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "previous-model");
-    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
-        PROVIDER_HEADER,
-        HeaderValue::from_static("stale"),
-    ));
-
-    assert!(
-        matches!(
-            filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "an absent body must continue while clearing stale state"
-    );
-
-    assert_stale_mapping_removed(&ctx);
 }
 
 #[tokio::test]
 async fn mapping_defers_partial_bodies_until_end_of_stream() {
     let filter = build_filter(vertex_config());
     let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = context(&request);
     let original = Bytes::from_static(br#"{"model":"claude-sonnet-4-5"}"#);
     let mut body = Some(original.clone());
-
+    assert_continue(&filter.on_request_body(&mut ctx, &mut body, false).await.unwrap());
+    assert_eq!(body, Some(original), "partial bodies must stay unchanged");
     assert!(
-        matches!(
-            filter.on_request_body(&mut ctx, &mut body, false).await.unwrap(),
-            FilterAction::Continue
-        ),
-        "partial requests must continue until their buffered body is complete"
-    );
-
-    assert_eq!(body, Some(original), "a partial body must stay unchanged");
-    assert!(
-        ctx.request_headers_to_set.is_empty(),
-        "a partial body must not set headers"
+        ctx.get_filter_state::<ResolvedUpstream>().is_none(),
+        "partial bodies must not stage a selection"
     );
     assert!(
-        ctx.request_headers_to_remove.is_empty(),
-        "a partial body must not remove headers"
+        ctx.filter_metadata.is_empty(),
+        "partial bodies must not publish an alias"
     );
-    assert!(ctx.filter_metadata.is_empty(), "a partial body must not write metadata");
 }
 
 #[tokio::test]
@@ -300,12 +240,14 @@ async fn mapping_latency_microbenchmark() {
         );
         let started = std::time::Instant::now();
         for _iteration in 0..10_000 {
-            let mut ctx = make_filter_context(&request);
+            let mut ctx = context(&request);
             // Each invocation owns the body it may replace; Bytes shares the fixture allocation.
             let mut body = Some(original.clone());
             let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-            let (observed_action, _observed_body, _observed_metadata) =
-                std::hint::black_box((action, body, ctx.filter_metadata));
+            assert!(matches!(action, FilterAction::Continue));
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            let (observed_action, _observed_body, _observed_metadata, _observed_cluster) =
+                std::hint::black_box((action, body, ctx.filter_metadata, ctx.cluster));
             assert!(matches!(observed_action, FilterAction::Continue));
         }
         let nanos_per_request = started.elapsed().as_nanos().checked_div(10_000).unwrap();
@@ -319,6 +261,14 @@ async fn mapping_latency_microbenchmark() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
+/// Assert that resolution permits the rest of the pipeline to execute.
+fn assert_continue(action: &FilterAction) {
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "resolution must continue processing"
+    );
+}
+
 /// Build the configured filter for a unit test.
 fn build_filter(yaml: &str) -> Box<dyn HttpFilter> {
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
@@ -327,50 +277,12 @@ fn build_filter(yaml: &str) -> Box<dyn HttpFilter> {
 
 /// Example stable-model mapping used by request tests.
 fn vertex_config() -> &'static str {
-    "models:\n  - model: claude-sonnet-4-5\n    provider: vertex\n    target_model: vertex/claude-sonnet-4-5\n    paths: [/v1/messages, /v1/messages/count_tokens]"
+    "models: [{model: claude-sonnet-4-5, upstream: vertex, target_model: 'claude-sonnet-4-5@20250929', paths: [/v1/messages, /v1/messages/count_tokens]}]"
 }
 
-/// Assert the selector the router needs after a mapped request.
-fn assert_vertex_selector(ctx: &HttpFilterContext<'_>) {
-    assert!(
-        ctx.request_headers_to_set
-            .iter()
-            .any(|(name, value)| name == PROVIDER_HEADER && value == "vertex"),
-        "a mapped request must queue the vertex provider selector"
-    );
-}
-
-/// Assert stale mapping state is cleared even when body handling returns early.
-fn assert_stale_mapping_removed(ctx: &HttpFilterContext<'_>) {
-    assert!(
-        ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
-        "every early return must clear stale public-model metadata"
-    );
-    assert!(
-        ctx.request_headers_to_remove.contains(&PROVIDER_HEADER),
-        "every early return must queue stale selector removal"
-    );
-    assert!(
-        matches!(ctx.pre_read_mutations.last(), Some(TrustedHeaderMutation::Remove(name)) if *name == PROVIDER_HEADER),
-        "stale selector removal must follow earlier ordered mutations"
-    );
-}
-
-/// Assert grouped selector removal while retaining unrelated header writes.
-fn assert_grouped_mapping_cleared(ctx: &HttpFilterContext<'_>, tenant: HeaderName) {
-    assert_eq!(
-        ctx.pending_header_value(&PROVIDER_HEADER).unwrap(),
-        praxis_filter::PendingHeaderResult::Removed,
-        "a later unmapped decision must revoke earlier grouped selector sets and adds"
-    );
-    assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
-    assert_eq!(ctx.request_headers_to_set, [(tenant, HeaderValue::from_static("acme"))]);
-    assert_eq!(
-        ctx.extra_request_headers,
-        [("x-trusted-mode".into(), "preserved".to_owned())]
-    );
-    assert!(
-        ctx.pre_read_mutations.is_empty(),
-        "grouped cleanup must preserve grouped mode"
-    );
+/// Give direct hook calls the same per-filter state slot the pipeline provides.
+fn context(request: &praxis_filter::Request) -> HttpFilterContext<'_> {
+    let mut ctx = make_filter_context(request);
+    ctx.current_filter_id = Some(0);
+    ctx
 }

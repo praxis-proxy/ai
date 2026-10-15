@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Resolves stable client-facing model IDs to a provider and provider target model.
+//! Resolves stable client-facing model IDs to existing upstream clusters.
 //!
-//! The exact configured model/path pair sets the internal
-//! `x-praxis-ai-provider` route selector, rewrites the request body's `model`
-//! field, and records the client-facing model ID in filter metadata for a
-//! provider response adapter. Responses are never rewritten here. Unknown
-//! models and paths pass through unchanged.
+//! An exact model/path match selects a configured cluster, rewrites the request
+//! body's `model`, and preserves the public model ID for metering and response
+//! adapters. Unmatched bodies remain unchanged; `fallback_upstream` optionally
+//! selects their cluster. The load balancer owns endpoint selection and retries.
 //! Configuration is local to the filter pipeline; this filter does not watch
 //! Kubernetes resources or perform request-time control-plane lookups.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue};
-use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, MODEL_PROVIDER_HEADER, json_body::replace_json_body};
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, json_body::replace_json_body};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation,
-    body::DEFAULT_JSON_BODY_MAX_BYTES, builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
+    builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,19 +33,17 @@ use serde_json::Value;
 const MAX_MODEL_MAPPINGS: usize = 1024;
 /// Maximum paths accepted for one model mapping.
 const MAX_PATHS_PER_MAPPING: usize = 16;
-/// Maximum byte length for model and provider identifiers.
+/// Maximum byte length for model and upstream identifiers.
 const MAX_MAPPING_VALUE_LEN: usize = 253;
-/// Internal route-selection header written by this filter.
-const PROVIDER_HEADER: HeaderName = HeaderName::from_static(MODEL_PROVIDER_HEADER);
 
-/// Configures a client model's provider route and upstream model identity.
+/// Configures a client model's upstream cluster and target model identity.
 ///
 /// ```yaml
 /// filter: model_to_provider
 /// models:
 ///   - model: claude-sonnet-4-5
-///     provider: vertex
-///     target_model: vertex/claude-sonnet-4-5
+///     upstream: vertex-prod
+///     target_model: claude-sonnet-4-5@20250929
 ///     paths: [/v1/messages, /v1/messages/count_tokens]
 /// ```
 #[derive(Debug, Deserialize)]
@@ -53,19 +51,22 @@ const PROVIDER_HEADER: HeaderName = HeaderName::from_static(MODEL_PROVIDER_HEADE
 struct ModelToProviderConfig {
     /// Exact client-facing model mappings.
     models: Vec<ModelProviderMappingConfig>,
+    /// Existing load-balancer cluster selected when no model/path mapping matches.
+    #[serde(default)]
+    fallback_upstream: Option<String>,
     /// Maximum JSON request body buffered to inspect the model field.
     #[serde(default = "default_max_body_bytes")]
     max_body_bytes: usize,
 }
 
-/// One public-model to provider mapping.
+/// One public-model to upstream mapping.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProviderMappingConfig {
     /// Exact model ID sent by the client.
     model: String,
-    /// Provider selector consumed by the unified `router` configuration.
-    provider: String,
+    /// Existing load-balancer cluster selected for this model.
+    upstream: String,
     /// Provider-specific model written into the request body.
     target_model: String,
     /// Exact inference paths on which this mapping applies.
@@ -75,22 +76,34 @@ struct ModelProviderMappingConfig {
 /// Validated mapping used on the request path.
 #[derive(Debug)]
 struct ModelProviderMapping {
-    /// Provider selector written to the internal route header.
-    provider: HeaderValue,
+    /// Shared configured cluster name selected during the request phase.
+    upstream: Arc<str>,
     /// Provider-specific request-body model.
     target_model: String,
     /// Exact request paths accepted for this client model.
     paths: Vec<String>,
 }
 
-/// Maps stable client-facing model IDs to an internal provider selector and
-/// provider-specific target model.
+/// Maps stable client-facing model IDs to existing upstream clusters and
+/// provider-specific target models.
 ///
-/// An exact model/path match sets `x-praxis-ai-provider` for the `router`,
-/// rewrites the JSON body model, and records the client ID in filter metadata
-/// for provider response adapters. Unknown models and paths pass through.
-/// Configuration is pipeline-local: the filter performs no Kubernetes or
-/// other control-plane lookups.
+/// An exact model/path match rewrites the JSON body model and records the
+/// client ID for metering and provider response adapters. During the request
+/// phase, the filter selects the mapping's `upstream` cluster. A following
+/// `load_balancer` owns endpoint selection, health checks, and retries; no
+/// header-matching `router` or provider registry is needed.
+///
+/// Unknown models and paths keep their bodies unchanged and select
+/// `fallback_upstream` when configured. Without it, this filter leaves cluster
+/// selection unchanged; a load balancer still needs a selected cluster to
+/// forward the request. Do not combine this selector with a competing router
+/// before the same load balancer.
+///
+/// The normal server pipeline validation checks mapped and fallback cluster
+/// names against the load balancers on startup and reload. Cluster application
+/// metadata is optional for routing. Provider adapters can read
+/// `selected_application_provider()` after load balancing and must separately
+/// declare any application metadata they require on those clusters.
 ///
 /// The filter does not restore the client-facing model ID in responses, so a
 /// provider that echoes the model it served returns `target_model` to the
@@ -103,16 +116,21 @@ struct ModelProviderMapping {
 /// filter: model_to_provider
 /// models:
 ///   - model: claude-sonnet-4-5
-///     provider: vertex
-///     target_model: vertex/claude-sonnet-4-5
+///     upstream: vertex-prod
+///     target_model: claude-sonnet-4-5@20250929
 ///     paths: [/v1/messages, /v1/messages/count_tokens]
 /// ```
 pub struct ModelToProviderFilter {
-    /// Exact public model ID to provider mapping table.
+    /// Exact public model ID to upstream mapping table.
     models: HashMap<String, ModelProviderMapping>,
+    /// Optional cluster for requests that match no mapping.
+    fallback_upstream: Option<Arc<str>>,
     /// Maximum buffered request body size.
     max_body_bytes: usize,
 }
+
+/// Per-filter selection staged during body pre-read for the request phase.
+struct ResolvedUpstream(Arc<str>);
 
 impl ModelToProviderFilter {
     /// Construct from YAML configuration.
@@ -128,7 +146,7 @@ impl ModelToProviderFilter {
     /// use praxis_ai_filters::ModelToProviderFilter;
     ///
     /// let config = serde_yaml::from_str(
-    ///     "models:\n  - model: public-model\n    paths: [/v1/messages]\n    provider: local\n    target_model: backend-model",
+    ///     "models:\n  - model: public-model\n    paths: [/v1/messages]\n    upstream: local\n    target_model: backend-model",
     /// ).unwrap();
     /// let filter = ModelToProviderFilter::from_config(&config).unwrap();
     /// assert_eq!(filter.name(), "model_to_provider");
@@ -139,8 +157,12 @@ impl ModelToProviderFilter {
             return Err(format!("model_to_provider: models must contain 1-{MAX_MODEL_MAPPINGS} mappings").into());
         }
         validate_max_body_bytes("model_to_provider", config.max_body_bytes)?;
+        if let Some(upstream) = &config.fallback_upstream {
+            validate_mapping_value("fallback_upstream", upstream)?;
+        }
         Ok(Box::new(Self {
             models: build_model_mappings(config.models)?,
+            fallback_upstream: config.fallback_upstream.map(Arc::from),
             max_body_bytes: config.max_body_bytes,
         }))
     }
@@ -168,15 +190,13 @@ fn build_model_mappings(
 /// Validate and construct one mapping entry.
 fn build_model_mapping(entry: ModelProviderMappingConfig) -> Result<(String, ModelProviderMapping), FilterError> {
     validate_mapping_value("model", &entry.model)?;
-    validate_mapping_value("provider", &entry.provider)?;
+    validate_mapping_value("upstream", &entry.upstream)?;
     validate_mapping_value("target_model", &entry.target_model)?;
     let paths = validate_mapping_paths(&entry.model, entry.paths)?;
-    let provider = HeaderValue::from_str(&entry.provider)
-        .map_err(|error| FilterError::from(format!("model_to_provider: invalid provider value: {error}")))?;
     Ok((
         entry.model,
         ModelProviderMapping {
-            provider,
+            upstream: Arc::from(entry.upstream),
             target_model: entry.target_model,
             paths,
         },
@@ -209,7 +229,7 @@ fn default_max_body_bytes() -> usize {
     DEFAULT_JSON_BODY_MAX_BYTES
 }
 
-/// Validate a public model, provider ID, or provider target model.
+/// Validate a public model, cluster name, or provider target model.
 fn validate_mapping_value(field: &str, value: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_MAPPING_VALUE_LEN || value.chars().any(char::is_control) {
         return Err(format!(
@@ -220,42 +240,26 @@ fn validate_mapping_value(field: &str, value: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Queue the provider selector for the router.
-///
-/// Core drops a pre-read pass's grouped header queues once any filter in that
-/// pass wrote the ordered `pre_read_mutations` log, so the selector must also
-/// join that log when an earlier filter already activated it. An empty log is
-/// left alone: activating ordered mode here would discard the grouped
-/// mutations of every other body filter in the pass.
-fn queue_provider_header(ctx: &mut HttpFilterContext<'_>, provider: &HeaderValue) {
-    ctx.request_headers_to_set.push((PROVIDER_HEADER, provider.clone()));
-    if !ctx.pre_read_mutations.is_empty() {
-        ctx.pre_read_mutations
-            .push(TrustedHeaderMutation::Set(PROVIDER_HEADER, provider.clone()));
-    }
-}
-
-/// Clear the owned selector before resolving the current model.
-///
-/// Grouped queues apply removes before sets and adds, so removing a header
-/// alone cannot revoke an earlier selector queued in the same body pass.
-fn clear_provider_state(ctx: &mut HttpFilterContext<'_>) {
-    ctx.request_headers_to_set
-        .retain(|(name, _value)| *name != PROVIDER_HEADER);
-    ctx.extra_request_headers
-        .retain(|(name, _value)| !name.eq_ignore_ascii_case(MODEL_PROVIDER_HEADER));
-    ctx.request_headers_to_remove.push(PROVIDER_HEADER);
-    if !ctx.pre_read_mutations.is_empty() {
-        ctx.pre_read_mutations
-            .push(TrustedHeaderMutation::Remove(PROVIDER_HEADER));
-    }
-    ctx.filter_metadata.remove(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
-}
-
 #[async_trait]
 impl HttpFilter for ModelToProviderFilter {
     fn name(&self) -> &'static str {
         "model_to_provider"
+    }
+
+    fn selects_cluster(&self) -> bool {
+        true
+    }
+
+    fn selected_clusters(&self) -> Vec<String> {
+        let mut clusters: Vec<String> = self
+            .models
+            .values()
+            .map(|mapping| mapping.upstream.to_string())
+            .chain(self.fallback_upstream.iter().map(ToString::to_string))
+            .collect();
+        clusters.sort_unstable();
+        clusters.dedup();
+        clusters
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -272,13 +276,23 @@ impl HttpFilter for ModelToProviderFilter {
         true
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        let upstream = ctx
+            .get_filter_state::<ResolvedUpstream>()
+            .map(|resolved| Arc::clone(&resolved.0))
+            .or_else(|| self.fallback_upstream.clone());
+        if let Some(upstream) = upstream {
+            ctx.cluster = Some(upstream);
+            ctx.route_retry_policy = None;
+            ctx.hedge_policy = None;
+            ctx.metrics_route = None;
+        }
         Ok(FilterAction::Continue)
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "one atomic model resolution decision owns header, metadata, and body mutation"
+        reason = "one atomic model resolution decision owns selection, metadata, and body mutation"
     )]
     async fn on_request_body(
         &self,
@@ -289,7 +303,8 @@ impl HttpFilter for ModelToProviderFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        clear_provider_state(ctx);
+        ctx.remove_filter_state::<ResolvedUpstream>();
+        ctx.filter_metadata.remove(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
 
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
@@ -312,7 +327,7 @@ impl HttpFilter for ModelToProviderFilter {
         }
 
         let needs_rewrite = client_model != mapping.target_model;
-        queue_provider_header(ctx, &mapping.provider);
+        ctx.insert_filter_state(ResolvedUpstream(Arc::clone(&mapping.upstream)));
         ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
 
         if needs_rewrite {

@@ -203,17 +203,26 @@ filter skips it entirely, preserving the incoming value.
 
 ### `model_to_provider`
 
-Maps an exact client model and request path to a provider
-selector and target model. The reserved
-`x-praxis-ai-provider` header lets the existing router
-select a cluster; the JSON request carries the provider
-target model. Unknown models and paths continue through
-the configured fallback route unchanged.
+Maps an exact client model and request path to an existing
+load-balancer cluster and target model. It stages the cluster
+during body pre-read and selects it during the request phase.
+The load balancer chooses endpoints and owns health checks
+and retries. No header-matching router or provider registry
+is needed. This is ordinary cluster selection: it does not
+publish the frozen binding read by `bound_upstream` conditions.
+
+Unknown models and paths retain their bodies and select
+`fallback_upstream` when configured. Without a fallback, the
+filter leaves cluster selection unchanged; a subsequent load
+balancer still needs a cluster to forward the request. Normal
+pipeline validation checks mapped and fallback cluster names
+against load-balancer declarations at startup and reload.
 
 The original client model stays in request metadata for
-metering and optional provider response adapters. The
-filter itself leaves responses unchanged. The example
-uses distinct provider and fallback backends.
+metering and optional provider response adapters. The filter
+itself leaves responses unchanged. Cluster application-provider
+metadata is optional for routing; an adapter that uses it must
+run after selection and require the appropriate tags.
 
 ### `openai_responses_request`
 

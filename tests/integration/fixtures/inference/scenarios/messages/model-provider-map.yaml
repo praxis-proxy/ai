@@ -1,6 +1,6 @@
 version: 1
 id: messages/model-provider-map
-description: Stable client model ID is routed to its provider with a provider-specific request model.
+description: Stable client model ID selects an existing cluster and exact provider target model.
 protocol: anthropic_messages
 example_config: model-to-provider.yaml
 upstream_authority: 127.0.0.1:9001

@@ -2078,7 +2078,7 @@ mod tests {
         assert_eq!(model_provider.id, "messages/model-provider-map", "model_provider.id");
         assert_eq!(
             model_provider.description,
-            "Stable client model ID is routed to its provider with a provider-specific request model.",
+            "Stable client model ID selects an existing cluster and exact provider target model.",
             "model_provider.description"
         );
         assert_eq!(

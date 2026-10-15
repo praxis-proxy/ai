@@ -3324,14 +3324,14 @@ mod tests {
                     let body = request.into_body().collect().await.unwrap().to_bytes();
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(
-                        body["model"], "vertex/claude-sonnet-4-5",
+                        body["model"], "claude-sonnet-4-5@20250929",
                         "the actual example must rewrite the recorded provider request"
                     );
                     json_response(
                         StatusCode::OK,
                         &json!({
                             "id": "msg_alias_1", "type": "message", "role": "assistant",
-                            "model": "vertex/claude-sonnet-4-5", "content": [{"type":"text", "text":"hi"}],
+                            "model": "claude-sonnet-4-5@20250929", "content": [{"type":"text", "text":"hi"}],
                             "stop_reason": "end_turn", "stop_sequence": null,
                             "usage": {"input_tokens": 1, "output_tokens": 1}
                         }),

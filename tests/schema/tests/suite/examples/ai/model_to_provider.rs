@@ -29,7 +29,7 @@ fn model_to_provider_routes_and_rewrites_stable_model_id() {
 
     let forwarded: serde_yaml::Value = serde_yaml::from_str(&provider.body()).unwrap();
     assert_eq!(
-        forwarded["model"], "vertex/claude-sonnet-4-5",
+        forwarded["model"], "claude-sonnet-4-5@20250929",
         "the provider must receive its target model"
     );
 }
