@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
+    Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml, start_capturing_backend,
     start_header_echo_backend, start_uri_echo_backend,
 };
 
@@ -202,7 +202,8 @@ fn count_tokens_keeps_the_mapped_snapshot_in_the_body() {
 
 #[test]
 fn unknown_models_and_malformed_bodies_reach_fallback_unchanged() {
-    let vertex = start_capturing_backend("unexpected Vertex response");
+    let vertex =
+        StatefulCapturingBackend::new(vec![(200, "unexpected Vertex response".to_owned())]).start_with_shutdown();
     let fallback = start_capturing_backend("fallback response");
     let config = super::load_example_config(
         "vertex/messages-to-anthropic.yaml",
@@ -215,6 +216,7 @@ fn unknown_models_and_malformed_bodies_reach_fallback_unchanged() {
         assert_eq!(parse_status(&raw), 200);
         assert_eq!(parse_body(&raw), "fallback response");
         assert_eq!(fallback.body(), body);
+        assert!(vertex.requests().is_empty(), "fallback traffic must not reach Vertex");
     }
 }
 
