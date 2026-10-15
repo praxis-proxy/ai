@@ -49,14 +49,15 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
+    bound_body_outcome,
     error::responses_error_rejection,
     history::MessageHistory,
     is_explicit_compact_request,
@@ -384,6 +385,21 @@ impl HttpFilter for CompactFilter {
         BodyAccess::ReadOnly
     }
 
+    /// Also offer the bound-upstream phase so a chain may defer compaction until
+    /// the router has bound a logical provider.
+    ///
+    /// Declaring both hooks is what lets an operator gate this filter with a
+    /// `bound_upstream` condition: core schedules the bound-upstream hook when
+    /// that condition is present and the pre-read hook otherwise, never both.
+    /// The managed-responses barrier needs the deferred phase because
+    /// `ResponsesState` — which carries the parsed `context_management` this
+    /// filter validates and the rehydrated history it summarizes — is only
+    /// minted once the body is bound. A standalone chain with no such condition
+    /// still runs the pre-read hook.
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -427,6 +443,26 @@ impl HttpFilter for CompactFilter {
         self.apply_compaction(ctx, &summary);
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
+    }
+
+    /// Same processing, deferred until a logical provider is bound.
+    ///
+    /// Shares one implementation with the pre-read hook so the two phases
+    /// cannot diverge. A chain that gates compaction on `bound_upstream`
+    /// metadata (the managed-responses barrier) schedules this filter in the
+    /// bound phase, where `ResponsesState` is already minted, so
+    /// `reject_invalid_compaction_config` observes the parsed
+    /// `context_management` and summarization sees rehydrated history. A chain
+    /// with no such condition still runs the pre-read hook above.
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        // The bound-upstream phase receives the complete body, so end-of-stream
+        // is always reached.
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 

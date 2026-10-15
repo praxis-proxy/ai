@@ -1225,23 +1225,78 @@ fn finish_only_function_call_fails_closed() {
 }
 
 #[test]
-fn fragmented_first_frame_emits_lifecycle_immediately() {
-    // The opening lifecycle events must be emitted on the first non-empty
-    // callback, even when that callback carries only part of the first SSE frame.
+fn fragmented_first_frame_waits_for_provider_metadata() {
+    // Opening snapshots borrow provider metadata, so a fragmented first frame
+    // must not emit lifecycle events until that frame is complete and parsed.
     let body = request_body();
     let mut conv = converter(wide_limits());
     let mut raw = Vec::new();
-    // A partial frame: no terminating blank line yet, so no frame parses.
+    // No terminating blank line yet, so no frame parses and no event is emitted.
     push(
         &mut conv,
         &body,
-        b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,",
+        b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"service_tier\":\"scale\",\"choices\":[{\"index\":0,",
         &mut raw,
     );
+    assert!(
+        raw.is_empty(),
+        "lifecycle must wait for the first complete provider frame"
+    );
+    push(&mut conv, &body, b"\"delta\":{\"role\":\"assistant\"}}]}\n\n", &mut raw);
     assert_eq!(
         types(&parse_events(&raw)),
         vec!["response.created", "response.in_progress"],
-        "lifecycle must be emitted on the first non-empty callback",
+        "lifecycle must be emitted after the first complete provider frame",
+    );
+}
+
+#[test]
+fn late_provider_service_tier_updates_opening_snapshot() {
+    let body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "hi",
+        "service_tier": "auto",
+        "stream": true,
+    });
+    let mut conv = converter(wide_limits());
+    let mut raw = Vec::new();
+    push(
+        &mut conv,
+        &body,
+        b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        &mut raw,
+    );
+    assert!(
+        raw.is_empty(),
+        "a metadata-only chunk without service_tier must not lock in the request fallback"
+    );
+    push(
+        &mut conv,
+        &body,
+        b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"service_tier\":\"scale\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        &mut raw,
+    );
+    push(
+        &mut conv,
+        &body,
+        b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"service_tier\":\"scale\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        &mut raw,
+    );
+    push(&mut conv, &body, b"data: [DONE]\n\n", &mut raw);
+    finish(&mut conv, &body, &mut raw);
+
+    let events = parse_events(&raw);
+    let snapshots = events
+        .iter()
+        .filter(|(name, _)| name == "response.created" || name == "response.in_progress")
+        .map(|(_, payload)| payload["response"]["service_tier"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots, vec![json!("scale"), json!("scale")]);
+    assert_eq!(events.last().unwrap().1["response"]["service_tier"], "scale");
+    assert_eq!(
+        types(&events)[..3],
+        ["response.created", "response.in_progress", "response.output_item.added"],
+        "lifecycle must remain before output events"
     );
 }
 
@@ -1667,6 +1722,31 @@ fn failed_terminal_does_not_echo_unbounded_request_fields() {
 }
 
 #[test]
+fn bad_first_frame_still_emits_failed_after_oversized_lifecycle() {
+    // A malformed first frame reaches failure handling before the deferred
+    // lifecycle has been emitted. The request-controlled lifecycle snapshot can
+    // exceed the body ceiling, but that rollback must still leave room for the
+    // bounded `response.failed` terminal rather than silently dropping it.
+    let limits = StreamLimits {
+        max_body_bytes: 1000,
+        ..wide_limits()
+    };
+    let body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "hi",
+        "stream": true,
+        "metadata": {"note": "m".repeat(4000)},
+    });
+    let events = run_stream_with_body(&[r#"{"malformed""#], &body, limits);
+
+    assert_eq!(
+        types(&events),
+        ["response.failed"],
+        "an early malformed frame must still terminate with a bounded failure event",
+    );
+}
+
+#[test]
 fn failed_terminal_fallback_is_schema_complete() {
     // The constant-bounded failure fallback must still be a valid Response
     // object: it has to carry every schema-required field, not just id/status/
@@ -1937,6 +2017,32 @@ fn changed_service_tier_emits_failed() {
 }
 
 #[test]
+fn opening_snapshot_uses_provider_service_tier() {
+    let body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "hi",
+        "service_tier": "auto",
+        "stream": true,
+    });
+    let events = run_stream_with_body(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","service_tier":"scale","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","service_tier":"scale","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+        &body,
+        wide_limits(),
+    );
+
+    let snapshots = events
+        .iter()
+        .filter(|(name, _)| name == "response.created" || name == "response.in_progress")
+        .map(|(_, payload)| payload["response"]["service_tier"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots, vec![json!("scale"), json!("scale")]);
+    assert_eq!(events.last().unwrap().1["response"]["service_tier"], "scale");
+}
+
+#[test]
 fn closeout_budget_is_atomic_across_items() {
     // A message and a tool call are both open when the finish reason arrives, so
     // the closeout emits several `*.done` events plus the terminal. Without a
@@ -2166,11 +2272,12 @@ fn lifecycle_frame_overflow_rolls_back_the_pair() {
         original_tool_choice: None,
         now: NOW,
     };
+    let first_frame = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"service_tier\":\"scale\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
     let mut probe = converter(wide_limits());
     let probe_raw = probe
-        .push(b"data: partial", &inputs)
+        .push(first_frame, &inputs)
         .unwrap()
-        .expect("the first non-empty callback must emit the lifecycle pair");
+        .expect("the first complete frame must emit the lifecycle pair");
     let frame_lengths: Vec<usize> = std::str::from_utf8(&probe_raw)
         .unwrap()
         .split("\n\n")
@@ -2193,7 +2300,7 @@ fn lifecycle_frame_overflow_rolls_back_the_pair() {
     };
     let mut conv = converter(limits);
     let raw = conv
-        .push(b"data: partial", &inputs)
+        .push(first_frame, &inputs)
         .unwrap()
         .expect("the oversized lifecycle must be replaced by response.failed");
     let events = parse_events(&raw);

@@ -51,7 +51,7 @@ use rmcp::{
 use sse_stream::{Error as SseError, Sse};
 
 use super::{McpClientError, McpDisplayUrl};
-use crate::{StateOwner, callout_target::AddressPolicy};
+use crate::{StateOwner, callout_target::AddressPolicy, is_event_stream_content_type};
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -1687,12 +1687,12 @@ fn map_prepare_error(error: &UrlTargetError) -> StreamableHttpError<McpTransport
 
 /// Whether a `Content-Type` value denotes JSON.
 fn is_json_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("application/json")
-}
-
-/// Whether a `Content-Type` value denotes an SSE event stream.
-fn is_event_stream_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("text/event-stream")
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// Parse a JSON-RPC error message from a response body, if it is one.
@@ -1908,14 +1908,36 @@ mod tests {
 
     // -- Content-type classification -------------------------------------------
 
+    /// [RFC 9110 Section 8.3.1] defines media types as case-insensitive
+    /// type/subtype tokens.
+    ///
+    /// [RFC 9110 Section 8.3.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-8.3.1
     #[test]
-    fn content_type_classification_tolerates_parameters_and_whitespace() {
-        assert!(is_json_content_type("application/json"));
-        assert!(is_json_content_type(" application/json; charset=utf-8"));
-        assert!(!is_json_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type(" text/event-stream; charset=utf-8"));
-        assert!(!is_event_stream_content_type("application/json"));
+    fn content_type_classification_is_case_insensitive_and_exact() {
+        for value in [
+            "application/json",
+            " Application/JSON; charset=utf-8",
+            "application/json ; charset=utf-8",
+        ] {
+            assert!(is_json_content_type(value), "expected JSON media type: {value}");
+        }
+        for value in ["application/jsonp", "application/json-patch+json", "text/event-stream"] {
+            assert!(!is_json_content_type(value), "expected non-JSON media type: {value}");
+        }
+
+        for value in [
+            "text/event-stream",
+            " Text/Event-Stream; charset=utf-8",
+            "text/event-stream ; charset=utf-8",
+        ] {
+            assert!(is_event_stream_content_type(value), "expected SSE media type: {value}");
+        }
+        for value in ["text/event-streamish", "text/event-stream+json", "application/json"] {
+            assert!(
+                !is_event_stream_content_type(value),
+                "expected non-SSE media type: {value}"
+            );
+        }
     }
 
     // -- Response-limit tiers (codex finding: response-limit regressions) -------
@@ -2373,6 +2395,75 @@ mod tests {
         );
         let out = classify_buffered_post_response(response, &message, false).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    #[test]
+    fn buffered_post_selects_only_exact_json_and_sse_media_types() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+
+        let json = sub_response(
+            200,
+            Some(" Application/JSON; charset=utf-8"),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        );
+        let out = classify_buffered_post_response(json, &message, false).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let sse = sub_response(
+            200,
+            Some(" Text/Event-Stream; charset=utf-8"),
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        );
+        let out = classify_buffered_post_response(sse, &message, false).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let response = sub_response(200, Some(content_type), br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+            let error = classify_buffered_post_response(response, &message, false).unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_post_selects_only_exact_json_and_sse_media_types() {
+        let (body, _) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+        let response = sub_response(200, Some(" Application/JSON; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let (body, cancelled) = fake_body([Bytes::from_static(
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        )]);
+        let response = sub_response(200, Some(" Text/Event-Stream; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let (body, cancelled) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+            let response = sub_response(200, Some(content_type), b"");
+            let error = client()
+                .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+            assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
 
     // -- collect_body fail-closed (F4) --

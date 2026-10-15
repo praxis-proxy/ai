@@ -235,7 +235,8 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
 | SQLite store, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
-| `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `openai_file_resolve`, `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `gcp_adc` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider); the `key_file` source signs its `RS256` assertion through OpenSSL's EVP signing API | not in the FIPS build (experimental) |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
 | sha2, hmac, aws-sigv4, rcgen (with ring) | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest; aws-lc-rs itself is gone from every graph, the policy engine aside |
 

@@ -485,6 +485,125 @@ fn full_flow_managed_chat_backend_translates_after_binding() {
     );
 }
 
+/// Native Chat Completions ingress reaches the direct Chat backend raw. A
+/// `POST /v1/chat/completions` body is bound by the EXACT-path route to
+/// `chat-ingress-backend` (application_provider direct) and dispatched through
+/// the direct-services terminal branch — no Responses translation, no IRR. The
+/// native model-rewrite instance (B) rewrites the body `model` via its
+/// `codex-*` alias before the bind, so the backend receives the Chat-shaped body
+/// verbatim with the rewritten target and the client gets the backend response
+/// unchanged. This is the witness the shared gateway goal depends on: a Chat
+/// request must land on the Chat backend, not fall through to the Responses path.
+#[test]
+fn full_flow_native_chat_ingress_reaches_chat_backend_raw() {
+    let chat_response = json!({
+        "id": "chatcmpl_native",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "llama-3.3-70b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "pong"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_native_chat_ingress");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"codex-mini","messages":[{"role":"user","content":"ping"}]}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "native chat ingress should complete: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(
+        response, chat_response,
+        "direct chat passthrough must return the backend response verbatim"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "native chat ingress makes exactly one backend request"
+    );
+    assert_eq!(
+        requests[0].uri, "/v1/chat/completions",
+        "native chat ingress must reach the Chat backend path unchanged"
+    );
+    let forwarded: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert!(
+        forwarded.get("messages").is_some(),
+        "the raw Chat body must pass through without Responses translation"
+    );
+    assert!(
+        forwarded.get("input").is_none(),
+        "no Responses translation runs on the native Chat path"
+    );
+    assert_eq!(
+        forwarded["model"], "llama-3.3-70b",
+        "native model-rewrite (instance B) must retarget the codex-* alias before the bind"
+    );
+}
+
+/// The identity model-rewrite (instance A) is semantically unchanged end to end.
+/// A `vllm-chat` Responses create matches the identity alias `vllm-chat ->
+/// vllm-chat`: the rewrite marks the body mutated and re-serializes it, but the
+/// model VALUE is preserved. The witness confirms the backend still receives
+/// `model: vllm-chat` after Responses->Chat translation — the identity rewrite
+/// neither drops nor rewrites the model the deployment advertises.
+#[test]
+fn full_flow_identity_model_rewrite_preserves_model_value() {
+    let chat_response = json!({
+        "id": "chatcmpl_identity",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "vllm-chat",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_identity_rewrite");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"vllm-chat","input":"hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "identity-aliased request should complete: {raw}"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "single-pass IRR should make one inference request");
+    assert_eq!(requests[0].uri, "/v1/chat/completions");
+    let translated: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert_eq!(
+        translated["model"], "vllm-chat",
+        "the identity alias must preserve the advertised model value end to end"
+    );
+}
+
 #[test]
 fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
     // #1602: a matched `POST /v1/responses` keeps the application protocol and

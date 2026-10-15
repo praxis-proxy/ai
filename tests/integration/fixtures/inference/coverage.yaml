@@ -295,6 +295,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.service_tier
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-service-tier-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.web_search
     scopes:
       - openai_responses_to_chat_completions

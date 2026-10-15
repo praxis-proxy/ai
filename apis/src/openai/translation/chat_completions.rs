@@ -1515,7 +1515,7 @@ pub(crate) fn chat_response_to_response_resource(
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
     let usage = build_usage(obj);
-    let service_tier = service_tier_value_with_context(obj, context);
+    let service_tier = service_tier_value_with_context(obj.get("service_tier"), context);
     let parts = ResponseResourceParts {
         status,
         incomplete_details: &incomplete_details,
@@ -1683,11 +1683,15 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 /// output list, null usage, and `in_progress` status, matching the snapshot
 /// carried by `response.created` and `response.in_progress` streaming events.
 pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
-    let service_tier = context
-        .service_tier
-        .filter(|value| value.is_string())
-        .cloned()
-        .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
+    in_progress_response_resource_with_service_tier(context, context.service_tier)
+}
+
+/// Build an `in_progress` snapshot with a provider-observed service tier.
+pub(crate) fn in_progress_response_resource_with_service_tier(
+    context: &ResponseContext<'_>,
+    service_tier: Option<&Value>,
+) -> Result<Value, TranslationError> {
+    let service_tier = service_tier_value_with_context(service_tier, context);
     let parts = ResponseResourceParts {
         status: "in_progress",
         incomplete_details: &Value::Null,
@@ -1920,8 +1924,8 @@ fn normalize_response_tools(tools: &[Value]) -> Vec<Value> {
 }
 
 /// Build provider service tier, falling back to the request context when absent.
-fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
-    obj.get("service_tier")
+fn service_tier_value_with_context(service_tier: Option<&Value>, context: &ResponseContext<'_>) -> Value {
+    service_tier
         .filter(|value| value.is_string())
         .or_else(|| context.service_tier.filter(|value| value.is_string()))
         .cloned()
