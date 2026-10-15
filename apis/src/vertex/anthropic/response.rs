@@ -84,11 +84,16 @@ fn patch_model_field(obj: &mut Map<String, Value>, user_model: &str) -> Option<(
     None
 }
 
+/// Event name whose payload carries the model to restore.
+const MESSAGE_START: &[u8] = b"message_start";
+
 /// Restore message-start models while forwarding every other wire frame unchanged.
 pub(crate) fn rebuild_sse_frames(frames: &[Vec<u8>], user_model: Option<&str>, initial_frame: bool) -> Vec<u8> {
     let mut output = Vec::new();
     for (index, raw) in frames.iter().enumerate() {
-        let patched = user_model.and_then(|model| patch_wire_frame(raw, model, initial_frame && index == 0));
+        let patched = user_model
+            .filter(|_| raw.windows(MESSAGE_START.len()).any(|bytes| bytes == MESSAGE_START))
+            .and_then(|model| patch_wire_frame(raw, model, initial_frame && index == 0));
         output.extend_from_slice(patched.as_deref().unwrap_or(raw));
     }
     output
@@ -248,6 +253,12 @@ mod tests {
             text.as_bytes().ends_with(&[unchanged, multiline_json].concat()),
             "unmodified frames must preserve multiline JSON and all wire bytes"
         );
+    }
+
+    #[test]
+    fn sse_rebuild_preserves_delta_payloads_containing_the_candidate_marker() {
+        let raw = b"event: content_block_delta\r\ndata: {\"delta\":{\"text\":\"message_start\"},\"model\":\"snapshot\"}\r\n\r\n";
+        assert_eq!(rebuild_sse_frames(&[raw.to_vec()], Some("public-model"), true), raw);
     }
 
     #[test]
