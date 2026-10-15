@@ -40,6 +40,7 @@ import threading
 import time
 
 import httpx
+import openai
 import pytest
 from openai import (
     AuthenticationError,

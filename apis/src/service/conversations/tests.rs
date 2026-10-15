@@ -273,7 +273,7 @@ fn build_item_records_defaults_missing_tool_search_call_ids_to_null() {
 
         assert_eq!(
             records[0].item_data.get("call_id"),
-            Some(&serde_json::Value::Null),
+            Some(&Value::Null),
             "stored tool-search items must contain an explicit null call_id"
         );
     }
