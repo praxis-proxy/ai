@@ -1211,8 +1211,11 @@ fn apply_overlay(new_snap: RouteSnapshot, snapshot: &ArcSwap<RouteSnapshot>) {
     let candidate_count = new_snap.candidates.len();
     let local_site = Arc::clone(&new_snap.local_site);
     let contract_format = new_snap.contract_format;
-    snapshot.store(Arc::new(new_snap));
-    metrics::set_snapshot_candidates(candidate_count);
+    {
+        let _publish_guard = metrics::lock_snapshot_candidates();
+        snapshot.store(Arc::new(new_snap));
+        metrics::set_snapshot_candidates(candidate_count);
+    }
     metrics::record_reload(ReloadResult::Accepted);
     tracing::info!(
         candidate_count,

@@ -9,6 +9,8 @@
 //! values are deliberately absent: a producer may rotate them on every
 //! revision and no exporter prunes retired series.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use metrics::{counter, gauge};
 
 use super::{
@@ -31,8 +33,19 @@ pub(crate) const SNAPSHOT_CANDIDATES: &str = "praxis_ai_intelligent_route_snapsh
 /// Overlay reload attempts by result.
 pub(crate) const SNAPSHOT_RELOADS_TOTAL: &str = "praxis_ai_intelligent_route_snapshot_reloads_total";
 
-/// Live session-affinity bindings in this process.
-pub(crate) const SESSION_BINDINGS: &str = "praxis_ai_intelligent_route_session_bindings";
+/// Entries in the session-affinity tables of every filter instance in this
+/// process, including expired entries not yet evicted.
+pub(crate) const SESSION_TABLE_ENTRIES: &str = "praxis_ai_intelligent_route_session_table_entries";
+
+/// Serializes snapshot-size publication so a first-request republish cannot
+/// overwrite the value an accepted reload published in between.
+static SNAPSHOT_CANDIDATES_LOCK: Mutex<()> = Mutex::new(());
+
+/// Hold this across a snapshot load (or store) and the gauge update that
+/// publishes its size.
+pub(crate) fn lock_snapshot_candidates() -> MutexGuard<'static, ()> {
+    SNAPSHOT_CANDIDATES_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How a request left the filter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,9 +160,14 @@ pub(crate) fn record_reload(result: ReloadResult) {
     counter!(SNAPSHOT_RELOADS_TOTAL, "result" => result.as_str()).increment(1);
 }
 
-/// Publish the number of live session bindings.
-pub(crate) fn set_session_bindings(count: usize) {
-    gauge!(SESSION_BINDINGS).set(usize_to_f64(count));
+/// Account for entries added to a session table.
+pub(crate) fn session_table_grew(count: usize) {
+    gauge!(SESSION_TABLE_ENTRIES).increment(usize_to_f64(count));
+}
+
+/// Account for entries removed from a session table.
+pub(crate) fn session_table_shrank(count: usize) {
+    gauge!(SESSION_TABLE_ENTRIES).decrement(usize_to_f64(count));
 }
 
 /// Gauge values are `f64`; snapshot and binding counts are bounded far below

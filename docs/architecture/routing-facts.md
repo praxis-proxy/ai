@@ -30,13 +30,13 @@ header is never a fact.
 
 | Fact | Producer | Carrier | Remove-then-set | Read by routing |
 |---|---|---|---|---|
-| Model name | `model_to_header` (or core `json_body_field`) | header `X-Model` (configurable) | yes (#1039) | `intelligent_route`, `provider_route`, `token_rate_limit` |
+| Model name | `model_to_header` | header `X-Model` (configurable) | yes (#1039) | `intelligent_route`, `provider_route`, `token_rate_limit` |
 | MCP method and tool name | `mcp` | metadata `mcp.method`, `mcp.name`; headers `x-praxis-mcp-*` | reserved prefix stripped at ingress | `intelligent_route` (tool routing takes precedence over the model header) |
 | A2A context/task owner | `a2a` | header `x-praxis-a2a-route-cluster` | reserved prefix stripped at ingress | core `router` |
 | Operation and protocol | `ai_operation` | headers `x-praxis-ai-operation`, `x-praxis-ai-application-protocol`; metadata `ai_operation.*` | yes (removed on no match) | branch conditions only |
-| Format, stream flag, tool presence, token limits | `openai_responses_format`, `openai_responses_request`, `anthropic_messages_format` | headers `x-praxis-ai-format`, `x-praxis-ai-model`, `x-praxis-ai-stream`; metadata `<filter>.model`, `.stream`, `.has_tools`, `.max_tokens` | partial: default `x-praxis-ai-*` names are reserved; custom names are not stripped yet (praxis-proxy/ai#418) | `time_to_first_token` (model label); not yet by routing |
+| Format, stream flag, tool presence, token limits | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` (metadata only) | headers `x-praxis-ai-format`, `x-praxis-ai-model`, `x-praxis-ai-stream`; metadata `<filter>.model`, `.stream`, `.has_tools`, `.max_tokens` | partial: default `x-praxis-ai-*` names are reserved; custom names are not stripped yet (praxis-proxy/ai#418) | `time_to_first_token` (model label); not yet by routing |
 | Session key | request header or cookie named in `session_affinity` | request | not applicable (client-owned by design) | `intelligent_route` affinity |
-| Tenant and subject | `identity_header_guard` (`identity.<header>` metadata), `state_owner` (`StateOwner` extension), authentication filters (`AuthenticatedIdentity` extension) | three carriers | `identity_header_guard` strips its source headers | `token_rate_limit` (subject), `external_metering` |
+| Tenant and subject | `identity_header_guard` (`identity.<header>` metadata), `state_owner` (`StateOwner` extension), authentication filters (`AuthenticatedIdentity` extension) | three carriers | partial: only `AuthenticatedIdentity` is verified in-process; `identity.*` and `StateOwner` are read from request headers and are trustworthy only behind an auth layer that strips client copies | `token_rate_limit` (subject), `external_metering` |
 | Over-quota tier | `token_rate_limit` soft tiers | injected upstream header | written by the filter | core `router` |
 | Guardrail verdict | `ai_guardrails`, `http_callout` | `filter_results` (ephemeral) | not applicable | branch chains only |
 
@@ -53,6 +53,9 @@ praxis-proxy/ai#106, #107, #108).
 - A producer that promotes a body field to a header pushes the
   header name to `request_headers_to_remove` before appending
   the derived value, whether or not the body carried the field.
+  Core `json_body_field` only appends, so a client's own copy
+  stays first and is the value a routing filter reads; use
+  `model_to_header` for the model fact.
 - Fact values are bounded and free of control characters. A
   value that fails the bound is treated as absent by the
   producer and never promoted.

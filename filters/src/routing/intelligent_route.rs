@@ -298,10 +298,22 @@ impl std::fmt::Debug for SessionAffinity {
     }
 }
 
+impl Drop for SessionAffinity {
+    fn drop(&mut self) {
+        metrics::session_table_shrank(self.bindings.len());
+    }
+}
+
 /// A single session binding.
 struct Binding {
     /// When this binding expires.
     expires: Instant,
+
+    /// Capability kind the session was bound for.
+    kind: CapabilityKind,
+
+    /// Capability name the session was bound for.
+    name: Arc<str>,
 
     /// Stable ID of the bound candidate.
     stable_id: Arc<str>,
@@ -399,13 +411,15 @@ enum AffinityOutcome<'a> {
 ///   reuse is not a selection).
 /// - `praxis_ai_intelligent_route_session_total{event}` — `bound`, `reused`, or `failover`, when session affinity is
 ///   enabled.
-/// - `praxis_ai_intelligent_route_session_bindings` — live bindings in this process.
+/// - `praxis_ai_intelligent_route_session_table_entries` — entries in the session tables of every instance in this
+///   process, including expired entries not yet evicted; instances add up and a dropped instance subtracts its table.
 /// - `praxis_ai_intelligent_route_snapshot_candidates` — candidates in the serving snapshot.
 /// - `praxis_ai_intelligent_route_snapshot_reloads_total{result}` — `accepted`, `unchanged`, `rejected`, or
 ///   `read_error`, per overlay reload attempt.
 ///
-/// Decision latency is already covered by the core
-/// `praxis_filter_duration_seconds{filter="intelligent_route"}` histogram.
+/// Decision latency is covered by the core
+/// `praxis_filter_duration_seconds{filter="intelligent_route"}` histogram,
+/// which the proxy records only when `metrics.filter_duration: true` is set.
 ///
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
 /// and `mcp.name` is present, `mcp_tool` candidates are matched.
@@ -493,13 +507,14 @@ enum AffinityOutcome<'a> {
 /// already-mounted Secret without rebuilding the filter pipeline.
 /// Every cluster name that may appear in any overlay version must
 /// already be configured in the downstream `load_balancer` filter.
-/// Pipeline validation checks the clusters this filter reports — the
-/// `clusters` list when configured, otherwise the clusters named by the
-/// initial snapshot plus `management_cluster` — so a cold-start overlay that
-/// names an unknown cluster fails pipeline build. With `clusters` configured,
-/// a reload naming a cluster outside the list is rejected and the previous
-/// snapshot is retained; without it, such a reload is accepted and the
-/// request fails when the `load_balancer` cannot resolve the cluster.
+/// Pipeline validation checks the clusters this filter reports: the
+/// `clusters` list when configured, otherwise static candidates (they live in
+/// the same configuration), always plus `management_cluster`. Overlay
+/// candidates are never reported on their own, so an overlay revision the
+/// running gateway accepted cannot fail the next restart. With `clusters`
+/// configured, a reload naming a cluster outside the list is rejected and the
+/// previous snapshot is retained; without it, such a reload is accepted and
+/// the request fails when the `load_balancer` cannot resolve the cluster.
 ///
 /// [`ArcSwap`]: arc_swap::ArcSwap
 pub struct IntelligentRouteFilter {
@@ -517,8 +532,8 @@ pub struct IntelligentRouteFilter {
     session_affinity: Option<SessionAffinity>,
     /// Atomic snapshot of routing state (candidates + `local_site`).
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
-    /// Authoritative cluster allowlist (None = report the initial snapshot only).
-    allowed_clusters: ClusterAllowlist,
+    /// Clusters reported to pipeline validation; see `selected_clusters`.
+    reported_clusters: Vec<String>,
     /// Whether the snapshot-size gauge has been published from the request
     /// path. Construction may run before the metrics recorder is installed,
     /// so the first request republishes it.
@@ -549,7 +564,13 @@ impl IntelligentRouteFilter {
         let skip_paths = validate_skip_paths(&cfg.skip_paths)?;
         let management_cluster = validate_management_cluster(cfg.management_cluster.as_deref(), &skip_paths)?;
         let allowed_clusters = validate_clusters(cfg.clusters.take())?;
+        let static_mode = cfg.candidates.is_some();
         let (snapshot, reload_handle) = build_route_snapshot(&mut cfg, allowed_clusters.as_ref())?;
+        let reported_clusters = reported_clusters(
+            allowed_clusters.as_deref(),
+            static_mode.then(|| snapshot.load()),
+            management_cluster.as_deref(),
+        );
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
 
@@ -561,7 +582,7 @@ impl IntelligentRouteFilter {
             provider_hop_clusters,
             session_affinity,
             snapshot,
-            allowed_clusters,
+            reported_clusters,
             snapshot_gauge_published: AtomicBool::new(false),
         }))
     }
@@ -569,6 +590,7 @@ impl IntelligentRouteFilter {
     /// Publish the serving snapshot's candidate count once from the request path.
     fn publish_snapshot_gauge_once(&self) {
         if !self.snapshot_gauge_published.swap(true, Ordering::Relaxed) {
+            let _publish_guard = metrics::lock_snapshot_candidates();
             metrics::set_snapshot_candidates(self.snapshot.load().candidates.len());
         }
     }
@@ -653,7 +675,7 @@ impl IntelligentRouteFilter {
             snap.selection_mode,
         )?;
         if let Some(aff) = &self.session_affinity {
-            record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
+            record_session(aff, ctx, c, session_key.as_deref(), failover);
         }
         Ok(FilterAction::Continue)
     }
@@ -763,6 +785,27 @@ fn accept_initial_snapshot(
     }
     metrics::set_snapshot_candidates(snap.candidates.len());
     Ok(())
+}
+
+/// Clusters to report to pipeline validation (see `selected_clusters`).
+fn reported_clusters(
+    allowed: Option<&BTreeSet<Arc<str>>>,
+    static_snapshot: Option<arc_swap::Guard<Arc<RouteSnapshot>>>,
+    management_cluster: Option<&str>,
+) -> Vec<String> {
+    let mut clusters: BTreeSet<String> = match (allowed, static_snapshot) {
+        (Some(allowed), _) => allowed.iter().map(ToString::to_string).collect(),
+        (None, Some(snapshot)) => snapshot
+            .candidates
+            .iter()
+            .map(|candidate| candidate.cluster.to_string())
+            .collect(),
+        (None, None) => BTreeSet::new(),
+    };
+    if let Some(management) = management_cluster {
+        clusters.insert(management.to_owned());
+    }
+    clusters.into_iter().collect()
 }
 
 /// Validate and deduplicate the optional authoritative cluster allowlist.
@@ -920,24 +963,13 @@ impl HttpFilter for IntelligentRouteFilter {
 
     /// The clusters pipeline validation checks against the `load_balancer`.
     ///
-    /// With a configured `clusters` list that list is authoritative; otherwise
-    /// the clusters named by the serving snapshot are reported. The
+    /// A configured `clusters` list is authoritative. Without one, static
+    /// candidates are reported because they live in the same configuration,
+    /// but overlay candidates are not: an overlay revision the running
+    /// gateway accepted must not be able to fail the next restart. The
     /// `management_cluster` is always included.
     fn selected_clusters(&self) -> Vec<String> {
-        let mut clusters: BTreeSet<String> = match &self.allowed_clusters {
-            Some(allowed) => allowed.iter().map(ToString::to_string).collect(),
-            None => self
-                .snapshot
-                .load()
-                .candidates
-                .iter()
-                .map(|candidate| candidate.cluster.to_string())
-                .collect(),
-        };
-        if let Some(management) = &self.management_cluster {
-            clusters.insert(management.to_string());
-        }
-        clusters.into_iter().collect()
+        self.reported_clusters.clone()
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -1034,12 +1066,12 @@ fn apply_route(
 fn record_session(
     affinity: &SessionAffinity,
     ctx: &mut HttpFilterContext<'_>,
-    stable_id: &Arc<str>,
+    candidate: &RouteCandidate,
     session_key: Option<&str>,
     failover: bool,
 ) {
     let bound = if let Some(key) = session_key {
-        store_binding(affinity, key, stable_id);
+        store_binding(affinity, key, candidate);
         metrics::record_session_event(if failover {
             SessionEvent::Failover
         } else {
@@ -1206,7 +1238,14 @@ fn lookup_binding<'a>(
     };
     if binding.expires < Instant::now() {
         drop(binding);
-        affinity.bindings.remove(key);
+        if affinity.bindings.remove(key).is_some() {
+            metrics::session_table_shrank(1);
+        }
+        return AffinityOutcome::New;
+    }
+    if binding.kind != kind || &*binding.name != name {
+        // A session asking for another capability starts a new binding; it is
+        // not a failover of the one it holds.
         return AffinityOutcome::New;
     }
     let stable = Arc::clone(&binding.stable_id);
@@ -1224,7 +1263,7 @@ fn lookup_binding<'a>(
 }
 
 /// Store or update a session binding.
-fn store_binding(affinity: &SessionAffinity, key: &str, stable_id: &Arc<str>) {
+fn store_binding(affinity: &SessionAffinity, key: &str, candidate: &RouteCandidate) {
     if affinity.bindings.len() >= MAX_BINDINGS {
         evict_expired(affinity);
     }
@@ -1232,21 +1271,26 @@ fn store_binding(affinity: &SessionAffinity, key: &str, stable_id: &Arc<str>) {
         tracing::warn!("intelligent_route: session binding table full; routing without binding");
         return;
     }
-    affinity.bindings.insert(
+    let previous = affinity.bindings.insert(
         key.to_owned(),
         Binding {
             expires: Instant::now() + affinity.ttl,
-            stable_id: Arc::clone(stable_id),
+            kind: candidate.kind,
+            name: Arc::clone(&candidate.name),
+            stable_id: Arc::clone(&candidate.stable_id),
         },
     );
-    metrics::set_session_bindings(affinity.bindings.len());
+    if previous.is_none() {
+        metrics::session_table_grew(1);
+    }
 }
 
 /// Remove all expired bindings.
 fn evict_expired(affinity: &SessionAffinity) {
     let now = Instant::now();
+    let before = affinity.bindings.len();
     affinity.bindings.retain(|_, b| b.expires > now);
-    metrics::set_session_bindings(affinity.bindings.len());
+    metrics::session_table_shrank(before.saturating_sub(affinity.bindings.len()));
 }
 
 // -----------------------------------------------------------------------------
@@ -2416,7 +2460,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
-            allowed_clusters: None,
+            reported_clusters: Vec::new(),
             snapshot_gauge_published: AtomicBool::new(false),
         };
 
@@ -2572,7 +2616,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
-            allowed_clusters: None,
+            reported_clusters: Vec::new(),
             snapshot_gauge_published: AtomicBool::new(false),
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
@@ -2681,6 +2725,8 @@ mod tests {
             "returning-user".to_owned(),
             Binding {
                 expires: Instant::now() + Duration::from_secs(300),
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
                 stable_id: Arc::from("inference_model/llama/s/c-drain"),
             },
         );
@@ -2710,6 +2756,8 @@ mod tests {
             "sess-1".to_owned(),
             Binding {
                 expires: Instant::now() + Duration::from_secs(300),
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
                 stable_id: Arc::from("inference_model/llama/s/c-old"),
             },
         );
@@ -2785,6 +2833,8 @@ mod tests {
             "sess-1".to_owned(),
             Binding {
                 expires: Instant::now() + Duration::from_secs(300),
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
                 stable_id: Arc::from("inference_model/llama/s/c-a"),
             },
         );
@@ -2826,6 +2876,8 @@ mod tests {
             "expired-sess".to_owned(),
             Binding {
                 expires: Instant::now() - Duration::from_secs(1),
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
                 stable_id: Arc::from("old-id"),
             },
         );
@@ -2876,6 +2928,8 @@ mod tests {
             "sess-1".to_owned(),
             Binding {
                 expires: Instant::now() + Duration::from_secs(300),
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
                 stable_id: Arc::from("inference_model/llama/s/c-a"),
             },
         );
@@ -2926,6 +2980,8 @@ mod tests {
                 format!("fill-{i}"),
                 Binding {
                     expires: Instant::now() + Duration::from_secs(3600),
+                    kind: CapabilityKind::InferenceModel,
+                    name: Arc::from("llama"),
                     stable_id: Arc::from("x"),
                 },
             );
@@ -3280,7 +3336,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
-            allowed_clusters: None,
+            reported_clusters: Vec::new(),
             snapshot_gauge_published: AtomicBool::new(false),
         };
 
@@ -3474,7 +3530,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
-            allowed_clusters: None,
+            reported_clusters: Vec::new(),
             snapshot_gauge_published: AtomicBool::new(false),
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
@@ -3689,7 +3745,7 @@ mod tests {
 
     #[test]
     fn decision_metrics_count_outcomes_selections_and_sessions() {
-        let snapshot = metrics_emitted_by(async {
+        let (_filter_kept_alive, snapshot) = metrics_emitted_by(async {
             let f = parse(
                 "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
             )
@@ -3704,6 +3760,7 @@ mod tests {
             let models = crate::test_utils::make_request(Method::GET, "/v1/models");
             let mut management = crate::test_utils::make_filter_context(&models);
             let _unused = f.on_request(&mut management).await.unwrap();
+            f
         });
 
         let decisions = |outcome: &str, kind: &str| {
@@ -3741,9 +3798,9 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            gauge_value(&snapshot, metrics::SESSION_BINDINGS, &[]),
+            gauge_value(&snapshot, metrics::SESSION_TABLE_ENTRIES, &[]),
             Some(1.0),
-            "one session is bound"
+            "one session entry was added and none removed"
         );
         assert_eq!(
             gauge_value(&snapshot, metrics::SNAPSHOT_CANDIDATES, &[]),
@@ -3754,22 +3811,77 @@ mod tests {
 
     #[test]
     fn affinity_failover_is_counted_as_a_session_event() {
-        let snapshot = metrics_emitted_by(async {
-            let f = parse(
-                "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
-            )
-            .unwrap();
-            let _first = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
-            let _other = route_path_model_with_session(f.as_ref(), "granite", "session-1").await;
+        let (_filter_kept_alive, snapshot) = metrics_emitted_by(async {
+            let snap = make_overlay_snapshot(&[("new_and_existing", "c-a"), ("new_and_existing", "c-b")]);
+            let shared = Arc::new(ArcSwap::from_pointee(snap));
+            let affinity = make_test_affinity();
+            affinity.bindings.insert(
+                "sess-1".to_owned(),
+                Binding {
+                    expires: Instant::now() + Duration::from_secs(300),
+                    kind: CapabilityKind::InferenceModel,
+                    name: Arc::from("llama"),
+                    stable_id: Arc::from("inference_model/llama/s/c-a"),
+                },
+            );
+            let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
+            shared.store(Arc::new(make_overlay_snapshot(&[("new_and_existing", "c-b")])));
+
+            let routed = route_path_model_with_session(&filter, "llama", "sess-1").await;
+            assert_eq!(
+                routed.1.as_deref(),
+                Some("c-b"),
+                "the session fails over to the remaining candidate"
+            );
+            filter
         });
         assert_eq!(
             counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "failover")]),
-            None,
-            "an unknown model never reaches affinity resolution"
+            Some(1)
         );
         assert_eq!(
             counter_value(&snapshot, metrics::SESSION_TOTAL, &[("event", "bound")]),
-            Some(1)
+            None,
+            "a failover re-binds the session without counting a fresh binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_capability_starts_a_new_binding_rather_than_a_failover() {
+        let f = parse(
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+        )
+        .unwrap();
+        let _first = route_path_model_with_session(f.as_ref(), "llama", "sess-1").await;
+
+        let mut req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
+        req.headers.insert("X-Model", HeaderValue::from_static("granite"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.cluster.as_deref(), Some("inf-b"));
+        assert_eq!(ctx.get_metadata("intelligent_route.session.failover"), Some("false"));
+        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
+    }
+
+    #[test]
+    fn session_table_gauge_adds_up_across_instances_and_shrinks_on_drop() {
+        let (_first_kept_alive, snapshot) = metrics_emitted_by(async {
+            let yaml = "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
+            let first = parse(yaml).unwrap();
+            let second = parse(yaml).unwrap();
+            let _unused = route_path_model_with_session(first.as_ref(), "llama", "sess-1").await;
+            let _unused = route_path_model_with_session(first.as_ref(), "llama", "sess-1").await;
+            let _unused = route_path_model_with_session(second.as_ref(), "llama", "sess-2").await;
+            let _unused = route_path_model_with_session(second.as_ref(), "llama", "sess-3").await;
+            drop(second);
+            first
+        });
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SESSION_TABLE_ENTRIES, &[]),
+            Some(1.0),
+            "three distinct sessions were added across two instances and two left with the dropped instance"
         );
     }
 
@@ -3782,6 +3894,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.selected_clusters(), vec!["inf-a", "inf-b", "mgmt"]);
+    }
+
+    #[test]
+    fn overlay_mode_without_clusters_reports_only_the_management_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let candidate = serde_json::json!([{
+            "kind": "inference_model", "name": "llama-3", "site": "site-a", "cluster": "provider-a", "fresh": true
+        }]);
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
+        let config = serde_json::json!({
+            "overlay_file": path.to_string_lossy(),
+            "reload": { "enabled": false },
+            "skip_paths": ["/v1/models"],
+            "management_cluster": "mgmt",
+        });
+        let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
+        assert_eq!(
+            filter.selected_clusters(),
+            vec!["mgmt"],
+            "an accepted overlay revision must not be able to fail the next restart"
+        );
     }
 
     #[test]
@@ -3884,9 +4018,14 @@ mod tests {
 
     /// Run `scenario` on the current thread with a local metrics recorder and
     /// return every metric it emitted.
-    fn metrics_emitted_by<F>(scenario: F) -> Vec<(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)>
+    fn metrics_emitted_by<T, F>(
+        scenario: F,
+    ) -> (
+        T,
+        Vec<(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)>,
+    )
     where
-        F: Future<Output = ()>,
+        F: Future<Output = T>,
     {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -3894,13 +4033,14 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        ::metrics::with_local_recorder(&recorder, || runtime.block_on(scenario));
-        snapshotter
+        let output = ::metrics::with_local_recorder(&recorder, || runtime.block_on(scenario));
+        let samples = snapshotter
             .snapshot()
             .into_vec()
             .into_iter()
             .map(|(key, _, _, value)| (key, value))
-            .collect()
+            .collect();
+        (output, samples)
     }
 
     fn metric_value<'a>(
@@ -4096,7 +4236,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
-            allowed_clusters: None,
+            reported_clusters: Vec::new(),
             snapshot_gauge_published: AtomicBool::new(false),
         }
     }
