@@ -32,7 +32,7 @@ STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
 STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth
 STORE_SQLITE_FEATURES := standard,openai-all,store-sqlite
 STORE_COMBINED_FEATURES := standard,openai-all,store-all
-STORE_ALL_WORKSPACE_FEATURES := praxis-ai-benchmarks/store-all,xtask/openai-all,praxis-ai-proxy/openai-all,praxis-tests-integration/openai-all,praxis-tests-schema/openai-all,praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
+STORE_ALL_WORKSPACE_FEATURES := praxis-ai-benchmarks/store-all,praxis-ai-proxy/openai-all,praxis-tests-integration/openai-all,praxis-tests-schema/openai-all,praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -290,7 +290,7 @@ lint: lint-clippy lint-xtask
 lint-clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
-		--features $(STORE_ALL_WORKSPACE_FEATURES),praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter \
+		--features $(STORE_ALL_WORKSPACE_FEATURES),xtask/openai-all,praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter \
 		-- -D warnings
 	$(MAKE) lint-lean
 	$(MAKE) check-dep-budget
