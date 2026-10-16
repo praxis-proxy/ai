@@ -95,6 +95,7 @@ for how these are authored and regenerated.
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+| [web-search-file-key.yaml](configs/anthropic/web-search-file-key.yaml) | A minimal Anthropic Messages web-search gateway that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/anthropic/web-search-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml |
 | [web-search-tavily-scoped-credentials.yaml](configs/anthropic/web-search-tavily-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml, over Tavily |
 
@@ -169,6 +170,7 @@ for how these are authored and regenerated.
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |
 | [web-search-chat-completions-fixture.yaml](configs/openai/responses/web-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses web_search tool |
 | [web-search-chat-completions.yaml](configs/openai/responses/web-search-chat-completions.yaml) | Accepts OpenAI Responses requests with hosted web search while targeting a backend that only implements /v1/chat/completions |
+| [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
 

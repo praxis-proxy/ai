@@ -33,7 +33,8 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_web_search_dispatch
         provider: brave
-        api_key: ${WEB_SEARCH_API_KEY}
+        api_key:
+          env_var: WEB_SEARCH_API_KEY
         default_context_size: medium
         timeout_ms: 10000
         outbound_chain: web-search-outbound

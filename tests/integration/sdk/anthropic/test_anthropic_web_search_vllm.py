@@ -306,7 +306,7 @@ class _TavilyRelay:
 def _write_config(proxy_port: int, authority: str, search_port: int, model: str, *, stub_key: bool) -> str:
     """Retarget the shipped example to live vLLM and a loopback search endpoint.
 
-    ``stub_key`` swaps the ``${WEB_SEARCH_API_KEY}`` placeholder for a known literal
+    ``stub_key`` swaps the ``env_var: WEB_SEARCH_API_KEY`` source for a known literal
     (Mode A); otherwise the placeholder is left intact so the real Tavily key is
     resolved from the environment (Mode B). In both modes the provider ``base_url``
     is pointed at ``search_port`` on loopback, so the executor's SSRF opt-in is
@@ -328,9 +328,9 @@ def _write_config(proxy_port: int, authority: str, search_port: int, model: str,
     assert config.count('"127.0.0.1:8001"') == 1, CONFIG_PATH
     config = config.replace('"127.0.0.1:8001"', f'"{authority}"')
 
-    key_line = f"api_key: {STUB_SEARCH_KEY}" if stub_key else "api_key: ${WEB_SEARCH_API_KEY}"
+    key_line = f"value: {STUB_SEARCH_KEY}" if stub_key else "env_var: WEB_SEARCH_API_KEY"
     replaced = config.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
+        "env_var: WEB_SEARCH_API_KEY",
         f"{key_line}\n                base_url: http://127.0.0.1:{search_port}",
     )
     assert replaced != config, "example drift: provider api_key not found"

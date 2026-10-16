@@ -431,7 +431,8 @@ impl<'de> Visitor<'de> for TrackedValueVisitor {
 /// ```yaml
 /// filter: anthropic_web_search
 /// provider: you
-/// api_key: ${WEB_SEARCH_API_KEY}
+/// api_key:
+///   env_var: WEB_SEARCH_API_KEY
 /// ```
 ///
 /// # Full YAML
@@ -439,7 +440,8 @@ impl<'de> Visitor<'de> for TrackedValueVisitor {
 /// ```yaml
 /// filter: anthropic_web_search
 /// provider: you
-/// api_key: ${WEB_SEARCH_API_KEY}
+/// api_key:
+///   env_var: WEB_SEARCH_API_KEY
 /// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
@@ -478,6 +480,10 @@ pub struct AnthropicWebSearchFilter {
     /// Callout-credential slot id whose per-user secret is required for the
     /// provider callout. `None` uses the shared configured `api_key`.
     user_credential_slot: Option<String>,
+    /// Retains the API key file watcher (for a `file`-sourced key) for the
+    /// filter's lifetime so rotation keeps publishing; dropping it stops the
+    /// watcher. `None` for `value`/`env_var` sources.
+    _watch_handle: Option<crate::credential_source::WatchHandle>,
 }
 
 impl AnthropicWebSearchFilter {
@@ -535,7 +541,7 @@ impl AnthropicWebSearchFilter {
         client: crate::subrequest::SubRequestClient,
         outbound: Arc<FilterPipeline>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let validated = build_config(FILTER_NAME, config)?;
+        let (validated, watch_handle) = build_config(FILTER_NAME, config)?;
         let search_client = SearchClient::from_config(FILTER_NAME, &validated, client)?;
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
@@ -543,6 +549,7 @@ impl AnthropicWebSearchFilter {
             search_client,
             outbound,
             user_credential_slot: validated.user_credential,
+            _watch_handle: watch_handle,
         }))
     }
 
