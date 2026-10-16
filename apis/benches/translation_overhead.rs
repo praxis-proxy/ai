@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Focused request-translation benchmarks. Run with:
+//! `cargo bench -p praxis-ai-apis --bench translation_overhead`.
+
+use std::time::Duration;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use serde_json::{Value, json};
+
+#[expect(
+    clippy::allow_attributes,
+    reason = "the path-imported test modules have expectations that are inactive in a benchmark harness"
+)]
+#[allow(
+    unfulfilled_lint_expectations,
+    reason = "path-imported test-only lint expectations may not apply in benchmark mode"
+)]
+#[expect(
+    dead_code,
+    unused_imports,
+    clippy::missing_docs_in_private_items,
+    reason = "benchmark imports the private translator without exposing it publicly"
+)]
+#[path = "../src/bedrock/converse/request.rs"]
+mod bedrock_request;
+#[expect(
+    clippy::allow_attributes,
+    reason = "the path-imported test modules have expectations that are inactive in a benchmark harness"
+)]
+#[allow(
+    unfulfilled_lint_expectations,
+    reason = "path-imported test-only lint expectations may not apply in benchmark mode"
+)]
+#[expect(
+    dead_code,
+    unused_imports,
+    clippy::missing_docs_in_private_items,
+    reason = "benchmark imports the private translator without exposing it publicly"
+)]
+#[path = "../src/vertex/gemini/request.rs"]
+mod gemini_request;
+
+/// Run Bedrock request translation on an opaque benchmark input.
+#[expect(clippy::unwrap_used, reason = "benchmark fixture is valid")]
+fn translate_bedrock(body: &[u8]) {
+    let result = bedrock_request::transform_request(std::hint::black_box(body)).unwrap();
+    std::hint::black_box((&result.body, &result.model, result.stream, result.include_usage));
+}
+
+/// Run Gemini request translation on an opaque benchmark input.
+#[expect(clippy::unwrap_used, reason = "benchmark fixture is valid")]
+fn translate_gemini(body: &[u8]) {
+    let result = gemini_request::transform_request(std::hint::black_box(body)).unwrap();
+    std::hint::black_box((
+        &result.body,
+        &result.model,
+        result.stream,
+        result.include_usage,
+        result.candidate_count,
+    ));
+}
+
+/// Build a Bedrock request with large tool schemas and stop sequences.
+#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
+fn bedrock_large_tool_request() -> Vec<u8> {
+    let description = "s".repeat(16 * 1024);
+    let tools: Vec<Value> = (0..4)
+        .map(|index| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("tool_{index}"),
+                    "description": "large schema fixture",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string", "description": description}
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let stops: Vec<String> = (0..16)
+        .map(|index| format!("stop_{index}_{}", "x".repeat(256)))
+        .collect();
+
+    serde_json::to_vec(&json!({
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "messages": [{"role": "user", "content": "translate"}],
+        "stop": stops,
+        "tools": tools
+    }))
+    .unwrap()
+}
+
+/// Build a Gemini request with matched tool-call and tool-result messages.
+#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
+fn gemini_call_result_request(call_result_pairs: usize) -> Vec<u8> {
+    let mut calls = Vec::with_capacity(call_result_pairs);
+    let mut results = Vec::with_capacity(call_result_pairs);
+    for index in 0..call_result_pairs {
+        let id = format!("call_{index}");
+        let name = format!("tool_{index}");
+        calls.push(json!({
+            "id": id,
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"}
+        }));
+        results.push(json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": "{}"
+        }));
+    }
+
+    let mut messages = Vec::with_capacity(call_result_pairs + 2);
+    messages.push(json!({"role": "user", "content": "run all tools"}));
+    messages.push(json!({"role": "assistant", "content": null, "tool_calls": calls}));
+    messages.extend(results);
+    serde_json::to_vec(&json!({"model": "gemini-1.5-pro", "messages": messages})).unwrap()
+}
+
+/// Build a Gemini request with large image, schema, stop, and result fields.
+#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
+fn gemini_large_request() -> Vec<u8> {
+    let image_data = format!("data:image/png;base64,{}", "A".repeat(512 * 1024));
+    let schema_description = "d".repeat(16 * 1024);
+    let stop_sequences: Vec<String> = (0..16)
+        .map(|index| format!("stop_{index}_{}", "x".repeat(256)))
+        .collect();
+
+    serde_json::to_vec(&json!({
+        "model": "gemini-1.5-pro",
+        "messages": [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_data}}]},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_lookup", "type": "function", "function": {"name": "lookup", "arguments": "{}"},
+                 "extra_content": {"google": {"thought_signature": "signature"}}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "x".repeat(32 * 1024)}
+        ],
+        "stop": stop_sequences,
+        "response_format": {"type": "json_schema", "json_schema": {"schema": {
+            "type": "object",
+            "properties": {"result": {"type": "string", "description": schema_description}}
+        }}},
+        "tools": [{"type": "function", "function": {
+            "name": "lookup",
+            "description": "large tool schema",
+            "parameters": {"type": "object", "properties": {
+                "payload": {"type": "string", "description": schema_description}
+            }}
+        }}]
+    }))
+    .unwrap()
+}
+
+/// Report allocator activity for one translation fixture.
+#[expect(
+    clippy::print_stderr,
+    reason = "allocation reports are consumed from benchmark stderr"
+)]
+fn report_allocation(label: &str, translation: impl FnOnce()) {
+    let allocations = allocation_counter::measure(translation);
+    eprintln!(
+        "allocation_report,{label},count={},bytes={}",
+        allocations.count_total, allocations.bytes_total
+    );
+}
+
+/// Benchmark Bedrock translation for several large tool schemas.
+fn bedrock_large_tools(c: &mut Criterion) {
+    let body = bedrock_large_tool_request();
+    report_allocation("bedrock_large_tools", || translate_bedrock(&body));
+
+    let mut group = c.benchmark_group("bedrock_large_tools");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("four_16k_schemas_and_stop_array", |b| {
+        b.iter(|| translate_bedrock(&body));
+    });
+    group.finish();
+}
+
+/// Benchmark Gemini translation as paired tool calls and results scale.
+fn gemini_lookup_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gemini_lookup_scaling");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+
+    for call_result_pairs in [8, 16, 32, 64, 128, 256] {
+        let body = gemini_call_result_request(call_result_pairs);
+        report_allocation(&format!("gemini_lookup_pairs_{call_result_pairs}"), || {
+            translate_gemini(&body);
+        });
+        group.bench_with_input(BenchmarkId::from_parameter(call_result_pairs), &body, |b, body| {
+            b.iter(|| translate_gemini(body));
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark Gemini translation with large multimodal and schema fields.
+fn gemini_large_fields(c: &mut Criterion) {
+    let body = gemini_large_request();
+    report_allocation("gemini_large_fields", || translate_gemini(&body));
+
+    let mut group = c.benchmark_group("gemini_large_fields");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("512k_image_schema_stops_and_tool_result", |b| {
+        b.iter(|| translate_gemini(&body));
+    });
+    group.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bedrock_large_tools, gemini_lookup_scaling, gemini_large_fields
+}
+criterion_main!(benches);
