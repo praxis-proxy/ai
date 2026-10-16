@@ -77,6 +77,8 @@ mod openai_mcp_outbound_chain;
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_streaming;
 #[cfg(feature = "openai-mcp-tools")]
+mod openai_mcp_tool_admission;
+#[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_tool_resolve;
 mod openai_prompts_routing;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]

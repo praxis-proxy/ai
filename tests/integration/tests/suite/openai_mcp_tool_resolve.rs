@@ -1200,6 +1200,150 @@ fn connector_resolves_to_mock_mcp_server() {
     );
 }
 
+// =============================================================================
+// Operator metadata admission (#1724)
+// =============================================================================
+
+/// A trusted-service connector under operator read-only mode admits only tools
+/// its gateway classifies read-only, without a per-tool digest catalog, while
+/// preserving schema fidelity and tool identity. Exercised through the assembled
+/// pipeline so admission runs before the definitions could reach the model.
+#[test]
+fn protected_read_only_trusted_connector_admits_only_read_only_tools() {
+    let mcp_config = McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("read_docs")
+                .with_description("Read documents")
+                .with_annotations(serde_json::json!({"readOnlyHint": true})),
+            McpToolFixture::new("delete_docs").with_annotations(serde_json::json!({"readOnlyHint": false})),
+        ],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        tool_admission:\n          mode: protected\n          require_read_only: true\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            trust:\n              catalog: true\n              read_only: true"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"docs","connector_id":"gw"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "admission should succeed: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tools = parsed["tools"].as_array().expect("tools should be an array");
+    assert_eq!(tools.len(), 1, "only the read-only tool is admitted: {echoed}");
+    assert_eq!(tools[0]["name"], "docs__read_docs", "tool identity preserved");
+    assert_eq!(
+        tools[0]["description"], "Read documents",
+        "admitted tool keeps its legitimate description"
+    );
+    assert!(
+        !echoed.contains("delete_docs"),
+        "the writable tool must be excluded before inference: {echoed}"
+    );
+}
+
+/// In protected mode a client-selected direct `server_url` is untrusted: its
+/// advertised `readOnlyHint: true` cannot admit a destructive tool. The
+/// definition never reaches the model.
+#[test]
+fn protected_mode_excludes_untrusted_direct_server_tools() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_all").with_annotations(serde_json::json!({"readOnlyHint": true}))],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let admission = "        tool_admission:\n          mode: protected\n          require_read_only: true";
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), admission);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}"}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the tool excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("delete_all"),
+        "an untrusted server's readOnlyHint lie must not admit a destructive tool: {echoed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        tool_count, 0,
+        "no untrusted tools reach the model in protected mode: {echoed}"
+    );
+}
+
+/// A `defer_loading: true` direct `server_url` is still a client-selected
+/// untrusted target: protected mode must exclude it before it reaches the
+/// backend, and must not dial it (#1724 — deferred-passthrough bypass).
+#[test]
+fn protected_mode_excludes_untrusted_deferred_direct_target() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_all")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let admission = "        tool_admission:\n          mode: protected\n          require_read_only: true";
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), admission);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}","defer_loading":true}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the tool excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("delete_all") && !echoed.contains("defer_loading"),
+        "a deferred untrusted direct MCP entry must be stripped, not passed through: {echoed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(tool_count, 0, "no untrusted tools reach the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "an untrusted deferred target must never be dialed in protected mode"
+    );
+}
+
 #[test]
 fn unknown_connector_rejected_before_callout() {
     let mcp_config = McpMockConfig {

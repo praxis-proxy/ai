@@ -75,6 +75,7 @@ use self::{
 use super::{
     DEFAULT_STORE_NAME,
     error::responses_error_rejection,
+    mcp_admission::McpAdmissionDecisions,
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
@@ -295,6 +296,7 @@ impl McpDispatchFilter {
             connector_identity,
             session_pool,
             pool_namespace: self.pool_namespace,
+            admission: &state.mcp_admission,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -348,7 +350,10 @@ impl McpDispatchFilter {
             state.accumulated_output.push(result.output_item);
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-        state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+        let admission = &state.mcp_admission;
+        state
+            .tool_calls
+            .retain(|call| !is_mcp_owned_call(call, &tool_index, admission));
     }
 
     /// Fail closed when no shared sub-request client is available to dial the
@@ -395,6 +400,7 @@ impl McpDispatchFilter {
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
+        clippy::large_stack_frames,
         reason = "five borrow-scoped phases: parse, load, resolve, consume, apply"
     )]
     async fn resume_approvals(&self, ctx: &mut HttpFilterContext<'_>) -> Result<(), Rejection> {
@@ -529,6 +535,28 @@ impl McpDispatchFilter {
                         warn!(error = %e.message(), "mcp_dispatch: rejecting unresolvable approval response");
                         return Err(approval_rejection(&e));
                     },
+                }
+            }
+            // Re-validate every approving resumption against the current operator
+            // policy BEFORE the single-use approval is consumed (#1724). Resolve
+            // re-ran this request and rebuilt the admission verdicts, so a call
+            // whose tool is now denied (trust revoked, or writable under operator
+            // read-only mode) is rejected here without spending its approval. The
+            // dispatch-time check in `execute_single_call` remains as defense in
+            // depth.
+            for decision in &resolved {
+                if decision.approve
+                    && let Some(reason) = state
+                        .mcp_admission
+                        .admitted_denial(&decision.server_label, &decision.tool_name)
+                {
+                    let e = ApprovalError::TargetUnresolvable(format!(
+                        "approved tool '{}' is no longer admitted under the current operator policy: {}",
+                        decision.encoded_name,
+                        reason.message()
+                    ));
+                    warn!(error = %e.message(), "mcp_dispatch: rejecting approval for a policy-denied tool");
+                    return Err(approval_rejection(&e));
                 }
             }
             resolved
@@ -906,7 +934,12 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         };
         let needs_discovery = has_pending_deferred_discovery(state);
-        if !needs_discovery && (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty()) {
+        // A round with no admitted MCP tools can still carry a model-generated
+        // call to a policy-denied tool, which must be rejected rather than passed
+        // through: keep processing when denied verdicts exist (#1724).
+        if !needs_discovery
+            && (state.tool_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()))
+        {
             return Ok(FilterAction::Continue);
         }
 
@@ -962,12 +995,12 @@ impl HttpFilter for McpDispatchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+        if state.tool_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()) {
             return Ok(FilterAction::Continue);
         }
 
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index, &state.mcp_admission);
         if mcp_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -1048,11 +1081,15 @@ pub(crate) fn prepare_response_round(
     state: &mut ResponsesState,
     max_calls_per_round: usize,
 ) -> Result<(), DispatchFailure> {
-    if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+    // A denied-only round has an empty `mcp_tool_map` but still carries
+    // model-generated calls to policy-denied tools that the dispatcher will
+    // reject. Keep validating them (per-round cap, unique call ids) rather than
+    // skipping straight to dispatch (#1724).
+    if state.tool_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()) {
         return Ok(());
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-    let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &tool_index);
+    let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &tool_index, &state.mcp_admission);
     if mcp_call_count > max_calls_per_round {
         return Err(DispatchFailure {
             status: 502,
@@ -1060,7 +1097,7 @@ pub(crate) fn prepare_response_round(
             message: "model response exceeded the configured MCP call limit".to_owned(),
         });
     }
-    let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+    let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index, &state.mcp_admission);
     if mcp_calls.is_empty() {
         return Ok(());
     }
@@ -1096,7 +1133,10 @@ pub(crate) fn prepare_response_round(
     }
     record_and_emit_approvals(state, pending);
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-    state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+    let admission = &state.mcp_admission;
+    state
+        .tool_calls
+        .retain(|call| !is_mcp_owned_call(call, &tool_index, admission));
     if executable.is_empty() {
         state.mcp_approval_state = McpApprovalState::ApprovalPendingThenReturn;
     } else {
@@ -1135,16 +1175,44 @@ struct PendingApproval {
 fn extract_mcp_tool_calls<'a>(
     tool_calls: &'a [serde_json::Value],
     tool_index: &McpToolIndex<'_>,
+    admission: &McpAdmissionDecisions,
 ) -> Vec<&'a serde_json::Value> {
     tool_calls
         .iter()
-        .filter(|tc| is_mcp_tool_call(tc, tool_index))
+        .filter(|tc| is_mcp_owned_call(tc, tool_index, admission))
         .collect()
 }
 
 /// Count MCP-owned function calls without cloning provider payloads.
-fn count_mcp_tool_calls(tool_calls: &[serde_json::Value], tool_index: &McpToolIndex<'_>) -> usize {
-    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_index)).count()
+fn count_mcp_tool_calls(
+    tool_calls: &[serde_json::Value],
+    tool_index: &McpToolIndex<'_>,
+    admission: &McpAdmissionDecisions,
+) -> usize {
+    tool_calls
+        .iter()
+        .filter(|tc| is_mcp_owned_call(tc, tool_index, admission))
+        .count()
+}
+
+/// Whether a tool call is MCP-owned: either resolved into the dispatch map
+/// (admitted) or recorded as denied by operator admission (#1724).
+///
+/// Denied calls are kept MCP-owned so a forged model-generated call to a
+/// policy-denied tool is routed to an explicit dispatch rejection rather than
+/// mis-classified as a client-owned function and returned to the caller.
+fn is_mcp_owned_call(
+    tool_call: &serde_json::Value,
+    tool_index: &McpToolIndex<'_>,
+    admission: &McpAdmissionDecisions,
+) -> bool {
+    if is_mcp_tool_call(tool_call, tool_index) {
+        return true;
+    }
+    tool_call
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| admission.is_denied_encoded(name))
 }
 
 /// Require every MCP function call to carry a distinct non-empty correlation ID.
@@ -1452,6 +1520,9 @@ struct McpExecutionOptions<'a> {
     /// Namespace unique to the dispatcher whose transport configuration opened
     /// the session.
     pool_namespace: mcp_client::McpPoolNamespace,
+    /// Operator admission decisions, re-enforced at dispatch so a policy-denied
+    /// or ineligible call cannot execute even if it reaches this point (#1724).
+    admission: &'a McpAdmissionDecisions,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1666,7 +1737,12 @@ fn process_call_result(
 }
 
 /// Execute a single MCP tool call.
-#[expect(clippy::too_many_lines, reason = "linear validation + async call")]
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::large_stack_frames,
+    reason = "linear validation, dispatch-time admission re-enforcement, and async call"
+)]
 async fn execute_single_call(
     tool_call: &serde_json::Value,
     tool_index: &McpToolIndex<'_>,
@@ -1681,11 +1757,40 @@ async fn execute_single_call(
         .unwrap_or("unknown");
     let approval_request_id = approval_request_id(tool_call);
 
+    // Dispatch-time admission re-enforcement (#1724): a tool denied at discovery
+    // is not in the map, so reject it explicitly here rather than letting it fall
+    // through as an unresolved client function.
+    if let Some(reason) = options.admission.denied_reason(encoded_name) {
+        warn!(encoded_name, reason = ?reason, "rejecting model-generated call to a policy-denied MCP tool");
+        return Some(build_error_result(
+            call_id,
+            "unknown",
+            encoded_name,
+            "",
+            reason.message(),
+            approval_request_id,
+        ));
+    }
+
     let (key, entry) = match resolve_tool_entry(tool_index, encoded_name, call_id, approval_request_id) {
         Ok(r) => r,
         Err(opt) => return opt.map(|b| *b),
     };
     let original_tool_name = &key.1;
+    // Re-verify the resolved entry against its operator-owned verdict. Defense in
+    // depth: an admitted entry with no verdict, or a writable tool under operator
+    // read-only mode, fails closed before any external side effect.
+    if let Some(reason) = options.admission.admitted_denial(&key.0, original_tool_name) {
+        warn!(encoded_name, reason = ?reason, "rejecting MCP call ineligible under operator admission policy");
+        return Some(build_error_result(
+            call_id,
+            &key.0,
+            original_tool_name,
+            "",
+            reason.message(),
+            approval_request_id,
+        ));
+    }
     let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
     let server_label = entry
         .get("server_label")

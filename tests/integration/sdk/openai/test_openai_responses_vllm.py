@@ -278,6 +278,7 @@ def _write_full_flow_config(
     ogx_endpoint: str | None = None,
     file_url_origin: str | None = None,
     web_search_provider: str = "brave",
+    tool_admission: str | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     resolved_backend = backend_endpoint or _vllm_endpoint()
@@ -286,6 +287,12 @@ def _write_full_flow_config(
         praxis_port,
         backend_endpoint=resolved_backend,
     )
+    if tool_admission is not None:
+        # Inject an operator metadata-admission policy under the resolver so the
+        # SDK suite can exercise protected mode (#1724).
+        marker = "      - filter: openai_mcp_tool_resolve\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(marker, marker + tool_admission)
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
@@ -5749,6 +5756,69 @@ def agentic_client(agentic_proxy):
     )
 
 
+# Operator metadata-admission policy injected under the resolver (#1724):
+# protected mode with operator-enforced read-only.
+_PROTECTED_ADMISSION_BLOCK = (
+    "        tool_admission:\n"
+    "          mode: protected\n"
+    "          require_read_only: true\n"
+)
+
+
+@pytest.fixture(scope="session")
+def admission_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Start a Praxis proxy with protected MCP metadata admission (#1724)."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("admission-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
+        tool_admission=_PROTECTED_ADMISSION_BLOCK,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Admission Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def admission_client(admission_proxy):
+    """Return an OpenAI client pointed at the protected-admission proxy."""
+    proxy_port, _, _ = admission_proxy
+    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+
+
 @pytest.fixture(scope="session")
 def translated_agentic_proxy(
     tmp_path_factory,
@@ -6659,6 +6729,51 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
 
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
+
+    def test_protected_mode_excludes_untrusted_direct_mcp_tool(
+        self, admission_client, admission_proxy,
+    ):
+        """Protected metadata admission excludes a client-selected direct MCP
+        target before inference (#1724).
+
+        The direct ``server_url`` is untrusted, so in protected mode its tools
+        never reach the model and the untrusted server is never dispatched: the
+        response carries no ``mcp_call`` and the mock records no tool call.
+        """
+        _, mcp_port, _ = admission_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+        calls_before = MCPHandler.tool_call_count()
+
+        response = admission_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Call get_weather for Paris if a weather tool is available; "
+                "otherwise just answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"request should proceed with the tool excluded; got: {response.status}"
+        )
+        output_types = [item.type for item in response.output]
+        assert "mcp_call" not in output_types, (
+            "an untrusted direct target's tool must not execute in protected "
+            f"mode; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the untrusted direct target must never be dispatched in protected mode"
+        )
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,

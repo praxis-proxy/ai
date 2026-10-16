@@ -736,3 +736,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.native.mcp_admission_untrusted_excluded
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/mcp-tool-admission-untrusted-direct
+    providers:
+      synthetic:
+        status: synthetic_only
