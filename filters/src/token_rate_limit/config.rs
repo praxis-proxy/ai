@@ -123,7 +123,7 @@ use serde::Deserialize;
 /// The initial release gate is symmetric against official Redis 8.10.2
 /// (`redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0`)
 /// and Red Hat Valkey 8.0.11
-/// (`registry.redhat.io/rhel10/valkey-8@sha256:77a0c5aad7e39c35e2d575073e8d8b42417e2cbdba0f5626db4f59ade84e1fbe`).
+/// (`registry.access.redhat.com/rhel10/valkey-8@sha256:5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9`).
 /// These are symmetric qualification targets, not a claim that every
 /// deployment has passed; support requires both complete product lanes.
 ///

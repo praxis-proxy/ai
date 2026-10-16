@@ -20,7 +20,7 @@ into the container engine):
 ```console
 make test-token-rate-limit-sentinel-integration \
   SENTINEL_PRODUCT=valkey \
-  SENTINEL_IMAGE=registry.redhat.io/rhel10/valkey-8@sha256:77a0c5aad7e39c35e2d575073e8d8b42417e2cbdba0f5626db4f59ade84e1fbe
+  SENTINEL_IMAGE=registry.access.redhat.com/rhel10/valkey-8@sha256:5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9
 ```
 
 The fixture intentionally does not use mutable tags. Failover, replication
