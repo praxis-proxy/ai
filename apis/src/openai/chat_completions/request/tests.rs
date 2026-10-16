@@ -267,7 +267,7 @@ async fn control_char_model_not_promoted() {
 async fn stage_operation_match(ctx: &mut HttpFilterContext<'_>) {
     let classifier =
         crate::operation_classifier::AiOperationFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
-    drop(classifier.on_request(ctx).await.unwrap());
+    drop(classifier.on_request_head(ctx).await.unwrap());
 }
 
 /// Stage the operation match, run the filter body at EOS, and return the context

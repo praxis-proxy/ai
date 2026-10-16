@@ -26,10 +26,11 @@
 # the same filter branching Anthropic Messages beside them.
 #
 # Consuming the classification:
-#   The classifier runs in the header phase. Its headers are pending
-#   mutations applied when the request is forwarded, so the `router`
-#   filter — which matches the *downstream* request headers — does not
-#   see them in the same phase. Branch on the published filter results
+#   The classifier runs in the request-head phase, before any filter's
+#   buffered body pre-read. Its headers are pending mutations applied when
+#   the request is forwarded, so the `router` filter — which matches the
+#   *downstream* request headers — does not see them in the request phase.
+#   Branch on the published filter results
 #   with `on_result`, which are visible immediately; downstream filters
 #   read the typed match from request extensions; the backend reads the
 #   forwarded headers.
