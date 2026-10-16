@@ -664,6 +664,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
+                            # Read-only annotation so require_approval read_only
+                            # selectors can classify this tool (issue #1398).
+                            "annotations": {"readOnlyHint": True},
                         },
                         {
                             "name": "get_time",
@@ -6693,6 +6696,103 @@ class TestAgenticLoopVLLM:
         # message, so accept either as proof the tool result fed back into the model.
         assert "message" in output_types or "reasoning" in output_types, (
             f"approved response should resume to model output; got: {output_types}"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_gates_over_never_name(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
+
+        ``get_weather`` is annotated read-only. The policy names it in
+        ``never.tool_names`` but also selects it via ``always.read_only=true``.
+        ``always`` precedence must gate the call with an approval request; before
+        the fix the ignored read_only selector left only the never name-match and
+        the tool executed automatically.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {
+                    "always": {"read_only": True},
+                    "never": {"tool_names": ["get_weather"]},
+                },
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "always.read_only must gate the read-only tool even though "
+            "never.tool_names names it; "
+            f"got: {[item.type for item in response.output]}"
+        )
+        assert approval_requests[0].name == "get_weather"
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the gated call must not execute while approval is pending"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_auto_executes(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
+
+        ``get_weather`` is annotated read-only and matched by
+        ``never.read_only=true``, so it executes automatically with no approval
+        request -- proving the discovered readOnlyHint drives the exemption
+        through the OpenAI client.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {"never": {"read_only": True}},
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        output_types = [item.type for item in response.output]
+        assert not any(t == "mcp_approval_request" for t in output_types), (
+            f"never.read_only must auto-execute the read-only tool; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "the read-only tool must execute automatically under never.read_only"
+        )
+        assert "mcp_call" in output_types, (
+            f"auto-executed response should contain the MCP result; got: {output_types}"
         )
 
     @requires_vllm_compat

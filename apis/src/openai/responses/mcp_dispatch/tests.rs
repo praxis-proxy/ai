@@ -24,7 +24,7 @@ use crate::{
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
-        mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
+        mcp_classify::{ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
                 ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
@@ -135,6 +135,14 @@ fn parse_approval_absent_defaults_to_always() {
     assert_eq!(parse_approval_policy(&def), ApprovalPolicy::Always);
 }
 
+/// An `ApprovalSelector` selecting only by the given tool names.
+fn names_filter(list: &[&str]) -> ApprovalSelector {
+    ApprovalSelector {
+        names: Some(list.iter().map(|s| (*s).to_owned()).collect()),
+        read_only: None,
+    }
+}
+
 #[test]
 fn parse_approval_filter() {
     let def = json!({
@@ -143,30 +151,26 @@ fn parse_approval_filter() {
             "never": {"tool_names": ["safe_tool"]}
         }
     });
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert_eq!(always, vec!["dangerous_tool"]);
-            assert_eq!(never, vec!["safe_tool"]);
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Filter {
+            always: names_filter(&["dangerous_tool"]),
+            never: names_filter(&["safe_tool"]),
+        }
+    );
 }
 
 #[test]
-fn parse_approval_filter_flat_array_fallback() {
+fn parse_approval_filter_flat_array_is_not_schema_fails_closed() {
+    // The bare-array member form is outside the MCPToolFilter schema, so the
+    // whole policy now fails closed to Always instead of being leniently parsed.
     let def = json!({
         "require_approval": {
             "always": ["dangerous_tool"],
             "never": ["safe_tool"]
         }
     });
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert_eq!(always, vec!["dangerous_tool"]);
-            assert_eq!(never, vec!["safe_tool"]);
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(parse_approval_policy(&def), ApprovalPolicy::Always);
 }
 
 #[test]
@@ -181,40 +185,40 @@ fn parse_approval_unrecognized_string_defaults_to_always() {
 
 #[test]
 fn requires_approval_always() {
-    assert!(requires_approval(&ApprovalPolicy::Always, "any_tool"));
+    assert!(requires_approval(&ApprovalPolicy::Always, "any_tool", false));
 }
 
 #[test]
 fn requires_approval_never() {
-    assert!(!requires_approval(&ApprovalPolicy::Never, "any_tool"));
+    assert!(!requires_approval(&ApprovalPolicy::Never, "any_tool", false));
 }
 
 #[test]
 fn requires_approval_filter_always_list() {
     let policy = ApprovalPolicy::Filter {
-        always: vec!["dangerous".to_owned()],
-        never: vec![],
+        always: names_filter(&["dangerous"]),
+        never: ApprovalSelector::default(),
     };
-    assert!(requires_approval(&policy, "dangerous"));
+    assert!(requires_approval(&policy, "dangerous", false));
 }
 
 #[test]
 fn requires_approval_filter_never_list() {
     let policy = ApprovalPolicy::Filter {
-        always: vec![],
-        never: vec!["safe".to_owned()],
+        always: ApprovalSelector::default(),
+        never: names_filter(&["safe"]),
     };
-    assert!(!requires_approval(&policy, "safe"));
+    assert!(!requires_approval(&policy, "safe", false));
 }
 
 #[test]
 fn requires_approval_filter_always_takes_precedence() {
     let policy = ApprovalPolicy::Filter {
-        always: vec!["tool_x".to_owned()],
-        never: vec!["tool_x".to_owned()],
+        always: names_filter(&["tool_x"]),
+        never: names_filter(&["tool_x"]),
     };
     assert!(
-        requires_approval(&policy, "tool_x"),
+        requires_approval(&policy, "tool_x", false),
         "always should take precedence over never"
     );
 }
@@ -222,41 +226,39 @@ fn requires_approval_filter_always_takes_precedence() {
 #[test]
 fn requires_approval_filter_unlisted_defaults_to_true() {
     let policy = ApprovalPolicy::Filter {
-        always: vec![],
-        never: vec!["other".to_owned()],
+        always: ApprovalSelector::default(),
+        never: names_filter(&["other"]),
     };
     assert!(
-        requires_approval(&policy, "unknown_tool"),
+        requires_approval(&policy, "unknown_tool", false),
         "unlisted tools should default to requiring approval"
     );
 }
 
 // =========================================================================
-// extract_tool_names edge cases (via parse_approval_policy)
+// Filter-member parsing edge cases (via parse_approval_policy)
 // =========================================================================
 
 #[test]
 fn parse_approval_filter_absent_sub_keys() {
     let def = json!({"require_approval": {}});
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert!(always.is_empty());
-            assert!(never.is_empty());
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Filter {
+            always: ApprovalSelector::default(),
+            never: ApprovalSelector::default(),
+        }
+    );
 }
 
 #[test]
-fn parse_approval_filter_non_object_non_array_value() {
+fn parse_approval_filter_invalid_member_type_fails_closed() {
     let def = json!({"require_approval": {"always": 42, "never": true}});
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert!(always.is_empty(), "numeric value should produce empty list");
-            assert!(never.is_empty(), "boolean value should produce empty list");
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Always,
+        "non-object filter members are outside the schema and must fail closed"
+    );
 }
 
 // =========================================================================
@@ -511,6 +513,53 @@ fn find_approval_required_ambiguous_tool_requires_approval() {
     assert!(ungated.is_empty());
     assert_eq!(pending[0].tool_name, "my_server__get");
     assert_eq!(pending[0].server_label, "unknown");
+}
+
+#[test]
+fn find_approval_required_read_only_selector_gates_writable_tool() {
+    // Issue #1398: the approval policy selects by annotation. Under
+    // `always.read_only=false` / `never.read_only=true`, the writable tool must
+    // route to approval while the read-only tool executes automatically — the
+    // `read_only` selector was previously ignored, so both decisions depended
+    // only on names.
+    let policy = json!({"always": {"read_only": false}, "never": {"read_only": true}});
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("srv".to_owned(), "delete".to_owned()),
+        json!({
+            "server_label": "srv",
+            "server_url": "http://srv.example.com/mcp",
+            "headers": null,
+            "authorization": null,
+            "tool_definition": {"name": "delete", "annotations": {"readOnlyHint": false}},
+            "require_approval": policy.clone(),
+        }),
+    );
+    tool_map.insert(
+        ("srv".to_owned(), "list".to_owned()),
+        json!({
+            "server_label": "srv",
+            "server_url": "http://srv.example.com/mcp",
+            "headers": null,
+            "authorization": null,
+            "tool_definition": {"name": "list", "annotations": {"readOnlyHint": true}},
+            "require_approval": policy,
+        }),
+    );
+
+    let calls = vec![
+        json!({"name": "srv__delete", "call_id": "call_1"}),
+        json!({"name": "srv__list", "call_id": "call_2"}),
+    ];
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map);
+    assert_eq!(pending.len(), 1, "the writable tool must require approval");
+    assert_eq!(pending[0].tool_name, "delete");
+    assert_eq!(
+        ungated.len(),
+        1,
+        "the read-only tool is exempted by never.read_only=true"
+    );
+    assert_eq!(ungated[0]["call_id"], "call_2");
 }
 
 // =========================================================================
