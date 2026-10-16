@@ -59,6 +59,7 @@ http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 metrics = { workspace = true }
 openssl = { workspace = true }
+openssl-sys = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }

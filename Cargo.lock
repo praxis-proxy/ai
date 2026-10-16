@@ -3509,6 +3509,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "openssl",
+ "openssl-sys",
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-backends",
