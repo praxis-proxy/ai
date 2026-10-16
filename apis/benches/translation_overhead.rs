@@ -109,6 +109,9 @@ fn report_allocation(label: &str, translation: impl FnOnce()) {
 /// Benchmark Bedrock translation for several large tool schemas.
 fn bedrock_large_tools(c: &mut Criterion) {
     let body = bedrock_large_tool_request();
+    // Warm up once outside the measurement so one-time lazy state (the
+    // compiled model-ID regex) is excluded from the allocation evidence.
+    translate_bedrock(&body);
     report_allocation("bedrock_large_tools", || translate_bedrock(&body));
 
     let mut group = c.benchmark_group("bedrock_large_tools");
