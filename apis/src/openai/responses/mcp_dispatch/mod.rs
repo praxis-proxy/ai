@@ -30,6 +30,7 @@
 
 mod approval;
 mod config;
+mod validate;
 
 pub(crate) use approval::{OWNER_FINGERPRINT, owner_fingerprint};
 
@@ -1714,6 +1715,28 @@ async fn execute_single_call(
         Err(r) => return Some(*r),
     };
 
+    // Enforce the tool's advertised `inputSchema` before any outbound side
+    // effect. A schema violation (wrong type, missing required field, or a field
+    // forbidden by `additionalProperties: false`) is returned as a tool error so
+    // the model can correct itself, and no `tools/call` is dialed (issue #1125).
+    // The message is value-free, and the rejected arguments are not echoed back:
+    // a malformed value may carry private content, and echoing it would also risk
+    // overrunning the result-byte budget and discarding the actionable error.
+    if let Err(message) = validate::validate_arguments(entry.get("tool_definition"), &arguments) {
+        warn!(
+            tool_name = original_tool_name,
+            server_label, call_id, %message,
+            "rejecting MCP tool call: arguments failed input-schema validation"
+        );
+        return Some(build_schema_rejection_result(
+            call_id,
+            server_label,
+            original_tool_name,
+            &message,
+            approval_request_id,
+        ));
+    }
+
     debug!(
         tool_name = original_tool_name,
         server_label, call_id, "executing MCP tool call"
@@ -1895,6 +1918,42 @@ fn error_result_for_dropped_call(tool_call: &serde_json::Value, reason: &str) ->
 /// Extract the approval correlation id threaded through an approved tool call.
 fn approval_request_id(tool_call: &serde_json::Value) -> Option<&str> {
     tool_call.get("approval_request_id").and_then(serde_json::Value::as_str)
+}
+
+/// Build a schema-rejection result that fits the per-call retained-byte
+/// reservation.
+///
+/// The diagnostic is repeated across the replayed message and the public output
+/// item, and the identity fields (`call_id`, `server_label`, tool name, approval
+/// id) consume part of the fixed `MIN_RETAINED_RESULT_BYTES` budget. A fixed
+/// message cap therefore cannot guarantee the fit, so the message is trimmed
+/// until the whole result fits; otherwise the generic size fallback would discard
+/// the actionable explanation (issue #1125 review).
+fn build_schema_rejection_result(
+    call_id: &str,
+    server_label: &str,
+    tool_name: &str,
+    message: &str,
+    approval_request_id: Option<&str>,
+) -> McpCallResult {
+    let mut fitted = message.to_owned();
+    loop {
+        let result = build_error_result(call_id, server_label, tool_name, "", &fitted, approval_request_id);
+        if fitted.is_empty()
+            || result
+                .retained_bytes()
+                .is_none_or(|bytes| bytes <= MIN_RETAINED_RESULT_BYTES)
+        {
+            return result;
+        }
+        // Trim roughly a quarter (at least one byte) on a char boundary and retry.
+        let target = (fitted.len() * 3 / 4).min(fitted.len().saturating_sub(1));
+        let mut end = target;
+        while end > 0 && !fitted.is_char_boundary(end) {
+            end -= 1;
+        }
+        fitted.truncate(end);
+    }
 }
 
 /// Build result structs for a failed MCP call.

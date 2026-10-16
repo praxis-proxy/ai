@@ -1309,6 +1309,114 @@ async fn execute_single_call_connection_error() {
     );
 }
 
+/// A tool map whose single tool advertises a strict `inputSchema`, so dispatch
+/// can enforce argument validation (issue #1125).
+fn schema_tool_map() -> HashMap<(String, String), serde_json::Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        json!({
+            "server_label": "weather",
+            // An unroutable target: a dialed call would fail with a connection
+            // error, so a schema-rejection message proves no outbound call ran.
+            "server_url": "http://weather.example.com/mcp",
+            "headers": null,
+            "authorization": null,
+            "tool_definition": {
+                "name": "get_weather",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false,
+                },
+            },
+            "require_approval": null,
+        }),
+    );
+    map
+}
+
+#[tokio::test]
+async fn execute_single_call_rejects_invalid_arguments_without_dispatch() {
+    let map = schema_tool_map();
+    // `city` must be a string per the advertised schema; a number violates it.
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": 42}});
+    let timeout = std::time::Duration::from_millis(200);
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    let error = result.output_item["error"].as_str().unwrap();
+    assert!(
+        error.contains("input schema"),
+        "schema violation should be surfaced, not a dispatch error: {error}"
+    );
+    // The rejected arguments are not echoed back: a malformed value may carry
+    // private content, and echoing it risks overrunning the result-byte budget.
+    assert_eq!(result.output_item["arguments"], "");
+    // The offending value must not leak into the error or the replayed message.
+    let serialized = format!(
+        "{}{}",
+        serde_json::to_string(&result.output_item).unwrap(),
+        result.message
+    );
+    assert!(
+        !serialized.contains("42"),
+        "the offending value must not appear anywhere in the result: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn execute_single_call_rejects_field_forbidden_by_additional_properties() {
+    let map = schema_tool_map();
+    // `city` is valid, but `unit` is forbidden by additionalProperties:false.
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris", "unit": "c"}});
+    let timeout = std::time::Duration::from_millis(200);
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    let error = result.output_item["error"].as_str().unwrap();
+    assert!(
+        error.contains("input schema"),
+        "forbidden extra field should be rejected before dispatch: {error}"
+    );
+}
+
+#[tokio::test]
+async fn execute_single_call_admits_schema_valid_arguments_to_dispatch() {
+    let map = schema_tool_map();
+    // Schema-valid arguments pass validation and reach the (failing) dial, which
+    // confirms validation does not block conforming calls.
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
+    let timeout = std::time::Duration::from_millis(200);
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    let error = result.output_item["error"].as_str().unwrap();
+    assert!(
+        !error.contains("input schema"),
+        "conforming arguments must not be rejected by validation: {error}"
+    );
+}
+
 // =========================================================================
 // execute_mcp_calls (async)
 // =========================================================================

@@ -751,6 +751,93 @@ class MCPHandler(BaseHTTPRequestHandler):
         pass
 
 
+class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
+    """Deterministic native Responses backend that drives one schema-invalid
+    MCP tool call, then a final message once the gateway rejects it.
+
+    The handler is stateless: it replies based on whether the forwarded input
+    already carries the rejection (a ``function_call_output``), so it needs no
+    request counter and tolerates retries. On the first turn it emits a
+    ``function_call`` to the resolved ``get_weather`` function tool with a
+    type-invalid ``city`` argument; ``openai_mcp_dispatch`` must reject it against
+    the advertised ``inputSchema`` before any outbound ``tools/call``.
+    """
+
+    @staticmethod
+    def _encoded_get_weather(request_body: dict) -> str:
+        """Find the function tool the resolver advertised for ``get_weather``."""
+        for tool in request_body.get("tools") or []:
+            name = tool.get("name", "")
+            if tool.get("type") == "function" and name.endswith("get_weather"):
+                return name
+        return "weather__get_weather"
+
+    @staticmethod
+    def _already_rejected(request_body: dict) -> bool:
+        """True once the loop has fed the rejection back for a second turn."""
+        items = request_body.get("input")
+        if not isinstance(items, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in items
+        )
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body) if body else {}
+
+        if self._already_rejected(request_body):
+            output = [
+                {
+                    "id": "msg_mcp_invalid_final",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "I passed the wrong type; let me correct it.",
+                        }
+                    ],
+                }
+            ]
+        else:
+            output = [
+                {
+                    "id": "fc_mcp_invalid_1",
+                    "type": "function_call",
+                    "call_id": "call_mcp_invalid_1",
+                    "name": self._encoded_get_weather(request_body),
+                    # ``city`` must be a string per the advertised schema; a number
+                    # violates it, so the gateway rejects it before dispatch.
+                    "arguments": json.dumps({"city": 42}),
+                    "status": "completed",
+                }
+            ]
+
+        payload = json.dumps(
+            {
+                "id": f"resp_mcp_invalid_{time.time_ns()}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "status": "completed",
+                "output": output,
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 class BraveSearchHandler(BaseHTTPRequestHandler):
     """Mock Brave Search API returning canned results.
 
@@ -6401,6 +6488,131 @@ class TestClientToolCompatChatVLLM:
             for item in second.output
         ), f"lowered names must not leak on continuation: {[i.type for i in second.output]}"
         assert any(t.type == "custom" for t in second.tools), second.tools
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_backend():
+    """Start the deterministic schema-invalid MCP backend for the session."""
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), McpInvalidArgsBackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_proxy(
+    tmp_path_factory, request, mcp_server, nemo_guardrails_server, mcp_invalid_args_backend
+):
+    """Start the full-flow agentic proxy against the deterministic backend.
+
+    This drives MCP argument validation through the real OpenAI client without a
+    live model: the backend scripts one schema-invalid tool call and a recovery
+    message, so the outcome is deterministic in every lane (issue #1125).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-invalid-args-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        nemo_port=nemo_guardrails_server,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP invalid-args Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_client(mcp_invalid_args_proxy):
+    """Return an OpenAI client pointed at the deterministic MCP proxy."""
+    proxy_port, _ = mcp_invalid_args_proxy
+    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+
+
+@qualification_profile("supporting")
+def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
+    mcp_invalid_args_client, mcp_invalid_args_proxy
+):
+    """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
+
+    The backend emits a ``get_weather`` call whose ``city`` argument is a number,
+    violating the tool's advertised ``inputSchema``. The gateway must reject it
+    with an actionable, value-free tool error, make zero outbound ``tools/call``,
+    and let the loop recover to a model message.
+    """
+    _, mcp_port = mcp_invalid_args_proxy
+    tools = [
+        {
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never",
+        }
+    ]
+    calls_before = MCPHandler.tool_call_count()
+
+    response = mcp_invalid_args_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=tools,
+        store=True,
+        max_output_tokens=512,
+    )
+
+    # Zero outbound tools/call: the violation is caught before dispatch.
+    assert MCPHandler.tool_call_count() == calls_before, (
+        "schema-invalid arguments must not reach the upstream MCP server"
+    )
+
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 1, (
+        "the rejected call should surface exactly one mcp_call; got "
+        f"{[item.type for item in response.output]}"
+    )
+    rejected = mcp_calls[0]
+    assert rejected.error and (
+        "tool call arguments do not match the tool input schema" in rejected.error
+    ), f"the mcp_call must carry the actionable schema error: {rejected.error!r}"
+    assert not rejected.output, "a rejected call produces no tool output"
+    # The offending value is masked out of the client-visible result.
+    assert "42" not in (rejected.error or ""), (
+        f"the offending value must not be echoed to the client: {rejected.error!r}"
+    )
+    # The loop re-enters inference and resumes to a model message.
+    assert any(item.type == "message" for item in response.output), (
+        "the loop should resume to a model message after the rejection; got "
+        f"{[item.type for item in response.output]}"
+    )
 
 
 class TestAgenticLoopVLLM:
