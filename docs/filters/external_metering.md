@@ -26,6 +26,7 @@ When no `{prefix}model` identity header names the model and `model_to_provider` 
 | `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
 | `default_model` | string | no | Fallback model name when no identity model header is present. |
+| `internal_auth_token` | CredentialSource | no | Optional internal bearer token for authenticating metering callouts (the balance check and the usage report). One of `value \| env_var \| file`, read through the shared [`CredentialSource`] core: bounded reads, restart-free file rotation (ideal for a Kubernetes projected Secret), and fail-closed publication. When omitted, callouts are sent unauthenticated (unchanged behavior). |
 
 ## Example
 

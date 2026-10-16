@@ -3,6 +3,7 @@
 
 //! Deserialized YAML configuration types for the external metering filter.
 
+use praxis_ai_apis::credential_source::CredentialSource;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -93,6 +94,15 @@ pub(super) struct ExternalMeteringConfig {
     /// Fallback model name when no identity model header is present.
     #[serde(default)]
     pub default_model: Option<String>,
+
+    /// Optional internal bearer token for authenticating metering callouts
+    /// (the balance check and the usage report). One of `value | env_var |
+    /// file`, read through the shared [`CredentialSource`] core: bounded reads,
+    /// restart-free file rotation (ideal for a Kubernetes projected Secret),
+    /// and fail-closed publication. When omitted, callouts are sent
+    /// unauthenticated (unchanged behavior).
+    #[serde(default)]
+    pub internal_auth_token: Option<CredentialSource>,
 }
 
 /// Validate config at construction time.
