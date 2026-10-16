@@ -37,6 +37,8 @@ const DEFAULT_TEXT_FORMAT: &str = "text";
 
 /// Maximum query length accepted by the synthesized web-search function.
 const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 4_096;
+/// Maximum queries accepted in one synthesized web-search call.
+const WEB_SEARCH_MAX_QUERIES: usize = 64;
 
 /// Maximum query length advertised by the synthesized file-search function.
 ///
@@ -1321,13 +1323,18 @@ fn synthesized_web_search_tool() -> Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": WEB_SEARCH_QUERY_MAX_LENGTH
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": WEB_SEARCH_QUERY_MAX_LENGTH
+                        },
+                        "minItems": 1,
+                        "maxItems": WEB_SEARCH_MAX_QUERIES
                     }
                 },
-                "required": ["query"],
+                "required": ["queries"],
                 "additionalProperties": false
             },
             "strict": true
@@ -2156,7 +2163,7 @@ pub(crate) fn web_search_call_output_item_from_parts(
     if call_id.is_empty() {
         return Err(TranslationError::InvalidWebSearchCall("missing call id"));
     }
-    let query = web_search_query(arguments)?;
+    let action = web_search_action(arguments)?;
     // The response can be incomplete because generation hit a token or content
     // filter limit, but WebSearchToolCall has no `incomplete` item status.
     // Preserve the response-level status and represent the interrupted hosted
@@ -2167,10 +2174,7 @@ pub(crate) fn web_search_call_output_item_from_parts(
         "id": call_id,
         "type": "web_search_call",
         "status": status,
-        "action": {
-            "type": "search",
-            "query": query
-        }
+        "action": action
     }))
 }
 
@@ -2186,25 +2190,58 @@ fn web_search_call_id(tool_call: &Value) -> Result<&str, TranslationError> {
 /// Strict arguments accepted from the private web-search function.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WebSearchFunctionArguments {
-    /// Query to pass to the hosted search executor.
+struct WebSearchQueriesFunctionArguments {
+    /// Queries to pass to the hosted search executor.
+    queries: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Deprecated singular arguments retained for existing Chat backends.
+struct WebSearchQueryFunctionArguments {
+    /// Deprecated query form retained for existing Chat backends.
     query: String,
 }
 
-/// Parse and bound the query emitted by a Chat Completions model.
-fn web_search_query(arguments: &str) -> Result<String, TranslationError> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+/// Arguments accepted from the private web-search function.
+enum WebSearchFunctionArguments {
+    /// Current multi-query form.
+    Queries(WebSearchQueriesFunctionArguments),
+    /// Deprecated single-query form.
+    Query(WebSearchQueryFunctionArguments),
+}
+
+/// Parse and bound the action emitted by a Chat Completions model.
+fn web_search_action(arguments: &str) -> Result<Value, TranslationError> {
     let parsed: WebSearchFunctionArguments = serde_json::from_str(arguments).map_err(|_error| {
-        TranslationError::InvalidWebSearchCall("arguments must contain only a string-valued query")
+        TranslationError::InvalidWebSearchCall("arguments must contain a string-valued query or queries array")
     })?;
-    if parsed.query.is_empty() {
+
+    let queries = match parsed {
+        WebSearchFunctionArguments::Queries(args) => args.queries,
+        WebSearchFunctionArguments::Query(args) => vec![args.query],
+    };
+
+    if queries.is_empty() {
         return Err(TranslationError::InvalidWebSearchCall(
-            "query must be a non-empty string",
+            "queries must contain at least one non-empty string",
         ));
     }
-    if parsed.query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH {
-        return Err(TranslationError::InvalidWebSearchCall("query exceeds maximum length"));
+    if queries.len() > WEB_SEARCH_MAX_QUERIES {
+        return Err(TranslationError::InvalidWebSearchCall("queries exceed maximum count"));
     }
-    Ok(parsed.query)
+    if queries
+        .iter()
+        .any(|query| query.is_empty() || query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH)
+    {
+        return Err(TranslationError::InvalidWebSearchCall(
+            "each query must be a non-empty string within the maximum length",
+        ));
+    }
+
+    Ok(json!({"type": "search", "queries": queries}))
 }
 
 /// Build one `Responses` function call item from a Chat Completions tool call.

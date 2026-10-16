@@ -61,7 +61,7 @@
               "model": "synthetic-chat-web-search",
               "object": "response",
               "output": [{
-                "action": {"query": "Praxis Proxy latest release", "type": "search"},
+                "action": {"queries": ["Praxis Proxy latest release"], "type": "search"},
                 "id": "call_recorded_0002",
                 "status": "completed",
                 "type": "web_search_call"
@@ -113,8 +113,15 @@
                   "name": "web_search",
                   "parameters": {
                     "additionalProperties": false,
-                    "properties": {"query": {"maxLength": 4096, "minLength": 1, "type": "string"}},
-                    "required": ["query"],
+                    "properties": {
+                      "queries": {
+                        "items": {"maxLength": 4096, "minLength": 1, "type": "string"},
+                        "maxItems": 64,
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": ["queries"],
                     "type": "object"
                   },
                   "strict": true
@@ -139,7 +146,10 @@
                   "content": null,
                   "role": "assistant",
                   "tool_calls": [{
-                    "function": {"arguments": "{\"query\":\"Praxis Proxy latest release\"}", "name": "web_search"},
+                    "function": {
+                      "arguments": "{\"queries\":[\"Praxis Proxy latest release\"]}",
+                      "name": "web_search"
+                    },
                     "id": "call_recorded_0002",
                     "type": "function"
                   }]
