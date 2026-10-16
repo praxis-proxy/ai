@@ -3812,22 +3812,39 @@ struct CapturedRecord {
     fields: std::collections::BTreeMap<&'static str, String>,
 }
 
-/// A `tracing` layer that records spans and events for assertions.
+/// A `tracing` capture whose storage is private to one test thread.
 ///
-/// Install it with [`TracingCapture::install`] and keep the returned
-/// guard alive for the duration of the scenario; it is a thread-local
-/// default, so drive the code under test on the current thread.
+/// The subscriber is installed once for the test binary, while this value is
+/// selected through a thread-local sink. Tracing callsite interest is cached
+/// process-wide, so installing a scoped subscriber per test can race with
+/// another test and cause an event to be permanently skipped.
 #[derive(Debug, Clone, Default)]
 struct TracingCapture {
     events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
     spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
 }
 
+thread_local! {
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<TracingCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Process-wide always-interested layer; per-test routing happens through
+/// [`ACTIVE_CAPTURE`] rather than through a scoped dispatcher.
+#[derive(Debug, Default)]
+struct GlobalTracingCapture;
+
 impl TracingCapture {
-    /// Make this capture the default subscriber for the current thread.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    /// Select this capture for the current test thread.
+    fn install(&self) -> TracingCaptureGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(GlobalTracingCapture))
+                .expect("token-rate-limit tracing capture must own the test subscriber");
+        });
+        ACTIVE_CAPTURE.with(|active| TracingCaptureGuard {
+            previous: active.replace(Some(self.clone())),
+        })
     }
 
     /// Every event recorded so far, oldest first.
@@ -3844,6 +3861,19 @@ impl TracingCapture {
             .iter()
             .map(|(_, record)| record.clone())
             .collect()
+    }
+}
+
+/// Restores any prior capture when a test exits, including by unwinding.
+struct TracingCaptureGuard {
+    previous: Option<TracingCapture>,
+}
+
+impl Drop for TracingCaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| {
+            drop(active.replace(self.previous.take()));
+        });
     }
 }
 
@@ -3873,25 +3903,35 @@ impl tracing::field::Visit for FieldText {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GlobalTracingCapture {
+    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        attrs.record(&mut fields);
-        let metadata = attrs.metadata();
-        self.spans.lock().expect("capture lock").push((
-            id.into_u64(),
-            CapturedRecord {
-                name: metadata.name(),
-                target: metadata.target().to_owned(),
-                level: *metadata.level(),
-                fields: fields.0,
-            },
-        ));
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            attrs.record(&mut fields);
+            let metadata = attrs.metadata();
+            capture.spans.lock().expect("capture lock").push((
+                id.into_u64(),
+                CapturedRecord {
+                    name: metadata.name(),
+                    target: metadata.target().to_owned(),
+                    level: *metadata.level(),
+                    fields: fields.0,
+                },
+            ));
+        });
     }
 
     fn on_record(
@@ -3900,23 +3940,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
         values: &tracing::span::Record<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        values.record(&mut fields);
-        let mut spans = self.spans.lock().expect("capture lock");
-        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
-            record.fields.extend(fields.0);
-        }
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            values.record(&mut fields);
+            let mut spans = capture.spans.lock().expect("capture lock");
+            if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+                record.fields.extend(fields.0);
+            }
+        });
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let mut fields = FieldText::default();
-        event.record(&mut fields);
-        let metadata = event.metadata();
-        self.events.lock().expect("capture lock").push(CapturedRecord {
-            name: "event",
-            target: metadata.target().to_owned(),
-            level: *metadata.level(),
-            fields: fields.0,
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            let metadata = event.metadata();
+            capture.events.lock().expect("capture lock").push(CapturedRecord {
+                name: "event",
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            });
         });
     }
 }
