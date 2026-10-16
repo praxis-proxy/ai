@@ -3505,6 +3505,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "crc32fast",
+ "criterion",
  "futures",
  "http",
  "jsonschema",
