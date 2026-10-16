@@ -309,6 +309,7 @@ lint-xtask:
 	cargo xtask check-chat-completions-registry
 	cargo xtask check-files-registry
 	cargo xtask check-vector-stores-registry
+	cargo xtask check-anthropic-messages-registry
 	cargo xtask openresponses-coverage
 	cargo xtask translation-matrix
 
