@@ -2088,6 +2088,35 @@ mod tests {
     }
 
     #[test]
+    fn orphan_output_between_call_and_linked_output_keeps_input_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "user", "content": "orphan result"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+            ]),
+            "an orphan between a call and its linked output lowers at its own input position"
+        );
+    }
+
+    #[test]
     fn function_calls_separated_by_other_items_produce_separate_messages() {
         let mapped = map(&json!({
             "model": "m",

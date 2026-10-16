@@ -2766,7 +2766,7 @@ def test_orphan_function_call_output_survives_repeated_chat_turns(conversation_b
             orphan_passthrough = [
                 i
                 for i in input_items
-                if i.get("type") == "function_call_output" and not i.get("call_id")
+                if i.get("type") == "function_call_output" and i.get("call_id") is None
             ]
             assert len(orphan_passthrough) == 2, (
                 "native passthrough must retain stored orphan items as-is"
@@ -2780,7 +2780,7 @@ def test_orphan_function_call_output_survives_repeated_chat_turns(conversation_b
     assert {item.output for item in orphan_items} == {
         "orphan null result",
         "orphan missing result",
-    }, "stored orphan items must be retained unchanged after two responses"
+    }, "stored orphan items must survive two responses in their normalized stored shape"
 
 
 def test_structured_mcp_failure_append_back(conversation_backend):
