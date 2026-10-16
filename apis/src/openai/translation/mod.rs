@@ -2026,15 +2026,30 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_call_id_returns_error() {
+    fn function_call_output_without_call_id_becomes_user_text() {
+        for item in [
+            json!({"type": "function_call_output", "output": "done"}),
+            json!({"type": "function_call_output", "call_id": null, "output": "done"}),
+            json!({"type": "function_call_output", "output": [{"type": "input_text", "text": "done"}]}),
+        ] {
+            let mapped = map(&json!({"model": "m", "input": [item]}));
+            assert_eq!(
+                mapped["messages"],
+                json!([{"role": "user", "content": "done"}]),
+                "an uncorrelated output retains its text without inventing a Chat tool-call relationship"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_with_invalid_call_id_still_returns_error() {
         let error = map_error(&json!({
             "model": "m",
-            "input": [{"type": "function_call_output", "output": "done"}]
+            "input": [{"type": "function_call_output", "call_id": 42, "output": "done"}]
         }));
-
         assert_eq!(
-            error,
-            "Responses function_call_output input item is missing required field `call_id`"
+            error, "Responses function_call_output input item field `call_id` must be a string",
+            "only absent or null call IDs may be lowered to uncorrelated text"
         );
     }
 

@@ -837,20 +837,43 @@ fn function_call_tool_call(obj: &Map<String, Value>) -> Result<Value, Translatio
     }))
 }
 
-/// Convert a `Responses` function call output item into a Chat tool message.
+/// Convert a `Responses` function call output item into a Chat message.
+///
+/// A linked output (string `call_id`) becomes a Chat tool message. An
+/// orphan output (`call_id` absent or null) has no tool call to correlate
+/// with, so its text lowers to a user message instead of failing the
+/// translated request; stored history can legitimately contain such items
+/// after the conversation contract made `call_id` optional. Any other
+/// `call_id` shape stays invalid input and fails closed.
 fn append_tool_output(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let call_id = required_input_item_string(obj, "function_call_output", "call_id")?;
+    let linked_call_id = match obj.get("call_id") {
+        Some(Value::String(call_id)) => Some(call_id),
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            return Err(TranslationError::InvalidInputItemStringField {
+                item_type: "function_call_output",
+                field: "call_id",
+            });
+        },
+    };
     let output = obj.get("output").ok_or(TranslationError::MissingInputItemField {
         item_type: "function_call_output",
         field: "output",
     })?;
     let content = convert_function_call_output(output)?;
 
-    messages.push(json!({
-        "role": "tool",
-        "tool_call_id": call_id,
-        "content": content
-    }));
+    // The request history is borrowed; the owned Chat request keeps this text.
+    match linked_call_id {
+        Some(call_id) => messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content
+        })),
+        None => messages.push(json!({
+            "role": "user",
+            "content": content
+        })),
+    }
     Ok(())
 }
 
