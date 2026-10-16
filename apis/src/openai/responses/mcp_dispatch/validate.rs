@@ -88,10 +88,9 @@ fn advertised_input_schema(tool_definition: Option<&Value>) -> Option<&Value> {
 /// check does not add stricter semantics than the advertisement.
 pub(super) fn validate_arguments(tool_definition: Option<&Value>, arguments: &Value) -> Result<(), String> {
     let schema = advertised_input_schema(tool_definition).unwrap_or(&DEFAULT_OBJECT_SCHEMA);
-    let Ok(validator) = jsonschema::validator_for(schema) else {
-        warn!("mcp_dispatch: tool input schema did not compile; skipping argument validation");
-        return Ok(());
-    };
+    // Estimate before compiling: `validator_for` recurses through `$ref`s, so a
+    // deep reference chain can overflow the stack during compilation. The
+    // depth-capped estimate never recurses unbounded, so it is the safe gate.
     if schema_work_estimate(schema) > WORK_BUDGET {
         warn!(
             budget = WORK_BUDGET,
@@ -99,6 +98,10 @@ pub(super) fn validate_arguments(tool_definition: Option<&Value>, arguments: &Va
         );
         return Ok(());
     }
+    let Ok(validator) = jsonschema::validator_for(schema) else {
+        warn!("mcp_dispatch: tool input schema did not compile; skipping argument validation");
+        return Ok(());
+    };
     check(&validator, arguments)
 }
 
@@ -162,21 +165,42 @@ fn estimate(node: &Value, root: &Value, memo: &mut HashMap<String, u64>, depth: 
         return WORK_BUDGET.saturating_add(1);
     }
     match node {
-        Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get("$ref") {
-                return estimate_ref(reference, root, memo, depth);
-            }
-            // `$defs`/`definitions` are stores reached only through `$ref`, so
-            // counting them inline would over-count unreferenced definitions.
-            let children = map
-                .iter()
-                .filter(|(k, _)| *k != "$defs" && *k != "definitions")
-                .map(|(_, v)| v);
-            estimate_sum(children, root, memo, depth, 1)
-        },
+        Value::Object(map) => estimate_object(map, root, memo, depth),
         Value::Array(items) => estimate_sum(items.iter(), root, memo, depth, 0),
         _ => 0,
     }
+}
+
+/// Estimate an object schema.
+///
+/// `$defs`/`definitions` are stores reached only through `$ref`, so they are
+/// skipped. Every other key is summed, including a `$ref` *and its siblings*:
+/// JSON Schema 2020-12 evaluates sibling keywords alongside the reference, so
+/// ignoring them would let a bomb hide next to a harmless reference.
+fn estimate_object(
+    map: &serde_json::Map<String, Value>,
+    root: &Value,
+    memo: &mut HashMap<String, u64>,
+    depth: usize,
+) -> u64 {
+    let mut total: u64 = 1;
+    for (key, child) in map {
+        if key == "$defs" || key == "definitions" {
+            continue;
+        }
+        let added = if key == "$ref" {
+            child
+                .as_str()
+                .map_or(0, |reference| estimate_ref(reference, root, memo, depth))
+        } else {
+            estimate(child, root, memo, depth + 1)
+        };
+        total = total.saturating_add(added);
+        if total > WORK_BUDGET {
+            return total;
+        }
+    }
+    total
 }
 
 /// Sum [`estimate`] over child schemas, saturating and stopping once the running
@@ -206,9 +230,11 @@ fn estimate_ref(reference: &str, root: &Value, memo: &mut HashMap<String, u64>, 
         return cached;
     }
     let Some(target) = resolve_local_ref(reference, root) else {
-        // A non-local or unresolvable reference is never fetched by the
-        // validator, so it cannot amplify; count it as a single leaf.
-        return 1;
+        // The validator may resolve a form this estimator does not (an `$anchor`,
+        // an absolute URI, an exotic encoding). Counting it as a cheap leaf would
+        // let such a reference smuggle a bomb past the budget, so treat any
+        // reference this estimator cannot follow as over budget (skip validation).
+        return WORK_BUDGET.saturating_add(1);
     };
     // Seed with an over-budget sentinel so a reference that re-enters itself
     // (a cycle) resolves to over budget instead of recursing until the depth cap.
@@ -219,13 +245,18 @@ fn estimate_ref(reference: &str, root: &Value, memo: &mut HashMap<String, u64>, 
 }
 
 /// Resolve a local (`#/...`) JSON-pointer `$ref` against the root schema.
+///
+/// A `$ref` is a URI reference, so its fragment is percent-encoded; it is decoded
+/// before JSON-pointer parsing so an encoded pointer such as `#/$defs/%6422`
+/// resolves to the same target the validator reaches (`#/$defs/d22`).
 fn resolve_local_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
-    let pointer = reference.strip_prefix('#')?;
-    if pointer.is_empty() {
+    let fragment = reference.strip_prefix('#')?;
+    let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8().ok()?;
+    if decoded.is_empty() {
         return Some(root);
     }
     let mut current = root;
-    for raw in pointer.split('/').skip(1) {
+    for raw in decoded.split('/').skip(1) {
         let token = raw.replace("~1", "/").replace("~0", "~");
         current = match current {
             Value::Object(map) => map.get(&token)?,
@@ -238,7 +269,16 @@ fn resolve_local_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> 
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::panic, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::exit,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
 
@@ -430,21 +470,27 @@ mod tests {
         assert!(validate_arguments(Some(&def), &json!({"a": "x"})).is_err());
     }
 
-    /// Build an `allOf`-doubling `$ref` bomb: `d_n` references `d_{n-1}` twice, so
-    /// a full expansion is `2^n` leaves while the definition stays compact.
-    fn ref_bomb(depth: usize, wrapper: &str) -> Value {
+    /// `$defs` for an `allOf`-doubling `$ref` bomb: `d_n` references `d_{n-1}`
+    /// twice, so a full expansion is `2^n` leaves while the definition stays
+    /// compact.
+    fn bomb_defs(depth: usize) -> serde_json::Map<String, Value> {
         let mut defs = serde_json::Map::new();
         defs.insert("d0".to_owned(), json!({"not": {}}));
         for i in 1..=depth {
             let child = format!("#/$defs/d{}", i - 1);
             defs.insert(format!("d{i}"), json!({"allOf": [{"$ref": child}, {"$ref": child}]}));
         }
+        defs
+    }
+
+    /// A tool definition whose schema reaches the bomb through `wrapper`.
+    fn ref_bomb(depth: usize, wrapper: &str) -> Value {
         json!({
             "name": "boom",
             "inputSchema": {
                 "type": "object",
                 wrapper: [{"$ref": format!("#/$defs/d{depth}")}],
-                "$defs": Value::Object(defs),
+                "$defs": Value::Object(bomb_defs(depth)),
             },
         })
     }
@@ -493,5 +539,165 @@ mod tests {
             },
         });
         assert!(validate_arguments(Some(&def), &json!({"child": {"child": {}}})).is_ok());
+    }
+
+    // --- Deterministic work-estimate assertions (no wall-clock) ---------------
+
+    #[test]
+    fn work_estimate_is_small_for_a_normal_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "count": {"type": "integer"}},
+            "required": ["city"],
+            "additionalProperties": false,
+        });
+        assert!(
+            schema_work_estimate(&schema) < WORK_BUDGET,
+            "a normal tool schema must stay well under budget"
+        );
+    }
+
+    #[test]
+    fn work_estimate_exceeds_budget_for_allof_bomb() {
+        let schema = ref_bomb(22, "allOf")["inputSchema"].clone();
+        assert!(schema_work_estimate(&schema) > WORK_BUDGET);
+    }
+
+    #[test]
+    fn work_estimate_counts_ref_siblings() {
+        // 2020-12 evaluates keywords beside a `$ref`, so a bomb hidden next to a
+        // harmless reference must still be counted (regression: early-return on
+        // `$ref` let it bypass the guard).
+        let mut defs = bomb_defs(22);
+        defs.insert("harmless".to_owned(), json!({"type": "object"}));
+        let schema = json!({
+            "$ref": "#/$defs/harmless",
+            "allOf": [{"$ref": "#/$defs/d22"}],
+            "$defs": Value::Object(defs),
+        });
+        assert!(
+            schema_work_estimate(&schema) > WORK_BUDGET,
+            "a bomb beside a harmless $ref must not slip through"
+        );
+    }
+
+    #[test]
+    fn work_estimate_follows_percent_encoded_refs() {
+        // `%64` decodes to 'd', so `#/$defs/%6422` targets `d22` just as the
+        // validator resolves it (regression: estimator counted it as one leaf).
+        let schema = json!({
+            "allOf": [{"$ref": "#/$defs/%6422"}],
+            "$defs": Value::Object(bomb_defs(22)),
+        });
+        assert!(
+            schema_work_estimate(&schema) > WORK_BUDGET,
+            "a percent-encoded $ref must resolve to its real target"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_ref_resolves_to_its_target() {
+        let schema = json!({"$defs": {"d22": {"const": "x"}}});
+        assert_eq!(
+            resolve_local_ref("#/$defs/%6422", &schema),
+            Some(&json!({"const": "x"}))
+        );
+    }
+
+    #[test]
+    fn work_estimate_exceeds_budget_for_deep_linear_chain() {
+        let mut defs = serde_json::Map::new();
+        defs.insert("d0".to_owned(), json!({"type": "object"}));
+        for i in 1..=500 {
+            defs.insert(format!("d{i}"), json!({"$ref": format!("#/$defs/d{}", i - 1)}));
+        }
+        let schema = json!({"$ref": "#/$defs/d500", "$defs": Value::Object(defs)});
+        assert!(
+            schema_work_estimate(&schema) > WORK_BUDGET,
+            "a deep $ref chain must exceed the budget via the depth cap"
+        );
+    }
+
+    // --- Production-path (validate_arguments) adversarial regressions ---------
+
+    #[test]
+    fn ref_sibling_bomb_is_skipped_in_validation() {
+        use std::time::{Duration, Instant};
+        let mut defs = bomb_defs(22);
+        defs.insert("harmless".to_owned(), json!({"type": "object"}));
+        let def = json!({
+            "name": "sibling_boom",
+            "inputSchema": {
+                "$ref": "#/$defs/harmless",
+                "allOf": [{"$ref": "#/$defs/d22"}],
+                "$defs": Value::Object(defs),
+            },
+        });
+        let start = Instant::now();
+        assert!(validate_arguments(Some(&def), &json!({})).is_ok());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "sibling bomb must not be enumerated"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_ref_bomb_is_skipped_in_validation() {
+        use std::time::{Duration, Instant};
+        let def = json!({
+            "name": "encoded_boom",
+            "inputSchema": {"allOf": [{"$ref": "#/$defs/%6422"}], "$defs": Value::Object(bomb_defs(22))},
+        });
+        let start = Instant::now();
+        assert!(validate_arguments(Some(&def), &json!({})).is_ok());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "encoded bomb must not be enumerated"
+        );
+    }
+
+    #[test]
+    fn deep_ref_chain_does_not_crash_the_process() {
+        // A deep `$ref` chain overflows the stack inside `validator_for` if
+        // compilation runs before the depth-capped estimate. Run the check in an
+        // isolated subprocess so a regression surfaces as a non-zero child exit,
+        // not a crash of the whole test binary.
+        const MARKER: &str = "DEEP_REF_CHAIN_OK";
+        const TEST_PATH: &str =
+            "openai::responses::mcp_dispatch::validate::tests::deep_ref_chain_does_not_crash_the_process";
+
+        if std::env::var("PRAXIS_MCP_DEEP_REF_CHILD").is_ok() {
+            let mut defs = serde_json::Map::new();
+            defs.insert("d0".to_owned(), json!({"type": "object"}));
+            for i in 1..=3000 {
+                defs.insert(format!("d{i}"), json!({"$ref": format!("#/$defs/d{}", i - 1)}));
+            }
+            let def = json!({
+                "name": "chain",
+                "inputSchema": {"$ref": "#/$defs/d3000", "$defs": Value::Object(defs)},
+            });
+            // Must return (fail open) without overflowing the stack.
+            assert!(validate_arguments(Some(&def), &json!({})).is_ok());
+            println!("{MARKER}");
+            std::process::exit(0);
+        }
+
+        let exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", TEST_PATH, "--nocapture"])
+            .env("PRAXIS_MCP_DEEP_REF_CHILD", "1")
+            .output()
+            .expect("spawn isolated child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "deep $ref chain must not crash the process: status={:?}\nstdout={stdout}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            stdout.contains(MARKER),
+            "child did not run the deep-chain check; stdout={stdout}"
+        );
     }
 }

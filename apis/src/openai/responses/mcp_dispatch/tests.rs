@@ -1352,7 +1352,7 @@ async fn execute_single_call_rejects_invalid_arguments_without_dispatch() {
     )
     .await
     .unwrap();
-    let error = result.output_item["error"].as_str().unwrap();
+    let error = result.output_item["error"]["content"].as_str().unwrap();
     assert!(
         error.contains("input schema"),
         "schema violation should be surfaced, not a dispatch error: {error}"
@@ -1387,7 +1387,7 @@ async fn execute_single_call_rejects_field_forbidden_by_additional_properties() 
     )
     .await
     .unwrap();
-    let error = result.output_item["error"].as_str().unwrap();
+    let error = result.output_item["error"]["content"].as_str().unwrap();
     assert!(
         error.contains("input schema"),
         "forbidden extra field should be rejected before dispatch: {error}"
@@ -1410,7 +1410,7 @@ async fn execute_single_call_admits_schema_valid_arguments_to_dispatch() {
     )
     .await
     .unwrap();
-    let error = result.output_item["error"].as_str().unwrap();
+    let error = result.output_item["error"]["content"].as_str().unwrap();
     assert!(
         !error.contains("input schema"),
         "conforming arguments must not be rejected by validation: {error}"

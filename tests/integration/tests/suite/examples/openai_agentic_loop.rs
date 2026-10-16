@@ -546,7 +546,7 @@ fn invalid_mcp_arguments_are_rejected_without_an_outbound_call() {
         .find(|item| item["type"] == "mcp_call")
         .expect("the rejected call should surface an mcp_call item");
     assert!(
-        mcp_call["error"]
+        mcp_call["error"]["content"]
             .as_str()
             .is_some_and(|error| error.contains("tool call arguments do not match the tool input schema")),
         "the mcp_call item should carry the schema error: {mcp_call:#?}"

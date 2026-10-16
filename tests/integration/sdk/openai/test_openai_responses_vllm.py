@@ -6600,12 +6600,17 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
         f"{[item.type for item in response.output]}"
     )
     rejected = mcp_calls[0]
-    assert rejected.error and (
-        "tool call arguments do not match the tool input schema" in rejected.error
-    ), f"the mcp_call must carry the actionable schema error: {rejected.error!r}"
+    # The gateway returns a structured mcp_call error; the SDK exposes it as an
+    # McpToolExecutionError (`.content`). Fall back to str for older SDK lanes.
+    error_text = getattr(rejected.error, "content", None)
+    if error_text is None:
+        error_text = rejected.error if isinstance(rejected.error, str) else str(rejected.error or "")
+    assert "tool call arguments do not match the tool input schema" in error_text, (
+        f"the mcp_call must carry the actionable schema error: {rejected.error!r}"
+    )
     assert not rejected.output, "a rejected call produces no tool output"
     # The offending value is masked out of the client-visible result.
-    assert "42" not in (rejected.error or ""), (
+    assert "42" not in error_text, (
         f"the offending value must not be echoed to the client: {rejected.error!r}"
     )
     # The loop re-enters inference and resumes to a model message.
