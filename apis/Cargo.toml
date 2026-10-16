@@ -25,7 +25,7 @@ openai-responses-openapi = ["openai-responses", "dep:utoipa"]
 openai-file-resolve-filter = ["openai-responses"]
 # Response and conversation storage. The SQL backends live in praxis-ai-store-backends
 # so a build without a backend carries no SQL client or crypto.
-store = ["openai-responses", "praxis-ai-store/compression"]
+store = ["openai-responses", "praxis-ai-store/compression", "dep:praxis-ai-store-lifecycle"]
 # Internal implementation marker shared by both PostgreSQL profiles. Do not
 # enable directly; select one of the public features below.
 _store-postgres = ["store", "dep:praxis-ai-store-backends"]
@@ -39,11 +39,17 @@ openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
-openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
+# jsonschema enforces each tool-call's arguments against the advertised
+# `inputSchema` before dispatch (issue #1125).
+openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream", "dep:jsonschema"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
 full = ["openai-all", "store-postgres"]
+# Experimental: the anthropic_messages_to_vertexai_anthropic translation filter
+# (Anthropic Messages to Vertex AI rawPredict). Work in progress; the config
+# surface may change. Enabled through praxis-ai-filters' vertex-anthropic-filter.
+vertex-anthropic = []
 praxis-main = []
 
 [lints]
@@ -62,10 +68,12 @@ openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }
-# Transitional: apis re-exports the SQL backends at crate::store::* so the
-# conversations and responses filters keep compiling. Removed once #1259b and
-# #1262 take those filters off concrete-store construction. default-features off
-# so a per-backend apis build forwards only the backend it selects.
+praxis-ai-store-lifecycle = { workspace = true, optional = true }
+# apis uses the SQL backends directly in the responses and conversations store
+# config (URL, TLS, and table-identifier validation) and re-exports the concrete
+# stores and provisioning factory at crate::store::* for the server provisioning
+# bridge and the store test suites. default-features off so a per-backend apis
+# build forwards only the backend it selects.
 praxis-ai-store-backends = { path = "../store-backends", optional = true, default-features = false }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,

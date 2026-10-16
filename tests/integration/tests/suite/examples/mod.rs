@@ -41,8 +41,11 @@ mod guardrails;
 mod guardrails_response;
 mod identity_header_guard;
 mod inference_fallback;
+#[cfg(feature = "inflight-tracker-filter")]
+mod inflight_tracking;
 mod intelligent_route_hardening;
 mod intelligent_route_management_skip;
+mod intelligent_route_metrics;
 mod intelligent_route_projected_credentials;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
@@ -52,6 +55,8 @@ mod llmd_ext_proc;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
+mod model_to_header_trust_existing;
+mod model_to_provider;
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;
 #[cfg(feature = "store-sqlite")]
@@ -115,6 +120,8 @@ mod token_counting;
 mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
+#[cfg(feature = "vertex-anthropic-filter")]
+mod vertex_anthropic;
 mod vertex_gemini;
 mod vllm_agentic_api;
 mod web_search;

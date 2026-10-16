@@ -117,13 +117,19 @@ pub struct McpToolFixture {
 }
 
 impl McpToolFixture {
-    /// Create a fixture with the given name, an empty
+    /// Create a fixture with the given name, a permissive
     /// object schema, and no description.
+    ///
+    /// The mock's `tools/call` handler echoes a canned result regardless of the
+    /// arguments, so the advertised schema must accept any object: it declares no
+    /// properties and does not set `additionalProperties: false`. A fixture that
+    /// exercises gateway argument validation sets a stricter schema explicitly
+    /// through [`McpToolFixture::with_input_schema`].
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: None,
-            input_schema: json!({"type": "object", "additionalProperties": false}),
+            input_schema: json!({"type": "object"}),
         }
     }
 

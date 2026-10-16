@@ -374,6 +374,12 @@ jobs:
       - name: Run Anthropic web-search Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_web_search.py -s
 
+      - name: Build experimental Vertex adapter
+        run: cargo build -p praxis-ai-proxy --features vertex-anthropic-filter
+
+      - name: Run Vertex Anthropic Python SDK tests
+        run: uv run tests/integration/sdk/anthropic/test_vertex_anthropic.py -s
+
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI HTTP acceptance
   # ----------------------------------------------------------------------------

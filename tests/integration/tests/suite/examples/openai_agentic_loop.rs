@@ -428,6 +428,134 @@ fn round_trip_captures_tool_and_model_requests() {
 }
 
 #[test]
+fn invalid_mcp_arguments_are_rejected_without_an_outbound_call() {
+    // The model emits a tool call whose `location` is a number, violating the
+    // tool's advertised string-typed, required-field schema. The dispatcher must
+    // reject it against the `inputSchema` and dial zero outbound tools/call, then
+    // feed the actionable error back so the loop recovers (issue #1125).
+    let first_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_abc",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":42}"#,
+            "status": "completed"
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Sorry, I passed the wrong type. Let me retry."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "round-trip should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_2",
+        "the loop should recover to the second model response"
+    );
+
+    // Resolution still lists the tool, but the invalid call is never dialed.
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "the resolver should still list the request-supplied MCP tools"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "schema-invalid arguments must produce zero outbound tools/call"
+    );
+
+    // The model's recovery turn receives the actionable schema error.
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 2, "the loop re-enters inference after the rejection");
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request body should be valid JSON");
+    let function_output = second_body["input"]
+        .as_array()
+        .and_then(|input| input.iter().find(|item| item["type"] == "function_call_output"))
+        .expect("second model request should carry a function_call_output");
+    let function_output_text = function_output["output"].as_str().unwrap_or_default();
+    assert!(
+        function_output_text.contains("tool call arguments do not match the tool input schema"),
+        "the model must see the actionable schema error: {function_output:#?}"
+    );
+    // The rejected value is masked out of everything the model and client see.
+    assert!(
+        !function_output_text.contains("42"),
+        "the offending value must not be echoed to the model: {function_output_text}"
+    );
+
+    // The client-visible mcp_call item reports the rejection with no output and
+    // does not echo the rejected arguments.
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let mcp_call = output
+        .iter()
+        .find(|item| item["type"] == "mcp_call")
+        .expect("the rejected call should surface an mcp_call item");
+    assert!(
+        mcp_call["error"]["content"]
+            .as_str()
+            .is_some_and(|error| error.contains("tool call arguments do not match the tool input schema")),
+        "the mcp_call item should carry the schema error: {mcp_call:#?}"
+    );
+    assert_eq!(mcp_call["output"], "", "a rejected call produces no tool output");
+    assert_eq!(mcp_call["arguments"], "", "a rejected call does not echo its arguments");
+}
+
+#[test]
 fn agentic_guardrail_blocks_mcp_result_before_second_inference() {
     let first_response = serde_json::json!({
         "id": "resp_guarded_1",
@@ -1125,7 +1253,7 @@ fn mcp_calls_execute_regardless_of_max_tool_calls() {
     assert_eq!(mcp_calls.len(), 2, "both MCP calls appear in the output: {output:#?}");
     assert!(
         mcp_calls.iter().all(|item| {
-            item["error"]
+            item["error"]["content"]
                 .as_str()
                 .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
@@ -2431,11 +2559,16 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         Some(mcp_id.as_str()),
         "terminal[2] id: {body}"
     );
+    assert_eq!(
+        output[2]["error"]["type"].as_str(),
+        Some("mcp_tool_execution_error"),
+        "terminal[2] must carry the structured MCP error type: {body}"
+    );
     assert!(
-        output[2]["error"]
+        output[2]["error"]["content"]
             .as_str()
             .is_some_and(|error| error.contains("mock failure for get_weather")),
-        "terminal[2] must carry the MCP error: {body}"
+        "terminal[2] must carry the MCP error content: {body}"
     );
     assert_eq!(output[3]["type"], "message", "terminal[3] type: {body}");
     assert_eq!(
@@ -4162,7 +4295,7 @@ fn web_over_budget_fails_while_mcp_sibling_executes() {
     assert!(
         output.iter().any(|item| {
             item["type"] == "mcp_call"
-                && item["error"]
+                && item["error"]["content"]
                     .as_str()
                     .is_none_or(|error| !error.contains("max_tool_calls"))
         }),

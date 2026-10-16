@@ -1196,6 +1196,16 @@ fn valid_metadata() {
 }
 
 #[test]
+fn metadata_character_boundaries_are_valid() {
+    for character in ["a", "é", "界", "🦀"] {
+        let key = character.repeat(64);
+        let value = character.repeat(512);
+        let metadata = serde_json::json!({key: value});
+        validate_metadata(&metadata).unwrap();
+    }
+}
+
+#[test]
 fn null_metadata_is_valid() {
     validate_metadata(&Value::Null).unwrap();
 }
@@ -1219,18 +1229,22 @@ fn reject_too_many_keys() {
 
 #[test]
 fn reject_long_key() {
-    let long_key = "k".repeat(65);
-    let metadata = serde_json::json!({long_key: "value"});
-    let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.to_string().contains("exceeds 64 bytes"), "got: {err}");
+    for character in ["k", "é", "界", "🦀"] {
+        let long_key = character.repeat(65);
+        let metadata = serde_json::json!({long_key: "value"});
+        let err = validate_metadata(&metadata).unwrap_err();
+        assert!(err.to_string().contains("exceeds 64 characters"), "got: {err}");
+    }
 }
 
 #[test]
 fn reject_long_value() {
-    let long_value = "v".repeat(513);
-    let metadata = serde_json::json!({"key": long_value});
-    let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.to_string().contains("exceeds 512 bytes"), "got: {err}");
+    for character in ["v", "é", "界", "🦀"] {
+        let long_value = character.repeat(513);
+        let metadata = serde_json::json!({"key": long_value});
+        let err = validate_metadata(&metadata).unwrap_err();
+        assert!(err.to_string().contains("exceeds 512 characters"), "got: {err}");
+    }
 }
 
 #[test]
@@ -3014,6 +3028,94 @@ async fn list_items_desc_order() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn create_conversation_preserves_configuration_update_item() {
+    let (filter, store) = harness();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "item_configuration",
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create conversation");
+    };
+    assert_eq!(rejection.status, 200, "create should return 200");
+    let response = rejection_body(&rejection);
+    let conversation_id = response["id"].as_str().unwrap();
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    assert_eq!(rejection.status, 200, "list items should return 200");
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["id"], "item_configuration");
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+    assert_eq!(response["data"][0]["reasoning"], serde_json::json!({"effort": "high"}));
+}
+
+#[tokio::test]
+async fn append_configuration_update_item_round_trips() {
+    let (filter, store) = harness();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(b"{}"));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create conversation");
+    };
+    let conversation_id = rejection_body(&rejection)["id"].as_str().unwrap().to_owned();
+
+    let req = make_request(Method::POST, &format!("/v1/conversations/{conversation_id}/items"));
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "item_configuration_append",
+            "type": "configuration_update",
+            "reasoning": {"effort": "low"}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from append items");
+    };
+    assert_eq!(rejection.status, 200, "append items should return 200");
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+    assert_eq!(response["data"][0]["reasoning"], serde_json::json!({"effort": "low"}));
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    let response = rejection_body(&rejection);
+    assert_eq!(response["data"][0]["id"], "item_configuration_append");
+    assert_eq!(response["data"][0]["type"], "configuration_update");
+}
+
+#[tokio::test]
 async fn create_conversation_with_non_array_items_returns_400() {
     let (filter, store) = harness();
 
@@ -3936,7 +4038,7 @@ async fn on_response_body_skips_non_completed_status() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_skips_invalid_json() {
+async fn on_response_body_surfaces_invalid_json() {
     let (filter, store) = harness();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
@@ -3950,9 +4052,64 @@ async fn on_response_body_skips_invalid_json() {
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
 
+    // A 2xx body that cannot be parsed is the one case where the turn is
+    // unrecoverable: there is nothing to append and no way to tell an empty
+    // turn from a lost one. Releasing it would report success while dropping
+    // conversation history (#950), so it propagates like any other append-back
+    // failure and the pipeline's failure mode decides what the client sees.
     let mut body = Some(Bytes::from_static(b"{not-json"));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+
+    assert!(
+        result.is_err(),
+        "a malformed 2xx append-back body must propagate as an error, not a silent success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_nothing_to_persist_without_resolving_store() {
+    // `Ok(None)` must stay distinct from `Err`: a well-formed response with
+    // nothing to append never enters the persistence path at all. Dropping the
+    // append store before the body callback makes that observable — any attempt
+    // to resolve it would fail closed and turn these passthroughs into errors.
+    let cases: [(&str, Value); 2] = [
+        (
+            "non-completed status",
+            serde_json::json!({
+                "status": "failed",
+                "output": [{"type": "message", "role": "assistant", "content": "oops"}]
+            }),
+        ),
+        (
+            "completed with no items",
+            serde_json::json!({"status": "completed", "output": []}),
+        ),
+    ];
+
+    for (label, response_json) in cases {
+        let (filter, store) = harness();
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.current_filter_id = Some(0);
+        set_append_back_metadata(&mut ctx);
+        capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+
+        let mut resp = make_response();
+        resp.headers
+            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        ctx.response_header = Some(&mut resp);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        // Replace the registry with an empty one: the conversations store can
+        // no longer be resolved for the captured owner.
+        ctx.extensions.insert(ResponseStoreRegistry::new());
+
+        let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+        let action = filter
+            .on_response_body(&mut ctx, &mut body, true)
+            .unwrap_or_else(|e| panic!("{label} must not reach the append path: {e}"));
+        assert!(matches!(action, FilterAction::Continue), "{label} should continue");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -34,6 +34,7 @@ llmd-ext-proc = [
     "dep:tokio-stream",
     "dep:tonic",
 ]
+vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]
@@ -81,6 +82,9 @@ tokio-tungstenite = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+metrics = { workspace = true }
 
 # The tenant proxy serves the Conversations API, so it needs that filter group.
 [[example]]

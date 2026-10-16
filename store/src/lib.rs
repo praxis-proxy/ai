@@ -5,8 +5,8 @@
 //!
 //! SQL-free and transport-free: the persistence traits, record types, the owner
 //! identity, a unified backend registry, and an in-memory backend. This crate
-//! is a first-party workspace implementation detail with no external API and no
-//! semver promise.
+//! is an unpublished (`publish = false`), first-party workspace implementation
+//! detail with no external API and no semver promise.
 
 mod backend_config;
 #[cfg(feature = "compression")]

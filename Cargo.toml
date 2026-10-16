@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
@@ -66,7 +66,7 @@ rmcp = { version = "3.4.0", default-features = false, features = ["client", "tra
 # Without default features: `aws_lc_rs` on by default would silently link
 # aws-lc-rs into every test binary, and `prefer-post-quantum` implies
 # `aws_lc_rs`. The provider is whatever the process installed.
-rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
@@ -127,16 +127,16 @@ praxis = { version = "0.7.4", package = "praxis-proxy", default-features = false
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.6.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.7.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.6.0", path = "server", default-features = false }
-praxis-ai-filters = { version = "0.6.0", path = "filters", default-features = false }
-praxis-ai-store = { version = "0.6.0", path = "store" }
-praxis-ai-store-backends = { version = "0.6.0", path = "store-backends" }
-praxis-ai-store-lifecycle = { version = "0.6.0", path = "store-lifecycle" }
-praxis-ai-apis = { version = "0.6.0", path = "apis", default-features = false }
-praxis-ai-build-support = { version = "0.6.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.7.0", path = "server", default-features = false }
+praxis-ai-filters = { version = "0.7.0", path = "filters", default-features = false }
+praxis-ai-store = { version = "0.7.0", path = "store" }
+praxis-ai-store-backends = { version = "0.7.0", path = "store-backends" }
+praxis-ai-store-lifecycle = { version = "0.7.0", path = "store-lifecycle" }
+praxis-ai-apis = { version = "0.7.0", path = "apis", default-features = false }
+praxis-ai-build-support = { version = "0.7.0", path = "server/build_support" }
 
 # Pingora (temporary fork), at the version praxis builds against; two versions
 # of the fork in one graph do not share types, and the older one carries its

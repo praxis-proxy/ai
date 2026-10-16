@@ -3,6 +3,10 @@
 
 //! Backend provisioning and lifecycle for praxis-ai persisted state.
 //!
+//! Internal, unstable implementation crate: unpublished (`publish = false`), a
+//! first-party workspace detail with no external API surface and no semver
+//! promise.
+//!
 //! Backend-agnostic and crypto-free: it depends only on the praxis-ai-store
 //! interface and routes inline configuration to injected [`StoreBackendFactory`]
 //! implementations that binaries supply. It builds and validates backends
@@ -530,9 +534,12 @@ async fn release_into(entries: &DashMap<CacheKey, CachedBackend>, keys: &[CacheK
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     use async_trait::async_trait;
@@ -682,6 +689,30 @@ mod tests {
             name: Arc::from(name),
             backend_id: Arc::from(backend_id),
             config: json!({ "url": url }),
+        }
+    }
+
+    /// How long a test waits for a second provision to join a cold build.
+    const PARTICIPANT_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Wait for a second provision to join some key's singleflight wave, and
+    /// report whether it did within [`PARTICIPANT_JOIN_TIMEOUT`].
+    ///
+    /// Bounded by time, not by a yield count: on a multi-threaded runtime the
+    /// joining task runs on another worker, and under coverage instrumentation
+    /// on a busy runner it can take longer than any fixed number of yields to
+    /// get scheduled.
+    async fn second_participant_joined(cache: &BackendCache) -> bool {
+        let deadline = Instant::now() + PARTICIPANT_JOIN_TIMEOUT;
+        loop {
+            let joined = cache
+                .initializers
+                .iter()
+                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2);
+            if joined || Instant::now() >= deadline {
+                return joined;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -871,18 +902,10 @@ mod tests {
             }
         });
         second_started.wait().await;
-        let mut waiter_observed = false;
-        for _ in 0..1_000 {
-            waiter_observed = cache
-                .initializers
-                .iter()
-                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2);
-            if waiter_observed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(waiter_observed, "second provision must wait on the cold build");
+        assert!(
+            second_participant_joined(&cache).await,
+            "second provision must wait on the cold build"
+        );
         assert_eq!(
             builds.load(Ordering::SeqCst),
             1,
@@ -925,18 +948,10 @@ mod tests {
             let cache = Arc::clone(&cache);
             async move { cache.provision(&[store_ref("second", "singleflight", "unused")]).await }
         });
-        let mut waiter_observed = false;
-        for _ in 0..1_000 {
-            waiter_observed = cache
-                .initializers
-                .iter()
-                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2);
-            if waiter_observed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(waiter_observed, "second provision must queue behind the failing winner");
+        assert!(
+            second_participant_joined(&cache).await,
+            "second provision must queue behind the failing winner"
+        );
 
         factory.release.add_permits(1);
         let first_error = first
@@ -990,16 +1005,10 @@ mod tests {
             let cache = Arc::clone(&cache);
             async move { cache.provision(&[store_ref("waiter", "singleflight", "unused")]).await }
         });
-        for _ in 0..1_000 {
-            if cache
-                .initializers
-                .iter()
-                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        assert!(
+            second_participant_joined(&cache).await,
+            "waiter must reach the winner's initializer"
+        );
         assert_eq!(
             cache
                 .initializers

@@ -600,6 +600,19 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// What the request itself specified for `reasoning`.
+    ///
+    /// `from_request_body` computes this from the parsed body, and the
+    /// rehydrate filter replaces it with a capture taken before the stored
+    /// configuration default merges into [`Self::request_body`]. The proxy's
+    /// selected-phase rebuild uses it to separate the stored default, which
+    /// must still reach a request that omits reasoning, from a later filter's
+    /// removal, which must stand: an `effort` may be filled only when the
+    /// request carried no `effort` of its own, and the `reasoning` member may
+    /// be created only when the request carried none. Readers only consult it
+    /// for [`Self::history_rehydrated`] states.
+    pub request_reasoning: RequestReasoningPresence,
+
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
 
@@ -943,6 +956,52 @@ pub(crate) enum RequestBodyRebuild {
     Required,
 }
 
+/// What a rehydrated request itself specified for `reasoning`, captured before
+/// the stored `configuration_update` default was merged into
+/// [`ResponsesState::request_body`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestReasoningPresence {
+    /// No top-level `reasoning` member.
+    #[default]
+    Absent,
+
+    /// A `reasoning` member without an `effort` key (a `null` member counts).
+    OmittedEffort,
+
+    /// A `reasoning` member with an explicit `effort` key (null counts).
+    ExplicitEffort,
+}
+
+impl RequestReasoningPresence {
+    /// Whether the request carried a `reasoning` member at all.
+    pub(crate) fn carried_member(self) -> bool {
+        self != Self::Absent
+    }
+
+    /// Whether the request carried an `effort` key of its own.
+    pub(crate) fn carried_effort(self) -> bool {
+        self == Self::ExplicitEffort
+    }
+}
+
+/// Capture what a request itself specified for `reasoning`.
+///
+/// The rehydrate filter records this before merging the stored configuration
+/// default into the body, so the proxy's selected-phase rebuild can distinguish
+/// what the request omitted (the default may fill it) from a later filter's
+/// removal of the `reasoning` member or its `effort` (it must stand instead of
+/// being refilled from the merged default).
+pub(crate) fn request_reasoning_presence(body: &serde_json::Value) -> RequestReasoningPresence {
+    let Some(reasoning) = body.get("reasoning") else {
+        return RequestReasoningPresence::Absent;
+    };
+    if reasoning.get("effort").is_some() {
+        RequestReasoningPresence::ExplicitEffort
+    } else {
+        RequestReasoningPresence::OmittedEffort
+    }
+}
+
 impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
@@ -986,6 +1045,7 @@ impl Default for ResponsesState {
             response_created_at: None,
             response_id: None,
             request_body: serde_json::Value::Null,
+            request_reasoning: RequestReasoningPresence::Absent,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
@@ -1014,6 +1074,7 @@ impl Default for ResponsesState {
 
 impl ResponsesState {
     /// Create initial state from a parsed request body.
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
         let input = messages.clone();
@@ -1039,6 +1100,7 @@ impl ResponsesState {
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
+            request_reasoning: request_reasoning_presence(&body),
             request_body: body,
             tool_choice,
             tools,

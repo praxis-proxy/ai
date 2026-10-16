@@ -3,18 +3,13 @@
 
 //! Source-derived Conversation item schema artifact.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use clap::Parser;
+use praxis_test_utils::openapi::{Value as YamlValue, component_schema_closure, parse_document};
 use serde::Serialize;
 
-use super::{
-    area::OPENAI_REFERENCE_SPEC,
-    semantic_yaml::{Mapping as YamlMapping, Value as YamlValue},
-};
+use super::area::OPENAI_REFERENCE_SPEC;
 
 /// Checked-in schema artifact consumed by the Conversations runtime.
 pub(super) const ITEM_CONTRACTS_ARTIFACT: &str = "apis/src/openai/conversations/item_contracts.json";
@@ -66,28 +61,8 @@ pub(crate) fn run(args: &Args) {
 /// Derive the recursive item-schema closure from the pinned OpenAI document.
 pub(super) fn generate_item_contracts(source: &[u8]) -> Result<String, String> {
     let source = std::str::from_utf8(source).map_err(|error| format!("pinned OpenAI schema is not UTF-8: {error}"))?;
-    let document: YamlValue =
-        serde_yaml::from_str(source).map_err(|error| format!("failed to parse pinned OpenAI schema: {error}"))?;
-    let schemas = document
-        .as_mapping()
-        .and_then(|root| yaml_get(root, "components"))
-        .and_then(YamlValue::as_mapping)
-        .and_then(|components| yaml_get(components, "schemas"))
-        .and_then(YamlValue::as_mapping)
-        .ok_or_else(|| "pinned OpenAI schema has no components.schemas object".to_owned())?;
-
-    let mut pending = ROOT_SCHEMAS.into_iter().map(str::to_owned).collect::<BTreeSet<_>>();
-    let mut selected = BTreeMap::new();
-    while let Some(name) = pending.pop_first() {
-        if selected.contains_key(&name) {
-            continue;
-        }
-        let schema = schemas
-            .get(&YamlValue::String(name.clone()))
-            .ok_or_else(|| format!("item schema references missing component {name}"))?;
-        collect_schema_references(schema, &mut pending)?;
-        selected.insert(name, schema);
-    }
+    let document = parse_document(source)?;
+    let selected = component_schema_closure(&document, &ROOT_SCHEMAS)?;
 
     let artifact = ItemContractArtifact {
         schema_version: 1,
@@ -119,42 +94,4 @@ pub(super) fn verify_item_contracts(path: &std::path::Path, generated: &str) -> 
         ));
     }
     Ok(())
-}
-
-/// Add local schema component references found below one JSON value.
-fn collect_schema_references(value: &YamlValue, references: &mut BTreeSet<String>) -> Result<(), String> {
-    match value {
-        YamlValue::Sequence(values) => {
-            for value in values {
-                collect_schema_references(value, references)?;
-            }
-        },
-        YamlValue::Mapping(fields) => {
-            for (name, value) in fields.iter() {
-                if name.as_str() == Some("$ref") {
-                    let reference = value
-                        .as_str()
-                        .ok_or_else(|| "item schema contains a non-string $ref".to_owned())?;
-                    let component = reference
-                        .strip_prefix("#/components/schemas/")
-                        .ok_or_else(|| format!("item schema contains unsupported reference {reference}"))?;
-                    references.insert(component.to_owned());
-                } else {
-                    collect_schema_references(value, references)?;
-                }
-            }
-        },
-        YamlValue::Bool(_)
-        | YamlValue::Float(_)
-        | YamlValue::Null
-        | YamlValue::Signed(_)
-        | YamlValue::String(_)
-        | YamlValue::Unsigned(_) => {},
-    }
-    Ok(())
-}
-
-/// Borrow one string-keyed YAML mapping value.
-fn yaml_get<'a>(mapping: &'a YamlMapping, key: &str) -> Option<&'a YamlValue> {
-    mapping.get(&YamlValue::String(key.to_owned()))
 }

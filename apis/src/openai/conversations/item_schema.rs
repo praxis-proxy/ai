@@ -51,7 +51,7 @@ pub(super) fn openapi_components() -> Result<Map<String, Value>, String> {
 }
 
 /// Validate one item accepted by a create operation.
-pub(super) fn validate_input_item(item: &Value) -> Result<(), String> {
+pub(crate) fn validate_input_item(item: &Value) -> Result<(), String> {
     let validators = ITEM_VALIDATORS.as_ref().map_err(Clone::clone)?;
     validate_item(&validators.input, item, "InputItem")
 }
@@ -151,6 +151,21 @@ mod tests {
             "type": "reasoning",
             "id": "rs_1",
             "summary": []
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn generated_contracts_accept_configuration_update_items() {
+        validate_input_item(&json!({
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }))
+        .unwrap();
+        validate_output_item(&json!({
+            "type": "configuration_update",
+            "id": "cnfu_1",
+            "reasoning": {"effort": "high"}
         }))
         .unwrap();
     }

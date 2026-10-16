@@ -52,7 +52,7 @@ jobs:
             if [ "$already" -eq 0 ]; then
               gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
                 --body "${marker}
-          Please add a description to this PR explaining what it does and why. See our [coding conventions](docs/developing/conventions.md)."
+          Please add a description to this PR explaining what it does and why. See our [coding conventions](https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md)."
             fi
           fi
 

@@ -49,8 +49,12 @@ http-callout-filter = ["experimental", "dep:serde_json_path"]
 azure-ad-filter = ["experimental"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
-# Activates the `experimental` marker.
-gcp-adc-filter = ["experimental"]
+# Activates the `experimental` marker. `openssl` signs the service-account
+# `JWT` assertion for `source: key_file` in the system library.
+gcp-adc-filter = ["experimental", "dep:openssl"]
+# Experimental: Anthropic Messages to Vertex AI rawPredict translation. Work
+# in progress; the config surface may change. Activates the experimental marker.
+vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
@@ -65,6 +69,11 @@ token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
 # from token-rate-limit-filter because static request admission must fail
 # closed independently of quota-backend health.
 token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
+# Experimental: the inflight_tracker filter. Nothing reads InFlightRegistry's
+# counters yet (no scorer, no HTTP surface), and the registry's eventual
+# backing store is still an open question, so the filter itself stays gated
+# until both land. Activates the `experimental` marker.
+inflight-tracker-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
@@ -85,6 +94,7 @@ dashmap = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
+openssl = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }

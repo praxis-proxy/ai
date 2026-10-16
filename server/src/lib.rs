@@ -10,15 +10,13 @@ pub mod readiness;
 pub(crate) mod reload;
 mod server;
 #[cfg(feature = "_store-backend")]
-mod store_config;
-#[cfg(feature = "_store-backend")]
 pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
 #[cfg(feature = "_store-backend")]
 pub use pipelines::validate_pipelines_with_store_wiring;
-pub use praxis_ai_filters::install_pipeline_extensions;
+pub use praxis_ai_filters::{InFlightRegistry, install_pipeline_extensions};
 pub use praxis_core::logging::init_tracing;
 pub use server::{
     check_root_privilege, fatal, fips_blocker, install_crypto_provider, resolve_config_path, run_server,

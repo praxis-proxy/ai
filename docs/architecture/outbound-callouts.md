@@ -38,6 +38,7 @@ loopback test stubs) only after its authority has been independently restricted.
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
 | `azure_ad` token fetch | Configured authority plus tenant via `SubRequestClient` | `allow_private_authority` | No-follow | Client secret in the token POST body |
 | `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
+| `gcp_adc` key-file token exchange | Key file `token_uri`, which must be exactly `https://oauth2.googleapis.com/token`, via `SubRequestClient` | None (public-only) | No-follow | Signed `RS256` assertion in the token POST body |
 
 The request-derived `file_url` and MCP transports retain stricter policies:
 they resolve once per attempt, validate every address against `AddressPolicy`,

@@ -49,7 +49,7 @@ use super::{
     error::responses_error_rejection,
     extract_conversation_id,
     history::MessageHistory,
-    state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
+    state::{LOCAL_COMPACTION_MARKER, ResponsesState, request_reasoning_presence, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -1203,15 +1203,18 @@ async fn fetch_conversation(
 
 /// Build [`ResponsesState`] by prepending stored messages before the current input.
 fn build_state(
-    parsed_body: Value,
+    mut parsed_body: Value,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
 ) -> ResponsesState {
+    let request_reasoning = request_reasoning_presence(&parsed_body);
+    apply_stored_configuration(&mut parsed_body, &stored);
     let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
+    state.request_reasoning = request_reasoning;
     state.messages.prepend_shared(replay);
     state
         .provider_compaction_ids
@@ -1220,6 +1223,29 @@ fn build_state(
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
+}
+
+/// Configuration items are persisted, not replayed as model input. The latest
+/// update replaces earlier defaults; explicit per-request effort takes priority.
+fn apply_stored_configuration(body: &mut Value, stored: &[Value]) {
+    let effort = stored
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("configuration_update"))
+        .and_then(|item| item.get("reasoning"))
+        .and_then(|reasoning| reasoning.get("effort"));
+    let Some(effort) = effort else {
+        return;
+    };
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let reasoning = body
+        .entry("reasoning")
+        .or_insert_with(|| Value::Object(serde_json::Map::default()));
+    if let Some(reasoning) = reasoning.as_object_mut() {
+        reasoning.entry("effort").or_insert_with(|| effort.clone());
+    }
 }
 
 /// Return stored history, reconstructing from public fields for

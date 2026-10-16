@@ -30,8 +30,6 @@ mod reference;
 mod registry_check;
 /// Responses registry drift check against the pinned specification.
 mod responses_registry;
-/// Semantic YAML tree used for full-spec projection.
-mod semantic_yaml;
 /// `OpenAPI` spec loading and operation extraction.
 mod spec;
 mod vector_stores_registry;

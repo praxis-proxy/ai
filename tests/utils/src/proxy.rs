@@ -5,6 +5,8 @@
 
 use std::{
     fmt,
+    io::ErrorKind,
+    net::TcpListener,
     path::PathBuf,
     sync::{Arc, mpsc},
     thread::JoinHandle,
@@ -150,7 +152,7 @@ fn resolve_listener_pipeline(
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    praxis_ai::install_pipeline_extensions(&mut pipeline);
+    praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
     pipeline.add_pipeline_extension(Box::new(store_registry));
@@ -204,8 +206,8 @@ impl ShutdownSignalWatch for NotifyShutdownWatch {
     }
 }
 
-/// Maximum time to wait for the proxy server thread to join on
-/// [`ProxyGuard`] shutdown before giving up.
+/// Maximum time to wait for the proxy server thread to join, and its
+/// listener to close, on [`ProxyGuard`] shutdown before giving up.
 ///
 /// [`ProxyGuard`]: ProxyGuard
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -264,6 +266,9 @@ pub enum ProxyShutdownError {
     /// The producer thread panicked.
     #[error("proxy server thread panicked during shutdown")]
     ThreadPanicked,
+    /// The producer exited but its listen address stayed bound.
+    #[error("proxy listener still bound after the server thread exited")]
+    ListenerStillBound,
 }
 
 /// RAII guard that shuts down a Pingora proxy server when
@@ -300,8 +305,9 @@ impl ProxyGuard {
         self.store_readiness.wait();
     }
 
-    /// Signal the proxy to stop and wait for its producer thread
-    /// to exit within a bounded deadline.
+    /// Signal the proxy to stop and wait, within a bounded deadline,
+    /// for its producer thread to exit and its listen address to be
+    /// free again.
     ///
     /// A timeout retains the thread handle so a later call or the
     /// guard's drop fallback can make another bounded join attempt.
@@ -309,7 +315,8 @@ impl ProxyGuard {
     /// # Errors
     ///
     /// Returns an error if the producer does not finish before the
-    /// deadline, disconnects its completion channel, or panics.
+    /// deadline, disconnects its completion channel, or panics, or if
+    /// its listener is still bound when the deadline passes.
     pub fn shutdown(&mut self) -> Result<(), ProxyShutdownError> {
         let deadline = Instant::now() + self.join_timeout;
         self.notify.notify_one();
@@ -334,7 +341,8 @@ impl ProxyGuard {
         Ok(())
     }
 
-    /// Polls for thread completion within the shared deadline, then joins it.
+    /// Polls for thread completion and listener release within the shared
+    /// deadline, then joins the thread.
     fn join_producer(&mut self, deadline: Instant) -> Result<(), ProxyShutdownError> {
         while self.handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
             let remaining = remaining_until(deadline);
@@ -347,6 +355,9 @@ impl ProxyGuard {
             }
             std::thread::sleep(JOIN_POLL_INTERVAL.min(remaining));
         }
+        if self.handle.is_some() {
+            self.await_listener_release(deadline)?;
+        }
 
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -356,6 +367,25 @@ impl ProxyGuard {
         }
         if self.completion_disconnected {
             return Err(ProxyShutdownError::CompletionDisconnected);
+        }
+        Ok(())
+    }
+
+    /// Polls until the proxy's listen address can be bound again.
+    ///
+    /// The producer exiting does not mean its listener is closed: on a fast
+    /// shutdown Pingora stops the service runtimes without waiting for their
+    /// worker threads, and those drop the accept loops, and with them the
+    /// listening socket, after the producer has already returned. Only
+    /// `AddrInUse` counts as still bound, so an address this probe cannot bind
+    /// for other reasons never holds up shutdown.
+    fn await_listener_release(&self, deadline: Instant) -> Result<(), ProxyShutdownError> {
+        while TcpListener::bind(&self.addr).is_err_and(|error| error.kind() == ErrorKind::AddrInUse) {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                return Err(ProxyShutdownError::ListenerStillBound);
+            }
+            std::thread::sleep(JOIN_POLL_INTERVAL.min(remaining));
         }
         Ok(())
     }
@@ -423,6 +453,12 @@ fn build_pingora_server(
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
 ) -> (pingora_core::server::Server, HarnessStoreReadiness) {
+    use praxis_protocol::http::pingora::health;
+
+    // Mirror production's split admin API and health/metrics listeners. Install
+    // the recorder before building pipelines so startup instrumentation is kept.
+    let prometheus_recorder = (config.admin.address.is_some() || config.admin.metrics_address.is_some())
+        .then(health::install_prometheus_admin_recorder);
     let mut server = praxis_core::server::build_http_server(config.shutdown_timeout_secs, &RuntimeOptions::default());
 
     // Provision the response store on this server's runtime, mirroring boot_server:
@@ -458,11 +494,27 @@ fn build_pingora_server(
     drop(cert_shutdowns);
 
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_health_endpoint_to_pingora_server(
+        health::add_admin_api_to_pingora_server(
             &mut server,
             admin_addr,
+            health::AdminEndpointOptions {
+                verbose: config.admin.verbose,
+                ..Default::default()
+            },
+        );
+    }
+
+    if let Some(recorder) = prometheus_recorder {
+        health::add_prometheus_upkeep_to_pingora_server(&mut server, recorder);
+    }
+
+    if let Some(metrics_addr) = &config.admin.metrics_address {
+        health::add_health_endpoint_to_pingora_server_with_pipelines(
+            &mut server,
+            metrics_addr,
             None,
             config.admin.verbose,
+            None,
         );
     }
 
@@ -572,6 +624,8 @@ pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> 
 
 /// Start a full proxy server (HTTP + TCP protocols) in a background thread.
 pub fn start_full_proxy(config: Config) {
+    let mut config = config;
+    crate::allow_root_on_config(&mut config);
     std::thread::spawn(move || {
         praxis_ai::run_server(config, None);
     });
@@ -610,11 +664,15 @@ impl ReloadableProxyGuard {
 
     /// Rewrite the config file with new YAML content.
     ///
+    /// Injects `allow_root` when the harness is root so a reload cannot put
+    /// an unpatched config back on disk under UID 0.
+    ///
     /// # Panics
     ///
     /// Panics if the file cannot be written.
     pub fn write_config(&self, yaml: &str) {
-        std::fs::write(&self.config_path, yaml).expect("failed to write config file");
+        let yaml = crate::allow_root_for_test_harness(yaml);
+        std::fs::write(&self.config_path, yaml.as_ref()).expect("failed to write config file");
     }
 
     /// Rewrite config and wait for the debounce window.
@@ -642,7 +700,8 @@ const RELOAD_SETTLE: Duration = Duration::from_millis(1500);
 ///
 /// [`ReloadableProxyGuard::reload`]: ReloadableProxyGuard::reload
 pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
-    let config = Config::from_yaml(yaml).expect("test config should parse");
+    let yaml = crate::allow_root_for_test_harness(yaml);
+    let config = Config::from_yaml(yaml.as_ref()).expect("test config should parse");
     let addr = config
         .listeners
         .first()
@@ -798,7 +857,50 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{ProxyGuard, ProxyShutdownError, simple_proxy_yaml, start_proxy};
-    use crate::free_port_guard;
+    use crate::{free_port_guard, http_get};
+
+    #[test]
+    fn metrics_listener_records_counters_without_admin_api() {
+        let proxy_port = free_port_guard().release();
+        let backend_port = free_port_guard().release();
+        let metrics_address = format!("127.0.0.1:{}", free_port_guard().release());
+        let mut config =
+            Config::from_yaml(&simple_proxy_yaml(proxy_port, backend_port)).expect("test proxy config should parse");
+        config.admin.metrics_address = Some(metrics_address.clone());
+        let _proxy = start_proxy(&config);
+
+        metrics::counter!("praxis_test_harness_metrics_total", "listener" => "metrics_only").increment(1);
+        let (status, body) = http_get(&metrics_address, "/metrics", None);
+        assert_eq!(status, 200, "metrics-only config must expose /metrics: {body}");
+        assert!(
+            body.contains("praxis_test_harness_metrics_total{listener=\"metrics_only\"} 1"),
+            "the harness must install a recorder before counters are emitted: {body}"
+        );
+        assert_eq!(http_get(&metrics_address, "/healthy", None).0, 200);
+        assert_eq!(http_get(&metrics_address, "/ready", None).0, 200);
+    }
+
+    #[test]
+    fn admin_and_metrics_listeners_serve_separate_routes() {
+        let proxy_port = free_port_guard().release();
+        let backend_port = free_port_guard().release();
+        let admin_address = format!("127.0.0.1:{}", free_port_guard().release());
+        let metrics_address = format!("127.0.0.1:{}", free_port_guard().release());
+        let mut config =
+            Config::from_yaml(&simple_proxy_yaml(proxy_port, backend_port)).expect("test proxy config should parse");
+        config.admin.address = Some(admin_address.clone());
+        config.admin.metrics_address = Some(metrics_address.clone());
+        let _proxy = start_proxy(&config);
+
+        for path in ["/metrics", "/healthy", "/ready"] {
+            assert_eq!(
+                http_get(&admin_address, path, None).0,
+                404,
+                "{path} belongs on the metrics listener"
+            );
+            assert_eq!(http_get(&metrics_address, path, None).0, 200);
+        }
+    }
 
     #[test]
     fn explicit_shutdown_joins_real_proxy_and_releases_listener() {
@@ -888,6 +990,30 @@ mod tests {
         let error = proxy.shutdown().expect_err("producer panic must be an error");
 
         assert_eq!(error, ProxyShutdownError::ThreadPanicked);
+    }
+
+    #[test]
+    fn explicit_shutdown_reports_a_lingering_listener_then_retries() {
+        let lingering = TcpListener::bind("127.0.0.1:0").expect("lingering listener should bind");
+        let addr = lingering
+            .local_addr()
+            .expect("lingering listener should have an address");
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let _sent = completion_tx.send(());
+        });
+        let mut proxy = test_proxy_guard(handle, completion_rx, Duration::from_millis(100));
+        proxy.addr = addr.to_string();
+
+        let error = proxy
+            .shutdown()
+            .expect_err("a still-bound listener must not report success");
+        assert_eq!(error, ProxyShutdownError::ListenerStillBound);
+
+        drop(lingering);
+        proxy
+            .shutdown()
+            .expect("a retry should succeed once the listener is released");
     }
 
     fn test_proxy_guard(handle: JoinHandle<()>, completion: mpsc::Receiver<()>, join_timeout: Duration) -> ProxyGuard {

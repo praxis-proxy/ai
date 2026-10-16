@@ -15,7 +15,7 @@
 //! [`ArcSwap`]: arc_swap::ArcSwap
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fmt::Write as _,
     io::Read as _,
     path::{Path, PathBuf},
@@ -35,6 +35,7 @@ use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     group_index::{self, GroupIndex},
     metadata::{CandidateCredential, CredentialRef},
+    metrics::{self, ReloadResult},
 };
 
 // -----------------------------------------------------------------------------
@@ -927,7 +928,7 @@ pub(crate) fn spawn_overlay_watcher(
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     debounce_ms: u64,
 ) -> Result<OverlayReloadHandle, FilterError> {
-    spawn_overlay_watcher_with_scope(path, snapshot, debounce_ms, None)
+    spawn_overlay_watcher_with_scope(path, snapshot, debounce_ms, None, None)
 }
 
 /// Spawn a file watcher with optional expected scope validation.
@@ -943,6 +944,7 @@ pub(crate) fn spawn_overlay_watcher_with_scope(
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     debounce_ms: u64,
     expected_scope: Option<ExpectedOverlayScope>,
+    allowed_clusters: Option<Arc<BTreeSet<Arc<str>>>>,
 ) -> Result<OverlayReloadHandle, FilterError> {
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
@@ -959,7 +961,15 @@ pub(crate) fn spawn_overlay_watcher_with_scope(
                     return;
                 },
             };
-            rt.block_on(watch_loop(path, snapshot, debounce_ms, token, expected_scope, ready_tx));
+            rt.block_on(watch_loop(
+                path,
+                snapshot,
+                debounce_ms,
+                token,
+                expected_scope,
+                allowed_clusters,
+                ready_tx,
+            ));
         })
         .map_err(|error| FilterError::from(format!("routing: failed to spawn overlay watcher: {error}")))?;
 
@@ -994,6 +1004,7 @@ async fn watch_loop(
     debounce_ms: u64,
     shutdown: CancellationToken,
     expected_scope: Option<ExpectedOverlayScope>,
+    allowed_clusters: Option<Arc<BTreeSet<Arc<str>>>>,
     ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let (tx, mut rx) = mpsc::channel::<()>(16);
@@ -1013,7 +1024,7 @@ async fn watch_loop(
     // Authoritative re-read after watcher registration to close the
     // startup race window: any overlay change between the initial read
     // in build_overlay_snapshot and watcher registration is caught here.
-    handle_overlay_reload(&path, &snapshot, expected_scope.as_ref());
+    handle_overlay_reload(&path, &snapshot, expected_scope.as_ref(), allowed_clusters.as_deref());
 
     drop(ready_tx.send(Ok(())));
 
@@ -1030,6 +1041,7 @@ async fn watch_loop(
         debounce_ms,
         &shutdown,
         expected_scope.as_ref(),
+        allowed_clusters.as_deref(),
     )
     .await;
 }
@@ -1051,6 +1063,7 @@ async fn run_event_loop(
     debounce_ms: u64,
     shutdown: &CancellationToken,
     expected_scope: Option<&ExpectedOverlayScope>,
+    allowed_clusters: Option<&BTreeSet<Arc<str>>>,
 ) {
     loop {
         tokio::select! {
@@ -1060,7 +1073,7 @@ async fn run_event_loop(
                     tracing::info!("intelligent_route: overlay file watcher shutting down");
                     return;
                 }
-                handle_overlay_reload(path, snapshot, expected_scope);
+                handle_overlay_reload(path, snapshot, expected_scope, allowed_clusters);
             }
             () = shutdown.cancelled() => {
                 tracing::info!("intelligent_route: overlay file watcher shutting down");
@@ -1071,10 +1084,14 @@ async fn run_event_loop(
 }
 
 /// Read, validate, and swap the overlay snapshot.
+///
+/// When `allowed_clusters` is set, a snapshot naming a candidate cluster
+/// outside it is rejected like any other invalid overlay.
 pub(super) fn handle_overlay_reload(
     path: &Path,
     snapshot: &ArcSwap<RouteSnapshot>,
     expected_scope: Option<&ExpectedOverlayScope>,
+    allowed_clusters: Option<&BTreeSet<Arc<str>>>,
 ) {
     let Some(content) = read_overlay(path) else {
         return;
@@ -1084,19 +1101,54 @@ pub(super) fn handle_overlay_reload(
     let content_hash = Sha256::digest(&content);
     if content_hash == current.content_hash {
         tracing::debug!("intelligent_route: overlay snapshot is unchanged");
+        metrics::record_reload(ReloadResult::Unchanged);
         return;
     }
 
-    match RouteSnapshot::from_overlay_with_scope(&content, expected_scope) {
+    let parsed = RouteSnapshot::from_overlay_with_scope(&content, expected_scope).and_then(|new_snap| {
+        if let Some(allowed) = allowed_clusters {
+            validate_snapshot_clusters(&new_snap, allowed)?;
+        }
+        Ok(new_snap)
+    });
+    match parsed {
         Ok(new_snap) => {
             if is_semantically_unchanged(&current, &new_snap) {
                 tracing::debug!("intelligent_route: overlay snapshot is semantically unchanged");
+                metrics::record_reload(ReloadResult::Unchanged);
                 return;
             }
             apply_overlay(new_snap, snapshot);
         },
         Err(e) => log_overlay_reload_error(path, snapshot, &e),
     }
+}
+
+/// Reject a snapshot whose candidates name a cluster outside `allowed`.
+///
+/// The allowlist mirrors the clusters the downstream `load_balancer`
+/// declares, so a producer cannot publish a destination this gateway has no
+/// transport for.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] naming the first offending cluster.
+pub(crate) fn validate_snapshot_clusters(
+    snapshot: &RouteSnapshot,
+    allowed: &BTreeSet<Arc<str>>,
+) -> Result<(), FilterError> {
+    if let Some(candidate) = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| !allowed.contains(&candidate.cluster))
+    {
+        return Err(format!(
+            "intelligent_route: candidate '{}' names cluster '{}' which is not in the configured clusters list",
+            candidate.name, candidate.cluster
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Read the overlay file with a bounded read.
@@ -1111,6 +1163,7 @@ fn read_overlay(path: &Path) -> Option<Vec<u8>> {
                 error = %e,
                 "intelligent_route: failed to read overlay file for reload"
             );
+            metrics::record_reload(ReloadResult::ReadError);
             None
         },
     }
@@ -1158,7 +1211,12 @@ fn apply_overlay(new_snap: RouteSnapshot, snapshot: &ArcSwap<RouteSnapshot>) {
     let candidate_count = new_snap.candidates.len();
     let local_site = Arc::clone(&new_snap.local_site);
     let contract_format = new_snap.contract_format;
-    snapshot.store(Arc::new(new_snap));
+    {
+        let _publish_guard = metrics::lock_snapshot_candidates();
+        snapshot.store(Arc::new(new_snap));
+        metrics::set_snapshot_candidates(candidate_count);
+    }
+    metrics::record_reload(ReloadResult::Accepted);
     tracing::info!(
         candidate_count,
         local_site = &*local_site,
@@ -1185,6 +1243,7 @@ fn log_overlay_reload_error(path: &Path, snapshot: &ArcSwap<RouteSnapshot>, erro
         retained_serving_revision = %serving_rev,
         "intelligent_route: overlay reload failed, retaining previous snapshot"
     );
+    metrics::record_reload(ReloadResult::Rejected);
 }
 
 /// Set up a [`RecommendedWatcher`] that sends to the given channel
@@ -1872,7 +1931,7 @@ mod tests {
 
         let updated = make_weighted_envelope_json([25, 75]);
         std::fs::write(&path, updated).unwrap();
-        handle_overlay_reload(&path, &snapshot, None);
+        handle_overlay_reload(&path, &snapshot, None, None);
 
         assert_weighted_snapshot_weights(&snapshot, initial_revision.as_deref(), [25, 75]);
     }
@@ -1888,7 +1947,7 @@ mod tests {
 
         let empty = make_empty_weighted_envelope_json();
         std::fs::write(&path, empty).unwrap();
-        handle_overlay_reload(&path, &snapshot, None);
+        handle_overlay_reload(&path, &snapshot, None, None);
 
         let serving = snapshot.load();
         assert!(
@@ -1959,7 +2018,7 @@ mod tests {
     #[test]
     fn retain_on_read_failure() {
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap, None);
+        handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1969,7 +2028,7 @@ mod tests {
         let path = dir.path().join("routing-config.json");
         std::fs::write(&path, b"").unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1979,7 +2038,7 @@ mod tests {
         let path = dir.path().join("routing-config.json");
         std::fs::write(&path, "{{not json}}").unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1990,7 +2049,7 @@ mod tests {
         let json = r#"{"local_site":"","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -2000,7 +2059,7 @@ mod tests {
         let path = dir.path().join("routing-config.json");
         std::fs::write(&path, r#"{"local_site":"a","candidates":[]}"#).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -2012,7 +2071,7 @@ mod tests {
             r#"{"local_site":"a","candidates":[{"kind":"bad_kind","name":"m","site":"s","cluster":"c","fresh":true}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -2023,7 +2082,7 @@ mod tests {
         let content = vec![b'x'; (MAX_OVERLAY_SIZE + 1) as usize];
         std::fs::write(&path, &content).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -2034,7 +2093,7 @@ mod tests {
         let json = r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"credential":{"strategy":"bearer_token","token":"leaked","secretRef":{"name":"k","namespace":"n","key":"k"}}}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -2045,7 +2104,7 @@ mod tests {
         let json = r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"admission_state":"future_state"}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(
             snap.load().content_hash,
             hash,
@@ -2063,7 +2122,7 @@ mod tests {
         );
         std::fs::write(&path, &json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash, "oversized stable_id must retain LKG");
     }
 
@@ -2080,7 +2139,7 @@ mod tests {
             namespace: None,
             local_site: None,
         };
-        handle_overlay_reload(&path, &snap, Some(&scope));
+        handle_overlay_reload(&path, &snap, Some(&scope), None);
         assert_eq!(
             snap.load().content_hash,
             hash,
@@ -2320,7 +2379,7 @@ mod tests {
 
         let empty = make_empty_envelope_json("site-a", "test-net");
         std::fs::write(&path, &empty).unwrap();
-        handle_overlay_reload(&path, &snapshot, None);
+        handle_overlay_reload(&path, &snapshot, None, None);
 
         let serving = snapshot.load();
         assert!(serving.candidates.is_empty());
@@ -2342,7 +2401,7 @@ mod tests {
             r#"{"schema_version":"1.0.0","overlay":{"local_site":"site-a","candidates":[]}}"#,
         )
         .unwrap();
-        handle_overlay_reload(&path, &snapshot, None);
+        handle_overlay_reload(&path, &snapshot, None, None);
 
         let serving = snapshot.load();
         assert!(serving.candidates.is_empty());
@@ -2628,7 +2687,7 @@ mod tests {
         json["schema_version"] = serde_json::json!("99.0.0");
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash, "LKG retained on schema version error");
     }
 
@@ -2642,7 +2701,7 @@ mod tests {
         json["revision"]["value"] = serde_json::json!(bad);
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, None);
+        handle_overlay_reload(&path, &snap, None, None);
         assert_eq!(snap.load().content_hash, hash, "LKG retained on digest error");
     }
 
@@ -2658,7 +2717,7 @@ mod tests {
             local_site: None,
         };
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap, Some(&scope));
+        handle_overlay_reload(&path, &snap, Some(&scope), None);
         assert_eq!(snap.load().content_hash, hash, "LKG retained on scope mismatch");
     }
 
@@ -2762,7 +2821,7 @@ mod tests {
         let path = dir.path().join("overlay.json");
         std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
 
-        handle_overlay_reload(&path, &snapshot, None);
+        handle_overlay_reload(&path, &snapshot, None, None);
 
         assert!(Arc::ptr_eq(&before, &snapshot.load_full()));
     }
@@ -2943,6 +3002,101 @@ mod tests {
 
     /// Test-only startup wait for the background notify watcher.
     const WATCHER_STARTUP_MS: u64 = 750;
+
+    // ---- Reload metrics and cluster allowlist (praxis-proxy/ai#74 Phase 0) ----
+
+    #[test]
+    fn reload_results_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-config.json");
+        std::fs::write(&path, make_overlay_json("site-a", "llama-3", "local")).unwrap();
+        let (snap, _) = make_valid_snapshot();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        ::metrics::with_local_recorder(&recorder, || {
+            handle_overlay_reload(&path, &snap, None, None);
+            std::fs::write(&path, make_overlay_json("site-a", "llama-3", "other")).unwrap();
+            handle_overlay_reload(&path, &snap, None, None);
+            std::fs::write(&path, "{{not json}}").unwrap();
+            handle_overlay_reload(&path, &snap, None, None);
+            handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap, None, None);
+        });
+
+        let counts = snapshotter.snapshot().into_vec();
+        assert_eq!(reload_count(&counts, "unchanged"), Some(1));
+        assert_eq!(reload_count(&counts, "accepted"), Some(1));
+        assert_eq!(reload_count(&counts, "rejected"), Some(1));
+        assert_eq!(reload_count(&counts, "read_error"), Some(1));
+        assert_eq!(
+            snapshot_candidates_gauge(&counts),
+            Some(1.0),
+            "the accepted reload publishes its candidate count"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_candidate_cluster_outside_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-config.json");
+        std::fs::write(&path, make_overlay_json("site-a", "llama-3", "other")).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        let allowed: BTreeSet<Arc<str>> = [Arc::from("local")].into_iter().collect();
+
+        handle_overlay_reload(&path, &snap, None, Some(&allowed));
+        assert_eq!(
+            snap.load().content_hash,
+            hash,
+            "a candidate cluster outside the allowlist must retain the previous snapshot"
+        );
+
+        std::fs::write(&path, make_overlay_json("site-a", "llama-3", "local")).unwrap();
+        handle_overlay_reload(&path, &snap, None, Some(&allowed));
+        assert_eq!(snap.load().candidates[0].cluster.as_ref(), "local");
+    }
+
+    #[test]
+    fn validate_clusters_names_the_offending_cluster() {
+        let json = make_overlay_json("site-a", "llama-3", "other");
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        let allowed: BTreeSet<Arc<str>> = [Arc::from("local")].into_iter().collect();
+        let err = validate_snapshot_clusters(&snap, &allowed).unwrap_err();
+        assert!(err.to_string().contains("other"), "{err}");
+        assert!(validate_snapshot_clusters(&snap, &[Arc::from("other")].into_iter().collect()).is_ok());
+    }
+
+    type MetricSample = (
+        metrics_util::CompositeKey,
+        Option<::metrics::Unit>,
+        Option<::metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    );
+
+    fn reload_count(samples: &[MetricSample], result: &str) -> Option<u64> {
+        samples
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == metrics::SNAPSHOT_RELOADS_TOTAL
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "result" && label.value() == result)
+            })
+            .and_then(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(count) => Some(*count),
+                _ => None,
+            })
+    }
+
+    fn snapshot_candidates_gauge(samples: &[MetricSample]) -> Option<f64> {
+        samples
+            .iter()
+            .find(|(key, ..)| key.key().name() == metrics::SNAPSHOT_CANDIDATES)
+            .map(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Gauge(gauge) => gauge.into_inner(),
+                other => panic!("expected gauge, got {other:?}"),
+            })
+    }
 
     fn make_overlay_json(local_site: &str, model: &str, cluster: &str) -> String {
         format!(

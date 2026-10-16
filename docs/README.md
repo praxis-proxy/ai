@@ -13,10 +13,12 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 ## Architecture
 
 - [AI inference](architecture/ai-inference.md)
+- [Routing facts](architecture/routing-facts.md)
 - [Agentic protocols](architecture/agentic-protocols.md)
 - [Response store](architecture/response-store.md)
 - [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md)
 - [Outbound callout security](architecture/outbound-callouts.md)
+- [Cryptographic operations inventory](architecture/cryptographic-inventory.md)
 
 ## Provider guides
 
@@ -43,4 +45,4 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [FIPS 140-3](fips.md)
 - [Migrating to 0.2.0](migrating-to-0.2.md)
 - [Security policy](../.github/SECURITY.md)
-- [Contributing](../.github/CONTRIBUTING.md)
+- [Contributing](../CONTRIBUTING.md)
