@@ -20,6 +20,7 @@ pub mod gcp;
 pub mod guardrails;
 mod identity_guard;
 pub mod inference;
+mod llm_metrics;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
