@@ -466,6 +466,9 @@ impl HttpFilter for ExternalMeteringFilter {
 /// Identity and timing state captured during the request phase and consumed
 /// during the response phase.
 struct MeteringState {
+    /// Cost center allocated for billing.
+    cost_center: String,
+
     /// Tenant group, falling back to the subscription when absent.
     group: String,
 
@@ -474,6 +477,9 @@ struct MeteringState {
 
     /// Model attributed to this request.
     model: String,
+
+    /// Billing organization identifier.
+    organization_id: String,
 
     /// Start of the request, used to derive the reported duration.
     request_start: std::time::Instant,
@@ -578,9 +584,11 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
     }
 
     MeteringState {
+        cost_center: identity.cost_center,
         group: identity.group,
         is_error: false,
         model: identity.model,
+        organization_id: identity.organization_id,
         request_start: std::time::Instant::now(),
         response_status: 0,
         subscription: identity.subscription,
@@ -592,11 +600,17 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
 /// Tenant identity as carried on the request headers.
 #[derive(Default)]
 struct Identity {
+    /// Value of `{prefix}cost-center`.
+    cost_center: String,
+
     /// Value of `{prefix}group`.
     group: String,
 
     /// Value of `{prefix}model`.
     model: String,
+
+    /// Value of `{prefix}organization-id`.
+    organization_id: String,
 
     /// Value of `{prefix}subscription`.
     subscription: String,
@@ -630,7 +644,9 @@ fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity
     let has_verified_identity = !(identity.username.is_empty()
         && identity.group.is_empty()
         && identity.subscription.is_empty()
-        && identity.model.is_empty());
+        && identity.model.is_empty()
+        && identity.organization_id.is_empty()
+        && identity.cost_center.is_empty());
 
     if !has_verified_identity {
         read_metadata_identity(ctx, prefix, &format!("{identity_namespace}."), &mut identity);
@@ -649,11 +665,23 @@ fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity
 /// Read the `{namespace}{prefix}*` identity keys from `filter_metadata`,
 /// overwriting only the fields the namespace carries.
 fn read_metadata_identity(ctx: &HttpFilterContext<'_>, prefix_lower: &str, namespace: &str, identity: &mut Identity) {
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}cost-center"))
+    {
+        identity.cost_center.clone_from(val);
+    }
     if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}group")) {
         identity.group.clone_from(val);
     }
     if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}model")) {
         identity.model.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}organization-id"))
+    {
+        identity.organization_id.clone_from(val);
     }
     if let Some(val) = ctx
         .filter_metadata
@@ -679,8 +707,12 @@ fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, ide
         let val = value.to_str().unwrap_or_default();
 
         match suffix {
+            "cost-center" if identity.cost_center.is_empty() => val.clone_into(&mut identity.cost_center),
             "group" if identity.group.is_empty() => val.clone_into(&mut identity.group),
             "model" if identity.model.is_empty() => val.clone_into(&mut identity.model),
+            "organization-id" if identity.organization_id.is_empty() => {
+                val.clone_into(&mut identity.organization_id);
+            },
             "subscription" if identity.subscription.is_empty() => val.clone_into(&mut identity.subscription),
             "username" if identity.username.is_empty() => val.clone_into(&mut identity.username),
             _ => {},
@@ -927,6 +959,8 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
             "user": state.username,
             "group": state.group,
             "subscription": state.subscription,
+            "organization_id": state.organization_id,
+            "cost_center": state.cost_center,
             "provider": ctx.provider,
             "model": state.model,
             "duration_ms": ctx.duration_ms,

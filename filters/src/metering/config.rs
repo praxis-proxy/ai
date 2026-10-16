@@ -74,7 +74,8 @@ pub(super) struct ExternalMeteringConfig {
 
     /// Prefix for tenant identity headers to capture and strip.
     /// Expected headers: `{prefix}username`, `{prefix}group`,
-    /// `{prefix}subscription`, `{prefix}model`.
+    /// `{prefix}subscription`, `{prefix}model`, `{prefix}organization-id`,
+    /// `{prefix}cost-center`.
     #[serde(default = "default_identity_header_prefix")]
     pub identity_header_prefix: String,
 

@@ -437,6 +437,8 @@ fn usage_event_has_correct_structure() {
     assert_eq!(event["data"]["reasoning_tokens"], 30);
     assert_eq!(event["data"]["duration_ms"], 500);
     assert_eq!(event["data"]["model"], "gpt-4");
+    assert_eq!(event["data"]["organization_id"], "org-1");
+    assert_eq!(event["data"]["cost_center"], "cc-42");
 }
 
 #[test]
@@ -498,6 +500,30 @@ fn error_event_has_correct_structure() {
     assert_eq!(event["type"], CE_TYPE_ERROR);
     assert_eq!(event["data"]["status_code"], 500);
     assert_eq!(event["data"]["user"], "testuser");
+    assert_eq!(event["data"]["organization_id"], "org-1");
+    assert_eq!(event["data"]["cost_center"], "cc-42");
+}
+
+#[test]
+fn absent_organization_and_cost_center_emit_empty_strings() {
+    let mut state = state_for("testuser", "gpt-4");
+    state.organization_id.clear();
+    state.cost_center.clear();
+
+    let event = build_usage_event(
+        &event_ctx("evt-empty", &state),
+        &TokenCounts {
+            input: 1,
+            output: 1,
+            total: 2,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        },
+    );
+
+    assert_eq!(event["data"]["organization_id"], "");
+    assert_eq!(event["data"]["cost_center"], "");
 }
 
 // -----------------------------------------------------------------------------
@@ -511,6 +537,8 @@ fn captures_tenant_headers_with_default_prefix() {
     req.headers.insert("x-tenant-group", "engineering".parse().unwrap());
     req.headers.insert("x-tenant-subscription", "sub-42".parse().unwrap());
     req.headers.insert("x-tenant-model", "gpt-4".parse().unwrap());
+    req.headers.insert("x-tenant-organization-id", "org-9".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
     let state = capture_identity(&mut ctx, "x-tenant-", "identity");
@@ -519,6 +547,8 @@ fn captures_tenant_headers_with_default_prefix() {
     assert_eq!(state.group, "engineering");
     assert_eq!(state.subscription, "sub-42");
     assert_eq!(state.model, "gpt-4");
+    assert_eq!(state.organization_id, "org-9");
+    assert_eq!(state.cost_center, "cc-7");
 }
 
 #[test]
@@ -526,12 +556,16 @@ fn strips_identity_and_auth_headers() {
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers.insert("x-tenant-username", "alice".parse().unwrap());
     req.headers.insert("authorization", "Bearer sk-test".parse().unwrap());
+    req.headers.insert("x-tenant-organization-id", "org-9".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
     let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"x-tenant-username"));
+    assert!(removed.contains(&"x-tenant-organization-id"));
+    assert!(removed.contains(&"x-tenant-cost-center"));
     assert!(removed.contains(&"authorization"));
     assert!(removed.contains(&"x-api-key"));
 }
@@ -590,6 +624,31 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
         "forged model must be ignored when identity is verified: {}",
         state.model
     );
+}
+
+#[test]
+fn verified_billing_identity_ignores_forged_org_and_cost_center() {
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-organization-id", "org-forged".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-forged".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());
+    ctx.filter_metadata
+        .insert("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned());
+    ctx.filter_metadata
+        .insert("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
+
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+
+    assert_eq!(state.organization_id, "org-verified");
+    assert_eq!(state.cost_center, "cc-verified");
 }
 
 #[test]
@@ -925,6 +984,8 @@ fn state_for(username: &str, model: &str) -> MeteringState {
         username: username.into(),
         group: "engineering".into(),
         subscription: "sub-1".into(),
+        organization_id: "org-1".into(),
+        cost_center: "cc-42".into(),
         model: model.into(),
         user_agent: "test/1.0".into(),
         request_start: std::time::Instant::now(),
