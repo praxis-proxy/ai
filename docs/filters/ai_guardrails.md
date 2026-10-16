@@ -17,6 +17,8 @@ Because this filter reads the request body before the header-phase security filt
 
 **Wire format:** client request/response evaluation supports Chat Completions only (`messages` on requests, `choices[].message` on responses). `phase.tool_results` separately evaluates canonical local Responses tool results inside an IRR step. Other Responses content, Anthropic Messages, and MCP wire bodies are not supported yet (see ai#1043). For `phase.tool_results`, a provider `modified` verdict fails closed with `502 guardrail_error`; sanitized text is not forwarded because it cannot yet be safely mapped back to the canonical tool-result items. Only a `passed` verdict permits model re-entry.
 
+A provider `modified` verdict on the request rewrites each targeted user message and forwards the masked body. A request rewrite that cannot be applied is rejected with HTTP 502 so the original text is not sent upstream. On the response, each targeted choice is rebuilt from `index`, `finish_reason`, and a message containing only `role` and the masked `content`. When the upstream sent `Content-Length`, a response rewrite that would grow the body is refused and the client receives the original HTTP 200 with an `evaluation_failed` error document.
+
 When `phase.response` is enabled, Chat Completions requests with `"stream": true` are rejected with HTTP 422 until incremental SSE response evaluation is supported (see #1108).
 
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
