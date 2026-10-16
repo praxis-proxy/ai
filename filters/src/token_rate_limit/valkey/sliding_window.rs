@@ -263,13 +263,13 @@ impl ValkeySlidingWindowBackend {
     /// writer does not even trim shared indexes.
     async fn ensure_accounting_config(&self) -> Result<(), BackendError> {
         let state_index = self.keys_key();
-        ensure_accounting_config(
+        Box::pin(ensure_accounting_config(
             &self.valkey,
             &self.namespace,
             &self.accounting_config_key(),
             &self.config_fingerprint,
             &state_index,
-        )
+        ))
         .await
     }
 
@@ -470,6 +470,14 @@ impl ValkeySlidingWindowBackend {
     /// Charge the estimate and record the reservation atomically.
     /// Called only on the admit path; two requests that race between the read
     /// and this write may both be admitted (overshoot bounded by concurrency).
+    #[expect(
+        clippy::allow_attributes,
+        reason = "this stack-frame allowance must work across supported Clippy versions"
+    )]
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "plain-command admission owns a bounded pipeline state machine"
+    )]
     async fn admit(&self, key_id: &str, request: &ReserveRequest) -> Result<u64, BackendError> {
         let prefix = self.key_prefix(key_id);
         let mut seq = redis::pipe();
@@ -691,6 +699,14 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
         clippy::significant_drop_tightening,
         reason = "transaction.finish() consumes the connection after the borrowed attempt"
     )]
+    #[expect(
+        clippy::allow_attributes,
+        reason = "this stack-frame allowance must work across supported Clippy versions"
+    )]
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "plain-command settlement owns a bounded transaction state machine"
+    )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
         Box::pin(self.ensure_accounting_config()).await?;
         let mut retry = AbortRetry::start();
@@ -719,7 +735,7 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
     }
 
     fn backend_name(&self) -> &'static str {
-        "valkey"
+        self.valkey.backend_name()
     }
 
     fn algorithm_name(&self) -> &'static str {

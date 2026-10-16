@@ -7,7 +7,7 @@ use std::future::Future;
 
 use praxis_filter::{FilterAction, HttpFilter};
 
-use super::TokenRateLimitFilter;
+use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
@@ -621,13 +621,91 @@ fn from_config_rejects_valkey_backend_without_url() {
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
-    assert!(err.to_string().contains("backend.url is required"), "got: {err}");
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
     let yaml = single_rule_yaml_with(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 2s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("topologies must be exclusive")
+    };
+    assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_insecure_tls_without_tls() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("insecure TLS requires TLS")
+    };
+    assert!(err.to_string().contains("tls_insecure requires tls"), "got: {err}");
+}
+
+#[test]
+fn insecure_tls_requires_an_explicit_process_opt_in() {
+    assert!(super::validate_insecure_tls_opt_in_with(false, false).is_ok());
+    assert!(
+        super::validate_insecure_tls_opt_in_with(true, false)
+            .expect_err("certificate verification bypass must be opt-in")
+            .to_string()
+            .contains("PRAXIS_TOKEN_RATE_LIMIT_ALLOW_INSECURE_TLS=1")
+    );
+    assert!(super::validate_insecure_tls_opt_in_with(true, true).is_ok());
+}
+
+#[test]
+fn from_config_rejects_a_plain_sentinel_endpoint_when_tls_is_enabled() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("TLS requires rediss Sentinel endpoints")
+    };
+    assert!(err.to_string().contains("endpoint scheme"), "got: {err}");
+}
+
+#[test]
+fn from_config_accepts_a_valkeys_tls_sentinel_endpoint() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [valkeys://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
@@ -1008,7 +1086,7 @@ async fn missing_reservation_id_skips_reconciliation() {
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "the first 400-token request fits"
     );
-    ctx.filter_metadata.remove(super::META_RESERVATION_ID);
+    ctx.filter_metadata.remove(META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(
@@ -1138,6 +1216,7 @@ fn debug_format_lists_configured_rule_names() {
         epoch: std::time::Instant::now(),
         valkey_clock: false,
         hierarchy: None,
+        on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1873,6 +1952,61 @@ async fn valkey_failure_fails_closed() {
 }
 
 #[tokio::test]
+async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.get_metadata(META_RESERVATION_ID).is_none(),
+        "open mode must not fabricate a reservation ID"
+    );
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(
+        ctx.get_metadata(META_FAIL_OPEN).is_none(),
+        "fail-open marker must not leak across exchanges"
+    );
+}
+
+#[test]
+fn from_config_rejects_an_unbounded_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  operation_timeout: 61s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must remain bounded")
+    };
+    assert!(err.to_string().contains("must not exceed 60s"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_zero_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 0ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must be positive")
+    };
+    assert!(
+        err.to_string().contains("backend.discovery_timeout") && err.to_string().contains("duration must be positive"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_another() {
     // The token-bucket analog of `valkey_budget_exhausted_on_one_instance_is_denied_on_another`:
     // proves the *second* algorithm also gets the distributed-state
@@ -1965,6 +2099,23 @@ async fn valkey_token_bucket_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the token-bucket request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metadata() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.get_metadata(META_RESERVATION_ID).is_none());
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
 }
 
 #[tokio::test]

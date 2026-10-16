@@ -7,6 +7,13 @@
 VERSION          ?= $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' Cargo.toml | head -n 1)
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+SENTINEL_PRODUCT ?= valkey
+SENTINEL_ENV_FILE ?= target/sentinel.env
+SENTINEL_DEAD_ENDPOINT ?=
+SENTINEL_FAILOVER_BEFORE_COMMAND ?=
+SENTINEL_REPLICATION_HEALTH_TEST ?=
+SENTINEL_ON_FAILURE ?=
+SENTINEL_TEST_FILTER ?= sentinel_fixture_
 OPENAI_CONFORMANCE_ARGS ?=
 RESPONSES_CONFORMANCE_ARGS ?=
 V                ?=
@@ -47,6 +54,7 @@ endif
 	test-store-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
+	test-token-rate-limit-sentinel-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
 	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
@@ -238,6 +246,20 @@ test-postgres-integration:
 		openai_responses_store_postgres \
 		openai_responses_store_postgres_mtls \
 		openai_conversations_postgres_mtls $(if $(V),--nocapture)
+
+test-token-rate-limit-sentinel-integration:
+	@test -n "$(SENTINEL_IMAGE)" || { echo "SENTINEL_IMAGE must be an immutable @sha256 image reference" >&2; exit 2; }
+	@TOKEN_RATE_LIMIT_SENTINEL_DEAD_ENDPOINT="$(SENTINEL_DEAD_ENDPOINT)" \
+		TOKEN_RATE_LIMIT_SENTINEL_FAILOVER_BEFORE_COMMAND="$(SENTINEL_FAILOVER_BEFORE_COMMAND)" \
+		TOKEN_RATE_LIMIT_SENTINEL_REPLICATION_HEALTH_TEST="$(SENTINEL_REPLICATION_HEALTH_TEST)" \
+		TOKEN_RATE_LIMIT_SENTINEL_ON_FAILURE="$(SENTINEL_ON_FAILURE)" \
+		tests/integration/fixtures/token_rate_limit/start-sentinel-topology.sh \
+		--product "$(SENTINEL_PRODUCT)" --image "$(SENTINEL_IMAGE)" \
+		--env-file "$(SENTINEL_ENV_FILE)" -- \
+		sh -c 'cargo test -p praxis-ai-filters --features token-rate-limit-filter \
+			live_sentinel_ --lib -- --test-threads=1 $(if $(V),--nocapture) && \
+			cargo test -p praxis-tests-integration --features token-rate-limit-filter --test suite \
+			$(SENTINEL_TEST_FILTER) -- --test-threads=1 $(if $(V),--nocapture)'
 
 test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
@@ -859,6 +881,7 @@ help:
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
+	@echo "  test-token-rate-limit-sentinel-integration Sentinel fixture smoke (needs SENTINEL_IMAGE; failover with SENTINEL_FAILOVER_BEFORE_COMMAND=1)"
 	@echo "  test-environment     llm-d ext_proc environment tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"

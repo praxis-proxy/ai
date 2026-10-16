@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Valkey-backed state for the `token_rate_limit` filter, on plain commands.
+//! Redis/Valkey-backed state for the `token_rate_limit` filter, on plain
+//! commands.
 //!
 //! Admission and reconciliation are composed from plain Valkey commands
 //! instead of server-side scripts. The sliding window uses commutative
 //! operations (`INCRBY`, `ZADD`, `ZREMRANGEBYSCORE`, TTLs): two admissions
 //! racing on one key may both pass, and the proposal accepts that momentary
-//! overshoot; what is never lost is the usage they write. The token bucket's
+//! overshoot; a dispatched mutation is never replayed, although asynchronous
+//! replication may still lose an acknowledged write during failover. The token bucket's
 //! refill is a read-modify-write, so it runs under `WATCH`/`MULTI`/`EXEC`.
 //! In both, each reservation lives in its own key that expires with the
 //! reservation timeout, and it is settled exactly once: both algorithms
 //! delete it in a transaction that `WATCH` aborts when another settlement
 //! got there first.
+//!
+//! This module is the shared-backend infrastructure boundary. The filter only
+//! calls [`TokenRateLimitStateBackend`]; Sentinel discovery, TLS/authenticated
+//! transport, pooling, fencing, and mutation-outcome classification stay here
+//! and must not become admission-policy branches.
 
 use std::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -253,8 +260,12 @@ const BOOTSTRAP_SCAN_COUNT: usize = 256;
 /// the marker transaction and retry state are inherently larger than the
 /// stack-frame lint threshold.
 #[expect(
+    clippy::allow_attributes,
+    reason = "this stack-frame allowance must work across supported Clippy versions"
+)]
+#[allow(
     clippy::large_stack_frames,
-    reason = "all callers box this inherently large Valkey transaction future before awaiting it"
+    reason = "bounded accounting state machine has intentionally large await state"
 )]
 pub(super) async fn ensure_accounting_config(
     valkey: &ValkeyConnection,
@@ -263,7 +274,7 @@ pub(super) async fn ensure_accounting_config(
     expected: &str,
     state_index: &str,
 ) -> Result<(), BackendError> {
-    let stored = read_accounting_marker(valkey, namespace, marker).await?;
+    let stored = Box::pin(read_accounting_marker(valkey, namespace, marker)).await?;
     if let Some(stored) = stored {
         return validate_accounting_config(Some(&stored), expected);
     }
@@ -289,6 +300,14 @@ pub(super) async fn ensure_accounting_config(
 }
 
 /// Read both persistent markers together on the normal reserve/reconcile path.
+#[expect(
+    clippy::allow_attributes,
+    reason = "this stack-frame allowance must work across supported Clippy versions"
+)]
+#[allow(
+    clippy::large_stack_frames,
+    reason = "marker read owns the bounded generation bootstrap await state"
+)]
 async fn read_accounting_marker(
     valkey: &ValkeyConnection,
     namespace: &str,
@@ -303,7 +322,7 @@ async fn read_accounting_marker(
         Some(ACCOUNTING_GENERATION_VALUE) => Ok(stored),
         Some(_) => Err(BackendError::ConfigurationMismatch),
         None => {
-            ensure_accounting_generation(valkey, namespace).await?;
+            Box::pin(ensure_accounting_generation(valkey, namespace)).await?;
             // Bootstrap can race with marker deletion; let the transactional
             // path re-read and validate the rule marker before proceeding.
             Ok(None)
@@ -320,8 +339,12 @@ async fn read_accounting_marker(
 /// unmarked state is found, a permanent tombstone forces an explicit namespace
 /// cutover instead of allowing a new policy to reinterpret it.
 #[expect(
+    clippy::allow_attributes,
+    reason = "this stack-frame allowance must work across supported Clippy versions"
+)]
+#[allow(
     clippy::large_stack_frames,
-    reason = "namespace bootstrap owns the bounded Valkey scan state machine"
+    reason = "namespace scan is bounded but has a large async state machine"
 )]
 async fn ensure_accounting_generation(valkey: &ValkeyConnection, namespace: &str) -> Result<(), BackendError> {
     let generation = accounting_generation_key(namespace);
@@ -500,8 +523,8 @@ mod sliding_window;
 mod token_bucket;
 mod window;
 
-pub(super) use connection::ValkeyConnection;
-use connection::{AbortRetry, VALKEY_TIMEOUT, command_error, unwatch};
+use connection::{AbortRetry, command_error, unwatch};
+pub(super) use connection::{VALKEY_TIMEOUT, ValkeyConnection};
 pub(super) use sliding_window::{ValkeySlidingWindowBackend, ValkeySlidingWindowConfig};
 pub(super) use token_bucket::{ValkeyTokenBucketBackend, ValkeyTokenBucketConfig};
 

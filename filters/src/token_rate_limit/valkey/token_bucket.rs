@@ -302,13 +302,13 @@ impl ValkeyTokenBucketBackend {
     /// writer cannot reinterpret the bucket before failing closed.
     async fn ensure_accounting_config(&self) -> Result<(), BackendError> {
         let state_index = self.keys_key();
-        ensure_accounting_config(
+        Box::pin(ensure_accounting_config(
             &self.valkey,
             &self.namespace,
             &self.accounting_config_key(),
             &self.config_fingerprint,
             &state_index,
-        )
+        ))
         .await
     }
 
@@ -679,6 +679,14 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
         clippy::significant_drop_tightening,
         reason = "transaction.finish() consumes the connection; the lint misidentifies the borrow across .await as a retained drop"
     )]
+    #[expect(
+        clippy::allow_attributes,
+        reason = "this stack-frame allowance must work across supported Clippy versions"
+    )]
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "WATCH/MULTI/EXEC settlement owns a bounded transaction state machine"
+    )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
         Box::pin(self.ensure_accounting_config()).await?;
         let mut retry = AbortRetry::start();
@@ -707,7 +715,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
     }
 
     fn backend_name(&self) -> &'static str {
-        "valkey"
+        self.valkey.backend_name()
     }
 
     fn algorithm_name(&self) -> &'static str {
@@ -1337,7 +1345,7 @@ mod tests {
             }
         };
         let started = std::time::Instant::now();
-        let outcome = backend.reserve_with(reserve("alice", 1, 1_000_000), interfere).await;
+        let outcome = Box::pin(backend.reserve_with(reserve("alice", 1, 1_000_000), interfere)).await;
         let elapsed = started.elapsed();
         assert!(
             matches!(&outcome, Err(BackendError::Unavailable(message)) if message.contains("contended")),

@@ -1,0 +1,99 @@
+name: Token Rate Limit Sentinel Fixture Smoke
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sentinel:
+    name: Sentinel fixture smoke (${{ matrix.product }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: redis
+            image: docker.io/library/redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+          - product: valkey
+            image: registry.redhat.io/rhel10/valkey-8@sha256:77a0c5aad7e39c35e2d575073e8d8b42417e2cbdba0f5626db4f59ade84e1fbe
+
+    env:
+      SENTINEL_PRODUCT: ${{ matrix.product }}
+      SENTINEL_IMAGE: ${{ matrix.image }}
+      SENTINEL_ENV_FILE: ${{ runner.temp }}/sentinel.env
+      SENTINEL_DEAD_ENDPOINT: redis://127.0.0.1:1
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+
+      - name: Configure Red Hat registry pull secret
+        if: matrix.product == 'valkey'
+        env:
+          REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+        run: |
+          test -n "$REDHAT_PULL_SECRET" || {
+            echo "REDHAT_PULL_SECRET is required; Valkey qualification must not be skipped" >&2
+            exit 1
+          }
+          mkdir -p "$HOME/.docker"
+          printf '%s' "$REDHAT_PULL_SECRET" > "$HOME/.docker/config.json"
+          chmod 600 "$HOME/.docker/config.json"
+
+      - name: Pull immutable qualification image
+        run: docker pull "$SENTINEL_IMAGE"
+
+      - name: Record resolved Redis client
+        run: cargo tree --locked --package redis
+
+      - name: Build the proxy binary (compile gate)
+        run: cargo build -p praxis-ai-proxy --bin praxis-ai --features token-rate-limit-filter
+
+      - name: Run token-rate-limit unit suite
+        run: cargo test -p praxis-ai-filters --features token-rate-limit-filter token_rate_limit --lib
+
+      - name: Run Sentinel fixture integration
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT"
+
+      - name: Run Sentinel fixture after planned failover
+        env:
+          SENTINEL_FAILOVER_BEFORE_COMMAND: "1"
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT" \
+          SENTINEL_FAILOVER_BEFORE_COMMAND="$SENTINEL_FAILOVER_BEFORE_COMMAND"
+
+      - name: Run closed-mode NOREPLICAS health test
+        env:
+          SENTINEL_REPLICATION_HEALTH_TEST: "1"
+          SENTINEL_ON_FAILURE: closed
+          SENTINEL_TEST_FILTER: sentinel_health_noreplicas_failure
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
+          SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
+          SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"
+
+      - name: Run open-mode NOREPLICAS health test
+        env:
+          SENTINEL_REPLICATION_HEALTH_TEST: "1"
+          SENTINEL_ON_FAILURE: open
+          SENTINEL_TEST_FILTER: sentinel_health_noreplicas_failure
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
+          SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
+          SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"
