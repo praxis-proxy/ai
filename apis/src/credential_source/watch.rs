@@ -1,19 +1,18 @@
 //! Single-thread projected-file watcher with fail-closed publication.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use praxis_filter::FilterError;
 use zeroize::Zeroizing;
 
-use super::{
-    CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, TransformFn, resolve_raw_token,
-};
+use super::{CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, TransformFn, resolve_raw_token};
 
 /// Watcher-thread control message.
 enum WatcherMessage {
@@ -250,13 +249,8 @@ impl WatchRegistry {
                 // complete startup snapshot.
                 let mut initial = Vec::with_capacity(watched.len());
                 for item in &watched {
-                    let Ok(payload) =
-                        resolve_raw_token_and_transform(&item.path, &item.ctx, &item.transform)
-                    else {
-                        drop(ready_tx.send(Err(format!(
-                            "{}: failed authoritative credential read",
-                            item.ctx.owner
-                        ))));
+                    let Ok(payload) = resolve_raw_token_and_transform(&item.path, &item.ctx, &item.transform) else {
+                        drop(ready_tx.send(Err(format!("{}: failed authoritative credential read", item.ctx.owner))));
                         return;
                     };
                     initial.push((Arc::clone(&item.snapshot), payload));
@@ -284,9 +278,7 @@ impl WatchRegistry {
             Err(error) => {
                 drop(message_tx.send(WatcherMessage::Shutdown));
                 drop(thread.join());
-                return Err(
-                    format!("credential_source: credential watcher did not initialize: {error}").into(),
-                );
+                return Err(format!("credential_source: credential watcher did not initialize: {error}").into());
             },
         };
         if let Err(error) = ready {
@@ -294,7 +286,10 @@ impl WatchRegistry {
             drop(thread.join());
             return Err(format!("credential_source: {error}").into());
         }
-        Ok(Some(WatchHandle { shutdown: message_tx, thread: Some(thread) }))
+        Ok(Some(WatchHandle {
+            shutdown: message_tx,
+            thread: Some(thread),
+        }))
     }
 }
 
@@ -316,7 +311,10 @@ fn process_event(event: &notify::Event, watched: &[WatchedSource]) {
         reload_all(watched);
         return;
     }
-    if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
         return;
     }
     for item in watched {
@@ -344,16 +342,21 @@ fn process_event(event: &notify::Event, watched: &[WatchedSource]) {
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use zeroize::Zeroizing;
+
     use super::*;
     use crate::credential_source::{CredentialSource, DiagnosticContext};
-    use std::time::{Duration, Instant};
-    use zeroize::Zeroizing;
 
     fn identity() -> impl Fn(&str) -> Result<Zeroizing<String>, FilterError> + Send + Sync + 'static {
         |t: &str| Ok(Zeroizing::new(t.to_owned()))
     }
     fn ctx(reference: &str) -> DiagnosticContext {
-        DiagnosticContext { owner: "credential_inject", reference: Some(reference.to_owned()) }
+        DiagnosticContext {
+            owner: "credential_inject",
+            reference: Some(reference.to_owned()),
+        }
     }
 
     async fn wait_until<F: Fn() -> bool>(pred: F) -> bool {
@@ -389,9 +392,7 @@ mod tests {
         let tmp = dir.path().join("key.tmp");
         std::fs::write(&tmp, "tok-b\n").unwrap();
         std::fs::rename(&tmp, &path).unwrap();
-        assert!(
-            wait_until(|| handle.current().payload.as_deref().map(String::as_str) == Some("tok-b")).await
-        );
+        assert!(wait_until(|| handle.current().payload.as_deref().map(String::as_str) == Some("tok-b")).await);
     }
 
     #[tokio::test]
@@ -449,10 +450,18 @@ mod tests {
         std::fs::write(&p2, "two\n").unwrap();
         let mut reg = WatchRegistry::new();
         let h1 = reg
-            .register(ctx("a/b/1"), &CredentialSource::File(p1.to_string_lossy().into_owned()), identity())
+            .register(
+                ctx("a/b/1"),
+                &CredentialSource::File(p1.to_string_lossy().into_owned()),
+                identity(),
+            )
             .unwrap();
         let h2 = reg
-            .register(ctx("a/b/2"), &CredentialSource::File(p2.to_string_lossy().into_owned()), identity())
+            .register(
+                ctx("a/b/2"),
+                &CredentialSource::File(p2.to_string_lossy().into_owned()),
+                identity(),
+            )
             .unwrap();
         let watch = reg.finish().unwrap().expect("file sources produce a watch handle");
         assert_eq!(watch.thread_count(), 1, "both files share one watcher thread");
@@ -470,7 +479,11 @@ mod tests {
     fn register_rejects_non_file_source() {
         let mut reg = WatchRegistry::new();
         let err = reg
-            .register(ctx("a/b/c"), &CredentialSource::Value(Zeroizing::new("x".to_owned())), identity())
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::Value(Zeroizing::new("x".to_owned())),
+                identity(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("file"), "{err}");
     }
@@ -506,7 +519,11 @@ mod tests {
         std::fs::write(&path, "token-b\n").unwrap();
         let mut reg = WatchRegistry::new();
         let handle = reg
-            .register(ctx("a/b/c"), &CredentialSource::File(path.to_string_lossy().into_owned()), identity())
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
             .unwrap();
         std::fs::write(&path, "token-c\n").unwrap();
         let _watch = reg.finish().unwrap();

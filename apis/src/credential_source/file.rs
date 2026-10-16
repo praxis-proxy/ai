@@ -1,8 +1,6 @@
 //! Bounded, fail-closed projected-file token read.
 
-use std::fs::File;
-use std::io::Read as _;
-use std::path::Path;
+use std::{fs::File, io::Read as _, path::Path};
 
 use praxis_filter::FilterError;
 use zeroize::Zeroizing;
@@ -40,24 +38,21 @@ pub(crate) fn validate_source_len(kind: &str, value: &str, owner: &str) -> Resul
 
 /// Read a projected credential file with a hard byte cap; trim and validate.
 /// Secret bytes never appear in any error.
-pub(crate) fn read_projected_token(
-    path: &str,
-    ctx: &DiagnosticContext,
-) -> Result<Zeroizing<String>, FilterError> {
+pub(crate) fn read_projected_token(path: &str, ctx: &DiagnosticContext) -> Result<Zeroizing<String>, FilterError> {
     let owner = ctx.owner;
-    let file = File::open(Path::new(path)).map_err(|error| {
-        format!("{owner}: cannot read file '{path}'{}: {error}", for_reference(ctx))
-    })?;
+    let file = File::open(Path::new(path))
+        .map_err(|error| format!("{owner}: cannot read file '{path}'{}: {error}", for_reference(ctx)))?;
     let mut content = Zeroizing::new(String::new());
     file.take(MAX_TOKEN_READ_BYTES)
         .read_to_string(&mut content)
         .map_err(|error| {
-            format!("{owner}: cannot read projected credential '{path}'{}: {error}", for_reference(ctx))
+            format!(
+                "{owner}: cannot read projected credential '{path}'{}: {error}",
+                for_reference(ctx)
+            )
         })?;
     if content.len() > MAX_TOKEN_BYTES {
-        return Err(
-            format!("{owner}: projected credential '{path}' exceeds {MAX_TOKEN_BYTES} bytes").into(),
-        );
+        return Err(format!("{owner}: projected credential '{path}' exceeds {MAX_TOKEN_BYTES} bytes").into());
     }
     let token = Zeroizing::new(content.trim().to_owned());
     validate_token(&token, owner)?;
@@ -68,14 +63,21 @@ pub(crate) fn read_projected_token(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::*;
     use std::io::Write as _;
 
+    use super::*;
+
     fn ctx_with_ref() -> DiagnosticContext {
-        DiagnosticContext { owner: "credential_inject", reference: Some("name/namespace/key".to_owned()) }
+        DiagnosticContext {
+            owner: "credential_inject",
+            reference: Some("name/namespace/key".to_owned()),
+        }
     }
     fn ctx_no_ref() -> DiagnosticContext {
-        DiagnosticContext { owner: "anthropic_web_search", reference: None }
+        DiagnosticContext {
+            owner: "anthropic_web_search",
+            reference: None,
+        }
     }
 
     #[test]
@@ -100,7 +102,10 @@ mod tests {
         let err = read_projected_token("/no/such/projected/file", &ctx_no_ref()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("anthropic_web_search"), "{msg}");
-        assert!(!msg.contains(" for '"), "owner-only form must omit the reference clause: {msg}");
+        assert!(
+            !msg.contains(" for '"),
+            "owner-only form must omit the reference clause: {msg}"
+        );
     }
 
     #[test]
@@ -150,7 +155,10 @@ mod tests {
     #[test]
     fn validate_source_len_bounds_error_is_owner_qualified() {
         let env_var = validate_source_len("env_var", "", "credential_inject").unwrap_err();
-        assert_eq!(env_var.to_string(), "credential_inject: env_var must contain 1-4096 bytes");
+        assert_eq!(
+            env_var.to_string(),
+            "credential_inject: env_var must contain 1-4096 bytes"
+        );
         let file = validate_source_len("file", "", "credential_inject").unwrap_err();
         assert_eq!(file.to_string(), "credential_inject: file must contain 1-4096 bytes");
     }
