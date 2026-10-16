@@ -2684,6 +2684,105 @@ def test_nullable_function_output_fields(conversation_backend, fields):
             )
 
 
+def test_orphan_function_call_output_survives_repeated_chat_turns(conversation_backend):
+    """Orphan function_call_output items must not wedge either lane.
+
+    A stored function_call_output whose call_id is missing or explicitly null
+    has no tool call to attach to. The translated lane must lower it to user
+    text instead of failing the request, keep linked outputs as tool messages
+    with their real IDs, and retain the stored item itself across repeated
+    turns. The native lane verifies passthrough only: the loopback backend
+    accepts anything, so it is not evidence that a real provider accepts
+    orphan outputs.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call_output",
+                "call_id": None,
+                "output": "orphan null result",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan missing result",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_linked",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_linked",
+                "output": "linked result",
+            },
+        ]
+    )
+    first = client.responses.create(
+        model="test-model", conversation=conversation.id, input="first turn"
+    )
+    second = client.responses.create(
+        model="test-model", conversation=conversation.id, input="second turn"
+    )
+    assert first.status == "completed", "orphan outputs must not fail the first turn"
+    assert second.status == "completed", "replayed orphan outputs must not fail a later turn"
+    assert len(captured) == 2, "each turn must reach the backend exactly once"
+    for (path, body), turn_input in zip(captured, ["first turn", "second turn"]):
+        if translated:
+            assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+            messages = body["messages"]
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            assert all(
+                m.get("tool_call_id") == "call_linked" for m in tool_messages
+            ), "orphan outputs must never be forwarded as tool messages"
+            user_texts = [
+                m["content"]
+                for m in messages
+                if m.get("role") == "user" and isinstance(m.get("content"), str)
+            ]
+            assert "orphan null result" in user_texts, (
+                "an explicitly null call_id must lower to user text"
+            )
+            assert "orphan missing result" in user_texts, (
+                "a missing call_id must lower to user text"
+            )
+            assert turn_input in user_texts, "the turn input must still be forwarded"
+            assert any(
+                m.get("role") == "assistant"
+                and any(
+                    tc.get("id") == "call_linked" for tc in m.get("tool_calls", [])
+                )
+                for m in messages
+            ), "the linked function call must stay an assistant tool_call"
+            assert any(
+                m.get("tool_call_id") == "call_linked" and m.get("content") == "linked result"
+                for m in tool_messages
+            ), "the linked output must stay a tool message with its real ID"
+        else:
+            assert path == "/v1/responses", "native lane must forward Responses"
+            input_items = body["input"]
+            orphan_passthrough = [
+                i
+                for i in input_items
+                if i.get("type") == "function_call_output" and i.get("call_id") is None
+            ]
+            assert len(orphan_passthrough) == 2, (
+                "native passthrough must retain stored orphan items as-is"
+            )
+    listed = client.conversations.items.list(conversation.id, order="asc").data
+    orphan_items = [
+        i
+        for i in listed
+        if i.type == "function_call_output" and "call_id" not in i.model_fields_set
+    ]
+    assert {item.output for item in orphan_items} == {
+        "orphan null result",
+        "orphan missing result",
+    }, "stored orphan items must survive two responses in their normalized stored shape"
+
+
 def test_structured_mcp_failure_append_back(conversation_backend):
     """Failed native MCP items round-trip into stored conversation history."""
     client, _, output, translated = conversation_backend

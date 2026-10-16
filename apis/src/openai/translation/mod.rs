@@ -2060,15 +2060,59 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_call_id_returns_error() {
+    fn function_call_output_without_call_id_becomes_user_text() {
+        for item in [
+            json!({"type": "function_call_output", "output": "done"}),
+            json!({"type": "function_call_output", "call_id": null, "output": "done"}),
+            json!({"type": "function_call_output", "output": [{"type": "input_text", "text": "done"}]}),
+        ] {
+            let mapped = map(&json!({"model": "m", "input": [item]}));
+            assert_eq!(
+                mapped["messages"],
+                json!([{"role": "user", "content": "done"}]),
+                "an uncorrelated output retains its text without inventing a Chat tool-call relationship"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_with_invalid_call_id_still_returns_error() {
         let error = map_error(&json!({
             "model": "m",
-            "input": [{"type": "function_call_output", "output": "done"}]
+            "input": [{"type": "function_call_output", "call_id": 42, "output": "done"}]
         }));
-
         assert_eq!(
-            error,
-            "Responses function_call_output input item is missing required field `call_id`"
+            error, "Responses function_call_output input item field `call_id` must be a string",
+            "only absent or null call IDs may be lowered to uncorrelated text"
+        );
+    }
+
+    #[test]
+    fn orphan_output_between_call_and_linked_output_keeps_input_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "user", "content": "orphan result"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+            ]),
+            "an orphan between a call and its linked output lowers at its own input position"
         );
     }
 

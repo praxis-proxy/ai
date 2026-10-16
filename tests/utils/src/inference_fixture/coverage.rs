@@ -1306,6 +1306,7 @@ mod tests {
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["openai_responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1392,11 +1393,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 77, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 63, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 68, "manifest recording inventory count");
+        assert_eq!(report.features_total, 78, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 64, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 69, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1432,6 +1434,7 @@ mod tests {
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
                 "responses/chat-null-tool-choice",
+                "responses/chat-orphan-tool-output",
                 "responses/chat-reasoning-disabled",
                 "responses/chat-reasoning-nonstream",
                 "responses/chat-reasoning-replay",
@@ -1465,7 +1468,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 77, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 78, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1827,6 +1830,10 @@ mod tests {
                     &"vertex.anthropic.request.resolved_target".to_owned(),
                     &vec!["vertex/anthropic-wire-translation".to_owned()]
                 ),
+                (
+                    &"responses.chat.tools.orphan_output_projection".to_owned(),
+                    &vec!["responses/chat-orphan-tool-output".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -1989,7 +1996,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[58..77] {
+        for feature in &manifest.features[58..78] {
             assert_eq!(
                 feature
                     .providers
