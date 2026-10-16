@@ -9,7 +9,10 @@
 //! values are deliberately absent: a producer may rotate them on every
 //! revision and no exporter prunes retired series.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use metrics::{counter, gauge};
 
@@ -37,14 +40,104 @@ pub(crate) const SNAPSHOT_RELOADS_TOTAL: &str = "praxis_ai_intelligent_route_sna
 /// process, including expired entries not yet evicted.
 pub(crate) const SESSION_TABLE_ENTRIES: &str = "praxis_ai_intelligent_route_session_table_entries";
 
-/// Serializes snapshot-size publication so a first-request republish cannot
-/// overwrite the value an accepted reload published in between.
+/// Serializes snapshot-size publication so a request-path claim and an
+/// accepted reload cannot interleave their snapshot load or store with the
+/// gauge update that publishes its size.
 static SNAPSHOT_CANDIDATES_LOCK: Mutex<()> = Mutex::new(());
 
-/// Hold this across a snapshot load (or store) and the gauge update that
-/// publishes its size.
-pub(crate) fn lock_snapshot_candidates() -> MutexGuard<'static, ()> {
-    SNAPSHOT_CANDIDATES_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+/// The slot every instance in this process competes for.
+static SNAPSHOT_GAUGE_SLOT: GaugeSlot = GaugeSlot {
+    owner: AtomicU64::new(0),
+};
+
+/// Source of instance identities for [`SnapshotOwner`].
+static NEXT_SNAPSHOT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+/// The holder of one snapshot gauge.
+#[derive(Debug, Default)]
+pub(crate) struct GaugeSlot {
+    /// Identity of the instance holding the gauge; `0` when none does.
+    owner: AtomicU64,
+}
+
+/// One filter instance's claim on the snapshot-size gauge.
+///
+/// A pipeline reload builds a replacement instance before deciding whether
+/// to serve it, so construction must not publish. The instance that serves
+/// requests claims the gauge on its first request, an accepted reload only
+/// republishes while its instance still holds the gauge, and dropping the
+/// holder clears it so a retired snapshot's size is never reported.
+#[derive(Debug)]
+pub(crate) struct SnapshotOwner {
+    /// This instance's identity.
+    id: u64,
+    /// Whether this instance has published at least once.
+    published: AtomicBool,
+    /// The slot this instance competes for.
+    slot: &'static GaugeSlot,
+}
+
+impl SnapshotOwner {
+    /// A claim on the process-wide gauge.
+    pub(crate) fn new() -> Self {
+        Self::in_slot(&SNAPSHOT_GAUGE_SLOT)
+    }
+
+    /// A claim on a slot of its own, so a test can observe ownership without
+    /// other instances in the process interfering.
+    #[cfg(test)]
+    pub(crate) fn isolated() -> Self {
+        Self::in_slot(Box::leak(Box::default()))
+    }
+
+    /// A claim with a fresh identity on `slot`.
+    fn in_slot(slot: &'static GaugeSlot) -> Self {
+        Self {
+            id: NEXT_SNAPSHOT_OWNER.fetch_add(1, Ordering::Relaxed),
+            published: AtomicBool::new(false),
+            slot,
+        }
+    }
+
+    /// Claim the gauge for this instance and publish `count`.
+    ///
+    /// Called from the request path, so it is a single atomic load once the
+    /// claim is settled: an instance republishes only on its first request
+    /// or when the gauge has no holder, never on every request.
+    pub(crate) fn claim(&self, count: impl FnOnce() -> usize) {
+        let owner = self.slot.owner.load(Ordering::Acquire);
+        if owner == self.id || (owner != 0 && self.published.load(Ordering::Relaxed)) {
+            return;
+        }
+        let _guard = SNAPSHOT_CANDIDATES_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        self.slot.owner.store(self.id, Ordering::Release);
+        self.published.store(true, Ordering::Relaxed);
+        gauge!(SNAPSHOT_CANDIDATES).set(usize_to_f64(count()));
+    }
+
+    /// Run `install`, which swaps in a new snapshot and returns its size,
+    /// and publish that size if this instance holds the gauge.
+    pub(crate) fn publish_after(&self, install: impl FnOnce() -> usize) {
+        let _guard = SNAPSHOT_CANDIDATES_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = install();
+        if self.slot.owner.load(Ordering::Acquire) == self.id {
+            gauge!(SNAPSHOT_CANDIDATES).set(usize_to_f64(count));
+        }
+    }
+}
+
+impl Drop for SnapshotOwner {
+    fn drop(&mut self) {
+        let _guard = SNAPSHOT_CANDIDATES_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if self
+            .slot
+            .owner
+            .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            gauge!(SNAPSHOT_CANDIDATES).set(0.0);
+        }
+    }
 }
 
 /// How a request left the filter.
@@ -148,11 +241,6 @@ pub(crate) fn record_selected(candidate: &RouteCandidate, mode: PickerPolicy) {
 /// Count one session-affinity event.
 pub(crate) fn record_session_event(event: SessionEvent) {
     counter!(SESSION_TOTAL, "event" => event.as_str()).increment(1);
-}
-
-/// Publish the serving snapshot's candidate count.
-pub(crate) fn set_snapshot_candidates(count: usize) {
-    gauge!(SNAPSHOT_CANDIDATES).set(usize_to_f64(count));
 }
 
 /// Count one overlay reload attempt.
