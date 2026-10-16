@@ -69,12 +69,14 @@ use self::{
         build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
         parse_approval_response, resolve_approval, target_fingerprint,
     },
-    config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
+    config::{
+        MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, MinimumApproval, build_config, require_inline_outbound_chain,
+    },
 };
 use super::{
     DEFAULT_STORE_NAME,
     error::responses_error_rejection,
-    mcp_classify::{McpDisposition, classify_mcp},
+    mcp_classify::{ApprovalFloor, McpDisposition, classify_mcp},
     mcp_tool_resolve::{
         McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
@@ -121,6 +123,7 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 ///
 /// ```yaml
 /// filter: openai_mcp_dispatch
+/// minimum_approval: always
 /// forward_headers:
 ///   - x-tenant-id
 ///   - x-user-id
@@ -130,6 +133,10 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// max_result_bytes: 1048576
 /// max_total_result_bytes: 8388608
 /// ```
+///
+/// `minimum_approval: always` is an operator approval floor: it forces approval
+/// for every MCP call in this pipeline regardless of the client's per-tool
+/// `require_approval`. Omit it to keep the client-driven default.
 ///
 /// `forward_headers` applies only to connector-backed tools resolved by
 /// `openai_mcp_tool_resolve`. Direct client-selected `server_url` targets never
@@ -156,6 +163,10 @@ pub struct McpDispatchFilter {
     outbound_pipeline: Arc<FilterPipeline>,
     /// Trusted request headers explicitly allowed across the MCP boundary.
     forward_headers: Vec<http::HeaderName>,
+    /// Operator approval floor combined monotonically with each tool's client
+    /// `require_approval` policy. [`ApprovalFloor::Always`] forces approval for
+    /// every MCP call; [`ApprovalFloor::None`] preserves the client-driven policy.
+    minimum_approval: ApprovalFloor,
     /// Timeout for MCP tool calls.
     timeout: Duration,
     /// Hard cap on calls accepted from one model round.
@@ -248,6 +259,9 @@ impl McpDispatchFilter {
                 .iter()
                 .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
                 .collect(),
+            minimum_approval: validated
+                .minimum_approval
+                .map_or(ApprovalFloor::None, MinimumApproval::as_floor),
             timeout: Duration::from_millis(validated.timeout_ms),
             max_calls_per_round: validated.max_calls_per_round,
             max_parallel_calls: validated.max_parallel_calls,
@@ -831,6 +845,16 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        // Publish the operator approval floor onto typed request state so the
+        // owner's response-phase approval partitioning (`prepare_response_round`)
+        // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
+        // count; silently drops a new key once full), a struct field cannot be
+        // dropped under metadata saturation, so a configured security floor can
+        // never be silently disabled. When there is no `ResponsesState` there is
+        // no MCP tool map to gate, so nothing is lost by skipping.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.mcp_operator_approval_floor = self.minimum_approval;
+        }
         let forwarded_headers = self.forwarded_headers(ctx);
 
         // Approval resume runs before the approved call is injected into
@@ -1046,6 +1070,7 @@ pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Opt
 pub(crate) fn prepare_response_round(
     state: &mut ResponsesState,
     max_calls_per_round: usize,
+    operator_floor: ApprovalFloor,
 ) -> Result<(), DispatchFailure> {
     if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
         return Ok(());
@@ -1074,7 +1099,7 @@ pub(crate) fn prepare_response_round(
     let mut pending = Vec::new();
     let mut executable = Vec::new();
     for call in mcp_calls {
-        if let Some(approval) = check_single_approval(call, &tool_index) {
+        if let Some(approval) = check_single_approval(call, &tool_index, operator_floor) {
             pending.push(approval);
         } else {
             executable.push(call.clone());
@@ -1220,12 +1245,13 @@ fn find_by_encoded_name<'a>(
 fn partition_calls_by_approval(
     mcp_calls: Vec<&serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
+    operator_floor: ApprovalFloor,
 ) -> (Vec<PendingApproval>, Vec<serde_json::Value>) {
     let tool_index = McpToolIndex::new(tool_map);
     let mut pending = Vec::new();
     let mut ungated = Vec::new();
     for call in mcp_calls {
-        if let Some(approval) = check_single_approval(call, &tool_index) {
+        if let Some(approval) = check_single_approval(call, &tool_index, operator_floor) {
             pending.push(approval);
         } else {
             ungated.push((*call).clone());
@@ -1276,14 +1302,19 @@ fn extract_arguments(tc: &serde_json::Value) -> String {
 /// Build the client-visible approval request for a tool call, if it needs one.
 ///
 /// Returns `Some` only when [`classify_mcp`] deems the call
-/// [`McpDisposition::ApprovalRequired`] — an MCP call whose policy requires
-/// approval, or one whose encoded name is ambiguous across servers
-/// (fail-closed). The disposition decision is owned by [`classify_mcp`]; this
-/// function only resolves the identity fields needed to render the
-/// `mcp_approval_request`.
+/// [`McpDisposition::ApprovalRequired`] — an MCP call whose effective policy
+/// (the `operator_floor` combined monotonically with the client per-tool
+/// `require_approval`) requires approval, or one whose encoded name is ambiguous
+/// across servers (fail-closed). The disposition decision is owned by
+/// [`classify_mcp`]; this function only resolves the identity fields needed to
+/// render the `mcp_approval_request`.
 #[expect(clippy::too_many_lines, reason = "linear validation with clear structure")]
-fn check_single_approval(tc: &serde_json::Value, tool_index: &McpToolIndex<'_>) -> Option<PendingApproval> {
-    if classify_mcp(tc, tool_index) != McpDisposition::ApprovalRequired {
+fn check_single_approval(
+    tc: &serde_json::Value,
+    tool_index: &McpToolIndex<'_>,
+    operator_floor: ApprovalFloor,
+) -> Option<PendingApproval> {
+    if classify_mcp(tc, tool_index, operator_floor) != McpDisposition::ApprovalRequired {
         return None;
     }
 

@@ -278,6 +278,7 @@ def _write_full_flow_config(
     ogx_endpoint: str | None = None,
     file_url_origin: str | None = None,
     web_search_provider: str = "brave",
+    mcp_minimum_approval: str | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     resolved_backend = backend_endpoint or _vllm_endpoint()
@@ -400,6 +401,16 @@ def _write_full_flow_config(
         )
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if mcp_minimum_approval is not None:
+        # Inject the operator approval floor onto openai_mcp_dispatch so the
+        # pipeline requires approval for every MCP call regardless of the client's
+        # per-tool require_approval (issue #1723).
+        anchor = "              - filter: openai_mcp_dispatch\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor,
+            anchor + f"                minimum_approval: {mcp_minimum_approval}\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -5626,6 +5637,67 @@ def agentic_client(agentic_proxy):
 
 
 @pytest.fixture(scope="session")
+def mcp_approval_floor_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Agentic proxy with the operator approval floor (minimum_approval: always).
+
+    Same pipeline as ``agentic_proxy`` with ``openai_mcp_dispatch.minimum_approval``
+    set to ``always`` so every MCP call requires approval regardless of the
+    client's per-tool ``require_approval`` (issue #1723).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-approval-floor")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
+        mcp_minimum_approval="always",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP approval-floor Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_approval_floor_client(mcp_approval_floor_proxy):
+    """Return an OpenAI client pointed at the approval-floor Praxis proxy."""
+    proxy_port, _, _ = mcp_approval_floor_proxy
+    return _make_openai_client(
+        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
+    )
+
+
+@pytest.fixture(scope="session")
 def translated_agentic_proxy(
     tmp_path_factory,
     request,
@@ -6764,6 +6836,55 @@ class TestAgenticLoopVLLM:
         assert json.loads(approvals[0].arguments).get("city")
         assert not any(item.type == "mcp_call" for item in response.output), (
             response.output
+        )
+
+    def test_operator_floor_forces_approval_over_client_never(
+        self,
+        mcp_approval_floor_client,
+        mcp_approval_floor_proxy,
+    ):
+        """Operator ``minimum_approval: always`` must force an approval exchange
+        even when the client sends ``require_approval: "never"`` (issue #1723).
+
+        The MCP server must receive zero ``tools/call`` because the floor stops
+        dispatch and returns an ``mcp_approval_request`` instead.
+        """
+        _, mcp_port, _ = mcp_approval_floor_proxy
+        MCPHandler.authorization_headers.clear()
+        calls_before = MCPHandler.tool_call_count()
+
+        response = mcp_approval_floor_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "allowed_tools": ["get_weather"],
+                    # The client opts out of approval; the operator floor overrides.
+                    "require_approval": "never",
+                }
+            ],
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
+            max_output_tokens=256,
+        )
+
+        approvals = [
+            item for item in response.output if item.type == "mcp_approval_request"
+        ]
+        assert len(approvals) == 1, response.output
+        assert approvals[0].name == "get_weather"
+        assert approvals[0].server_label == "weather"
+        assert not any(item.type == "mcp_call" for item in response.output), (
+            response.output
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the operator floor must stop dispatch before the MCP server is called"
         )
 
     def test_mcp_authorization_is_bearer_and_not_forwarded_to_model(

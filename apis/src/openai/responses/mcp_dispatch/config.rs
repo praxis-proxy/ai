@@ -7,6 +7,8 @@ use praxis_core::config::ChainRef;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::openai::responses::mcp_classify::ApprovalFloor;
+
 /// Default timeout for MCP `tools/call` calls (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -75,6 +77,15 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
+    /// Operator approval floor applied to every MCP call in this pipeline,
+    /// combined monotonically with each tool's client `require_approval`:
+    /// `approval_required = operator_floor || client_requires_approval`. Set
+    /// `always` to require approval for every MCP call regardless of the client's
+    /// request — a client `"never"` or a server-supplied `readOnlyHint` can never
+    /// suppress it. Omit to preserve the client-driven behavior (the default).
+    #[serde(default)]
+    pub minimum_approval: Option<MinimumApproval>,
+
     /// Per-call timeout in milliseconds for `tools/call` calls. Inside an
     /// iterative request router, every MCP exchange is capped by the router's
     /// remaining deadline.
@@ -99,6 +110,29 @@ pub(crate) struct McpDispatchConfig {
     /// Maximum retained bytes across one MCP result batch (default: 8 MiB).
     #[serde(default = "default_max_total_result_bytes")]
     pub max_total_result_bytes: usize,
+}
+
+/// Operator approval-floor setting for `openai_mcp_dispatch`.
+///
+/// The YAML surface for the operator floor combined with each tool's client
+/// `require_approval` policy. Only `always` is meaningful: a `never` floor would
+/// be a no-op (the floor can only *raise* the requirement, never weaken it), so
+/// it is deliberately not a variant and is rejected by `deny_unknown_fields`.
+/// Maps to [`ApprovalFloor`] via [`MinimumApproval::as_floor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MinimumApproval {
+    /// Require approval for every MCP call, regardless of client settings.
+    Always,
+}
+
+impl MinimumApproval {
+    /// Project the configured floor onto the shared classification [`ApprovalFloor`].
+    pub(crate) const fn as_floor(self) -> ApprovalFloor {
+        match self {
+            Self::Always => ApprovalFloor::Always,
+        }
+    }
 }
 
 /// Default value for `timeout_ms`.

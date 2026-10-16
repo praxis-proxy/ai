@@ -47,9 +47,27 @@ pub(crate) enum McpDisposition {
 /// - **no match** → [`McpDisposition::NotMcp`];
 /// - **more than one match** (a lossy encoded-name collision across servers) → [`McpDisposition::ApprovalRequired`],
 ///   failing closed *before* any policy lookup so an ambiguous call can never execute automatically;
-/// - **exactly one match** → the per-tool `require_approval` policy decides [`McpDisposition::ApprovalRequired`] vs
-///   [`McpDisposition::Automatic`], fail-closed to approval when the policy is absent or unrecognized.
-pub(crate) fn classify_mcp(tool_call: &serde_json::Value, tool_index: &McpToolIndex<'_>) -> McpDisposition {
+/// - **exactly one match** → the operator floor and the per-tool `require_approval` policy together decide
+///   [`McpDisposition::ApprovalRequired`] vs [`McpDisposition::Automatic`], fail-closed to approval when the policy is
+///   absent or unrecognized.
+///
+/// `operator_floor` is combined with the client's per-tool policy **monotonically**:
+///
+/// ```text
+/// approval_required = operator_floor_requires_approval || client_requires_approval
+/// ```
+///
+/// The floor can only *raise* the requirement. An operator floor of
+/// [`ApprovalFloor::Always`] forces approval for every resolved MCP call, so a
+/// client `"require_approval": "never"` (or a server-supplied `readOnlyHint`,
+/// which never feeds approval) can never suppress it. When the floor is
+/// [`ApprovalFloor::None`] the classification is exactly the client-driven
+/// behavior.
+pub(crate) fn classify_mcp(
+    tool_call: &serde_json::Value,
+    tool_index: &McpToolIndex<'_>,
+    operator_floor: ApprovalFloor,
+) -> McpDisposition {
     let Some(encoded_name) = tool_call.get("name").and_then(serde_json::Value::as_str) else {
         return McpDisposition::NotMcp;
     };
@@ -57,12 +75,44 @@ pub(crate) fn classify_mcp(tool_call: &serde_json::Value, tool_index: &McpToolIn
         None => McpDisposition::NotMcp,
         Some(McpToolMatch::Ambiguous { .. }) => McpDisposition::ApprovalRequired,
         Some(McpToolMatch::Unique { key, entry }) => {
-            if requires_approval(&parse_approval_policy(entry), &key.1) {
+            if operator_floor.forces_approval() || requires_approval(&parse_approval_policy(entry), &key.1) {
                 McpDisposition::ApprovalRequired
             } else {
                 McpDisposition::Automatic
             }
         },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Operator approval floor
+// -----------------------------------------------------------------------------
+
+/// Operator-configured minimum approval requirement for the Responses MCP path.
+///
+/// Combined monotonically with each tool's client `require_approval` policy in
+/// [`classify_mcp`]:
+///
+/// ```text
+/// approval_required = operator_floor_requires_approval || client_requires_approval
+/// ```
+///
+/// The floor can only *raise* the requirement; it never weakens a client that
+/// already requires approval, and a client `"never"` or a server-supplied
+/// `readOnlyHint` cannot suppress an operator-required approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ApprovalFloor {
+    /// No operator floor; the client's per-tool policy decides (existing behavior).
+    #[default]
+    None,
+    /// Require approval for every resolved MCP call, regardless of client settings.
+    Always,
+}
+
+impl ApprovalFloor {
+    /// Whether the operator floor forces approval for every classified MCP call.
+    pub(crate) const fn forces_approval(self) -> bool {
+        matches!(self, Self::Always)
     }
 }
 
@@ -173,7 +223,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{McpDisposition, classify_mcp};
+    use super::{ApprovalFloor, McpDisposition, classify_mcp};
     use crate::openai::responses::mcp_tool_resolve::McpToolIndex;
 
     /// Build a one-entry tool map for `(label, tool)` with the given approval policy.
@@ -200,7 +250,7 @@ mod tests {
         let map = tool_map_with_policy("srv", "search", json!("never"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "some_client_fn", "call_id": "c1"});
-        assert_eq!(classify_mcp(&call, &index), McpDisposition::NotMcp);
+        assert_eq!(classify_mcp(&call, &index, ApprovalFloor::None), McpDisposition::NotMcp);
     }
 
     #[test]
@@ -208,7 +258,7 @@ mod tests {
         let map = tool_map_with_policy("srv", "search", json!("never"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "call_id": "c1"});
-        assert_eq!(classify_mcp(&call, &index), McpDisposition::NotMcp);
+        assert_eq!(classify_mcp(&call, &index, ApprovalFloor::None), McpDisposition::NotMcp);
     }
 
     #[test]
@@ -216,7 +266,10 @@ mod tests {
         let map = tool_map_with_policy("srv", "search", json!("never"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
-        assert_eq!(classify_mcp(&call, &index), McpDisposition::Automatic);
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::None),
+            McpDisposition::Automatic
+        );
     }
 
     #[test]
@@ -224,7 +277,10 @@ mod tests {
         let map = tool_map_with_policy("srv", "search", json!("always"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
-        assert_eq!(classify_mcp(&call, &index), McpDisposition::ApprovalRequired);
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::None),
+            McpDisposition::ApprovalRequired
+        );
     }
 
     #[test]
@@ -232,7 +288,10 @@ mod tests {
         let map = tool_map_with_policy("srv", "search", serde_json::Value::Null);
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
-        assert_eq!(classify_mcp(&call, &index), McpDisposition::ApprovalRequired);
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::None),
+            McpDisposition::ApprovalRequired
+        );
     }
 
     #[test]
@@ -254,9 +313,77 @@ mod tests {
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "srv_one__search", "call_id": "c1"});
         assert_eq!(
-            classify_mcp(&call, &index),
+            classify_mcp(&call, &index, ApprovalFloor::None),
             McpDisposition::ApprovalRequired,
             "an ambiguous encoded name must fail closed to approval, not automatic"
         );
+    }
+
+    #[test]
+    fn operator_floor_forces_approval_over_client_never() {
+        // The acceptance core: a client `require_approval: "never"` resolves to
+        // Automatic without a floor, but the operator floor overrides it.
+        let map = tool_map_with_policy("srv", "search", json!("never"));
+        let index = McpToolIndex::new(&map);
+        let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::None),
+            McpDisposition::Automatic,
+            "without the floor, a client 'never' executes automatically"
+        );
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::Always),
+            McpDisposition::ApprovalRequired,
+            "the operator floor must force approval even when the client said 'never'"
+        );
+    }
+
+    #[test]
+    fn operator_floor_keeps_approval_for_always_client() {
+        // Monotonic: a client that already requires approval is unaffected.
+        let map = tool_map_with_policy("srv", "search", json!("always"));
+        let index = McpToolIndex::new(&map);
+        let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::Always),
+            McpDisposition::ApprovalRequired
+        );
+    }
+
+    #[test]
+    fn operator_floor_cannot_be_weakened_by_read_only_hint() {
+        // `readOnlyHint` feeds tool filtering, never approval, so it cannot
+        // suppress the operator floor: a read-only tool with client 'never' still
+        // requires approval under the floor.
+        let mut map = tool_map_with_policy("srv", "search", json!("never"));
+        map.get_mut(&("srv".to_owned(), "search".to_owned())).unwrap()["tool_definition"] =
+            json!({"name": "search", "annotations": {"readOnlyHint": true}});
+        let index = McpToolIndex::new(&map);
+        let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::Always),
+            McpDisposition::ApprovalRequired,
+            "a server-supplied readOnlyHint must not weaken the operator floor"
+        );
+    }
+
+    #[test]
+    fn operator_floor_does_not_change_non_mcp_calls() {
+        // The floor only promotes Automatic → ApprovalRequired for resolved MCP
+        // calls; a non-MCP call stays NotMcp regardless of the floor.
+        let map = tool_map_with_policy("srv", "search", json!("never"));
+        let index = McpToolIndex::new(&map);
+        let call = json!({"type": "function_call", "name": "client_only_fn", "call_id": "c1"});
+        assert_eq!(
+            classify_mcp(&call, &index, ApprovalFloor::Always),
+            McpDisposition::NotMcp
+        );
+    }
+
+    #[test]
+    fn approval_floor_forces_approval_predicate() {
+        assert!(!ApprovalFloor::None.forces_approval());
+        assert!(ApprovalFloor::Always.forces_approval());
+        assert_eq!(ApprovalFloor::default(), ApprovalFloor::None);
     }
 }
