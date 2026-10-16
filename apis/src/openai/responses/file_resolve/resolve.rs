@@ -27,9 +27,22 @@ use crate::{
     callout_policy::OnMissing,
     openai::{
         api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
-        responses::content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
+        responses::{
+            agentic_loop::budget::{SimpleBudget, output_charge},
+            content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
+        },
     },
 };
+
+/// A resolved value can live in the cache, returned value, request, both history
+/// vectors, and rewritten wire while the transport has spare capacity.
+const RETAINED_FILE_OWNER_MULTIPLIER: usize = 16;
+/// Bound one download while leaving room for metadata and transport staging.
+const RETAINED_FILE_READ_DIVISOR: usize = 32;
+/// Metadata is read separately from content; reserve room for JSON parsing.
+const METADATA_HEADROOM_DIVISOR: usize = 128;
+/// Metadata control bytes may escape sixfold in several rewritten owners.
+const METADATA_OWNER_MULTIPLIER: usize = 64;
 
 /// Files API path prefix used in resource URL construction.
 const FILES_PATH_PREFIX: &str = "v1/files";
@@ -163,6 +176,9 @@ pub(crate) enum ResolveError {
         limit: usize,
     },
 
+    /// A file owner would exceed the request-wide retained-payload ceiling.
+    RetainedBudget,
+
     /// The file URL target is blocked by SSRF policy.
     FileUrlBlocked {
         /// Redacted URL label for client-facing messages.
@@ -196,6 +212,7 @@ impl std::fmt::Display for ResolveError {
                     "resolved file reference '{reference}' exceeds configured limit ({limit} bytes)"
                 )
             },
+            Self::RetainedBudget => write!(f, "agentic retained payload budget exceeded"),
             Self::FileUrlBlocked { label } => {
                 write!(f, "file URL '{label}' blocked by security policy")
             },
@@ -256,6 +273,8 @@ pub(crate) struct ResolutionBudget {
     references_seen: usize,
     /// Inline bytes still available across current input and state history.
     remaining_resolved_bytes: usize,
+    /// Copy of the shared request ledger, published after resolution succeeds.
+    simple_budget: Option<SimpleBudget>,
     /// Bound outbound chain execution for configured Files API
     /// (`file_id`) callouts. `None` on the chain-less construction paths,
     /// which fall back to the direct client transport.
@@ -312,6 +331,33 @@ struct ContentResolver<'a> {
 }
 
 impl ResolutionBudget {
+    /// Install the shared request allowance before the first callout.
+    pub(crate) fn set_simple_budget(&mut self, budget: Option<SimpleBudget>) {
+        self.simple_budget = budget;
+    }
+
+    /// Return the updated shared allowance for the next filter.
+    pub(crate) fn simple_budget(&self) -> Option<SimpleBudget> {
+        self.simple_budget
+    }
+
+    /// Remaining request-wide bytes before a transient allocation.
+    fn headroom(&self) -> Result<Option<usize>, ResolveError> {
+        self.simple_budget
+            .map(|budget| budget.remaining_bytes().ok_or(ResolveError::RetainedBudget))
+            .transpose()
+    }
+
+    /// Reserve another independently owned file value before cloning it.
+    fn reserve_retained(&mut self, bytes: usize) -> Result<(), ResolveError> {
+        if let Some(budget) = self.simple_budget.as_mut()
+            && !budget.reserve_additional_input(bytes)
+        {
+            return Err(ResolveError::RetainedBudget);
+        }
+        Ok(())
+    }
+
     /// Look up a resolution without constructing an owned cache key.
     fn cached(
         &self,
@@ -354,17 +400,53 @@ impl ResolutionBudget {
         } = request;
         let cache_kind = (part_type, source.kind());
         if let Some(cached) = self.cached(part_type, source) {
-            return cached.clone();
+            let charge = retained_outcome_charge(part_type, source, cached)?;
+            self.reserve_retained(charge)?;
+            return self
+                .cached(part_type, source)
+                .cloned()
+                .ok_or(ResolveError::RetainedBudget)?;
         }
 
+        let source_charge = source
+            .value()
+            .len()
+            .checked_mul(RETAINED_FILE_OWNER_MULTIPLIER)
+            .and_then(|bytes| bytes.checked_add(4_096))
+            .ok_or(ResolveError::RetainedBudget)?;
+        self.reserve_retained(source_charge)?;
         self.register_reference()?;
+        let headroom = self.headroom()?;
+        let bounded_max = headroom.map_or(max_resolved_bytes, |bytes| {
+            max_resolved_bytes.min(bytes / RETAINED_FILE_READ_DIVISOR)
+        });
+        if bounded_max == 0 {
+            return Err(if headroom.is_some() {
+                ResolveError::RetainedBudget
+            } else {
+                ResolveError::TooLarge {
+                    reference: source.to_string(),
+                    limit: self.max_resolved_bytes,
+                }
+            });
+        }
+        let metadata_cap = headroom.map(|bytes| bytes / METADATA_HEADROOM_DIVISOR);
+        let constrained = bounded_max < max_resolved_bytes;
 
         let outbound = self.outbound.as_ref();
         let resolution = tokio::time::timeout_at(self.deadline, async {
             match source {
                 ReferenceSource::FileId(file_id) => {
                     client
-                        .resolve_file(file_id, request_headers, max_resolved_bytes, part_type, outbound)
+                        .resolve_file(
+                            file_id,
+                            request_headers,
+                            bounded_max,
+                            metadata_cap,
+                            headroom,
+                            part_type,
+                            outbound,
+                        )
                         .await
                 },
                 ReferenceSource::FileUrl(url) => {
@@ -374,12 +456,26 @@ impl ResolutionBudget {
                             detail: "file URL resolution not configured".to_owned(),
                         });
                     };
-                    resolver.resolve_url(url, self.deadline, max_resolved_bytes).await
+                    resolver.resolve_url(url, self.deadline, bounded_max).await
                 },
             }
         })
         .await
         .unwrap_or_else(|_elapsed| overall_timeout_error_for_source(source));
+        let resolution = match resolution {
+            Err(ResolveError::TooLarge { .. }) if constrained => Err(ResolveError::RetainedBudget),
+            Err(ResolveError::FileUrlFailed { detail, .. })
+                if constrained && detail == "content type prefix exceeds budget" =>
+            {
+                Err(ResolveError::RetainedBudget)
+            },
+            other => other,
+        };
+        if matches!(resolution, Err(ResolveError::RetainedBudget)) {
+            return resolution;
+        }
+        let value_charge = retained_outcome_charge(part_type, source, &resolution)?;
+        self.reserve_retained(value_charge)?;
 
         // Retain one owned outcome for repeated references while
         // returning an independently owned value to the JSON part.
@@ -428,6 +524,38 @@ fn overall_timeout_error_for_source(source: ReferenceSource<'_>) -> Result<Resol
     }
 }
 
+/// Bound cached and returned outcomes before either owner is cloned.
+fn retained_outcome_charge(
+    part_type: &str,
+    source: ReferenceSource<'_>,
+    outcome: &Result<ResolvedFile, ResolveError>,
+) -> Result<usize, ResolveError> {
+    let charge = match outcome {
+        Ok(file) => {
+            let metadata = file
+                .content_type
+                .len()
+                .checked_add(file.filename.as_ref().map_or(0, String::len))
+                .ok_or(ResolveError::RetainedBudget)?;
+            output_len_for_part(part_type, source, file)
+                .checked_mul(RETAINED_FILE_OWNER_MULTIPLIER)
+                .and_then(|charge| charge.checked_add(metadata.checked_mul(METADATA_OWNER_MULTIPLIER)?))
+        },
+        Err(error) => match error {
+            ResolveError::CalloutFailed { file_id, detail } | ResolveError::InvalidFileId { file_id, detail } => {
+                file_id.len().checked_add(detail.len())
+            },
+            ResolveError::FileUrlFailed { label, detail } => label.len().checked_add(detail.len()),
+            ResolveError::TooLarge { reference, .. } => Some(reference.len()),
+            ResolveError::FileUrlBlocked { label } => Some(label.len()),
+            ResolveError::TooManyReferences { .. } | ResolveError::RetainedBudget => Some(0),
+        }
+        .and_then(|bytes| bytes.checked_mul(RETAINED_FILE_OWNER_MULTIPLIER)),
+    }
+    .ok_or(ResolveError::RetainedBudget)?;
+    charge.checked_add(4_096).ok_or(ResolveError::RetainedBudget)
+}
+
 impl FilesApiClient {
     /// Build a new client from a pre-built [`ApiClient`] and
     /// domain-specific options.
@@ -456,6 +584,7 @@ impl FilesApiClient {
             max_resolved_bytes: self.max_resolved_bytes,
             references_seen: 0,
             remaining_resolved_bytes: self.max_resolved_bytes,
+            simple_budget: None,
             outbound,
         }
     }
@@ -474,10 +603,17 @@ impl FilesApiClient {
     ///
     /// When `outbound` is present the callout routes through the bound
     /// outbound filter chain; otherwise it uses the direct client transport.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "metadata callout must enforce both standalone and request-wide bounds before parsing"
+    )]
     async fn fetch_metadata(
         &self,
         file_id: &str,
         request_headers: &http::HeaderMap,
+        metadata_cap: Option<usize>,
+        headroom: Option<usize>,
         outbound: Option<&OutboundExecution>,
     ) -> Result<FileMetadata, ResolveError> {
         let url = self
@@ -485,19 +621,41 @@ impl FilesApiClient {
             .resource_url(FILES_PATH_PREFIX, file_id, None)
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let max_bytes = self.client.max_response_bytes();
+        let max_bytes = metadata_cap.map_or_else(
+            || self.client.max_response_bytes(),
+            |cap| self.client.max_response_bytes().min(cap),
+        );
+        if max_bytes == 0 {
+            return Err(ResolveError::RetainedBudget);
+        }
         // Box the callout future so the large transport frame is not inlined
         // into this and every ancestor resolve future (clippy::large_futures).
         let response = match outbound {
             Some(outbound) => Box::pin(self.client.get_via_chain(&url, request_headers, max_bytes, outbound)).await,
             None => Box::pin(self.client.get(&url, request_headers, max_bytes)).await,
         }
-        .map_err(|e| map_api_error(e, file_id))?;
+        .map_err(|e| {
+            if metadata_cap.is_some_and(|cap| cap < self.client.max_response_bytes())
+                && matches!(e, ApiClientError::ResponseTooLarge { .. })
+            {
+                ResolveError::RetainedBudget
+            } else {
+                map_api_error(e, file_id)
+            }
+        })?;
         if !(200..300).contains(&response.status) {
             return Err(ResolveError::CalloutFailed {
                 file_id: file_id.to_owned(),
                 detail: format!("Files API returned status {}", response.status),
             });
+        }
+        if let Some(headroom) = headroom {
+            let charge = output_charge(&response.body)
+                .and_then(|charge| charge.checked_add(response.body.len().checked_mul(8)?))
+                .ok_or(ResolveError::RetainedBudget)?;
+            if charge > headroom / 2 {
+                return Err(ResolveError::RetainedBudget);
+            }
         }
         let body = serde_json::from_slice(&response.body).map_err(|_error| ResolveError::CalloutFailed {
             file_id: file_id.to_owned(),
@@ -569,10 +727,14 @@ impl FilesApiClient {
         file_id: &str,
         request_headers: &http::HeaderMap,
         max_resolved_bytes: usize,
+        metadata_cap: Option<usize>,
+        headroom: Option<usize>,
         part_type: &str,
         outbound: Option<&OutboundExecution>,
     ) -> Result<ResolvedFile, ResolveError> {
-        let metadata = self.fetch_metadata(file_id, request_headers, outbound).await?;
+        let metadata = self
+            .fetch_metadata(file_id, request_headers, metadata_cap, headroom, outbound)
+            .await?;
         let max_content_bytes = match part_type {
             "input_image" => max_content_bytes_for_data_url(max_resolved_bytes, &metadata.content_type),
             _ => Some(max_content_bytes_for_base64(max_resolved_bytes)),
@@ -792,7 +954,7 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::RetainedBudget)) => Err(e),
         Err(e) if matches!(source, ReferenceSource::FileUrl(_)) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");
@@ -1127,6 +1289,168 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
+        reason = "two independent cached expansions prove one shared ledger"
+    )]
+    async fn retained_budget_combines_two_cached_file_expansions() {
+        let client = test_client("http://127.0.0.1:9");
+        let mut budget = client.resolution_budget(None);
+        budget.set_simple_budget(SimpleBudget::new_with_store(2_097_152, 0, false));
+        for id in ["file-a", "file-b"] {
+            budget
+                .cache
+                .entry(("input_file", ReferenceKind::FileId))
+                .or_default()
+                .insert(
+                    id.to_owned(),
+                    Ok(ResolvedFile {
+                        base64: "A".repeat(65_536),
+                        content_type: "text/plain".to_owned(),
+                        filename: None,
+                    }),
+                );
+        }
+        let headers = http::HeaderMap::new();
+        let first = budget
+            .resolve(ResolutionRequest {
+                client: &client,
+                source: ReferenceSource::FileId("file-a"),
+                max_resolved_bytes: 1_048_576,
+                part_type: "input_file",
+                request_headers: &headers,
+                url_resolver: None,
+            })
+            .await;
+        assert!(first.is_ok(), "first cached result should fit");
+        let second = budget
+            .resolve(ResolutionRequest {
+                client: &client,
+                source: ReferenceSource::FileId("file-b"),
+                max_resolved_bytes: 1_048_576,
+                part_type: "input_file",
+                request_headers: &headers,
+                url_resolver: None,
+            })
+            .await;
+        assert!(matches!(second, Err(ResolveError::RetainedBudget)));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two real Files API references exercise cumulative admission"
+    )]
+    async fn retained_budget_combines_two_file_callouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut request = [0_u8; 4096];
+                    let read = stream.read(&mut request).unwrap();
+                    let content = String::from_utf8_lossy(&request[..read]).contains("/content");
+                    let body = if content {
+                        vec![b'a'; 12_288]
+                    } else {
+                        br#"{"id":"file-test","content_type":"text/plain","bytes":12288}"#.to_vec()
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).unwrap();
+                    stream.write_all(&body).unwrap();
+                });
+            }
+        });
+        let client = test_client_with_limits(&format!("http://{address}"), 1_048_576, 1_000);
+        let mut budget = client.resolution_budget(None);
+        budget.set_simple_budget(SimpleBudget::new_with_store(1_048_576, 0, false));
+        let mut body = serde_json::json!({"input":[{"type":"message","role":"user","content":[
+            {"type":"input_file","file_id":"file-one"},
+            {"type":"input_file","file_id":"file-two"}
+        ]}]});
+        let result = resolve_input_with_budget(
+            &mut body,
+            &client,
+            OnMissing::Continue,
+            &http::HeaderMap::new(),
+            None,
+            &mut budget,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+        assert!(body["input"][0]["content"][0].get("file_data").is_some());
+        assert!(body["input"][0]["content"][1].get("file_data").is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_budget_failure_is_terminal_with_on_missing_continue() {
+        let client = test_client("http://127.0.0.1:9");
+        let mut budget = client.resolution_budget(None);
+        budget.set_simple_budget(SimpleBudget::new_with_store(1_048_576, 0, false));
+        budget
+            .cache
+            .entry(("input_file", ReferenceKind::FileId))
+            .or_default()
+            .insert(
+                "file-error".to_owned(),
+                Err(ResolveError::CalloutFailed {
+                    file_id: "file-error".to_owned(),
+                    detail: "x".repeat(100_000),
+                }),
+            );
+        let headers = http::HeaderMap::new();
+        let mut resolver = ContentResolver {
+            budget: &mut budget,
+            client: &client,
+            on_missing: OnMissing::Continue,
+            request_headers: &headers,
+            url_resolver: None,
+        };
+        let result = resolve_reference(
+            ReferenceSource::FileId("file-error"),
+            "input_file",
+            1_048_576,
+            &mut resolver,
+        )
+        .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+    }
+
+    #[tokio::test]
+    async fn retained_budget_checks_metadata_nodes_before_json_parse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let deep = format!("{}0{}", "[".repeat(110), "]".repeat(110));
+        let body = format!("{{\"unused\":[{}]}}", vec![deep; 180].join(","));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        let client = test_client(&format!("http://{address}"));
+        let result = client
+            .fetch_metadata(
+                "file-deep",
+                &http::HeaderMap::new(),
+                Some(65_536),
+                Some(8_388_608),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(ResolveError::RetainedBudget)));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the metadata and content matrices keep non-success body shapes explicit"
     )]
     async fn non_success_files_responses_fail_before_body_decoding() {
@@ -1146,7 +1470,7 @@ mod tests {
             });
             let client = test_client(&format!("http://{address}"));
             let Err(err) = client
-                .fetch_metadata("file-missing", &http::HeaderMap::new(), None)
+                .fetch_metadata("file-missing", &http::HeaderMap::new(), None, None, None)
                 .await
             else {
                 panic!("metadata response must fail for a non-success status");

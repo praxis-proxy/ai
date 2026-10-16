@@ -3,6 +3,8 @@
 
 //! Proxy startup and configuration test utilities for integration tests.
 
+#[cfg(feature = "openai-responses")]
+use std::collections::HashMap;
 use std::{
     fmt,
     io::ErrorKind,
@@ -120,6 +122,10 @@ fn resolve_praxis_ai_bin_path() -> PathBuf {
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 /// [`FilterEntry`]: praxis_core::config::FilterEntry
+#[expect(
+    clippy::too_many_lines,
+    reason = "test pipeline mirrors server body caps and extension wiring"
+)]
 fn resolve_listener_pipeline(
     config: &Config,
     listener: &Listener,
@@ -129,7 +135,9 @@ fn resolve_listener_pipeline(
 ) -> Arc<FilterPipeline> {
     // Mirror the server: fold each chain's inherited `conditions:` into its
     // filters before composition so chain-level gates apply to every filter in
-    // the chain (chain gate AND filter gate).
+    // the chain (chain gate AND filter gate). `as_slices()` borrows the expanded
+    // entries for branch/outbound chain resolution; `for_listener()` concatenates
+    // the listener's referenced chains with the same inherited conditions folded in.
     let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
     let chains = expanded_chains.as_slices();
 
@@ -137,11 +145,34 @@ fn resolve_listener_pipeline(
         .for_listener(listener)
         .unwrap_or_else(|err| panic!("{err}"));
 
+    // Inject the retained-payload budget caps into the expanded listener entries
+    // and a per-listener owned copy of the expanded branch chains, so the
+    // inherited chain conditions folded in by `ExpandedFilterChains` survive the
+    // rewrite. `chains` shadows the borrowed expanded slices with the
+    // budget-adjusted owned copies for this listener's build.
+    #[cfg(feature = "openai-responses")]
+    let mut owned_chains: HashMap<String, Vec<praxis_core::config::FilterEntry>> = chains
+        .iter()
+        .map(|(name, filters)| ((*name).to_owned(), filters.to_vec()))
+        .collect();
+    #[cfg(feature = "openai-responses")]
+    let budget_policy = praxis_ai::prepare_agentic_budget_entries(&mut entries, &mut owned_chains)
+        .unwrap_or_else(|error| panic!("invalid agentic budget pipeline: {error}"));
+    #[cfg(feature = "openai-responses")]
+    let chains: HashMap<&str, &[_]> = owned_chains
+        .iter()
+        .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+        .collect();
+
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    #[cfg(feature = "openai-responses")]
+    let request_body_limit = praxis_ai::agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
+    #[cfg(not(feature = "openai-responses"))]
+    let request_body_limit = config.body_limits.max_request_bytes;
     pipeline
         .apply_body_limits(
-            config.body_limits.max_request_bytes,
+            request_body_limit,
             config.body_limits.max_response_bytes,
             config.insecure_options.allow_unbounded_body,
         )
@@ -153,6 +184,10 @@ fn resolve_listener_pipeline(
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
+    #[cfg(feature = "openai-responses")]
+    if let Some(policy) = budget_policy {
+        pipeline.add_pipeline_extension(Box::new(policy));
+    }
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
     pipeline.add_pipeline_extension(Box::new(store_registry));
