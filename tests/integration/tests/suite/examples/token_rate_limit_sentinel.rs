@@ -6,7 +6,11 @@
 use std::{
     collections::HashMap,
     env,
+    io::Write as _,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
 };
 
 use praxis_test_utils::{
@@ -84,6 +88,73 @@ fn fixture_config_with_rule(
     yaml = yaml.replace(old_endpoints, &format!("            endpoints:\n{endpoint_lines}"));
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:9000", backend_port)]));
     praxis_core::config::Config::from_yaml(&patched).expect("Sentinel fixture config should parse")
+}
+
+/// Run the fixture's native Sentinel CLI without putting credentials in the
+/// container-engine argument list.
+fn sentinel_cli(args: &[&str]) -> std::process::Output {
+    let engine = env::var("TOKEN_RATE_LIMIT_SENTINEL_ENGINE").expect("fixture must export its container engine");
+    let container =
+        env::var("TOKEN_RATE_LIMIT_SENTINEL_SENTINEL_CONTAINER").expect("fixture must export its Sentinel container");
+    let product = env::var("TOKEN_RATE_LIMIT_SENTINEL_PRODUCT").unwrap_or_else(|_| "valkey".to_owned());
+    let cli = if product == "redis" { "redis-cli" } else { "valkey-cli" };
+    let password = env::var("TOKEN_RATE_LIMIT_SENTINEL_PASSWORD").ok();
+
+    let mut command = Command::new(engine);
+    if let Some(password) = password {
+        let mut child = command
+            .args([
+                "exec",
+                "-i",
+                &container,
+                "sh",
+                "-c",
+                "IFS= read -r REDISCLI_AUTH; export REDISCLI_AUTH; exec \"$@\"",
+                "sh",
+                cli,
+            ])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start Sentinel CLI with authentication");
+        child
+            .stdin
+            .take()
+            .expect("Sentinel CLI stdin")
+            .write_all(format!("{password}\n").as_bytes())
+            .expect("write Sentinel CLI authentication");
+        return child.wait_with_output().expect("wait for Sentinel CLI");
+    }
+
+    command
+        .args(["exec", &container, cli])
+        .args(args)
+        .output()
+        .expect("run Sentinel CLI")
+}
+
+/// Trigger and observe Sentinel's planned promotion after the proxy has made
+/// its first request, so the next request must recover an existing connection.
+fn failover_warm_proxy_connection() {
+    let sentinel_port = env::var("TOKEN_RATE_LIMIT_SENTINEL_SENTINEL_PORT").expect("Sentinel port");
+    let replica_port = env::var("TOKEN_RATE_LIMIT_SENTINEL_REPLICA_PORT").expect("replica port");
+    let requested = sentinel_cli(&["-p", &sentinel_port, "SENTINEL", "failover", "mymaster"]);
+    assert!(
+        requested.status.success(),
+        "planned Sentinel failover failed: {}",
+        String::from_utf8_lossy(&requested.stderr)
+    );
+
+    for _ in 0..30 {
+        let observed = sentinel_cli(&["-p", &sentinel_port, "SENTINEL", "get-master-addr-by-name", "mymaster"]);
+        if String::from_utf8_lossy(&observed.stdout).contains(&format!("127.0.0.1\n{replica_port}")) {
+            return;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    panic!("planned Sentinel failover did not promote replica port {replica_port}");
 }
 
 #[test]
@@ -166,6 +237,33 @@ fn sentinel_fixture_enforces_token_bucket_quota_through_the_real_pipeline() {
         1,
         "the denied request must not invoke upstream"
     );
+}
+
+#[test]
+fn sentinel_fixture_warm_connection_reconnects_after_planned_failover() {
+    if env::var("TOKEN_RATE_LIMIT_SENTINEL_FAILOVER_BEFORE_COMMAND").as_deref() != Ok("1") {
+        eprintln!("skipping: planned failover lane is not enabled");
+        return;
+    }
+    let backend = StatefulCapturingBackend::new(vec![(200, OPENAI_RESPONSE_BODY.to_owned())]).start_with_shutdown();
+    let config = fixture_config(free_port(), backend.port());
+    let proxy = start_proxy(&config);
+
+    let first = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "the pre-failover request should warm the proxy connection: {first}"
+    );
+    failover_warm_proxy_connection();
+
+    let second = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&second),
+        200,
+        "the proxy must recover its existing Sentinel connection after failover: {second}"
+    );
+    assert_eq!(backend.requests().len(), 2, "both requests must reach the upstream");
 }
 
 #[test]

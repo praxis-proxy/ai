@@ -245,23 +245,9 @@ if [[ "$server_version" != "$expected_server_version" ]]; then
 fi
 echo "Sentinel fixture product=$product image=$image server_version=$server_version replication_offset=$TOKEN_RATE_LIMIT_SENTINEL_PRIMARY_REPLICATION_OFFSET"
 
-if [[ "${TOKEN_RATE_LIMIT_SENTINEL_FAILOVER_BEFORE_COMMAND:-}" == 1 ]]; then
-    sentinel_cli "${prefix}-sentinel-1" -p "$sentinel_1_port" SENTINEL failover mymaster >/dev/null
-    deadline=$((SECONDS + 30))
-    while ((SECONDS < deadline)); do
-        master=$(sentinel_cli "${prefix}-sentinel-1" -p "$sentinel_1_port" \
-            SENTINEL get-master-addr-by-name mymaster | tr '\n' ':')
-        if [[ "$master" == "127.0.0.1:${replica_port}:" ]]; then
-            break
-        fi
-        sleep 1
-    done
-    [[ "$master" == "127.0.0.1:${replica_port}:" ]] || {
-        echo "planned failover did not promote the replica: $master" >&2
-        debug_logs
-        exit 1
-    }
-fi
+# Planned failover is triggered by the integration test after it has warmed an
+# existing proxy connection. Failing over here would only exercise discovery
+# before the proxy ever owns a stale connection.
 
 if [[ "$replication_health_test" == 1 ]]; then
     data_cli "${prefix}-primary" -p "$primary_port" CONFIG SET min-replicas-to-write 1 >/dev/null

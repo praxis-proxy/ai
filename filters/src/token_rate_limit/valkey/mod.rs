@@ -279,13 +279,19 @@ pub(super) async fn ensure_accounting_config(
         return validate_accounting_config(Some(&stored), expected);
     }
 
-    let mut retry = AbortRetry::start();
+    let mut retry = AbortRetry::start(valkey.operation_deadline());
     loop {
-        let mut transaction = valkey.transaction().await?;
+        let mut transaction = tokio::time::timeout(retry.remaining()?, valkey.transaction())
+            .await
+            .map_err(|_elapsed| BackendError::Unavailable("Valkey operation deadline exceeded".into()))??;
         let outcome = ensure_accounting_config_attempt(transaction.inner(), marker, expected, state_index).await;
         match outcome {
             Ok(outcome) => {
-                transaction.finish().await;
+                if !transaction.finish().await {
+                    return Err(BackendError::Unconfirmed(
+                        "Valkey transaction connection was invalidated".into(),
+                    ));
+                }
                 if let Some(()) = outcome {
                     return Ok(());
                 }

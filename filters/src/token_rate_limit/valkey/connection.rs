@@ -25,8 +25,8 @@ use super::super::{
     validate_insecure_tls_opt_in,
 };
 
-/// Bound on connecting and on every command's response; the token bucket
-/// also uses it as the deadline for retrying aborted transactions.
+/// Default bound on connecting and on every command's response. The configured
+/// operation timeout is also the overall deadline for transaction retries.
 pub(in crate::token_rate_limit) const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Default overall bound for native Sentinel traversal and convergence.
 pub(in crate::token_rate_limit) const SENTINEL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -373,6 +373,11 @@ impl ValkeyConnection {
         self.backend_name
     }
 
+    /// Start one bounded backend operation deadline.
+    pub(in crate::token_rate_limit) fn operation_deadline(&self) -> Instant {
+        Instant::now() + self.timeouts.operation
+    }
+
     /// Run `pipe` on the shared connection, dropping that connection on
     /// any failure so a wedged one is not reused.
     ///
@@ -712,6 +717,18 @@ pub(super) struct TransactionConnection {
     shared_generation_at_checkout: u64,
 }
 
+/// Whether a checked-out transaction still belongs to both current pool
+/// generations. Either generation changing makes a completed mutation
+/// unconfirmed and prevents the socket from being pooled.
+fn transaction_generation_is_current(
+    transaction_generation: u64,
+    pool_generation: u64,
+    shared_generation_at_checkout: u64,
+    shared_generation: u64,
+) -> bool {
+    transaction_generation == pool_generation && shared_generation_at_checkout == shared_generation
+}
+
 impl TransactionConnection {
     /// The underlying connection.
     pub(super) fn inner(&mut self) -> &mut MultiplexedConnection {
@@ -723,19 +740,26 @@ impl TransactionConnection {
 
     /// Return the connection to the pool for reuse, or drop both when
     /// [`MAX_IDLE_TRANSACTION_CONNECTIONS`] are already idle.
-    pub(super) async fn finish(mut self) {
+    pub(super) async fn finish(mut self) -> bool {
         let Some(connection) = self.connection.take() else {
             unreachable!("checked-out transaction connection is present");
         };
         let pool = Arc::clone(&self.pool);
         let generation = self.generation;
         let mut idle = pool.idle.lock().await;
-        if generation == pool.generation.load(Ordering::Acquire) && idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
+        let pool_is_current = transaction_generation_is_current(
+            generation,
+            pool.generation.load(Ordering::Acquire),
+            self.shared_generation_at_checkout,
+            self.shared_generation.load(Ordering::Acquire),
+        );
+        if pool_is_current && idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
             idle.push(PooledConnection { connection, generation });
         }
         drop(idle);
         drop(self.permit.take());
         drop(self);
+        pool_is_current
     }
 }
 
@@ -759,27 +783,32 @@ pub(super) async fn unwatch(connection: &mut MultiplexedConnection) -> Result<()
 
 /// Retry aborted optimistic transactions within the Valkey deadline.
 pub(super) struct AbortRetry {
-    /// Monotonic start time for the retry deadline.
-    started: Instant,
+    /// Monotonic deadline for the retry window.
+    deadline: Instant,
     /// Upper bound of the next jittered pause.
     backoff: Duration,
 }
 
 impl AbortRetry {
     /// Start the bounded retry window.
-    pub(super) fn start() -> Self {
+    pub(super) fn start(deadline: Instant) -> Self {
         Self {
-            started: Instant::now(),
+            deadline,
             backoff: FIRST_ABORT_BACKOFF,
         }
     }
 
+    /// Remaining time in the enclosing operation.
+    pub(super) fn remaining(&self) -> Result<Duration, BackendError> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| BackendError::Unavailable("Valkey operation deadline exceeded".into()))
+    }
+
     /// Pause before another attempt, failing closed once the deadline passes.
     pub(super) async fn pause(&mut self) -> Result<(), BackendError> {
-        let left = VALKEY_TIMEOUT
-            .checked_sub(self.started.elapsed())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| BackendError::Unavailable("Valkey transaction contended".into()))?;
+        let left = self.remaining()?;
         let upper = u64::try_from(self.backoff.as_micros()).unwrap_or(u64::MAX);
         let jitter = Duration::from_micros(rand::rng().random_range(upper / 2..=upper));
         tokio::time::sleep(jitter.min(left)).await;
@@ -871,6 +900,19 @@ mod tests {
             super::primary_url("primary.example", 6379),
             "redis://primary.example:6379"
         );
+    }
+
+    #[test]
+    fn transaction_generation_fence_rejects_pool_or_shared_invalidation() {
+        assert!(super::transaction_generation_is_current(4, 4, 7, 7));
+        assert!(!super::transaction_generation_is_current(4, 5, 7, 7));
+        assert!(!super::transaction_generation_is_current(4, 4, 7, 8));
+    }
+
+    #[test]
+    fn abort_retry_rejects_an_expired_operation_deadline() {
+        let retry = super::AbortRetry::start(Instant::now() - Duration::from_secs(1));
+        assert!(retry.remaining().is_err(), "expired operation must not retry");
     }
 
     #[tokio::test]

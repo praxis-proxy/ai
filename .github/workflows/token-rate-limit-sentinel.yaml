@@ -92,7 +92,7 @@ jobs:
           SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
           SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT"
 
-      - name: Run Sentinel fixture after planned failover
+      - name: Run Sentinel fixture with planned failover on a warm connection
         env:
           SENTINEL_FAILOVER_BEFORE_COMMAND: "1"
         run: make test-token-rate-limit-sentinel-integration \

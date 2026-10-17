@@ -405,15 +405,30 @@ impl ValkeyTokenBucketBackend {
         F: Future<Output = ()> + Send,
     {
         Box::pin(self.ensure_accounting_config()).await?;
-        let mut retry = AbortRetry::start();
+        let mut retry = AbortRetry::start(self.valkey.operation_deadline());
         let mut attempt = 0_u32;
         loop {
             attempt = attempt.saturating_add(1);
-            let mut transaction = self.valkey.transaction().await?;
-            let outcome = self
-                .reserve_attempt(transaction.inner(), &request, attempt, &mut between)
-                .await?;
-            transaction.finish().await;
+            let mut transaction = tokio::time::timeout(retry.remaining()?, self.valkey.transaction())
+                .await
+                .map_err(|_elapsed| BackendError::Unavailable("Valkey operation deadline exceeded".into()))??;
+            let outcome = match tokio::time::timeout(
+                retry.remaining()?,
+                self.reserve_attempt(transaction.inner(), &request, attempt, &mut between),
+            )
+            .await
+            {
+                Ok(outcome) => outcome?,
+                Err(_elapsed) => {
+                    drop(transaction);
+                    return Err(BackendError::Unconfirmed("Valkey operation deadline exceeded".into()));
+                },
+            };
+            if !transaction.finish().await {
+                return Err(BackendError::Unconfirmed(
+                    "Valkey transaction connection was invalidated".into(),
+                ));
+            }
             if let Some(outcome) = outcome {
                 return Ok(outcome);
             }
@@ -689,11 +704,28 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
     )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
         Box::pin(self.ensure_accounting_config()).await?;
-        let mut retry = AbortRetry::start();
+        let mut retry = AbortRetry::start(self.valkey.operation_deadline());
         loop {
-            let mut transaction = self.valkey.transaction().await?;
-            let outcome = self.reconcile_attempt(transaction.inner(), &request).await?;
-            transaction.finish().await;
+            let mut transaction = tokio::time::timeout(retry.remaining()?, self.valkey.transaction())
+                .await
+                .map_err(|_elapsed| BackendError::Unavailable("Valkey operation deadline exceeded".into()))??;
+            let outcome = match tokio::time::timeout(
+                retry.remaining()?,
+                self.reconcile_attempt(transaction.inner(), &request),
+            )
+            .await
+            {
+                Ok(outcome) => outcome?,
+                Err(_elapsed) => {
+                    drop(transaction);
+                    return Err(BackendError::Unconfirmed("Valkey operation deadline exceeded".into()));
+                },
+            };
+            if !transaction.finish().await {
+                return Err(BackendError::Unconfirmed(
+                    "Valkey transaction connection was invalidated".into(),
+                ));
+            }
             if let Some(settlement) = outcome {
                 return Ok(settlement);
             }
