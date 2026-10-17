@@ -20,10 +20,7 @@ use redis::{
     sentinel::{SentinelClient, SentinelClientBuilder, SentinelServerType},
 };
 
-use super::super::{
-    backend::BackendError, config::BackendConfig, expand_backend_url, parse_backend_timeout,
-    validate_insecure_tls_opt_in,
-};
+use super::super::{backend::BackendError, config::BackendConfig, expand_backend_url, parse_backend_timeout};
 
 /// Default bound on connecting and on every command's response. The configured
 /// operation timeout is also the overall deadline for transaction retries.
@@ -122,8 +119,6 @@ struct TlsSentinelConfig {
     service_name: String,
     /// Credentials used by discovered data nodes.
     data_settings: redis::RedisConnectionInfo,
-    /// Whether certificate verification is disabled for this fixture/profile.
-    tls_insecure: bool,
 }
 
 /// Format a Sentinel-reported primary address as a Redis URL, preserving IPv6
@@ -208,11 +203,9 @@ impl ValkeyConnection {
                     expand_credential(&sentinel.redis_username)?,
                     expand_credential(&sentinel.redis_password)?,
                     sentinel.tls,
-                    sentinel.tls_insecure,
                     timeouts,
                     backend_name,
                 )?;
-                validate_insecure_tls_opt_in(sentinel.tls_insecure)?;
                 connection
             },
             (None, None) => {
@@ -244,7 +237,6 @@ impl ValkeyConnection {
         redis_username: Option<String>,
         redis_password: Option<String>,
         tls: bool,
-        tls_insecure: bool,
         timeouts: ValkeyTimeouts,
         backend_name: &'static str,
     ) -> Result<Self, BackendError> {
@@ -288,16 +280,10 @@ impl ValkeyConnection {
             builder = builder.set_client_to_redis_password(value);
         }
         if tls {
-            let mode = if tls_insecure {
-                redis::TlsMode::Insecure
-            } else {
-                redis::TlsMode::Secure
-            };
+            let mode = redis::TlsMode::Secure;
             builder = builder
                 .set_client_to_sentinel_tls_mode(mode)
                 .set_client_to_redis_tls_mode(mode);
-        } else if tls_insecure {
-            return Err(BackendError::Unavailable("tls_insecure requires tls: true".into()));
         }
         let client = builder
             .build()
@@ -324,7 +310,7 @@ impl ValkeyConnection {
                                 redis::ConnectionAddr::TcpTls { host, port, .. } => redis::ConnectionAddr::TcpTls {
                                     host: host.clone(),
                                     port: *port,
-                                    insecure: tls_insecure,
+                                    insecure: false,
                                     tls_params: None,
                                 },
                                 other => other.clone(),
@@ -350,7 +336,6 @@ impl ValkeyConnection {
                     endpoints,
                     service_name,
                     data_settings,
-                    tls_insecure,
                 }),
             }
         } else {
@@ -622,7 +607,7 @@ impl ValkeyConnection {
                     .set_addr(redis::ConnectionAddr::TcpTls {
                         host: primary_host,
                         port: address.1,
-                        insecure: sentinel.tls_insecure,
+                        insecure: false,
                         tls_params: None,
                     })
                     .set_redis_settings(sentinel.data_settings.clone());
@@ -738,6 +723,17 @@ impl TransactionConnection {
         }
     }
 
+    /// Reject a transaction whose checkout epoch was invalidated before its
+    /// first command. `finish` repeats this check after the mutation attempt.
+    pub(super) fn is_current(&self) -> bool {
+        transaction_generation_is_current(
+            self.generation,
+            self.pool.generation.load(Ordering::Acquire),
+            self.shared_generation_at_checkout,
+            self.shared_generation.load(Ordering::Acquire),
+        )
+    }
+
     /// Return the connection to the pool for reuse, or drop both when
     /// [`MAX_IDLE_TRANSACTION_CONNECTIONS`] are already idle.
     pub(super) async fn finish(mut self) -> bool {
@@ -747,12 +743,7 @@ impl TransactionConnection {
         let pool = Arc::clone(&self.pool);
         let generation = self.generation;
         let mut idle = pool.idle.lock().await;
-        let pool_is_current = transaction_generation_is_current(
-            generation,
-            pool.generation.load(Ordering::Acquire),
-            self.shared_generation_at_checkout,
-            self.shared_generation.load(Ordering::Acquire),
-        );
+        let pool_is_current = self.is_current();
         if pool_is_current && idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
             idle.push(PooledConnection { connection, generation });
         }
@@ -859,7 +850,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             ValkeyTimeouts {
                 connect: Duration::from_millis(20),
                 operation: Duration::from_millis(20),
@@ -884,7 +874,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             ValkeyTimeouts::default(),
             "valkey",
@@ -937,7 +926,6 @@ mod tests {
             None,
             data_password,
             false,
-            false,
             ValkeyTimeouts {
                 connect: Duration::from_secs(1),
                 operation: Duration::from_secs(1),
@@ -984,7 +972,6 @@ mod tests {
             nonempty_env("TOKEN_RATE_LIMIT_SENTINEL_PASSWORD"),
             None,
             nonempty_env("TOKEN_RATE_LIMIT_SENTINEL_DATA_PASSWORD"),
-            false,
             false,
             ValkeyTimeouts {
                 connect: Duration::from_secs(1),

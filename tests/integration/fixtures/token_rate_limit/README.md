@@ -55,7 +55,3 @@ For an authenticated run, set either or both of
 configures separate data-node and Sentinel credentials, passes CLI credentials
 over stdin, and exports them only to the child test process; do not place them
 in the repository or command-line arguments.
-
-Controlled self-signed TLS qualification must additionally set
-`PRAXIS_TOKEN_RATE_LIMIT_ALLOW_INSECURE_TLS=1`; certificate verification is
-otherwise required.

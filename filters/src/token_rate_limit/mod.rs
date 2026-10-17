@@ -171,10 +171,6 @@ const META_ESTIMATE: &str = "token_rate_limit.estimate";
 /// reservation handle and is cleared at the end of the exchange.
 const META_FAIL_OPEN: &str = "token_rate_limit.fail_open";
 
-/// Explicit process-level opt-in required before certificate verification can
-/// be disabled for a Sentinel TLS fixture.
-const INSECURE_TLS_OPT_IN_ENV: &str = "PRAXIS_TOKEN_RATE_LIMIT_ALLOW_INSECURE_TLS";
-
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
 
@@ -3383,27 +3379,6 @@ fn parse_backend_timeout(
         return Err(format!("token_rate_limit: backend.{name} must not exceed 60s").into());
     }
     Ok(std::time::Duration::from_millis(millis))
-}
-
-/// Keep certificate-verification bypass out of ordinary deployments unless an
-/// operator explicitly opts into the local-qualification posture.
-fn validate_insecure_tls_opt_in(tls_insecure: bool) -> Result<(), FilterError> {
-    validate_insecure_tls_opt_in_with(tls_insecure, insecure_tls_process_opt_in())
-}
-
-/// Validate the certificate-bypass setting against an explicit process posture.
-fn validate_insecure_tls_opt_in_with(tls_insecure: bool, process_opt_in: bool) -> Result<(), FilterError> {
-    if tls_insecure && !process_opt_in {
-        return Err(
-            format!("token_rate_limit: backend.sentinel.tls_insecure requires {INSECURE_TLS_OPT_IN_ENV}=1").into(),
-        );
-    }
-    Ok(())
-}
-
-/// Return whether the process explicitly permits insecure TLS fixtures.
-fn insecure_tls_process_opt_in() -> bool {
-    std::env::var(INSECURE_TLS_OPT_IN_ENV).is_ok_and(|value| value == "1")
 }
 
 impl std::fmt::Debug for TokenRateLimitFilter {

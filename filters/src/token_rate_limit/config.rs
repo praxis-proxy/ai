@@ -123,9 +123,9 @@ use serde::Deserialize;
 /// The initial release gate is symmetric against official Redis 8.10.2
 /// (`redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0`)
 /// and Red Hat Valkey 8.0.11
-/// (`registry.access.redhat.com/rhel10/valkey-8@sha256:5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9`).
-/// These are symmetric qualification targets, not a claim that every
-/// deployment has passed; support requires both complete product lanes.
+/// (`registry.access.redhat.com/rhel10/valkey-8@sha256:
+/// 5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9`). These are symmetric qualification targets, not a
+/// claim that every deployment has passed; support requires both complete product lanes.
 ///
 /// The shared token bucket, by contrast, serialises admissions per key
 /// through an optimistic transaction: one key admits at most about one
@@ -1120,11 +1120,6 @@ pub(super) struct SentinelConfig {
     /// Use TLS for both Sentinel and discovered data-node connections.
     #[serde(default)]
     pub tls: bool,
-    /// Permit invalid certificates only with the explicit process opt-in
-    /// `PRAXIS_TOKEN_RATE_LIMIT_ALLOW_INSECURE_TLS=1`; never use this in a
-    /// production deployment.
-    #[serde(default)]
-    pub tls_insecure: bool,
     /// Overall Sentinel discovery and convergence bound.
     #[serde(default)]
     pub discovery_timeout: Option<String>,

@@ -714,6 +714,12 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
             let mut transaction = tokio::time::timeout(retry.remaining()?, self.valkey.transaction())
                 .await
                 .map_err(|_elapsed| BackendError::Unavailable("Valkey operation deadline exceeded".into()))??;
+            if !transaction.is_current() {
+                drop(transaction);
+                return Err(BackendError::Unconfirmed(
+                    "Valkey transaction connection was invalidated".into(),
+                ));
+            }
             let outcome = match tokio::time::timeout(
                 retry.remaining()?,
                 self.reconcile_attempt(transaction.inner(), &request),

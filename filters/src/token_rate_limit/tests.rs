@@ -667,27 +667,15 @@ fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
 }
 
 #[test]
-fn from_config_rejects_insecure_tls_without_tls() {
+fn from_config_rejects_insecure_tls_configuration() {
     let yaml = single_rule_yaml_with(
         "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
-        panic!("insecure TLS requires TLS")
+        panic!("insecure TLS configuration must be rejected")
     };
-    assert!(err.to_string().contains("tls_insecure requires tls"), "got: {err}");
-}
-
-#[test]
-fn insecure_tls_requires_an_explicit_process_opt_in() {
-    assert!(super::validate_insecure_tls_opt_in_with(false, false).is_ok());
-    assert!(
-        super::validate_insecure_tls_opt_in_with(true, false)
-            .expect_err("certificate verification bypass must be opt-in")
-            .to_string()
-            .contains("PRAXIS_TOKEN_RATE_LIMIT_ALLOW_INSECURE_TLS=1")
-    );
-    assert!(super::validate_insecure_tls_opt_in_with(true, true).is_ok());
+    assert!(err.to_string().contains("tls_insecure"), "got: {err}");
 }
 
 #[test]
