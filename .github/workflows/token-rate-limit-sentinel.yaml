@@ -1,7 +1,34 @@
 name: Token Rate Limit Sentinel Fixture Smoke
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/token-rate-limit-sentinel.yaml"
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/fixtures/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/**"
+      - "examples/configs/token-rate-limit*.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/token-rate-limit-sentinel.yaml"
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/fixtures/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/**"
+      - "examples/configs/token-rate-limit*.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions: {}
 
@@ -9,6 +36,8 @@ jobs:
   sentinel:
     name: Sentinel fixture smoke (${{ matrix.product }})
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +50,6 @@ jobs:
     env:
       SENTINEL_PRODUCT: ${{ matrix.product }}
       SENTINEL_IMAGE: ${{ matrix.image }}
-      SENTINEL_ENV_FILE: ${{ runner.temp }}/sentinel.env
       SENTINEL_DEAD_ENDPOINT: redis://127.0.0.1:1
 
     steps:
@@ -59,7 +87,7 @@ jobs:
         run: make test-token-rate-limit-sentinel-integration \
           SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
           SENTINEL_IMAGE="$SENTINEL_IMAGE" \
-          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
           SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT"
 
       - name: Run Sentinel fixture after planned failover
@@ -68,7 +96,7 @@ jobs:
         run: make test-token-rate-limit-sentinel-integration \
           SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
           SENTINEL_IMAGE="$SENTINEL_IMAGE" \
-          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
           SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT" \
           SENTINEL_FAILOVER_BEFORE_COMMAND="$SENTINEL_FAILOVER_BEFORE_COMMAND"
 
@@ -80,7 +108,7 @@ jobs:
         run: make test-token-rate-limit-sentinel-integration \
           SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
           SENTINEL_IMAGE="$SENTINEL_IMAGE" \
-          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
           SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
           SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
           SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"
@@ -93,7 +121,7 @@ jobs:
         run: make test-token-rate-limit-sentinel-integration \
           SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
           SENTINEL_IMAGE="$SENTINEL_IMAGE" \
-          SENTINEL_ENV_FILE="$SENTINEL_ENV_FILE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
           SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
           SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
           SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"
