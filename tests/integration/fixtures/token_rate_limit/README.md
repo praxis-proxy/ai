@@ -35,10 +35,11 @@ Set `SENTINEL_DEAD_ENDPOINT=redis://127.0.0.1:1` to prepend an unavailable
 Sentinel endpoint. The real client must skip it and discover through the
 remaining healthy endpoints.
 
-Set `SENTINEL_FAILOVER_BEFORE_COMMAND=1` to request a planned Sentinel
-failover after readiness and before the child test command. The fixture waits
-for replication offsets to converge before promotion, then waits for the
-replica to become the reported primary before starting the test.
+Set `SENTINEL_FAILOVER_BEFORE_COMMAND=1` to enable the planned-failover test.
+The integration test first warms an existing proxy connection, then triggers
+Sentinel promotion through the fixture container and waits for the replica to
+become the reported primary before sending the next request. This exercises
+recovery of a connection that was already in use before failover.
 
 Set `SENTINEL_REPLICATION_HEALTH_TEST=1` with
 `SENTINEL_ON_FAILURE=closed` or `open` to stop the replica after convergence,
