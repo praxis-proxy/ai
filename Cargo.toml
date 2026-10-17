@@ -55,7 +55,7 @@ openssl = "0.10.81"
 quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"
-redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
+redis = { version = "1.7.0", default-features = false, features = ["sentinel", "tokio-rustls-comp", "tls-rustls-insecure"] }
 regex = "1.13.1"
 # reqwest is a dev/test-only dependency. Production callouts use
 # SubRequestClient, which inherits TLS from the process-wide Pingora

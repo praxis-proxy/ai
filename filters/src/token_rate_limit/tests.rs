@@ -7,7 +7,7 @@ use std::future::Future;
 
 use praxis_filter::{FilterAction, HttpFilter};
 
-use super::TokenRateLimitFilter;
+use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
@@ -621,13 +621,79 @@ fn from_config_rejects_valkey_backend_without_url() {
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
-    assert!(err.to_string().contains("backend.url is required"), "got: {err}");
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
     let yaml = single_rule_yaml_with(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 2s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("topologies must be exclusive")
+    };
+    assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_insecure_tls_configuration() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("insecure TLS configuration must be rejected")
+    };
+    assert!(err.to_string().contains("tls_insecure"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_plain_sentinel_endpoint_when_tls_is_enabled() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("TLS requires rediss Sentinel endpoints")
+    };
+    assert!(err.to_string().contains("endpoint scheme"), "got: {err}");
+}
+
+#[test]
+fn from_config_accepts_a_valkeys_tls_sentinel_endpoint() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [valkeys://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
@@ -1008,7 +1074,7 @@ async fn missing_reservation_id_skips_reconciliation() {
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "the first 400-token request fits"
     );
-    ctx.filter_metadata.remove(super::META_RESERVATION_ID);
+    ctx.filter_metadata.remove(META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(
@@ -1138,6 +1204,7 @@ fn debug_format_lists_configured_rule_names() {
         epoch: std::time::Instant::now(),
         valkey_clock: false,
         hierarchy: None,
+        on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1873,6 +1940,61 @@ async fn valkey_failure_fails_closed() {
 }
 
 #[tokio::test]
+async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.get_metadata(META_RESERVATION_ID).is_none(),
+        "open mode must not fabricate a reservation ID"
+    );
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(
+        ctx.get_metadata(META_FAIL_OPEN).is_none(),
+        "fail-open marker must not leak across exchanges"
+    );
+}
+
+#[test]
+fn from_config_rejects_an_unbounded_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  operation_timeout: 61s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must remain bounded")
+    };
+    assert!(err.to_string().contains("must not exceed 60s"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_zero_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 0ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must be positive")
+    };
+    assert!(
+        err.to_string().contains("backend.discovery_timeout") && err.to_string().contains("duration must be positive"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_another() {
     // The token-bucket analog of `valkey_budget_exhausted_on_one_instance_is_denied_on_another`:
     // proves the *second* algorithm also gets the distributed-state
@@ -1965,6 +2087,23 @@ async fn valkey_token_bucket_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the token-bucket request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metadata() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.get_metadata(META_RESERVATION_ID).is_none());
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
 }
 
 #[tokio::test]
@@ -3661,22 +3800,39 @@ struct CapturedRecord {
     fields: std::collections::BTreeMap<&'static str, String>,
 }
 
-/// A `tracing` layer that records spans and events for assertions.
+/// A `tracing` capture whose storage is private to one test thread.
 ///
-/// Install it with [`TracingCapture::install`] and keep the returned
-/// guard alive for the duration of the scenario; it is a thread-local
-/// default, so drive the code under test on the current thread.
+/// The subscriber is installed once for the test binary, while this value is
+/// selected through a thread-local sink. Tracing callsite interest is cached
+/// process-wide, so installing a scoped subscriber per test can race with
+/// another test and cause an event to be permanently skipped.
 #[derive(Debug, Clone, Default)]
 struct TracingCapture {
     events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
     spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
 }
 
+thread_local! {
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<TracingCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Process-wide always-interested layer; per-test routing happens through
+/// [`ACTIVE_CAPTURE`] rather than through a scoped dispatcher.
+#[derive(Debug, Default)]
+struct GlobalTracingCapture;
+
 impl TracingCapture {
-    /// Make this capture the default subscriber for the current thread.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    /// Select this capture for the current test thread.
+    fn install(&self) -> TracingCaptureGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(GlobalTracingCapture))
+                .expect("token-rate-limit tracing capture must own the test subscriber");
+        });
+        ACTIVE_CAPTURE.with(|active| TracingCaptureGuard {
+            previous: active.replace(Some(self.clone())),
+        })
     }
 
     /// Every event recorded so far, oldest first.
@@ -3693,6 +3849,19 @@ impl TracingCapture {
             .iter()
             .map(|(_, record)| record.clone())
             .collect()
+    }
+}
+
+/// Restores any prior capture when a test exits, including by unwinding.
+struct TracingCaptureGuard {
+    previous: Option<TracingCapture>,
+}
+
+impl Drop for TracingCaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| {
+            drop(active.replace(self.previous.take()));
+        });
     }
 }
 
@@ -3722,25 +3891,35 @@ impl tracing::field::Visit for FieldText {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GlobalTracingCapture {
+    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        attrs.record(&mut fields);
-        let metadata = attrs.metadata();
-        self.spans.lock().expect("capture lock").push((
-            id.into_u64(),
-            CapturedRecord {
-                name: metadata.name(),
-                target: metadata.target().to_owned(),
-                level: *metadata.level(),
-                fields: fields.0,
-            },
-        ));
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            attrs.record(&mut fields);
+            let metadata = attrs.metadata();
+            capture.spans.lock().expect("capture lock").push((
+                id.into_u64(),
+                CapturedRecord {
+                    name: metadata.name(),
+                    target: metadata.target().to_owned(),
+                    level: *metadata.level(),
+                    fields: fields.0,
+                },
+            ));
+        });
     }
 
     fn on_record(
@@ -3749,23 +3928,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
         values: &tracing::span::Record<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        values.record(&mut fields);
-        let mut spans = self.spans.lock().expect("capture lock");
-        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
-            record.fields.extend(fields.0);
-        }
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            values.record(&mut fields);
+            let mut spans = capture.spans.lock().expect("capture lock");
+            if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+                record.fields.extend(fields.0);
+            }
+        });
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let mut fields = FieldText::default();
-        event.record(&mut fields);
-        let metadata = event.metadata();
-        self.events.lock().expect("capture lock").push(CapturedRecord {
-            name: "event",
-            target: metadata.target().to_owned(),
-            level: *metadata.level(),
-            fields: fields.0,
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            let metadata = event.metadata();
+            capture.events.lock().expect("capture lock").push(CapturedRecord {
+                name: "event",
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            });
         });
     }
 }
