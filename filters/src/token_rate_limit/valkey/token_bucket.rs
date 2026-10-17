@@ -1392,7 +1392,7 @@ mod tests {
         let outcome = Box::pin(backend.reserve_with(reserve("alice", 1, 1_000_000), interfere)).await;
         let elapsed = started.elapsed();
         assert!(
-            matches!(&outcome, Err(BackendError::Unavailable(message)) if message.contains("contended")),
+            matches!(&outcome, Err(BackendError::Unavailable(message)) if message.contains("deadline")),
             "when every EXEC aborts the backend fails closed, got {outcome:?}"
         );
         assert!(
