@@ -51,6 +51,7 @@ jobs:
       SENTINEL_PRODUCT: ${{ matrix.product }}
       SENTINEL_IMAGE: ${{ matrix.image }}
       SENTINEL_DEAD_ENDPOINT: redis://127.0.0.1:1
+      CONTAINER_ENGINE: docker
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +73,8 @@ jobs:
           chmod 600 "$HOME/.docker/config.json"
 
       - name: Pull immutable qualification image
-        run: docker pull "$SENTINEL_IMAGE"
+        run: |
+          "$CONTAINER_ENGINE" pull "$SENTINEL_IMAGE"
 
       - name: Record resolved Redis client
         run: cargo tree --locked --package redis
