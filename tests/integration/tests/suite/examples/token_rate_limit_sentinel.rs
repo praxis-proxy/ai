@@ -182,7 +182,11 @@ fn sentinel_fixture_enforces_sliding_window_quota_through_the_real_pipeline() {
         eprintln!("skipping: TOKEN_RATE_LIMIT_SENTINEL_ENDPOINTS not set");
         return;
     }
-    let backend = StatefulCapturingBackend::new(vec![(200, OPENAI_RESPONSE_BODY.to_owned())]).start_with_shutdown();
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, OPENAI_RESPONSE_BODY.to_owned()),
+        (200, OPENAI_RESPONSE_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
     let config = fixture_config_with_rule(free_port(), backend.port(), SLIDING_QUOTA_RULE, "sliding-quota");
     let proxy = start_proxy(&config);
 
@@ -245,7 +249,11 @@ fn sentinel_fixture_warm_connection_reconnects_after_planned_failover() {
         eprintln!("skipping: planned failover lane is not enabled");
         return;
     }
-    let backend = StatefulCapturingBackend::new(vec![(200, OPENAI_RESPONSE_BODY.to_owned())]).start_with_shutdown();
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, OPENAI_RESPONSE_BODY.to_owned()),
+        (200, OPENAI_RESPONSE_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
     let config = fixture_config(free_port(), backend.port());
     let proxy = start_proxy(&config);
 
