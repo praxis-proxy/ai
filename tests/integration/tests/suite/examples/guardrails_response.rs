@@ -18,9 +18,6 @@ use super::load_example_config;
 // -----------------------------------------------------------------------------
 
 /// Build a Chat Completion JSON response body with the given assistant content.
-///
-/// The body is padded to be large enough that error JSON replacements
-/// (via `fit_to_committed_length`) are not truncated during tests.
 fn chat_completion_body(content: &str) -> String {
     serde_json::json!({
         "id": "chatcmpl-test-0000000000000000000000000000000000000000",

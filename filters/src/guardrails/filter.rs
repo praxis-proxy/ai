@@ -82,9 +82,10 @@ const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
 /// applied is rejected with HTTP 502 so the original text is not sent
 /// upstream. On the response, each targeted choice is rebuilt from `index`,
 /// `finish_reason`, and a message containing only `role` and the masked
-/// `content`. When the upstream sent `Content-Length`, a response rewrite
-/// that would grow the body is refused and the client receives the original
-/// HTTP 200 with an `evaluation_failed` error document.
+/// `content`. A choice whose message has array `content`, `tool_calls`, or
+/// `function_call` cannot be redacted; the client receives the original HTTP
+/// 200 with an `evaluation_failed` error document. `on_response` drops
+/// `Content-Length` so core reframes the buffered body at its natural size.
 ///
 /// When `phase.response` is enabled, Chat Completions requests with
 /// `"stream": true` are rejected with HTTP 422 until incremental SSE
@@ -318,9 +319,7 @@ impl HttpFilter for AiGuardrailsFilter {
             ));
         }
 
-        ctx.insert_filter_state(ResponseFraming {
-            content_length_committed: upstream_sent_content_length(ctx),
-        });
+        remove_stale_content_length(ctx);
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
             max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
         });
@@ -476,7 +475,6 @@ impl HttpFilter for AiGuardrailsFilter {
                     &format!("Guardrail evaluation failed: {e}"),
                     "guardrail_error",
                     "evaluation_failed",
-                    content_length_committed(ctx),
                 );
                 Ok(FilterAction::Continue)
             },
@@ -581,16 +579,10 @@ fn record_verdict(
             tracing::debug!(verdict, phase = phase_label, "ai_guardrails: verdict");
             Ok(FilterAction::Continue)
         },
-        GuardResult::Block { reason } => Ok(enforce_block(
-            body,
-            reason,
-            phase,
-            verdict,
-            content_length_committed(ctx),
-        )),
+        GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, verdict)),
         GuardResult::Redact { replacements, reason } => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
-            Ok(apply_redaction(ctx, body, replacements, phase))
+            Ok(apply_redaction(body, replacements, phase))
         },
     }
 }
@@ -601,15 +593,11 @@ fn record_verdict(
 /// A request rewrite that cannot be applied is rejected with HTTP 502.
 /// Returning an error would let `failure_mode: open` forward the original text.
 ///
-/// Response headers are already committed. `on_response` records whether the
-/// upstream sent `Content-Length`. When it did, a rewrite that fits is
-/// space-padded to that length, and a rewrite that would grow the body is
-/// refused: truncating it would return malformed JSON with the original 200,
-/// so the client receives a valid fail-closed document fitted to the committed
-/// length instead. Chunked responses and HTTP/2 responses without
-/// `Content-Length` are rewritten at their natural length.
+/// Response headers stay committed, except `Content-Length`, which
+/// `on_response` removes so core reframes the buffered body. A response
+/// rewrite that cannot be applied replaces the body with an `evaluation_failed`
+/// document at its natural size and keeps the original HTTP 200.
 fn apply_redaction(
-    ctx: &HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     replacements: Vec<MessageRedaction>,
     phase: GuardPhase,
@@ -625,15 +613,13 @@ fn apply_redaction(
             FilterAction::Continue
         },
         GuardPhase::Response => {
-            let content_length_committed = content_length_committed(ctx);
-            if let Err(error) = apply_response_redaction(body, replacements, content_length_committed) {
+            if let Err(error) = apply_response_redaction(body, replacements) {
                 tracing::error!(%error, "ai_guardrails: response-phase redaction failed");
-                install_length_fitting_error(
+                replace_body_with_error(
                     body,
                     &format!("Guardrail redaction failed: {error}"),
                     "guardrail_error",
                     "evaluation_failed",
-                    content_length_committed,
                 );
             }
             FilterAction::Continue
@@ -658,15 +644,9 @@ fn apply_request_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRe
 
 /// Replace each redacted choice with an allowlisted object.
 ///
-/// When `content_length_committed` is set, a longer document is refused. The
-/// caller emits a fail-closed body instead of truncating the chat completion
-/// to the committed `Content-Length`. Without a committed length the rewrite
-/// is forwarded at its natural size.
-fn apply_response_redaction(
-    body: &mut Option<Bytes>,
-    replacements: Vec<MessageRedaction>,
-    content_length_committed: bool,
-) -> Result<(), FilterError> {
+/// The rewritten document is forwarded at its natural size. `on_response`
+/// already dropped `Content-Length` so core can reframe it.
+fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
     if replacements.is_empty() {
         return Err("ai_guardrails: cannot redact: no message replacements".into());
     }
@@ -683,10 +663,7 @@ fn apply_response_redaction(
     }
     let serialized = serde_json::to_string(&value)
         .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
-    if content_length_committed && serialized.len() > body.as_ref().map_or(0, Bytes::len) {
-        return Err("ai_guardrails: redacted response exceeds committed Content-Length".into());
-    }
-    *body = Some(response_body_bytes(serialized, body, content_length_committed));
+    *body = Some(Bytes::from(serialized));
     Ok(())
 }
 
@@ -694,14 +671,19 @@ fn apply_response_redaction(
 /// plus masked `content`.
 ///
 /// `logprobs`, `token_ids`, and `message.reasoning` repeat the original
-/// completion. Dropping them only shrinks the body, so a committed
-/// `Content-Length` still fits.
+/// completion, so they are dropped rather than forwarded.
 fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
     ensure_redactable_choice(choice, replacement.index)?;
     write_allowlisted_choice(choice, replacement.modified_text)
 }
 
-/// Confirm the choice is an object whose message has text `content` and a string `role`.
+/// Confirm the choice is an object whose message has text `content`, a string
+/// `role`, and no tool invocation.
+///
+/// `tool_calls` and `function_call` are not copied onto the rebuilt message.
+/// Keeping `finish_reason` without them would tell the client a tool turn
+/// completed and then omit the calls. Copying them could leak text `NeMo` just
+/// masked, so a message that has either field fails closed.
 fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<(), FilterError> {
     let Some(choice_object) = choice.as_object() else {
         return Err("ai_guardrails: choice is not a JSON object".into());
@@ -710,10 +692,24 @@ fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<
         return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
     };
     ensure_text_content(message)?;
+    if message_has_tool_invocation(message) {
+        return Err("ai_guardrails: cannot redact: message includes a tool invocation".into());
+    }
     if message.get("role").is_some_and(serde_json::Value::is_string) {
         return Ok(());
     }
     Err("ai_guardrails: cannot redact: message role is not a string".into())
+}
+
+/// Whether `message` carries `tool_calls` or a legacy `function_call`.
+///
+/// A null field is treated as absent, matching text `content`.
+fn message_has_tool_invocation(message: &serde_json::Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    object.get("tool_calls").is_some_and(|value| !value.is_null())
+        || object.get("function_call").is_some_and(|value| !value.is_null())
 }
 
 /// `index`, `finish_reason`, and message `role` copied from one choice.
@@ -835,13 +831,7 @@ fn set_verdict(ctx: &mut HttpFilterContext<'_>, verdict: &'static str) -> Result
 }
 
 /// Enforce a `Block` verdict for the given phase.
-fn enforce_block(
-    body: &mut Option<Bytes>,
-    reason: String,
-    phase: GuardPhase,
-    verdict: &str,
-    content_length_committed: bool,
-) -> FilterAction {
+fn enforce_block(body: &mut Option<Bytes>, reason: String, phase: GuardPhase, verdict: &str) -> FilterAction {
     let phase_label = phase.label();
     match phase {
         GuardPhase::Request => {
@@ -855,52 +845,15 @@ fn enforce_block(
                 &format!("Response blocked by guardrails: {reason}"),
                 "guardrail_violation",
                 "content_blocked",
-                content_length_committed,
             );
             FilterAction::Continue
         },
     }
 }
 
-/// Replace the response body with an error JSON payload.
-fn replace_body_with_error(
-    body: &mut Option<Bytes>,
-    message: &str,
-    error_type: &str,
-    code: &str,
-    content_length_committed: bool,
-) {
-    let error_json = error_document(message, error_type, code);
-    *body = Some(response_body_bytes(error_json, body, content_length_committed));
-}
-
-/// Replace the response body with a valid error document.
-///
-/// When the upstream sent `Content-Length`, that length is already on the
-/// wire. The message is shortened until the document fits, then padded with
-/// spaces. Trailing spaces are JSON whitespace, so the client still parses
-/// one value. Without a committed length the full document is forwarded.
-fn install_length_fitting_error(
-    body: &mut Option<Bytes>,
-    message: &str,
-    error_type: &str,
-    code: &str,
-    content_length_committed: bool,
-) {
-    if !content_length_committed {
-        *body = Some(Bytes::from(error_document(message, error_type, code)));
-        return;
-    }
-    let original_len = body.as_ref().map_or(0, Bytes::len);
-    let full = error_document(message, error_type, code);
-    if full.len() > original_len {
-        tracing::warn!(
-            new_len = full.len(),
-            original_len,
-            "ai_guardrails: fail-closed response shortened to fit committed Content-Length",
-        );
-    }
-    *body = Some(length_fitting_error(message, error_type, code, original_len));
+/// Replace the response body with an error JSON payload at its natural size.
+fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
+    *body = Some(Bytes::from(error_document(message, error_type, code)));
 }
 
 /// OpenAI-style error JSON with `message`, `type`, and `code`.
@@ -915,141 +868,16 @@ fn error_document(message: &str, error_type: &str, code: &str) -> String {
     .to_string()
 }
 
-/// Error JSON that parses and occupies exactly `original_len` bytes.
+/// Remove stale `Content-Length` so core recomputes framing for the buffered body.
 ///
-/// Prefers the full message, then the longest message prefix that fits, then a
-/// code-only object, then `{}`. A body shorter than two bytes cannot hold a
-/// JSON object, so it is filled with spaces and does not echo the upstream text.
-pub(super) fn length_fitting_error(message: &str, error_type: &str, code: &str, original_len: usize) -> Bytes {
-    if original_len == 0 {
-        return Bytes::new();
-    }
-    if let Some(document) = longest_error_document(message, error_type, code, original_len) {
-        return pad_to_len(document, original_len);
-    }
-    for document in fallback_error_documents(code) {
-        if document.len() <= original_len {
-            return pad_to_len(document, original_len);
-        }
-    }
-    Bytes::from(vec![b' '; original_len])
-}
-
-/// Longest `error_document` whose message is a prefix of `message` and whose
-/// serialized form is at most `original_len` bytes.
-fn longest_error_document(message: &str, error_type: &str, code: &str, original_len: usize) -> Option<String> {
-    let full = error_document(message, error_type, code);
-    if full.len() <= original_len {
-        return Some(full);
-    }
-
-    let chars: Vec<char> = message.chars().collect();
-    let mut low = 0;
-    let mut high = chars.len();
-    let mut best = None;
-    while low <= high {
-        let mid = low.midpoint(high);
-        let prefix: String = chars.iter().take(mid).collect();
-        let candidate = error_document(&prefix, error_type, code);
-        if candidate.len() <= original_len {
-            best = Some(candidate);
-            if mid == high {
-                break;
-            }
-            low = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            high = mid - 1;
-        }
-    }
-    best
-}
-
-/// Documents used when even an empty message does not fit.
-fn fallback_error_documents(code: &str) -> [String; 2] {
-    [
-        serde_json::json!({"error": {"code": code}}).to_string(),
-        "{}".to_owned(),
-    ]
-}
-
-/// Pad `text` with trailing spaces out to `len`.
-fn pad_to_len(text: String, len: usize) -> Bytes {
-    let mut bytes = text.into_bytes();
-    debug_assert!(
-        bytes.len() <= len,
-        "pad_to_len must not truncate; a longer document would no longer be valid JSON"
-    );
-    bytes.resize(len, b' ');
-    Bytes::from(bytes)
-}
-
-/// Use `replacement` as the response body, padding only when a length was committed.
-fn response_body_bytes(replacement: String, original_body: &Option<Bytes>, content_length_committed: bool) -> Bytes {
-    if content_length_committed {
-        fit_to_committed_length(replacement, original_body)
-    } else {
-        Bytes::from(replacement)
-    }
-}
-
-/// Whether `on_response` saw an upstream `Content-Length` header.
-///
-/// Missing state means no committed length was recorded, so the body is not
-/// padded or refused for growth.
-fn content_length_committed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_filter_state::<ResponseFraming>()
-        .is_some_and(|framing| framing.content_length_committed)
-}
-
-/// The `Content-Length` header is already on the wire when this is true.
-fn upstream_sent_content_length(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.response_header
-        .as_ref()
-        .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_LENGTH))
-}
-
-/// Framing captured from the upstream response headers.
-struct ResponseFraming {
-    /// Upstream sent `Content-Length`, so the body on the wire cannot grow.
-    content_length_committed: bool,
-}
-
-/// Whether `on_response` recorded a committed `Content-Length`.
-#[cfg(test)]
-pub(super) fn recorded_content_length(ctx: &HttpFilterContext<'_>) -> Option<bool> {
-    ctx.get_filter_state::<ResponseFraming>()
-        .map(|framing| framing.content_length_committed)
-}
-
-/// Fit `replacement` bytes to the original response body length.
-pub(super) fn fit_to_committed_length(replacement: String, original_body: &Option<Bytes>) -> Bytes {
-    let original_len = original_body.as_ref().map_or(0, Bytes::len);
-    let replacement = replacement.into_bytes();
-    match replacement.len().cmp(&original_len) {
-        std::cmp::Ordering::Equal => Bytes::from(replacement),
-        std::cmp::Ordering::Less => {
-            let mut padded = replacement;
-            padded.resize(original_len, b' ');
-            Bytes::from(padded)
-        },
-        std::cmp::Ordering::Greater => {
-            tracing::warn!(
-                new_len = replacement.len(),
-                original_len,
-                "ai_guardrails: replacement body larger than committed Content-Length; truncating",
-            );
-            let prefix = replacement.get(..original_len).unwrap_or(&replacement);
-            let safe = match std::str::from_utf8(prefix) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            let mut result = replacement;
-            result.truncate(safe);
-            result.resize(original_len, b' ');
-            Bytes::from(result)
-        },
+/// The length on the upstream response is not the length the client will see:
+/// compression, or a translator listed ahead of this filter, can drop it later.
+/// The body is fully buffered here, so core can reframe from the bytes this
+/// filter forwards.
+fn remove_stale_content_length(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(response) = &mut ctx.response_header {
+        response.headers.remove(http::header::CONTENT_LENGTH);
+        ctx.response_headers_modified = true;
     }
 }
 

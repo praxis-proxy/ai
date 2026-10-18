@@ -115,8 +115,7 @@ fn chat_completion_response(content: &str) -> bytes::Bytes {
 /// guardrail error structure and that the blocked rail name appears in the
 /// message.
 fn assert_blocked_body_json(body: &bytes::Bytes, expected_rail: &str) {
-    let trimmed = body.trim_ascii_end();
-    let json: serde_json::Value = serde_json::from_slice(trimmed).expect("replacement should be valid JSON");
+    let json: serde_json::Value = serde_json::from_slice(body).expect("replacement should be valid JSON");
     let error = json.get("error").expect("body should have an 'error' key");
     assert_eq!(error.get("code").and_then(|v| v.as_str()), Some("content_blocked"),);
     let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -126,24 +125,11 @@ fn assert_blocked_body_json(body: &bytes::Bytes, expected_rail: &str) {
     );
 }
 
-/// Assert that a replaced response body contains an error JSON payload.
-///
-/// When the error JSON is larger than the original body,
-/// `fit_to_committed_length` truncates to match `Content-Length`, so the
-/// replacement may be partial JSON. We check:
-/// 1. The body starts with `{"error":` (replacement happened)
-/// 2. If the body is large enough for full JSON, validate structure
+/// Assert that a replaced response body is an error JSON document.
 fn assert_error_body_json(body: &bytes::Bytes, expected_code: &str) {
-    let trimmed = body.trim_ascii_end();
-    assert!(
-        trimmed.starts_with(br#"{"error":"#),
-        "body should start with error JSON; got: {}",
-        String::from_utf8_lossy(trimmed.get(..40).unwrap_or(trimmed)),
-    );
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(trimmed) {
-        let error = json.get("error").expect("body should have an 'error' key");
-        assert_eq!(error.get("code").and_then(|v| v.as_str()), Some(expected_code));
-    }
+    let json: serde_json::Value = serde_json::from_slice(body).expect("replacement should be valid JSON");
+    let error = json.get("error").expect("body should have an 'error' key");
+    assert_eq!(error.get("code").and_then(|v| v.as_str()), Some(expected_code));
 }
 
 /// Read a JSON string at `pointer`, or `None` if the path is missing or not a string.
@@ -199,19 +185,13 @@ fn assert_forwarded_messages(body: &bytes::Bytes, expected_messages: &[(&str, &s
 }
 
 /// Assert response-phase redaction rewrote assistant `content` and stayed valid JSON.
-fn assert_redacted_assistant_content(
-    ctx: &HttpFilterContext<'_>,
-    body: &bytes::Bytes,
-    original_len: usize,
-    expected: &str,
-) {
-    assert_eq!(body.len(), original_len, "must match original Content-Length");
+fn assert_redacted_assistant_content(ctx: &HttpFilterContext<'_>, body: &bytes::Bytes, expected: &str) {
+    assert_natural_json(body);
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").and_then(|r| r.get("status")),
         Some("redacted")
     );
-    let json: serde_json::Value =
-        serde_json::from_slice(body.trim_ascii_end()).expect("redacted body should remain valid JSON");
+    let json: serde_json::Value = serde_json::from_slice(body).expect("redacted body should remain valid JSON");
     assert_eq!(
         json_str(&json, "/choices/0/message/content"),
         Some(expected),
@@ -219,33 +199,9 @@ fn assert_redacted_assistant_content(
     );
 }
 
-/// Run `on_response` and record whether the upstream sent `Content-Length`.
-///
-/// The header value is not the buffered body length. Only its presence
-/// selects the committed-length rules. The response binding is expanded into
-/// the caller so it outlives later uses of the context. `response_header`
-/// borrows that response for the context's lifetime.
-macro_rules! note_upstream_content_length {
-    ($filter:expr, $ctx:expr, $committed:expr) => {
-        $ctx.current_filter_id = Some(0);
-        let mut response = crate::test_utils::make_response();
-        if $committed {
-            response
-                .headers
-                .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("1"));
-        }
-        $ctx.response_header = Some(&mut response);
-        let action = $filter
-            .on_response(&mut $ctx)
-            .await
-            .expect("on_response should note response framing");
-        assert!(
-            matches!(action, praxis_filter::FilterAction::Continue),
-            "recording response framing should continue"
-        );
-        $ctx.response_header = None;
-        $ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    };
+/// Buffer the response body so `on_response_body` evaluates it.
+fn buffer_response(ctx: &mut HttpFilterContext<'_>) {
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
 }
 
 /// The body is one JSON value and is not space-padded out to a longer length.
@@ -1266,141 +1222,6 @@ phase:
 }
 
 // =============================================================================
-// fit_to_committed_length
-// =============================================================================
-
-#[test]
-fn fit_to_committed_length_equal_size_returns_as_is() {
-    use super::filter::fit_to_committed_length;
-
-    let original = Some(bytes::Bytes::from_static(b"1234567890"));
-    let replacement = "abcdefghij".to_owned();
-    let result = fit_to_committed_length(replacement, &original);
-    assert_eq!(result.len(), 10);
-    assert_eq!(&*result, b"abcdefghij");
-}
-
-#[test]
-fn fit_to_committed_length_shorter_replacement_is_padded() {
-    use super::filter::fit_to_committed_length;
-
-    let original = Some(bytes::Bytes::from_static(b"1234567890abcdef"));
-    let replacement = "short".to_owned();
-    let result = fit_to_committed_length(replacement, &original);
-    assert_eq!(result.len(), 16, "padded result must match original body length");
-    assert!(result.starts_with(b"short"), "replacement content must be preserved");
-    assert!(
-        result.get(5..).unwrap_or_default().iter().all(|&b| b == b' '),
-        "padding bytes must be ASCII spaces"
-    );
-}
-
-#[test]
-fn fit_to_committed_length_longer_replacement_is_truncated() {
-    use super::filter::fit_to_committed_length;
-
-    let original = Some(bytes::Bytes::from_static(b"tiny"));
-    let replacement = "this replacement is much longer than the original".to_owned();
-    let result = fit_to_committed_length(replacement, &original);
-    assert_eq!(result.len(), 4, "truncated result must match original body length");
-    assert_eq!(&*result, b"this");
-}
-
-#[test]
-fn fit_to_committed_length_truncation_respects_utf8_boundary() {
-    use super::filter::fit_to_committed_length;
-
-    // "héllo" is 6 bytes (h=1, é=2, l=1, l=1, o=1). Truncating to 2 bytes
-    // would split the é (bytes 1-2), so the function should back up to
-    // byte 1 ("h") and pad with a space.
-    let original = Some(bytes::Bytes::from_static(b"ab"));
-    let replacement = "héllo".to_owned();
-    let result = fit_to_committed_length(replacement, &original);
-    assert_eq!(result.len(), 2, "must match original body length");
-    let text = std::str::from_utf8(&result).expect("result must be valid UTF-8");
-    assert_eq!(text, "h ", "should truncate before the multi-byte char and pad");
-}
-
-#[test]
-fn fit_to_committed_length_none_body_returns_empty() {
-    use super::filter::fit_to_committed_length;
-
-    let result = fit_to_committed_length("anything".to_owned(), &None);
-    assert!(
-        result.is_empty(),
-        "None original body means 0 committed length, so result should be empty"
-    );
-}
-
-#[test]
-fn length_fitting_error_keeps_full_message_when_it_fits() {
-    use super::filter::length_fitting_error;
-
-    let result = length_fitting_error("too big", "guardrail_error", "evaluation_failed", 120);
-    assert_eq!(result.len(), 120);
-    let json: serde_json::Value = serde_json::from_slice(result.trim_ascii_end()).expect("padded error should parse");
-    assert_eq!(
-        json.pointer("/error/message").and_then(serde_json::Value::as_str),
-        Some("too big")
-    );
-    assert_eq!(
-        json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
-    );
-}
-
-#[test]
-fn length_fitting_error_shortens_message_instead_of_truncating_json() {
-    use super::filter::length_fitting_error;
-
-    let message = "x".repeat(400);
-    let result = length_fitting_error(&message, "guardrail_error", "evaluation_failed", 90);
-    assert_eq!(result.len(), 90);
-    let json: serde_json::Value =
-        serde_json::from_slice(result.trim_ascii_end()).expect("shortened error should parse");
-    assert_eq!(
-        json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
-    );
-    let kept = json
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    assert!(kept.len() < message.len(), "message should be shortened to fit");
-    assert!(message.starts_with(kept));
-}
-
-#[test]
-fn length_fitting_error_drops_to_code_only_when_message_cannot_fit() {
-    use super::filter::length_fitting_error;
-
-    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 40);
-    assert_eq!(result.len(), 40);
-    let json: serde_json::Value =
-        serde_json::from_slice(result.trim_ascii_end()).expect("code-only error should parse");
-    assert_eq!(
-        json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
-    );
-}
-
-#[test]
-fn length_fitting_error_uses_empty_object_when_code_cannot_fit() {
-    use super::filter::length_fitting_error;
-
-    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 4);
-    assert_eq!(result, bytes::Bytes::from_static(b"{}  "));
-}
-
-#[test]
-fn length_fitting_error_zero_length_is_empty() {
-    use super::filter::length_fitting_error;
-
-    let result = length_fitting_error("expanded", "guardrail_error", "evaluation_failed", 0);
-    assert!(result.is_empty());
-}
-
-// =============================================================================
 // Response body access
 // =============================================================================
 
@@ -1692,14 +1513,13 @@ async fn on_response_body_blocked_replaces_body() {
     let filter = nemo_filter_response(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(filter.as_ref(), ctx, true);
-    let original_len = chat_completion_response("something toxic").len();
+    buffer_response(&mut ctx);
     let mut body = Some(chat_completion_response("something toxic"));
 
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
     let replaced = body.expect("body should be replaced, not cleared");
-    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    assert_natural_json(&replaced);
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
         Some("blocked")
@@ -1721,15 +1541,13 @@ async fn on_response_body_modified_rewrites_assistant_content() {
     let filter = nemo_filter_response(&format!("{}/v1/checks", mock_server.uri()));
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(filter.as_ref(), ctx, true);
-    let original = chat_completion_response("My SSN is 123-45-6789");
-    let original_len = original.len();
-    let mut body = Some(original);
+    buffer_response(&mut ctx);
+    let mut body = Some(chat_completion_response("My SSN is 123-45-6789"));
 
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
     let replaced = body.expect("body should be rewritten, not cleared");
-    assert_redacted_assistant_content(&ctx, &replaced, original_len, "My SSN is [REDACTED]");
+    assert_redacted_assistant_content(&ctx, &replaced, "My SSN is [REDACTED]");
 }
 
 /// Response-phase filter that masks choice 0 as `mask`.
@@ -1750,12 +1568,11 @@ fn response_redact_filter() -> AiGuardrailsFilter {
     response_mask_filter("[REDACTED]")
 }
 
-/// Run response redaction against a committed `Content-Length` and require a same-length continuation.
+/// Run response redaction and return the forwarded body at its natural size.
 async fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(filter, ctx, true);
-    let original_len = original.len();
+    buffer_response(&mut ctx);
     let mut body = Some(original);
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(
@@ -1763,14 +1580,14 @@ async fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes)
         "response redaction should continue"
     );
     let replaced = body.expect("body should be replaced, not cleared");
-    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    assert_natural_json(&replaced);
     replaced
 }
 
 /// The fail-closed body parses as `evaluation_failed` and omits `absent` text.
 fn assert_evaluation_failed(replaced: &bytes::Bytes, absent: &[&str]) {
-    let json: serde_json::Value =
-        serde_json::from_slice(replaced.trim_ascii_end()).expect("fail-closed body must be valid JSON");
+    assert_natural_json(replaced);
+    let json: serde_json::Value = serde_json::from_slice(replaced).expect("fail-closed body must be valid JSON");
     assert_eq!(
         json.pointer("/error/code").and_then(serde_json::Value::as_str),
         Some("evaluation_failed"),
@@ -1808,6 +1625,56 @@ fn completion_with_recoverable_original_text() -> bytes::Bytes {
     )
 }
 
+/// Assistant message with text plus `tool_calls`. The arguments repeat a secret.
+fn completion_with_tool_calls() -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Looking up the record",
+                    "tool_calls": [{
+                        "id": "call_secret",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_ssn",
+                            "arguments": "{\"ssn\":\"123-45-6789\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+/// Assistant message with text plus a legacy `function_call`.
+fn completion_with_function_call() -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Looking up the record",
+                    "function_call": {
+                        "name": "lookup_ssn",
+                        "arguments": "{\"ssn\":\"123-45-6789\"}"
+                    }
+                },
+                "finish_reason": "function_call"
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
 /// Assistant message whose `content` is text plus an image part.
 fn completion_with_array_content() -> bytes::Bytes {
     bytes::Bytes::from(
@@ -1830,45 +1697,32 @@ fn completion_with_array_content() -> bytes::Bytes {
     )
 }
 
-/// `"x"` → `"[REDACTED]"` grows the chat completion past the committed
-/// `Content-Length`. The client must get a parseable error, not a truncated
-/// completion with HTTP 200.
+/// `"x"` → `"[REDACTED]"` grows the completion. Core reframes the buffered body,
+/// so the longer mask is forwarded instead of an `evaluation_failed` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_expanded_redaction_fails_closed() {
-    let replaced = rewritten_response(&response_redact_filter(), chat_completion_response("x")).await;
-    assert_evaluation_failed(&replaced, &["[REDACTED]", "chatcmpl-test"]);
+async fn on_response_body_expanded_redaction_is_forwarded() {
+    let original = chat_completion_response("x");
+    let original_len = original.len();
+    let replaced = rewritten_response(&response_redact_filter(), original).await;
+    assert!(
+        replaced.len() > original_len,
+        "a longer mask is forwarded at its natural size"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted JSON");
+    assert_eq!(json_str(&json, "/choices/0/message/content"), Some("[REDACTED]"));
+    assert!(json.pointer("/error").is_none(), "growth must stay a completion");
 }
 
-/// A short completion cannot hold the full error text. The replacement must
-/// still parse and must not keep the upstream secret.
+/// A short completion whose mask is longer than the original text is forwarded
+/// whole. The upstream secret must not remain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
-    let filter = AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
-        PhaseConfig {
-            request: false,
-            response: true,
-            tool_results: false,
-        },
-    )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(&filter, ctx, true);
+async fn on_response_body_expanded_redaction_forwards_short_body() {
     let original = bytes::Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"SECRET-9"}}]}"#);
     let original_len = original.len();
-    let mut body = Some(original);
-
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    let replaced = body.expect("body should be replaced, not cleared");
-    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
-    let json: serde_json::Value =
-        serde_json::from_slice(replaced.trim_ascii_end()).expect("short fail-closed body must be valid JSON");
-    assert_eq!(
-        json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
-    );
+    let replaced = rewritten_response(&response_redact_filter(), original).await;
+    assert!(replaced.len() > original_len, "the longer mask is not truncated");
+    let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted JSON");
+    assert_eq!(json_str(&json, "/choices/0/message/content"), Some("[REDACTED]"));
     assert!(
         !String::from_utf8_lossy(&replaced).contains("SECRET-9"),
         "upstream secret must not reach the client"
@@ -1936,8 +1790,7 @@ fn assert_redacted_choice_drops_original(json: &serde_json::Value, replaced: &by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
     let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text()).await;
-    let json: serde_json::Value =
-        serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
+    let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted body must be valid JSON");
     assert_allowlisted_choice(&json);
     assert_redacted_choice_drops_original(&json, &replaced);
 }
@@ -1950,39 +1803,50 @@ async fn on_response_body_redaction_failure_replaces_body() {
     assert_evaluation_failed(&replaced, &["123-45-6789", "image_url"]);
 }
 
-/// `on_response` records whether the upstream response included `Content-Length`.
-#[tokio::test]
-async fn on_response_records_whether_content_length_was_sent() {
-    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-
-    {
-        let mut ctx = crate::test_utils::make_filter_context(&req);
-        note_upstream_content_length!(filter.as_ref(), ctx, true);
-        assert_eq!(
-            super::filter::recorded_content_length(&ctx),
-            Some(true),
-            "a Content-Length header commits the response length"
-        );
-    }
-
-    {
-        let mut ctx = crate::test_utils::make_filter_context(&req);
-        note_upstream_content_length!(filter.as_ref(), ctx, false);
-        assert_eq!(
-            super::filter::recorded_content_length(&ctx),
-            Some(false),
-            "responses without Content-Length are not length-limited"
-        );
-    }
+/// Text plus `tool_calls` fails closed. Copying the calls could leak the masked
+/// turn, and dropping them would leave `finish_reason: "tool_calls"` with no calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_tool_calls_fail_closed() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_tool_calls()).await;
+    assert_evaluation_failed(&replaced, &["123-45-6789", "lookup_ssn", "call_secret", "tool_calls"]);
 }
 
-/// A longer mask is forwarded as a completion when no length was committed.
-fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, original_len: usize) {
+/// A legacy `function_call` fails closed for the same reason as `tool_calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_function_call_fails_closed() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_function_call()).await;
+    assert_evaluation_failed(&replaced, &["123-45-6789", "lookup_ssn", "function_call"]);
+}
+
+/// `on_response` drops a stale `Content-Length` so core can reframe the buffered body.
+#[tokio::test]
+async fn on_response_removes_stale_content_length() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("128"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.expect("on_response");
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let removed = ctx
+        .response_header
+        .as_ref()
+        .is_some_and(|header| !header.headers.contains_key(http::header::CONTENT_LENGTH));
+    assert!(removed, "stale Content-Length must be removed");
     assert!(
-        replaced.len() > original_len,
-        "a longer mask is forwarded when the upstream sent no Content-Length"
+        ctx.response_headers_modified,
+        "header removal must be visible to core"
     );
+    ctx.response_header = None;
+}
+
+/// A longer mask is forwarded as a completion. Core reframes the body.
+fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, original_len: usize) {
+    assert!(replaced.len() > original_len, "a longer mask is forwarded at its natural size");
     assert_natural_json(replaced);
     let json: serde_json::Value = serde_json::from_slice(replaced).expect("redacted JSON");
     assert_eq!(
@@ -1992,7 +1856,7 @@ fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, o
     );
     assert!(
         json.pointer("/error/code").is_none(),
-        "growth without Content-Length must stay a completion"
+        "a longer mask must stay a completion"
     );
     assert_eq!(
         ctx.filter_results
@@ -2002,15 +1866,14 @@ fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, o
     );
 }
 
-/// A short name replaced by a longer mask grows the completion. With no
-/// `Content-Length` on the wire, the masked body is forwarded instead of an
-/// `evaluation_failed` error.
+/// A short name replaced by a longer mask grows the completion. The masked body
+/// is forwarded instead of an `evaluation_failed` error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_growth_without_content_length_is_forwarded() {
+async fn on_response_body_growth_is_forwarded() {
     let filter = response_mask_filter("<PERSON>");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(&filter, ctx, false);
+    buffer_response(&mut ctx);
     let original = chat_completion_response("Bob");
     let original_len = original.len();
     let mut body = Some(original);
@@ -2023,9 +1886,9 @@ async fn on_response_body_growth_without_content_length_is_forwarded() {
     assert_forwarded_mask(&ctx, &body.expect("body should be rewritten"), original_len);
 }
 
-/// A blocked body is the error document itself when no length was committed.
+/// A blocked body is the error document itself, not padded out to the upstream body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_block_without_content_length_is_not_padded() {
+async fn on_response_body_block_is_not_padded() {
     let filter = AiGuardrailsFilter::with_verdict(
         GuardResult::Block {
             reason: "toxicity".into(),
@@ -2039,7 +1902,7 @@ async fn on_response_body_block_without_content_length_is_not_padded() {
     .expect("test filter");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(&filter, ctx, false);
+    buffer_response(&mut ctx);
     let original = chat_completion_response(&"x".repeat(400));
     let original_len = original.len();
     let mut body = Some(original);
@@ -2055,14 +1918,13 @@ async fn on_response_body_block_without_content_length_is_not_padded() {
     assert_blocked_body_json(&replaced, "toxicity");
 }
 
-/// A redaction that cannot be applied returns the error document itself when
-/// no length was committed.
+/// A redaction that cannot be applied returns the error document at its natural size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_redaction_failure_without_content_length_is_not_padded() {
+async fn on_response_body_redaction_failure_is_not_padded() {
     let filter = response_redact_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    note_upstream_content_length!(&filter, ctx, false);
+    buffer_response(&mut ctx);
     let original = completion_with_array_content();
     let original_len = original.len();
     let mut body = Some(original);
