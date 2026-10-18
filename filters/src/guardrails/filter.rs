@@ -597,11 +597,7 @@ fn record_verdict(
 /// `on_response` removes so core reframes the buffered body. A response
 /// rewrite that cannot be applied replaces the body with an `evaluation_failed`
 /// document at its natural size and keeps the original HTTP 200.
-fn apply_redaction(
-    body: &mut Option<Bytes>,
-    replacements: Vec<MessageRedaction>,
-    phase: GuardPhase,
-) -> FilterAction {
+fn apply_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>, phase: GuardPhase) -> FilterAction {
     match phase {
         GuardPhase::Request => {
             if let Err(error) = apply_request_redaction(body, replacements) {

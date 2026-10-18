@@ -1845,16 +1845,16 @@ async fn on_response_removes_stale_content_length() {
         .as_ref()
         .is_some_and(|header| !header.headers.contains_key(http::header::CONTENT_LENGTH));
     assert!(removed, "stale Content-Length must be removed");
-    assert!(
-        ctx.response_headers_modified,
-        "header removal must be visible to core"
-    );
+    assert!(ctx.response_headers_modified, "header removal must be visible to core");
     ctx.response_header = None;
 }
 
 /// A longer mask is forwarded as a completion. Core reframes the body.
 fn assert_forwarded_mask(ctx: &HttpFilterContext<'_>, replaced: &bytes::Bytes, original_len: usize) {
-    assert!(replaced.len() > original_len, "a longer mask is forwarded at its natural size");
+    assert!(
+        replaced.len() > original_len,
+        "a longer mask is forwarded at its natural size"
+    );
     assert_natural_json(replaced);
     let json: serde_json::Value = serde_json::from_slice(replaced).expect("redacted JSON");
     assert_eq!(
