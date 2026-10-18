@@ -1569,7 +1569,15 @@ fn response_redact_filter() -> AiGuardrailsFilter {
 }
 
 /// Run response redaction and return the forwarded body at its natural size.
-fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
+///
+/// Async so callers can await it on a multi-thread runtime. `on_response_body`
+/// uses `block_in_place`, which requires that runtime even though this helper
+/// itself does not await.
+#[expect(
+    clippy::unused_async,
+    reason = "callers await this on a multi-thread runtime so on_response_body can block_in_place"
+)]
+async fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     buffer_response(&mut ctx);
@@ -1699,11 +1707,11 @@ fn completion_with_array_content() -> bytes::Bytes {
 
 /// `"x"` → `"[REDACTED]"` grows the completion. Core reframes the buffered body,
 /// so the longer mask is forwarded instead of an `evaluation_failed` error.
-#[test]
-fn on_response_body_expanded_redaction_is_forwarded() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_expanded_redaction_is_forwarded() {
     let original = chat_completion_response("x");
     let original_len = original.len();
-    let replaced = rewritten_response(&response_redact_filter(), original);
+    let replaced = rewritten_response(&response_redact_filter(), original).await;
     assert!(
         replaced.len() > original_len,
         "a longer mask is forwarded at its natural size"
@@ -1715,11 +1723,11 @@ fn on_response_body_expanded_redaction_is_forwarded() {
 
 /// A short completion whose mask is longer than the original text is forwarded
 /// whole. The upstream secret must not remain.
-#[test]
-fn on_response_body_expanded_redaction_forwards_short_body() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_expanded_redaction_forwards_short_body() {
     let original = bytes::Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"SECRET-9"}}]}"#);
     let original_len = original.len();
-    let replaced = rewritten_response(&response_redact_filter(), original);
+    let replaced = rewritten_response(&response_redact_filter(), original).await;
     assert!(replaced.len() > original_len, "the longer mask is not truncated");
     let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted JSON");
     assert_eq!(json_str(&json, "/choices/0/message/content"), Some("[REDACTED]"));
@@ -1787,9 +1795,9 @@ fn assert_redacted_choice_drops_original(json: &serde_json::Value, replaced: &by
 /// A redacted choice keeps only `index`, `finish_reason`, and `message.role`
 /// plus the masked `content`. Side fields that quote the original tokens are
 /// dropped.
-#[test]
-fn on_response_body_modified_rebuilds_choice_from_allowlist() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_modified_rebuilds_choice_from_allowlist() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_recoverable_original_text()).await;
     let json: serde_json::Value = serde_json::from_slice(&replaced).expect("redacted body must be valid JSON");
     assert_allowlisted_choice(&json);
     assert_redacted_choice_drops_original(&json, &replaced);
@@ -1797,24 +1805,24 @@ fn on_response_body_modified_rebuilds_choice_from_allowlist() {
 
 /// A configured redaction that cannot be applied must replace the response
 /// with an `evaluation_failed` document and must not forward the original text.
-#[test]
-fn on_response_body_redaction_failure_replaces_body() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_array_content());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_redaction_failure_replaces_body() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_array_content()).await;
     assert_evaluation_failed(&replaced, &["123-45-6789", "image_url"]);
 }
 
 /// Text plus `tool_calls` fails closed. Copying the calls could leak the masked
 /// turn, and dropping them would leave `finish_reason: "tool_calls"` with no calls.
-#[test]
-fn on_response_body_tool_calls_fail_closed() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_tool_calls());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_tool_calls_fail_closed() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_tool_calls()).await;
     assert_evaluation_failed(&replaced, &["123-45-6789", "lookup_ssn", "call_secret", "tool_calls"]);
 }
 
 /// A legacy `function_call` fails closed for the same reason as `tool_calls`.
-#[test]
-fn on_response_body_function_call_fails_closed() {
-    let replaced = rewritten_response(&response_redact_filter(), completion_with_function_call());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_function_call_fails_closed() {
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_function_call()).await;
     assert_evaluation_failed(&replaced, &["123-45-6789", "lookup_ssn", "function_call"]);
 }
 
