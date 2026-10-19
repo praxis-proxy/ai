@@ -2253,13 +2253,19 @@ mod tests {
             .collect();
         store.create_items_and_sync_messages(&owner, "c", &items).await.unwrap();
         if !cancel {
-            sqlx::query("UPDATE items SET item_data = '{broken-json' WHERE item_id = ?")
-                .bind(&items.get(1).unwrap().item_id)
-                .execute(&store.pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE items SET item_data = '{broken-json' WHERE conversation_id = 'c' AND item_id = ? \
+                 AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(&items.get(1).unwrap().item_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&store.pool)
+            .await
+            .unwrap();
         }
-        let before = read_snapshot(&store).await;
+        let before = read_snapshot(&store, &owner).await;
         interrupt_history_read(&mut store, &owner, &items.first().unwrap().item_data, cancel).await;
         let mut connection = store.pool.acquire().await.unwrap();
         sqlx::query("BEGIN")
@@ -2269,19 +2275,25 @@ mod tests {
         sqlx::query("ROLLBACK").execute(&mut *connection).await.unwrap();
         drop(connection);
         assert_eq!(
-            read_snapshot(&store).await,
+            read_snapshot(&store, &owner).await,
             before,
             "reads must preserve item bytes, positions, and legacy cache"
         );
         let stranger = StateOwner::from_trusted_parts("other-tenant", "issuer", "subject").unwrap();
         assert!(store.conversation_history(&stranger, "c").await.unwrap().is_none());
         if !cancel {
-            sqlx::query("UPDATE items SET item_data = ? WHERE item_id = ?")
-                .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
-                .bind(&items.get(1).unwrap().item_id)
-                .execute(&store.pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE items SET item_data = ? WHERE conversation_id = 'c' AND item_id = ? \
+                 AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
+            .bind(&items.get(1).unwrap().item_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&store.pool)
+            .await
+            .unwrap();
         }
         let mut expected = Vec::with_capacity(items.len() + 1);
         expected.push(legacy);
@@ -2347,14 +2359,24 @@ mod tests {
         store.history_read_probe = None;
     }
 
-    async fn read_snapshot(store: &SqliteResponseStore) -> (String, Vec<(String, i64, String)>) {
-        let cache = sqlx::query_scalar("SELECT messages FROM conversations WHERE conversation_id = 'c'")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
-        let rows = sqlx::query_as(
-            "SELECT item_id, position, item_data FROM items WHERE conversation_id = 'c' ORDER BY position, item_id",
+    async fn read_snapshot(store: &SqliteResponseStore, owner: &StateOwner) -> (String, Vec<(String, i64, String)>) {
+        let cache = sqlx::query_scalar(
+            "SELECT messages FROM conversations WHERE conversation_id = 'c' \
+             AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
         )
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query_as(
+            "SELECT item_id, position, item_data FROM items WHERE conversation_id = 'c' \
+             AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? ORDER BY position, item_id",
+        )
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
         .fetch_all(&store.pool)
         .await
         .unwrap();
