@@ -654,7 +654,75 @@ fn build_chat_messages(
         append_input_messages(&mut messages, input, reasoning)?;
     }
 
+    keep_tool_answers_adjacent(&mut messages);
     Ok(messages)
+}
+
+/// Call IDs that an assistant `tool_calls` message expects tool answers for.
+///
+/// Returns `None` for messages that do not open a tool-call block. The IDs
+/// are copied because the message list is mutated while they are held.
+fn expected_tool_answers(message: &Value) -> Option<Vec<String>> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let calls = message.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Keep each assistant `tool_calls` message adjacent to its tool answers.
+///
+/// Chat Completions backends reject a request where any other message sits
+/// between an assistant `tool_calls` message and the tool messages answering
+/// its call IDs: "An assistant message with `tool_calls` must be followed by
+/// tool messages responding to each `tool_call_id`." Responses input can
+/// legally produce that shape when an orphan output or a plain message sits
+/// between a `function_call` and its linked output, so the translated list is
+/// repaired here: intervening messages move to just after the block they
+/// interrupted, preserving their relative order.
+fn keep_tool_answers_adjacent(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let Some(needed) = messages.get(index).and_then(expected_tool_answers) else {
+            index += 1;
+            continue;
+        };
+        let mut displaced: Vec<Value> = Vec::new();
+        let mut cursor = index + 1;
+        while cursor < messages.len() {
+            if messages
+                .get(cursor)
+                .is_some_and(|message| is_tool_answer_for(message, &needed))
+            {
+                cursor += 1;
+                continue;
+            }
+            if messages.get(cursor).and_then(expected_tool_answers).is_some() {
+                // The next block starts; keep the displaced messages before it.
+                break;
+            }
+            displaced.push(messages.remove(cursor));
+        }
+        let insert_at = cursor;
+        for (offset, message) in displaced.into_iter().enumerate() {
+            messages.insert(insert_at + offset, message);
+        }
+        index = insert_at;
+    }
+}
+
+/// Whether `message` is a Chat `tool` answer for one of `needed` call IDs.
+fn is_tool_answer_for(message: &Value, needed: &[String]) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("tool")
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|answer_id| needed.iter().any(|needed_id| needed_id == answer_id))
 }
 
 /// Append converted input messages to a Chat Completions message list.

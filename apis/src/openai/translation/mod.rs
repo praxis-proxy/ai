@@ -2088,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_output_between_call_and_linked_output_keeps_input_order() {
+    fn orphan_output_between_call_and_linked_output_follows_tool_result() {
         let mapped = map(&json!({
             "model": "m",
             "input": [
@@ -2109,10 +2109,70 @@ mod tests {
                         "function": {"name": "lookup", "arguments": "{}"}
                     }]
                 },
-                {"role": "user", "content": "orphan result"},
                 {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan result"},
             ]),
-            "an orphan between a call and its linked output lowers at its own input position"
+            "an orphan between a call and its linked output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn message_between_call_and_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"role": "user", "content": "interlude"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "interlude"},
+            ]),
+            "a message between a call and its output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn orphan_outputs_between_call_and_output_keep_their_relative_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan one"},
+                {"type": "function_call_output", "output": "orphan two"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan one"},
+                {"role": "user", "content": "orphan two"},
+            ]),
+            "multiple orphans deferred past a tool answer keep their input order"
         );
     }
 

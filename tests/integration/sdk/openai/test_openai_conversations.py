@@ -2783,6 +2783,79 @@ def test_orphan_function_call_output_survives_repeated_chat_turns(conversation_b
     }, "stored orphan items must survive two responses in their normalized stored shape"
 
 
+def test_orphan_output_between_call_and_linked_output_stays_after_tool_result(conversation_backend):
+    """An orphan output between a call and its linked output must not break adjacency.
+
+    Chat Completions backends reject a request where a message sits between
+    an assistant tool_calls message and the tool messages answering its call
+    IDs. Stored history can legally interleave an orphan function_call_output
+    between the function_call and its linked output, so the translated lane
+    must keep the tool answer adjacent to its call and lower the orphan
+    after it. The native lane forwards the stored order untouched.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call",
+                "call_id": "call_interleave",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan interlude result",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_interleave",
+                "output": "linked result",
+            },
+        ]
+    )
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="next turn"
+    )
+    assert response.status == "completed", "the interleaved orphan must not fail the turn"
+    assert len(captured) == 1, "the turn must reach the backend exactly once"
+    path, body = captured[0]
+    if translated:
+        assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+        sequence = [
+            (m["role"], m.get("tool_call_id"), m.get("content"))
+            for m in body["messages"]
+        ]
+        assert sequence == [
+            ("assistant", None, None),
+            ("tool", "call_interleave", "linked result"),
+            ("user", None, "orphan interlude result"),
+            ("user", None, "next turn"),
+        ], "the tool answer must stay adjacent to its call, with the orphan lowered after it"
+    else:
+        assert path == "/v1/responses", "native lane must forward Responses"
+        input_items = body["input"]
+        assert [i["type"] for i in input_items if isinstance(i, dict)] == [
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+            "message",
+        ], "native passthrough must keep the stored item order, then the turn input"
+        assert input_items[1].get("call_id") is None, "the orphan item must pass through without a call_id"
+        assert input_items[2]["call_id"] == "call_interleave", "the linked output must keep its call_id"
+        turn_item = input_items[3]
+        assert turn_item.get("role") == "user", "the turn input must stay a user message"
+        content = turn_item["content"]
+        if isinstance(content, list):
+            turn_text = "".join(
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "input_text"
+            )
+        else:
+            turn_text = content
+        assert turn_text == "next turn", "the turn input must still be forwarded"
+
+
 def test_structured_mcp_failure_append_back(conversation_backend):
     """Failed native MCP items round-trip into stored conversation history."""
     client, _, output, translated = conversation_backend
