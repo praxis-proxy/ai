@@ -1999,6 +1999,7 @@ async fn run_sse_extraction(
 // -----------------------------------------------------------------------------
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
 fn publish_token_usage_records_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2014,24 +2015,31 @@ fn publish_token_usage_records_llm_metrics() {
     metrics::with_local_recorder(&recorder, || publish_token_usage(&mut ctx, usage));
     let snap = snapshotter.snapshot().into_vec();
 
-    let total = |name: &str| -> u64 {
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
         snap.iter()
-            .filter(|(k, ..)| k.key().name() == name)
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "gpt-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "cb-glm")
+            })
             .filter_map(|(_, _, _, v)| match v {
                 DebugValue::Counter(c) => Some(*c),
                 _ => None,
             })
             .sum()
     };
+    let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
 
-    assert_eq!(total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 12);
-    assert_eq!(total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 34);
-    assert_eq!(total(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL), 5);
-    assert_eq!(total(crate::llm_metrics::METRIC_REASONING_TOKENS_TOTAL), 2);
-    assert_eq!(
-        total(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
-        0,
-        "empty_completions must not bump on a non-empty response"
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 12);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 34);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL), 5);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_REASONING_TOKENS_TOTAL), 2);
+    assert!(
+        !present(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "empty_completions must not be recorded on a non-empty response"
     );
 }
 
@@ -2082,9 +2090,16 @@ fn bedrock_headers_record_llm_metrics() {
     metrics::with_local_recorder(&recorder, || extract_bedrock_headers(&mut ctx));
     let snap = snapshotter.snapshot().into_vec();
 
-    let total = |name: &str| -> u64 {
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
         snap.iter()
-            .filter(|(k, ..)| k.key().name() == name)
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "claude-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "bedrock")
+            })
             .filter_map(|(_, _, _, v)| match v {
                 DebugValue::Counter(c) => Some(*c),
                 _ => None,
@@ -2093,8 +2108,8 @@ fn bedrock_headers_record_llm_metrics() {
     };
     let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
 
-    assert_eq!(total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 40);
-    assert_eq!(total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 7);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 40);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 7);
     assert!(
         !present(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL),
         "Bedrock headers carry no cache breakdown"
