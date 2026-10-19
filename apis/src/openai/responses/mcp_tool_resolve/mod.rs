@@ -160,11 +160,10 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// connectors:
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
-///     # Declare the connector's tool service authoritative. Scopes are
-///     # independent and default to false (untrusted).
-///     trust:
-///       catalog: true        # authoritative for catalog admission
-///       read_only: true      # authoritative for read-only classification
+///     # Operator trust level (default untrusted): `catalog` admits its tools
+///     # (writes included) without trusting readOnlyHint; `catalog_and_read_only`
+///     # additionally trusts its readOnlyHint classifications.
+///     trust: catalog_and_read_only
 /// ```
 ///
 /// `forward_headers` applies only to configured `connector_id` targets. Direct
@@ -607,7 +606,7 @@ impl McpToolResolveFilter {
         // (which `resolvable_server_url` reports as `None`) would otherwise
         // pass through to the backend, and a deferred untrusted connector would
         // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
-        if excluded_as_untrusted(entry, self.admission_policy, &self.connector_trust) {
+        if protected_exclusion(entry, self.admission_policy, &self.connector_trust).is_some() {
             debug!(label, "protected mode: excluding untrusted MCP target without dialing");
             return Ok(Some(Vec::new()));
         }
@@ -953,13 +952,15 @@ fn collect_resolutions(
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
         let tools =
             (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
-        // Record any untrusted target excluded without dialing so a forged call
-        // into its namespace is rejected explicitly. Done for every excluded
-        // entry, whether it reaches the Resolved branch (eager short-circuit) or
-        // the deferred/targetless branch below (#1724).
-        let excluded = excluded_as_untrusted(entry, policy, connector_trust);
-        if excluded {
-            decisions.record_excluded_namespace(server_label(entry), McpDenyReason::UntrustedSource);
+        // Record any target excluded without dialing so a forged call into its
+        // namespace is rejected explicitly, with the precise reason (untrusted
+        // source, or a catalog connector denied read-only authority under
+        // require_read_only). Done for every excluded entry, whether it reaches
+        // the Resolved branch (eager short-circuit) or the deferred/targetless
+        // branch below (#1724).
+        let excluded = protected_exclusion(entry, policy, connector_trust);
+        if let Some(reason) = excluded {
+            decisions.record_excluded_namespace(server_label(entry), reason);
         }
         if let Some((resolution, listing_tools)) =
             build_entry_resolution(entry, tools, &mut tool_map, policy, connector_trust, &mut decisions)?
@@ -973,7 +974,7 @@ fn collect_resolutions(
                 tools: listing_tools,
             });
             per_entry.push(resolution);
-        } else if excluded {
+        } else if excluded.is_some() {
             // A deferred untrusted target gets no resolution task, so the
             // resolve_entry short-circuit never runs for it. Exclude it here —
             // resolving to zero tools drops it from the outbound body rather than
@@ -1806,11 +1807,13 @@ fn collect_deferred_connectors(
             let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
             let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
             let trust = connector_trust.get(connector_id).copied().unwrap_or_default();
-            // Protected mode excludes an untrusted connector in `resolve_entry`
-            // without dialing, so never queue it for deferred discovery — doing so
-            // would make `openai_mcp_dispatch` dial the untrusted service only to
-            // deny every tool (and abort the request if it is unreachable) (#1724).
-            if policy.is_protected() && !trust.catalog {
+            // Protected mode excludes a connector that can supply no admissible
+            // tool in `resolve_entry` without dialing, so never queue it for
+            // deferred discovery — doing so would make `openai_mcp_dispatch` dial
+            // the service only to deny every tool (and abort the request if it is
+            // unreachable). Covers untrusted connectors and catalog connectors
+            // denied read-only authority under require_read_only (#1724).
+            if protected_exclusion_reason(trust, policy).is_some() {
                 return None;
             }
             Some(DeferredMcpConnector {
@@ -3375,22 +3378,39 @@ fn admit_tools(
     admitted
 }
 
-/// Whether protected mode excludes this MCP entry outright because its target
-/// has no operator catalog-admission trust.
+/// Why protected mode excludes an MCP entry outright without dialing, or `None`
+/// if the target may be contacted.
 ///
-/// Called only on `type: "mcp"` entries. Covers direct `server_url` targets,
-/// connectors, and targetless (label-only) entries, eager or deferred: in
-/// protected mode anything without catalog trust is resolved to zero tools
-/// without dialing, so an untrusted — or incomplete — MCP entry can never reach
-/// the backend. `resolve_entry` uses this to skip the eager dial;
-/// `collect_resolutions` uses it for entries that never get a resolution task
-/// (deferred or targetless) (#1724).
-fn excluded_as_untrusted(
+/// A target is excluded without contact when it can supply no admissible tool:
+/// - no catalog trust (`UntrustedSource`) — direct `server_url` targets, untrusted connectors, and targetless
+///   (label-only) entries; or
+/// - catalog trust but not read-only authority while `require_read_only` is set (`NoReadOnlyAuthority`) — every tool it
+///   could advertise would be denied, so dialing it is pure cost (and an unreachable service would fail the request).
+///
+/// Centralizes the exclusion rule shared by `resolve_entry` (eager dial),
+/// `collect_resolutions` (deferred/targetless entries with no resolution task),
+/// and `collect_deferred_connectors` (deferred-discovery queueing) (#1724).
+fn protected_exclusion_reason(trust: ConnectorTrust, policy: McpAdmissionPolicy) -> Option<McpDenyReason> {
+    if !policy.is_protected() {
+        return None;
+    }
+    if !trust.admits_catalog() {
+        return Some(McpDenyReason::UntrustedSource);
+    }
+    if policy.require_read_only && !trust.trusts_read_only() {
+        return Some(McpDenyReason::NoReadOnlyAuthority);
+    }
+    None
+}
+
+/// [`protected_exclusion_reason`] resolved for one MCP entry via its connector
+/// trust ([`trust_for_entry`]).
+fn protected_exclusion(
     entry: &serde_json::Value,
     policy: McpAdmissionPolicy,
     connector_trust: &HashMap<String, ConnectorTrust>,
-) -> bool {
-    policy.is_protected() && !trust_for_entry(entry, connector_trust).catalog
+) -> Option<McpDenyReason> {
+    protected_exclusion_reason(trust_for_entry(entry, connector_trust), policy)
 }
 
 /// Resolve the operator trust for one MCP entry.

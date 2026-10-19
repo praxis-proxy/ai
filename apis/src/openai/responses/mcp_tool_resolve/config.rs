@@ -44,39 +44,43 @@ pub(crate) struct ConnectorConfig {
     pub id: String,
     /// MCP server URL for this connector.
     pub server_url: String,
-    /// Operator trust declaration for this connector's tool service.
+    /// Operator trust level for this connector's tool service.
     ///
-    /// Trust is operator-owned and scoped. By default a connector is untrusted,
-    /// so in protected mode it follows the same admission rules as a
-    /// client-selected direct target. Declaring `trust.catalog: true` makes the
-    /// service authoritative for catalog admission (its tools are admitted
-    /// without a per-tool digest); `trust.read_only: true` makes it authoritative
-    /// for read-only classification (its `readOnlyHint` is a trusted capability
-    /// decision). The scopes are independent: a read-only-only trust grants no
-    /// catalog admission.
+    /// Trust is operator-owned. By default a connector is `untrusted`, so in
+    /// protected mode it follows the same admission rules as a client-selected
+    /// direct target. `catalog` lets the service supply tools (admitted without a
+    /// per-tool digest), including tools that write; its `readOnlyHint` claims
+    /// carry no operator trust. `catalog_and_read_only` additionally trusts its
+    /// `readOnlyHint` classifications. Merely configuring a connector or matching
+    /// its URL never grants trust.
     #[serde(default)]
     pub trust: ConnectorTrustConfig,
 }
 
-/// Operator trust granted to a connector's tool service. Both scopes default to
-/// `false` (untrusted).
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ConnectorTrustConfig {
-    /// Authoritative for catalog admission.
-    #[serde(default)]
-    pub catalog: bool,
-    /// Authoritative for read-only classification.
-    #[serde(default)]
-    pub read_only: bool,
+/// Operator trust level granted to a connector's tool service. Defaults to
+/// `untrusted`.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectorTrustConfig {
+    /// The connector cannot supply tools in protected mode. This is the default.
+    #[default]
+    Untrusted,
+    /// The connector may supply tools, including tools that write. Its read-only
+    /// claims carry no operator trust.
+    Catalog,
+    /// The connector may supply tools, and its read-only classifications are
+    /// trusted. Whether writes are allowed still depends on `require_read_only`.
+    CatalogAndReadOnly,
 }
 
 impl ConnectorTrustConfig {
     /// Snapshot as the request-scoped admission trust type.
-    pub(crate) fn snapshot(&self) -> crate::openai::responses::mcp_admission::ConnectorTrust {
-        crate::openai::responses::mcp_admission::ConnectorTrust {
-            catalog: self.catalog,
-            read_only: self.read_only,
+    pub(crate) fn snapshot(self) -> crate::openai::responses::mcp_admission::ConnectorTrust {
+        use crate::openai::responses::mcp_admission::ConnectorTrust;
+        match self {
+            Self::Untrusted => ConnectorTrust::Untrusted,
+            Self::Catalog => ConnectorTrust::Catalog,
+            Self::CatalogAndReadOnly => ConnectorTrust::CatalogAndReadOnly,
         }
     }
 }
@@ -236,6 +240,7 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
     }
     validate_connectors(&cfg.connectors)?;
     validate_tool_admission(&cfg.tool_admission)?;
+    warn_connectors_excluded_by_read_only(&cfg.tool_admission, &cfg.connectors);
     Ok(cfg)
 }
 
@@ -243,8 +248,11 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
 ///
 /// `require_read_only` is operator-enforced protection; it has no meaning in
 /// advisory mode, so pairing it with `mode: advisory` is rejected rather than
-/// silently providing advisory behavior. `trust.read_only` without
-/// `trust.catalog` stays valid (it grants no protected-mode admission).
+/// silently providing advisory behavior. A per-connector `trust` level is always
+/// valid: `trust: catalog` under `require_read_only` is accepted (the connector
+/// is intentionally excluded without contact — see
+/// [`warn_connectors_excluded_by_read_only`]), so an operator can keep the
+/// declaration and flip `require_read_only` without a config error.
 fn validate_tool_admission(cfg: &ToolAdmissionConfig) -> Result<(), FilterError> {
     if matches!(cfg.mode, ToolAdmissionMode::Advisory) && cfg.require_read_only {
         return Err(
@@ -252,6 +260,32 @@ fn validate_tool_admission(cfg: &ToolAdmissionConfig) -> Result<(), FilterError>
         );
     }
     Ok(())
+}
+
+/// Warn, without rejecting, when protected read-only mode excludes a `catalog`
+/// connector that cannot satisfy it.
+///
+/// A `trust: catalog` connector's `readOnlyHint` claims carry no operator trust,
+/// so under `require_read_only` every tool it could advertise is denied and the
+/// connector is excluded without contact. That is a valid configuration (an
+/// operator may intentionally park a connector), but almost always a mismatch —
+/// emit one warning per affected connector so it is visible in logs.
+/// `catalog_and_read_only` and `untrusted` connectors are unaffected.
+fn warn_connectors_excluded_by_read_only(admission: &ToolAdmissionConfig, connectors: &[ConnectorConfig]) {
+    if !matches!(admission.mode, ToolAdmissionMode::Protected) || !admission.require_read_only {
+        return;
+    }
+    for connector in connectors {
+        if matches!(connector.trust, ConnectorTrustConfig::Catalog) {
+            tracing::warn!(
+                connector = %connector.id,
+                "openai_mcp_tool_resolve: connector '{}' declares trust: catalog but tool_admission.require_read_only \
+                 is set, so its tools are excluded without contact; use trust: catalog_and_read_only to admit its \
+                 affirmatively read-only tools",
+                connector.id,
+            );
+        }
+    }
 }
 
 /// Validate one optional request-scoped context slot name.

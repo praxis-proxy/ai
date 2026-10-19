@@ -74,21 +74,43 @@ impl McpAdmissionPolicy {
     }
 }
 
-/// Operator trust granted to one connector's tool service.
+/// Operator trust level granted to one connector's tool service.
 ///
-/// The scopes are independent: trusting a service for read-only classification
-/// does not grant it catalog-admission trust. A declaration that sets neither
-/// scope leaves the connector untrusted, so it follows the same protected-mode
-/// admission rules as a client-selected direct target.
+/// A single ordered level rather than independent booleans: read-only trust is
+/// meaningful only for a service already trusted to supply tools, so the only
+/// states that carry authority are "catalog" and "catalog and read-only". A
+/// connector that declares no level is [`Untrusted`](ConnectorTrust::Untrusted)
+/// and follows the same protected-mode admission rules as a client-selected
+/// direct target. Trust is operator-owned: configuring a connector or matching
+/// its URL never grants it.
 #[cfg(feature = "openai-mcp-tools")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ConnectorTrust {
-    /// Authoritative for catalog admission: its tools are admitted without a
-    /// per-tool digest.
-    pub catalog: bool,
-    /// Authoritative for read-only classification: its `readOnlyHint` is a
-    /// trusted capability decision.
-    pub read_only: bool,
+pub(crate) enum ConnectorTrust {
+    /// No operator trust. In protected mode the connector cannot supply tools
+    /// and is excluded without contact. This is the default.
+    #[default]
+    Untrusted,
+    /// The connector may supply tools (admitted without a per-tool digest),
+    /// including tools that write. Its `readOnlyHint` claims carry no operator
+    /// trust, so under `require_read_only` it can admit nothing and is excluded
+    /// without contact.
+    Catalog,
+    /// The connector may supply tools and its `readOnlyHint` classifications are
+    /// trusted. Whether writes are admitted still depends on `require_read_only`.
+    CatalogAndReadOnly,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl ConnectorTrust {
+    /// Whether the connector may supply tools at all (catalog authority).
+    pub(crate) fn admits_catalog(self) -> bool {
+        matches!(self, Self::Catalog | Self::CatalogAndReadOnly)
+    }
+
+    /// Whether the connector's `readOnlyHint` is a trusted capability decision.
+    pub(crate) fn trusts_read_only(self) -> bool {
+        matches!(self, Self::CatalogAndReadOnly)
+    }
 }
 
 /// Why a discovered tool was denied admission under protected mode.
@@ -193,11 +215,11 @@ pub(crate) fn evaluate_tool(policy: McpAdmissionPolicy, trust: ConnectorTrust, t
         policy.is_protected(),
         "evaluate_tool is only meaningful in protected mode"
     );
-    if !trust.catalog {
+    if !trust.admits_catalog() {
         return McpToolVerdict::Denied(McpDenyReason::UntrustedSource);
     }
     if policy.require_read_only {
-        if !trust.read_only {
+        if !trust.trusts_read_only() {
             return McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority);
         }
         return match classify_read_only(tool_def) {
@@ -209,7 +231,7 @@ pub(crate) fn evaluate_tool(policy: McpAdmissionPolicy, trust: ConnectorTrust, t
     // Admission without operator read-only enforcement: the tool is admitted,
     // and its trusted read-only classification is recorded only when the source
     // is authoritative for it and affirms it.
-    let read_only = trust.read_only && matches!(classify_read_only(tool_def), ReadOnlyClass::Affirmative);
+    let read_only = trust.trusts_read_only() && matches!(classify_read_only(tool_def), ReadOnlyClass::Affirmative);
     McpToolVerdict::Admitted { read_only }
 }
 
@@ -408,80 +430,56 @@ mod tests {
 
     #[test]
     fn catalog_trust_admits_without_read_only_enforcement() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: false,
-        };
+        let trust = ConnectorTrust::Catalog;
         let verdict = evaluate_tool(protected(false), trust, &tool(None));
         assert_eq!(verdict, McpToolVerdict::Admitted { read_only: false });
     }
 
     #[test]
     fn catalog_trust_records_trusted_read_only_when_authoritative() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(protected(false), trust, &tool(Some(json!({"readOnlyHint": true}))));
         assert_eq!(verdict, McpToolVerdict::Admitted { read_only: true });
     }
 
     #[test]
     fn read_only_without_authority_denied_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: false,
-        };
+        let trust = ConnectorTrust::Catalog;
         let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": true}))));
         assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority));
     }
 
     #[test]
     fn affirmative_read_only_admitted_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": true}))));
         assert_eq!(verdict, McpToolVerdict::Admitted { read_only: true });
     }
 
     #[test]
     fn writable_tool_denied_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": false}))));
         assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::Writable));
     }
 
     #[test]
     fn missing_hint_denied_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(protected(true), trust, &tool(None));
         assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly));
     }
 
     #[test]
     fn malformed_hint_denied_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(protected(true), trust, &tool(Some(json!({"readOnlyHint": "yes"}))));
         assert_eq!(verdict, McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly));
     }
 
     #[test]
     fn conflicting_hint_denied_in_enforced_mode() {
-        let trust = ConnectorTrust {
-            catalog: true,
-            read_only: true,
-        };
+        let trust = ConnectorTrust::CatalogAndReadOnly;
         let verdict = evaluate_tool(
             protected(true),
             trust,

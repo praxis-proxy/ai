@@ -26,19 +26,24 @@
 #     from the model-visible set — a `readOnlyHint: true` claim cannot admit
 #     them. (Connector-only deployments can additionally reject direct targets
 #     outright; that switch is tracked separately.)
-#   * A connector is untrusted unless the operator declares a trust contract on
-#     it. `trust.catalog: true` makes the service authoritative for catalog
-#     admission (its tools are admitted without a per-tool digest). Merely
+#   * A connector is untrusted unless the operator declares a `trust` level on
+#     it. `trust: catalog` makes the service authoritative for catalog admission
+#     (its tools are admitted without a per-tool digest), including tools that
+#     write; its `readOnlyHint` claims carry no operator trust. Merely
 #     configuring a connector endpoint does NOT grant trust.
-#   * `trust.read_only: true` makes the service authoritative for read-only
-#     CLASSIFICATION (its `readOnlyHint` is trusted). It is independent of
-#     catalog trust: declaring it alone grants no admission.
+#   * `trust: catalog_and_read_only` additionally makes the service authoritative
+#     for read-only CLASSIFICATION (its `readOnlyHint` is trusted). Omitting
+#     `trust` (or `trust: untrusted`) leaves the connector untrusted.
 #
 # `tool_admission.require_read_only: true` is operator-enforced read-only: only
 # tools with a trusted AFFIRMATIVE read-only classification are admitted. A
 # trusted service reporting a tool as writable, or a missing / malformed /
 # conflicting classification, is excluded. Trusting the classification does not
-# waive this restriction. `require_read_only` requires `mode: protected`.
+# waive this restriction. `require_read_only` requires `mode: protected`. Under
+# it a `trust: catalog` connector can admit nothing (its read-only claims are not
+# trusted), so it is excluded WITHOUT contact; use `trust: catalog_and_read_only`
+# to admit its affirmatively read-only tools. That configuration stays valid (it
+# emits a warning), so an operator can park a connector intentionally.
 #
 # ## Enforcement ownership and failure semantics
 #
@@ -62,9 +67,10 @@
 #   connectors:
 #     - id: trusted_gateway
 #       server_url: https://gateway.internal/mcp
-#       trust:
-#         catalog: true     # admit its tools without a per-tool digest
-#         read_only: true   # honor its readOnlyHint as a trusted classification
+#       # admit its tools without a per-tool digest AND honor its readOnlyHint as
+#       # a trusted classification (use `catalog` to admit tools without trusting
+#       # readOnlyHint, or `untrusted` / omit for no trust):
+#       trust: catalog_and_read_only
 #
 # A request then references it by `connector_id` instead of a direct `server_url`:
 #   {"type": "mcp", "server_label": "docs", "connector_id": "trusted_gateway"}

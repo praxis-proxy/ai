@@ -30,9 +30,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 | `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
 | `connectors[].id` | string | yes | Connector identifier referenced in requests. |
 | `connectors[].server_url` | string | yes | MCP server URL for this connector. |
-| `connectors[].trust` | ConnectorTrustConfig | no | Operator trust declaration for this connector's tool service. Trust is operator-owned and scoped. By default a connector is untrusted, so in protected mode it follows the same admission rules as a client-selected direct target. Declaring `trust.catalog: true` makes the service authoritative for catalog admission (its tools are admitted without a per-tool digest); `trust.read_only: true` makes it authoritative for read-only classification (its `readOnlyHint` is a trusted capability decision). The scopes are independent: a read-only-only trust grants no catalog admission. |
-| `connectors[].trust.catalog` | bool | no | Authoritative for catalog admission. |
-| `connectors[].trust.read_only` | bool | no | Authoritative for read-only classification. |
+| `connectors[].trust` | `untrusted` \| `catalog` \| `catalog_and_read_only` | no | Operator trust level for this connector's tool service. Trust is operator-owned. By default a connector is `untrusted`, so in protected mode it follows the same admission rules as a client-selected direct target. `catalog` lets the service supply tools (admitted without a per-tool digest), including tools that write; its `readOnlyHint` claims carry no operator trust. `catalog_and_read_only` additionally trusts its `readOnlyHint` classifications. Merely configuring a connector or matching its URL never grants trust. |
 | `tool_admission` | ToolAdmissionConfig | no | Operator metadata-admission policy. Defaults to advisory (unchanged behavior), so existing non-protected deployments are not affected. |
 | `tool_admission.mode` | `advisory` \| `protected` | no | Admission mode (`advisory` default, or `protected`). |
 | `tool_admission.require_read_only` | bool | no | Operator-enforced read-only: in protected mode admit only tools with a trusted affirmative read-only classification. Requires `mode: protected`. |
@@ -63,9 +61,8 @@ tool_admission:
 connectors:
   - id: corp_drive
     server_url: https://drive-mcp.internal/mcp
-    # Declare the connector's tool service authoritative. Scopes are
-    # independent and default to false (untrusted).
-    trust:
-      catalog: true        # authoritative for catalog admission
-      read_only: true      # authoritative for read-only classification
+    # Operator trust level (default untrusted): `catalog` admits its tools
+    # (writes included) without trusting readOnlyHint; `catalog_and_read_only`
+    # additionally trusts its readOnlyHint classifications.
+    trust: catalog_and_read_only
 ```

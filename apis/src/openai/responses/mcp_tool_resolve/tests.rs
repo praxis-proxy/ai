@@ -5901,7 +5901,7 @@ mod admission {
 
     use super::super::{
         ConnectorTrust, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
-        McpToolVerdict, admit_tools, build_entry_resolution, excluded_as_untrusted, trust_for_entry,
+        McpToolVerdict, admit_tools, build_entry_resolution, protected_exclusion, trust_for_entry,
     };
     use crate::openai::responses::mcp_admission::{McpAdmissionMode, McpDenyReason};
 
@@ -5979,22 +5979,50 @@ mod admission {
     }
 
     #[test]
-    fn config_accepts_connector_read_only_trust_without_catalog() {
+    fn config_accepts_every_connector_trust_level() {
+        for level in ["untrusted", "catalog", "catalog_and_read_only"] {
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: \
+                 https://gw.internal/mcp\n    trust: {level}\n"
+            ))
+            .unwrap();
+            assert!(
+                McpToolResolveFilter::from_config(&yaml).is_ok(),
+                "trust level {level} must be a valid connector trust declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn config_defaults_connector_trust_to_untrusted() {
+        // Omitting `trust` is valid and leaves the connector untrusted.
         let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    \
-             trust:\n      read_only: true\n",
+            "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n",
+        )
+        .unwrap();
+        assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+    }
+
+    #[test]
+    fn config_accepts_catalog_connector_under_require_read_only() {
+        // A `catalog` connector under require_read_only is excluded without
+        // contact but the configuration stays valid (operators may park a
+        // connector intentionally); it only emits a warning.
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tool_admission:\n  mode: protected\n  require_read_only: true\nconnectors:\n  - id: gw\n    server_url: \
+             https://gw.internal/mcp\n    trust: catalog\n",
         )
         .unwrap();
         assert!(
             McpToolResolveFilter::from_config(&yaml).is_ok(),
-            "read-only trust without catalog trust must be valid"
+            "catalog + require_read_only must stay valid (excluded without contact, warned)"
         );
     }
 
     #[test]
-    fn config_rejects_unknown_trust_field() {
+    fn config_rejects_unknown_trust_level() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "connectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    trust:\n      bogus: true\n",
+            "connectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    trust: bogus\n",
         )
         .unwrap();
         assert!(McpToolResolveFilter::from_config(&yaml).is_err());
@@ -6008,25 +6036,15 @@ mod admission {
         // mode must still exclude it (no trust) rather than passing it through to
         // the backend (#1724).
         let entry = json!({"type": "mcp", "server_label": "x"});
-        assert!(excluded_as_untrusted(&entry, protected(false), &HashMap::new()));
+        assert!(protected_exclusion(&entry, protected(false), &HashMap::new()).is_some());
         // Advisory mode leaves it alone (unchanged behavior).
-        assert!(!excluded_as_untrusted(
-            &entry,
-            McpAdmissionPolicy::default(),
-            &HashMap::new()
-        ));
+        assert!(protected_exclusion(&entry, McpAdmissionPolicy::default(), &HashMap::new()).is_none());
     }
 
     #[test]
     fn direct_entry_is_always_untrusted() {
         let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+        trust.insert("gw".to_owned(), ConnectorTrust::CatalogAndReadOnly);
         assert_eq!(trust_for_entry(&direct_entry("srv"), &trust), ConnectorTrust::default());
     }
 
@@ -6076,13 +6094,7 @@ mod admission {
     #[test]
     fn protected_catalog_trusted_connector_admits_with_identity_preserved() {
         let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: false,
-            },
-        );
+        trust.insert("gw".to_owned(), ConnectorTrust::Catalog);
         let def = tool("search", Some(json!({"readOnlyHint": true})));
         let (tool_map, functions, decisions) = resolve(
             &connector_entry("srv", "gw"),
@@ -6106,13 +6118,7 @@ mod admission {
     #[test]
     fn protected_require_read_only_admits_only_affirmative_trusted_tools() {
         let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+        trust.insert("gw".to_owned(), ConnectorTrust::CatalogAndReadOnly);
         let tools = vec![
             tool("reader", Some(json!({"readOnlyHint": true}))),
             tool("writer", Some(json!({"readOnlyHint": false}))),
@@ -6143,13 +6149,7 @@ mod admission {
     #[test]
     fn protected_require_read_only_denies_connector_without_read_only_authority() {
         let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: false,
-            },
-        );
+        trust.insert("gw".to_owned(), ConnectorTrust::Catalog);
         let (tool_map, functions, decisions) = resolve(
             &connector_entry("srv", "gw"),
             vec![tool("reader", Some(json!({"readOnlyHint": true})))],
@@ -6162,6 +6162,52 @@ mod admission {
             decisions.verdict("srv", "reader"),
             Some(McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority))
         );
+    }
+
+    #[test]
+    fn protected_exclusion_matches_the_trust_combination_table() {
+        // The full combination table: which trust levels are excluded without
+        // contact (and why) under protected mode, for both require_read_only
+        // settings. Advisory mode never excludes. Direct/unknown targets are
+        // untrusted via trust_for_entry (covered elsewhere).
+        let connector = connector_entry("srv", "gw");
+        let with = |level: ConnectorTrust| {
+            let mut trust = HashMap::new();
+            trust.insert("gw".to_owned(), level);
+            trust
+        };
+
+        // Advisory mode: never excluded without contact, any level.
+        for level in [
+            ConnectorTrust::Untrusted,
+            ConnectorTrust::Catalog,
+            ConnectorTrust::CatalogAndReadOnly,
+        ] {
+            assert!(
+                protected_exclusion(&connector, McpAdmissionPolicy::default(), &with(level)).is_none(),
+                "advisory mode never excludes without contact"
+            );
+        }
+
+        // Protected, require_read_only = false.
+        assert_eq!(
+            protected_exclusion(&connector, protected(false), &with(ConnectorTrust::Untrusted)),
+            Some(McpDenyReason::UntrustedSource)
+        );
+        assert!(protected_exclusion(&connector, protected(false), &with(ConnectorTrust::Catalog)).is_none());
+        assert!(protected_exclusion(&connector, protected(false), &with(ConnectorTrust::CatalogAndReadOnly)).is_none());
+
+        // Protected, require_read_only = true: catalog is now excluded WITHOUT
+        // contact (no dial) because it can admit nothing.
+        assert_eq!(
+            protected_exclusion(&connector, protected(true), &with(ConnectorTrust::Untrusted)),
+            Some(McpDenyReason::UntrustedSource)
+        );
+        assert_eq!(
+            protected_exclusion(&connector, protected(true), &with(ConnectorTrust::Catalog)),
+            Some(McpDenyReason::NoReadOnlyAuthority)
+        );
+        assert!(protected_exclusion(&connector, protected(true), &with(ConnectorTrust::CatalogAndReadOnly)).is_none());
     }
 
     #[test]
@@ -6186,13 +6232,7 @@ mod admission {
     #[test]
     fn two_connectors_same_url_do_not_share_trust() {
         let mut trust = HashMap::new();
-        trust.insert(
-            "trusted".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+        trust.insert("trusted".to_owned(), ConnectorTrust::CatalogAndReadOnly);
         trust.insert("untrusted".to_owned(), ConnectorTrust::default());
         let def = tool("search", Some(json!({"readOnlyHint": true})));
 
@@ -6222,13 +6262,7 @@ mod admission {
     fn trust_revocation_changes_verdict_on_the_next_request() {
         let def = tool("search", Some(json!({"readOnlyHint": true})));
         let mut trusted = HashMap::new();
-        trusted.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+        trusted.insert("gw".to_owned(), ConnectorTrust::CatalogAndReadOnly);
 
         let (map_before, fns_before, _) = resolve(
             &connector_entry("srv", "gw"),

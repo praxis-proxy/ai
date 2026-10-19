@@ -1225,7 +1225,7 @@ fn protected_read_only_trusted_connector_admits_only_read_only_tools() {
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
     let connectors = format!(
-        "        tool_admission:\n          mode: protected\n          require_read_only: true\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            trust:\n              catalog: true\n              read_only: true"
+        "        tool_admission:\n          mode: protected\n          require_read_only: true\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            trust: catalog_and_read_only"
     );
     let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
     let config = Config::from_yaml(&yaml).unwrap();
@@ -1253,6 +1253,53 @@ fn protected_read_only_trusted_connector_admits_only_read_only_tools() {
     assert!(
         !echoed.contains("delete_docs"),
         "the writable tool must be excluded before inference: {echoed}"
+    );
+}
+
+/// A `catalog` connector (no read-only authority) under operator read-only mode
+/// can admit nothing, so protected mode excludes it WITHOUT dialing: the gateway
+/// receives zero network calls and no tool reaches the model. The configuration
+/// stays valid (it only emits a warning).
+#[test]
+fn protected_read_only_excludes_catalog_connector_without_contact() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("read_docs").with_annotations(serde_json::json!({"readOnlyHint": true}))],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        tool_admission:\n          mode: protected\n          require_read_only: true\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            trust: catalog"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"docs","connector_id":"gw"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the connector excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        tool_count, 0,
+        "a catalog connector admits nothing under require_read_only: {echoed}"
+    );
+    assert!(!echoed.contains("read_docs"), "no tool reaches the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "an excluded catalog connector must never be dialed"
     );
 }
 
