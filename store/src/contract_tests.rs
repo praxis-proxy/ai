@@ -96,6 +96,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
+    pending_approval_size_measures_payload_only(backend).await;
     persist_pairs_response_and_approvals(backend).await;
     insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
@@ -334,6 +335,113 @@ async fn approvals_require_an_owner_matched_response(backend: &dyn PersistedStat
             .expect("read wrong-owner approvals")
             .is_empty(),
         "approval persisted under an owner that does not own its issuing response"
+    );
+}
+
+/// `pending_approval_payload_bytes` sums the matched rows' payload size without
+/// materializing them, counts only owner- and response-scoped matches, treats
+/// unknown ids and an empty slice as zero, and never fetches a row that another
+/// owner or a different issuing response holds. This is the size-only admission
+/// probe aggregate budgeting runs before loading a stored approval.
+#[expect(clippy::too_many_lines, reason = "linear scoping and sizing assertions")]
+async fn pending_approval_size_measures_payload_only(backend: &dyn PersistedStateBackend) {
+    let o = owner("size");
+    let other = owner("size-other");
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_size".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert response for size query");
+
+    // Distinct, known-length ASCII fields so the expected byte total is the
+    // sum of every stored column and is not accidentally equal across rows.
+    let first = PendingApprovalRecord {
+        approval_id: "size_a".to_owned(),
+        server_label: "search-server".to_owned(),
+        tool_name: "lookup".to_owned(),
+        arguments: "{\"q\":\"alpha\"}".to_owned(),
+        target_fingerprint: "fp-aaaa".to_owned(),
+    };
+    let second = PendingApprovalRecord {
+        approval_id: "size_bb".to_owned(),
+        server_label: "db".to_owned(),
+        tool_name: "query-rows".to_owned(),
+        arguments: "{\"table\":\"orders\",\"limit\":100}".to_owned(),
+        target_fingerprint: "fp-b".to_owned(),
+    };
+    backend
+        .record_pending_approvals(&o, "resp_size", &[first.clone(), second.clone()], 10)
+        .await
+        .expect("record approvals for size query");
+
+    let payload_bytes = |record: &PendingApprovalRecord| {
+        record.approval_id.len()
+            + record.server_label.len()
+            + record.tool_name.len()
+            + record.arguments.len()
+            + record.target_fingerprint.len()
+    };
+
+    // Both rows matched; the unknown id contributes nothing to the total.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_a", "size_bb", "size_missing"])
+            .await
+            .expect("size of matched rows"),
+        payload_bytes(&first) + payload_bytes(&second),
+        "size must sum only the matched rows and ignore unknown ids"
+    );
+    // A single id returns just that row's payload size.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_bb"])
+            .await
+            .expect("size of one row"),
+        payload_bytes(&second),
+        "a single matched id measures only its own payload"
+    );
+    // Unknown id only: zero bytes, never an error.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_missing"])
+            .await
+            .expect("size of missing row"),
+        0,
+        "unknown approval ids contribute zero"
+    );
+    // Wrong owner: the rows are invisible, so zero bytes.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&other, "resp_size", &["size_a", "size_bb"])
+            .await
+            .expect("size under wrong owner"),
+        0,
+        "a non-owner must not measure another owner's approvals"
+    );
+    // Wrong issuing response: scoped out, so zero bytes.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_other", &["size_a", "size_bb"])
+            .await
+            .expect("size under wrong response"),
+        0,
+        "approvals are scoped to their issuing response"
+    );
+    // An empty id slice measures nothing.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &[])
+            .await
+            .expect("size of empty slice"),
+        0,
+        "an empty id slice measures nothing"
     );
 }
 
