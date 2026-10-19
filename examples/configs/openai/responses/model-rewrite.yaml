@@ -1,4 +1,5 @@
 # Responses and Chat Completions Model Rewrite
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # Rewrites or injects the top-level `model` field in Responses API
 # and Chat Completions request bodies before forwarding to the

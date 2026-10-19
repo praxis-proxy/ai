@@ -1221,6 +1221,7 @@ pub(crate) fn has_file_search_tool(state: &ResponsesState) -> bool {
 /// 1. `{"query": "..."}` — single query string (most common from vLLM)
 /// 2. `{"queries": ["...", "..."]}` — explicit query array
 /// 3. Raw string fallback — entire arguments string used as one query
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn extract_file_search_queries(arguments: &str) -> Vec<String> {
     if let Ok(parsed) = serde_json::from_str::<Value>(arguments) {
         if let Some(query) = parsed.get("query").and_then(Value::as_str)
@@ -1251,6 +1252,7 @@ fn extract_file_search_queries(arguments: &str) -> Vec<String> {
 /// `file_search_call` items so the pending-call scan recognizes them.
 ///
 /// Returns the round-local output indices it rewrote.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn translate_function_calls_to_file_search(response: &mut Value) -> Vec<usize> {
     let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
         return Vec::new();
@@ -1272,6 +1274,7 @@ pub(crate) fn translate_function_calls_to_file_search(response: &mut Value) -> V
 /// Rewrite one `function_call(name="file_search")` object into a canonical
 /// `file_search_call` in place, preserving a stable public id derived from the
 /// model's `call_id` when the item arrived without one (issue #955).
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Value>) {
     let queries = object
         .get("arguments")
@@ -1435,6 +1438,7 @@ fn ensure_public_file_search_call_id(
 /// `response["id"]` and stamp any missing/empty id in place (issue #955). The
 /// loop owner runs this after normalization and before accumulation so both the
 /// buffered and streaming paths share one implementation.
+#[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn ensure_public_output_item_ids_in_response(response: &mut Value) {
     let response_identity_hash = response
         .get("id")
@@ -1446,6 +1450,7 @@ pub(crate) fn ensure_public_output_item_ids_in_response(response: &mut Value) {
 }
 
 /// Normalize missing or malformed provider IDs for every public output item.
+#[cfg(feature = "openai-agentic-loop")]
 fn ensure_public_output_item_ids(items: &mut [Value], response_identity_hash: u64) {
     for (output_index, item) in items.iter_mut().enumerate() {
         let Some(object) = item.as_object_mut() else {

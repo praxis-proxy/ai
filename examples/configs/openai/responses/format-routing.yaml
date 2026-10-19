@@ -1,4 +1,5 @@
 # Responses Format Routing
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # Routes AI API traffic by request-head operation identity and body format.
 # The `ai_operation` filter classifies supported AI operations from

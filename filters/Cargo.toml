@@ -27,7 +27,9 @@ aws-sigv4-filter = ["dep:aws-credential-types"]
 # non-experimental filter.
 apis = ["full"]
 # Opt-in OpenAI filter groups; see praxis-ai-apis for what each one contains.
-openai-responses = ["praxis-ai-apis/openai-responses"]
+openai-responses = ["experimental", "praxis-ai-apis/openai-responses"]
+# Experimental ephemeral agent orchestration; separate from Responses support.
+openai-agentic-loop = ["openai-responses", "experimental", "praxis-ai-apis/openai-agentic-loop"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-apis/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-apis/store"]
 store-postgres = ["store", "praxis-ai-apis/store-postgres"]
@@ -37,10 +39,10 @@ store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-apis/openai-conversations"]
 openai-compact = ["store", "praxis-ai-apis/openai-compact"]
 openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
-# Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
-# Every non-experimental filter; equals the pre-feature-split capability.
-full = ["standard", "openai-all", "store-postgres"]
+# Every OpenAI group, including experimental capabilities, without a backend.
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+# Every non-experimental filter. Experimental OpenAI groups stay opt-in.
+full = ["standard"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental", "dep:serde_json_path"]
@@ -76,7 +78,7 @@ token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
 inflight-tracker-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
-experimental = []
+experimental = ["praxis-ai-apis/experimental"]
 opentelemetry = []
 praxis-main = ["praxis-ai-apis/praxis-main"]
 

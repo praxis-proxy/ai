@@ -17,7 +17,7 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
@@ -145,7 +145,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite` first"
     )
 
 
@@ -278,6 +278,8 @@ def _write_full_flow_config(
     ogx_endpoint: str | None = None,
     file_url_origin: str | None = None,
     web_search_provider: str = "brave",
+    tool_admission: str | None = None,
+    mcp_minimum_approval: str | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     resolved_backend = backend_endpoint or _vllm_endpoint()
@@ -286,6 +288,12 @@ def _write_full_flow_config(
         praxis_port,
         backend_endpoint=resolved_backend,
     )
+    if tool_admission is not None:
+        # Inject an operator metadata-admission policy under the resolver so the
+        # SDK suite can exercise protected mode (#1724).
+        marker = "      - filter: openai_mcp_tool_resolve\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(marker, marker + tool_admission)
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
@@ -400,6 +408,16 @@ def _write_full_flow_config(
         )
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if mcp_minimum_approval is not None:
+        # Inject the operator approval floor onto openai_mcp_dispatch so the
+        # pipeline requires approval for every MCP call regardless of the client's
+        # per-tool require_approval (issue #1723).
+        anchor = "              - filter: openai_mcp_dispatch\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor,
+            anchor + f"                minimum_approval: {mcp_minimum_approval}\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
@@ -664,6 +682,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
+                            # Read-only annotation so require_approval read_only
+                            # selectors can classify this tool (issue #1398).
+                            "annotations": {"readOnlyHint": True},
                         },
                         {
                             "name": "get_time",
@@ -1343,6 +1364,51 @@ class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class OversizedCallIdBackendHandler(BaseHTTPRequestHandler):
+    """Native Responses backend scripting one MCP call with an escaping id.
+
+    Issue #1400: a provider-emitted ``call_id`` at the raw-byte bound but whose
+    JSON-serialized fallback exceeds the retained reservation must fail closed
+    before an approval is persisted or the tool executes. Real vLLM cannot be
+    forced to emit such an id, so this handler scripts deterministic output.
+    """
+
+    request_count: ClassVar[int] = 0
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        type(self).request_count += 1
+        payload = json.dumps(
+            {
+                "id": "resp_oversized_call_id",
+                "object": "response",
+                "created_at": 1,
+                "model": VLLM_MODEL,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_oversized_call_id",
+                        "call_id": "\0" * 128,
+                        "name": "weather__get_weather",
+                        "arguments": json.dumps({"city": "Paris"}),
+                        "status": "completed",
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
 class SimulatorBackendHandler(BaseHTTPRequestHandler):
     """Record Praxis requests and script hosted-tool Chat responses.
 
@@ -1357,6 +1423,7 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
 
     recorded_requests: ClassVar[list[tuple[str, dict[str, Any]]]] = []
     web_search_queries: ClassVar[list[str]] = []
+    web_search_multi_query_call: ClassVar[bool] = False
 
     def log_message(self, fmt, *args):
         pass
@@ -1490,10 +1557,22 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                     else "Praxis marker"
                 ]
             )
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
+            if (
+                tool_name == "web_search"
+                and SimulatorBackendHandler.web_search_multi_query_call
+            ):
+                tool_calls = [
+                    {
+                        "id": f"call_simulator_{tool_name}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"queries": queries}),
+                        },
+                    }
+                ]
+            else:
+                tool_calls = [
                     {
                         "id": (
                             f"call_simulator_{tool_name}_{index}"
@@ -1507,7 +1586,11 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                         },
                     }
                     for index, query in enumerate(queries)
-                ],
+                ]
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
 
@@ -1565,24 +1648,44 @@ def _assert_simulator_auto_tool_round(
             65_536,
         ),
     }[tool_name]
+    if tool_name == "web_search":
+        parameters = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": max_length,
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        }
+    else:
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": max_length,
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
     expected_tools = [
         {
             "type": "function",
             "function": {
                 "name": tool_name,
                 "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": max_length,
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
+                "parameters": parameters,
                 "strict": True,
             },
         }
@@ -5712,6 +5815,130 @@ def agentic_client(agentic_proxy):
     )
 
 
+# Operator metadata-admission policy injected under the resolver (#1724):
+# protected mode with operator-enforced read-only.
+_PROTECTED_ADMISSION_BLOCK = (
+    "        tool_admission:\n"
+    "          mode: protected\n"
+    "          require_read_only: true\n"
+)
+
+
+@pytest.fixture(scope="session")
+def admission_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Start a Praxis proxy with protected MCP metadata admission (#1724)."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("admission-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
+        tool_admission=_PROTECTED_ADMISSION_BLOCK,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Admission Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def admission_client(admission_proxy):
+    """Return an OpenAI client pointed at the protected-admission proxy."""
+    proxy_port, _, _ = admission_proxy
+    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+
+
+@pytest.fixture(scope="session")
+def mcp_approval_floor_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Agentic proxy with the operator approval floor (minimum_approval: always).
+
+    Same pipeline as ``agentic_proxy`` with ``openai_mcp_dispatch.minimum_approval``
+    set to ``always`` so every MCP call requires approval regardless of the
+    client's per-tool ``require_approval`` (issue #1723).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-approval-floor")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
+        mcp_minimum_approval="always",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP approval-floor Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_approval_floor_client(mcp_approval_floor_proxy):
+    """Return an OpenAI client pointed at the approval-floor Praxis proxy."""
+    proxy_port, _, _ = mcp_approval_floor_proxy
+    return _make_openai_client(
+        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
+    )
+
+
 @pytest.fixture(scope="session")
 def translated_agentic_proxy(
     tmp_path_factory,
@@ -5776,6 +6003,55 @@ def translated_agentic_client(translated_agentic_proxy):
             "x-user-brave-key": "controlled-test-only",
         },
     )
+
+
+@pytest.fixture()
+def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_server):
+    """Run the agentic loop against a backend scripting an oversized MCP id."""
+    OversizedCallIdBackendHandler.request_count = 0
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), OversizedCallIdBackendHandler)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("oversized-mcp-call-id")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), mcp_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Oversized call id Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -6623,6 +6899,51 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
+    def test_protected_mode_excludes_untrusted_direct_mcp_tool(
+        self, admission_client, admission_proxy,
+    ):
+        """Protected metadata admission excludes a client-selected direct MCP
+        target before inference (#1724).
+
+        The direct ``server_url`` is untrusted, so in protected mode its tools
+        never reach the model and the untrusted server is never dispatched: the
+        response carries no ``mcp_call`` and the mock records no tool call.
+        """
+        _, mcp_port, _ = admission_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+        calls_before = MCPHandler.tool_call_count()
+
+        response = admission_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Call get_weather for Paris if a weather tool is available; "
+                "otherwise just answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"request should proceed with the tool excluded; got: {response.status}"
+        )
+        output_types = [item.type for item in response.output]
+        assert "mcp_call" not in output_types, (
+            "an untrusted direct target's tool must not execute in protected "
+            f"mode; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the untrusted direct target must never be dispatched in protected mode"
+        )
+
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
     ):
@@ -6693,6 +7014,103 @@ class TestAgenticLoopVLLM:
         # message, so accept either as proof the tool result fed back into the model.
         assert "message" in output_types or "reasoning" in output_types, (
             f"approved response should resume to model output; got: {output_types}"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_gates_over_never_name(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
+
+        ``get_weather`` is annotated read-only. The policy names it in
+        ``never.tool_names`` but also selects it via ``always.read_only=true``.
+        ``always`` precedence must gate the call with an approval request; before
+        the fix the ignored read_only selector left only the never name-match and
+        the tool executed automatically.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {
+                    "always": {"read_only": True},
+                    "never": {"tool_names": ["get_weather"]},
+                },
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "always.read_only must gate the read-only tool even though "
+            "never.tool_names names it; "
+            f"got: {[item.type for item in response.output]}"
+        )
+        assert approval_requests[0].name == "get_weather"
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the gated call must not execute while approval is pending"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_auto_executes(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
+
+        ``get_weather`` is annotated read-only and matched by
+        ``never.read_only=true``, so it executes automatically with no approval
+        request -- proving the discovered readOnlyHint drives the exemption
+        through the OpenAI client.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {"never": {"read_only": True}},
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        output_types = [item.type for item in response.output]
+        assert not any(t == "mcp_approval_request" for t in output_types), (
+            f"never.read_only must auto-execute the read-only tool; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "the read-only tool must execute automatically under never.read_only"
+        )
+        assert "mcp_call" in output_types, (
+            f"auto-executed response should contain the MCP result; got: {output_types}"
         )
 
     @requires_vllm_compat
@@ -6983,6 +7401,102 @@ class TestAgenticLoopVLLM:
             response.output
         )
 
+    @qualification_profile("supporting")
+    def test_mcp_oversized_call_id_fails_closed_before_dispatch(
+        self,
+        oversized_call_id_client,
+    ):
+        """Issue #1400: an escaping MCP call id fails closed before dispatch.
+
+        The provider-emitted correlation id is at the raw-byte bound, but JSON
+        escaping expands its fallback beyond the retained reservation, so the
+        round is rejected with a 502 before any approval is persisted and
+        before the MCP tool executes.
+        """
+        client, mcp_port = oversized_call_id_client
+        calls_before = MCPHandler.tool_call_count()
+
+        with pytest.raises(openai.InternalServerError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input=(
+                    "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "allowed_tools": ["get_weather"],
+                        "require_approval": "always",
+                    }
+                ],
+                store=True,
+                max_output_tokens=256,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 502, (
+            "an oversized correlation id must fail closed as a server error"
+        )
+        assert error.body["code"] == "server_error"
+        assert "call_id" in error.body["message"], error.body["message"]
+        assert OversizedCallIdBackendHandler.request_count == 1, (
+            "exactly one inference round must run before the round is rejected"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute when the correlation id is rejected"
+        )
+
+    def test_operator_floor_forces_approval_over_client_never(
+        self,
+        mcp_approval_floor_client,
+        mcp_approval_floor_proxy,
+    ):
+        """Operator ``minimum_approval: always`` must force an approval exchange
+        even when the client sends ``require_approval: "never"`` (issue #1723).
+
+        The MCP server must receive zero ``tools/call`` because the floor stops
+        dispatch and returns an ``mcp_approval_request`` instead.
+        """
+        _, mcp_port, _ = mcp_approval_floor_proxy
+        MCPHandler.authorization_headers.clear()
+        calls_before = MCPHandler.tool_call_count()
+
+        response = mcp_approval_floor_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "allowed_tools": ["get_weather"],
+                    # The client opts out of approval; the operator floor overrides.
+                    "require_approval": "never",
+                }
+            ],
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
+            max_output_tokens=256,
+        )
+
+        approvals = [
+            item for item in response.output if item.type == "mcp_approval_request"
+        ]
+        assert len(approvals) == 1, response.output
+        assert approvals[0].name == "get_weather"
+        assert approvals[0].server_label == "weather"
+        assert not any(item.type == "mcp_call" for item in response.output), (
+            response.output
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the operator floor must stop dispatch before the MCP server is called"
+        )
+
     def test_mcp_authorization_is_bearer_and_not_forwarded_to_model(
         self,
         agentic_client,
@@ -7198,6 +7712,70 @@ class TestAgenticLoopVLLM:
         finally:
             BraveSearchHandler.reset()
             SimulatorBackendHandler.web_search_queries = []
+
+    @requires_simulator
+    def test_web_search_multi_query_round_trip_preserves_queries(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            SimulatorBackendHandler.web_search_multi_query_call = True
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search for both questions, then report "
+                    "each result title and URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                include=["web_search_call.action.sources"],
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "completed"
+            assert len(BraveSearchHandler.request_paths) == request_count + 2
+
+            completed_call = web_search_calls[0].model_dump()
+            assert completed_call.get("action", {}).get("queries") == [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            sources = completed_call.get("action", {}).get("sources", [])
+            assert any(
+                source.get("url") == "https://example.com/mock"
+                for source in sources
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "Mock Search Result" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+            SimulatorBackendHandler.web_search_multi_query_call = False
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(

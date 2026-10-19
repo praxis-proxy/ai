@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
 #[cfg(feature = "openai-mcp-tools")]
+use crate::openai::responses::mcp_admission::ConnectorTrust;
+#[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
     openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
@@ -3370,7 +3372,65 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
         server_label: "drive".to_owned(),
         server_url: "https://drive.example.com/mcp".to_owned(),
         timeout: std::time::Duration::from_secs(5),
+        trust: ConnectorTrust::default(),
     }
+}
+
+/// A call to a tool denied by operator admission (#1724) is not in
+/// `mcp_tool_map`, but the denied verdict keeps it recognized as MCP-owned so
+/// the loop dispatches it (to be rejected) instead of returning it to the client
+/// as an unresolved function.
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn denied_mcp_call_is_dispatchable_and_server_owned() {
+    use crate::openai::responses::mcp_admission::{
+        McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+    };
+
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "x"}));
+    let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
+        mode: McpAdmissionMode::Protected,
+        require_read_only: true,
+    });
+    admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
+    state.mcp_admission = admission;
+    // The denied tool is absent from the dispatch map, exactly as discovery left it.
+    state.tool_calls = vec![json!({
+        "type": "function_call",
+        "name": "gw__delete_repo",
+        "call_id": "c1",
+        "arguments": "{}",
+    })];
+
+    assert!(
+        super::has_dispatchable_mcp_work(&state),
+        "a denied MCP call must keep the loop dispatching so the dispatcher can reject it"
+    );
+    let (has_server, has_client) = super::mcp_call_ownership(&state);
+    assert!(
+        has_server && !has_client,
+        "a denied MCP call must be server-owned, not treated as a client function"
+    );
+}
+
+/// A genuine client-owned function (no admission verdict, not in the map) stays
+/// client-owned and is not forced into MCP dispatch.
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn client_function_stays_client_owned() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "x"}));
+    state.tool_calls = vec![json!({
+        "type": "function_call",
+        "name": "my_client_fn",
+        "call_id": "c1",
+    })];
+
+    let (has_server, has_client) = super::mcp_call_ownership(&state);
+    assert!(!has_server && has_client, "a client function must remain client-owned");
+    assert!(
+        !super::has_dispatchable_mcp_work(&state),
+        "a client-only round has no dispatchable MCP work"
+    );
 }
 
 /// A completed `function_call` whose encoded name (`server__lookup`) resolves to

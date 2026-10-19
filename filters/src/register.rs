@@ -473,6 +473,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
     );
     register_web_search_dispatch(registry, subrequest_client);
+    #[cfg(feature = "openai-agentic-loop")]
     register_openai_agentic_filters(registry);
 }
 
@@ -529,8 +530,8 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
     );
 }
 
-/// Register OpenAI agentic loop filters.
-#[cfg(feature = "openai-responses")]
+/// Register the experimental OpenAI agentic loop only when explicitly selected.
+#[cfg(feature = "openai-agentic-loop")]
 fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
@@ -909,6 +910,7 @@ provider:
     /// Every opt-in filter paired with whether its cargo feature is enabled.
     const OPTIONAL_FILTERS: &[(&str, bool)] = &[
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
+        ("openai_responses_request", cfg!(feature = "openai-responses")),
         ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
         (
@@ -917,7 +919,7 @@ provider:
         ),
         ("openai_doc_extract", cfg!(feature = "openai-responses")),
         ("openai_client_tool_compat", cfg!(feature = "openai-responses")),
-        ("openai_agentic_loop", cfg!(feature = "openai-responses")),
+        ("openai_agentic_loop", cfg!(feature = "openai-agentic-loop")),
         ("openai_file_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_web_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_file_resolve", cfg!(feature = "openai-file-resolve-filter")),
@@ -937,6 +939,35 @@ provider:
         let names = registry.available_filters();
         for &(name, enabled) in OPTIONAL_FILTERS {
             assert_experimental_registration(&names, name, enabled);
+        }
+    }
+
+    /// Disabled experimental OpenAI filters fail before a pipeline can serve traffic.
+    #[test]
+    fn disabled_openai_filters_reject_pipeline_configuration() {
+        let registry = build_ai_registry();
+        for (name, enabled) in [
+            ("openai_responses_request", cfg!(feature = "openai-responses")),
+            ("openai_agentic_loop", cfg!(feature = "openai-agentic-loop")),
+        ] {
+            if enabled {
+                continue;
+            }
+            let mut entries: Vec<FilterEntry> =
+                serde_yaml::from_str(&format!("- filter: {name}\n")).expect("filter entry parses");
+            let result = FilterPipeline::build_with_chains(
+                &mut entries,
+                &registry,
+                &HashMap::new(),
+                &InsecureOptions::default(),
+            );
+            let Err(error) = result else {
+                panic!("an unavailable filter must fail pipeline construction");
+            };
+            assert!(
+                error.to_string().contains(name),
+                "diagnostic must identify {name}: {error}"
+            );
         }
     }
 

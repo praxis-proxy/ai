@@ -81,11 +81,13 @@ impl MessageHistory {
     }
 
     /// Append an owned item.
+    #[cfg(any(test, feature = "store", feature = "openai-agentic-loop"))]
     pub fn push(&mut self, item: Value) {
         self.0.push(Arc::new(item));
     }
 
     /// Append an already shared item without copying its payload.
+    #[cfg(any(feature = "store", feature = "openai-agentic-loop"))]
     pub(crate) fn push_shared(&mut self, item: Arc<Value>) {
         self.0.push(item);
     }

@@ -26,7 +26,7 @@
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
 
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-agentic-loop")]
 pub(crate) mod agentic_loop;
 #[cfg(feature = "openai-responses")]
 mod body_limits;
@@ -46,6 +46,8 @@ pub(crate) mod file_resolve;
 pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_admission;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
@@ -77,7 +79,7 @@ pub(crate) mod tool_parse;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-agentic-loop")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
@@ -158,7 +160,7 @@ pub(crate) fn bound_body_outcome(action: FilterAction) -> Result<BoundUpstreamBo
 const AGENTIC_STREAM_GUARD_KEY: &str = "responses.agentic_stream_guard";
 
 /// Arm the agentic streaming safety check for the current IRR round.
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
     ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
 }
@@ -680,7 +682,7 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 // -----------------------------------------------------------------------------
 
 /// Only a successfully terminated stream may authorize external side effects.
-#[cfg(feature = "openai-responses")]
+#[cfg(all(feature = "openai-responses", any(test, feature = "openai-agentic-loop")))]
 pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
     state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
         || (ctx.get_metadata("responses.stream_completion") == Some("terminal")

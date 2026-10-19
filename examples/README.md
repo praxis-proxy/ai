@@ -10,6 +10,9 @@ cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
 curl http://localhost:8080/
 ```
 
+The command explicitly enables experimental Responses and agentic loops. They
+are absent from default builds; see [Cargo features](../docs/features.md#cargo-features).
+
 Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.
@@ -139,9 +142,11 @@ for how these are authored and regenerated.
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Runs the complete Responses API pipeline through an agentic iterative_request_router that executes hosted file_search, web_search, and MCP tool calls in a model-tool-model loop, persisting both buffered and streaming (`stream: true`) responses |
 | [http-passthrough.yaml](configs/openai/responses/http-passthrough.yaml) | The strict-HTTP acceptance test for pinned Codex CLI for GitHub issue #870 drives the proxy over `POST /v1/responses` and any other Responses API paths the client may probe |
 | [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
+| [mcp-approval-floor.yaml](configs/openai/responses/mcp-approval-floor.yaml) | Demonstrates the openai_mcp_dispatch operator approval floor on a complete persisted agentic Responses pipeline |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-outbound-chain.yaml](configs/openai/responses/mcp-outbound-chain.yaml) | Demonstrates binding an operator `outbound_chain` onto the outbound MCP callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery request) |
 | [mcp-streaming.yaml](configs/openai/responses/mcp-streaming.yaml) | Demonstrates MCP tool calls over the filtered-subrequest transport with SSE streaming support |
+| [mcp-tool-admission.yaml](configs/openai/responses/mcp-tool-admission.yaml) | Demonstrates operator-owned metadata admission and read-only enforcement for the `openai_mcp_tool_resolve` filter (issue #1724) |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API and Chat Completions request bodies before forwarding to the inference backend |
 | [rehydrate-fixture.yaml](configs/openai/responses/rehydrate-fixture.yaml) | Minimal native OpenAI Responses pipeline that stores a first turn, rehydrates a stored `previous_response_id` into the outbound `input` history, and proxies to a native /v1/responses backend |

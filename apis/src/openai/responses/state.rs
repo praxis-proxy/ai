@@ -17,13 +17,16 @@ use std::{
     time::Duration,
 };
 
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 use bytes::Bytes;
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{
-    bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response,
-    history::MessageHistory,
-};
+use super::history::MessageHistory;
+#[cfg(feature = "openai-mcp-tools")]
+use super::mcp_classify::ApprovalFloor;
+#[cfg(any(test, feature = "openai-agentic-loop"))]
+use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -62,6 +65,7 @@ pub(crate) enum SynthesisKind {
     /// Translated from a private `function_call` this round; opening must be synthesized.
     Private,
     /// Native hybrid `file_search_call`; opening already streamed.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     Native,
 }
 
@@ -294,6 +298,10 @@ fn is_pending_file_search_call(item: &serde_json::Value) -> bool {
 
 /// Lifecycle state for MCP batches that must return after local execution.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(any(
+    feature = "openai-agentic-loop",
+    all(test, feature = "openai-mcp-tools", feature = "store-sqlite")
+))]
 pub(crate) enum McpApprovalState {
     /// No deferred local response exists.
     #[default]
@@ -376,7 +384,7 @@ pub(crate) struct ResponsesState {
     /// frame, so the store persists synchronously BEFORE releasing the chunk
     /// (failing closed on error) and then skips the redundant end-of-stream
     /// persist. A request-phase local completion uses the separate
-    /// [`Self::local_stream_terminal_emitted`] flag because IRR can deliver its
+    /// `local_stream_terminal_emitted` flag because IRR can deliver its
     /// terminal body as a non-end-of-stream chunk too.
     ///
     /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
@@ -385,6 +393,7 @@ pub(crate) struct ResponsesState {
     /// A request-phase dispatcher encoded a local `response.completed` frame.
     /// IRR can deliver this as a non-EOS chunk, so outer persistence filters
     /// must commit the canonical response before releasing that chunk.
+    #[cfg(any(test, feature = "store", feature = "openai-agentic-loop"))]
     pub local_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
@@ -436,6 +445,29 @@ pub(crate) struct ResponsesState {
     #[cfg(feature = "openai-mcp-tools")]
     pub mcp_connector_context_policy: McpConnectorContextPolicy,
 
+    /// Operator metadata-admission decisions for this request (#1724).
+    ///
+    /// Stamped afresh by `openai_mcp_tool_resolve` from operator configuration
+    /// (policy + connector trust), extended through deferred discovery, and
+    /// re-enforced at dispatch. Verdicts are typed and operator-owned; client
+    /// fields, cached definitions, and restored history never supply admission
+    /// authority. Defaults to advisory (empty, no enforcement).
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_admission: super::mcp_admission::McpAdmissionDecisions,
+
+    /// Operator approval floor published by `openai_mcp_dispatch` during the
+    /// request phase for the `openai_agentic_loop` owner to apply when it
+    /// partitions approvals in the response phase of the same IRR iteration.
+    ///
+    /// Carried as typed request state (not step metadata) because the floor is a
+    /// security control that must never be silently dropped: `set_metadata` caps
+    /// at a fixed number of entries and drops a new key once full, so a saturated
+    /// metadata map could silently disable the floor and let a client
+    /// `require_approval: "never"` call execute automatically. A struct field has
+    /// no such ceiling and fails closed by construction.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_operator_approval_floor: ApprovalFloor,
+
     /// Maximum number of built-in tool invocations.
     ///
     /// Enforced by built-in tool filters across retained output.
@@ -467,6 +499,10 @@ pub(crate) struct ResponsesState {
     pub client_tool_echo: Option<ClientToolEcho>,
 
     /// Lifecycle state for an MCP batch that must return after execution.
+    #[cfg(any(
+        feature = "openai-agentic-loop",
+        all(test, feature = "openai-mcp-tools", feature = "store-sqlite")
+    ))]
     pub mcp_approval_state: McpApprovalState,
 
     /// Whether a local dispatcher exhausted the response-wide tool budget.
@@ -642,6 +678,7 @@ pub(crate) struct ResponsesState {
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// `openai_mcp_dispatch` consumes these to load deferred connector
     /// tools before the next inference round.
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     pub tool_search_calls: Vec<serde_json::Value>,
 
     /// Web search calls from the current inference response only.
@@ -902,6 +939,14 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Per-server timeout for the deferred `tools/list` call.
     pub timeout: Duration,
+
+    /// Operator trust stamped from connector configuration at resolve time.
+    ///
+    /// Deferred discovery runs inside `openai_mcp_dispatch`, which has no access
+    /// to the resolver's connector configuration, so the trust is carried here —
+    /// operator-owned and never derived from server, cached, or client data.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub trust: super::mcp_admission::ConnectorTrust,
 }
 
 /// Request-scoped slot policy bound to configured MCP connector state.
@@ -1013,6 +1058,7 @@ impl Default for ResponsesState {
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
             logical_stream_terminal_emitted: false,
+            #[cfg(any(test, feature = "store", feature = "openai-agentic-loop"))]
             local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
@@ -1021,7 +1067,15 @@ impl Default for ResponsesState {
             deferred_mcp: Vec::new(),
             #[cfg(feature = "openai-mcp-tools")]
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_admission: super::mcp_admission::McpAdmissionDecisions::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_operator_approval_floor: ApprovalFloor::None,
             max_tool_calls: None,
+            #[cfg(any(
+                feature = "openai-agentic-loop",
+                all(test, feature = "openai-mcp-tools", feature = "store-sqlite")
+            ))]
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
@@ -1050,6 +1104,7 @@ impl Default for ResponsesState {
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
             tool_search_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,
@@ -1157,6 +1212,7 @@ impl ResponsesState {
     /// `(accumulated_output index, persisted_messages index)` provenance in
     /// lockstep so storage assembly can drop the later wholesale append of the
     /// same item without guessing by value.
+    #[cfg(feature = "openai-agentic-loop")]
     pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: serde_json::Value) {
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
@@ -1167,6 +1223,7 @@ impl ResponsesState {
     /// `(accumulated_output index, persisted_messages index)` provenance while
     /// sharing a single allocation with the replay projection instead of cloning
     /// the item into durable history.
+    #[cfg(feature = "openai-agentic-loop")]
     pub(crate) fn persist_collected_output_shared(
         &mut self,
         accumulated_index: usize,
@@ -1180,6 +1237,7 @@ impl ResponsesState {
     /// Record one agentic round's boundaries after a collector finished it, before
     /// dispatch appends any tool result. `persisted_start`/`output_start` are the
     /// lengths captured when the round began collecting.
+    #[cfg(feature = "openai-agentic-loop")]
     pub(crate) fn record_collected_round(&mut self, output_start: usize, persisted_start: usize) {
         self.collected_rounds.push(CollectedRound {
             output_start,
@@ -1282,6 +1340,7 @@ impl ResponsesState {
     /// Returns a [`FilterAction::Reject`] carrying an HTTP 502 error envelope on
     /// citation-annotation failure, JSON size overflow, or serialization
     /// failure, closing the prior fail-open serialization gap.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
         if !self.response_object.is_object() {
             return Ok(());
@@ -1330,6 +1389,7 @@ impl ResponsesState {
 
 /// Build the HTTP 502 rejection returned by [`ResponsesState::finalize_response_body`]
 /// when the terminal response cannot be annotated, size-bounded, or serialized.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn finalize_rejection(message: &str) -> FilterAction {
     FilterAction::Reject(responses_error_rejection(502, "server_error", message))
 }
@@ -1359,6 +1419,7 @@ pub(crate) fn current_round_tool_call_admissions(
     clippy::too_many_lines,
     reason = "ordered cross-dispatch admission is clearer as one linear model-output scan"
 )]
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn current_round_file_search_admissions(
     state: &ResponsesState,
     assignments: &[FileSearchAssignment],
@@ -1438,6 +1499,7 @@ fn current_round_tool_call_admissions_by<'a>(
 /// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
 /// When the current round's output is not yet replayable, remaining prior-round
 /// budget is the admission signal.
+#[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
     let Some(max) = state.max_tool_calls else {
         return true;

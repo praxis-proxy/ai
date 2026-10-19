@@ -200,7 +200,7 @@ def capture(args):
         "gateway": {"checkout_sha": command("git", "rev-parse", "HEAD"),
                     "binary": "target/debug/praxis-ai",
                     "binary_sha256": file_hash("target/debug/praxis-ai"),
-                    "build_profile": "cargo build -p praxis-ai-proxy --features full (debug)",
+                    "build_profile": "cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres (debug)",
                     "praxis_version": locked_version("praxis-proxy"),
                     "praxis_filter_version": locked_version("praxis-proxy-filter")},
         "backend": {"mode": "real-vllm-gpu", "version": command(runtime, "exec", "vllm", "python", "-c", "import vllm; print(vllm.__version__)"),

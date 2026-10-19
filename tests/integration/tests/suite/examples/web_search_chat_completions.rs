@@ -158,7 +158,10 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
     assert_eq!(response["output"][0]["type"], "web_search_call");
     assert_eq!(response["output"][0]["id"], "call_search_1");
     assert_eq!(response["output"][0]["status"], "completed");
-    assert_eq!(response["output"][0]["action"]["query"], "Praxis Proxy latest release");
+    assert_eq!(
+        response["output"][0]["action"]["queries"],
+        json!(["Praxis Proxy latest release"])
+    );
     assert_eq!(
         response["output"][0]["action"]["sources"][0]["url"],
         "https://github.com/praxis-proxy/praxis/releases"
@@ -185,7 +188,7 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
     assert_eq!(first_forwarded["tools"][0]["function"]["name"], "web_search");
     assert_eq!(
         first_forwarded["tools"][0]["function"]["parameters"]["required"],
-        json!(["query"])
+        json!(["queries"])
     );
     assert_eq!(
         first_forwarded["tool_choice"],
@@ -201,7 +204,7 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
         .expect("messages should be an array");
     assert!(messages.iter().any(|message| {
         message["tool_calls"][0]["function"]["name"] == "web_search"
-            && message["tool_calls"][0]["function"]["arguments"] == "{\"query\":\"Praxis Proxy latest release\"}"
+            && message["tool_calls"][0]["function"]["arguments"] == "{\"queries\":[\"Praxis Proxy latest release\"]}"
     }));
     assert!(messages.iter().any(|message| {
         message["role"] == "tool"
@@ -382,7 +385,8 @@ fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
     assert!(
         messages.iter().any(|message| {
             message["tool_calls"][0]["function"]["name"] == "web_search"
-                && message["tool_calls"][0]["function"]["arguments"] == "{\"query\":\"Praxis Proxy latest release\"}"
+                && message["tool_calls"][0]["function"]["arguments"]
+                    == "{\"queries\":[\"Praxis Proxy latest release\"]}"
         }),
         "second inference should carry the bridged web_search function_call: {messages:#?}"
     );

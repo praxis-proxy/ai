@@ -125,7 +125,7 @@ fn resolve_listener_pipeline(
     listener: &Listener,
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
-    store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
+    #[cfg(feature = "store")] store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
 ) -> Arc<FilterPipeline> {
     // Mirror the server: fold each chain's inherited `conditions:` into its
     // filters before composition so chain-level gates apply to every filter in
@@ -155,6 +155,7 @@ fn resolve_listener_pipeline(
     praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
+    #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(store_registry));
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
@@ -183,6 +184,7 @@ pub fn build_pipeline(config: &Config) -> FilterPipeline {
         listener,
         &registry,
         &client,
+        #[cfg(feature = "store")]
         praxis_ai_apis::store::ResponseStoreRegistry::new(),
     ))
     .unwrap_or_else(|_| panic!("pipeline Arc should have single owner"))
@@ -241,6 +243,13 @@ impl HarnessStoreReadiness {
     /// Block until every configured store is provisioned, or the deadline
     /// elapses. Polls the shared readiness value to observe the provisioner
     /// without a timing assumption. A no-op when no store is configured.
+    #[cfg_attr(
+        not(feature = "_store-backend"),
+        expect(
+            clippy::unused_self,
+            reason = "the feature-off waiter preserves the same readiness interface"
+        )
+    )]
     fn wait(&self) {
         #[cfg(feature = "_store-backend")]
         if let Some(handle) = &self.handle {
@@ -441,12 +450,9 @@ impl Drop for ProxyGuard {
 /// and the optional admin endpoint.
 ///
 /// [`Server`]: pingora_core::server::Server
-#[cfg_attr(
-    feature = "_store-backend",
-    expect(
-        clippy::too_many_lines,
-        reason = "listener wiring plus store provisioning mirror boot_server"
-    )
+#[expect(
+    clippy::too_many_lines,
+    reason = "listener wiring and optional store provisioning mirror boot_server"
 )]
 fn build_pingora_server(
     config: &Config,
@@ -468,7 +474,7 @@ fn build_pingora_server(
     #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
-    #[cfg(not(feature = "_store-backend"))]
+    #[cfg(all(feature = "store", not(feature = "_store-backend")))]
     let store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> =
         std::collections::HashMap::new();
 
@@ -481,12 +487,14 @@ fn build_pingora_server(
 
     let mut cert_shutdowns = Vec::new();
     for listener in &config.listeners {
+        #[cfg(feature = "store")]
         let store_registry = store_registries.get(&listener.name).cloned().unwrap_or_default();
         let pipeline = Arc::new(ArcSwap::from(resolve_listener_pipeline(
             config,
             listener,
             registry,
             client,
+            #[cfg(feature = "store")]
             store_registry,
         )));
         load_http_handler(&mut server, listener, pipeline, &mut cert_shutdowns).unwrap();

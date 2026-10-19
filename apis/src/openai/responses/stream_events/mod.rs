@@ -2060,6 +2060,7 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 /// the response-body finalizer cannot emit the deferred terminal event. Build
 /// the same canonical terminal representation directly from shared response
 /// state for IRR to append after already-emitted logical stream chunks.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option<Bytes> {
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
@@ -2111,6 +2112,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
 /// `prepare_local_terminal_events`, so the error frame is appended directly rather
 /// than through `encode_local_error` (which would re-drain those events). Marks the
 /// record un-persistable so a later GET cannot serve the private lowered shape.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u8>, error: &SseParseError) -> Bytes {
     let message = error.to_string();
     let sequence_number = ctx.extensions.get_mut::<ResponsesState>().map_or(0, |state| {
@@ -2134,7 +2136,7 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
 /// The dispatch owner (`openai_agentic_loop`) calls this during request-body
 /// EOS when a request-phase dispatcher recorded a
 /// [`DispatchFailure`](crate::openai::responses::state::DispatchFailure) after
-/// the stream was already committed. It mirrors [`encode_local_completion`]: the
+/// the stream was already committed. It mirrors `encode_local_completion`: the
 /// terminal frame is built directly from shared response state so IRR can append
 /// it after the logical stream chunks already emitted this round, rather than
 /// through the response-body finalizer (no upstream response body exists on a
