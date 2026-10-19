@@ -1663,7 +1663,12 @@ jobs:
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
-          exit "${PIPESTATUS[0]}"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-native.log"
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
@@ -1682,7 +1687,12 @@ jobs:
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
-          exit "${PIPESTATUS[0]}"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-translated.log"
 
       - name: Run Codex native-Responses compaction acceptance test (once, no retry)
         id: codex_compaction
@@ -1707,7 +1717,12 @@ jobs:
             "$TEST_BIN" \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
-          exit "${PIPESTATUS[0]}"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-compaction.log"
 
       - name: Capture diagnostics on failure
         if: failure()

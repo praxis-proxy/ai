@@ -441,12 +441,12 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite --no-run
+          cargo test -p praxis-tests-integration --features openai-all --test suite --no-run
           # Fail if feature gates or renamed selectors remove either acceptance case.
-          cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite \
+          cargo test -p praxis-tests-integration --features openai-all --test suite \
             codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --list --exact \
             | grep -Fx "codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http: test"
-          cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite \
+          cargo test -p praxis-tests-integration --features openai-all --test suite \
             codex_http::pinned_codex_uses_responses_http_through_full_flow -- --list --exact \
             | grep -Fx "codex_http::pinned_codex_uses_responses_http_through_full_flow: test"
 
@@ -489,11 +489,15 @@ jobs:
                 CARGO_INCREMENTAL=0 \
                 PATH="$runner_path" \
                 PRAXIS_TEST_CODEX_BIN="$codex_bin" \
-                bash -ceu "
-                  cargo test --offline -p praxis-tests-integration --features openai-all,store-postgres --test suite \
-                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
-                  cargo test --offline -p praxis-tests-integration --features openai-all,store-postgres --test suite \
-                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact
+                bash -ceuo pipefail "
+                  cargo test --offline -p praxis-tests-integration --features openai-all --test suite \
+                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact \
+                    | tee target/codex-http-chat.log
+                  grep -F \"test result: ok. 1 passed; 0 failed; 0 ignored;\" target/codex-http-chat.log
+                  cargo test --offline -p praxis-tests-integration --features openai-all --test suite \
+                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact \
+                    | tee target/codex-http-responses.log
+                  grep -F \"test result: ok. 1 passed; 0 failed; 0 ignored;\" target/codex-http-responses.log
                 "
           ' bash \
             "$runner_uid" \
