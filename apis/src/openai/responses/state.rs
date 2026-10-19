@@ -2829,6 +2829,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "linear resolve-rejection assertions")]
     fn output_assignment_resolves_only_the_unchanged_current_round_item() {
         let item = json!({"id": "fc_1", "type": "function_call", "name": "t", "call_id": "c1"});
         let assignment = OutputAssignment::new(1, &item).expect("assignment from an item carrying an id");

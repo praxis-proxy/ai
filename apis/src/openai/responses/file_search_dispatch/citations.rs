@@ -508,7 +508,10 @@ fn split_marker(candidate: &str) -> Option<(&str, &str)> {
 /// artifacts. `legacy` selects the former path that also collects removal
 /// offset ranges; the optimized path skips them when no annotation remaps.
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "combined-peak fixture stages test-controlled citation text")]
+#[expect(
+    clippy::expect_used,
+    reason = "combined-peak fixture stages test-controlled citation text"
+)]
 pub(super) fn stage_citations_owned(
     text: &str,
     citation_files: &HashMap<String, String>,

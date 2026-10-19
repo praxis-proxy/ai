@@ -490,13 +490,21 @@ pub(super) fn build_context_reused(result: &SearchResult, query: &str) -> String
 /// combined staging-peak fixture. Allocates one owned annotation per chunk and
 /// copies the concatenation into the finished wrapper.
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "combined-peak fixture renders test-controlled results")]
+#[expect(
+    clippy::expect_used,
+    reason = "combined-peak fixture renders test-controlled results"
+)]
 pub(super) fn build_context_deep_copy(result: &SearchResult, query: &str) -> String {
     let mut rendered = String::new();
     for (index, chunk) in result.content.iter().enumerate() {
-        let annotation =
-            render_annotation_bounded(result, &chunk.text, index + 1, ANNOTATION_TEMPLATE, MAX_MODEL_CONTEXT_BYTES)
-                .expect("combined-peak fixture annotation must render");
+        let annotation = render_annotation_bounded(
+            result,
+            &chunk.text,
+            index + 1,
+            ANNOTATION_TEMPLATE,
+            MAX_MODEL_CONTEXT_BYTES,
+        )
+        .expect("combined-peak fixture annotation must render");
         rendered.push_str(&annotation);
     }
     render_template_bounded(

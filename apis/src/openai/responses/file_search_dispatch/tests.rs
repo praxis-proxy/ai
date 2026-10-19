@@ -2788,7 +2788,12 @@ fn measure_combined_staging_peak(
 
     let bodies: Vec<Vec<u8>> = (0..body_count)
         .map(|body_index| {
-            build_search_body(results_per_body, chunks_per_result, chunk_bytes, &format!("{label}{body_index}-"))
+            build_search_body(
+                results_per_body,
+                chunks_per_result,
+                chunk_bytes,
+                &format!("{label}{body_index}-"),
+            )
         })
         .collect();
     // Each body's text references its retained file IDs with a marker, so the
@@ -2797,7 +2802,9 @@ fn measure_combined_staging_peak(
     let texts: Vec<String> = (0..body_count)
         .map(|body_index| {
             (0..RETAIN)
-                .map(|result_index| format!("chunk {result_index} source <|file-{label}{body_index}-{result_index}|>\n"))
+                .map(|result_index| {
+                    format!("chunk {result_index} source <|file-{label}{body_index}-{result_index}|>\n")
+                })
                 .collect::<String>()
         })
         .collect();

@@ -46,13 +46,12 @@ fn committed_stream_overflow_terminates_with_sse_error() {
          \"annotations\":[],\"text\":\"{oversized}\"}}]}}]}}}}\n\n"
     );
 
-    let backend_port = start_streaming_backend(vec![
-        CREATED_EVENT.to_owned(),
-        delta_event,
-        completed_event,
-    ]);
+    let backend_port = start_streaming_backend(vec![CREATED_EVENT.to_owned(), delta_event, completed_event]);
     let proxy = start_example_proxy(backend_port);
-    let raw = read_response_to_end(proxy.addr(), r#"{"model":"gpt-4.1","input":"Reply briefly.","stream":true}"#);
+    let raw = read_response_to_end(
+        proxy.addr(),
+        r#"{"model":"gpt-4.1","input":"Reply briefly.","stream":true}"#,
+    );
     let body = parse_body(&raw);
 
     assert_eq!(

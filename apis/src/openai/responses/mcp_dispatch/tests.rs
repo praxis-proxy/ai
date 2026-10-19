@@ -3692,7 +3692,11 @@ async fn over_budget_approval_is_retryable_then_replay_is_rejected() {
         "a retry under a sufficient budget must resume, not reject"
     );
     let state2 = ctx2.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state2.accumulated_output.len(), 1, "the retry executes the tool exactly once");
+    assert_eq!(
+        state2.accumulated_output.len(),
+        1,
+        "the retry executes the tool exactly once"
+    );
     assert_eq!(state2.accumulated_output[0]["id"], "call_retry");
 
     // Attempt 3: the now-consumed approval cannot be replayed.
