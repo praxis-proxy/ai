@@ -2280,7 +2280,10 @@ mod tests {
             "reads must preserve item bytes, positions, and legacy cache"
         );
         let stranger = StateOwner::from_trusted_parts("other-tenant", "issuer", "subject").unwrap();
-        assert!(store.conversation_history(&stranger, "c").await.unwrap().is_none());
+        assert!(
+            store.conversation_history(&stranger, "c").await.unwrap().is_none(),
+            "a different tenant must not read the conversation history"
+        );
         if !cancel {
             sqlx::query(
                 "UPDATE items SET item_data = ? WHERE conversation_id = 'c' AND item_id = ? \
@@ -2338,10 +2341,14 @@ mod tests {
                 .expect("reader owns the allocated prefix");
             let values = prefix.lock().unwrap();
             assert_eq!(values.len(), 1, "pause after a decoded row, not pool acquisition");
-            assert_eq!(values.first(), Some(expected));
+            assert_eq!(
+                values.first(),
+                Some(expected),
+                "the prefix holds the first ordered item"
+            );
             drop(values);
         }
-        assert_eq!(store.pool.size(), 1);
+        assert_eq!(store.pool.size(), 1, "the memory store pool has exactly one connection");
         assert_eq!(store.pool.num_idle(), 0, "reader holds the only lease");
         if cancel {
             drop(read);
