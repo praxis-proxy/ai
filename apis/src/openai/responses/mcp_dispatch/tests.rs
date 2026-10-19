@@ -1915,7 +1915,7 @@ fn prepare_response_round_rejects_oversized_call_id_before_approval_persistence(
         ..ResponsesState::default()
     };
 
-    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+    let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
 
     assert_eq!(failure.status, 502);
     assert_eq!(failure.code, "server_error");
