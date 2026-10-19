@@ -28,11 +28,16 @@ use praxis_tls::ClientCertMode;
 /// resolution error, body limit conflict, or pipeline ordering violation).
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, and shared services"
+)]
 pub fn resolve_pipelines(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(feature = "store")]
@@ -42,6 +47,7 @@ pub fn resolve_pipelines(
             registry,
             health_registry,
             kv_stores,
+            inflight_registry,
             subrequest_client,
             &HashMap::new(),
         )
@@ -53,6 +59,7 @@ pub fn resolve_pipelines(
             registry,
             health_registry,
             kv_stores,
+            inflight_registry,
             subrequest_client,
             |_| false,
             |_, _| {},
@@ -71,11 +78,16 @@ pub fn resolve_pipelines(
 ///
 /// Returns an error from store wiring validation or pipeline construction.
 #[cfg(feature = "_store-backend")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, and shared services"
+)]
 pub fn validate_pipelines_with_store_wiring(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (store_registries, _service, _reload, _readiness) = crate::store_provision::build_store_wiring(config)?;
@@ -84,6 +96,7 @@ pub fn validate_pipelines_with_store_wiring(
         registry,
         health_registry,
         kv_stores,
+        inflight_registry,
         subrequest_client,
         &store_registries,
     )?;
@@ -109,6 +122,7 @@ pub(crate) fn resolve_pipelines_with_stores(
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     store_registries: &crate::StoreRegistries,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
@@ -117,6 +131,7 @@ pub(crate) fn resolve_pipelines_with_stores(
         registry,
         health_registry,
         kv_stores,
+        inflight_registry,
         subrequest_client,
         |listener| store_registries.contains_key(&listener.name),
         |listener, pipeline| {
@@ -136,13 +151,15 @@ pub(crate) fn resolve_pipelines_with_stores(
 /// Returns an error when pipeline construction fails.
 #[expect(
     clippy::too_many_arguments,
-    reason = "threads config, registries, shared services, and a per-listener hook"
+    clippy::too_many_lines,
+    reason = "threads config, registries, shared services, and a per-listener hook over each listener"
 )]
 fn build_listener_pipelines(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
@@ -184,7 +201,14 @@ fn build_listener_pipelines(
 
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
-        configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
+        configure_pipeline(
+            &mut pipeline,
+            config,
+            health_registry,
+            kv_stores,
+            inflight_registry,
+            subrequest_client,
+        )?;
         attach(listener, &mut pipeline);
 
         validate_provider_boundary(listener, &entries, &chains)?;
@@ -231,11 +255,16 @@ fn store_readiness_gate_entry() -> FilterEntry {
 
 /// Apply body limits, health registry, KV stores, and insecure options to a
 /// pipeline. Store registries are attached by the caller's `attach` hook.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, and shared services"
+)]
 fn configure_pipeline(
     pipeline: &mut FilterPipeline,
     config: &Config,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pipeline.apply_body_limits(
@@ -249,7 +278,7 @@ fn configure_pipeline(
     if !kv_stores.is_empty() {
         pipeline.set_kv_stores(kv_stores.clone());
     }
-    crate::install_pipeline_extensions(pipeline);
+    crate::install_pipeline_extensions(pipeline, inflight_registry);
     pipeline.set_subrequest_client(subrequest_client.clone());
     // Propagate the private-upstream override into the pipeline and its nested
     // callout chains (e.g. `openai_file_resolve`'s and the MCP callouts'
@@ -476,6 +505,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -490,6 +520,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -508,6 +539,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -573,6 +605,7 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .expect("the production build path must succeed");
@@ -628,6 +661,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -671,6 +705,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -711,6 +746,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -780,6 +816,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &client,
         )
         .unwrap();
@@ -818,6 +855,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "router without LB should be a warning, not an error");
@@ -849,6 +887,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "skip_pipeline_validation should allow startup");
@@ -1029,6 +1068,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_err(), "misaligned clusters should fail validation");
@@ -1072,6 +1112,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_err(), "open security filter should fail validation");
@@ -1116,6 +1157,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "allow_open_security_filters should permit open ip_acl");
@@ -1126,7 +1168,15 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let kv = make_kv_registry();
-        let pipelines = resolve_pipelines(&config, &registry, &empty_health_registry(), &kv, &test_client()).unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &kv,
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert!(pipeline.kv_stores().is_some(), "pipeline should have kv_stores set");
     }
@@ -1136,7 +1186,15 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let kv = empty_kv_stores();
-        let pipelines = resolve_pipelines(&config, &registry, &empty_health_registry(), &kv, &test_client()).unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &kv,
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert!(
             pipeline.kv_stores().is_none(),
@@ -1154,6 +1212,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &client,
         )
         .unwrap();
@@ -1176,6 +1235,11 @@ filter_chains:
     /// Empty KV store registry for tests without KV stores.
     fn empty_kv_stores() -> praxis_core::kv::KvStoreRegistry {
         praxis_core::kv::KvStoreRegistry::new()
+    }
+
+    /// Throwaway in-flight registry for tests that don't exercise it.
+    fn empty_inflight_registry() -> praxis_ai_filters::InFlightRegistry {
+        praxis_ai_filters::InFlightRegistry::new()
     }
 
     /// Minimal sub-request client for tests. The connector builds a rustls

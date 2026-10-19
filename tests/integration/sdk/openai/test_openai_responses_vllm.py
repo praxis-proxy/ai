@@ -675,6 +675,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
+                            # Read-only annotation so require_approval read_only
+                            # selectors can classify this tool (issue #1398).
+                            "annotations": {"readOnlyHint": True},
                         },
                         {
                             "name": "get_time",
@@ -757,6 +760,93 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
+    """Deterministic native Responses backend that drives one schema-invalid
+    MCP tool call, then a final message once the gateway rejects it.
+
+    The handler is stateless: it replies based on whether the forwarded input
+    already carries the rejection (a ``function_call_output``), so it needs no
+    request counter and tolerates retries. On the first turn it emits a
+    ``function_call`` to the resolved ``get_weather`` function tool with a
+    type-invalid ``city`` argument; ``openai_mcp_dispatch`` must reject it against
+    the advertised ``inputSchema`` before any outbound ``tools/call``.
+    """
+
+    @staticmethod
+    def _encoded_get_weather(request_body: dict) -> str:
+        """Find the function tool the resolver advertised for ``get_weather``."""
+        for tool in request_body.get("tools") or []:
+            name = tool.get("name", "")
+            if tool.get("type") == "function" and name.endswith("get_weather"):
+                return name
+        return "weather__get_weather"
+
+    @staticmethod
+    def _already_rejected(request_body: dict) -> bool:
+        """True once the loop has fed the rejection back for a second turn."""
+        items = request_body.get("input")
+        if not isinstance(items, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in items
+        )
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body) if body else {}
+
+        if self._already_rejected(request_body):
+            output = [
+                {
+                    "id": "msg_mcp_invalid_final",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "I passed the wrong type; let me correct it.",
+                        }
+                    ],
+                }
+            ]
+        else:
+            output = [
+                {
+                    "id": "fc_mcp_invalid_1",
+                    "type": "function_call",
+                    "call_id": "call_mcp_invalid_1",
+                    "name": self._encoded_get_weather(request_body),
+                    # ``city`` must be a string per the advertised schema; a number
+                    # violates it, so the gateway rejects it before dispatch.
+                    "arguments": json.dumps({"city": 42}),
+                    "status": "completed",
+                }
+            ]
+
+        payload = json.dumps(
+            {
+                "id": f"resp_mcp_invalid_{time.time_ns()}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "status": "completed",
+                "output": output,
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def log_message(self, fmt, *args):
         pass
@@ -1281,6 +1371,7 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
 
     recorded_requests: ClassVar[list[tuple[str, dict[str, Any]]]] = []
     web_search_queries: ClassVar[list[str]] = []
+    web_search_multi_query_call: ClassVar[bool] = False
 
     def log_message(self, fmt, *args):
         pass
@@ -1414,10 +1505,22 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                     else "Praxis marker"
                 ]
             )
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
+            if (
+                tool_name == "web_search"
+                and SimulatorBackendHandler.web_search_multi_query_call
+            ):
+                tool_calls = [
+                    {
+                        "id": f"call_simulator_{tool_name}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"queries": queries}),
+                        },
+                    }
+                ]
+            else:
+                tool_calls = [
                     {
                         "id": (
                             f"call_simulator_{tool_name}_{index}"
@@ -1431,7 +1534,11 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                         },
                     }
                     for index, query in enumerate(queries)
-                ],
+                ]
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
 
@@ -1489,24 +1596,44 @@ def _assert_simulator_auto_tool_round(
             65_536,
         ),
     }[tool_name]
+    if tool_name == "web_search":
+        parameters = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": max_length,
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        }
+    else:
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": max_length,
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
     expected_tools = [
         {
             "type": "function",
             "function": {
                 "name": tool_name,
                 "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": max_length,
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
+                "parameters": parameters,
                 "strict": True,
             },
         }
@@ -6475,6 +6602,136 @@ class TestClientToolCompatChatVLLM:
         assert any(t.type == "custom" for t in second.tools), second.tools
 
 
+@pytest.fixture(scope="session")
+def mcp_invalid_args_backend():
+    """Start the deterministic schema-invalid MCP backend for the session."""
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), McpInvalidArgsBackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_proxy(
+    tmp_path_factory, request, mcp_server, nemo_guardrails_server, mcp_invalid_args_backend
+):
+    """Start the full-flow agentic proxy against the deterministic backend.
+
+    This drives MCP argument validation through the real OpenAI client without a
+    live model: the backend scripts one schema-invalid tool call and a recovery
+    message, so the outcome is deterministic in every lane (issue #1125).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-invalid-args-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        nemo_port=nemo_guardrails_server,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP invalid-args Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_client(mcp_invalid_args_proxy):
+    """Return an OpenAI client pointed at the deterministic MCP proxy."""
+    proxy_port, _ = mcp_invalid_args_proxy
+    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+
+
+@qualification_profile("supporting")
+def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
+    mcp_invalid_args_client, mcp_invalid_args_proxy
+):
+    """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
+
+    The backend emits a ``get_weather`` call whose ``city`` argument is a number,
+    violating the tool's advertised ``inputSchema``. The gateway must reject it
+    with an actionable, value-free tool error, make zero outbound ``tools/call``,
+    and let the loop recover to a model message.
+    """
+    _, mcp_port = mcp_invalid_args_proxy
+    tools = [
+        {
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never",
+        }
+    ]
+    calls_before = MCPHandler.tool_call_count()
+
+    response = mcp_invalid_args_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=tools,
+        store=True,
+        max_output_tokens=512,
+    )
+
+    # Zero outbound tools/call: the violation is caught before dispatch.
+    assert MCPHandler.tool_call_count() == calls_before, (
+        "schema-invalid arguments must not reach the upstream MCP server"
+    )
+
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 1, (
+        "the rejected call should surface exactly one mcp_call; got "
+        f"{[item.type for item in response.output]}"
+    )
+    rejected = mcp_calls[0]
+    # The gateway returns a structured mcp_call error; the SDK exposes it as an
+    # McpToolExecutionError (`.content`). Fall back to str for older SDK lanes.
+    error_text = getattr(rejected.error, "content", None)
+    if error_text is None:
+        error_text = rejected.error if isinstance(rejected.error, str) else str(rejected.error or "")
+    assert "tool call arguments do not match the tool input schema" in error_text, (
+        f"the mcp_call must carry the actionable schema error: {rejected.error!r}"
+    )
+    assert not rejected.output, "a rejected call produces no tool output"
+    # The offending value is masked out of the client-visible result.
+    assert "42" not in error_text, (
+        f"the offending value must not be echoed to the client: {rejected.error!r}"
+    )
+    # The loop re-enters inference and resumes to a model message.
+    assert any(item.type == "message" for item in response.output), (
+        "the loop should resume to a model message after the rejection; got "
+        f"{[item.type for item in response.output]}"
+    )
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
@@ -6548,6 +6805,103 @@ class TestAgenticLoopVLLM:
         # message, so accept either as proof the tool result fed back into the model.
         assert "message" in output_types or "reasoning" in output_types, (
             f"approved response should resume to model output; got: {output_types}"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_gates_over_never_name(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
+
+        ``get_weather`` is annotated read-only. The policy names it in
+        ``never.tool_names`` but also selects it via ``always.read_only=true``.
+        ``always`` precedence must gate the call with an approval request; before
+        the fix the ignored read_only selector left only the never name-match and
+        the tool executed automatically.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {
+                    "always": {"read_only": True},
+                    "never": {"tool_names": ["get_weather"]},
+                },
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "always.read_only must gate the read-only tool even though "
+            "never.tool_names names it; "
+            f"got: {[item.type for item in response.output]}"
+        )
+        assert approval_requests[0].name == "get_weather"
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the gated call must not execute while approval is pending"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_auto_executes(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
+
+        ``get_weather`` is annotated read-only and matched by
+        ``never.read_only=true``, so it executes automatically with no approval
+        request -- proving the discovered readOnlyHint drives the exemption
+        through the OpenAI client.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {"never": {"read_only": True}},
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        output_types = [item.type for item in response.output]
+        assert not any(t == "mcp_approval_request" for t in output_types), (
+            f"never.read_only must auto-execute the read-only tool; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "the read-only tool must execute automatically under never.read_only"
+        )
+        assert "mcp_call" in output_types, (
+            f"auto-executed response should contain the MCP result; got: {output_types}"
         )
 
     @requires_vllm_compat
@@ -7102,6 +7456,70 @@ class TestAgenticLoopVLLM:
         finally:
             BraveSearchHandler.reset()
             SimulatorBackendHandler.web_search_queries = []
+
+    @requires_simulator
+    def test_web_search_multi_query_round_trip_preserves_queries(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            SimulatorBackendHandler.web_search_multi_query_call = True
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search for both questions, then report "
+                    "each result title and URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                include=["web_search_call.action.sources"],
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "completed"
+            assert len(BraveSearchHandler.request_paths) == request_count + 2
+
+            completed_call = web_search_calls[0].model_dump()
+            assert completed_call.get("action", {}).get("queries") == [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            sources = completed_call.get("action", {}).get("sources", [])
+            assert any(
+                source.get("url") == "https://example.com/mock"
+                for source in sources
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "Mock Search Result" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+            SimulatorBackendHandler.web_search_multi_query_call = False
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(

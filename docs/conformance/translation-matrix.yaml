@@ -411,13 +411,14 @@ surfaces:
       hosted-tools:
         status: translated-lossy
         note: >-
-          web_search and file_search are replaced by synthesized private
-          functions taking only a query string. search_context_size,
+          web_search is replaced by a synthesized private function taking a
+          bounded queries array, while file_search is replaced by a synthesized
+          private function taking a single query. search_context_size,
           user_location, vector_store_ids, max_num_results, filters and
           ranking_options are validated but never conveyed to the backend. MCP,
           code_interpreter and computer_use are rejected 400 unless the
           dispatch filters lower them first.
-        evidence: apis/src/openai/translation/chat_completions.rs:1291-1312; apis/src/openai/translation/chat_completions.rs:1355-1364; apis/src/openai/translation/chat_completions.rs:1116-1117; apis/src/openai/responses/responses_to_chat_completions/mod.rs:588-595
+        evidence: apis/src/openai/translation/chat_completions.rs:1294-1320; apis/src/openai/translation/chat_completions.rs:1347-1371; apis/src/openai/translation/chat_completions.rs:1110-1121; apis/src/openai/responses/responses_to_chat_completions/mod.rs:588-595
       structured-output:
         status: translated
         evidence: apis/src/openai/translation/chat_completions.rs:563-585

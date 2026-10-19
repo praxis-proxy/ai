@@ -140,7 +140,8 @@ fn model_to_provider_rejects_unknown_mapped_and_fallback_clusters() {
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
         let client = praxis_test_utils::test_subrequest_client();
         let registry = praxis_ai::build_full_registry(&client);
-        let error = praxis_ai::resolve_pipelines(&config, &registry, &health, &kv_stores, &client)
+        let inflight_registry = praxis_ai::InFlightRegistry::new();
+        let error = praxis_ai::resolve_pipelines(&config, &registry, &health, &kv_stores, &inflight_registry, &client)
             .err()
             .expect("normal pipeline validation must reject unknown mapping targets");
         assert!(

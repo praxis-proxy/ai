@@ -70,19 +70,19 @@
               },
               {
                 "event": "response.output_item.added",
-                "data": "{\"item\":{\"action\":{\"query\":\"Praxis Proxy latest release\",\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"in_progress\",\"type\":\"web_search_call\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "data": "{\"item\":{\"action\":{\"queries\":[\"Praxis Proxy latest release\"],\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"in_progress\",\"type\":\"web_search_call\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.output_item.done",
-                "data": "{\"item\":{\"action\":{\"query\":\"Praxis Proxy latest release\",\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"completed\",\"type\":\"web_search_call\"},\"output_index\":0,\"sequence_number\":3,\"type\":\"response.output_item.done\"}",
+                "data": "{\"item\":{\"action\":{\"queries\":[\"Praxis Proxy latest release\"],\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"completed\",\"type\":\"web_search_call\"},\"output_index\":0,\"sequence_number\":3,\"type\":\"response.output_item.done\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "response.completed",
-                "data": "{\"response\":{\"background\":false,\"completed_at\":0,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"Find the latest Praxis Proxy release.\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-chat-web-search\",\"object\":\"response\",\"output\":[{\"action\":{\"query\":\"Praxis Proxy latest release\",\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"completed\",\"type\":\"web_search_call\"}],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":null,\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"completed\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":{\"type\":\"web_search\"},\"tools\":[{\"search_context_size\":\"high\",\"type\":\"web_search\"}],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":0}},\"sequence_number\":4,\"type\":\"response.completed\"}",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":0,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"Find the latest Praxis Proxy release.\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-chat-web-search\",\"object\":\"response\",\"output\":[{\"action\":{\"queries\":[\"Praxis Proxy latest release\"],\"type\":\"search\"},\"id\":\"call_recorded_0002\",\"status\":\"completed\",\"type\":\"web_search_call\"}],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":null,\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"completed\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":{\"type\":\"web_search\"},\"tools\":[{\"search_context_size\":\"high\",\"type\":\"web_search\"}],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":0}},\"sequence_number\":4,\"type\":\"response.completed\"}",
                 "id": null,
                 "retry": null
               }
@@ -128,14 +128,19 @@
                     "parameters": {
                       "additionalProperties": false,
                       "properties": {
-                        "query": {
-                          "maxLength": 4096,
-                          "minLength": 1,
-                          "type": "string"
+                        "queries": {
+                          "items": {
+                            "maxLength": 4096,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "maxItems": 64,
+                          "minItems": 1,
+                          "type": "array"
                         }
                       },
                       "required": [
-                        "query"
+                        "queries"
                       ],
                       "type": "object"
                     },
@@ -165,13 +170,13 @@
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"query\\\":\"},\"index\":0}]},\"index\":0}],\"created\":0,\"id\":\"chatcmpl_web_search\",\"model\":\"synthetic-chat-web-search\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"queries\\\":[\"},\"index\":0}]},\"index\":0}],\"created\":0,\"id\":\"chatcmpl_web_search\",\"model\":\"synthetic-chat-web-search\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"Praxis Proxy latest release\\\"}\"},\"index\":0}]},\"index\":0}],\"created\":0,\"id\":\"chatcmpl_web_search\",\"model\":\"synthetic-chat-web-search\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"Praxis Proxy latest release\\\"]}\"},\"index\":0}]},\"index\":0}],\"created\":0,\"id\":\"chatcmpl_web_search\",\"model\":\"synthetic-chat-web-search\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },

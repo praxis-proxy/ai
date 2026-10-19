@@ -12,6 +12,8 @@ use crate::AzureAdFilter;
 use crate::GcpAdcFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
+#[cfg(feature = "inflight-tracker-filter")]
+use crate::InFlightTrackerFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
 #[cfg(feature = "token-ceiling-filter")]
@@ -20,9 +22,9 @@ use crate::TokenCeilingFilter;
 use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
-    IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, ModelToProviderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenUsageHeadersFilter,
+    InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
+    ModelToProviderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -65,23 +67,37 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
 
 /// Install the pipeline extensions the registered AI filters rely on.
 ///
-/// With the `store` feature this adds a fresh response store registry, which
+/// With the `inflight-tracker-filter` feature, `inflight_registry` is installed
+/// as a pipeline extension so the `inflight_tracker` filter finds its shared
+/// per-model counter table; it is gated on the same feature that registers the
+/// filter, so a stable build carries neither the filter nor its registry
+/// extension. Unlike the response store registry, which is created fresh per
+/// pipeline build, the caller is expected to pass the *same* `InFlightRegistry`
+/// handle across every (re)build of a server's pipelines: in-flight counts are
+/// a live gauge of requests the old pipeline is still serving, and a registry
+/// recreated on every hot reload would reset to zero while those requests are
+/// still in-flight.
+///
+/// With the `store` feature this also adds a response store registry, which
 /// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
-/// share backends. It is gated on this crate's `store` feature, the same one
-/// that registers those filters, so a pipeline can never carry them without
-/// their registry. Builds without the store have nothing to install.
+/// share backends; that one is gated on the same `store` feature that
+/// registers those filters, so a pipeline can never carry them without their
+/// registry.
 #[cfg_attr(
-    not(feature = "store"),
+    not(any(feature = "inflight-tracker-filter", feature = "store")),
     expect(
+        unused_variables,
         clippy::needless_pass_by_ref_mut,
-        reason = "the pipeline is only mutated when the store feature installs its registry"
+        reason = "a lean build installs no extensions; the signature stays uniform across feature sets"
     )
 )]
-pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline) {
+pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline, inflight_registry: &InFlightRegistry) {
+    #[cfg(feature = "inflight-tracker-filter")]
+    pipeline.add_pipeline_extension(Box::new(inflight_registry.clone()));
+    #[cfg(not(feature = "inflight-tracker-filter"))]
+    let _ = inflight_registry;
     #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    #[cfg(not(feature = "store"))]
-    let _ = pipeline;
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -195,11 +211,21 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "prompt_enrich" => PromptEnrichFilter::from_config
     );
+    register_request_metadata_filters(registry);
+    register_token_filters(registry);
+}
+
+/// Register filters that observe per-request metadata (timing, in-flight load).
+fn register_request_metadata_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
     );
-    register_token_filters(registry);
+    #[cfg(feature = "inflight-tracker-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "inflight_tracker" => InFlightTrackerFilter::from_config
+    );
 }
 
 /// Register request-model extraction and provider-resolution filters.
@@ -877,6 +903,7 @@ provider:
         );
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
         assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
+        assert_experimental_registration(&names, "inflight_tracker", cfg!(feature = "inflight-tracker-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.

@@ -69,6 +69,11 @@ token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
 # from token-rate-limit-filter because static request admission must fail
 # closed independently of quota-backend health.
 token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
+# Experimental: the inflight_tracker filter. Nothing reads InFlightRegistry's
+# counters yet (no scorer, no HTTP surface), and the registry's eventual
+# backing store is still an open question, so the filter itself stays gated
+# until both land. Activates the `experimental` marker.
+inflight-tracker-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []

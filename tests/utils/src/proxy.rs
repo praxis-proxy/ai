@@ -152,7 +152,7 @@ fn resolve_listener_pipeline(
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    praxis_ai::install_pipeline_extensions(&mut pipeline);
+    praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
     pipeline.add_pipeline_extension(Box::new(store_registry));

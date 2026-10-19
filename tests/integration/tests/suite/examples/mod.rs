@@ -41,6 +41,8 @@ mod guardrails;
 mod guardrails_response;
 mod identity_header_guard;
 mod inference_fallback;
+#[cfg(feature = "inflight-tracker-filter")]
+mod inflight_tracking;
 mod intelligent_route_hardening;
 mod intelligent_route_management_skip;
 mod intelligent_route_metrics;

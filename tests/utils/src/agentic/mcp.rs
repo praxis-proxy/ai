@@ -114,16 +114,28 @@ pub struct McpToolFixture {
 
     /// JSON Schema for the tool's input parameters.
     pub input_schema: Value,
+
+    /// When set, advertised as `annotations.readOnlyHint` in `tools/list`
+    /// (`true` = read-only, `false` = writable). `None` omits the annotation so
+    /// the tool defaults to writable, matching the MCP annotation default.
+    pub read_only_hint: Option<bool>,
 }
 
 impl McpToolFixture {
-    /// Create a fixture with the given name, an empty
+    /// Create a fixture with the given name, a permissive
     /// object schema, and no description.
+    ///
+    /// The mock's `tools/call` handler echoes a canned result regardless of the
+    /// arguments, so the advertised schema must accept any object: it declares no
+    /// properties and does not set `additionalProperties: false`. A fixture that
+    /// exercises gateway argument validation sets a stricter schema explicitly
+    /// through [`McpToolFixture::with_input_schema`].
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: None,
-            input_schema: json!({"type": "object", "additionalProperties": false}),
+            input_schema: json!({"type": "object"}),
+            read_only_hint: None,
         }
     }
 
@@ -131,6 +143,13 @@ impl McpToolFixture {
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Advertise `annotations.readOnlyHint` for this tool in `tools/list`.
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only_hint = Some(read_only);
         self
     }
 
@@ -475,6 +494,9 @@ fn handle_tools_list(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
             });
             if let Some(desc) = &t.description {
                 tool["description"] = json!(desc);
+            }
+            if let Some(read_only) = t.read_only_hint {
+                tool["annotations"] = json!({"readOnlyHint": read_only});
             }
             tool
         })

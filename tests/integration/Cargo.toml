@@ -48,6 +48,9 @@ basic-auth-filter = ["praxis-ai-proxy/basic-auth-filter"]
 # token_rate_limit filter registered in the in-process proxy registry.
 token-rate-limit-filter = ["praxis-ai-proxy/token-rate-limit-filter"]
 token-ceiling-filter = ["praxis-ai-proxy/token-ceiling-filter"]
+# Experimental: gates the inflight_tracker example test, which needs the
+# inflight_tracker filter registered in the in-process proxy registry.
+inflight-tracker-filter = ["praxis-ai-proxy/inflight-tracker-filter"]
 llmd-ext-proc = ["praxis-test-utils/llmd-ext-proc"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 praxis-main = ["praxis-test-utils/praxis-main"]

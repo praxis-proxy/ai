@@ -125,6 +125,12 @@ see the [Praxis core filter reference][core-ref].
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 | [`model_to_provider`](model_to_provider.md) | Maps stable client-facing model IDs to existing upstream clusters and provider-specific target models. |
 
+### Inflight
+
+| Filter | Description |
+|--------|-------------|
+| [`inflight_tracker`](inflight_tracker.md) | Tracks live request counts and reserved tokens per model. |
+
 ### Metering
 
 | Filter | Description |
