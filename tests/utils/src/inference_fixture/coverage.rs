@@ -1268,6 +1268,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["openai_responses_to_chat_completions"],
                 vec!["openai_responses_to_chat_completions"],
                 vec!["openai_responses_to_chat_completions"],
@@ -1447,6 +1448,7 @@ mod tests {
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
                 "responses/background-unsupported",
+                "responses/budget-overflow-streaming",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
@@ -1678,6 +1680,10 @@ mod tests {
                 (
                     &"responses.agentic.irr_terminal_streaming".to_owned(),
                     &vec!["responses/irr-terminal-streaming".to_owned()]
+                ),
+                (
+                    &"responses.agentic.committed_stream_budget_overflow".to_owned(),
+                    &vec!["responses/budget-overflow-streaming".to_owned()]
                 ),
                 (
                     &"responses.agentic.deferred_mcp_connectors".to_owned(),

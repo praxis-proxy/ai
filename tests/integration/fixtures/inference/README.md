@@ -60,6 +60,7 @@ The manifest declares **86 features** across **11 scopes**, linked to **66 scena
 | `responses_agentic_loop` | `responses.agentic.parallel_tool_calls` | `synthetic_only` | `responses/agentic-parallel-tool-calls` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.status_less_function_call` | `synthetic_only` | `responses/agentic-status-less-function-call` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.irr_terminal_streaming` | `synthetic_only` | `responses/irr-terminal-streaming` | `synthetic`: `synthetic_only` |
+| `responses_agentic_loop` | `responses.agentic.committed_stream_budget_overflow` | `synthetic_only` | `responses/budget-overflow-streaming` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.deferred_mcp_connectors` | `synthetic_only` | `responses/agentic-deferred-mcp-connectors` | `synthetic`: `synthetic_only` |
 | `openai_responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
 | `openai_responses_to_chat_completions` | `responses.chat.reasoning.request` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |

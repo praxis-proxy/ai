@@ -22,6 +22,8 @@ mod aws_sigv4;
 mod azure_ad;
 mod azure_translation;
 mod bedrock;
+#[cfg(feature = "store-sqlite")]
+mod budget_overflow_streaming;
 #[cfg(feature = "openai-agentic-loop")]
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
