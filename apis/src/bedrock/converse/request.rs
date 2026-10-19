@@ -1806,4 +1806,95 @@ mod tests {
             legacy.bytes_total
         );
     }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers the three remaining text-move callers (system, assistant, tool result) with one scale pair each"
+    )]
+    #[test]
+    fn system_assistant_and_tool_result_text_allocations_do_not_scale_with_payload() {
+        // System/developer text moves into the hoisted `system` parts.
+        let measure_system = |text_bytes: usize| {
+            let text = "x".repeat(text_bytes);
+            let mut parts = Vec::new();
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                append_system_content(&mut parts, Value::String(text), "system").unwrap();
+                moved_len = parts[0]["text"].as_str().unwrap().len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_system(16 * 1024);
+        let (large, large_len) = measure_system(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small system payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large system payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "system text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "system text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
+
+        // Assistant text moves out of the message via `mem::take`.
+        let measure_assistant = |text_bytes: usize| {
+            let mut msg = serde_json::json!({"role": "assistant", "content": "x".repeat(text_bytes)});
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                moved_len = translate_assistant_content(&mut msg).unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_assistant(16 * 1024);
+        let (large, large_len) = measure_assistant(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small assistant payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large assistant payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "assistant text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "assistant text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
+
+        // Tool-result text moves into the `toolResult` content block.
+        let measure_tool_result = |text_bytes: usize| {
+            let mut msg = serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "x".repeat(text_bytes)
+            });
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                moved_len = translate_tool_result(&mut msg).unwrap()["toolResult"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_tool_result(16 * 1024);
+        let (large, large_len) = measure_tool_result(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small tool-result payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large tool-result payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "tool-result text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "tool-result text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
+    }
 }

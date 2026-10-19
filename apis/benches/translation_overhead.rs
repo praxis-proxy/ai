@@ -26,11 +26,16 @@ use serde_json::{Value, json};
 
 /// Bedrock Converse request translator, path-imported from the crate source
 /// because `transform_request` is `pub(crate)` and benchmark targets are
-/// separate crates.
+/// separate crates. The workspace's `praxis-ai-benchmarks` crate is not used
+/// because it only reaches the public API; the path import keeps the private
+/// function benchmarkable without widening visibility, at the cost of
+/// compiling `request.rs` a second time.
 ///
-/// Bench targets compile with `cfg(test)`, so the module's `#[cfg(test)]`
-/// test code is included and its fixtures surface as dead code in a harness
-/// that never calls them.
+/// Cargo compiles `harness = false` bench targets with `--cfg test` (verified
+/// via `cargo bench --no-run -v`), so the module's `#[cfg(test)]` test code is
+/// included and its fixtures surface as dead code in a harness that never
+/// calls them. The `allow` below covers non-cargo compilations, such as
+/// rust-analyzer, where those module-level expectations may not fire.
 #[expect(
     clippy::allow_attributes,
     reason = "an `#[allow]` is required for compilation modes where the module-level expectations do not fire"
@@ -107,6 +112,11 @@ fn report_allocation(label: &str, translation: impl FnOnce()) {
 }
 
 /// Benchmark Bedrock translation for several large tool schemas.
+///
+/// Wall time is measured with `allocation-counter`'s counting global
+/// allocator installed for the whole bench process, which inflates it
+/// relative to a production build. Compare times only within this bench;
+/// the allocation report is the trustworthy cross-build metric.
 fn bedrock_large_tools(c: &mut Criterion) {
     let body = bedrock_large_tool_request();
     // Warm up once outside the measurement so one-time lazy state (the
