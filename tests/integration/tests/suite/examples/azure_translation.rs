@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_proxy,
+    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_header, parse_status,
+    start_proxy,
 };
 
 use super::load_example_config;
@@ -167,6 +168,38 @@ fn azure_translation_normalizes_error_with_null_type() {
     assert!(
         response["error"].get("innererror").is_none(),
         "innererror should be stripped from normalized errors"
+    );
+}
+
+#[test]
+fn azure_translation_normalizes_error_status_with_event_stream_content_type() {
+    let azure_error = serde_json::json!({
+        "error": {
+            "message": "The API deployment for this resource does not exist.",
+            "type": null,
+            "code": "DeploymentNotFound"
+        }
+    });
+    let backend = Backend::status(404, &azure_error.to_string())
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy = azure_proxy(backend.port());
+
+    let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+    let body_str = parse_body(&raw);
+
+    assert_eq!(parse_status(&raw), 404);
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "normalized error should use a JSON content type"
+    );
+    let response: serde_json::Value =
+        serde_json::from_str(&body_str).unwrap_or_else(|e| panic!("error should be JSON: {e}\nbody: {body_str}"));
+    assert_eq!(
+        response["error"]["type"], "invalid_request_error",
+        "error status should take precedence over the event-stream content type"
     );
 }
 

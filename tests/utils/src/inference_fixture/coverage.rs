@@ -1292,6 +1292,7 @@ mod tests {
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["openai_chat_completions_to_azureai_chat_completions"],
+                vec!["openai_chat_completions_to_azureai_chat_completions"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["messages_to_chat_completions"],
@@ -1394,15 +1395,17 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 78, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 64, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 69, "manifest recording inventory count");
+        assert_eq!(report.features_total, 79, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 65, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 70, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
                 "azure/annotation-stream",
+                "azure/error-status-event-stream",
                 "bedrock/basic-nonstream",
                 "messages/basic-nonstream",
                 "messages/basic-stream",
@@ -1468,7 +1471,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 78, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 79, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1773,6 +1776,10 @@ mod tests {
                 (
                     &"azure.chat.response.annotation_stream".to_owned(),
                     &vec!["azure/annotation-stream".to_owned()]
+                ),
+                (
+                    &"azure.chat.response.error_status_event_stream".to_owned(),
+                    &vec!["azure/error-status-event-stream".to_owned()]
                 ),
                 (
                     &"vertex.gemini.request.invalid_content".to_owned(),

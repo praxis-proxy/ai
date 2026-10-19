@@ -610,6 +610,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: azure.chat.response.error_status_event_stream
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/error-status-event-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: vertex.gemini.request.invalid_content
     scopes:
       - openai_chat_completions_to_vertexai_gemini
