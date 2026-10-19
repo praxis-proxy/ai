@@ -1568,7 +1568,7 @@ jobs:
       - name: Build Praxis and Codex acceptance test
         run: |
           cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
-          cargo test -p praxis-tests-integration --test suite --no-run
+          cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite --no-run
 
       - name: Create restricted Codex network namespace
         id: codex_namespace
@@ -1627,13 +1627,23 @@ jobs:
         id: codex_test_binary
         run: |
           set -uo pipefail
-          TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite --no-run \
               --message-format=json 2>/dev/null \
             | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
           if [ -z "$TEST_BIN" ]; then
             echo "::error::could not locate the compiled suite test binary"
             exit 1
           fi
+          # An exact libtest selector otherwise succeeds when no test is compiled.
+          for test_name in \
+            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
+            if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
+              echo "::error::missing Codex acceptance test: $test_name"
+              exit 1
+            fi
+          done
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
