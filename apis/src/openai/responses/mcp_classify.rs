@@ -455,13 +455,13 @@ mod tests {
 
     #[test]
     fn operator_floor_keeps_approval_for_always_client() {
-        // Monotonic: a client that already requires approval is unaffected.
         let map = tool_map_with_policy("srv", "search", json!("always"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "srv__search", "call_id": "c1"});
         assert_eq!(
             classify_mcp(&call, &index, ApprovalFloor::Always),
-            McpDisposition::ApprovalRequired
+            McpDisposition::ApprovalRequired,
+            "the floor must not weaken a client policy that already requires approval"
         );
     }
 
@@ -484,22 +484,28 @@ mod tests {
 
     #[test]
     fn operator_floor_does_not_change_non_mcp_calls() {
-        // The floor only promotes Automatic → ApprovalRequired for resolved MCP
-        // calls; a non-MCP call stays NotMcp regardless of the floor.
         let map = tool_map_with_policy("srv", "search", json!("never"));
         let index = McpToolIndex::new(&map);
         let call = json!({"type": "function_call", "name": "client_only_fn", "call_id": "c1"});
         assert_eq!(
             classify_mcp(&call, &index, ApprovalFloor::Always),
-            McpDisposition::NotMcp
+            McpDisposition::NotMcp,
+            "the floor must not reclassify a non-MCP call"
         );
     }
 
     #[test]
     fn approval_floor_forces_approval_predicate() {
-        assert!(!ApprovalFloor::None.forces_approval());
-        assert!(ApprovalFloor::Always.forces_approval());
-        assert_eq!(ApprovalFloor::default(), ApprovalFloor::None);
+        assert!(
+            !ApprovalFloor::None.forces_approval(),
+            "no floor must not force approval"
+        );
+        assert!(ApprovalFloor::Always.forces_approval(), "Always must force approval");
+        assert_eq!(
+            ApprovalFloor::default(),
+            ApprovalFloor::None,
+            "the floor must default to unset"
+        );
     }
 
     // -------------------------------------------------------------------------

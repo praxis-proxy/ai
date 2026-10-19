@@ -277,4 +277,15 @@ fn non_mcp_request_is_undisturbed_by_the_floor() {
         response["output"][0]["content"][0]["text"], "The weather in SF is 72F and sunny.",
         "a request with no MCP tools must reach the model and return its message unchanged: {response:#?}"
     );
+    let requests = model.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a non-MCP request must make exactly one inference call"
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(&requests[0].body).expect("forwarded body should be JSON");
+    assert!(
+        forwarded.to_string().contains("Hello, world!"),
+        "the floored pipeline must forward the client input unchanged: {forwarded}"
+    );
 }

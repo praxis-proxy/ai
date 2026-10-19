@@ -82,7 +82,10 @@ pub(crate) struct McpDispatchConfig {
     /// `approval_required = operator_floor || client_requires_approval`. Set
     /// `always` to require approval for every MCP call regardless of the client's
     /// request — a client `"never"` or a server-supplied `readOnlyHint` can never
-    /// suppress it. Omit to preserve the client-driven behavior (the default).
+    /// suppress it. Pending approvals are correlated through `previous_response_id`,
+    /// so the pipeline needs `openai_responses_store` and `openai_responses_rehydrate`;
+    /// without persistence the request fails closed (`store: false` → 400, no store → 500).
+    /// Omit to preserve the client-driven behavior (the default).
     #[serde(default)]
     pub minimum_approval: Option<MinimumApproval>,
 
