@@ -38,6 +38,9 @@ pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
 
+/// Request metadata carrying the client model ID across a provider target rewrite.
+pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
+
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
@@ -117,6 +120,7 @@ pub(crate) mod test_utils {
             cluster: None,
             current_filter_id: None,
             downstream_tls: false,
+            hedge_policy: None,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
             executed_branch_filters: Vec::new(),

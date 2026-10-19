@@ -677,14 +677,14 @@ mod tests {
             assert_eq!(mapped["tools"][0]["function"]["name"], "web_search");
             assert_eq!(
                 mapped["tools"][0]["function"]["parameters"]["required"],
-                json!(["query"])
+                json!(["queries"])
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["minLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["minLength"],
                 1
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["maxLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["maxLength"],
                 4096
             );
             assert_eq!(
@@ -1544,7 +1544,7 @@ mod tests {
                 "id": "call_search_1",
                 "type": "web_search_call",
                 "status": "completed",
-                "action": {"type": "search", "query": "Praxis Proxy"}
+                "action": {"type": "search", "queries": ["Praxis Proxy"]}
             })
         );
         assert_eq!(mapped["tools"], request["tools"]);
@@ -1557,11 +1557,20 @@ mod tests {
             super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
 
         let oversized = serde_json::to_string(&json!({"query": "x".repeat(4097)})).unwrap();
+        let oversized_queries = serde_json::to_string(&json!({"queries": ["x".repeat(4097)]})).unwrap();
+        let too_many_queries = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 65]})).unwrap();
+        let both_query_shapes = serde_json::to_string(&json!({"query": "ok", "queries": ["ok"]})).unwrap();
         let cases = [
             "{}",
             "{\"query\":\"\"}",
             "{\"query\":42}",
             "{\"query\":\"ok\",\"extra\":true}",
+            "{\"queries\":[]}",
+            "{\"queries\":[\"\"]}",
+            "{\"queries\":[42]}",
+            both_query_shapes.as_str(),
+            too_many_queries.as_str(),
+            oversized_queries.as_str(),
             "not json",
             oversized.as_str(),
         ];
@@ -1584,6 +1593,31 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn private_web_search_call_accepts_the_maximum_query_count() {
+        let arguments = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 64]})).unwrap();
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "call_ws",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": arguments}
+                }]}
+            }]
+        });
+        let request = json!({"model": "m", "tools": [{"type": "web_search"}]});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(
+            mapped["output"][0]["action"],
+            json!({"type": "search", "queries": vec!["q".to_owned(); 64]})
+        );
     }
 
     #[test]

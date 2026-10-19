@@ -36,6 +36,7 @@ use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     callout_target::AddressPolicy,
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
@@ -125,6 +126,12 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// headers. A higher tier always wins, so forged client headers can
 /// never override verified claims, and identity headers plus client
 /// credentials are always stripped before the request is forwarded.
+///
+/// When no `{prefix}model` identity header names the model and
+/// `model_to_provider` mapped the request, balance checks and usage events use
+/// the client-facing model ID it recorded rather than the provider target.
+/// That filter buffers the request body, so its body pass completes before
+/// this filter's request hook runs the balance check.
 ///
 /// # YAML
 ///
@@ -248,22 +255,22 @@ impl ExternalMeteringFilter {
     /// as a denial.
     async fn check_balance(&self, state: &MeteringState) -> FilterAction {
         let url = build_balance_url(&self.metering_url, &state.username, &self.feature_key, &state.model);
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: http::Uri::default(),
-            headers: http::HeaderMap::new(),
-            body: Bytes::new(),
-        };
 
-        let result = subrequest::execute_configured_url(
-            &self.subrequest_client,
-            &url,
-            request,
-            MAX_CALLOUT_RESPONSE_BYTES,
-            self.timeout,
-            self.address_policy,
-        )
-        .await;
+        // The metering service URL is operator-configured, so it resolves
+        // through the shared DNS cache.
+        let result = self
+            .subrequest_client
+            .execute_url(
+                &url,
+                balance_probe_request(),
+                subrequest::address_policy_hook(self.address_policy),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                self.timeout,
+                MAX_CALLOUT_RESPONSE_BYTES,
+                None,
+            )
+            .await
+            .map_err(subrequest::map_url_error);
 
         match result {
             Ok(resp) if is_success(resp.status) => parse_balance_result(&resp.body, self.fail_open),
@@ -293,6 +300,9 @@ impl ExternalMeteringFilter {
     fn resolve_report_model(&self, ctx: &HttpFilterContext<'_>, state: &MeteringState) -> String {
         if !state.model.is_empty() {
             return state.model.clone();
+        }
+        if let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA) {
+            return model.to_owned();
         }
         if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
             return model.clone();
@@ -346,6 +356,11 @@ impl HttpFilter for ExternalMeteringFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
+        if state.model.is_empty()
+            && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        {
+            state.model = model.to_owned();
+        }
 
         if state.username.is_empty() {
             let Some(fallback) = self.default_username.as_ref() else {
@@ -796,16 +811,21 @@ fn spawn_usage_report(
             body: Bytes::from(body),
         };
 
+        // The metering service URL is operator-configured, so it resolves
+        // through the shared DNS cache.
         report_delivery(
-            subrequest::execute_configured_url(
-                &client,
-                &url,
-                request,
-                MAX_CALLOUT_RESPONSE_BYTES,
-                timeout,
-                address_policy,
-            )
-            .await,
+            client
+                .execute_url(
+                    &url,
+                    request,
+                    subrequest::address_policy_hook(address_policy),
+                    subrequest::UrlResolutionPolicy::OperatorCached,
+                    timeout,
+                    MAX_CALLOUT_RESPONSE_BYTES,
+                    None,
+                )
+                .await
+                .map_err(subrequest::map_url_error),
         );
     });
 }
@@ -838,6 +858,16 @@ fn is_success(status: u16) -> bool {
 // -----------------------------------------------------------------------------
 // URL Construction
 // -----------------------------------------------------------------------------
+
+/// A bodiless GET sub-request for the entitlement balance probe.
+fn balance_probe_request() -> SubRequest {
+    SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers: http::HeaderMap::new(),
+        body: Bytes::new(),
+    }
+}
 
 /// Build the entitlement balance check URL for a tenant and model.
 fn build_balance_url(base_url: &str, customer_id: &str, feature_key: &str, model: &str) -> String {

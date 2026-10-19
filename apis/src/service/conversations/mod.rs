@@ -106,10 +106,47 @@ fn normalize_item(item: Value, generate_item_id: &mut impl FnMut() -> String) ->
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
+    strip_known_nullable_nulls(&mut map);
+    normalize_legacy_mcp_error(&mut map);
     default_item_status(&mut map);
+    if matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("tool_search_call" | "tool_search_output")
+    ) && !map.contains_key("call_id")
+    {
+        // Tool-search input permits omission, but the resource requires a nullable call_id.
+        map.insert("call_id".to_owned(), Value::Null);
+    }
     let item = Value::Object(map);
     validate_output_item(&item).map_err(StoreError::InvalidInput)?;
     Ok((item_id, item))
+}
+
+/// Input permits null optional fields, but output permits only absent or string values.
+fn strip_known_nullable_nulls(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) == Some("function_call_output") {
+        for key in ["call_id", "name", "namespace"] {
+            if map.get(key).is_some_and(Value::is_null) {
+                map.remove(key);
+            }
+        }
+    }
+}
+
+/// Historical records predate the tagged MCP error contract. Move legacy
+/// string content into that shape before validation so append-back output and
+/// response projection agree on the current schema.
+pub(crate) fn normalize_legacy_mcp_error(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) != Some("mcp_call") {
+        return;
+    }
+    let Some(error) = map.get_mut("error").filter(|error| error.is_string()) else {
+        return;
+    };
+    let mut tagged = Map::new();
+    tagged.insert("type".to_owned(), Value::String("mcp_tool_execution_error".to_owned()));
+    tagged.insert("content".to_owned(), std::mem::take(error));
+    map.insert("error".to_owned(), Value::Object(tagged));
 }
 
 /// Default a missing or `null` item `status` to `completed`.

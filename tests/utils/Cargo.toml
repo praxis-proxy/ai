@@ -9,13 +9,15 @@ publish = false
 
 [features]
 # Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
-# default is `full` so a plain `cargo test -p <crate>` exercises every filter.
+# default is `full`; experimental filter suites require explicit opt-in.
 default = ["full"]
 standard = ["praxis-ai-proxy/standard"]
 # The signing filter alone, so the FIPS suites can enable exactly the
 # feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
 aws-sigv4-filter = ["praxis-ai-proxy/aws-sigv4-filter"]
-openai-responses = ["praxis-ai-proxy/openai-responses"]
+openai-responses = ["experimental", "praxis-ai-proxy/openai-responses"]
+# Experimental ephemeral agent orchestration; separate from Responses support.
+openai-agentic-loop = ["openai-responses", "experimental", "praxis-ai-proxy/openai-agentic-loop"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-proxy/store", "praxis-ai-apis/store"]
 _store-backend = []
@@ -26,14 +28,17 @@ store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-proxy/openai-conversations"]
 openai-compact = ["store", "praxis-ai-proxy/openai-compact"]
 openai-mcp-tools = ["store", "praxis-ai-proxy/openai-mcp-tools"]
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
-full = ["standard", "openai-all", "store-postgres"]
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["standard"]
+# Passive marker; experimental capabilities remain individually selected.
+experimental = ["praxis-ai-proxy/experimental"]
 llmd-ext-proc = [
     "praxis-ai-proxy/llmd-ext-proc",
     "dep:praxis-ai-llmd-ext-proc",
     "dep:tokio-stream",
     "dep:tonic",
 ]
+vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]
@@ -43,7 +48,7 @@ workspace = true
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 praxis = { workspace = true }
-praxis-ai-apis = { workspace = true, features = ["store"] }
+praxis-ai-apis = { workspace = true }
 praxis-ai-proxy = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
@@ -81,6 +86,9 @@ tokio-tungstenite = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+metrics = { workspace = true }
 
 # The tenant proxy serves the Conversations API, so it needs that filter group.
 [[example]]

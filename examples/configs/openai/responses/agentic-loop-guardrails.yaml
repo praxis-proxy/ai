@@ -1,4 +1,5 @@
 # Responses Agentic Loop with NeMo Tool-Result Guardrails
+# Requires `--features openai-agentic-loop,openai-mcp-tools` (experimental and off by default).
 #
 # Screens each newly produced local tool result before it can enter the next
 # inference request. The guardrail belongs inside the IRR step, after every
@@ -29,10 +30,7 @@ filter_chains:
       - filter: ai_operation
 
       # Pure fact publisher: classifies the body and promotes format/model/stream
-      # for the guardrail and agentic filters downstream. No managed owner
-      # (initialize_state: true) runs in this focused example, so the parse it
-      # caches is never reused — it is a request-scoped entry released, unused,
-      # when the request ends.
+      # for the guardrail and agentic filters downstream.
       - filter: openai_responses_request
         initialize_state: false
         on_invalid: reject
@@ -40,6 +38,19 @@ filter_chains:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
+
+      # Managed owner: validates parameters, generates response IDs, and mints
+      # the request-scoped ResponsesState that carries the agentic
+      # retained-payload budget. openai_agentic_loop installs that budget policy,
+      # so a managed owner must run here to attach the budget before MCP
+      # discovery and the loop; without it those filters fail closed.
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: openai_tool_parse
 

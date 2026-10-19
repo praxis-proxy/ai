@@ -55,9 +55,6 @@ jobs:
           ' || { echo "::error::missing legal files in runtime image"; exit 1; }
           echo "License label and legal files verified"
 
-      - name: Verify SQLite persistence in the runtime image
-        run: .github/scripts/container-sqlite-smoke.sh praxis-ai:ci
-
       - name: Run container
         run: docker run -d --name praxis-ai praxis-ai:ci
 
@@ -80,3 +77,22 @@ jobs:
       - name: Stop container
         if: always()
         run: docker rm -f praxis-ai
+
+  # Responses and SQLite are explicit opt-ins in the runtime image.
+  build-and-run-sqlite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build container image with Responses and SQLite
+        run: >-
+          docker build -t praxis-ai:ci-sqlite -f Containerfile
+          --build-arg PRAXIS_AI_FEATURES=full,openai-responses,store-sqlite .
+
+      - name: Verify SQLite persistence in the runtime image
+        run: .github/scripts/container-sqlite-smoke.sh praxis-ai:ci-sqlite

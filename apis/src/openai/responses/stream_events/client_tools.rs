@@ -324,13 +324,15 @@ fn plan_added_disposition(lowered: &LoweredClientTool, payload: &Value) -> Clien
 /// ownership boundary) and re-types its nested item: `type` becomes
 /// `custom_tool_call`, `name` becomes the client's original member name (never the
 /// private lowered name), `namespace` is re-added for `NamespaceCustom`, and the
-/// `fc_` id is rewritten to its public `ctc_` form. The freeform `input` is absent
-/// at add time — it arrives via the synthesized `custom_tool_call_input` events.
+/// `fc_` id is rewritten to its public `ctc_` form, and the required `input` starts
+/// as an empty string — its value arrives via the synthesized
+/// `custom_tool_call_input` events.
 fn build_custom_added_payload(payload: &Value, lowered: &LoweredClientTool) -> Value {
     let mut out = payload.clone();
     if let Some(item) = out.get_mut("item").and_then(Value::as_object_mut) {
         item.insert("type".to_owned(), Value::String("custom_tool_call".to_owned()));
         item.insert("name".to_owned(), Value::String(lowered.original_name.clone()));
+        item.insert("input".to_owned(), Value::String(String::new()));
         match &lowered.namespace {
             Some(namespace) => {
                 item.insert("namespace".to_owned(), Value::String(namespace.clone()));
@@ -817,6 +819,7 @@ mod tests {
                 assert_eq!(added_item.get("type").unwrap(), "custom_tool_call");
                 assert_eq!(added_item.get("name").unwrap(), "run_python");
                 assert_eq!(added_item.get("id").unwrap(), "ctc_1");
+                assert_eq!(added_item.get("input").unwrap(), "");
             },
             other => panic!("expected EmitCustomShell, got {other:?}"),
         }

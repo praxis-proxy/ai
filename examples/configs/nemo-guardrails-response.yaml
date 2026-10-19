@@ -1,15 +1,18 @@
 # Guardrails (NeMo) - Response Phase Only
 #
 # Evaluates upstream responses against a NeMo Guardrails service.
-# Request-side guardrails are disabled so the request always reaches
-# the upstream. This config is used by integration tests to verify
-# response-phase behavior in isolation.
+# Request-side guardrails are disabled. Non-streaming requests reach the upstream.
+# Requests with `stream: true` are rejected before forwarding because response
+# guardrails cannot evaluate SSE responses.
+# This config is used by integration tests to verify response-phase behavior in isolation.
 #
 #   Response phase:
 #     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
 #                (status remains 200 because headers are already committed)
-#     modified - redaction verdict recorded; original body forwarded until #49
+#     modified - last assistant message replaced with masked text, then forwarded
+#     provider HTTP error - response body replaced with a JSON error payload
+#                (same as blocked; headers are already committed)
 
 listeners:
   - name: gateway

@@ -24,7 +24,7 @@ cover code style, testing requirements, file
 organization, and security practices. Submissions
 that do not follow these conventions will be rejected.
 
-[CONTRIBUTING.md]:../../.github/CONTRIBUTING.md
+[CONTRIBUTING.md]:../../CONTRIBUTING.md
 
 ## Build
 
@@ -47,6 +47,12 @@ make test-integration
 ### OpenAI SDK Integration Tests (Dual 2.x / 3.x Lanes)
 
 Praxis AI maintains compatibility with both OpenAI Python SDK 2.x and 3.x releases. Local and CI test runs validate both SDK major versions independently.
+
+These suites require an explicit build with the experimental OpenAI filters:
+
+```console
+cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
+```
 
 To run `test_openai_responses_vllm.py` in simulator mode locally, start the `inference-sim` container first:
 ```console
@@ -85,6 +91,7 @@ storage backend or OpenAI SDK lane) and pins `openai-agents` via its PEP 723
 header:
 
 ```console
+cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
 ```
 
@@ -267,3 +274,16 @@ options.
 Include benchmark or load-test evidence in PRs that materially
 affect request processing, storage, streaming, or protocol parsing
 costs.
+
+Run the model-to-provider request-body benchmark with
+`make bench-model-to-provider`. The Tests workflow runs the same
+command in its filter job. It executes the ignored benchmark in the
+release profile and reports nanoseconds per request over 10,000
+iterations for mapped models with 64-byte, 1 KiB, and 16 KiB prompts,
+plus an unknown model with 1 KiB and 16 KiB prompts.
+
+These timings include request-context construction, shared body
+ownership, the filter call, and cleanup. They measure local filter
+cost without network or backend latency. Shared CI runner timings
+are informational; they are not a throughput guarantee or a fixed
+latency budget.

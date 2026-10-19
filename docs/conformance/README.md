@@ -100,6 +100,26 @@ Every operation has one proxy-boundary mode:
 Only `transform` and `local` operations enter owned-contract OpenAPI
 comparison. All eight current Conversations operations are `local`.
 
+### Rate-limit response ownership
+
+The pinned OpenAI reference declares a `429` response on all eight
+Conversations operations. Its `TooManyRequests` contract includes an optional
+integer `Retry-After` header (minimum 1) and an `ErrorResponse` JSON body.
+
+The local Conversations handlers do not produce `429` responses. Their registry
+therefore does not declare that response. A deployment rate limiter can reject
+traffic before the handler, but that does not establish the upstream response
+contract for the locally owned operation. In particular, the token rate limiter
+returns a bodyless rejection, while `OpenAiErrorFormatter` formats fatal proxy
+errors, not arbitrary filter rejections.
+
+The eight missing `429` responses remain actionable response drift. Do not copy
+the upstream error schema into the implementation document without a runtime
+path that produces it, or exclude the status from comparison. Closing this gap
+requires a runtime-owned rate-limit response path and focused tests of its JSON
+body and optional retry header before changing the registry and regenerating
+this report.
+
 ### Authentication ownership
 
 The `openai_conversations` filter terminates matching requests but does not

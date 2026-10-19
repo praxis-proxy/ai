@@ -15,22 +15,21 @@ and how the tooling works is in [FIPS Tooling](developing/fips.md).
 
 ## The FIPS build
 
-The standard build enables every non-experimental filter (`full`); the image
-(`make container`) adds the SQLite store backend on top of it. The FIPS build
-turns off what is known not to be FIPS compliant yet, so nobody has to know
-which features to pick:
+The standard build and image enable every non-experimental filter (`full`).
+The FIPS build also excludes the policy engine. Neither enables experimental
+Responses, stores or the agentic loop by default:
 
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` (`full,store-sqlite` in the image) | `openai-responses`, `openai-file-resolve-filter`, `aws-sigv4-filter`, `store-postgres-cert-auth` |
-| Responses API kernel (`openai_responses_*`, `openai_responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
+| Cargo features | `full` | `aws-sigv4-filter` |
+| Responses API and agentic loop | experimental opt-in | experimental opt-in |
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
-| PostgreSQL Responses store | yes | yes: certificate-only SQLx profile through system OpenSSL |
-| SQLite store, Conversations API, context compaction, MCP tools | yes | no: their additional dependency boundaries have not been cleared for this profile |
-| `openai_file_resolve` | yes | yes: uses the shared subrequest transport |
-| `azure_ad`, `gcp_adc`, MCP tool dispatch | `full` / experimental | no: their dependency boundaries have not been cleared for this profile |
+| PostgreSQL Responses store | experimental opt-in | experimental opt-in: certificate-only SQLx profile through system OpenSSL |
+| SQLite store, Conversations API, context compaction, MCP tools | experimental opt-in | no: their additional dependency boundaries have not been cleared for this profile |
+| `openai_file_resolve` | experimental opt-in | experimental opt-in: uses the shared subrequest transport |
+| `azure_ad`, `gcp_adc`, MCP tool dispatch | experimental opt-in | no: their dependency boundaries have not been cleared for this profile |
 | Base image | Alpine, praxis-ai built with upstream Rust | `ubi9/ubi-minimal`, praxis-ai built with Red Hat's `rust-toolset` on `ubi9/ubi`, both pinned by digest and signature-verified |
 | OpenSSL | Alpine's, dynamically linked | UBI's, dynamically linked (`openssl-libs` and `openssl-fips-provider-so`), the validated module on a FIPS host |
 | Published tags | `<version>`, `<major>.<minor>`, `sha-<hash>` (see [image tags](release.md#image-tags)) | the same with a `-fips` suffix (`0.3.0-fips`) |
@@ -48,6 +47,11 @@ crates performing security-relevant cryptography in the image are the rustls
 protocol engine and the OpenSSL bindings that delegate every primitive to the
 system library; the rest of the crypto-adjacent crates in the image are
 listed in the exemption table at the end of this page.
+
+For the experimental Responses/certificate-authenticated store profile, use
+`make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,store-postgres-cert-auth`
+or pass the same list as `--build-arg CARGO_FEATURES=...` to `Containerfile.fips`.
+The agentic loop additionally requires `openai-agentic-loop`.
 
 The certificate-only store currently pins SQLx to commit `6736b97d` from a
 temporary fork. That commit makes migrations, PostgreSQL password
@@ -227,7 +231,8 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 |---|---|---|
 | rustls, rustls-webpki, rustls-pki-types, rustls-pemfile, rustls-native-certs, tokio-rustls | TLS protocol engine, X.509 path building, PEM parsing, system roots; no cryptography of their own | compliant through the OpenSSL provider |
 | rustls-openssl (published from the Pingora fork as `quixotic-plecostomus-rustls-openssl`), openssl, openssl-sys, openssl-probe | the provider and the bindings; dynamic link to the system `libcrypto.so.3` | compliant |
-| rand, rand_chacha, rand_xoshiro, chacha20 | request ids, load-balancer picks, jitter (rand's ChaCha-based RNG) | not security functions |
+| rand, rand_chacha, chacha20 | load-balancer picks and jitter (rand's ChaCha-based RNG) | not security functions |
+| rand_xoshiro | transitive `metrics-util` dependency; its sampling reservoir is not constructed by the Prometheus exporter | no runtime operation |
 | ahash, crc32fast, blake2, digest, crypto-common | hash maps, gzip checksums, Pingora cache keys | not security functions |
 | x509-parser, asn1-rs, der-parser, oid-registry (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
@@ -235,7 +240,8 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
 | SQLite store, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
-| `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `openai_file_resolve`, `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `gcp_adc` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider); the `key_file` source signs its `RS256` assertion through OpenSSL's EVP signing API | not in the FIPS build (experimental) |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
 | sha2, hmac, aws-sigv4, rcgen (with ring) | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest; aws-lc-rs itself is gone from every graph, the policy engine aside |
 

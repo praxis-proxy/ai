@@ -156,6 +156,8 @@ struct ServerState {
     pipelines: Arc<ListenerPipelines>,
     /// KV store registry.
     kv_stores: praxis_core::kv::KvStoreRegistry,
+    /// In-flight per-model request tracker, preserved across reloads.
+    inflight_registry: praxis_ai_filters::InFlightRegistry,
     /// Shared sub-request client for filters and `iterative_request_router` step chains.
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
@@ -189,6 +191,7 @@ fn build_server_state(
 ) -> ServerState {
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
+    let inflight_registry = praxis_ai_filters::InFlightRegistry::new();
 
     #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, store_reload, store_readiness) =
@@ -204,14 +207,21 @@ fn build_server_state(
         registry,
         health_registry,
         &kv_stores,
+        &inflight_registry,
         &subrequest_client,
         &store_registries,
     )
     .unwrap_or_else(|e| fatal(&e));
     #[cfg(not(feature = "store"))]
-    let pipelines =
-        crate::pipelines::resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
-            .unwrap_or_else(|e| fatal(&e));
+    let pipelines = crate::pipelines::resolve_pipelines(
+        config,
+        registry,
+        health_registry,
+        &kv_stores,
+        &inflight_registry,
+        &subrequest_client,
+    )
+    .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
@@ -226,6 +236,7 @@ fn build_server_state(
     ServerState {
         pipelines: Arc::new(pipelines),
         kv_stores,
+        inflight_registry,
         subrequest_client,
         health_shutdown,
         store_reload,
@@ -279,6 +290,7 @@ fn spawn_watcher(
         health_shutdown: state.health_shutdown,
         initial_config: config,
         kv_stores: state.kv_stores,
+        inflight_registry: state.inflight_registry,
         pipelines: state.pipelines,
         registry: Arc::new(registry),
         shutdown: CancellationToken::new(),
@@ -300,18 +312,41 @@ fn register_admin_endpoints(
     health_registry: HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
+    use praxis_protocol::http::pingora::health;
+
+    // praxis 0.7.4 splits the admin API (`/api/*`) from the health/metrics
+    // listener (`/healthy`, `/ready`, `/metrics`), each bound to its own
+    // address. Install the Prometheus recorder once when either listener is
+    // configured, then register its upkeep and bind the two services.
+    let prometheus_recorder = (config.admin.address.is_some() || config.admin.metrics_address.is_some())
+        .then(health::install_prometheus_admin_recorder);
+
     if let Some(admin_addr) = &config.admin.address {
-        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+        health::add_admin_api_to_pingora_server(
             server.server_mut(),
             admin_addr,
-            praxis_protocol::http::pingora::health::AdminEndpointOptions {
-                health_registry: Some(health_registry),
+            health::AdminEndpointOptions {
+                health_registry: Some(Arc::clone(&health_registry)),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
                 stats: None,
                 verbose: config.admin.verbose,
             },
+        );
+    }
+
+    if let Some(recorder) = prometheus_recorder {
+        health::add_prometheus_upkeep_to_pingora_server(server.server_mut(), recorder);
+    }
+
+    if let Some(metrics_addr) = &config.admin.metrics_address {
+        health::add_health_endpoint_to_pingora_server_with_pipelines(
+            server.server_mut(),
+            metrics_addr,
+            Some(health_registry),
+            config.admin.verbose,
+            None,
         );
     }
 }

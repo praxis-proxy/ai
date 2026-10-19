@@ -688,6 +688,67 @@ async fn known_alias_rewrites_model() {
     );
 }
 
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn budgeted_responses_alias_rewrites_model() {
+    let filter = make_filter(ALIAS_CONFIG);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from(r#"{"model":"codex-mini-latest","input":"test"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(parsed["model"], "llama-3.3-70b");
+}
+
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn budgeted_responses_alias_rejects_expansion_before_rewrite() {
+    let target = "x".repeat(1_024);
+    let config = format!("model_aliases:\n  short: {target}\n");
+    let filter = make_filter(&config);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap();
+    ctx.extensions.insert(policy);
+    let original = Bytes::from(r#"{"model":"short","input":"test"}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("model expansion must be rejected before rewriting the body");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
+}
+
+#[cfg(feature = "openai-responses")]
+#[tokio::test]
+async fn budgeted_responses_rewrite_checks_prior_round_usage() {
+    let filter = make_filter(ALIAS_CONFIG);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap();
+    ctx.extensions.insert(policy);
+    let mut state = super::super::state::ResponsesState::default();
+    let mut budget = SimpleBudget::new(4_096, 100).unwrap();
+    assert!(budget.admit_output(&[b' '; 20]));
+    state.simple_budget = Some(budget);
+    ctx.extensions.insert(state);
+    let original = Bytes::from(r#"{"model":"codex-mini-latest","input":"test"}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a previous round must reduce the remaining rewrite budget");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body, Some(original));
+}
+
 #[tokio::test]
 async fn wildcard_alias_rewrites_model() {
     let (ctx, body) = run_filter_with_body(

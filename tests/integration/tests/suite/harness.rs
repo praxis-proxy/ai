@@ -15,6 +15,15 @@ use tempfile::TempDir;
 /// Pinned version of the Claude Code CLI executable used for E2E acceptance tests.
 pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.267";
 
+/// Pinned version of the OpenCode CLI executable used for E2E acceptance tests.
+///
+/// `opencode --version` prints the bare version with no product prefix
+/// (`1.18.35`, not `opencode 1.18.35`), so this is compared for equality
+/// against the trimmed output rather than as a substring of a longer line.
+/// Kept in sync with `tests/integration/fixtures/opencode-cli/pin.toml` by
+/// `opencode::pin_toml_version_matches_harness_const`.
+pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.18.35";
+
 /// Portable shell fragment that reads bytes on stdin and prints their lowercase
 /// sha256 hex digest (no filename column). GNU coreutils ships `sha256sum`, but
 /// macOS (where this suite's precompute and the CLI clients' fixed PATH run) ships
@@ -132,6 +141,7 @@ fn run_git_cmd(args: &[&str], dir: &Path) {
 
 /// Seed `count` uniquely-filled ballast files (`chapter_01.txt`, ...) of roughly
 /// `approx_bytes` each in `dir` and return their names in deterministic order.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io::Result<Vec<String>> {
     const WORDS: &[&str] = &[
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima",
@@ -172,11 +182,13 @@ fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io:
 /// wire (the client's summarization POST), and the result write is proven to
 /// follow the compaction boundary; the on-disk source makes the final write
 /// reliable regardless of whether the model happened to retain the token verbatim.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 pub(crate) struct CodexCompactionWorkspace {
     dir: TempDir,
     marker: String,
 }
 
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 impl CodexCompactionWorkspace {
     /// Create a workspace whose marker lives in `secret.txt`, with a marker-free
     /// hash-based `verify.sh`.

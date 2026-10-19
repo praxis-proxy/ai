@@ -4,7 +4,7 @@ Thank you for your interest in contributing! Start by
 reading the [development conventions]. Submissions that
 do not follow the conventions will be rejected.
 
-[development conventions]: .github/CONTRIBUTING.md
+[development conventions]: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md
 
 ## Getting Started
 
@@ -50,4 +50,4 @@ CI enforces reviewability on every PR:
 
 See the [PR conventions] section for details and override labels.
 
-[PR conventions]: .github/CONTRIBUTING.md#pr-review-process
+[PR conventions]: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#pull-request-conventions

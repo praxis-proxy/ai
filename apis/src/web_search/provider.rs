@@ -15,7 +15,9 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
+use praxis_core::connectivity::{
+    PreparedSubrequest, PreparedTarget, UrlResolutionPolicy, prepare_url_target_with_policy,
+};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, DeferredCredential, FilterError, FilterPipeline, FilteredSubrequestExecutor,
     HttpFilterContext, IterationState, PendingCredentials, RequestExtensions, StagedUpstream, StagedUpstreamFallback,
@@ -36,7 +38,7 @@ use crate::{
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
-const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -62,6 +64,9 @@ pub(crate) struct SearchResult {
 pub(crate) enum SearchOutcome {
     /// Search succeeded. An empty vector is a successful zero-result search.
     Results(Vec<SearchResult>),
+    /// The request-wide retained-payload allowance stopped body collection.
+    /// This must terminate the logical response, not become a provider failure.
+    RetainedLimitExceeded,
     /// Search failed — timeout, transport error, non-2xx status, oversized
     /// response, or unparseable body. Callers continue with a truthful failed
     /// tool result rather than exposing provider details to the client.
@@ -205,14 +210,14 @@ fn provider_auth(provider: SearchProvider) -> (http::HeaderName, &'static str) {
 /// from.
 ///
 /// The executor resolves the callout destination from this same URL (via
-/// [`prepare_url_target`]), so binding the credential to the authority derived
+/// [`prepare_url_target_with_policy`]), so binding the credential to the authority derived
 /// here matches the resolved destination by construction while being dropped,
 /// zeroized, on any host *or* port divergence — an exact authority, never a host
 /// wildcard. The port is the URL's explicit port, else the scheme default (443
 /// for `https` or a scheme-less URL, 80 for `http`) — the same effective port the
-/// executor pins. `IPv6` literals are re-bracketed because `Uri::host` strips the
-/// brackets but [`DeferredCredential::new`] requires bracketed `IPv6` to separate
-/// host from port.
+/// executor pins. `Uri::host` already returns `IPv6` literals bracketed, so only
+/// an unbracketed literal is re-bracketed here; [`DeferredCredential::new`]
+/// requires bracketed `IPv6` to separate host from port.
 ///
 /// # Errors
 ///
@@ -308,6 +313,34 @@ impl SearchClient {
         country: Option<&str>,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
+        self.search_with_response_limit(
+            outbound,
+            callout,
+            query,
+            context_size,
+            country,
+            identity,
+            MAX_SEARCH_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    /// Execute a search with a body ceiling derived from the enclosing
+    /// request's retained-payload budget.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the caller supplies identity and the request-wide body ceiling"
+    )]
+    pub(crate) async fn search_with_response_limit(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        query: &str,
+        context_size: Option<SearchContextSize>,
+        country: Option<&str>,
+        identity: &CalloutIdentity,
+        response_limit: usize,
+    ) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -328,7 +361,8 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count, country),
         };
-        self.execute_search(outbound, callout, &url, request, identity).await
+        self.execute_search_with_limit(outbound, callout, &url, request, identity, response_limit)
+            .await
     }
 
     /// Provider name for diagnostics and client-facing rejection messages.
@@ -405,7 +439,7 @@ impl SearchClient {
     /// Execute a search request through the outbound chain and map the response
     /// to a [`SearchOutcome`].
     ///
-    /// The provider destination is resolved with [`prepare_url_target`] (a
+    /// The provider destination is resolved with [`prepare_url_target_with_policy`] (a
     /// permissive validation hook — private-address/SSRF enforcement is deferred
     /// to the executor's connect-time `build_peer`, gated by
     /// `insecure_options.allow_private_upstreams`) and staged as a
@@ -421,6 +455,7 @@ impl SearchClient {
         clippy::too_many_arguments,
         reason = "threads the caller's per-callout identity through the fixed staging chain"
     )]
+    #[cfg(test)]
     async fn execute_search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -429,6 +464,27 @@ impl SearchClient {
         request: SubRequest,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
+        self.execute_search_with_limit(outbound, callout, url, request, identity, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+    }
+
+    /// Execute one provider request with the selected response body limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "staged callout carries the request-wide body ceiling"
+    )]
+    async fn execute_search_with_limit(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        url: &str,
+        request: SubRequest,
+        identity: &CalloutIdentity,
+        response_limit: usize,
+    ) -> SearchOutcome {
+        if response_limit == 0 {
+            return SearchOutcome::RetainedLimitExceeded;
+        }
         // A callout receives at most its configured timeout and never a fresh
         // budget beyond the enclosing IRR's absolute request deadline. This is
         // recomputed for every round, so later calls inherit only the time that
@@ -444,11 +500,11 @@ impl SearchClient {
             self.client.clone(),
             callout.runtime,
             callout.depth,
-            MAX_SEARCH_RESPONSE_BYTES,
+            response_limit.min(MAX_SEARCH_RESPONSE_BYTES),
             self.timeout,
         );
         let result = Self::dispatch_callout(executor, outbound, prepared.request(), extensions, deadline).await;
-        self.map_callout_outcome(result)
+        self.map_callout_outcome(result, response_limit < MAX_SEARCH_RESPONSE_BYTES)
     }
 
     /// Resolve and stage the provider destination for a callout.
@@ -466,14 +522,19 @@ impl SearchClient {
         identity: &CalloutIdentity,
     ) -> Option<(PreparedSubrequest, RequestExtensions)> {
         // Private-address / SSRF enforcement is deferred to the executor's
-        // connect-time `build_peer`, so this hook is permissive.
-        let target = match prepare_url_target(url, deadline, |_addrs| Ok(())).await {
-            Ok(target) => target,
-            Err(e) => {
-                warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
-                return None;
-            },
-        };
+        // connect-time `build_peer`, so this hook is permissive. The provider
+        // endpoint is operator-configured, so it resolves through the shared
+        // DNS cache.
+        let target =
+            match prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+            {
+                Ok(target) => target,
+                Err(e) => {
+                    warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
+                    return None;
+                },
+            };
         // Assemble the executor extensions while `target` is still owned, then
         // let `bind` consume it into the origin-form request.
         let extensions = self.stage_extensions(&target, url, identity)?;
@@ -594,9 +655,9 @@ impl SearchClient {
     /// loop and never surfaces a provider-response status to the client, so
     /// [`CalloutOutcome::ResponseTooLarge`] fails the callout closed — the model
     /// then continues with a truthful "search unavailable" result.
-    fn map_callout_outcome(&self, result: Result<CalloutOutcome, FilterError>) -> SearchOutcome {
+    fn map_callout_outcome(&self, result: Result<CalloutOutcome, FilterError>, request_limited: bool) -> SearchOutcome {
         match result {
-            Ok(outcome) => self.map_callout_success(outcome),
+            Ok(outcome) => self.map_callout_success(outcome, request_limited),
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
                 SearchOutcome::Failed
@@ -608,7 +669,7 @@ impl SearchClient {
     /// [`SearchOutcome`], failing closed on anything but a bounded buffered
     /// response. Split from [`map_callout_outcome`](Self::map_callout_outcome)
     /// so each stays within the cognitive-complexity budget.
-    fn map_callout_success(&self, outcome: CalloutOutcome) -> SearchOutcome {
+    fn map_callout_success(&self, outcome: CalloutOutcome, request_limited: bool) -> SearchOutcome {
         match outcome {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => self.map_search_result(&response),
             CalloutOutcome::Response(CalloutResponse::Streaming { .. }) => {
@@ -625,7 +686,11 @@ impl SearchClient {
                     limit,
                     "search callout response exceeded the size limit; treating as failed"
                 );
-                SearchOutcome::Failed
+                if request_limited {
+                    SearchOutcome::RetainedLimitExceeded
+                } else {
+                    SearchOutcome::Failed
+                }
             },
             // `CalloutOutcome` is `#[non_exhaustive]`: a future classified outcome
             // fails the callout closed rather than being read as a success.
@@ -1483,6 +1548,23 @@ mod tests {
     }
 
     #[test]
+    fn request_limited_web_body_overflow_is_distinct_from_provider_failure() {
+        let client = test_search_client();
+        let oversized = || CalloutOutcome::ResponseTooLarge {
+            actual: Some(33),
+            limit: 32,
+        };
+        assert!(matches!(
+            client.map_callout_success(oversized(), false),
+            SearchOutcome::Failed
+        ));
+        assert!(matches!(
+            client.map_callout_success(oversized(), true),
+            SearchOutcome::RetainedLimitExceeded
+        ));
+    }
+
+    #[test]
     fn callout_deadline_uses_provider_timeout_without_a_parent() {
         let now = Instant::now();
         let timeout = Duration::from_secs(5);
@@ -1909,10 +1991,14 @@ mod tests {
         let attacker_addr = attacker_listener.local_addr().unwrap();
         let attacker_rx = spawn_recording_server(attacker_listener, 200, "{}");
         let attacker_url = format!("http://{attacker_addr}/");
-        let attacker_target =
-            prepare_url_target(&attacker_url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-                .await
-                .unwrap();
+        let attacker_target = prepare_url_target_with_policy(
+            &attacker_url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let attacker_upstream = StagedUpstream::from_prepared_target(&attacker_target).unwrap().0;
         let url = format!("http://{provider_addr}/res/v1/web/search?q=test&count=5");
         (url, retargeting_outbound(attacker_upstream), provider_rx, attacker_rx)
@@ -2102,9 +2188,14 @@ mod tests {
     async fn stage_extensions_projects_owner_into_child_extensions() {
         let client = test_client_for(SearchProvider::Brave);
         let url = "http://127.0.0.1:9/res/v1/web/search";
-        let target = prepare_url_target(url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-            .await
-            .unwrap();
+        let target = prepare_url_target_with_policy(
+            url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let identity = CalloutIdentity::for_test(
             Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
             None,
@@ -2170,7 +2261,10 @@ mod tests {
     /// [`SearchClient::execute_search`] performs.
     async fn dispatch_with_staged_credential(url: &str, pending: PendingCredentials) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let target = prepare_url_target(url, deadline, |_addrs| Ok(())).await.unwrap();
+        let target =
+            prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+                .unwrap();
         let mut extensions = RequestExtensions::default();
         extensions.insert(StagedUpstream::from_prepared_target(&target).unwrap());
         extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));

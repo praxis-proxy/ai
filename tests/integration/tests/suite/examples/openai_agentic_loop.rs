@@ -21,7 +21,7 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
+    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
     start_proxy,
 };
 
@@ -48,7 +48,7 @@ fn single_pass_completes_through_irr() {
     let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"Hello"}"#;
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(
@@ -65,6 +65,546 @@ fn single_pass_completes_through_irr() {
         model_body.get("parallel_tool_calls").is_none(),
         "an omitted parallel_tool_calls field must remain omitted"
     );
+}
+
+#[test]
+fn retained_budget_allows_model_alias_before_validation() {
+    let response = r#"{"id":"resp_model_alias","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_model_rewrite(free_port(), model.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"client-alias","input":"Hello","store":false}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "budgeted alias request failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["model"], "gpt-4.1");
+}
+
+#[test]
+fn retained_budget_preserves_provider_owned_fields() {
+    let response = r#"{"id":"resp_provider_fields","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Hello",
+        "store":false,
+        "include":["reasoning.encrypted_content"],
+        "background":false,
+        "prompt":null,
+        "context_management":[{"type":"compaction","compact_threshold":1000}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "budgeted provider fields failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    for field in ["include", "background", "prompt", "context_management"] {
+        assert_eq!(outbound[field], request[field], "{field} must survive the proxy");
+    }
+}
+
+#[test]
+fn retained_budget_preserves_responses_with_chat_prompt_enrichment_filter() {
+    let response = r#"{"id":"resp_prompt_enrich","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let original = std::fs::read_to_string(example_config_path("openai/responses/agentic-loop.yaml"))
+        .expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "      - filter: openai_responses_request",
+        "      - filter: prompt_enrich\n        on_invalid: continue\n        prepend:\n          - role: system\n            content: Be helpful.\n\n      - filter: openai_responses_request",
+        1,
+    );
+    assert_ne!(yaml, original, "insert the chat prompt filter before Responses parsing");
+    let yaml = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", model.port())]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic config");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","store":false}"#),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "chat prompt filter should leave Responses input intact: {raw}"
+    );
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(sent["input"], "Hello");
+    assert!(
+        sent.get("messages").is_none(),
+        "chat-only enrichment does not change Responses input"
+    );
+}
+
+#[test]
+fn retained_budget_preserves_text_message_array() {
+    let response = r#"{"id":"resp_text_array","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let input = serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]);
+    let body = serde_json::json!({"model":"gpt-4.1","input":input,"store":false});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body.to_string()));
+    assert_eq!(parse_status(&raw), 200, "text message array failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["input"], input);
+}
+
+#[test]
+fn retained_budget_preserves_single_message_object_and_empty_input() {
+    let response = r#"{"id":"resp_input_shape","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned()), (200, response.to_owned())])
+        .start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let message = serde_json::json!({"type":"message","role":"user","content":"Hello"});
+    let requests = [
+        serde_json::json!({"model":"gpt-4.1","input":message,"store":false}),
+        serde_json::json!({"model":"gpt-4.1","store":false}),
+    ];
+
+    for request in &requests {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "in-budget request shape failed: {raw}");
+    }
+
+    let sent = model.requests();
+    assert_eq!(sent.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&sent[0].body).expect("first provider request JSON");
+    let second: serde_json::Value = serde_json::from_str(&sent[1].body).expect("second provider request JSON");
+    assert_eq!(first["input"], requests[0]["input"]);
+    assert!(second.get("input").is_none(), "omitted input must remain omitted");
+}
+
+#[test]
+fn retained_budget_persists_default_store_plain_response() {
+    let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_plain_store");
+    let config = load_approval_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&created),
+        200,
+        "default Store create must succeed: {created}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = body["id"].as_str().expect("created response id");
+
+    let (status, retrieved) = http_get(proxy.addr(), &format!("/v1/responses/{id}"), None);
+    assert_eq!(status, 200, "budgeted response must be stored: {retrieved}");
+    assert_eq!(model.requests().len(), 1, "retrieve must not run inference");
+}
+
+#[test]
+fn retained_budget_restores_previous_plain_response() {
+    let first = r#"{"id":"resp_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_restore_previous");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let first_raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&first_raw), 200, "first response: {first_raw}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    let first_id = created["id"].as_str().expect("created response id");
+    let next_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Next turn",
+        "store": false,
+        "previous_response_id": first_id,
+    });
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next_body.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "bounded restore: {next_raw}");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "one inference per turn");
+    let second_sent: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "backend must receive previous input/output and new turn: {second_sent}"
+    );
+    assert!(
+        second_sent.get("previous_response_id").is_none(),
+        "locally rehydrated history must not also ask the backend to restore it"
+    );
+}
+
+#[test]
+fn retained_budget_explicit_compact_persists_and_restores_summary() {
+    let first = r#"{"id":"resp_before_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_before_compact","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let summary = r#"{"id":"chatcmpl-summary","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary marker"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}}"#;
+    let follow_up = r#"{"id":"resp_after_compact","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first.to_owned()),
+        (200, summary.to_owned()),
+        (200, follow_up.to_owned()),
+    ])
+    .start_with_shutdown();
+    let db = TempSqlite::new("budgeted_explicit_compact");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_before_compact","input":"More context"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&compacted), 200, "budgeted compact: {compacted}");
+    let compacted_body: serde_json::Value = serde_json::from_str(&parse_body(&compacted)).unwrap();
+    assert_eq!(
+        compacted_body["object"], "response.compaction",
+        "explicit response shape"
+    );
+    let compact_id = compacted_body["id"].as_str().expect("compaction response id");
+    let (status, stored) = http_get(proxy.addr(), &format!("/v1/responses/{compact_id}"), None);
+    assert_eq!(status, 200, "compaction must persist: {stored}");
+
+    let next =
+        serde_json::json!({"model":"gpt-4.1","input":"Next turn","previous_response_id":compact_id,"store":false});
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "restore compacted history: {next_raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "create, compact callout, and follow-up inference");
+    let outbound: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    assert!(
+        outbound["input"].to_string().contains("Summary marker"),
+        "follow-up must replay the compacted summary: {outbound}"
+    );
+}
+
+#[test]
+fn retained_budget_explicit_compact_rejects_oversized_stored_history_before_callout() {
+    let first = r#"{"id":"resp_large_for_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_large","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let db = TempSqlite::new("budgeted_explicit_compact_overflow");
+    let model = StatefulCapturingBackend::new(vec![(200, first.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    drop(proxy);
+    drop(model);
+
+    let callout = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), callout.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_large_for_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&compacted),
+        413,
+        "stored history must exceed the small budget: {compacted}"
+    );
+    assert!(
+        callout.requests().is_empty(),
+        "Store overflow must stop before summarization"
+    );
+}
+
+#[test]
+fn retained_budget_appends_plain_conversation_and_restores_next_turn() {
+    let first = r#"{"id":"resp_conv_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_conv_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_conversation_append");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = created["id"].as_str().expect("conversation ID");
+    assert!(
+        id.starts_with("conv_"),
+        "local Conversations create must return an ID: {created}"
+    );
+    for input in ["First turn", "Second turn"] {
+        let request = serde_json::json!({"model":"gpt-4.1","input":input,"store":false,"conversation":id});
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "conversation turn: {raw}");
+    }
+
+    let requests = model.requests();
+    let inference: Vec<_> = requests.iter().filter(|request| !request.body.is_empty()).collect();
+    assert_eq!(
+        inference.len(),
+        2,
+        "model requests: {:?}",
+        requests.iter().map(|request| &request.body).collect::<Vec<_>>()
+    );
+    let second_sent: serde_json::Value = serde_json::from_str(&inference[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "second inference must replay appended first turn: {second_sent}"
+    );
+    let (status, items) = http_get(proxy.addr(), &format!("/v1/conversations/{id}/items"), None);
+    assert_eq!(status, 200, "list appended items: {items}");
+    let listed: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(4));
+}
+
+#[test]
+fn budgeted_conversation_append_overflow_does_not_store_success() {
+    let response = r#"{"id":"resp_conv_append_overflow","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+
+    // Admission and the model output fit. The retained input copy needed for
+    // append-back alone exceeds the remaining request budget.
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_ne!(parse_status(&raw), 200, "append overflow cannot report success: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "inference must have completed before append admission"
+    );
+
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_conv_append_overflow", None);
+    assert_eq!(status, 404, "a failed append cannot leave a successful Store record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
+fn budgeted_stream_conversation_append_overflow_emits_error_without_success_or_store() {
+    let response_id = "resp_stream_conv_append_overflow";
+    let events = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": response_id, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0,
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{"type":"message","id":"msg_stream_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}],
+                },
+                "sequence_number": 1,
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) =
+        start_streaming_model_with_pacing(vec![events], Some(Duration::from_millis(50)));
+    let db = TempSqlite::new("budgeted_stream_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model_port, 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "stream": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "stream headers and prefix should already be committed: {raw}"
+    );
+    assert!(
+        body.contains("event: response.created"),
+        "the client should receive the streamed prefix: {body}"
+    );
+    assert_eq!(
+        body.matches("event: error").count(),
+        1,
+        "append overflow needs one terminal SSE error: {body}"
+    );
+    assert!(
+        !body.contains("event: response.completed"),
+        "success must be withheld: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "error streams have no success sentinel: {body}"
+    );
+    let frames = parse_sse_frames(&body);
+    let error = sole_event(&frames, "error");
+    assert_eq!(error.data["code"], "invalid_request_error");
+    assert_eq!(error.data["sequence_number"], 1);
+    assert!(
+        error.data["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conversation append"))
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    model_thread.join().expect("model should finish streaming");
+
+    let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 404, "the failed stream cannot leave a Store success record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_budget_store_overflow_skips_persistence() {
+    let response = serde_json::json!({
+        "id": "resp_store_overflow",
+        "object": "response",
+        "created_at": 1_760_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type":"message","content":[{"type":"output_text","text":"x".repeat(200)}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_store_overflow");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "over-budget Store output must fail before persistence: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "overflow must stop after the first inference"
+    );
+
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("Store database should open");
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("Store table should be queryable");
+    assert_eq!(persisted, 0, "an over-budget response must not be stored");
+    pool.close().await;
+}
+
+#[test]
+fn retained_budget_rejects_oversized_initial_input_before_inference() {
+    let model = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 4_096);
+    let proxy = start_proxy(&config);
+
+    // This stays below the listener's 128-byte raw cap so the Responses
+    // admission guard, rather than core's generic transport 413, rejects it.
+    let request_body = r#"{"model":"gpt-4.1","input":"Hi","store":false,"temperature":0,"seed":1}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
+
+    assert_eq!(parse_status(&raw), 413);
+    assert!(!parse_body(&raw).is_empty(), "empty 413 response: {raw:?}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_retained_bytes")),
+        "413 must identify the retained-payload budget: {body}"
+    );
+    assert!(model.requests().is_empty(), "rejected input must not reach inference");
+}
+
+#[test]
+fn retained_budget_rejects_oversized_buffered_output_without_dispatch() {
+    let response = serde_json::json!({
+        "id": "resp_provider",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "x".repeat(200)}],
+        }],
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 8_192);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi","store":false}"#),
+    );
+
+    assert_eq!(parse_status(&raw), 502);
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(model.requests().len(), 1, "overflow must stop after one inference");
 }
 
 #[test]
@@ -316,7 +856,7 @@ fn round_trip_captures_tool_and_model_requests() {
     );
     let raw = http_send(proxy.addr(), &request);
 
-    assert_eq!(parse_status(&raw), 200, "round-trip should return 200");
+    assert_eq!(parse_status(&raw), 200, "round-trip should return 200: {raw}");
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
     assert_eq!(
@@ -425,6 +965,305 @@ fn round_trip_captures_tool_and_model_requests() {
         model_body["tool_choice"], "auto",
         "openai_agentic_loop must reset tool_choice to auto on re-entry"
     );
+}
+
+// Issue #1398: the MCP approval policy's `read_only` selector must participate in
+// classification end to end — the annotation has to survive discovery
+// (`tools/list` → resolved tool map) and the agentic loop must gate a writable
+// call before dispatch while auto-executing a read-only one. These exercise the
+// real request path (model backend + mock MCP server) rather than a hand-built
+// tool map.
+
+#[test]
+fn read_only_policy_gates_writable_call_before_dispatch() {
+    // A writable tool (annotations.readOnlyHint=false) is named by
+    // `never.tool_names` AND selected by `always.read_only=false` — the exact
+    // overlap from #1398. `always` precedence must win, so the loop surfaces an
+    // mcp_approval_request and runs no tool. Before the fix the ignored
+    // read_only selector left only the never name-match and the tool executed.
+    let call_response = serde_json::json!({
+        "id": "resp_ro_gate_1",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_ro_gate",
+            "call_id": "call_ro_delete",
+            "name": "writer__delete",
+            "arguments": r#"{"path":"/tmp/x"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&call_response).unwrap())])
+        .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("delete")
+                .with_description("Delete a path")
+                .with_read_only(false),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1398_read_only_gate");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Delete the file.",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "writer",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["delete"],
+            "require_approval": {"always": {"read_only": false}, "never": {"tool_names": ["delete"]}}
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approval-gated request should return 200: {raw}"
+    );
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let output = response["output"].as_array().expect("output array");
+    let approvals: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|item| item["type"] == "mcp_approval_request")
+        .collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the writable tool must surface exactly one mcp_approval_request: {output:#?}"
+    );
+    assert_eq!(
+        approvals[0]["name"], "delete",
+        "the approval request must preserve the original tool name"
+    );
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "discovery must call tools/list so the readOnlyHint annotation reaches classification"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "the writable call must be gated before dispatch, not executed automatically"
+    );
+}
+
+#[test]
+fn read_only_policy_auto_dispatches_read_only_call() {
+    // Complement to the gate test: a read-only tool (readOnlyHint=true) under
+    // `never.read_only=true` must auto-execute, proving the discovered annotation
+    // drives the exemption through the real loop (not just a hand-built map).
+    let call_response = serde_json::json!({
+        "id": "resp_ro_auto_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_ro_auto",
+            "call_id": "call_ro_list",
+            "name": "reader__list",
+            "arguments": "{}",
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_ro_auto_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Listing done."}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("list").with_read_only(true)],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "List files.",
+        "conversation": {"id": "conv_ro_auto"},
+        "tools": [{
+            "type": "mcp",
+            "server_label": "reader",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["list"],
+            "require_approval": {"never": {"read_only": true}}
+        }]
+    });
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "read-only auto-dispatch should return 200: {raw}"
+    );
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_ro_auto_2",
+        "the loop must resume to the final model turn after auto-dispatching the read-only call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the read-only tool must execute automatically under never.read_only=true"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("list"));
+}
+
+#[test]
+fn invalid_mcp_arguments_are_rejected_without_an_outbound_call() {
+    // The model emits a tool call whose `location` is a number, violating the
+    // tool's advertised string-typed, required-field schema. The dispatcher must
+    // reject it against the `inputSchema` and dial zero outbound tools/call, then
+    // feed the actionable error back so the loop recovers (issue #1125).
+    let first_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_abc",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":42}"#,
+            "status": "completed"
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Sorry, I passed the wrong type. Let me retry."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "round-trip should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_2",
+        "the loop should recover to the second model response"
+    );
+
+    // Resolution still lists the tool, but the invalid call is never dialed.
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "the resolver should still list the request-supplied MCP tools"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "schema-invalid arguments must produce zero outbound tools/call"
+    );
+
+    // The model's recovery turn receives the actionable schema error.
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 2, "the loop re-enters inference after the rejection");
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request body should be valid JSON");
+    let function_output = second_body["input"]
+        .as_array()
+        .and_then(|input| input.iter().find(|item| item["type"] == "function_call_output"))
+        .expect("second model request should carry a function_call_output");
+    let function_output_text = function_output["output"].as_str().unwrap_or_default();
+    assert!(
+        function_output_text.contains("tool call arguments do not match the tool input schema"),
+        "the model must see the actionable schema error: {function_output:#?}"
+    );
+    // The rejected value is masked out of everything the model and client see.
+    assert!(
+        !function_output_text.contains("42"),
+        "the offending value must not be echoed to the model: {function_output_text}"
+    );
+
+    // The client-visible mcp_call item reports the rejection with no output and
+    // does not echo the rejected arguments.
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let mcp_call = output
+        .iter()
+        .find(|item| item["type"] == "mcp_call")
+        .expect("the rejected call should surface an mcp_call item");
+    assert!(
+        mcp_call["error"]["content"]
+            .as_str()
+            .is_some_and(|error| error.contains("tool call arguments do not match the tool input schema")),
+        "the mcp_call item should carry the schema error: {mcp_call:#?}"
+    );
+    assert_eq!(mcp_call["output"], "", "a rejected call produces no tool output");
+    assert_eq!(mcp_call["arguments"], "", "a rejected call does not echo its arguments");
 }
 
 #[test]
@@ -1125,7 +1964,7 @@ fn mcp_calls_execute_regardless_of_max_tool_calls() {
     assert_eq!(mcp_calls.len(), 2, "both MCP calls appear in the output: {output:#?}");
     assert!(
         mcp_calls.iter().all(|item| {
-            item["error"]
+            item["error"]["content"]
                 .as_str()
                 .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
@@ -2431,11 +3270,16 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         Some(mcp_id.as_str()),
         "terminal[2] id: {body}"
     );
+    assert_eq!(
+        output[2]["error"]["type"].as_str(),
+        Some("mcp_tool_execution_error"),
+        "terminal[2] must carry the structured MCP error type: {body}"
+    );
     assert!(
-        output[2]["error"]
+        output[2]["error"]["content"]
             .as_str()
             .is_some_and(|error| error.contains("mock failure for get_weather")),
-        "terminal[2] must carry the MCP error: {body}"
+        "terminal[2] must carry the MCP error content: {body}"
     );
     assert_eq!(output[3]["type"], "message", "terminal[3] type: {body}");
     assert_eq!(
@@ -2542,6 +3386,106 @@ const EXPECTED_OUTPUT_TYPES: [&str; 6] = [
 const FINAL_TEXT: &str = "SF is 72F and it is 3pm PST.";
 
 #[test]
+fn retained_budget_reuses_released_round_body_headroom() {
+    // Each tool round returns a large round-local provider body: a top-level
+    // `filler` field the loop parses and drops, so only the small `function_call`
+    // survives into `accumulated_output`. The round body is charged before the
+    // parse (~16 KiB -> ~1 MiB under the output multiplier), then released once the
+    // round is retained. Four such rounds complete under a budget that accumulating
+    // every round's body charge would exceed by the second round, demonstrating
+    // that released round-local headroom is reused while retained output does not
+    // reset.
+    let filler = "x".repeat(16 * 1024);
+    let tool_round = |id: &str, tool: &str, arguments: &str| {
+        serde_json::json!({
+            "id": format!("resp_{id}"),
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": format!("fc_{id}"),
+                "call_id": id,
+                "name": format!("weather__{tool}"),
+                "arguments": arguments,
+                "status": "completed"
+            }],
+            // Round-local only: parsed and dropped, never retained in output.
+            "filler": filler,
+        })
+        .to_string()
+    };
+    let final_response = serde_json::json!({
+        "id": "resp_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }],
+        "filler": filler,
+    })
+    .to_string();
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, tool_round("call_1", "get_weather", r#"{"location":"SF"}"#)),
+        (200, tool_round("call_2", "get_time", r#"{"timezone":"PST"}"#)),
+        (200, tool_round("call_3", "get_weather", r#"{"location":"NY"}"#)),
+        (200, final_response),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(object_schema("location")),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time for a timezone")
+                .with_input_schema(object_schema("timezone")),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    // One round's ~16 KiB body fits under this limit with the transport reserve,
+    // but four accumulated body charges (~4 MiB) would not. `store: false` keeps
+    // the comparison to the loop's own output accounting.
+    let budget = 3_145_728; // 3 MiB
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_with_budget(proxy_port, model.port(), budget);
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather and time?",
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "released round-local headroom must let every modest round run: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        4,
+        "all four inference rounds ran without a mid-loop retained-payload rejection"
+    );
+}
+
+#[test]
 fn two_tool_rounds_accumulate_output_and_usage() {
     // Round 1: the model asks to call the weather tool.
     let first_response = serde_json::json!({
@@ -2641,16 +3585,15 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         "model backend should receive exactly three requests"
     );
 
-    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
-    // they share one initialized session. The server therefore sees a single
-    // dispatch handshake covering both tools/call rounds; the only other
-    // initialize/tools/list pair comes from tool discovery
-    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
-    // would re-handshake, yielding initialize == 3.
+    // This example enables max_retained_bytes. Each budgeted tools/call uses a
+    // fresh transport so an older pooled session cannot carry a larger wire or
+    // parser ceiling into the next round. Discovery and both dispatch rounds
+    // therefore initialize separately; unbudgeted pooling is covered by the
+    // mcp_client session-pool tests.
     assert_eq!(
         mcp.method_count("initialize"),
-        2,
-        "one discovery handshake + one reused dispatch handshake across both rounds"
+        3,
+        "one discovery handshake and one bounded dispatch handshake per tool round"
     );
     assert_eq!(
         mcp.method_count("tools/list"),
@@ -4162,7 +5105,7 @@ fn web_over_budget_fails_while_mcp_sibling_executes() {
     assert!(
         output.iter().any(|item| {
             item["type"] == "mcp_call"
-                && item["error"]
+                && item["error"]["content"]
                     .as_str()
                     .is_none_or(|error| !error.contains("max_tool_calls"))
         }),
@@ -6120,6 +7063,10 @@ type StreamingModel = (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>);
 
 /// Start a two-turn model backend that emits each SSE event as a chunk.
 fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
+    start_streaming_model_with_pacing(responses, None)
+}
+
+fn start_streaming_model_with_pacing(responses: Vec<Vec<String>>, pacing: Option<Duration>) -> StreamingModel {
     let listener = TcpListener::bind("127.0.0.1:0").expect("streaming model should bind");
     let port = listener
         .local_addr()
@@ -6146,6 +7093,9 @@ fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
             for event in response {
                 write!(stream, "{:x}\r\n{event}\r\n", event.len()).expect("streaming model should write event chunk");
                 stream.flush().expect("streaming model should flush event chunk");
+                if let Some(delay) = pacing {
+                    thread::sleep(delay);
+                }
             }
             stream
                 .write_all(b"0\r\n\r\n")
@@ -7760,6 +8710,608 @@ fn approval_without_configured_store_is_rejected() {
 }
 
 // -----------------------------------------------------------------------------
+// Operator Approval Floor (issue #1723)
+// -----------------------------------------------------------------------------
+//
+// An operator can set `openai_mcp_dispatch.minimum_approval: always` to require
+// approval for EVERY MCP call, combined monotonically with each client's per-tool
+// policy: `approval_required = operator_floor || client_requires_approval`. A
+// client `require_approval: "never"` can no longer suppress the operator
+// requirement. These tests mirror the client-driven round trips above but send
+// `"never"` tools with the floor enabled, proving — for buffered and streaming
+// Responses, direct and connector-backed tools, deferred discovery, and multiple
+// rounds — that the floor forces an approval request and zero `tools/call` before
+// approval, that a valid approval still executes the call exactly once, and that
+// a denial executes nothing.
+
+/// Like [`load_approval_config`] but enables the operator approval floor on
+/// `openai_mcp_dispatch` (`minimum_approval: always`).
+fn load_approval_floor_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let floored = yaml.replacen(
+        "              - filter: openai_mcp_dispatch\n",
+        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        1,
+    );
+    assert_ne!(
+        floored, yaml,
+        "expected to inject minimum_approval into the openai_mcp_dispatch block; its config may have changed"
+    );
+    praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor config")
+}
+
+/// Like [`load_approval_floor_config`] but also rewrites the example's
+/// `corp_drive` connector to `connector_url`, so the floor can be exercised
+/// against connector-backed and deferred-discovery MCP tools whose destination is
+/// resolved internally (never client-supplied).
+fn load_approval_floor_connector_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    connector_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replacen(
+        "          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!("          - id: corp_drive\n            server_url: {connector_url}\n"),
+        1,
+    );
+    assert!(
+        yaml.contains(&format!("server_url: {connector_url}")),
+        "expected to rewrite the corp_drive connector url"
+    );
+    let floored = yaml.replacen(
+        "              - filter: openai_mcp_dispatch\n",
+        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        1,
+    );
+    assert_ne!(
+        floored, yaml,
+        "expected to inject minimum_approval into openai_mcp_dispatch"
+    );
+    praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor connector config")
+}
+
+/// The same MCP tool as [`approval_tools`] but with the client policy set to
+/// `"never"`, so only the operator floor can require approval.
+fn approval_never_tools(mcp_port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+        "allowed_tools": ["get_weather"],
+        "require_approval": "never"
+    }])
+}
+
+#[test]
+fn approval_floor_overrides_client_never_buffered() {
+    let model = StatefulCapturingBackend::new(vec![(200, approval_call_response()), (200, approval_final_response())])
+        .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_buffered");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    // The client explicitly asks for NO approval; the operator floor forces it.
+    // `request_approval` asserts exactly one mcp_approval_request and zero
+    // tools/call while the approval is pending.
+    let tools = approval_never_tools(mcp.port());
+    let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+    assert_eq!(approval_id, "call_appr_weather", "approval id must equal the call id");
+
+    // Approving resumes the recorded call, which executes exactly once.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, true, &tools),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "approved follow-up should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "an approved floored round trip must complete model→tool→model"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "a valid approval must execute the floored call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+}
+
+#[test]
+fn approval_floor_denied_makes_zero_tool_calls() {
+    let model = StatefulCapturingBackend::new(vec![(200, approval_call_response()), (200, approval_final_response())])
+        .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_deny");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+    let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, false, &tools),
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "denied follow-up should still return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "a denied floored approval must never execute the tool"
+    );
+}
+
+#[test]
+fn approval_floor_overrides_client_never_streaming() {
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_appr_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_appr_1",
+                    "object": "response",
+                    "created_at": 1000,
+                    "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_appr",
+                        "call_id": "call_appr_weather",
+                        "name": "weather__get_weather",
+                        "arguments": r#"{"location":"SF"}"#,
+                        "status": "completed"
+                    }]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![first_response]);
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_streaming");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "tools": approval_never_tools(mcp.port()),
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed floored approval must return normally: {raw}"
+    );
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model request lock should not be poisoned")
+            .len(),
+        1,
+        "the floor must stop the loop before another inference call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no tool may execute while a floored approval is pending"
+    );
+    assert_eq!(body.matches("event: response.completed").count(), 1, "{body}");
+    assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+    assert!(
+        body.contains("mcp_approval_request"),
+        "the floor must surface an approval request even though the client said never: {body}"
+    );
+    assert!(
+        body.contains("call_appr_weather"),
+        "the gated call must remain pending: {body}"
+    );
+}
+
+/// Extract the id of the single `response.completed` object from an SSE body.
+fn completed_response_id(sse_body: &str) -> String {
+    for line in sse_body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if value["response"]["status"] == "completed"
+            && let Some(id) = value["response"]["id"].as_str()
+        {
+            return id.to_owned();
+        }
+    }
+    panic!("no completed response id in SSE body: {sse_body}");
+}
+
+#[test]
+fn approval_floor_connector_backed_executes_once_on_approval() {
+    // The floor must apply to connector-backed tools whose destination is resolved
+    // internally (never client-supplied), not only to direct server_url tools.
+    let call_response = serde_json::json!({
+        "id": "resp_floor_conn_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_conn", "call_id": "call_floor_conn",
+            "name": "drive__search", "arguments": r#"{"query":"reports"}"#, "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_floor_conn_final", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Found quarterly reports."}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("search").with_description("Search files")],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1723_floor_connector");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_approval_floor_connector_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    // An eager connector-backed MCP tool whose client policy is "never".
+    let tools = serde_json::json!([{
+        "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+        "allowed_tools": ["search"], "require_approval": "never"
+    }]);
+
+    // Turn 1: the floor forces an approval for the connector tool; nothing dispatches.
+    let request = serde_json::json!({"model": "gpt-4.1", "input": "Find quarterly reports", "tools": tools});
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "connector floored approval should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    let approvals: Vec<&serde_json::Value> = output.iter().filter(|i| i["type"] == "mcp_approval_request").collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the floor must surface one approval for a connector-backed tool: {output:#?}"
+    );
+    assert_eq!(approvals[0]["name"], "search");
+    assert_eq!(approvals[0]["server_label"], "drive");
+    let approval_id = approvals[0]["id"].as_str().unwrap().to_owned();
+    let previous_response_id = response["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no connector tool may execute before approval"
+    );
+
+    // Turn 2: approving runs the recorded connector call exactly once.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, true, &tools),
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved connector follow-up should return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "approval must execute the connector-backed call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("search"));
+}
+
+#[test]
+fn approval_floor_requires_approval_for_deferred_connector() {
+    // A deferred connector is discovered on a later round via tool_search; the
+    // floor must still require approval for the call the model makes against it,
+    // before any tools/call runs.
+    let search_response = serde_json::json!({
+        "id": "resp_floor_def_1", "object": "response", "status": "completed",
+        "output": [{"type": "tool_search_call", "id": "tsc_1", "status": "completed"}]
+    });
+    let call_response = serde_json::json!({
+        "id": "resp_floor_def_2", "object": "response", "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_def", "call_id": "call_floor_def",
+            "name": "drive__search", "arguments": r#"{"query":"reports"}"#, "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&search_response).unwrap()),
+        (200, serde_json::to_string(&call_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("search").with_description("Search files"),
+            McpToolFixture::new("delete").with_description("Delete files"),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1723_floor_deferred");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_approval_floor_connector_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find quarterly reports",
+        "tools": [
+            {"type": "tool_search"},
+            {"type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+             "defer_loading": true, "allowed_tools": ["search"], "require_approval": "never"}
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "deferred connector floored approval should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    let approvals: Vec<&serde_json::Value> = output.iter().filter(|i| i["type"] == "mcp_approval_request").collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the floor must surface an approval for a deferred-discovered connector tool: {output:#?}"
+    );
+    assert_eq!(approvals[0]["name"], "search");
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "tool_search must have discovered the deferred connector"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no deferred connector tool may execute while a floored approval is pending"
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "search then the (floored) call; the approval stops the loop before a third inference"
+    );
+}
+
+#[test]
+fn approval_floor_floors_a_call_produced_on_a_later_round() {
+    // After one floored call is approved and executed, a *subsequent* round that
+    // produces another MCP call must also be floored — the operator floor is
+    // re-applied every round, never just the first.
+    let call_a = serde_json::json!({
+        "id": "resp_floor_mr_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_a", "call_id": "call_floor_a",
+            "name": "weather__get_weather", "arguments": r#"{"location":"SF"}"#, "status": "completed"
+        }]
+    });
+    let call_b = serde_json::json!({
+        "id": "resp_floor_mr_2", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_b", "call_id": "call_floor_b",
+            "name": "weather__get_weather", "arguments": r#"{"location":"NYC"}"#, "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_a).unwrap()),
+        (200, serde_json::to_string(&call_b).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_multiround");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+
+    // Turn 1: the first call is floored.
+    let (approval_a, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+    assert_eq!(approval_a, "call_floor_a");
+
+    // Turn 2: approving call A executes it once, then the model's *next* round
+    // produces call B, which the floor also gates — so call B is returned as a new
+    // approval request and does not execute.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_a, true, &tools),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "approved first call should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(
+        output
+            .iter()
+            .any(|i| i["type"] == "mcp_call" && i["id"] == "call_floor_a"),
+        "the first (approved) call must have executed: {output:#?}"
+    );
+    let approvals_b: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|i| i["type"] == "mcp_approval_request" && i["id"] == "call_floor_b")
+        .collect();
+    assert_eq!(
+        approvals_b.len(),
+        1,
+        "the later-round call must be floored into its own approval request: {output:#?}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the approved first call may execute; the floored second call must not"
+    );
+}
+
+#[test]
+fn approval_floor_streaming_executes_once_on_approval() {
+    // The streaming floor must also complete the exchange: approving the pending
+    // call resumes a streamed round that executes the tool exactly once.
+    let turn1 = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_floor_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_floor_stream_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call", "id": "fc_appr", "call_id": "call_appr_weather",
+                        "name": "weather__get_weather", "arguments": r#"{"location":"SF"}"#, "status": "completed"
+                    }]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let turn2 = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_floor_stream_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_floor_stream_2", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "The weather in SF is 72F and sunny."}]}]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, _model_requests, _model_thread) = start_streaming_model(vec![turn1, turn2]);
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_stream_rt");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+
+    // Turn 1 (streamed): floor emits an approval request, nothing dispatches.
+    let request = serde_json::json!({
+        "model": "gpt-4.1", "input": "What is the weather in SF?", "stream": true, "tools": tools,
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed floored approval should return 200: {raw}"
+    );
+    assert!(
+        body.contains("mcp_approval_request"),
+        "turn 1 must stream an approval request: {body}"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 0, "no tool may run before approval");
+    let previous_response_id = completed_response_id(&body);
+
+    // Turn 2 (streamed): approving resumes and runs the tool exactly once.
+    let followup = approval_followup(&previous_response_id, "call_appr_weather", true, &tools);
+    let followup = serde_json::to_string(&{
+        let mut v: serde_json::Value = serde_json::from_str(&followup).unwrap();
+        v["stream"] = serde_json::Value::Bool(true);
+        v
+    })
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved streamed follow-up should return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "approval must execute the streamed floored call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
 
@@ -7845,6 +9397,72 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
 }
 
+fn load_agentic_config_with_model_rewrite(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    // The example documents aliasing here: before the managed (state-building)
+    // `openai_responses_request`, after the facts-only classifier. The anchor
+    // matches only the managed instance (the facts-only one declares
+    // `initialize_state: false` before `on_invalid`).
+    let anchor = "      - filter: openai_responses_request\n        on_invalid: reject";
+    let yaml = original.replacen(
+        anchor,
+        &format!(
+            "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"client-alias\": \"gpt-4.1\"\n\n{anchor}"
+        ),
+        1,
+    );
+    assert_ne!(
+        yaml, original,
+        "expected to insert model rewrite before the managed request filter"
+    );
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config with model rewrite")
+}
+
+fn load_agentic_config_with_budget(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(yaml, original, "expected the example's retained-payload limit");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config")
+}
+
+fn load_agentic_config_with_budget_and_store(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let with_budget = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(with_budget, original, "expected the example's retained-payload limit");
+    let with_store = with_budget.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(
+        &with_store,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port)]),
+    );
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config with Store")
+}
+
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
@@ -7885,6 +9503,24 @@ fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_cor
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     load_loopback_mcp_config_inner(proxy_port, model_port, false)
+}
+
+fn load_loopback_mcp_config_with_budget(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(yaml, original, "expected the example's retained-payload limit");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded loopback MCP config")
 }
 
 fn load_agentic_guardrails_config(proxy_port: u16, model_port: u16, nemo_port: u16) -> praxis_core::config::Config {
@@ -7963,7 +9599,18 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
+    // This variant delegates conversation history to the model backend. The
+    // local Conversations filter cannot append to that backend-owned ID.
+    let yaml = yaml.replacen(
+        "      - filter: openai_conversations\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        conversations_table: openai_conversations\n        items_table: openai_conversation_items\n\n",
+        "",
+        1,
+    );
     let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
+    assert!(
+        !yaml.contains("      - filter: openai_conversations\n"),
+        "native conversation history must not append into the local store"
+    );
     assert!(
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"
