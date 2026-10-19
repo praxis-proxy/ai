@@ -275,6 +275,72 @@ fn indexed_buffered_collection_allocates_less_than_payload_dispatch_copies() {
 }
 
 #[test]
+fn indexed_collection_saves_copies_for_many_small_items() {
+    // Companion to the single-long-string probe above: the same total payload
+    // (256 KiB) split across many small items. Indexed dispatch must still avoid
+    // the per-item accumulated and dispatch deep copies, so all three metrics
+    // (allocation count, cumulative bytes, peak live bytes) improve.
+    const ITEMS: usize = 256;
+    const ITEM_BYTES: usize = 1024;
+    let total_payload = (ITEMS * ITEM_BYTES) as u64;
+    let output: Vec<Value> = (0..ITEMS)
+        .map(|i| {
+            json!({
+                "type": "function_call",
+                "id": format!("fc_{i}"),
+                "call_id": format!("call_{i}"),
+                "name": "server__lookup",
+                "arguments": "x".repeat(ITEM_BYTES),
+                "status": "completed"
+            })
+        })
+        .collect();
+    let response = json!({ "object": "response", "output": output });
+    let mut old_response = response.clone();
+    let mut new_response = response;
+    let mut old_state = ResponsesState::default();
+    let mut new_state = ResponsesState::default();
+    let mut old_dispatch = Vec::new();
+
+    let old = allocation_counter::measure(|| {
+        for item in old_response["output"].as_array_mut().unwrap().iter() {
+            old_state.accumulated_output.push(item.clone());
+            old_dispatch.push(item.clone());
+            old_state.messages.push(item.clone());
+            old_state.persisted_messages.push(item.clone());
+        }
+        std::hint::black_box(&old_dispatch);
+    });
+    let new = allocation_counter::measure(|| {
+        collect_output_items(&mut new_response, &mut new_state, &[]);
+        std::hint::black_box(&new_state);
+    });
+
+    assert_eq!(new_state.selected_tool_calls().len(), ITEMS);
+    assert_eq!(new_state.messages, old_state.messages);
+    assert_eq!(new_state.persisted_messages, old_state.persisted_messages);
+    assert_eq!(new_state.accumulated_output, old_state.accumulated_output);
+    assert!(
+        old.bytes_total >= new.bytes_total + 2 * total_payload,
+        "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
+        old.bytes_total,
+        new.bytes_total
+    );
+    assert!(
+        old.count_total > new.count_total,
+        "old payload copies allocated {} times; indexed collection allocated {} times",
+        old.count_total,
+        new.count_total
+    );
+    assert!(
+        old.bytes_max >= new.bytes_max + 2 * total_payload,
+        "old retained copies peaked at {} bytes; indexed collection peaked at {} bytes",
+        old.bytes_max,
+        new.bytes_max
+    );
+}
+
+#[test]
 fn streamed_round_moves_public_output_payload_without_reallocating_it() {
     let mut state = ResponsesState {
         response_object: json!({
