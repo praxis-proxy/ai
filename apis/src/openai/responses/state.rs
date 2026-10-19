@@ -2827,4 +2827,50 @@ mod tests {
             "accessor falls back to canonical tool_choice when request_body has no key",
         );
     }
+
+    #[test]
+    fn output_assignment_resolves_only_the_unchanged_current_round_item() {
+        let item = json!({"id": "fc_1", "type": "function_call", "name": "t", "call_id": "c1"});
+        let assignment = OutputAssignment::new(1, &item).expect("assignment from an item carrying an id");
+
+        // A matching index, id, and type within the current round resolves by borrow.
+        let output = vec![json!({"id": "prev", "type": "function_call"}), item.clone()];
+        assert_eq!(
+            assignment.resolve(&output, 1, "function_call"),
+            Some(&output[1]),
+            "a current-round item with matching id and type resolves",
+        );
+
+        // An index before the round start belongs to a prior round and must not dispatch.
+        assert!(
+            assignment.resolve(&output, 2, "function_call").is_none(),
+            "an index before round_start must not resolve",
+        );
+
+        // A rewritten slot (same index, different id) must not dispatch a different item.
+        let rewritten = vec![
+            json!({"id": "prev", "type": "function_call"}),
+            json!({"id": "other", "type": "function_call"}),
+        ];
+        assert!(
+            assignment.resolve(&rewritten, 1, "function_call").is_none(),
+            "a displaced or rewritten id at the index must not resolve",
+        );
+
+        // A changed item type at the slot must not resolve.
+        let retyped = vec![
+            json!({"id": "prev", "type": "function_call"}),
+            json!({"id": "fc_1", "type": "message"}),
+        ];
+        assert!(
+            assignment.resolve(&retyped, 1, "function_call").is_none(),
+            "a changed item type at the index must not resolve",
+        );
+
+        // An index past the end (the output shrank) fails safely rather than panicking.
+        assert!(
+            assignment.resolve(&output[..1], 0, "function_call").is_none(),
+            "an out-of-bounds index must not resolve",
+        );
+    }
 }
