@@ -495,34 +495,82 @@ fn validate_replay_literal_credentials(mapping: &serde_yaml::Mapping) -> Result<
 ///
 /// The filter type is admitted so deferred-connector sanitization (no
 /// `tools/list`) can replay. An MCP tool without `defer_loading: true` would
-/// call `tools/list` even when the connector URL is the replay-owned backend,
-/// so those scenario requests are not contained.
+/// normally call `tools/list` even when the connector URL is the replay-owned
+/// backend, so those scenario requests are not contained — **unless** the
+/// resolver runs in protected admission mode (#1724), where an untrusted target
+/// (a direct `server_url`, or a connector with no catalog trust) is excluded
+/// without dialing and is therefore replay-contained.
 fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScenario) -> Result<(), FixtureError> {
-    if !json_contains_filter(config, "openai_mcp_tool_resolve") {
+    let mut resolvers = Vec::new();
+    collect_mcp_resolve_filters(config, &mut resolvers);
+    if resolvers.is_empty() {
         return Ok(());
     }
     for turn in &scenario.turns {
-        if recorded_body_has_eager_mcp_tool(&turn.request.body) {
+        if recorded_body_has_dialing_mcp_tool(&turn.request.body, &resolvers) {
             return Err(runtime_error("scenario MCP listing is not replay-contained"));
         }
     }
     Ok(())
 }
 
-/// Whether a serialized config tree names `filter_type` as a pipeline filter.
-fn json_contains_filter(value: &Value, filter_type: &str) -> bool {
+/// Collect every `openai_mcp_tool_resolve` filter object in a config tree.
+///
+/// A config can declare more than one resolver (e.g. across chains); the replay
+/// check must consider all of them so a protected resolver in an unused chain
+/// cannot mask an advisory resolver on the active chain that still dials.
+fn collect_mcp_resolve_filters<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
     match value {
         Value::Object(object) => {
-            object.get("filter").and_then(Value::as_str) == Some(filter_type)
-                || object.values().any(|value| json_contains_filter(value, filter_type))
+            if object.get("filter").and_then(Value::as_str) == Some("openai_mcp_tool_resolve") {
+                out.push(value);
+            }
+            for child in object.values() {
+                collect_mcp_resolve_filters(child, out);
+            }
         },
-        Value::Array(values) => values.iter().any(|value| json_contains_filter(value, filter_type)),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+        Value::Array(values) => {
+            for child in values {
+                collect_mcp_resolve_filters(child, out);
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
     }
 }
 
-/// Whether a scenario request body contains an MCP tool that would call `tools/list` now.
-fn recorded_body_has_eager_mcp_tool(body: &RecordedBody) -> bool {
+/// Whether a resolver filter runs in protected admission mode.
+fn resolver_is_protected(resolver: &Value) -> bool {
+    resolver
+        .get("tool_admission")
+        .and_then(|admission| admission.get("mode"))
+        .and_then(Value::as_str)
+        == Some("protected")
+}
+
+/// Whether a configured connector is operator-trusted for catalog admission.
+fn connector_has_catalog_trust(resolver: &Value, connector_id: &str) -> bool {
+    resolver
+        .get("connectors")
+        .and_then(Value::as_array)
+        .is_some_and(|connectors| {
+            connectors.iter().any(|connector| {
+                connector.get("id").and_then(Value::as_str) == Some(connector_id)
+                    && connector
+                        .get("trust")
+                        .and_then(|trust| trust.get("catalog"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
+        })
+}
+
+/// Whether a scenario request body contains an MCP tool that would call
+/// `tools/list` now under any configured resolver.
+///
+/// A tool is uncontained if ANY resolver would dial it, so a single advisory
+/// resolver keeps an eager entry out of replay even when another resolver is
+/// protected.
+fn recorded_body_has_dialing_mcp_tool(body: &RecordedBody, resolvers: &[&Value]) -> bool {
     let RecordedBody::Json { value } = body else {
         return false;
     };
@@ -530,9 +578,30 @@ fn recorded_body_has_eager_mcp_tool(body: &RecordedBody) -> bool {
         return false;
     };
     tools.iter().any(|tool| {
-        tool.get("type").and_then(Value::as_str) == Some("mcp")
-            && !tool.get("defer_loading").and_then(Value::as_bool).unwrap_or(false)
+        resolvers
+            .iter()
+            .any(|resolver| mcp_tool_would_dial(tool, resolver_is_protected(resolver), resolver))
     })
+}
+
+/// Whether one request tool entry would trigger an eager `tools/list` dial.
+fn mcp_tool_would_dial(tool: &Value, protected: bool, resolver: &Value) -> bool {
+    if tool.get("type").and_then(Value::as_str) != Some("mcp") {
+        return false;
+    }
+    if tool.get("defer_loading").and_then(Value::as_bool).unwrap_or(false) {
+        // Deferred connectors are sanitized without an eager `tools/list`.
+        return false;
+    }
+    if !protected {
+        return true;
+    }
+    // Protected mode: only a catalog-trusted connector is dialed. Untrusted
+    // direct targets and untrusted connectors are excluded without dialing.
+    match tool.get("connector_id").and_then(Value::as_str) {
+        Some(connector_id) => connector_has_catalog_trust(resolver, connector_id),
+        None => false,
+    }
 }
 
 /// Traverses top-level and inline branch filters without scanning inert config data.

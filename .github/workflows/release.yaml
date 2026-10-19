@@ -181,17 +181,40 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           # latest=auto tags this release as latest-fips too, mirroring the
-          # standard image's latest tag. Only the Release workflow (on a
-          # version tag) does this; the nightly Publish workflow keeps
-          # latest=false so scheduled builds never move latest-fips.
+          # standard image's latest tag. onlatest=true is what applies the
+          # -fips suffix to that latest tag: without it metadata-action emits a
+          # bare latest (suffix is applied to every tag "and optionally for
+          # latest"), and the push loop below would overwrite the standard
+          # (Alpine) image's latest with the FIPS build, breaking SQLite-backed
+          # stores for :latest deployments (issue #1731). Only the Release
+          # workflow (on a version tag) does this; the nightly Publish workflow
+          # keeps latest=false so scheduled builds never move latest-fips.
           flavor: |
             latest=auto
-            suffix=-fips
+            suffix=-fips,onlatest=true
           tags: |
             type=sha
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+
+      # Guard the one tag that must never belong to the FIPS image: a bare
+      # latest. The standard container job owns latest (the Alpine full build);
+      # if the suffix flavor ever regresses to emitting an unsuffixed latest
+      # here, the push loop below would clobber it with the FIPS build (#1731).
+      # Checked from the resolved tag list so it catches the mistake before any
+      # push, with no registry round-trip.
+      - name: Assert the FIPS metadata did not emit a bare latest tag
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+          BARE_LATEST: ghcr.io/${{ github.repository }}:latest
+        run: |
+          if grep -qxF "$BARE_LATEST" <<< "$PUBLISHED_TAGS"; then
+            echo "::error::FIPS metadata emitted a bare '$BARE_LATEST'; the push loop would overwrite the standard (Alpine) image's latest with the FIPS build. The -fips suffix needs onlatest=true so the FIPS release lands on latest-fips (issue #1731)."
+            exit 1
+          fi
+          echo "FIPS tags (no bare latest):"
+          printf '%s\n' "$PUBLISHED_TAGS" | sed 's/^/  /'
 
       - name: Tag and push the scanned FIPS image
         id: push-fips

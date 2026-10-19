@@ -1306,6 +1306,7 @@ mod tests {
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["responses_native_passthrough"],
                 vec!["openai_responses_to_chat_completions"],
             ]
         );
@@ -1394,11 +1395,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 78, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 64, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 69, "manifest recording inventory count");
+        assert_eq!(report.features_total, 79, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 65, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 70, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1456,6 +1458,7 @@ mod tests {
                 "responses/client-tool-compat-stream",
                 "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
+                "responses/mcp-tool-admission-untrusted-direct",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-continuation",
@@ -1468,7 +1471,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 78, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 79, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1829,6 +1832,10 @@ mod tests {
                 (
                     &"vertex.anthropic.request.resolved_target".to_owned(),
                     &vec!["vertex/anthropic-wire-translation".to_owned()]
+                ),
+                (
+                    &"responses.native.mcp_admission_untrusted_excluded".to_owned(),
+                    &vec!["responses/mcp-tool-admission-untrusted-direct".to_owned()]
                 ),
                 (
                     &"responses.chat.tools.orphan_output_projection".to_owned(),

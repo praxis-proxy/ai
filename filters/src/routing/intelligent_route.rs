@@ -25,10 +25,7 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -413,7 +410,8 @@ enum AffinityOutcome<'a> {
 ///   enabled.
 /// - `praxis_ai_intelligent_route_session_table_entries` — entries in the session tables of every instance in this
 ///   process, including expired entries not yet evicted; instances add up and a dropped instance subtracts its table.
-/// - `praxis_ai_intelligent_route_snapshot_candidates` — candidates in the serving snapshot.
+/// - `praxis_ai_intelligent_route_snapshot_candidates` — candidates in the serving snapshot, published by the instance
+///   serving requests and cleared when it is dropped.
 /// - `praxis_ai_intelligent_route_snapshot_reloads_total{result}` — `accepted`, `unchanged`, `rejected`, or
 ///   `read_error`, per overlay reload attempt.
 ///
@@ -534,10 +532,10 @@ pub struct IntelligentRouteFilter {
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     /// Clusters reported to pipeline validation; see `selected_clusters`.
     reported_clusters: Vec<String>,
-    /// Whether the snapshot-size gauge has been published from the request
-    /// path. Construction may run before the metrics recorder is installed,
-    /// so the first request republishes it.
-    snapshot_gauge_published: AtomicBool,
+    /// This instance's claim on the snapshot-size gauge, shared with the
+    /// overlay watcher so an accepted reload republishes only while this
+    /// instance serves.
+    snapshot_gauge: Arc<metrics::SnapshotOwner>,
 }
 
 impl IntelligentRouteFilter {
@@ -565,7 +563,8 @@ impl IntelligentRouteFilter {
         let management_cluster = validate_management_cluster(cfg.management_cluster.as_deref(), &skip_paths)?;
         let allowed_clusters = validate_clusters(cfg.clusters.take())?;
         let static_mode = cfg.candidates.is_some();
-        let (snapshot, reload_handle) = build_route_snapshot(&mut cfg, allowed_clusters.as_ref())?;
+        let snapshot_gauge = Arc::new(metrics::SnapshotOwner::new());
+        let (snapshot, reload_handle) = build_route_snapshot(&mut cfg, allowed_clusters.as_ref(), &snapshot_gauge)?;
         let reported_clusters = reported_clusters(
             allowed_clusters.as_deref(),
             static_mode.then(|| snapshot.load()),
@@ -583,16 +582,13 @@ impl IntelligentRouteFilter {
             session_affinity,
             snapshot,
             reported_clusters,
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge,
         }))
     }
 
-    /// Publish the serving snapshot's candidate count once from the request path.
-    fn publish_snapshot_gauge_once(&self) {
-        if !self.snapshot_gauge_published.swap(true, Ordering::Relaxed) {
-            let _publish_guard = metrics::lock_snapshot_candidates();
-            metrics::set_snapshot_candidates(self.snapshot.load().candidates.len());
-        }
+    /// Claim the snapshot-size gauge for this serving instance.
+    fn claim_snapshot_gauge(&self) {
+        self.snapshot_gauge.claim(|| self.snapshot.load().candidates.len());
     }
 
     /// Handle a management/discovery path that bypasses model resolution.
@@ -693,6 +689,7 @@ type ClusterAllowlist = Option<Arc<BTreeSet<Arc<str>>>>;
 fn build_route_snapshot(
     cfg: &mut IntelligentRouteConfig,
     allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
+    snapshot_gauge: &Arc<metrics::SnapshotOwner>,
 ) -> SnapshotResult {
     if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
         return Err("intelligent_route: cannot set both overlay_file and candidates".into());
@@ -702,7 +699,13 @@ fn build_route_snapshot(
     }
     if let Some(path) = cfg.overlay_file.take() {
         let reload = cfg.reload.take().unwrap_or_default();
-        build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope.take(), allowed_clusters)
+        build_overlay_snapshot(
+            path,
+            &reload,
+            cfg.expected_overlay_scope.take(),
+            allowed_clusters,
+            snapshot_gauge,
+        )
     } else if let Some(candidates_raw) = cfg.candidates.take() {
         if cfg.reload.is_some() {
             return Err("intelligent_route: reload block is not valid with static candidates".into());
@@ -719,13 +722,10 @@ fn build_overlay_snapshot(
     reload: &ReloadConfig,
     expected_scope: Option<ExpectedOverlayScope>,
     allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
+    snapshot_gauge: &Arc<metrics::SnapshotOwner>,
 ) -> SnapshotResult {
-    let content = overlay::read_overlay_bounded(&path).map_err(|e| {
-        FilterError::from(format!(
-            "intelligent_route: failed to read overlay file {}: {e}",
-            path.display()
-        ))
-    })?;
+    let content = overlay::read_overlay_bounded(&path)
+        .map_err(|e| format!("intelligent_route: failed to read overlay file {}: {e}", path.display()))?;
     let snap = RouteSnapshot::from_overlay_with_scope(&content, expected_scope.as_ref())?;
     accept_initial_snapshot(&snap, allowed_clusters)?;
     tracing::info!(
@@ -745,6 +745,7 @@ fn build_overlay_snapshot(
             reload.debounce_ms,
             expected_scope,
             allowed_clusters.map(Arc::clone),
+            Some(Arc::clone(snapshot_gauge)),
         )?)
     } else {
         None
@@ -775,7 +776,11 @@ fn build_static_snapshot(
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
 }
 
-/// Check the initial snapshot against the allowlist and publish its size.
+/// Check the initial snapshot against the allowlist.
+///
+/// Its size is not published here: a reload builds a replacement instance
+/// before deciding whether to serve it, so the gauge follows the first
+/// request instead (see [`metrics::SnapshotOwner`]).
 fn accept_initial_snapshot(
     snap: &RouteSnapshot,
     allowed_clusters: Option<&Arc<BTreeSet<Arc<str>>>>,
@@ -783,7 +788,6 @@ fn accept_initial_snapshot(
     if let Some(allowed) = allowed_clusters {
         overlay::validate_snapshot_clusters(snap, allowed)?;
     }
-    metrics::set_snapshot_candidates(snap.candidates.len());
     Ok(())
 }
 
@@ -973,7 +977,7 @@ impl HttpFilter for IntelligentRouteFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        self.publish_snapshot_gauge_once();
+        self.claim_snapshot_gauge();
         // Client-supplied routing protocol context is never allowed to survive an
         // edge routing decision.
         ctx.request_headers_to_remove
@@ -1070,17 +1074,14 @@ fn record_session(
     session_key: Option<&str>,
     failover: bool,
 ) {
-    let bound = if let Some(key) = session_key {
-        store_binding(affinity, key, candidate);
+    let bound = session_key.is_some_and(|key| store_binding(affinity, key, candidate));
+    if bound {
         metrics::record_session_event(if failover {
             SessionEvent::Failover
         } else {
             SessionEvent::Bound
         });
-        true
-    } else {
-        false
-    };
+    }
     ctx.set_metadata("intelligent_route.session.bound", if bound { "true" } else { "false" });
     ctx.set_metadata("intelligent_route.session.reused", "false");
     ctx.set_metadata(
@@ -1262,14 +1263,14 @@ fn lookup_binding<'a>(
     AffinityOutcome::Failover
 }
 
-/// Store or update a session binding.
-fn store_binding(affinity: &SessionAffinity, key: &str, candidate: &RouteCandidate) {
+/// Store or update a session binding; `false` when the table is full.
+fn store_binding(affinity: &SessionAffinity, key: &str, candidate: &RouteCandidate) -> bool {
     if affinity.bindings.len() >= MAX_BINDINGS {
         evict_expired(affinity);
     }
     if affinity.bindings.len() >= MAX_BINDINGS {
         tracing::warn!("intelligent_route: session binding table full; routing without binding");
-        return;
+        return false;
     }
     let previous = affinity.bindings.insert(
         key.to_owned(),
@@ -1283,14 +1284,24 @@ fn store_binding(affinity: &SessionAffinity, key: &str, candidate: &RouteCandida
     if previous.is_none() {
         metrics::session_table_grew(1);
     }
+    true
 }
 
 /// Remove all expired bindings.
+///
+/// Removals are counted inside `retain`, since the table is shared and
+/// another request may be inserting or evicting concurrently.
 fn evict_expired(affinity: &SessionAffinity) {
     let now = Instant::now();
-    let before = affinity.bindings.len();
-    affinity.bindings.retain(|_, b| b.expires > now);
-    metrics::session_table_shrank(before.saturating_sub(affinity.bindings.len()));
+    let mut removed = 0;
+    affinity.bindings.retain(|_, b| {
+        let keep = b.expires > now;
+        if !keep {
+            removed += 1;
+        }
+        keep
+    });
+    metrics::session_table_shrank(removed);
 }
 
 // -----------------------------------------------------------------------------
@@ -2461,7 +2472,7 @@ mod tests {
             session_affinity: None,
             snapshot: Arc::clone(&shared),
             reported_clusters: Vec::new(),
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge: Arc::new(metrics::SnapshotOwner::new()),
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -2617,7 +2628,7 @@ mod tests {
             session_affinity: None,
             snapshot: Arc::clone(&shared),
             reported_clusters: Vec::new(),
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge: Arc::new(metrics::SnapshotOwner::new()),
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
@@ -3337,7 +3348,7 @@ mod tests {
             session_affinity: Some(make_test_affinity()),
             snapshot,
             reported_clusters: Vec::new(),
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge: Arc::new(metrics::SnapshotOwner::new()),
         };
 
         let mut first = crate::test_utils::make_request(Method::POST, "/chat");
@@ -3433,7 +3444,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
         std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
-        overlay::handle_overlay_reload(&path, &shared, None, None);
+        overlay::handle_overlay_reload(&path, &shared, None, None, None);
 
         let serving = shared.load();
         assert!(
@@ -3487,7 +3498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
         std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
-        overlay::handle_overlay_reload(&path, &shared, None, None);
+        overlay::handle_overlay_reload(&path, &shared, None, None, None);
 
         let serving = shared.load();
         let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
@@ -3531,7 +3542,7 @@ mod tests {
             session_affinity: None,
             snapshot: shared,
             reported_clusters: Vec::new(),
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge: Arc::new(metrics::SnapshotOwner::new()),
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
@@ -3885,6 +3896,156 @@ mod tests {
         );
     }
 
+    const TWO_CANDIDATES_YAML: &str = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n";
+    const ONE_CANDIDATE_YAML: &str = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
+
+    #[test]
+    fn a_replacement_that_never_serves_leaves_the_snapshot_gauge_alone() {
+        let (_serving, snapshot) = metrics_emitted_by(async {
+            let serving = parse(TWO_CANDIDATES_YAML).unwrap();
+            let _unused = route_path_model(serving.as_ref(), "/v1/chat/completions", "llama").await;
+            let rejected = parse(ONE_CANDIDATE_YAML).unwrap();
+            drop(rejected);
+            serving
+        });
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SNAPSHOT_CANDIDATES, &[]),
+            Some(2.0),
+            "a replacement built for a rejected reload never served, so the serving instance's count stands"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_gauge_follows_the_instance_that_serves() {
+        let (_successor, snapshot) = metrics_emitted_by(async {
+            let old = parse(TWO_CANDIDATES_YAML).unwrap();
+            let _unused = route_path_model(old.as_ref(), "/v1/chat/completions", "llama").await;
+            let new = parse(ONE_CANDIDATE_YAML).unwrap();
+            let _unused = route_path_model(new.as_ref(), "/v1/chat/completions", "llama").await;
+            drop(old);
+            new
+        });
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SNAPSHOT_CANDIDATES, &[]),
+            Some(1.0),
+            "the replaced instance no longer owns the gauge, so dropping it must not clear the successor's count"
+        );
+    }
+
+    /// Uses an isolated gauge slot: other tests in this process serve requests
+    /// concurrently and would otherwise take the process-wide slot between the
+    /// claim and the drop.
+    #[test]
+    fn dropping_the_serving_instance_clears_the_snapshot_gauge() {
+        let ((), snapshot) = metrics_emitted_by(async {
+            let serving = IntelligentRouteFilter {
+                model_header: HeaderName::from_static("x-model"),
+                _reload_handle: None,
+                skip_paths: Vec::new(),
+                management_cluster: None,
+                provider_hop_clusters: BTreeSet::new(),
+                session_affinity: None,
+                snapshot: Arc::new(ArcSwap::from_pointee(make_snapshot("inf-a"))),
+                reported_clusters: Vec::new(),
+                snapshot_gauge: Arc::new(metrics::SnapshotOwner::isolated()),
+            };
+            let _unused = route_path_model(&serving, "/v1/chat/completions", "llama").await;
+            drop(serving);
+        });
+        assert_eq!(
+            gauge_value(&snapshot, metrics::SNAPSHOT_CANDIDATES, &[]),
+            Some(0.0),
+            "no instance serves, so no snapshot size may be reported"
+        );
+    }
+
+    #[test]
+    fn concurrent_eviction_shrinks_the_session_gauge_by_each_removed_entry_once() {
+        const EXPIRED: usize = 4_000;
+        const EXPIRED_F64: f64 = 4_000.0;
+        const LIVE: usize = 100;
+        const THREADS: usize = 8;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let affinity = make_test_affinity();
+        let expired_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        for i in 0..EXPIRED {
+            affinity
+                .bindings
+                .insert(format!("expired-{i}"), test_binding(expired_at));
+        }
+        for i in 0..LIVE {
+            affinity.bindings.insert(
+                format!("live-{i}"),
+                test_binding(Instant::now() + Duration::from_secs(3600)),
+            );
+        }
+        let barrier = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    ::metrics::with_local_recorder(&recorder, || {
+                        barrier.wait();
+                        evict_expired(&affinity);
+                    });
+                });
+            }
+        });
+        assert_eq!(
+            affinity.bindings.len(),
+            LIVE,
+            "every expired entry is gone and every live one kept"
+        );
+        let samples: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key, value))
+            .collect();
+        assert_eq!(
+            gauge_value(&samples, metrics::SESSION_TABLE_ENTRIES, &[]),
+            Some(-EXPIRED_F64),
+            "concurrent evictions must each account only for the entries they removed"
+        );
+    }
+
+    #[test]
+    fn a_full_table_reports_no_binding_and_counts_no_session_event() {
+        let ((bound, cluster), samples) = metrics_emitted_by(async {
+            let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+            let affinity = make_test_affinity();
+            for i in 0..MAX_BINDINGS {
+                affinity.bindings.insert(
+                    format!("fill-{i}"),
+                    test_binding(Instant::now() + Duration::from_secs(3600)),
+                );
+            }
+            let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(affinity));
+            let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+            req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+            req.headers.insert("x-session-id", HeaderValue::from_static("overflow"));
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            let _unused = filter.on_request(&mut ctx).await.unwrap();
+            (
+                ctx.get_metadata("intelligent_route.session.bound").map(str::to_owned),
+                ctx.cluster.as_deref().map(str::to_owned),
+            )
+        });
+        assert_eq!(cluster.as_deref(), Some("c-a"), "routing still succeeds at capacity");
+        assert_eq!(
+            bound.as_deref(),
+            Some("false"),
+            "nothing was stored, so nothing is bound"
+        );
+        for event in ["bound", "failover"] {
+            assert_eq!(
+                counter_value(&samples, metrics::SESSION_TOTAL, &[("event", event)]),
+                None,
+                "a binding the table refused must not be counted as {event}"
+            );
+        }
+    }
+
     // ---- Cluster validation ----
 
     #[test]
@@ -4224,6 +4385,15 @@ mod tests {
         }
     }
 
+    fn test_binding(expires: Instant) -> Binding {
+        Binding {
+            expires,
+            kind: CapabilityKind::InferenceModel,
+            name: Arc::from("llama"),
+            stable_id: Arc::from("x"),
+        }
+    }
+
     fn make_affinity_filter(
         snapshot: Arc<ArcSwap<RouteSnapshot>>,
         session_affinity: Option<SessionAffinity>,
@@ -4237,7 +4407,7 @@ mod tests {
             session_affinity,
             snapshot,
             reported_clusters: Vec::new(),
-            snapshot_gauge_published: AtomicBool::new(false),
+            snapshot_gauge: Arc::new(metrics::SnapshotOwner::new()),
         }
     }
 
