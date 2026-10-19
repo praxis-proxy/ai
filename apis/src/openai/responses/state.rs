@@ -497,7 +497,12 @@ pub(crate) struct ResponsesState {
     /// Preserved as-is so downstream filters can inspect what the
     /// client actually sent, independent of conversation history
     /// resolved by `rehydrate`.
-    pub input: Vec<serde_json::Value>,
+    ///
+    /// Shares each item's `Arc` payload with [`Self::messages`] at construction,
+    /// so this immutable snapshot costs only a vector of handles rather than a
+    /// second deep copy of the input (#1618). Mutating `messages` detaches only
+    /// the edited item, leaving this view pointing at the original payload.
+    pub input: MessageHistory,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
     /// `openai_agentic_loop` at the start of each new inference round.
@@ -1101,7 +1106,7 @@ impl Default for ResponsesState {
             local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
-            input: Vec::new(),
+            input: MessageHistory::default(),
             iteration: 0,
             deferred_mcp: Vec::new(),
             #[cfg(feature = "openai-mcp-tools")]
@@ -1284,9 +1289,12 @@ impl ResponsesState {
 
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
-        let messages = normalize_input(&body);
+        let messages = MessageHistory::from(normalize_input(&body));
+        // `input` is the immutable client snapshot and `persisted_messages` the
+        // persistence view. Cloning `MessageHistory` shares each item's `Arc`
+        // payload, so neither view deep-copies the input here (#1618); only
+        // `messages` detaches an item when a later filter mutates it.
         let input = messages.clone();
-        let messages = MessageHistory::from(messages);
         let persisted_messages = messages.clone();
         let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
         let tool_choice = body
@@ -1864,6 +1872,122 @@ mod tests {
         assert_eq!(state.input, vec![input]);
         assert_eq!(state.messages, state.input);
         assert_eq!(state.persisted_messages, state.input);
+    }
+
+    /// Two-item body shared by the input-ownership tests below.
+    fn two_item_state() -> ResponsesState {
+        ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": "second"}
+            ]
+        }))
+    }
+
+    #[test]
+    fn from_request_body_shares_input_payloads_with_histories() {
+        // The immutable input snapshot shares each item's Arc payload with both
+        // the backend and persistence histories, so no item is deep-copied at
+        // construction (#1618).
+        let state = two_item_state();
+        assert!(
+            state.input.shares_item_with(0, &state.messages, 0),
+            "shares item 0 with messages"
+        );
+        assert!(
+            state.input.shares_item_with(1, &state.messages, 1),
+            "shares item 1 with messages"
+        );
+        assert!(
+            state.input.shares_item_with(0, &state.persisted_messages, 0),
+            "shares item 0 with persisted_messages"
+        );
+    }
+
+    #[test]
+    fn messages_mutation_detaches_only_the_edited_input_item() {
+        let mut state = two_item_state();
+        state.messages[0]["content"] = json!("changed");
+        assert!(
+            !state.input.shares_item_with(0, &state.messages, 0),
+            "the edited message detaches from the input snapshot"
+        );
+        assert_eq!(
+            state.input[0]["content"], "first",
+            "the input snapshot keeps the original payload"
+        );
+        assert!(
+            state.input.shares_item_with(1, &state.messages, 1),
+            "an untouched item stays shared after an unrelated edit"
+        );
+    }
+
+    #[test]
+    fn from_request_body_input_snapshot_shares_large_text_without_deep_copy() {
+        // Prepare both representations outside the measured closures so only the
+        // input-snapshot clone is measured, never the parse (#1618 step 2).
+        let large = "x".repeat(200_000);
+        let body = json!({"model": "gpt-4o", "input": large});
+        let normalized = normalize_input(&body);
+        let history = MessageHistory::from(normalized.clone());
+
+        // Legacy ownership kept a second *deep* copy of the normalized input.
+        let legacy = allocation_counter::measure(|| {
+            std::hint::black_box(normalized.clone());
+        });
+        // The new snapshot clones only Arc handles.
+        let shared = allocation_counter::measure(|| {
+            std::hint::black_box(history.clone());
+        });
+
+        assert!(
+            legacy.bytes_total >= 200_000,
+            "legacy input snapshot deep-copies the 200 KiB text, allocated {} bytes",
+            legacy.bytes_total
+        );
+        assert!(
+            shared.bytes_total < legacy.bytes_total,
+            "shared input snapshot must not deep-copy the text: shared={} bytes, legacy={} bytes",
+            shared.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[test]
+    fn from_request_body_input_snapshot_shares_many_small_messages_without_deep_copy() {
+        // Many small objects: the shape the issue calls out as amplifying most.
+        let items: Vec<_> = (0..2_000)
+            .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
+            .collect();
+        let body = json!({"model": "gpt-4o", "input": items});
+        let normalized = normalize_input(&body);
+        let history = MessageHistory::from(normalized.clone());
+
+        let legacy = allocation_counter::measure(|| {
+            std::hint::black_box(normalized.clone());
+        });
+        let shared = allocation_counter::measure(|| {
+            std::hint::black_box(history.clone());
+        });
+
+        assert!(
+            legacy.count_total >= 2_000,
+            "legacy input snapshot allocates per item, made {} allocations",
+            legacy.count_total
+        );
+        assert!(
+            shared.bytes_total < legacy.bytes_total,
+            "shared input snapshot must not deep-copy each item: shared={} bytes, legacy={} bytes",
+            shared.bytes_total,
+            legacy.bytes_total
+        );
+        assert!(
+            shared.count_total < legacy.count_total,
+            "shared input snapshot allocates far fewer times: shared={}, legacy={}",
+            shared.count_total,
+            legacy.count_total
+        );
     }
 
     #[test]

@@ -781,7 +781,6 @@ fn continuation_state_fits(
     }
     for values in [
         &state.accumulated_output,
-        &state.input,
         &state.previous_tools,
         &state.tools,
     ] {
@@ -790,7 +789,9 @@ fn continuation_state_fits(
         };
         used = used.saturating_add(size);
     }
-    for history in [&state.messages, &state.persisted_messages] {
+    // `input` shares item payloads with `messages`, so charging all three is a
+    // conservative over-estimate — safe for a fail-closed DoS bound (#313/#1618).
+    for history in [&state.input, &state.messages, &state.persisted_messages] {
         let Some(size) = bounded_json_size(history, max_bytes.saturating_sub(used))
             .ok()
             .flatten()
