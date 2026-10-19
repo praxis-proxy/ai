@@ -216,12 +216,11 @@ test-inference-fixtures:
 	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
 
-# The API store contracts use both pg_ and postgres_ prefixes. Backend tests
-# live in their own crate; run all its ignored tests with only PostgreSQL enabled
-# so new history regressions cannot be silently dropped by a name filter.
+# Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
+# --ignored alone selects them all: no name filter can drop one silently.
+# Backend history regressions run the same way with only PostgreSQL enabled.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
-		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored $(if $(V),--nocapture)
 	cargo test -p praxis-ai-store-backends --no-default-features --features postgres \
 		-- --ignored $(if $(V),--nocapture)
 

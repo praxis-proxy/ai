@@ -2319,7 +2319,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires local PostgreSQL via DATABASE_URL"]
     async fn history_read_cancellation_releases_partial_progress() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(true))
+        tokio::time::timeout(std::time::Duration::from_secs(40), history_read_cleanup(true))
             .await
             .expect("cancelled history read must release its only connection");
     }
@@ -2327,7 +2327,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires local PostgreSQL via DATABASE_URL"]
     async fn history_read_error_releases_partial_progress() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(false))
+        tokio::time::timeout(std::time::Duration::from_secs(40), history_read_cleanup(false))
             .await
             .expect("failed history read must release its only connection");
     }
@@ -2627,37 +2627,68 @@ mod tests {
             .await
             .unwrap();
         let table = store.tables.items.as_deref().unwrap();
-        let update = format!("UPDATE {table} SET item_data = $1 WHERE conversation_id = $2 AND item_id = $3");
+        // A data-row query missing any owner column is a cross-tenant leak, even
+        // in a fixture: scope every write to the owning tenant and principal.
+        let update = format!(
+            "UPDATE {table} SET item_data = $1 WHERE conversation_id = $2 AND item_id = $3 \
+             AND tenant_id = $4 AND owner_issuer = $5 AND owner_subject = $6"
+        );
         if !cancel {
             sqlx::query(AssertSqlSafe(update.as_str()))
                 .bind("{broken-json")
                 .bind(&conversation_id)
                 .bind(&items.get(1).unwrap().item_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .execute(&store.pool)
                 .await
                 .unwrap();
         }
-        let before = read_snapshot(&store, &conversation_id).await;
-        interrupt_history_read(
-            &mut store,
-            &owner,
-            &conversation_id,
-            &items.first().unwrap().item_data,
-            cancel,
-        )
-        .await;
+        let before = read_snapshot(&store, &owner, &conversation_id).await;
+        // The pool's only connection: capture its server backend pid so recovery
+        // proves the interrupted session itself survived, not that the pool
+        // silently opened a replacement.
         let mut connection = store.pool.acquire().await.unwrap();
-        let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+        let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *connection)
             .await
             .unwrap();
-        assert_eq!(
-            read_only, "off",
-            "the history reader's read-only transaction was rolled back"
-        );
         drop(connection);
+        // Only the interrupted read and connection recovery run under the short
+        // timeout: the generous fixture envelope above covers setup, so setup
+        // duration cannot consume the read timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            interrupt_history_read(
+                &mut store,
+                &owner,
+                &conversation_id,
+                &items.first().unwrap().item_data,
+                cancel,
+            )
+            .await;
+            let mut connection = store.pool.acquire().await.unwrap();
+            let recovered_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered_pid, backend_pid,
+                "the interrupted connection itself recovered, not a replacement session"
+            );
+            let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_only, "off",
+                "the history reader's read-only transaction was rolled back"
+            );
+        })
+        .await
+        .expect("interrupted history read and connection recovery finish within 10 seconds");
         assert_eq!(
-            read_snapshot(&store, &conversation_id).await,
+            read_snapshot(&store, &owner, &conversation_id).await,
             before,
             "reads must preserve item bytes, positions, and legacy cache"
         );
@@ -2674,6 +2705,9 @@ mod tests {
                 .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
                 .bind(&conversation_id)
                 .bind(&items.get(1).unwrap().item_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .execute(&store.pool)
                 .await
                 .unwrap();
@@ -2749,23 +2783,30 @@ mod tests {
 
     async fn read_snapshot(
         store: &PostgresResponseStore,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> (String, Vec<(String, i64, String)>) {
         let cache_sql = format!(
-            "SELECT messages FROM {} WHERE conversation_id = $1",
+            "SELECT messages FROM {} WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             store.tables.conversations
         );
         let cache = sqlx::query_scalar(AssertSqlSafe(cache_sql.as_str()))
             .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_one(&store.pool)
             .await
             .unwrap();
         let items_sql = format!(
-            "SELECT item_id, position, item_data FROM {} WHERE conversation_id = $1 ORDER BY position, item_id",
+            "SELECT item_id, position, item_data FROM {} WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 ORDER BY position, item_id",
             store.tables.items.as_deref().unwrap()
         );
         let rows = sqlx::query_as(AssertSqlSafe(items_sql.as_str()))
             .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_all(&store.pool)
             .await
             .unwrap();

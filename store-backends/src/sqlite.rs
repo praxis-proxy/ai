@@ -2237,20 +2237,24 @@ mod tests {
             })
             .await
             .unwrap();
-        let items: Vec<_> = ["z", "a", "m"]
-            .into_iter()
-            .map(|id| ConversationItemRecord {
+        // 64 rows overflow SQLx's 50-row worker channel: the reader pauses after
+        // one decoded row while the worker is parked on a full channel, so
+        // cancellation and failure must unblock the worker before the rollback
+        // can run. Three rows only ever exercised dropping buffered rows.
+        let items: Vec<_> = (0..64)
+            .map(|index| ConversationItemRecord {
                 owner: owner.clone(),
                 conversation_id: "c".into(),
-                item_id: id.into(),
+                item_id: format!("item_{index:08}"),
                 created_at: 1,
                 position: 0,
-                item_data: serde_json::json!({"id": id, "content": "x".repeat(65_536)}),
+                item_data: serde_json::json!({"id": index, "content": "x".repeat(64)}),
             })
             .collect();
         store.create_items_and_sync_messages(&owner, "c", &items).await.unwrap();
         if !cancel {
-            sqlx::query("UPDATE items SET item_data = '{broken-json' WHERE item_id = 'a'")
+            sqlx::query("UPDATE items SET item_data = '{broken-json' WHERE item_id = ?")
+                .bind(&items.get(1).unwrap().item_id)
                 .execute(&store.pool)
                 .await
                 .unwrap();
@@ -2272,18 +2276,18 @@ mod tests {
         let stranger = StateOwner::from_trusted_parts("other-tenant", "issuer", "subject").unwrap();
         assert!(store.conversation_history(&stranger, "c").await.unwrap().is_none());
         if !cancel {
-            sqlx::query("UPDATE items SET item_data = ? WHERE item_id = 'a'")
+            sqlx::query("UPDATE items SET item_data = ? WHERE item_id = ?")
                 .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
+                .bind(&items.get(1).unwrap().item_id)
                 .execute(&store.pool)
                 .await
                 .unwrap();
         }
-        let expected = vec![
-            legacy,
-            items.first().unwrap().item_data.clone(),
-            items.get(1).unwrap().item_data.clone(),
-            items.get(2).unwrap().item_data.clone(),
-        ];
+        let mut expected = Vec::with_capacity(items.len() + 1);
+        expected.push(legacy);
+        for item in &items {
+            expected.push(item.item_data.clone());
+        }
         assert_eq!(
             store.conversation_history(&owner, "c").await.unwrap(),
             Some(expected),
