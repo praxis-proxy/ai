@@ -8064,6 +8064,608 @@ fn approval_without_configured_store_is_rejected() {
 }
 
 // -----------------------------------------------------------------------------
+// Operator Approval Floor (issue #1723)
+// -----------------------------------------------------------------------------
+//
+// An operator can set `openai_mcp_dispatch.minimum_approval: always` to require
+// approval for EVERY MCP call, combined monotonically with each client's per-tool
+// policy: `approval_required = operator_floor || client_requires_approval`. A
+// client `require_approval: "never"` can no longer suppress the operator
+// requirement. These tests mirror the client-driven round trips above but send
+// `"never"` tools with the floor enabled, proving — for buffered and streaming
+// Responses, direct and connector-backed tools, deferred discovery, and multiple
+// rounds — that the floor forces an approval request and zero `tools/call` before
+// approval, that a valid approval still executes the call exactly once, and that
+// a denial executes nothing.
+
+/// Like [`load_approval_config`] but enables the operator approval floor on
+/// `openai_mcp_dispatch` (`minimum_approval: always`).
+fn load_approval_floor_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let floored = yaml.replacen(
+        "              - filter: openai_mcp_dispatch\n",
+        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        1,
+    );
+    assert_ne!(
+        floored, yaml,
+        "expected to inject minimum_approval into the openai_mcp_dispatch block; its config may have changed"
+    );
+    praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor config")
+}
+
+/// Like [`load_approval_floor_config`] but also rewrites the example's
+/// `corp_drive` connector to `connector_url`, so the floor can be exercised
+/// against connector-backed and deferred-discovery MCP tools whose destination is
+/// resolved internally (never client-supplied).
+fn load_approval_floor_connector_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    connector_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replacen(
+        "          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!("          - id: corp_drive\n            server_url: {connector_url}\n"),
+        1,
+    );
+    assert!(
+        yaml.contains(&format!("server_url: {connector_url}")),
+        "expected to rewrite the corp_drive connector url"
+    );
+    let floored = yaml.replacen(
+        "              - filter: openai_mcp_dispatch\n",
+        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        1,
+    );
+    assert_ne!(
+        floored, yaml,
+        "expected to inject minimum_approval into openai_mcp_dispatch"
+    );
+    praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor connector config")
+}
+
+/// The same MCP tool as [`approval_tools`] but with the client policy set to
+/// `"never"`, so only the operator floor can require approval.
+fn approval_never_tools(mcp_port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+        "allowed_tools": ["get_weather"],
+        "require_approval": "never"
+    }])
+}
+
+#[test]
+fn approval_floor_overrides_client_never_buffered() {
+    let model = StatefulCapturingBackend::new(vec![(200, approval_call_response()), (200, approval_final_response())])
+        .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_buffered");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    // The client explicitly asks for NO approval; the operator floor forces it.
+    // `request_approval` asserts exactly one mcp_approval_request and zero
+    // tools/call while the approval is pending.
+    let tools = approval_never_tools(mcp.port());
+    let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+    assert_eq!(approval_id, "call_appr_weather", "approval id must equal the call id");
+
+    // Approving resumes the recorded call, which executes exactly once.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, true, &tools),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "approved follow-up should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "an approved floored round trip must complete model→tool→model"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "a valid approval must execute the floored call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+}
+
+#[test]
+fn approval_floor_denied_makes_zero_tool_calls() {
+    let model = StatefulCapturingBackend::new(vec![(200, approval_call_response()), (200, approval_final_response())])
+        .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_deny");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+    let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, false, &tools),
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "denied follow-up should still return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "a denied floored approval must never execute the tool"
+    );
+}
+
+#[test]
+fn approval_floor_overrides_client_never_streaming() {
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_appr_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_appr_1",
+                    "object": "response",
+                    "created_at": 1000,
+                    "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_appr",
+                        "call_id": "call_appr_weather",
+                        "name": "weather__get_weather",
+                        "arguments": r#"{"location":"SF"}"#,
+                        "status": "completed"
+                    }]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![first_response]);
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_streaming");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "tools": approval_never_tools(mcp.port()),
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed floored approval must return normally: {raw}"
+    );
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model request lock should not be poisoned")
+            .len(),
+        1,
+        "the floor must stop the loop before another inference call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no tool may execute while a floored approval is pending"
+    );
+    assert_eq!(body.matches("event: response.completed").count(), 1, "{body}");
+    assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+    assert!(
+        body.contains("mcp_approval_request"),
+        "the floor must surface an approval request even though the client said never: {body}"
+    );
+    assert!(
+        body.contains("call_appr_weather"),
+        "the gated call must remain pending: {body}"
+    );
+}
+
+/// Extract the id of the single `response.completed` object from an SSE body.
+fn completed_response_id(sse_body: &str) -> String {
+    for line in sse_body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if value["response"]["status"] == "completed"
+            && let Some(id) = value["response"]["id"].as_str()
+        {
+            return id.to_owned();
+        }
+    }
+    panic!("no completed response id in SSE body: {sse_body}");
+}
+
+#[test]
+fn approval_floor_connector_backed_executes_once_on_approval() {
+    // The floor must apply to connector-backed tools whose destination is resolved
+    // internally (never client-supplied), not only to direct server_url tools.
+    let call_response = serde_json::json!({
+        "id": "resp_floor_conn_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_conn", "call_id": "call_floor_conn",
+            "name": "drive__search", "arguments": r#"{"query":"reports"}"#, "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_floor_conn_final", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Found quarterly reports."}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("search").with_description("Search files")],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1723_floor_connector");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_approval_floor_connector_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    // An eager connector-backed MCP tool whose client policy is "never".
+    let tools = serde_json::json!([{
+        "type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+        "allowed_tools": ["search"], "require_approval": "never"
+    }]);
+
+    // Turn 1: the floor forces an approval for the connector tool; nothing dispatches.
+    let request = serde_json::json!({"model": "gpt-4.1", "input": "Find quarterly reports", "tools": tools});
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "connector floored approval should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    let approvals: Vec<&serde_json::Value> = output.iter().filter(|i| i["type"] == "mcp_approval_request").collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the floor must surface one approval for a connector-backed tool: {output:#?}"
+    );
+    assert_eq!(approvals[0]["name"], "search");
+    assert_eq!(approvals[0]["server_label"], "drive");
+    let approval_id = approvals[0]["id"].as_str().unwrap().to_owned();
+    let previous_response_id = response["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no connector tool may execute before approval"
+    );
+
+    // Turn 2: approving runs the recorded connector call exactly once.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_id, true, &tools),
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved connector follow-up should return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "approval must execute the connector-backed call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("search"));
+}
+
+#[test]
+fn approval_floor_requires_approval_for_deferred_connector() {
+    // A deferred connector is discovered on a later round via tool_search; the
+    // floor must still require approval for the call the model makes against it,
+    // before any tools/call runs.
+    let search_response = serde_json::json!({
+        "id": "resp_floor_def_1", "object": "response", "status": "completed",
+        "output": [{"type": "tool_search_call", "id": "tsc_1", "status": "completed"}]
+    });
+    let call_response = serde_json::json!({
+        "id": "resp_floor_def_2", "object": "response", "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_def", "call_id": "call_floor_def",
+            "name": "drive__search", "arguments": r#"{"query":"reports"}"#, "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&search_response).unwrap()),
+        (200, serde_json::to_string(&call_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("search").with_description("Search files"),
+            McpToolFixture::new("delete").with_description("Delete files"),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1723_floor_deferred");
+    let proxy_port = free_port();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let config = load_approval_floor_connector_config(proxy_port, model.port(), db.url(), &mcp_url);
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find quarterly reports",
+        "tools": [
+            {"type": "tool_search"},
+            {"type": "mcp", "server_label": "drive", "connector_id": "corp_drive",
+             "defer_loading": true, "allowed_tools": ["search"], "require_approval": "never"}
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "deferred connector floored approval should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    let approvals: Vec<&serde_json::Value> = output.iter().filter(|i| i["type"] == "mcp_approval_request").collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the floor must surface an approval for a deferred-discovered connector tool: {output:#?}"
+    );
+    assert_eq!(approvals[0]["name"], "search");
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "tool_search must have discovered the deferred connector"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no deferred connector tool may execute while a floored approval is pending"
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "search then the (floored) call; the approval stops the loop before a third inference"
+    );
+}
+
+#[test]
+fn approval_floor_floors_a_call_produced_on_a_later_round() {
+    // After one floored call is approved and executed, a *subsequent* round that
+    // produces another MCP call must also be floored — the operator floor is
+    // re-applied every round, never just the first.
+    let call_a = serde_json::json!({
+        "id": "resp_floor_mr_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_a", "call_id": "call_floor_a",
+            "name": "weather__get_weather", "arguments": r#"{"location":"SF"}"#, "status": "completed"
+        }]
+    });
+    let call_b = serde_json::json!({
+        "id": "resp_floor_mr_2", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call", "id": "fc_b", "call_id": "call_floor_b",
+            "name": "weather__get_weather", "arguments": r#"{"location":"NYC"}"#, "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_a).unwrap()),
+        (200, serde_json::to_string(&call_b).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_multiround");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+
+    // Turn 1: the first call is floored.
+    let (approval_a, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
+    assert_eq!(approval_a, "call_floor_a");
+
+    // Turn 2: approving call A executes it once, then the model's *next* round
+    // produces call B, which the floor also gates — so call B is returned as a new
+    // approval request and does not execute.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &approval_followup(&previous_response_id, &approval_a, true, &tools),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "approved first call should return 200: {raw}");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(
+        output
+            .iter()
+            .any(|i| i["type"] == "mcp_call" && i["id"] == "call_floor_a"),
+        "the first (approved) call must have executed: {output:#?}"
+    );
+    let approvals_b: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|i| i["type"] == "mcp_approval_request" && i["id"] == "call_floor_b")
+        .collect();
+    assert_eq!(
+        approvals_b.len(),
+        1,
+        "the later-round call must be floored into its own approval request: {output:#?}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the approved first call may execute; the floored second call must not"
+    );
+}
+
+#[test]
+fn approval_floor_streaming_executes_once_on_approval() {
+    // The streaming floor must also complete the exchange: approving the pending
+    // call resumes a streamed round that executes the tool exactly once.
+    let turn1 = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_floor_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_floor_stream_1", "object": "response", "created_at": 1000, "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call", "id": "fc_appr", "call_id": "call_appr_weather",
+                        "name": "weather__get_weather", "arguments": r#"{"location":"SF"}"#, "status": "completed"
+                    }]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let turn2 = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_floor_stream_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_floor_stream_2", "object": "response", "created_at": 2000, "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "The weather in SF is 72F and sunny."}]}]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, _model_requests, _model_thread) = start_streaming_model(vec![turn1, turn2]);
+    let mcp = approval_weather_mock();
+
+    let db = TempSqlite::new("issue1723_floor_stream_rt");
+    let proxy_port = free_port();
+    let config = load_approval_floor_config(proxy_port, model_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_never_tools(mcp.port());
+
+    // Turn 1 (streamed): floor emits an approval request, nothing dispatches.
+    let request = serde_json::json!({
+        "model": "gpt-4.1", "input": "What is the weather in SF?", "stream": true, "tools": tools,
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed floored approval should return 200: {raw}"
+    );
+    assert!(
+        body.contains("mcp_approval_request"),
+        "turn 1 must stream an approval request: {body}"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 0, "no tool may run before approval");
+    let previous_response_id = completed_response_id(&body);
+
+    // Turn 2 (streamed): approving resumes and runs the tool exactly once.
+    let followup = approval_followup(&previous_response_id, "call_appr_weather", true, &tools);
+    let followup = serde_json::to_string(&{
+        let mut v: serde_json::Value = serde_json::from_str(&followup).unwrap();
+        v["stream"] = serde_json::Value::Bool(true);
+        v
+    })
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved streamed follow-up should return 200: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "approval must execute the streamed floored call exactly once"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
 

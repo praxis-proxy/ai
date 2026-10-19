@@ -20,6 +20,8 @@ use std::{
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
+#[cfg(feature = "openai-mcp-tools")]
+use super::mcp_classify::ApprovalFloor;
 use super::{
     bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response,
     history::MessageHistory,
@@ -445,6 +447,19 @@ pub(crate) struct ResponsesState {
     /// authority. Defaults to advisory (empty, no enforcement).
     #[cfg(feature = "openai-mcp-tools")]
     pub mcp_admission: super::mcp_admission::McpAdmissionDecisions,
+
+    /// Operator approval floor published by `openai_mcp_dispatch` during the
+    /// request phase for the `openai_agentic_loop` owner to apply when it
+    /// partitions approvals in the response phase of the same IRR iteration.
+    ///
+    /// Carried as typed request state (not step metadata) because the floor is a
+    /// security control that must never be silently dropped: `set_metadata` caps
+    /// at a fixed number of entries and drops a new key once full, so a saturated
+    /// metadata map could silently disable the floor and let a client
+    /// `require_approval: "never"` call execute automatically. A struct field has
+    /// no such ceiling and fails closed by construction.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_operator_approval_floor: ApprovalFloor,
 
     /// Maximum number of built-in tool invocations.
     ///
@@ -1041,6 +1056,8 @@ impl Default for ResponsesState {
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             #[cfg(feature = "openai-mcp-tools")]
             mcp_admission: super::mcp_admission::McpAdmissionDecisions::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_operator_approval_floor: ApprovalFloor::None,
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,

@@ -13,6 +13,7 @@ Executes MCP tool calls against upstream MCP servers within the Responses API ag
 | `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_credentials.assertions`. Must match the corresponding `openai_mcp_tool_resolve` setting. |
 | `outbound_chain` | string \| object | no | Inline outbound filter chain the MCP `tools/call` callout runs through. `openai_mcp_dispatch` runs inside an `iterative_request_router` step. praxis core builds each IRR step with a live chain-binding context, so an inline chain (`{ name, filters }`) is bound at step-build time. A named reference is rejected: IRR supplies each step an empty top-level named-chain map, so a `Named` reference can never resolve inside a step (see [`require_inline_outbound_chain`]). The chain carries only operator-configured cross-cutting filters — the SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture, not a per-filter flag. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `tools/call` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
+| `minimum_approval` | `always` | no | Operator approval floor applied to every MCP call in this pipeline, combined monotonically with each tool's client `require_approval`: `approval_required = operator_floor \|\| client_requires_approval`. Set `always` to require approval for every MCP call regardless of the client's request — a client `"never"` or a server-supplied `readOnlyHint` can never suppress it. Pending approvals are correlated through `previous_response_id`, so the pipeline needs `openai_responses_store` and `openai_responses_rehydrate`; without persistence the request fails closed (`store: false` → 400, no store → 500). Omit to preserve the client-driven behavior (the default). |
 | `timeout_ms` | integer | no | Per-call timeout in milliseconds for `tools/call` calls. Inside an iterative request router, every MCP exchange is capped by the router's remaining deadline. |
 | `max_calls_per_round` | integer | no | Hard cap on MCP calls processed from one model response, and the maximum number of `mcp_approval_response` items accepted from a single resume request — a resume batch cannot exceed what one round could have emitted (1..=1024; default: 32). |
 | `max_parallel_calls` | integer | no | Maximum concurrent MCP calls when `parallel_tool_calls` is enabled (1..=64; default: 8). |
@@ -31,6 +32,7 @@ filter: openai_mcp_dispatch
 
 ```yaml
 filter: openai_mcp_dispatch
+minimum_approval: always
 forward_headers:
   - x-tenant-id
   - x-user-id

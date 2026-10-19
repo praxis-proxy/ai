@@ -70,6 +70,8 @@ mod openai_doc_extract;
 mod openai_embeddings_routing;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_file_resolve;
+#[cfg(all(feature = "openai-mcp-tools", feature = "store-sqlite"))]
+mod openai_mcp_approval_floor;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
