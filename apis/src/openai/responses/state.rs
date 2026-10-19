@@ -1289,20 +1289,15 @@ impl ResponsesState {
 
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
-        let messages = MessageHistory::from(normalize_input(&body));
         // `input` is the immutable client snapshot and `persisted_messages` the
         // persistence view. Cloning `MessageHistory` shares each item's `Arc`
         // payload, so neither view deep-copies the input here (#1618); only
         // `messages` detaches an item when a later filter mutates it.
+        let messages = MessageHistory::from(normalize_input(&body));
         let input = messages.clone();
         let persisted_messages = messages.clone();
         let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
-        let tool_choice = body
-            .get("tool_choice")
-            .filter(|v| !v.is_null())
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
-
+        let tool_choice = request_tool_choice_or_auto(&body);
         let tools = extract_array_field(&body, "tools");
         Self {
             context_management: body.get("context_management").cloned(),
@@ -1735,6 +1730,14 @@ pub(crate) fn normalize_input_owned(input: serde_json::Value) -> Vec<serde_json:
         },
         _ => Vec::new(),
     }
+}
+
+/// Resolve the request's `tool_choice`, defaulting to `"auto"` when absent or null.
+fn request_tool_choice_or_auto(body: &serde_json::Value) -> serde_json::Value {
+    body.get("tool_choice")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()))
 }
 
 /// Extract a JSON array field by name, defaulting to empty.
