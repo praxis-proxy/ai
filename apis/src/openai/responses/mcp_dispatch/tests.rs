@@ -18,7 +18,8 @@ use super::{
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
     extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
     mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, reserve_mcp_execution, resolve_tool_entry, result_payload_limit,
+    prepare_response_round, process_call_result, reserve_mcp_execution, reserve_pending_approval_rows,
+    resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -122,6 +123,56 @@ fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
     let before = too_tight.simple_budget.unwrap().remaining_bytes();
     assert!(reserve_mcp_execution(&mut too_tight, 1, 8_192, 8_192).is_none());
     assert_eq!(too_tight.simple_budget.unwrap().remaining_bytes(), before);
+}
+
+#[test]
+fn reserve_pending_approval_rows_fails_closed_on_unknowable_size() {
+    // The `ResponseStore` trait default returns `usize::MAX` for a backend that
+    // cannot size stored approvals. Admission must reject that sentinel rather
+    // than load an unbounded payload, so an unknown backend fails closed before
+    // the rows are fetched.
+    let mut unknowable = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let before = unknowable.simple_budget.unwrap().remaining_bytes();
+    assert!(
+        !reserve_pending_approval_rows(&mut unknowable, 1, usize::MAX),
+        "a usize::MAX payload size must be rejected, not charged"
+    );
+    assert_eq!(
+        unknowable.simple_budget.unwrap().remaining_bytes(),
+        before,
+        "a rejected reservation must not spend any headroom"
+    );
+
+    // A small, knowable payload fits within a generous budget; the charge is
+    // 8x the payload bytes plus an 8 KiB per-row fixed cost.
+    let mut ample = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let ample_before = ample.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(reserve_pending_approval_rows(&mut ample, 2, 256));
+    assert_eq!(
+        ample.simple_budget.unwrap().remaining_bytes(),
+        Some(ample_before - (256 * 8 + 2 * 8_192)),
+        "the charge is 8x payload plus 8 KiB per reserved row"
+    );
+
+    // The same small payload cannot fit a tight budget: an ordinary
+    // over-budget rejection also leaves the headroom untouched.
+    let mut tight = ResponsesState {
+        simple_budget: SimpleBudget::new(4_096, 0),
+        ..ResponsesState::default()
+    };
+    let tight_before = tight.simple_budget.unwrap().remaining_bytes();
+    assert!(!reserve_pending_approval_rows(&mut tight, 1, 256));
+    assert_eq!(tight.simple_budget.unwrap().remaining_bytes(), tight_before);
+
+    // Without a configured budget the reservation is a no-op pass.
+    let mut unbudgeted = ResponsesState::default();
+    assert!(reserve_pending_approval_rows(&mut unbudgeted, 4, usize::MAX));
 }
 
 #[test]
