@@ -879,10 +879,9 @@ async fn sync_state_updates_responses_state() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    let state_input = state.request_body.get("input").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(
-        state_input[0]["content"][0]["type"], "input_text",
-        "state.request_body should have extracted input_text"
+    assert!(
+        state.request_body.get("input").is_none(),
+        "extracted input is synced into histories, not duplicated in request_body (#1618)"
     );
 
     assert_eq!(

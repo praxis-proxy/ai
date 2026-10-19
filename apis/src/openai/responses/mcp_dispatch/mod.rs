@@ -1302,7 +1302,11 @@ impl HttpFilter for McpDispatchFilter {
             let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
                 ctx.extensions
                     .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
+                    // Serialize the current request explicitly: `request_body` holds
+                    // parameters only, so re-attach the current input in its form (#1618).
+                    .and_then(|state| {
+                        serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)).ok()
+                    })
                     .unwrap_or_default()
             } else {
                 Vec::new()

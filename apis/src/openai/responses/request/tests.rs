@@ -1487,9 +1487,13 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
         .get::<ResponsesState>()
         .expect("the managed pass initializes state from the cached parse");
     assert_eq!(
-        state.request_body.pointer("/input").and_then(serde_json::Value::as_str),
+        state
+            .input
+            .get(0)
+            .and_then(|item| item.get("content"))
+            .and_then(serde_json::Value::as_str),
         Some("deserialize once"),
-        "state must come from the cached parse"
+        "state must come from the cached parse (input is moved out of request_body, #1618)"
     );
 }
 

@@ -885,6 +885,9 @@ pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
 pub(crate) mod rehydrate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod request;
+
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod request_input;
 #[cfg(feature = "openai-responses")]
 #[cfg(feature = "openai-responses")]
 pub(crate) mod web_search_dispatch;

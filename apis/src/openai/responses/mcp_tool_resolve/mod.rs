@@ -3036,7 +3036,7 @@ fn write_state(
         if let Some(tc) = parsed.get("tool_choice") {
             state.tool_choice = tc.clone();
         }
-        state.request_body = parsed;
+        state.set_request_params(parsed);
     } else {
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
@@ -3327,7 +3327,7 @@ fn commit_deferred_listings(
     // encoded-name collision cannot reject an admitted or client function (#1724).
     state.mcp_admission.mark_available_functions(&expanded_tools);
     state.tools = expanded_tools;
-    state.request_body = request_body;
+    state.set_request_params(request_body);
     state.mark_request_body_for_rebuild();
     Ok(retained)
 }

@@ -30,6 +30,8 @@ use super::{bounded_json_size, error::responses_error_rejection, file_search_dis
 use super::{history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat};
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use crate::json_body::MAX_JSON_BODY_BYTES;
+#[cfg(feature = "openai-mcp-tools")]
+use super::request_input::InputForm;
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -504,6 +506,16 @@ pub(crate) struct ResponsesState {
     /// the edited item, leaving this view pointing at the original payload.
     pub input: MessageHistory,
 
+    /// Original JSON shape of the request's `input` (missing/null/string/object/
+    /// array), kept so the current-request view reproduces the client's form
+    /// without retaining a second decoded copy in [`Self::request_body`] (#1618).
+    ///
+    /// Only MCP tool discovery re-serializes the current request, so this is
+    /// tracked under `openai-mcp-tools`; input is stripped from `request_body`
+    /// regardless of features.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub input_form: InputForm,
+
     /// Current agentic loop iteration (0-indexed). Incremented by
     /// `openai_agentic_loop` at the start of each new inference round.
     pub iteration: u32,
@@ -725,7 +737,13 @@ pub(crate) struct ResponsesState {
     /// metadata, so translated responses must also be able to read the ID here.
     pub response_id: Option<String>,
 
-    /// Parsed request body as received from the client.
+    /// Parsed request *parameters* as received from the client.
+    ///
+    /// The `input` member is moved out at construction into [`Self::input`] /
+    /// [`Self::input_form`] so the payload is decoded only once (#1618); this
+    /// object holds everything else (model, tools, reasoning, store, etc.). Use
+    /// [`Self::set_request_params`] rather than assigning this field directly so a
+    /// later filter cannot reintroduce a duplicate `input` copy.
     pub request_body: serde_json::Value,
 
     /// Whether provider-visible request fields require outbound serialization.
@@ -1107,6 +1125,8 @@ impl Default for ResponsesState {
             current_round_output_start: None,
             history_rehydrated: false,
             input: MessageHistory::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            input_form: InputForm::default(),
             iteration: 0,
             deferred_mcp: Vec::new(),
             #[cfg(feature = "openai-mcp-tools")]
@@ -1288,12 +1308,36 @@ impl ResponsesState {
     }
 
     /// Create initial state from a parsed request body.
-    pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
-        // `input` is the immutable client snapshot and `persisted_messages` the
-        // persistence view. Cloning `MessageHistory` shares each item's `Arc`
-        // payload, so neither view deep-copies the input here (#1618); only
-        // `messages` detaches an item when a later filter mutates it.
-        let messages = MessageHistory::from(normalize_input(&body));
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
+    pub(crate) fn from_request_body(mut body: serde_json::Value) -> Self {
+        // Move `input` out of the parsed parameters so it is decoded exactly once
+        // (#1618). Supported shapes (null/string/object/array) normalize into
+        // shared items and leave `request_body` with parameters only; an
+        // unsupported scalar can neither be normalized nor reconstructed, so it
+        // stays in the parameters for existing validators (e.g. Chat-completions
+        // translation) to reject. Cloning `MessageHistory` shares each item's
+        // `Arc` payload, so the immutable snapshot and persistence view never
+        // deep-copy the input; only `messages` detaches an item on later mutation.
+        #[cfg(feature = "openai-mcp-tools")]
+        let input_form = InputForm::classify(body.get("input"));
+        let normalizable = matches!(
+            body.get("input"),
+            Some(
+                serde_json::Value::Null
+                    | serde_json::Value::String(_)
+                    | serde_json::Value::Object(_)
+                    | serde_json::Value::Array(_)
+            )
+        );
+        let messages = if normalizable {
+            let value = body
+                .as_object_mut()
+                .and_then(|object| object.remove("input"))
+                .unwrap_or(serde_json::Value::Null);
+            MessageHistory::from(normalize_input_owned(value))
+        } else {
+            MessageHistory::default()
+        };
         let input = messages.clone();
         let persisted_messages = messages.clone();
         let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
@@ -1304,6 +1348,8 @@ impl ResponsesState {
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
             input,
+            #[cfg(feature = "openai-mcp-tools")]
+            input_form,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
@@ -1311,6 +1357,7 @@ impl ResponsesState {
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
+            // `input` was removed above; `request_body` now holds parameters only.
             request_body: body,
             tool_choice,
             tools,
@@ -1345,6 +1392,19 @@ impl ResponsesState {
         if self.security_failure.is_none() {
             self.security_failure = Some(failure);
         }
+    }
+
+    /// Store request parameters, dropping any `input` member so the parameter
+    /// object never duplicates the shared current input (#1618).
+    ///
+    /// Filters that rewrite the body (file/document resolution, MCP tool
+    /// expansion) call this instead of assigning [`Self::request_body`] directly;
+    /// the current input remains owned by [`Self::input`] / [`Self::input_form`].
+    pub(crate) fn set_request_params(&mut self, mut params: serde_json::Value) {
+        if let Some(object) = params.as_object_mut() {
+            object.remove("input");
+        }
+        self.request_body = params;
     }
 
     /// Require the proxy to serialize provider-visible request state.
@@ -1700,22 +1760,6 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
         .any(|admitted| admitted)
 }
 
-/// Normalize the `input` field into a message array.
-///
-/// The Responses API `input` can be a string (single user message),
-/// a single item object, or an array of items. Normalizes all three
-/// forms to a `Vec<Value>`.
-fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
-    normalize_input_value(body.get("input"))
-}
-
-/// Normalize one Responses API `input` value into a message array.
-pub(crate) fn normalize_input_value(input: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
-    input
-        .map(|input| normalize_input_owned(input.clone()))
-        .unwrap_or_default()
-}
-
 /// Normalize an owned `input` value without cloning array or object items.
 pub(crate) fn normalize_input_owned(input: serde_json::Value) -> Vec<serde_json::Value> {
     match input {
@@ -1932,7 +1976,7 @@ mod tests {
         // input-snapshot clone is measured, never the parse (#1618 step 2).
         let large = "x".repeat(200_000);
         let body = json!({"model": "gpt-4o", "input": large});
-        let normalized = normalize_input(&body);
+        let normalized = normalize_input_owned(body.get("input").cloned().unwrap_or(serde_json::Value::Null));
         let history = MessageHistory::from(normalized.clone());
 
         // Legacy ownership kept a second *deep* copy of the normalized input.
@@ -1964,7 +2008,7 @@ mod tests {
             .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
             .collect();
         let body = json!({"model": "gpt-4o", "input": items});
-        let normalized = normalize_input(&body);
+        let normalized = normalize_input_owned(body.get("input").cloned().unwrap_or(serde_json::Value::Null));
         let history = MessageHistory::from(normalized.clone());
 
         let legacy = allocation_counter::measure(|| {
@@ -2075,10 +2119,19 @@ mod tests {
     }
 
     #[test]
-    fn request_body_is_preserved() {
+    fn request_body_retains_parameters_without_input() {
         let body = json!({"model": "gpt-4o", "input": "hello", "temperature": 0.7});
-        let state = ResponsesState::from_request_body(body.clone());
-        assert_eq!(state.request_body, body, "original request body should be preserved");
+        let state = ResponsesState::from_request_body(body);
+        assert_eq!(
+            state.request_body,
+            json!({"model": "gpt-4o", "temperature": 0.7}),
+            "request_body keeps parameters only; input is moved out of the parse (#1618)"
+        );
+        assert!(
+            state.request_body.get("input").is_none(),
+            "input must not be duplicated inside request_body"
+        );
+        assert_eq!(state.input[0]["content"], "hello", "the input is owned by state.input");
     }
 
     #[test]
