@@ -5,6 +5,8 @@
 
 use std::{
     fmt,
+    io::ErrorKind,
+    net::TcpListener,
     path::PathBuf,
     sync::{Arc, mpsc},
     thread::JoinHandle,
@@ -150,7 +152,7 @@ fn resolve_listener_pipeline(
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    praxis_ai::install_pipeline_extensions(&mut pipeline);
+    praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
     #[cfg(feature = "store")]
@@ -206,8 +208,8 @@ impl ShutdownSignalWatch for NotifyShutdownWatch {
     }
 }
 
-/// Maximum time to wait for the proxy server thread to join on
-/// [`ProxyGuard`] shutdown before giving up.
+/// Maximum time to wait for the proxy server thread to join, and its
+/// listener to close, on [`ProxyGuard`] shutdown before giving up.
 ///
 /// [`ProxyGuard`]: ProxyGuard
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -273,6 +275,9 @@ pub enum ProxyShutdownError {
     /// The producer thread panicked.
     #[error("proxy server thread panicked during shutdown")]
     ThreadPanicked,
+    /// The producer exited but its listen address stayed bound.
+    #[error("proxy listener still bound after the server thread exited")]
+    ListenerStillBound,
 }
 
 /// RAII guard that shuts down a Pingora proxy server when
@@ -309,8 +314,9 @@ impl ProxyGuard {
         self.store_readiness.wait();
     }
 
-    /// Signal the proxy to stop and wait for its producer thread
-    /// to exit within a bounded deadline.
+    /// Signal the proxy to stop and wait, within a bounded deadline,
+    /// for its producer thread to exit and its listen address to be
+    /// free again.
     ///
     /// A timeout retains the thread handle so a later call or the
     /// guard's drop fallback can make another bounded join attempt.
@@ -318,7 +324,8 @@ impl ProxyGuard {
     /// # Errors
     ///
     /// Returns an error if the producer does not finish before the
-    /// deadline, disconnects its completion channel, or panics.
+    /// deadline, disconnects its completion channel, or panics, or if
+    /// its listener is still bound when the deadline passes.
     pub fn shutdown(&mut self) -> Result<(), ProxyShutdownError> {
         let deadline = Instant::now() + self.join_timeout;
         self.notify.notify_one();
@@ -343,7 +350,8 @@ impl ProxyGuard {
         Ok(())
     }
 
-    /// Polls for thread completion within the shared deadline, then joins it.
+    /// Polls for thread completion and listener release within the shared
+    /// deadline, then joins the thread.
     fn join_producer(&mut self, deadline: Instant) -> Result<(), ProxyShutdownError> {
         while self.handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
             let remaining = remaining_until(deadline);
@@ -356,6 +364,9 @@ impl ProxyGuard {
             }
             std::thread::sleep(JOIN_POLL_INTERVAL.min(remaining));
         }
+        if self.handle.is_some() {
+            self.await_listener_release(deadline)?;
+        }
 
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -365,6 +376,25 @@ impl ProxyGuard {
         }
         if self.completion_disconnected {
             return Err(ProxyShutdownError::CompletionDisconnected);
+        }
+        Ok(())
+    }
+
+    /// Polls until the proxy's listen address can be bound again.
+    ///
+    /// The producer exiting does not mean its listener is closed: on a fast
+    /// shutdown Pingora stops the service runtimes without waiting for their
+    /// worker threads, and those drop the accept loops, and with them the
+    /// listening socket, after the producer has already returned. Only
+    /// `AddrInUse` counts as still bound, so an address this probe cannot bind
+    /// for other reasons never holds up shutdown.
+    fn await_listener_release(&self, deadline: Instant) -> Result<(), ProxyShutdownError> {
+        while TcpListener::bind(&self.addr).is_err_and(|error| error.kind() == ErrorKind::AddrInUse) {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                return Err(ProxyShutdownError::ListenerStillBound);
+            }
+            std::thread::sleep(JOIN_POLL_INTERVAL.min(remaining));
         }
         Ok(())
     }
@@ -968,6 +998,30 @@ mod tests {
         let error = proxy.shutdown().expect_err("producer panic must be an error");
 
         assert_eq!(error, ProxyShutdownError::ThreadPanicked);
+    }
+
+    #[test]
+    fn explicit_shutdown_reports_a_lingering_listener_then_retries() {
+        let lingering = TcpListener::bind("127.0.0.1:0").expect("lingering listener should bind");
+        let addr = lingering
+            .local_addr()
+            .expect("lingering listener should have an address");
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let _sent = completion_tx.send(());
+        });
+        let mut proxy = test_proxy_guard(handle, completion_rx, Duration::from_millis(100));
+        proxy.addr = addr.to_string();
+
+        let error = proxy
+            .shutdown()
+            .expect_err("a still-bound listener must not report success");
+        assert_eq!(error, ProxyShutdownError::ListenerStillBound);
+
+        drop(lingering);
+        proxy
+            .shutdown()
+            .expect("a retry should succeed once the listener is released");
     }
 
     fn test_proxy_guard(handle: JoinHandle<()>, completion: mpsc::Receiver<()>, join_timeout: Duration) -> ProxyGuard {

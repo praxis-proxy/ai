@@ -1,0 +1,76 @@
+# Vertex AI dialect translation (Anthropic Messages -> rawPredict)
+#
+# Translates Anthropic Messages requests into Vertex AI rawPredict form
+# and Vertex responses back to the Anthropic dialect after model_to_provider
+# selects an upstream and resolves its exact target model.
+#
+# Public aliases (public-claude and public-claude-snapshot) map to the
+# documented Vertex snapshot in model_to_provider. The load balancer
+# publishes application_provider: vertex for the adapter; unmapped models
+# go to the fallback backend.
+# The body model moves into the URL path (:rawPredict /
+# :streamRawPredict), anthropic_version is injected, and responses are
+# translated back (user-facing model id restored, Google error
+# envelopes mapped to Anthropic error types).
+#
+# Production note: replace the static credential_injection below with
+# the experimental `gcp_adc` filter (source: metadata) on a Google Cloud
+# host to fetch short-lived OAuth tokens from its attached service account,
+# and point the cluster at
+# aiplatform.googleapis.com:443 with tls.sni likewise.
+#
+# This example is fully self-contained and proxies to a local backend
+# so it can be exercised without GCP credentials.
+#
+# Experimental: rebuild with --features vertex-anthropic-filter.
+# Configuration may change before graduation.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features vertex-anthropic-filter -- \
+#     -c examples/configs/vertex/messages-to-anthropic.yaml
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - vertex
+
+filter_chains:
+  - name: vertex
+    filters:
+      - filter: model_to_provider
+        fallback_upstream: fallback
+        max_body_bytes: 33554432 # matches the Vertex adapter's 32 MiB limit
+        models:
+          - model: public-claude
+            upstream: vertex
+            target_model: claude-sonnet-4-5@20250929
+            paths: [/v1/messages, /v1/messages/count_tokens]
+          - model: public-claude-snapshot
+            upstream: vertex
+            target_model: claude-sonnet-4-5@20250929
+            paths: [/v1/messages, /v1/messages/count_tokens]
+      - filter: anthropic_messages_to_vertexai_anthropic
+        project: my-gcp-project
+        # location: global          # default; use a regional location for data residency
+        # beta_allowlist: [context-1m-2025-08-07]
+      - filter: credential_injection
+        clusters:
+          - name: vertex
+            header: Authorization
+            header_prefix: "Bearer "
+            value: "ya29.example-static-token"
+            strip_client_credential: true
+      - filter: load_balancer
+        clusters:
+          - name: vertex
+            http:
+              application_provider: vertex
+            endpoints:
+              - "127.0.0.1:3000"
+          - name: fallback
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

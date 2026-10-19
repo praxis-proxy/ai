@@ -43,16 +43,25 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     }
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
+    let inflight_registry = praxis_ai_filters::InFlightRegistry::new();
     #[cfg(feature = "_store-backend")]
     praxis_ai::validate_pipelines_with_store_wiring(
         config,
         &registry,
         &health_registry,
         &kv_stores,
+        &inflight_registry,
         &subrequest_client,
     )?;
     #[cfg(not(feature = "_store-backend"))]
-    praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
+    praxis_ai::resolve_pipelines(
+        config,
+        &registry,
+        &health_registry,
+        &kv_stores,
+        &inflight_registry,
+        &subrequest_client,
+    )?;
     Ok(())
 }
 

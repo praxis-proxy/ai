@@ -44,6 +44,78 @@ pub(crate) struct ConnectorConfig {
     pub id: String,
     /// MCP server URL for this connector.
     pub server_url: String,
+    /// Operator trust declaration for this connector's tool service.
+    ///
+    /// Trust is operator-owned and scoped. By default a connector is untrusted,
+    /// so in protected mode it follows the same admission rules as a
+    /// client-selected direct target. Declaring `trust.catalog: true` makes the
+    /// service authoritative for catalog admission (its tools are admitted
+    /// without a per-tool digest); `trust.read_only: true` makes it authoritative
+    /// for read-only classification (its `readOnlyHint` is a trusted capability
+    /// decision). The scopes are independent: a read-only-only trust grants no
+    /// catalog admission.
+    #[serde(default)]
+    pub trust: ConnectorTrustConfig,
+}
+
+/// Operator trust granted to a connector's tool service. Both scopes default to
+/// `false` (untrusted).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectorTrustConfig {
+    /// Authoritative for catalog admission.
+    #[serde(default)]
+    pub catalog: bool,
+    /// Authoritative for read-only classification.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl ConnectorTrustConfig {
+    /// Snapshot as the request-scoped admission trust type.
+    pub(crate) fn snapshot(&self) -> crate::openai::responses::mcp_admission::ConnectorTrust {
+        crate::openai::responses::mcp_admission::ConnectorTrust {
+            catalog: self.catalog,
+            read_only: self.read_only,
+        }
+    }
+}
+
+/// Operator admission mode for MCP tool metadata.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolAdmissionMode {
+    /// Standard advisory behavior; unchanged. This is the default.
+    #[default]
+    Advisory,
+    /// Operator-enforced protection.
+    Protected,
+}
+
+/// Operator metadata-admission policy for the `openai_mcp_tool_resolve` filter.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolAdmissionConfig {
+    /// Admission mode (`advisory` default, or `protected`).
+    #[serde(default)]
+    pub mode: ToolAdmissionMode,
+    /// Operator-enforced read-only: in protected mode admit only tools with a
+    /// trusted affirmative read-only classification. Requires `mode: protected`.
+    #[serde(default)]
+    pub require_read_only: bool,
+}
+
+impl ToolAdmissionConfig {
+    /// Snapshot as the request-scoped admission policy type.
+    pub(crate) fn snapshot(&self) -> crate::openai::responses::mcp_admission::McpAdmissionPolicy {
+        crate::openai::responses::mcp_admission::McpAdmissionPolicy {
+            mode: match self.mode {
+                ToolAdmissionMode::Advisory => crate::openai::responses::mcp_admission::McpAdmissionMode::Advisory,
+                ToolAdmissionMode::Protected => crate::openai::responses::mcp_admission::McpAdmissionMode::Protected,
+            },
+            require_read_only: self.require_read_only,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -115,6 +187,11 @@ pub(crate) struct McpToolResolveConfig {
     /// Named connectors mapping connector IDs to server URLs.
     #[serde(default)]
     pub connectors: Vec<ConnectorConfig>,
+
+    /// Operator metadata-admission policy. Defaults to advisory (unchanged
+    /// behavior), so existing non-protected deployments are not affected.
+    #[serde(default)]
+    pub tool_admission: ToolAdmissionConfig,
 }
 
 /// Default max rewritten body bytes (64 MiB): a post-expansion backstop.
@@ -158,7 +235,23 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
         return Err("openai_mcp_tool_resolve: max_tools must be greater than 0".into());
     }
     validate_connectors(&cfg.connectors)?;
+    validate_tool_admission(&cfg.tool_admission)?;
     Ok(cfg)
+}
+
+/// Reject a contradictory admission policy.
+///
+/// `require_read_only` is operator-enforced protection; it has no meaning in
+/// advisory mode, so pairing it with `mode: advisory` is rejected rather than
+/// silently providing advisory behavior. `trust.read_only` without
+/// `trust.catalog` stays valid (it grants no protected-mode admission).
+fn validate_tool_admission(cfg: &ToolAdmissionConfig) -> Result<(), FilterError> {
+    if matches!(cfg.mode, ToolAdmissionMode::Advisory) && cfg.require_read_only {
+        return Err(
+            "openai_mcp_tool_resolve: tool_admission.require_read_only requires tool_admission.mode: protected".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Validate one optional request-scoped context slot name.

@@ -12,6 +12,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use openssl::rand::rand_bytes;
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
@@ -21,6 +22,9 @@ use tracing::warn;
 
 /// Maximum candidate choices allowed in a single stream.
 pub(crate) const MAX_STREAM_CANDIDATES: u64 = 64;
+
+/// Maximum byte length of an upstream `responseId` retained in a client response.
+const MAX_RESPONSE_ID_BYTES: usize = 256;
 
 /// Maximum tool-call slots allowed per candidate in a single stream.
 pub(crate) const MAX_STREAM_TOOL_CALL_SLOTS: usize = 128;
@@ -140,19 +144,39 @@ impl StreamTranslateState {
         }
     }
 
-    /// Set the OpenAI completion id once: Vertex `responseId` when the first
-    /// frame has one, otherwise the shared fallback. Later frames cannot
-    /// change it (a late `responseId` must not rewrite earlier chunk ids).
-    fn ensure_completion_id(&mut self, response_id: Option<&str>) {
+    /// Set the OpenAI completion id once when an emitted chunk first needs it:
+    /// use Vertex `responseId` when present, otherwise generate a fallback.
+    /// Later frames cannot change it (a late `responseId` must not rewrite
+    /// earlier chunk ids).
+    fn ensure_completion_id(&mut self, response_id: Option<&str>) -> Result<(), String> {
         if self.completion_id.is_none() {
-            self.completion_id = Some(
-                response_id
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map_or_else(|| super::FALLBACK_RESPONSE_ID.to_owned(), str::to_owned),
-            );
+            self.completion_id = Some(response_id_or_minted_fallback(response_id)?);
         }
+        Ok(())
     }
+}
+
+/// Preserve a bounded, usable Vertex response ID, or mint an OpenAI-shaped fallback.
+///
+/// A blank or oversized identifier is not useful to clients, so it follows the
+/// same path as an omitted one. The generated ID is opaque and unique across
+/// requests; stream state keeps it stable across all chunks for one response.
+fn response_id_or_minted_fallback(response_id: Option<&str>) -> Result<String, String> {
+    response_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_RESPONSE_ID_BYTES)
+        .map_or_else(mint_fallback_completion_id, |id| Ok(id.to_owned()))
+}
+
+/// Mint an OpenAI-shaped completion ID from 128 bits of OpenSSL randomness.
+fn mint_fallback_completion_id() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    rand_bytes(&mut random).map_err(|error| format!("failed to generate fallback completion id: {error}"))?;
+    Ok(format!(
+        "{}{:032x}",
+        super::FALLBACK_RESPONSE_ID_PREFIX,
+        u128::from_be_bytes(random)
+    ))
 }
 
 // -----------------------------------------------------------------------------
@@ -174,10 +198,7 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     let obj = value.as_object();
 
-    let id = obj
-        .and_then(|o| o.get("responseId"))
-        .and_then(Value::as_str)
-        .unwrap_or(super::FALLBACK_RESPONSE_ID);
+    let id = response_id_or_minted_fallback(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
 
     let candidates = obj.and_then(|o| o.get("candidates")).and_then(Value::as_array);
 
@@ -617,7 +638,6 @@ pub(crate) fn transform_stream_chunk(
     let value: Value = serde_json::from_slice(data).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object();
 
-    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str));
     state.capture_usage(obj);
 
     // Detect upstream errors and content blocks that arrive as valid JSON
@@ -636,6 +656,7 @@ pub(crate) fn transform_stream_chunk(
         return Ok(None);
     }
 
+    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
     serialize_stream_chunk(choices, model, state)
 }
 
@@ -645,8 +666,12 @@ fn serialize_stream_chunk(
     model: &str,
     state: &StreamTranslateState,
 ) -> Result<Option<Vec<u8>>, String> {
+    let completion_id = state
+        .completion_id
+        .as_deref()
+        .ok_or("stream completion id was not initialized")?;
     let mut chunk = json!({
-        "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
+        "id": completion_id,
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
@@ -687,9 +712,15 @@ pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &
     if !state.include_usage {
         return None;
     }
+    state.usage.as_ref()?;
+    if let Err(error) = state.ensure_completion_id(None) {
+        warn!(%error, "failed to generate completion id for trailing usage chunk");
+        return None;
+    }
     let usage = state.usage.take()?;
+    let completion_id = state.completion_id.as_deref()?;
     let chunk = json!({
-        "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
+        "id": completion_id,
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
@@ -1156,12 +1187,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_response_id_uses_fallback() {
-        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
+    fn response_id_trims_whitespace() {
+        let body = br#"{
+            "responseId": "  resp-padded  ",
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]
+        }"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert_eq!(parsed["id"], "chatcmpl-vertex");
+        assert_eq!(parsed["id"], "resp-padded");
+    }
+
+    #[test]
+    fn oversized_response_id_mints_fallback() {
+        let accepted = "a".repeat(MAX_RESPONSE_ID_BYTES);
+        let fallback = "a".repeat(MAX_RESPONSE_ID_BYTES + 1);
+
+        assert_eq!(response_id_or_minted_fallback(Some(&accepted)).unwrap(), accepted);
+        assert!(
+            response_id_or_minted_fallback(Some(&fallback))
+                .unwrap()
+                .starts_with("chatcmpl-vertex-")
+        );
+    }
+
+    #[test]
+    fn missing_response_id_mints_unique_fallback_per_response() {
+        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
+        let first: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+        let second: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+        assert!(first_id.starts_with("chatcmpl-vertex-"));
+        assert!(second_id.starts_with("chatcmpl-vertex-"));
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn blank_response_id_mints_fallback() {
+        let body =
+            br#"{"responseId":"   ","candidates":[{"content":{"parts":[{"text":"Hi"}]},"finishReason":"STOP"}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+
+        assert!(parsed["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
     }
 
     #[test]
@@ -1625,7 +1694,7 @@ mod tests {
 
         assert_eq!(parsed["object"], "chat.completion.chunk");
         assert_eq!(parsed["created"], 1_700_000_000);
-        assert_eq!(parsed["id"], "chatcmpl-vertex");
+        assert!(parsed["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
         assert_eq!(parsed["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(parsed["choices"][0]["delta"]["content"], "Hi");
         assert!(parsed["choices"][0]["finish_reason"].is_null());
@@ -1857,9 +1926,36 @@ mod tests {
             br#"{"responseId":"resp-late","candidates":[{"content":{"parts":[{"text":"!"}]}}]}"#,
         );
 
-        assert_eq!(first["id"], "chatcmpl-vertex");
-        assert_eq!(second["id"], "chatcmpl-vertex");
+        assert!(first["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
+        assert_eq!(first["id"], second["id"]);
         assert_ne!(second["id"], "resp-late");
+    }
+
+    #[test]
+    fn stream_completion_id_trims_upstream_response_id() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"responseId":"  resp-padded  ","candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+        );
+
+        assert_eq!(parsed["id"], "resp-padded");
+    }
+
+    #[test]
+    fn missing_response_id_mints_unique_fallback_per_stream() {
+        let data = br#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#;
+        let mut first_state = new_stream_state(1);
+        let mut second_state = new_stream_state(1);
+
+        let first = translate_stream(&mut first_state, data);
+        let second = translate_stream(&mut second_state, data);
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+
+        assert!(first_id.starts_with("chatcmpl-vertex-"));
+        assert!(second_id.starts_with("chatcmpl-vertex-"));
+        assert_ne!(first_id, second_id);
     }
 
     #[test]
@@ -2223,6 +2319,34 @@ mod tests {
         let usage: Value =
             serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
         assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["total_tokens"], 15);
+        assert!(usage["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
+    }
+
+    #[test]
+    fn stream_metadata_first_preserves_later_response_id() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        assert!(
+            transform_stream_chunk(
+                br#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+                "gemini-2.0-flash",
+                &mut state,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(state.completion_id.is_none());
+
+        let content = translate_stream(
+            &mut state,
+            br#"{"responseId":"resp-after-metadata","candidates":[{"content":{"parts":[{"text":"Hi"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(content["id"], "resp-after-metadata");
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
+        assert_eq!(usage["id"], "resp-after-metadata");
         assert_eq!(usage["usage"]["total_tokens"], 15);
     }
 

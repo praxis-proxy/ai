@@ -14,8 +14,10 @@ V                ?=
 # Experimental filter features are package-specific and off by default.
 # Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
 # crate; it is not a praxis-ai-filters feature.
-FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
-INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+# Experimental praxis-ai-apis features, whose unit tests live in that crate.
+APIS_EXPERIMENTAL_FEATURES := vertex-anthropic
 # Release and container builds exclude experimental Responses and agents.
 # Opt in with PRAXIS_AI_FEATURES=full,openai-all,store-sqlite when needed.
 PRAXIS_AI_FEATURES ?= full
@@ -40,7 +42,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
-	test-schema test-integration test-inference-fixtures \
+	test-schema test-integration test-inference-fixtures bench-model-to-provider \
 	test-store-features test-responses-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
@@ -114,12 +116,18 @@ test-unit: test-unit-apis test-unit-filters test-unit-proxy
 test-unit-apis:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres,$(APIS_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full,openai-all,store-postgres $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full,openai-all,store-postgres,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+
+bench-model-to-provider:
+	cargo test --locked --release -p praxis-ai-filters --lib \
+		inference::model_to_provider::tests::mapping_latency_microbenchmark \
+		-- --ignored --exact --nocapture
 
 test-unit-proxy:
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
@@ -195,7 +203,7 @@ test-feature-isolation: test-responses-features
 		echo "check: $$group"; \
 		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
 	done
-	@for group in azure-ad-filter gcp-adc-filter; do \
+	@for group in azure-ad-filter gcp-adc-filter vertex-anthropic-filter; do \
 		echo "check: $$group"; \
 		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
 	done
@@ -214,13 +222,14 @@ test-integration:
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES)
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
-		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling \
+		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling examples::inflight_tracking \
+		examples::vertex_anthropic \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --features openai-all,store-all $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --features openai-all,store-all,vertex-anthropic-filter $(_NOCAPTURE)
 	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features openai-all,store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
 
 # Both filters are needed. libtest matches each as a substring, and
 # `store::tests::pg_` is not a substring of
@@ -290,7 +299,7 @@ lint: lint-clippy lint-xtask
 lint-clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
-		--features $(STORE_ALL_WORKSPACE_FEATURES),xtask/openai-all,praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter \
+		--features $(STORE_ALL_WORKSPACE_FEATURES),xtask/openai-all,praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-ai-proxy/inflight-tracker-filter,praxis-ai-proxy/vertex-anthropic-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter,praxis-tests-integration/inflight-tracker-filter,praxis-tests-integration/vertex-anthropic-filter \
 		-- -D warnings
 	$(MAKE) lint-lean
 	$(MAKE) check-dep-budget
@@ -848,6 +857,7 @@ help:
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
+	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"

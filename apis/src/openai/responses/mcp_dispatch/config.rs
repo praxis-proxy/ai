@@ -7,6 +7,8 @@ use praxis_core::config::ChainRef;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::openai::responses::mcp_classify::ApprovalFloor;
+
 /// Default timeout for MCP `tools/call` calls (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -36,6 +38,17 @@ const MAX_TOTAL_RESULT_BYTES: usize = 67_108_864;
 
 /// Minimum retained reservation needed for one bounded tool-error result.
 pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
+
+/// Maximum UTF-8 bytes accepted for one MCP correlation `call_id`.
+///
+/// This is the raw-length candidate bound. Approval records persist the call id
+/// verbatim and retained results echo it as `approval_request_id`, so the exact
+/// serialized fallback — including JSON escaping — must also fit
+/// [`MIN_RETAINED_RESULT_BYTES`]. Ids that fail either check are rejected
+/// before any approval is persisted; they are never truncated, because
+/// truncation would break correlation.
+#[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
+pub(super) const MAX_MCP_CALL_ID_BYTES: usize = 128;
 
 /// YAML configuration for the `openai_mcp_dispatch` filter.
 #[derive(Debug, Deserialize)]
@@ -75,6 +88,18 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
+    /// Operator approval floor applied to every MCP call in this pipeline,
+    /// combined monotonically with each tool's client `require_approval`:
+    /// `approval_required = operator_floor || client_requires_approval`. Set
+    /// `always` to require approval for every MCP call regardless of the client's
+    /// request — a client `"never"` or a server-supplied `readOnlyHint` can never
+    /// suppress it. Pending approvals are correlated through `previous_response_id`,
+    /// so the pipeline needs `openai_responses_store` and `openai_responses_rehydrate`;
+    /// without persistence the request fails closed (`store: false` → 400, no store → 500).
+    /// Omit to preserve the client-driven behavior (the default).
+    #[serde(default)]
+    pub minimum_approval: Option<MinimumApproval>,
+
     /// Per-call timeout in milliseconds for `tools/call` calls. Inside an
     /// iterative request router, every MCP exchange is capped by the router's
     /// remaining deadline.
@@ -99,6 +124,29 @@ pub(crate) struct McpDispatchConfig {
     /// Maximum retained bytes across one MCP result batch (default: 8 MiB).
     #[serde(default = "default_max_total_result_bytes")]
     pub max_total_result_bytes: usize,
+}
+
+/// Operator approval-floor setting for `openai_mcp_dispatch`.
+///
+/// The YAML surface for the operator floor combined with each tool's client
+/// `require_approval` policy. Only `always` is meaningful: a `never` floor would
+/// be a no-op (the floor can only *raise* the requirement, never weaken it), so
+/// it is deliberately not a variant and is rejected by `deny_unknown_fields`.
+/// Maps to [`ApprovalFloor`] via [`MinimumApproval::as_floor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MinimumApproval {
+    /// Require approval for every MCP call, regardless of client settings.
+    Always,
+}
+
+impl MinimumApproval {
+    /// Project the configured floor onto the shared classification [`ApprovalFloor`].
+    pub(crate) const fn as_floor(self) -> ApprovalFloor {
+        match self {
+            Self::Always => ApprovalFloor::Always,
+        }
+    }
 }
 
 /// Default value for `timeout_ms`.

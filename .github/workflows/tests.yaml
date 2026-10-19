@@ -118,7 +118,7 @@ jobs:
 
   test-filters:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -133,6 +133,9 @@ jobs:
 
       - name: Unit tests (filters)
         run: make test-unit-filters
+
+      - name: Model-to-provider latency benchmark (release)
+        run: make bench-model-to-provider
 
   test-proxy:
     runs-on: ubuntu-24.04

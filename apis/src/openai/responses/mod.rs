@@ -46,7 +46,9 @@ pub(crate) mod file_resolve;
 pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
-#[cfg(all(feature = "openai-mcp-tools", any(test, feature = "openai-agentic-loop")))]
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_admission;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;

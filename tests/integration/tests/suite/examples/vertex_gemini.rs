@@ -99,6 +99,12 @@ fn vertex_gemini_non_streaming_translates_response() {
     assert_chat_completion_response_schema(&parsed);
     assert_eq!(parsed["object"], "chat.completion");
     assert_eq!(parsed["model"], "gemini-2.0-flash");
+    assert!(
+        parsed["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("chatcmpl-vertex-")),
+        "a response without Vertex responseId must receive a generated completion id"
+    );
     assert_eq!(
         parsed["choices"][0]["message"]["content"], "4",
         "Gemini text part should become OpenAI message content"

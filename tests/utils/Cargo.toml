@@ -38,6 +38,7 @@ llmd-ext-proc = [
     "dep:tokio-stream",
     "dep:tonic",
 ]
+vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]

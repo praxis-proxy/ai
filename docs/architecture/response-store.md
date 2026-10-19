@@ -35,6 +35,18 @@ Conversations supplies the items table, and both must select the same
 conversations table. Both registry names then resolve the same backend lease and
 SQL pool.
 
+Offline discovery, config normalization, compatible-store sharing and SQL
+namespace validation are exposed by `praxis_ai_apis::store::plan`. The proxy
+server and external serving transports can reuse these rules without copying
+schema knowledge. Each transport still owns its registry, readiness, serving
+runtime and lifecycle leases. Reload-specific active-key preservation remains
+in the proxy server.
+
+Discovery preserves caller policy: the proxy server skips malformed nested
+entries and unparseable store references as before, while strict transports can
+reject them. The server retains its existing cross-store collision checks;
+transports requiring additional single-store checks use the stricter validator.
+
 ## Conversation History
 
 Conversation item rows are authoritative for Responses continuation. History is

@@ -8,6 +8,9 @@
 //! here at their original paths. This module keeps the SQL backends and the
 //! transport-bound registry wrapper.
 
+mod discovery;
+pub mod plan;
+
 // The SQL backends live in the praxis-ai-store-backends crate (#1260). The
 // concrete stores, the `to_pg_ssl_mode` helper, and the provisioning factory are
 // re-exported below at their original `crate::store::*` paths for the

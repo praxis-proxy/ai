@@ -166,10 +166,11 @@ This peek-then-stream pattern avoids the latency of
 external processor architectures while providing body
 visibility where it matters.
 
-Filters declare `BodyAccess::ReadOnly` +
+Filters declare body access and
 `BodyMode::StreamBuffer { max_bytes }` to opt in.
-Only `PromptEnrichFilter` uses `ReadWrite` (it
-modifies the messages array).
+Body writers such as `model_to_provider` and
+`prompt_enrich` use `BodyAccess::ReadWrite` to replace
+the buffered request before forwarding it.
 
 ## Filters
 
@@ -200,6 +201,29 @@ of Praxis already sets the header, an
 `unless: {headers_present: [...]}` condition on the
 filter skips it entirely, preserving the incoming value.
 
+### `model_to_provider`
+
+Maps an exact client model and request path to an existing
+load-balancer cluster and target model. It stages the cluster
+during body pre-read and selects it during the request phase.
+The load balancer chooses endpoints and owns health checks
+and retries. No header-matching router or provider registry
+is needed. This is ordinary cluster selection: it does not
+publish the frozen binding read by `bound_upstream` conditions.
+
+Unknown models and paths retain their bodies and select
+`fallback_upstream` when configured. Without a fallback, the
+filter leaves cluster selection unchanged; a subsequent load
+balancer still needs a cluster to forward the request. Normal
+pipeline validation checks mapped and fallback cluster names
+against load-balancer declarations at startup and reload.
+
+The original client model stays in request metadata for
+metering and optional provider response adapters. The filter
+itself leaves responses unchanged. Cluster application-provider
+metadata is optional for routing; an adapter that uses it must
+run after selection and require the appropriate tags.
+
 ### `openai_responses_request`
 
 Runs for the Responses operations `ai_operation`
@@ -227,6 +251,25 @@ Owns the Anthropic create-message body. The Messages
 registry decides the operation from the request head, then
 the body is deserialized once for envelope validation,
 routing facts, and canonical state.
+
+### `anthropic_messages_to_vertexai_anthropic`
+
+Translates the Anthropic wire format only after the load
+balancer selects a cluster tagged with HTTP
+`application_provider: vertex`. Its selected-upstream body
+hook receives the buffered body already rewritten by
+`model_to_provider`; provider selection and public-to-target
+model mapping stay in that earlier filter.
+
+The exact target model, including any snapshot suffix, moves
+into the Messages URL or stays in the count-tokens body.
+Responses restore the public model recorded by the mapper,
+including `message_start` frames processed incrementally.
+Without that metadata the target model is the response
+identity. Other selected providers and untagged clusters
+pass through without Vertex translation. The
+[Vertex example](../../examples/configs/vertex/messages-to-anthropic.yaml)
+includes both aliases and a separate fallback upstream.
 
 ### `prompt_enrich`
 
@@ -256,6 +299,8 @@ Persists non-streaming Responses API responses. See
   `OpenaiResponsesRequestFilter`
 - `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
+- `filters/src/inference/model_to_provider.rs`:
+  `ModelToProviderFilter`
 - `filters/src/prompt_enrich/`:
   prompt enrichment filter
 - `apis/src/anthropic/`:

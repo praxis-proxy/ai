@@ -23,6 +23,8 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
 use super::history::MessageHistory;
+#[cfg(feature = "openai-mcp-tools")]
+use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
 
@@ -443,6 +445,29 @@ pub(crate) struct ResponsesState {
     #[cfg(feature = "openai-mcp-tools")]
     pub mcp_connector_context_policy: McpConnectorContextPolicy,
 
+    /// Operator metadata-admission decisions for this request (#1724).
+    ///
+    /// Stamped afresh by `openai_mcp_tool_resolve` from operator configuration
+    /// (policy + connector trust), extended through deferred discovery, and
+    /// re-enforced at dispatch. Verdicts are typed and operator-owned; client
+    /// fields, cached definitions, and restored history never supply admission
+    /// authority. Defaults to advisory (empty, no enforcement).
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_admission: super::mcp_admission::McpAdmissionDecisions,
+
+    /// Operator approval floor published by `openai_mcp_dispatch` during the
+    /// request phase for the `openai_agentic_loop` owner to apply when it
+    /// partitions approvals in the response phase of the same IRR iteration.
+    ///
+    /// Carried as typed request state (not step metadata) because the floor is a
+    /// security control that must never be silently dropped: `set_metadata` caps
+    /// at a fixed number of entries and drops a new key once full, so a saturated
+    /// metadata map could silently disable the floor and let a client
+    /// `require_approval: "never"` call execute automatically. A struct field has
+    /// no such ceiling and fails closed by construction.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_operator_approval_floor: ApprovalFloor,
+
     /// Maximum number of built-in tool invocations.
     ///
     /// Enforced by built-in tool filters across retained output.
@@ -610,6 +635,19 @@ pub(crate) struct ResponsesState {
 
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
+
+    /// What the request itself specified for `reasoning`.
+    ///
+    /// `from_request_body` computes this from the parsed body, and the
+    /// rehydrate filter replaces it with a capture taken before the stored
+    /// configuration default merges into [`Self::request_body`]. The proxy's
+    /// selected-phase rebuild uses it to separate the stored default, which
+    /// must still reach a request that omits reasoning, from a later filter's
+    /// removal, which must stand: an `effort` may be filled only when the
+    /// request carried no `effort` of its own, and the `reasoning` member may
+    /// be created only when the request carried none. Readers only consult it
+    /// for [`Self::history_rehydrated`] states.
+    pub request_reasoning: RequestReasoningPresence,
 
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
@@ -901,6 +939,14 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Per-server timeout for the deferred `tools/list` call.
     pub timeout: Duration,
+
+    /// Operator trust stamped from connector configuration at resolve time.
+    ///
+    /// Deferred discovery runs inside `openai_mcp_dispatch`, which has no access
+    /// to the resolver's connector configuration, so the trust is carried here —
+    /// operator-owned and never derived from server, cached, or client data.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub trust: super::mcp_admission::ConnectorTrust,
 }
 
 /// Request-scoped slot policy bound to configured MCP connector state.
@@ -955,6 +1001,52 @@ pub(crate) enum RequestBodyRebuild {
     Required,
 }
 
+/// What a rehydrated request itself specified for `reasoning`, captured before
+/// the stored `configuration_update` default was merged into
+/// [`ResponsesState::request_body`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestReasoningPresence {
+    /// No top-level `reasoning` member.
+    #[default]
+    Absent,
+
+    /// A `reasoning` member without an `effort` key (a `null` member counts).
+    OmittedEffort,
+
+    /// A `reasoning` member with an explicit `effort` key (null counts).
+    ExplicitEffort,
+}
+
+impl RequestReasoningPresence {
+    /// Whether the request carried a `reasoning` member at all.
+    pub(crate) fn carried_member(self) -> bool {
+        self != Self::Absent
+    }
+
+    /// Whether the request carried an `effort` key of its own.
+    pub(crate) fn carried_effort(self) -> bool {
+        self == Self::ExplicitEffort
+    }
+}
+
+/// Capture what a request itself specified for `reasoning`.
+///
+/// The rehydrate filter records this before merging the stored configuration
+/// default into the body, so the proxy's selected-phase rebuild can distinguish
+/// what the request omitted (the default may fill it) from a later filter's
+/// removal of the `reasoning` member or its `effort` (it must stand instead of
+/// being refilled from the merged default).
+pub(crate) fn request_reasoning_presence(body: &serde_json::Value) -> RequestReasoningPresence {
+    let Some(reasoning) = body.get("reasoning") else {
+        return RequestReasoningPresence::Absent;
+    };
+    if reasoning.get("effort").is_some() {
+        RequestReasoningPresence::ExplicitEffort
+    } else {
+        RequestReasoningPresence::OmittedEffort
+    }
+}
+
 impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
@@ -975,6 +1067,10 @@ impl Default for ResponsesState {
             deferred_mcp: Vec::new(),
             #[cfg(feature = "openai-mcp-tools")]
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_admission: super::mcp_admission::McpAdmissionDecisions::default(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_operator_approval_floor: ApprovalFloor::None,
             max_tool_calls: None,
             #[cfg(any(
                 feature = "openai-agentic-loop",
@@ -1003,6 +1099,7 @@ impl Default for ResponsesState {
             response_created_at: None,
             response_id: None,
             request_body: serde_json::Value::Null,
+            request_reasoning: RequestReasoningPresence::Absent,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
@@ -1032,6 +1129,7 @@ impl Default for ResponsesState {
 
 impl ResponsesState {
     /// Create initial state from a parsed request body.
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
         let input = messages.clone();
@@ -1057,6 +1155,7 @@ impl ResponsesState {
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
+            request_reasoning: request_reasoning_presence(&body),
             request_body: body,
             tool_choice,
             tools,

@@ -56,8 +56,11 @@ mod guardrails_response;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;
+#[cfg(feature = "inflight-tracker-filter")]
+mod inflight_tracking;
 mod intelligent_route_hardening;
 mod intelligent_route_management_skip;
+mod intelligent_route_metrics;
 mod intelligent_route_projected_credentials;
 #[cfg(feature = "openai-responses")]
 mod irr_terminal_streaming;
@@ -69,6 +72,7 @@ mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod model_to_header_trust_existing;
+mod model_to_provider;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;
@@ -85,6 +89,12 @@ mod openai_doc_extract;
 mod openai_embeddings_routing;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_file_resolve;
+#[cfg(all(
+    feature = "openai-agentic-loop",
+    feature = "openai-mcp-tools",
+    feature = "store-sqlite"
+))]
+mod openai_mcp_approval_floor;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
@@ -92,6 +102,8 @@ mod openai_mcp_outbound_chain;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_streaming;
+#[cfg(feature = "openai-mcp-tools")]
+mod openai_mcp_tool_admission;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_tool_resolve;
 mod openai_prompts_routing;
@@ -157,6 +169,8 @@ mod token_counting;
 mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
+#[cfg(feature = "vertex-anthropic-filter")]
+mod vertex_anthropic;
 mod vertex_gemini;
 #[cfg(feature = "openai-responses")]
 mod vllm_agentic_api;

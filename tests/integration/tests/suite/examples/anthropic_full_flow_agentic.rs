@@ -18,11 +18,11 @@
 
 use std::{
     collections::HashMap,
-    io::{Read as _, Write as _},
+    io::{ErrorKind, Read as _, Write as _},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use praxis_test_utils::{
@@ -1552,31 +1552,17 @@ fn downstream_cancellation_closes_upstream_stream() {
         client_dropped_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("client should drop the downstream stream");
-        thread::sleep(Duration::from_millis(50));
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .expect("backend write timeout should be set");
-        // Flood with complete, forwardable text deltas: the proxy relays each to
-        // the dropped client, detects the closed downstream, and tears down this
-        // upstream exchange. (Raw non-SSE bytes would only be buffered, never
-        // written downstream, so the closure would go unnoticed.)
+        // Keep feeding complete, forwardable text deltas: the proxy relays each
+        // to the dropped client, detects the closed downstream, and tears down
+        // this upstream exchange. (Raw non-SSE bytes would only be buffered,
+        // never written downstream, so the closure would go unnoticed.)
         let filler = "x".repeat(16 * 1024);
         let delta = sse(
             "content_block_delta",
             &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": filler}}),
         );
-        let mut upstream_closed = false;
-        for _ in 0..256 {
-            if write_chunk_checked(&mut stream, &delta)
-                .and_then(|()| stream.flush())
-                .is_err()
-            {
-                upstream_closed = true;
-                break;
-            }
-        }
         cancelled_tx
-            .send(upstream_closed)
+            .send(feed_until_upstream_closes(&mut stream, &delta))
             .expect("test receiver should remain available");
     });
     let proxy_port = free_port();
@@ -1692,6 +1678,65 @@ fn write_chunk(stream: &mut TcpStream, chunk: &str) {
 /// Write one chunked-transfer frame, surfacing any transport error to the caller.
 fn write_chunk_checked(stream: &mut TcpStream, chunk: &str) -> std::io::Result<()> {
     write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len())
+}
+
+/// How long a backend keeps feeding a cancelled stream before concluding that
+/// the proxy never closed the upstream exchange.
+const UPSTREAM_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Feed `chunk` to the proxy until it closes this upstream connection, and
+/// report whether it did so within [`UPSTREAM_CLOSE_DEADLINE`].
+///
+/// Closure is observed directly when a read or write fails with a reset or
+/// broken pipe. Read EOF only proves the peer closed its request write-half,
+/// so keep probing response writes. A successful write proves nothing, since
+/// loopback buffers absorb megabytes after the proxy stops reading. A write
+/// timeout ends the feeding, because the partial frame it may leave behind
+/// would give the proxy a framing error to close on, but the backend still
+/// waits for the close until the deadline.
+fn feed_until_upstream_closes(stream: &mut TcpStream, chunk: &str) -> bool {
+    stream
+        .set_write_timeout(Some(Duration::from_millis(200)))
+        .expect("backend write timeout should be set");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("backend read timeout should be set");
+    let deadline = Instant::now() + UPSTREAM_CLOSE_DEADLINE;
+    let mut feeding = true;
+    let mut probe = [0_u8; 64];
+    while Instant::now() < deadline {
+        if feeding {
+            match write_chunk_checked(stream, chunk).and_then(|()| stream.flush()) {
+                Ok(()) => {},
+                Err(error) if is_connection_closed(&error) => return true,
+                Err(error) if is_timeout(&error) => feeding = false,
+                Err(error) => panic!("unexpected backend write error: {error}"),
+            }
+        }
+        match stream.read(&mut probe) {
+            // EOF is inconclusive; pace repeated reads even after feeding stops.
+            Ok(0) => thread::sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()))),
+            // The proxy sends nothing after the request; ignore stray bytes.
+            Ok(_) => {},
+            Err(error) if is_connection_closed(&error) => return true,
+            Err(error) if is_timeout(&error) => {},
+            Err(error) => panic!("unexpected backend read error: {error}"),
+        }
+    }
+    false
+}
+
+/// Whether `error` means the peer closed or reset the connection.
+fn is_connection_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset
+    )
+}
+
+/// Whether `error` is a socket timeout (`WouldBlock` on Unix, `TimedOut` elsewhere).
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
 }
 
 fn connect_and_send(proxy_addr: &str, body: &str) -> TcpStream {

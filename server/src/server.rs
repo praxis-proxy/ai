@@ -156,6 +156,8 @@ struct ServerState {
     pipelines: Arc<ListenerPipelines>,
     /// KV store registry.
     kv_stores: praxis_core::kv::KvStoreRegistry,
+    /// In-flight per-model request tracker, preserved across reloads.
+    inflight_registry: praxis_ai_filters::InFlightRegistry,
     /// Shared sub-request client for filters and `iterative_request_router` step chains.
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
@@ -189,6 +191,7 @@ fn build_server_state(
 ) -> ServerState {
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
+    let inflight_registry = praxis_ai_filters::InFlightRegistry::new();
 
     #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, store_reload, store_readiness) =
@@ -204,14 +207,21 @@ fn build_server_state(
         registry,
         health_registry,
         &kv_stores,
+        &inflight_registry,
         &subrequest_client,
         &store_registries,
     )
     .unwrap_or_else(|e| fatal(&e));
     #[cfg(not(feature = "store"))]
-    let pipelines =
-        crate::pipelines::resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
-            .unwrap_or_else(|e| fatal(&e));
+    let pipelines = crate::pipelines::resolve_pipelines(
+        config,
+        registry,
+        health_registry,
+        &kv_stores,
+        &inflight_registry,
+        &subrequest_client,
+    )
+    .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
@@ -226,6 +236,7 @@ fn build_server_state(
     ServerState {
         pipelines: Arc::new(pipelines),
         kv_stores,
+        inflight_registry,
         subrequest_client,
         health_shutdown,
         store_reload,
@@ -279,6 +290,7 @@ fn spawn_watcher(
         health_shutdown: state.health_shutdown,
         initial_config: config,
         kv_stores: state.kv_stores,
+        inflight_registry: state.inflight_registry,
         pipelines: state.pipelines,
         registry: Arc::new(registry),
         shutdown: CancellationToken::new(),
