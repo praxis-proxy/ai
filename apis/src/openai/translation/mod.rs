@@ -2177,6 +2177,47 @@ mod tests {
     }
 
     #[test]
+    fn linked_output_after_a_later_call_block_stays_with_its_call() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first result"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "second result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "first result"},
+                {"role": "user", "content": "orphan result"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "second result"},
+            ]),
+            "an answer that trails a later call block must still directly follow its own call"
+        );
+    }
+
+    #[test]
     fn function_calls_separated_by_other_items_produce_separate_messages() {
         let mapped = map(&json!({
             "model": "m",

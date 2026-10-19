@@ -2856,6 +2856,90 @@ def test_orphan_output_between_call_and_linked_output_stays_after_tool_result(co
         assert turn_text == "next turn", "the turn input must still be forwarded"
 
 
+def test_linked_output_after_a_later_call_block_stays_with_its_call(conversation_backend):
+    """An answer trailing a later call block must still follow its own call.
+
+    Stored history can interleave call blocks and answers across items: a
+    function_call, an orphan output, a second function_call, then the linked
+    outputs for both calls in stored order. The translated lane must keep
+    each tool answer adjacent to the assistant message that asked for it,
+    even when the answer trails a later call block; the native lane forwards
+    the stored order untouched.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan interlude result",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "search",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_first",
+                "output": "first result",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_second",
+                "output": "second result",
+            },
+        ]
+    )
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="next turn"
+    )
+    assert response.status == "completed", "the trailing answer must not fail the turn"
+    assert len(captured) == 1, "the turn must reach the backend exactly once"
+    path, body = captured[0]
+    if translated:
+        assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+        sequence = [
+            (m["role"], m.get("tool_call_id"), m.get("content"))
+            for m in body["messages"]
+        ]
+        assert sequence == [
+            ("assistant", None, None),
+            ("tool", "call_first", "first result"),
+            ("user", None, "orphan interlude result"),
+            ("assistant", None, None),
+            ("tool", "call_second", "second result"),
+            ("user", None, "next turn"),
+        ], "each tool answer must directly follow the assistant message that asked for it"
+        call_ids = [
+            call["id"]
+            for m in body["messages"]
+            if m["role"] == "assistant"
+            for call in m.get("tool_calls", [])
+        ]
+        assert call_ids == ["call_first", "call_second"], "the call blocks must keep their order"
+    else:
+        assert path == "/v1/responses", "native lane must forward Responses"
+        input_items = body["input"]
+        assert [i["type"] for i in input_items if isinstance(i, dict)] == [
+            "function_call",
+            "function_call_output",
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+            "message",
+        ], "native passthrough must keep the stored item order, then the turn input"
+        assert input_items[1].get("call_id") is None, "the orphan item must pass through without a call_id"
+        assert input_items[3]["call_id"] == "call_first", "the first linked output must keep its call_id"
+        assert input_items[4]["call_id"] == "call_second", "the second linked output must keep its call_id"
+
+
 def test_structured_mcp_failure_append_back(conversation_backend):
     """Failed native MCP items round-trip into stored conversation history."""
     client, _, output, translated = conversation_backend

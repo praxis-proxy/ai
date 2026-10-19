@@ -3,6 +3,8 @@
 
 //! `OpenAI` Responses API translation for Chat Completions-compatible providers.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
@@ -681,39 +683,65 @@ fn expected_tool_answers(message: &Value) -> Option<Vec<String>> {
 /// between an assistant `tool_calls` message and the tool messages answering
 /// its call IDs: "An assistant message with `tool_calls` must be followed by
 /// tool messages responding to each `tool_call_id`." Responses input can
-/// legally produce that shape when an orphan output or a plain message sits
-/// between a `function_call` and its linked output, so the translated list is
-/// repaired here: intervening messages move to just after the block they
-/// interrupted, preserving their relative order.
+/// legally produce that shape when an orphan output, a plain message, or a
+/// later `function_call` block sits between a call and its linked output, so
+/// the translated list is repaired here: each answer is pulled from anywhere
+/// after its block to directly follow it, and every other message keeps its
+/// relative order. An answer that appears nowhere after its block, or before
+/// it, cannot be repaired by reordering and passes through for the backend
+/// to reject.
 fn keep_tool_answers_adjacent(messages: &mut Vec<Value>) {
-    let mut index = 0;
-    while index < messages.len() {
-        let Some(needed) = messages.get(index).and_then(expected_tool_answers) else {
-            index += 1;
+    let mut slots: Vec<Option<Value>> = messages.drain(..).map(Some).collect();
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let pulled_after = plan_answer_pulls(&slots, &mut consumed);
+    let mut order: Vec<usize> = Vec::with_capacity(slots.len());
+    for position in 0..slots.len() {
+        if !consumed.contains(&position) {
+            order.push(position);
+            if let Some(answers) = pulled_after.get(&position) {
+                order.extend(answers.iter().copied());
+            }
+        }
+    }
+    let mut repaired: Vec<Value> = Vec::with_capacity(order.len());
+    for position in order {
+        if let Some(message) = slots.get_mut(position).and_then(Option::take) {
+            repaired.push(message);
+        }
+    }
+    debug_assert_eq!(repaired.len(), slots.len(), "repair must keep every message");
+    *messages = repaired;
+}
+
+/// Positions of the tool answers each assistant block pulls after itself.
+///
+/// Each answer position is assigned to the first block that expects its call
+/// ID, so a block can collect answers that trail a later block. Answers that
+/// appear before their block, or that no block expects, are left in place.
+fn plan_answer_pulls(slots: &[Option<Value>], consumed: &mut HashSet<usize>) -> HashMap<usize, Vec<usize>> {
+    let mut pulled_after: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (block, slot) in slots.iter().enumerate() {
+        let Some(needed) = slot.as_ref().and_then(expected_tool_answers) else {
             continue;
         };
-        let mut displaced: Vec<Value> = Vec::new();
-        let mut cursor = index + 1;
-        while cursor < messages.len() {
-            if messages
-                .get(cursor)
-                .is_some_and(|message| is_tool_answer_for(message, &needed))
-            {
-                cursor += 1;
-                continue;
+        for id in &needed {
+            let answer = slots
+                .iter()
+                .enumerate()
+                .skip(block + 1)
+                .find(|&(candidate, candidate_slot)| {
+                    !consumed.contains(&candidate)
+                        && candidate_slot
+                            .as_ref()
+                            .is_some_and(|message| is_tool_answer_for(message, std::slice::from_ref(id)))
+                });
+            if let Some((position, _)) = answer {
+                consumed.insert(position);
+                pulled_after.entry(block).or_default().push(position);
             }
-            if messages.get(cursor).and_then(expected_tool_answers).is_some() {
-                // The next block starts; keep the displaced messages before it.
-                break;
-            }
-            displaced.push(messages.remove(cursor));
         }
-        let insert_at = cursor;
-        for (offset, message) in displaced.into_iter().enumerate() {
-            messages.insert(insert_at + offset, message);
-        }
-        index = insert_at;
     }
+    pulled_after
 }
 
 /// Whether `message` is a Chat `tool` answer for one of `needed` call IDs.
