@@ -474,6 +474,43 @@ pub(super) fn is_valid_filename(filename: &str) -> bool {
         && filename.chars().all(|character| !character.is_control())
 }
 
+/// Build the optimized reused-storage model context for one result, used by the
+/// combined staging-peak fixture. Mirrors the dispatch path: one incremental
+/// builder that reuses a single annotation buffer and finishes in place.
+#[cfg(test)]
+pub(super) fn build_context_reused(result: &SearchResult, query: &str) -> String {
+    let mut builder = ModelContextBuilder::new(MAX_MODEL_CONTEXT_BYTES, query, CONTEXT_TEMPLATE, result.content.len());
+    for chunk in &result.content {
+        builder.append_chunk(result, &chunk.text, ANNOTATION_TEMPLATE);
+    }
+    builder.finish(query, CONTEXT_TEMPLATE).0
+}
+
+/// Build the baseline deep-copy model context for one result, used by the
+/// combined staging-peak fixture. Allocates one owned annotation per chunk and
+/// copies the concatenation into the finished wrapper.
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "combined-peak fixture renders test-controlled results")]
+pub(super) fn build_context_deep_copy(result: &SearchResult, query: &str) -> String {
+    let mut rendered = String::new();
+    for (index, chunk) in result.content.iter().enumerate() {
+        let annotation =
+            render_annotation_bounded(result, &chunk.text, index + 1, ANNOTATION_TEMPLATE, MAX_MODEL_CONTEXT_BYTES)
+                .expect("combined-peak fixture annotation must render");
+        rendered.push_str(&annotation);
+    }
+    render_template_bounded(
+        CONTEXT_TEMPLATE,
+        &[
+            ("query", query),
+            ("num_chunks", &result.content.len().to_string()),
+            ("results", &rendered),
+        ],
+        MAX_MODEL_CONTEXT_BYTES,
+    )
+    .expect("combined-peak fixture context must render")
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, reason = "tests")]
