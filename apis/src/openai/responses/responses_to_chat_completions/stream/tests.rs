@@ -492,7 +492,7 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
     assert_eq!(added["item"]["status"], "in_progress");
     assert_eq!(
         added["item"]["action"],
-        json!({"type": "search", "query": "Praxis Proxy"})
+        json!({"type": "search", "queries": ["Praxis Proxy"]})
     );
 
     let done = &events[3].1;
@@ -504,6 +504,36 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
         events.last().unwrap().1["response"]["output"][0],
         done["item"],
         "the terminal item must match the canonical item announced incrementally",
+    );
+}
+
+#[test]
+fn hosted_web_search_stream_emits_one_multi_query_call() {
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "search for two Praxis Proxy releases",
+        "stream": true,
+        "tools": [{"type": "web_search"}]
+    });
+    let events = run_stream_with_body(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_multi","type":"function","function":{"name":"web_search","arguments":"{\"queries\":[\"first release\",\"second release\"]}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ],
+        &body,
+        wide_limits(),
+    );
+
+    let search_items = events
+        .iter()
+        .filter(|(name, _)| name == "response.output_item.done")
+        .map(|(_, payload)| &payload["item"])
+        .filter(|item| item["type"] == "web_search_call")
+        .collect::<Vec<_>>();
+    assert_eq!(search_items.len(), 1, "{events:?}");
+    assert_eq!(
+        search_items[0]["action"],
+        json!({"type": "search", "queries": ["first release", "second release"]})
     );
 }
 

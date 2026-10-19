@@ -671,6 +671,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
+                            # Read-only annotation so require_approval read_only
+                            # selectors can classify this tool (issue #1398).
+                            "annotations": {"readOnlyHint": True},
                         },
                         {
                             "name": "get_time",
@@ -1364,6 +1367,7 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
 
     recorded_requests: ClassVar[list[tuple[str, dict[str, Any]]]] = []
     web_search_queries: ClassVar[list[str]] = []
+    web_search_multi_query_call: ClassVar[bool] = False
 
     def log_message(self, fmt, *args):
         pass
@@ -1497,10 +1501,22 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                     else "Praxis marker"
                 ]
             )
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
+            if (
+                tool_name == "web_search"
+                and SimulatorBackendHandler.web_search_multi_query_call
+            ):
+                tool_calls = [
+                    {
+                        "id": f"call_simulator_{tool_name}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"queries": queries}),
+                        },
+                    }
+                ]
+            else:
+                tool_calls = [
                     {
                         "id": (
                             f"call_simulator_{tool_name}_{index}"
@@ -1514,7 +1530,11 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                         },
                     }
                     for index, query in enumerate(queries)
-                ],
+                ]
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
 
@@ -1572,24 +1592,44 @@ def _assert_simulator_auto_tool_round(
             65_536,
         ),
     }[tool_name]
+    if tool_name == "web_search":
+        parameters = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": max_length,
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        }
+    else:
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": max_length,
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
     expected_tools = [
         {
             "type": "function",
             "function": {
                 "name": tool_name,
                 "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": max_length,
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
+                "parameters": parameters,
                 "strict": True,
             },
         }
@@ -6811,6 +6851,103 @@ class TestAgenticLoopVLLM:
         )
 
     @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_gates_over_never_name(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
+
+        ``get_weather`` is annotated read-only. The policy names it in
+        ``never.tool_names`` but also selects it via ``always.read_only=true``.
+        ``always`` precedence must gate the call with an approval request; before
+        the fix the ignored read_only selector left only the never name-match and
+        the tool executed automatically.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {
+                    "always": {"read_only": True},
+                    "never": {"tool_names": ["get_weather"]},
+                },
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "always.read_only must gate the read-only tool even though "
+            "never.tool_names names it; "
+            f"got: {[item.type for item in response.output]}"
+        )
+        assert approval_requests[0].name == "get_weather"
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the gated call must not execute while approval is pending"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_auto_executes(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
+
+        ``get_weather`` is annotated read-only and matched by
+        ``never.read_only=true``, so it executes automatically with no approval
+        request -- proving the discovered readOnlyHint drives the exemption
+        through the OpenAI client.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {"never": {"read_only": True}},
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        output_types = [item.type for item in response.output]
+        assert not any(t == "mcp_approval_request" for t in output_types), (
+            f"never.read_only must auto-execute the read-only tool; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "the read-only tool must execute automatically under never.read_only"
+        )
+        assert "mcp_call" in output_types, (
+            f"auto-executed response should contain the MCP result; got: {output_types}"
+        )
+
+    @requires_vllm_compat
     def test_mcp_approval_resume_streams_without_index_error(
         self, agentic_client, agentic_proxy,
     ):
@@ -7313,6 +7450,70 @@ class TestAgenticLoopVLLM:
         finally:
             BraveSearchHandler.reset()
             SimulatorBackendHandler.web_search_queries = []
+
+    @requires_simulator
+    def test_web_search_multi_query_round_trip_preserves_queries(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            SimulatorBackendHandler.web_search_multi_query_call = True
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search for both questions, then report "
+                    "each result title and URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                include=["web_search_call.action.sources"],
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "completed"
+            assert len(BraveSearchHandler.request_paths) == request_count + 2
+
+            completed_call = web_search_calls[0].model_dump()
+            assert completed_call.get("action", {}).get("queries") == [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            sources = completed_call.get("action", {}).get("sources", [])
+            assert any(
+                source.get("url") == "https://example.com/mock"
+                for source in sources
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "Mock Search Result" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+            SimulatorBackendHandler.web_search_multi_query_call = False
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(

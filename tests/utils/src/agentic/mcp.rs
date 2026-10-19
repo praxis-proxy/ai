@@ -152,6 +152,13 @@ impl McpToolFixture {
         self
     }
 
+    /// Advertise `annotations.readOnlyHint` for this tool in `tools/list`.
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.annotations = Some(json!({"readOnlyHint": read_only}));
+        self
+    }
+
     /// Set a custom input schema.
     ///
     /// # Panics

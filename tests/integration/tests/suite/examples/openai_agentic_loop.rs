@@ -427,6 +427,177 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
+// Issue #1398: the MCP approval policy's `read_only` selector must participate in
+// classification end to end — the annotation has to survive discovery
+// (`tools/list` → resolved tool map) and the agentic loop must gate a writable
+// call before dispatch while auto-executing a read-only one. These exercise the
+// real request path (model backend + mock MCP server) rather than a hand-built
+// tool map.
+
+#[test]
+fn read_only_policy_gates_writable_call_before_dispatch() {
+    // A writable tool (annotations.readOnlyHint=false) is named by
+    // `never.tool_names` AND selected by `always.read_only=false` — the exact
+    // overlap from #1398. `always` precedence must win, so the loop surfaces an
+    // mcp_approval_request and runs no tool. Before the fix the ignored
+    // read_only selector left only the never name-match and the tool executed.
+    let call_response = serde_json::json!({
+        "id": "resp_ro_gate_1",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_ro_gate",
+            "call_id": "call_ro_delete",
+            "name": "writer__delete",
+            "arguments": r#"{"path":"/tmp/x"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&call_response).unwrap())])
+        .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("delete")
+                .with_description("Delete a path")
+                .with_read_only(false),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let db = TempSqlite::new("issue1398_read_only_gate");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Delete the file.",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "writer",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["delete"],
+            "require_approval": {"always": {"read_only": false}, "never": {"tool_names": ["delete"]}}
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approval-gated request should return 200: {raw}"
+    );
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let output = response["output"].as_array().expect("output array");
+    let approvals: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|item| item["type"] == "mcp_approval_request")
+        .collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the writable tool must surface exactly one mcp_approval_request: {output:#?}"
+    );
+    assert_eq!(
+        approvals[0]["name"], "delete",
+        "the approval request must preserve the original tool name"
+    );
+    assert!(
+        mcp.method_count("tools/list") >= 1,
+        "discovery must call tools/list so the readOnlyHint annotation reaches classification"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "the writable call must be gated before dispatch, not executed automatically"
+    );
+}
+
+#[test]
+fn read_only_policy_auto_dispatches_read_only_call() {
+    // Complement to the gate test: a read-only tool (readOnlyHint=true) under
+    // `never.read_only=true` must auto-execute, proving the discovered annotation
+    // drives the exemption through the real loop (not just a hand-built map).
+    let call_response = serde_json::json!({
+        "id": "resp_ro_auto_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_ro_auto",
+            "call_id": "call_ro_list",
+            "name": "reader__list",
+            "arguments": "{}",
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_ro_auto_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Listing done."}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&call_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("list").with_read_only(true)],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "List files.",
+        "conversation": {"id": "conv_ro_auto"},
+        "tools": [{
+            "type": "mcp",
+            "server_label": "reader",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["list"],
+            "require_approval": {"never": {"read_only": true}}
+        }]
+    });
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "read-only auto-dispatch should return 200: {raw}"
+    );
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_ro_auto_2",
+        "the loop must resume to the final model turn after auto-dispatching the read-only call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the read-only tool must execute automatically under never.read_only=true"
+    );
+    assert_eq!(mcp.last_tool_call_name().as_deref(), Some("list"));
+}
+
 #[test]
 fn invalid_mcp_arguments_are_rejected_without_an_outbound_call() {
     // The model emits a tool call whose `location` is a number, violating the
