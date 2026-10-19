@@ -3641,6 +3641,96 @@ async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
 }
 
 #[tokio::test]
+async fn over_budget_approval_is_retryable_then_replay_is_rejected() {
+    // #1478: a budget rejection must leave the approval pending so a corrected
+    // follow-up under a sufficient budget can still consume it exactly once, and
+    // a later replay of the consumed approval is rejected.
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_retry", "{\"city\":\"Paris\"}").await;
+    let filter = make_dispatch_filter();
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+
+    // Attempt 1: too small a budget rejects before loading or consuming the row.
+    let req1 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx1 = make_owned_filter_context(&req1);
+    register_store(&mut ctx1, Arc::clone(&store));
+    ctx1.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(131_072, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body1 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx1, &mut body1, true).await.unwrap());
+    assert_eq!(rejection.status, 413, "an over-budget resumption is rejected");
+    assert!(reject_message(&rejection).contains("max_retained_bytes"));
+    assert!(
+        ctx1.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "the rejected attempt must not execute the tool"
+    );
+
+    // Attempt 2: a sufficient budget resumes and executes the pending call once.
+    let req2 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx2 = make_owned_filter_context(&req2);
+    register_store(&mut ctx2, Arc::clone(&store));
+    ctx2.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let resumed = filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap();
+    assert!(
+        matches!(resumed, FilterAction::Continue),
+        "a retry under a sufficient budget must resume, not reject"
+    );
+    let state2 = ctx2.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state2.accumulated_output.len(), 1, "the retry executes the tool exactly once");
+    assert_eq!(state2.accumulated_output[0]["id"], "call_retry");
+
+    // Attempt 3: the now-consumed approval cannot be replayed.
+    let req3 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx3 = make_owned_filter_context(&req3);
+    register_store(&mut ctx3, Arc::clone(&store));
+    ctx3.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body3 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let replay = expect_reject(filter.on_request_body(&mut ctx3, &mut body3, true).await.unwrap());
+    assert_eq!(replay.status, 400, "a consumed approval cannot be replayed");
+    assert!(reject_message(&replay).contains("already been used"));
+    assert!(
+        ctx3.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "replay produces no second mcp_call"
+    );
+
+    // The durable row is spent exactly once: a direct consume now finds nothing.
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_retry"], 9_999)
+            .await
+            .unwrap(),
+        Some(0),
+        "the approval was consumed exactly once by the successful retry"
+    );
+}
+
+#[tokio::test]
 async fn resume_approval_is_hidden_from_another_owner_in_the_same_tenant() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
