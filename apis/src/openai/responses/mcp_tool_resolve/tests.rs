@@ -70,6 +70,27 @@ fn declares_dual_phase_body_access() {
 }
 
 #[test]
+fn check_json_body_size_counts_retained_input() {
+    // The current input lives outside request_body (params-only, #1618). Params
+    // alone fit under the cap, but params + the separately-held input exceed it,
+    // so the input must be counted toward the rewritten-body limit.
+    let params = serde_json::json!({"model": "m", "tools": []});
+    let big_input = serde_json::json!([{"role": "user", "content": "x".repeat(4096)}]);
+    let cap = 1024;
+    assert!(
+        check_json_body_size(&params, &serde_json::json!([]), cap).is_ok(),
+        "small params with empty input fit under the cap"
+    );
+    assert!(
+        matches!(
+            check_json_body_size(&params, &big_input, cap),
+            Err(ResolveError::BodyTooLarge { .. })
+        ),
+        "the retained input must be counted toward the body-size cap"
+    );
+}
+
+#[test]
 fn config_with_custom_timeout() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();

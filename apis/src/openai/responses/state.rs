@@ -740,7 +740,7 @@ pub(crate) struct ResponsesState {
     /// Parsed request *parameters* as received from the client.
     ///
     /// The `input` member is moved out at construction into [`Self::input`] /
-    /// [`Self::input_form`] so the payload is decoded only once (#1618); this
+    /// `input_form` so the payload is decoded only once (#1618); this
     /// object holds everything else (model, tools, reasoning, store, etc.). Use
     /// [`Self::set_request_params`] rather than assigning this field directly so a
     /// later filter cannot reintroduce a duplicate `input` copy.
@@ -1320,16 +1320,7 @@ impl ResponsesState {
         // deep-copy the input; only `messages` detaches an item on later mutation.
         #[cfg(feature = "openai-mcp-tools")]
         let input_form = InputForm::classify(body.get("input"));
-        let normalizable = matches!(
-            body.get("input"),
-            Some(
-                serde_json::Value::Null
-                    | serde_json::Value::String(_)
-                    | serde_json::Value::Object(_)
-                    | serde_json::Value::Array(_)
-            )
-        );
-        let messages = if normalizable {
+        let messages = if input_is_normalizable(body.get("input")) {
             let value = body
                 .as_object_mut()
                 .and_then(|object| object.remove("input"))
@@ -1399,9 +1390,13 @@ impl ResponsesState {
     ///
     /// Filters that rewrite the body (file/document resolution, MCP tool
     /// expansion) call this instead of assigning [`Self::request_body`] directly;
-    /// the current input remains owned by [`Self::input`] / [`Self::input_form`].
+    /// the current input remains owned by [`Self::input`] / `input_form`.
     pub(crate) fn set_request_params(&mut self, mut params: serde_json::Value) {
-        if let Some(object) = params.as_object_mut() {
+        // Strip only a normalizable `input`; an unsupported scalar is left in place
+        // (as in `from_request_body`) so existing validators still reject it (#1618).
+        if input_is_normalizable(params.get("input"))
+            && let Some(object) = params.as_object_mut()
+        {
             object.remove("input");
         }
         self.request_body = params;
@@ -1758,6 +1753,24 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
     current_round_tool_call_admissions(state, &selected)
         .into_iter()
         .any(|admitted| admitted)
+}
+
+/// Whether an `input` value normalizes into message items, and is therefore moved
+/// out of `request_body` at construction.
+///
+/// Unsupported scalars (number/bool) return `false`: they cannot be normalized or
+/// reconstructed, so they stay in the parameter object for existing validators to
+/// reject, preserving prior behavior (#1618).
+fn input_is_normalizable(input: Option<&serde_json::Value>) -> bool {
+    matches!(
+        input,
+        Some(
+            serde_json::Value::Null
+                | serde_json::Value::String(_)
+                | serde_json::Value::Object(_)
+                | serde_json::Value::Array(_)
+        )
+    )
 }
 
 /// Normalize an owned `input` value without cloning array or object items.
@@ -2132,6 +2145,24 @@ mod tests {
             "input must not be duplicated inside request_body"
         );
         assert_eq!(state.input[0]["content"], "hello", "the input is owned by state.input");
+    }
+
+    #[test]
+    fn set_request_params_strips_normalizable_input_but_keeps_scalar() {
+        let mut state = ResponsesState::default();
+        state.set_request_params(json!({"model": "m", "input": [{"role": "user", "content": "hi"}]}));
+        assert!(
+            state.request_body.get("input").is_none(),
+            "a normalizable input is stripped from the parameters"
+        );
+
+        let mut state = ResponsesState::default();
+        state.set_request_params(json!({"model": "m", "input": 42}));
+        assert_eq!(
+            state.request_body.get("input"),
+            Some(&json!(42)),
+            "an unsupported scalar stays in the parameters so validators still reject it (#1618)"
+        );
     }
 
     #[test]

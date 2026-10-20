@@ -3277,7 +3277,7 @@ fn commit_deferred_listings(
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
     detect_name_collisions(&expanded_tools, &generated_names)?;
     let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
-    check_json_body_size(&request_body, max_rewritten_body_bytes)?;
+    check_json_body_size(&request_body, &state.input, max_rewritten_body_bytes)?;
 
     let retained = if let Some(slot) = budget {
         let mut charge = request_body
@@ -3350,8 +3350,19 @@ fn expanded_request_body(
 }
 
 /// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
-fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
-    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
+///
+/// The current input lives outside `request_body` (params-only, #1618), so it is
+/// measured separately and added to the expanded body's size; an unsupported
+/// scalar still counted inside `body` contributes an empty `input` array here,
+/// which is a negligible over-estimate for a fail-closed bound.
+fn check_json_body_size<I: serde::Serialize + ?Sized>(
+    body: &serde_json::Value,
+    input: &I,
+    max_rewritten_body_bytes: usize,
+) -> Result<(), ResolveError> {
+    let actual = serialized_len(body)
+        .map_err(ResolveError::Serialization)?
+        .saturating_add(serialized_len(input).map_err(ResolveError::Serialization)?);
     if actual > max_rewritten_body_bytes {
         return Err(ResolveError::BodyTooLarge {
             actual,
