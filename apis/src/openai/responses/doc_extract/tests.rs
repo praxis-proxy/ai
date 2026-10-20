@@ -50,11 +50,10 @@ fn preflight_rejects_budgeted_request_missing_budget_state_as_server_error() {
         body["error"]["type"], "server_error",
         "error type must be server_error: {body}"
     );
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("retained-payload budget state is missing")),
-        "error must name the missing budget state: {body}"
+    assert_eq!(
+        body["error"]["message"],
+        "Document extraction is unavailable because of a platform configuration problem. Contact the platform administrator.",
+        "client error must not expose internal budget wiring details: {body}"
     );
 }
 
