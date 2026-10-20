@@ -712,12 +712,12 @@ async fn compact_explicit_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(false).await;
+    Box::pin(assert_compaction_follow_up(false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_compressed_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(true).await;
+    Box::pin(assert_compaction_follow_up(true)).await;
 }
 
 /// Verify persisted compaction can be rehydrated with either storage codec.

@@ -1,5 +1,5 @@
 # Client Tool Compatibility
-# Requires `--features store-sqlite` because these filters are opt-in.
+# Requires `--features openai-agentic-loop,store-sqlite` because these filters are opt-in.
 #
 # Lets a rich Codex-style Responses client talk to a function-only Responses
 # backend (for example vLLM at POST /v1/responses) without routing through

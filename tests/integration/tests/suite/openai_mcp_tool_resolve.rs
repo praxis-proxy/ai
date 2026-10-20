@@ -1613,6 +1613,84 @@ fn deferred_connector_without_tool_search_rejected() {
 }
 
 #[test]
+fn require_connector_rejects_direct_url_before_any_callout() {
+    let connector_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let connector_server = start_mcp_mock_server_with_config(connector_config);
+    let direct_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_b")],
+        ..McpMockConfig::default()
+    };
+    let direct_server = start_mcp_mock_server_with_config(direct_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let connector_url = format!("http://127.0.0.1:{}/mcp", connector_server.port());
+    let connectors = format!(
+        "        require_connector: true\n        connectors:\n          - id: trusted\n            server_url: {connector_url}"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let direct_url = format!("http://127.0.0.1:{}/mcp", direct_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"direct","server_url":"{direct_url}"}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 400, "direct server_url should be rejected");
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("Use an administrator-configured connector_id instead."),
+        "response: {response_body}"
+    );
+    for server in [&connector_server, &direct_server] {
+        for method in ["initialize", "tools/list"] {
+            assert_eq!(
+                server.method_count(method),
+                0,
+                "no MCP call should reach a server for method {method}"
+            );
+        }
+    }
+}
+
+#[test]
+fn require_connector_still_resolves_configured_connector() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        require_connector: true\n        connectors:\n          - id: trusted\n            server_url: {mcp_url}"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"s","connector_id":"trusted","allowed_tools":["tool_a"]}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "configured connector should still resolve: {raw}"
+    );
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "configured connector should receive tools/list"
+    );
+}
+
+#[test]
 fn direct_url_alongside_connector_both_resolved() {
     let mcp_config_a = McpMockConfig {
         tools: vec![McpToolFixture::new("tool_a")],

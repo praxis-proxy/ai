@@ -126,6 +126,7 @@ pub(crate) fn synthesize_private_complete(item: &Value, output_index: u64) -> Ve
 
 /// Synthesize the tail of a native complete `file_search` (2 events: completed → done).
 /// Reuses the opening's `output_index`. Clone is necessary — synthesis payload.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn synthesize_native_complete_tail(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
     let idx = || Value::Number(output_index.into());
 
@@ -333,6 +334,7 @@ fn select_builder(item: &Value, output_index: u64, kind: SynthesisKind) -> Vec<(
     let completed = item.get("status").and_then(Value::as_str) == Some("completed");
     match (kind, completed) {
         (SynthesisKind::Private, true) => synthesize_private_complete(item, output_index),
+        #[cfg(any(test, feature = "openai-agentic-loop"))]
         (SynthesisKind::Native, true) => synthesize_native_complete_tail(item, output_index),
         // Incomplete (terminalized / open-failure) tail; private replays its opening.
         (kind, false) => synthesize_incomplete_tail(item, output_index, kind == SynthesisKind::Private),

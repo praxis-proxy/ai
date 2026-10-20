@@ -271,7 +271,7 @@ Reproduce the core suite against a local GPU (see
 [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) for serving vLLM):
 
 ```console
-cargo build -p praxis-ai-proxy --features full,store-sqlite
+cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
 VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
 ```

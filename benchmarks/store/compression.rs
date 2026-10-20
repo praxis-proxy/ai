@@ -6,10 +6,10 @@
 //! Run with:
 //!
 //! ```console
-//! cargo bench -p praxis-ai-benchmarks
+//! cargo bench -p praxis-ai-benchmarks --features store-all
 //! # add the PostgreSQL backend (plaintext local database):
 //! DATABASE_URL=postgres://user:pass@localhost/bench \
-//!   PRAXIS_BENCH_PG_SSLMODE=disable cargo bench -p praxis-ai-benchmarks
+//!   PRAXIS_BENCH_PG_SSLMODE=disable cargo bench -p praxis-ai-benchmarks --features store-all
 //! ```
 #![expect(
     clippy::expect_used,

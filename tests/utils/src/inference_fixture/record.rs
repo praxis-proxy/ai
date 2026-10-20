@@ -269,7 +269,7 @@ impl RecordingProxyGuard {
             return Err(runtime_error("recording proxy exceeded its expected request count"));
         }
         if state.attempts.len() != expected_exchanges {
-            return Err(runtime_error("recording proxy captured an unexpected request count"));
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
         }
         if state
             .attempts
@@ -397,6 +397,12 @@ pub(super) async fn record_live(
         .await
         {
             Ok(client_response) => {
+                if client_response.status != turn.expect.client_status {
+                    operation_error = Some(FixtureError::UnexpectedRecordedClientStatus {
+                        actual: client_response.status,
+                        expected: turn.expect.client_status,
+                    });
+                }
                 previous_response_id = client_response.response_id().map(str::to_owned);
                 let exchange = BorrowedRecordedExchange {
                     request: &turn.request,
@@ -414,7 +420,9 @@ pub(super) async fn record_live(
             },
             Err(error) => operation_error = Some(error),
         }
-        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await {
+        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await
+            && operation_error.is_none()
+        {
             operation_error = Some(error);
         }
         if operation_error.is_some() {
@@ -426,11 +434,22 @@ pub(super) async fn record_live(
         .shutdown()
         .map_err(|_error| runtime_error("scenario proxy shutdown did not complete"));
     let captured = recorder.finish_captures(attempts);
-    let captured = captured?;
     proxy_result?;
-    if let Some(error) = operation_error {
-        return Err(error);
-    }
+    let captured = match captured {
+        Err(FixtureError::UnexpectedRecordingRequestCount) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
+        },
+        Err(error) => return Err(error),
+        Ok(captured) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            captured
+        },
+    };
     if pending.len() != expected_turns || captured.len() != expected_turns {
         return Err(runtime_error("recording scenario did not complete every turn"));
     }
@@ -3309,6 +3328,30 @@ mod tests {
         let serialized = serde_json::to_string(&fixture).unwrap();
         assert!(!serialized.contains(SECRET_SENTINEL));
         super::super::validate_commit_safe(&fixture).unwrap();
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn record_live_preserves_unexpected_client_status_error() {
+        let provider = LocalProvider::start(handler(|_request| async move { chat_response(0) })).await;
+        let mut scenario = live_scenario();
+        scenario.turns.truncate(1);
+        scenario.turns[0].expect.client_status = 201;
+
+        let error = ScenarioRunner::record_live(&scenario, target(provider.http_url("/"), secret_headers()))
+            .await
+            .expect_err("recording must report the declared/observed client-status mismatch");
+
+        assert!(
+            matches!(
+                error,
+                FixtureError::UnexpectedRecordedClientStatus {
+                    actual: 200,
+                    expected: 201
+                }
+            ),
+            "recording should report actual status 200 against declared status 201"
+        );
         provider.finish().await;
     }
 

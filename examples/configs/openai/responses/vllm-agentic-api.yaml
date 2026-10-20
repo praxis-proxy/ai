@@ -1,4 +1,5 @@
 # vLLM Agentic API Responses passthrough
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # vLLM Agentic API: https://github.com/vllm-project/agentic-api
 #

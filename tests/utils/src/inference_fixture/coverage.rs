@@ -1220,6 +1220,7 @@ mod tests {
                 "openai_chat_completions_to_azureai_chat_completions",
                 "openai_chat_completions_to_vertexai_gemini",
                 "anthropic_messages_to_vertexai_anthropic",
+                "openai_chat_completions_to_anthropic_messages",
             ]
         );
         assert_eq!(
@@ -1306,7 +1307,14 @@ mod tests {
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["responses_native_passthrough"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
             ]
         );
@@ -1396,11 +1404,18 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 79, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 65, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 70, "manifest recording inventory count");
+        assert_eq!(report.features_total, 86, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 66, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 71, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1427,6 +1442,7 @@ mod tests {
                 "messages/upstream-error",
                 "messages/upstream-error-stream",
                 "messages/upstream-error-unknown-type",
+                "openai_legacy/anthropic-json-sse-error",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1471,7 +1487,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 79, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 86, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1834,8 +1850,36 @@ mod tests {
                     &vec!["vertex/anthropic-wire-translation".to_owned()]
                 ),
                 (
+                    &"external_model.anthropic.request.text".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.json".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.sse".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.cached_usage".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.context_window".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.error".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
                     &"responses.native.mcp_admission_untrusted_excluded".to_owned(),
                     &vec!["responses/mcp-tool-admission-untrusted-direct".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.null_cache_usage".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
                 ),
                 (
                     &"responses.chat.tools.orphan_output_projection".to_owned(),
@@ -2011,6 +2055,18 @@ mod tests {
                     .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                     .collect::<Vec<_>>(),
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
+            );
+        }
+        for feature in &manifest.features[77..85] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)],
+                "feature {} must have synthetic-only coverage",
+                feature.id,
             );
         }
 

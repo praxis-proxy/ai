@@ -148,6 +148,11 @@ asynchronous Responses lifecycle.
 Stateful mode influences routing decisions (e.g.
 directing to clusters with response store access).
 
+For an agentic Responses pipeline, the
+[retained-payload budget](responses-retained-payload.md)
+accounts for input, history, tool results, and output
+across inference rounds.
+
 ## StreamBuffer Body Access
 
 StreamBuffer is the key enabler for AI inference
@@ -308,6 +313,7 @@ Persists non-streaming Responses API responses. See
 
 ## Related
 
+- [OpenAI Responses retained-payload budget](responses-retained-payload.md)
 - [Response Store](response-store.md)
 - [Agentic Protocols](agentic-protocols.md)
 - [Features](../features.md)

@@ -10,6 +10,7 @@ scope:
   - openai_chat_completions_to_azureai_chat_completions
   - openai_chat_completions_to_vertexai_gemini
   - anthropic_messages_to_vertexai_anthropic
+  - openai_chat_completions_to_anthropic_messages
 features:
   - id: bedrock.converse.request.text
     scopes:
@@ -736,12 +737,75 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: external_model.anthropic.request.text
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.json
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.sse
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.cached_usage
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.context_window
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.error
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.mcp_admission_untrusted_excluded
     scopes:
       - responses_native_passthrough
     status: synthetic_only
     scenarios:
       - responses/mcp-tool-admission-untrusted-direct
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.null_cache_usage
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
     providers:
       synthetic:
         status: synthetic_only

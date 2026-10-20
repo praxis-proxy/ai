@@ -3,6 +3,8 @@
 
 //! Proxy startup and configuration test utilities for integration tests.
 
+#[cfg(feature = "openai-responses")]
+use std::collections::HashMap;
 use std::{
     fmt,
     io::ErrorKind,
@@ -120,16 +122,22 @@ fn resolve_praxis_ai_bin_path() -> PathBuf {
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 /// [`FilterEntry`]: praxis_core::config::FilterEntry
+#[expect(
+    clippy::too_many_lines,
+    reason = "test pipeline mirrors server body caps and extension wiring"
+)]
 fn resolve_listener_pipeline(
     config: &Config,
     listener: &Listener,
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
-    store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
+    #[cfg(feature = "store")] store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
 ) -> Arc<FilterPipeline> {
     // Mirror the server: fold each chain's inherited `conditions:` into its
     // filters before composition so chain-level gates apply to every filter in
-    // the chain (chain gate AND filter gate).
+    // the chain (chain gate AND filter gate). `as_slices()` borrows the expanded
+    // entries for branch/outbound chain resolution; `for_listener()` concatenates
+    // the listener's referenced chains with the same inherited conditions folded in.
     let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
     let chains = expanded_chains.as_slices();
 
@@ -137,11 +145,34 @@ fn resolve_listener_pipeline(
         .for_listener(listener)
         .unwrap_or_else(|err| panic!("{err}"));
 
+    // Inject the retained-payload budget caps into the expanded listener entries
+    // and a per-listener owned copy of the expanded branch chains, so the
+    // inherited chain conditions folded in by `ExpandedFilterChains` survive the
+    // rewrite. `chains` shadows the borrowed expanded slices with the
+    // budget-adjusted owned copies for this listener's build.
+    #[cfg(feature = "openai-responses")]
+    let mut owned_chains: HashMap<String, Vec<praxis_core::config::FilterEntry>> = chains
+        .iter()
+        .map(|(name, filters)| ((*name).to_owned(), filters.to_vec()))
+        .collect();
+    #[cfg(feature = "openai-responses")]
+    let budget_policy = praxis_ai::prepare_agentic_budget_entries(&mut entries, &mut owned_chains)
+        .unwrap_or_else(|error| panic!("invalid agentic budget pipeline: {error}"));
+    #[cfg(feature = "openai-responses")]
+    let chains: HashMap<&str, &[_]> = owned_chains
+        .iter()
+        .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+        .collect();
+
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    #[cfg(feature = "openai-responses")]
+    let request_body_limit = praxis_ai::agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
+    #[cfg(not(feature = "openai-responses"))]
+    let request_body_limit = config.body_limits.max_request_bytes;
     pipeline
         .apply_body_limits(
-            config.body_limits.max_request_bytes,
+            request_body_limit,
             config.body_limits.max_response_bytes,
             config.insecure_options.allow_unbounded_body,
         )
@@ -153,8 +184,13 @@ fn resolve_listener_pipeline(
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     praxis_ai::install_pipeline_extensions(&mut pipeline, &praxis_ai::InFlightRegistry::new());
+    #[cfg(feature = "openai-responses")]
+    if let Some(policy) = budget_policy {
+        pipeline.add_pipeline_extension(Box::new(policy));
+    }
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
+    #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(store_registry));
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
@@ -183,6 +219,7 @@ pub fn build_pipeline(config: &Config) -> FilterPipeline {
         listener,
         &registry,
         &client,
+        #[cfg(feature = "store")]
         praxis_ai_apis::store::ResponseStoreRegistry::new(),
     ))
     .unwrap_or_else(|_| panic!("pipeline Arc should have single owner"))
@@ -241,6 +278,13 @@ impl HarnessStoreReadiness {
     /// Block until every configured store is provisioned, or the deadline
     /// elapses. Polls the shared readiness value to observe the provisioner
     /// without a timing assumption. A no-op when no store is configured.
+    #[cfg_attr(
+        not(feature = "_store-backend"),
+        expect(
+            clippy::unused_self,
+            reason = "the feature-off waiter preserves the same readiness interface"
+        )
+    )]
     fn wait(&self) {
         #[cfg(feature = "_store-backend")]
         if let Some(handle) = &self.handle {
@@ -441,12 +485,9 @@ impl Drop for ProxyGuard {
 /// and the optional admin endpoint.
 ///
 /// [`Server`]: pingora_core::server::Server
-#[cfg_attr(
-    feature = "_store-backend",
-    expect(
-        clippy::too_many_lines,
-        reason = "listener wiring plus store provisioning mirror boot_server"
-    )
+#[expect(
+    clippy::too_many_lines,
+    reason = "listener wiring and optional store provisioning mirror boot_server"
 )]
 fn build_pingora_server(
     config: &Config,
@@ -468,9 +509,8 @@ fn build_pingora_server(
     #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
-    #[cfg(not(feature = "_store-backend"))]
-    let store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> =
-        std::collections::HashMap::new();
+    #[cfg(all(feature = "store", not(feature = "_store-backend")))]
+    let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
 
     #[cfg(feature = "_store-backend")]
     let readiness = HarnessStoreReadiness {
@@ -481,12 +521,14 @@ fn build_pingora_server(
 
     let mut cert_shutdowns = Vec::new();
     for listener in &config.listeners {
+        #[cfg(feature = "store")]
         let store_registry = store_registries.get(&listener.name).cloned().unwrap_or_default();
         let pipeline = Arc::new(ArcSwap::from(resolve_listener_pipeline(
             config,
             listener,
             registry,
             client,
+            #[cfg(feature = "store")]
             store_registry,
         )));
         load_http_handler(&mut server, listener, pipeline, &mut cert_shutdowns).unwrap();

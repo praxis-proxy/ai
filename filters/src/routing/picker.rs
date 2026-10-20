@@ -116,6 +116,7 @@ mod tests {
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from(cluster),
+            provider_profile: None,
         }
     }
 

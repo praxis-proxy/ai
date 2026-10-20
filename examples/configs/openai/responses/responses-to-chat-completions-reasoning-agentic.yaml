@@ -1,5 +1,5 @@
 # Agentic reasoning storage fixture
-# Requires SQLite support (--features store-all).
+# Requires SQLite support (--features openai-agentic-loop,store-all).
 #
 # Exercises stored reasoning and previous_response_id replay through the agentic
 # loop, where the output collector records each round into the stored history.

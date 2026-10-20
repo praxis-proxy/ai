@@ -19,6 +19,7 @@
 //!
 //! [`PendingApproval`]: super::mcp_dispatch
 
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::mcp_tool_resolve::{McpToolIndex, McpToolMatch};
 
 /// Disposition of a single model-emitted tool call relative to the resolved MCP
@@ -29,6 +30,7 @@ use super::mcp_tool_resolve::{McpToolIndex, McpToolMatch};
 /// that `openai_mcp_dispatch` needs to build a client-visible
 /// `mcp_approval_request`. That construction stays private to the dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) enum McpDisposition {
     /// An MCP tool call whose policy permits automatic execution.
     Automatic,
@@ -63,6 +65,7 @@ pub(crate) enum McpDisposition {
 /// which never feeds approval) can never suppress it. When the floor is
 /// [`ApprovalFloor::None`] the classification is exactly the client-driven
 /// behavior.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn classify_mcp(
     tool_call: &serde_json::Value,
     tool_index: &McpToolIndex<'_>,
@@ -112,6 +115,7 @@ pub(crate) enum ApprovalFloor {
     Always,
 }
 
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 impl ApprovalFloor {
     /// Whether the operator floor forces approval for every classified MCP call.
     pub(crate) const fn forces_approval(self) -> bool {
@@ -132,6 +136,7 @@ impl ApprovalFloor {
 /// type — collapses to [`ApprovalPolicy::Always`], the fail-closed default that
 /// forces approval before a tool can execute.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) enum ApprovalPolicy {
     /// Always require approval.
     Always,
@@ -156,6 +161,7 @@ pub(crate) enum ApprovalPolicy {
 /// A filter with no selectors matches no tool, so a degenerate `{}` member
 /// never changes a call's disposition.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) struct ApprovalSelector {
     /// Optional `tool_names` allowlist; `None` imposes no name constraint.
     pub(crate) names: Option<Vec<String>>,
@@ -164,6 +170,7 @@ pub(crate) struct ApprovalSelector {
     pub(crate) read_only: Option<bool>,
 }
 
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 impl ApprovalSelector {
     /// Whether `tool_name`/`read_only_hint` satisfy every selector present on
     /// this filter. A filter carrying no selectors matches nothing.
@@ -196,6 +203,7 @@ impl ApprovalSelector {
 /// - `{"always"?: MCPToolFilter, "never"?: MCPToolFilter}` → `Filter`;
 /// - an object with an unknown field, a non-object `always`/`never`, a non-array `tool_names`, a non-string tool name,
 ///   or a non-boolean `read_only` → `Always` (malformed, fail closed before dispatch).
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn parse_approval_policy(tool_def: &serde_json::Value) -> ApprovalPolicy {
     let Some(value) = tool_def.get("require_approval") else {
         return ApprovalPolicy::Always;
@@ -216,12 +224,14 @@ pub(crate) fn parse_approval_policy(tool_def: &serde_json::Value) -> ApprovalPol
 }
 
 /// Recognized keys in an `MCPToolApprovalFilter` object.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 const APPROVAL_FILTER_KEYS: &[&str] = &["always", "never"];
 
 /// Parse the `{always?, never?}` approval-filter object.
 ///
 /// Returns `None` for any shape outside the closed schema (an unknown key or a
 /// member that is not a valid `MCPToolFilter`) so the caller fails closed.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn parse_filter_policy(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ApprovalPolicy> {
     if obj.keys().any(|key| !APPROVAL_FILTER_KEYS.contains(&key.as_str())) {
         return None;
@@ -232,6 +242,7 @@ fn parse_filter_policy(obj: &serde_json::Map<String, serde_json::Value>) -> Opti
 }
 
 /// Recognized keys in an `MCPToolFilter` object.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 const TOOL_FILTER_KEYS: &[&str] = &["tool_names", "read_only"];
 
 /// Parse one `MCPToolFilter` member of an approval policy.
@@ -244,6 +255,7 @@ const TOOL_FILTER_KEYS: &[&str] = &["tool_names", "read_only"];
 /// treated as malformed rather than a dropped selector (otherwise
 /// `{"never":{"tool_names":null,"read_only":false}}` would silently exempt every
 /// writable tool from approval).
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn parse_filter_member(value: Option<&serde_json::Value>) -> Option<ApprovalSelector> {
     let Some(value) = value else {
         return Some(ApprovalSelector::default());
@@ -264,6 +276,7 @@ fn parse_filter_member(value: Option<&serde_json::Value>) -> Option<ApprovalSele
 }
 
 /// Collect a `tool_names` array, returning `None` if any element is not a string.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn parse_tool_names(arr: &[serde_json::Value]) -> Option<Vec<String>> {
     arr.iter().map(|v| v.as_str().map(ToOwned::to_owned)).collect()
 }
@@ -274,6 +287,7 @@ fn parse_tool_names(arr: &[serde_json::Value]) -> Option<Vec<String>> {
 /// `false`/writable when absent). For `Filter`, an `always` match forces
 /// approval and takes precedence over a `never` match; a tool matched by
 /// neither selector defaults to requiring approval (fail closed).
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn requires_approval(policy: &ApprovalPolicy, tool_name: &str, read_only_hint: bool) -> bool {
     match policy {
         ApprovalPolicy::Always => true,
@@ -296,6 +310,7 @@ pub(crate) fn requires_approval(policy: &ApprovalPolicy, tool_name: &str, read_o
 /// The resolved entry wraps the tool under `tool_definition`; a missing hint
 /// defaults to `false` (writable), matching the MCP annotation default so a
 /// tool without annotations is treated as data-modifying.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn tool_read_only_hint(entry: &serde_json::Value) -> bool {
     entry
         .get("tool_definition")
