@@ -1793,6 +1793,11 @@ impl ConversationItemStore for PostgresResponseStore {
 impl PostgresResponseStore {
     /// Preflight and reconstruct a conversation in one stable read transaction.
     /// The size-only query runs before any JSON column is returned to the process.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::large_stack_frames,
+        reason = "one read transaction keeps the size preflight and reconstruction on the same snapshot; async_trait boxes the future"
+    )]
     async fn conversation_record_within(
         &self,
         owner: &StateOwner,
@@ -1809,10 +1814,8 @@ impl PostgresResponseStore {
             .await
             .map_err(|e| self.db_err(&e))?;
         let (message_bytes, item_bytes, item_exists) = if let Some(table) = self.tables.items.as_deref() {
-            let item_scope = format!(
-                "i.conversation_id = c.conversation_id AND i.tenant_id = c.tenant_id \
-                 AND i.owner_issuer = c.owner_issuer AND i.owner_subject = c.owner_subject"
-            );
+            let item_scope = "i.conversation_id = c.conversation_id AND i.tenant_id = c.tenant_id \
+                 AND i.owner_issuer = c.owner_issuer AND i.owner_subject = c.owner_subject";
             (
                 format!(
                     "CASE WHEN left(c.messages, 19) = '{{\"legacy_messages\":' \
@@ -1922,8 +1925,7 @@ impl PostgresResponseStore {
     /// Reconstruct a conversation's full history (legacy prefix + item rows).
     #[expect(
         clippy::too_many_lines,
-        clippy::large_stack_frames,
-        reason = "linear history reconstruction; its future is boxed at the async_trait call boundary"
+        reason = "linear history reconstruction reads item rows and the legacy prefix in one snapshot"
     )]
     async fn conversation_history_within(
         &self,
