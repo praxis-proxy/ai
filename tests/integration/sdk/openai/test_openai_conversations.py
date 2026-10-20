@@ -3180,6 +3180,35 @@ def test_structured_mcp_failure_append_back(conversation_backend):
     ), "append-back must retain the structured error verbatim"
 
 
+def test_completed_response_stores_original_request_input(conversation_backend):
+    """#1618: the original request input round-trips into stored history.
+
+    Managed state init moves ``input`` out of ``request_body`` and the store/
+    append-back path reconstructs it from the shared snapshot. A completed
+    response must therefore persist the original user input as a conversation
+    item, exercising the shared input path end-to-end through the OpenAI client.
+    """
+    client, _, _output, _translated = conversation_backend
+    conversation = client.conversations.create()
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="remember this exact input"
+    )
+    assert response.status == "completed"
+
+    page = client.conversations.items.list(conversation.id, order="asc")
+    texts = []
+    for item in page.data:
+        if getattr(item, "role", None) != "user":
+            continue
+        for part in item.content or []:
+            text = part.text if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+            if text:
+                texts.append(text)
+    assert any("remember this exact input" in text for text in texts), (
+        "the original request input must be stored after #1618 moves it out of request_body"
+    )
+
+
 class _CapturingResponsesBackend(_ChunkedResponsesBackend):
     """Responses backend that records forwarded request bodies for assertions."""
 
