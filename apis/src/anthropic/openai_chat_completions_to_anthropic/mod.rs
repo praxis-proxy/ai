@@ -242,7 +242,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 503,
                 "api_translation_disabled",
-                "Anthropic provider translation is disabled by the tenant configuration",
+                "The platform administrator has forbidden translation to this provider's API.",
             )));
         }
         if let Err(error) = Self::bind_profile(ctx, &profile) {
@@ -290,7 +290,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
                 413,
                 "request_too_large",
-                "Chat Completions request body exceeds max_body_bytes",
+                "Chat Completions request body exceeds a size limit set by the platform administrator.",
             )));
         }
         let client_model = match request::client_model(bytes) {
@@ -413,7 +413,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 502,
                 "provider_response_too_large",
-                "Anthropic provider response exceeds max_body_bytes",
+                "Anthropic provider response exceeds a size limit set by the platform administrator.",
             )));
         }
 

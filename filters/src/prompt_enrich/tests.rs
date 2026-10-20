@@ -499,7 +499,16 @@ async fn budgeted_responses_enrichment_preflights_configured_copies() {
         .on_request_body(&mut exhausted_ctx, &mut exhausted_body, true)
         .await
         .unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    let rejection = match action {
+        FilterAction::Reject(rejection) => rejection,
+        other => panic!("exhausted enrichment budget must reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413);
+    let body = rejection.body.expect("rejection body");
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("limit set by the platform administrator"), "{message}");
+    assert!(!message.contains("openai_agentic_loop.max_retained_bytes"), "{message}");
     assert_eq!(exhausted_body, Some(original), "no configured message was copied");
 }
 

@@ -95,7 +95,7 @@ def _message(content: list[dict], usage: dict, stop_reason: str = "end_turn") ->
     }
 
 
-def _config(proxy_port: int, backend_port: int) -> dict:
+def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = True) -> dict:
     return {
         "listeners": [{"name": "proxy", "address": f"127.0.0.1:{proxy_port}", "filter_chains": ["main"]}],
         "filter_chains": [{
@@ -106,7 +106,7 @@ def _config(proxy_port: int, backend_port: int) -> dict:
                  "clusters": ["anthropic-backend"], "reload": {"enabled": False}},
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
-                {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": True,
+                {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
                  "max_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
@@ -153,6 +153,36 @@ def client():
                 proc.wait()
     backend.shutdown()
     thread.join(timeout=5)
+
+
+@pytest.fixture
+def translation_disabled_client():
+    """OpenAI client for verifying the disabled server-side translation policy."""
+    proxy_port, backend_port = _port(), _port()
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory) / "praxis.yaml"
+        config.write_text(json.dumps(_config(proxy_port, backend_port, api_translation_enabled=False)))
+        proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                raise TimeoutError("Praxis did not start")
+            with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                        max_retries=0, timeout=10) as sdk:
+                yield sdk
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
 def test_json_and_cached_usage(client: OpenAI) -> None:
@@ -240,6 +270,19 @@ def test_provider_error_preserves_status(client: OpenAI, status: int) -> None:
     body = caught.value.response.json()
     assert body["error"]["code"] == status, "OpenAI error code must retain provider status"
     assert body["error"]["type"] == ("rate_limit_error" if status == 429 else "server_error"), "OpenAI error type must match provider status"
+
+
+def test_disabled_translation_names_platform_administrator(translation_disabled_client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        translation_disabled_client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+        )
+
+    assert caught.value.status_code == 503
+    error = caught.value.response.json()["error"]
+    assert error["code"] == "api_translation_disabled"
+    assert "platform administrator has forbidden translation" in error["message"]
+    assert not STATE.requests, "disabled translation must reject before contacting the provider"
 
 
 if __name__ == "__main__":

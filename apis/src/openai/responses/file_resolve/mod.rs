@@ -482,7 +482,7 @@ fn reject_retained_file_budget() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "file resolution exceeded openai_agentic_loop.max_retained_bytes",
+        "File resolution exceeds a processing limit set by the platform administrator.",
     ))
 }
 

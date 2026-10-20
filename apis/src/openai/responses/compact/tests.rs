@@ -842,7 +842,7 @@ async fn budgeted_compaction_filter_rejects_oversized_body_before_store_or_callo
         FilterAction::Reject(rejection) => {
             assert_eq!(rejection.status, 413, "budgeted compaction must reject before callout");
             let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
-            assert!(text.contains("max_retained_bytes"), "{text}");
+            assert!(text.contains("limit set by the platform administrator"), "{text}");
         },
         _ => panic!("budgeted compaction must reject before callout"),
     }
@@ -982,7 +982,7 @@ async fn reactive_compaction_rejects_source_expansion_before_callout_even_when_f
     };
     assert_eq!(rejection.status, 413);
     let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
-    assert!(text.contains("max_retained_bytes"), "{text}");
+    assert!(text.contains("limit set by the platform administrator"), "{text}");
 }
 
 #[test]

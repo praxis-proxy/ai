@@ -304,7 +304,10 @@ async fn stale_anthropic_profile_fails_closed_when_tenant_permission_is_off() {
         return;
     };
     assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap()).contains("disabled by the tenant"));
+    assert!(
+        String::from_utf8_lossy(rejection.body.as_deref().unwrap())
+            .contains("platform administrator has forbidden translation")
+    );
     assert!(ctx.request_headers_to_set.is_empty());
 }
 
@@ -356,7 +359,10 @@ async fn selected_request_body_limit_rejects_before_json_parsing() {
         panic!("body over the configured limit must be rejected");
     };
     assert_eq!(rejection.status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap()).contains("max_body_bytes"));
+    assert!(
+        String::from_utf8_lossy(rejection.body.as_deref().unwrap())
+            .contains("size limit set by the platform administrator")
+    );
 }
 
 #[tokio::test]
@@ -445,7 +451,10 @@ async fn rejects_json_response_that_exceeds_accumulation_limit() {
         panic!("over-limit provider JSON must be rejected");
     };
     assert_eq!(rejection.status, StatusCode::BAD_GATEWAY);
-    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap()).contains("exceeds max_body_bytes"));
+    assert!(
+        String::from_utf8_lossy(rejection.body.as_deref().unwrap())
+            .contains("size limit set by the platform administrator")
+    );
     assert!(ctx.get_filter_state::<super::BufferedJsonResponse>().is_none());
 }
 
