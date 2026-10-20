@@ -1509,7 +1509,7 @@ impl ResponsesState {
     }
 
     /// Append a persistence-only item when durable history capture is enabled.
-    #[cfg(any(feature = "store", feature = "openai-agentic-loop", test))]
+    #[cfg(any(feature = "openai-mcp-tools", test))]
     pub(crate) fn push_persisted_message(&mut self, item: serde_json::Value) {
         if self.persistence_history_enabled {
             self.persisted_messages.push(item);
