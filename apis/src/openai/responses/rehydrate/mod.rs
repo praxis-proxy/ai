@@ -50,6 +50,7 @@ use super::{
     error::responses_error_rejection,
     extract_conversation_id,
     history::MessageHistory,
+    is_canonical_openresponses_replay_type,
     state::{LOCAL_COMPACTION_MARKER, ResponsesState, request_reasoning_presence, strip_local_compaction_marker},
 };
 use crate::{
@@ -1430,19 +1431,12 @@ fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
     let mut replay = MessageHistory::default();
     for item in stored.shared_items() {
         let is_locally_marked = item.get(LOCAL_COMPACTION_MARKER).and_then(Value::as_bool) == Some(true);
-        if !is_locally_marked
-            && matches!(
-                item.get("type").and_then(Value::as_str),
-                Some(
-                    "item_reference"
-                        | "reasoning"
-                        | "compaction"
-                        | "message"
-                        | "function_call"
-                        | "function_call_output"
-                )
-            )
-        {
+        // Shared fast path: a canonical replay type is sent back verbatim, so share
+        // the Arc instead of cloning. The predicate is shared with the owning
+        // `canonical_openresponses_replay_item` so the two cannot drift; it keeps
+        // client-owned `custom_tool_call*` items that a configured
+        // client-tool-compatibility adapter lowers downstream (#1764).
+        if !is_locally_marked && is_canonical_openresponses_replay_type(item) {
             replay.push_shared(std::sync::Arc::clone(item));
         } else if let Some(normalized) = canonical_openresponses_replay_item(item) {
             // Legacy normalization and marker removal change the replay value,

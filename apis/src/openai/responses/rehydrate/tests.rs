@@ -1638,6 +1638,41 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
 }
 
 #[test]
+fn replay_preserves_client_owned_custom_tool_history_without_cloning() {
+    // A stored client-tool continuation holds a correlated custom call/output
+    // pair alongside a hosted item. The client-owned pair must survive replay via
+    // the shared fast path (#1764) so the client-tool-compat adapter can lower it,
+    // while the hosted item stays excluded.
+    let persisted = MessageHistory::from(vec![
+        json!({"type": "message", "role": "user", "content": "Previous turn"}),
+        json!({"type": "custom_tool_call", "call_id": "call_history", "name": "do_work", "input": "Prior invocation"}),
+        json!({"type": "custom_tool_call_output", "call_id": "call_history", "output": "sentinel"}),
+        json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+    ]);
+
+    let replay = replay_messages_from_stored(&persisted);
+
+    assert_eq!(replay.len(), 3, "the hosted web_search_call is excluded: {replay:?}");
+    assert_eq!(replay[1]["type"], "custom_tool_call");
+    assert_eq!(replay[1]["call_id"], "call_history");
+    assert_eq!(replay[2]["type"], "custom_tool_call_output");
+    assert_eq!(replay[2]["output"], "sentinel");
+    assert!(
+        replay.iter().all(|item| item["type"] != "web_search_call"),
+        "hosted output items must not replay as request input: {replay:?}"
+    );
+    for index in 0..replay.len() {
+        // The user message (index 0) and both custom items (1, 2) replay verbatim,
+        // so none is cloned; the excluded hosted item at persisted index 3 shifts
+        // nothing because it is simply skipped.
+        assert!(
+            replay.shares_item_with(index, &persisted, index),
+            "client-owned item {index} must replay via the shared fast path, not a clone"
+        );
+    }
+}
+
+#[test]
 fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
     let stored = vec![
         json!({"id":"item-1"}),
