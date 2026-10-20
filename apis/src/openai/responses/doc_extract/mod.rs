@@ -323,10 +323,11 @@ fn projected_document_growth(ctx: &HttpFilterContext<'_>, parsed: &serde_json::V
         .map_or(Some(0), parts_growth)?;
     if let Some(state) = ctx.extensions.get::<ResponsesState>() {
         let history_end = state.messages.len().checked_sub(state.input.len())?;
-        let persisted_end = state.persisted_messages.len().checked_sub(state.input.len())?;
-        growth = growth
-            .checked_add(parts_growth(state.messages.iter().take(history_end))?)?
-            .checked_add(parts_growth(state.persisted_messages.iter().take(persisted_end))?)?;
+        growth = growth.checked_add(parts_growth(state.messages.iter().take(history_end))?)?;
+        if state.captures_persistence_history() {
+            let persisted_end = state.persisted_messages.len().checked_sub(state.input.len())?;
+            growth = growth.checked_add(parts_growth(state.persisted_messages.iter().take(persisted_end))?)?;
+        }
     }
     Some(growth)
 }
@@ -471,13 +472,10 @@ fn sync_state_after_rewrite(
     // stored as request parameters; the resolved input is not retained in
     // `request_body` (the params-only invariant, #1618).
     if let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) {
-        let ResponsesState {
-            messages,
-            persisted_messages,
-            ..
-        } = &mut *state;
-        sync_message_history(messages, input_len, Some(resolved_input), budget)?;
-        sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)?;
+        sync_message_history(&mut state.messages, input_len, Some(resolved_input), budget)?;
+        if let Some(persisted_messages) = state.persisted_messages_mut() {
+            sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)?;
+        }
     }
 
     state.set_request_params(resolved_body);
@@ -505,7 +503,10 @@ fn extract_state_history(ctx: &mut HttpFilterContext<'_>, budget: &mut Extractio
     let input_len = state.input.len();
 
     sync_message_history(&mut state.messages, input_len, None, budget)?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, budget)
+    if let Some(persisted_messages) = state.persisted_messages_mut() {
+        sync_persisted_history(persisted_messages, input_len, None, budget)?;
+    }
+    Ok(())
 }
 
 /// Sync the persisted-messages mirror with independent count and

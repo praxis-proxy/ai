@@ -84,7 +84,12 @@ impl MessageHistory {
     }
 
     /// Append an owned item.
-    #[cfg(any(test, feature = "store", feature = "openai-agentic-loop"))]
+    #[cfg(any(
+        test,
+        feature = "store",
+        feature = "openai-agentic-loop",
+        feature = "openai-mcp-tools"
+    ))]
     pub fn push(&mut self, item: Value) {
         self.0.push(Arc::new(item));
     }

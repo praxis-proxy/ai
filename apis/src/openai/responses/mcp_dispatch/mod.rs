@@ -504,8 +504,12 @@ impl McpDispatchFilter {
         };
         for result in results {
             let result_start = state.messages.len();
-            state.messages.push(result.message.clone());
-            state.persisted_messages.push(result.message);
+            if state.captures_persistence_history() {
+                state.messages.push(result.message.clone());
+                state.push_persisted_message(result.message);
+            } else {
+                state.messages.push(result.message);
+            }
             state.mark_local_tool_results_from(result_start);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
@@ -1074,8 +1078,12 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
         let result_start = state.messages.len();
-        state.messages.push(denial.clone());
-        state.persisted_messages.push(denial);
+        if state.captures_persistence_history() {
+            state.messages.push(denial.clone());
+            state.push_persisted_message(denial);
+        } else {
+            state.messages.push(denial);
+        }
         state.mark_local_tool_results_from(result_start);
     }
 }

@@ -7,7 +7,10 @@ use bytes::{Bytes, BytesMut};
 use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
-use super::*;
+use super::{
+    super::{request_input::{InputForm, input_echo_value}, state::normalize_input_owned},
+    *,
+};
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
@@ -68,6 +71,117 @@ fn replay_shares_canonical_items_and_copies_only_legacy_normalization() {
     for index in 0..persisted.len() {
         assert!(persisted.shares_item_with(index, &original, index));
     }
+}
+
+/// Compare the pre-#1618 ownership path with managed initialization, rehydration,
+/// and response-store input capture. Request parsing is prepared outside the
+/// measured closures, matching the managed filter's already-parsed input.
+fn compare_rehydrated_capture_allocations(body: Value) -> (u64, u64, u64, u64) {
+    let raw = serde_json::to_vec(&body).expect("serialize request fixture");
+    let stored = vec![json!({"type": "message", "role": "assistant", "content": "previous"})];
+    let legacy_body = body.clone();
+    let current_body = body;
+    let legacy_stored = stored.clone();
+    let current_stored = stored;
+    let legacy_raw = raw;
+
+    let legacy = allocation_counter::measure(|| {
+        // Before the input split, state retained the parsed request body while
+        // normalization cloned its input; Store then parsed the raw body again.
+        let messages = MessageHistory::from(
+            legacy_body
+                .get("input")
+                .cloned()
+                .map(normalize_input_owned)
+                .unwrap_or_default(),
+        );
+        let mut state = ResponsesState {
+            input: messages.clone(),
+            input_form: InputForm::classify(legacy_body.get("input")),
+            messages: messages.clone(),
+            persisted_messages: messages,
+            request_body: legacy_body,
+            ..ResponsesState::default()
+        };
+        let stored = MessageHistory::from(legacy_stored);
+        state.messages.prepend_shared(replay_messages_from_stored(&stored));
+        state.persisted_messages.prepend_shared(stored);
+        state.history_rehydrated = true;
+
+        let mut store_body: Value = serde_json::from_slice(&legacy_raw).expect("parse Store's request snapshot");
+        let store_input = store_body.as_object_mut().and_then(|object| object.remove("input"));
+        std::hint::black_box((state, store_input));
+    });
+    let current = allocation_counter::measure(|| {
+        let state = build_state(current_body, current_stored, vec![], None);
+        let store_input = input_echo_value(&state);
+        std::hint::black_box((state, store_input));
+    });
+    (
+        legacy.bytes_total,
+        legacy.count_total,
+        current.bytes_total,
+        current.count_total,
+    )
+}
+
+#[test]
+fn store_false_rehydrates_working_history_without_persistence_capture() {
+    let state = build_state(
+        json!({
+            "model": "gpt-4o",
+            "previous_response_id": "resp_previous",
+            "store": false,
+            "input": "next",
+        }),
+        vec![json!({"type": "message", "role": "assistant", "content": "previous"})],
+        vec![],
+        None,
+    );
+
+    assert!(state.history_rehydrated);
+    assert_eq!(
+        state.messages.len(),
+        2,
+        "rehydrated context remains available to inference"
+    );
+    assert_eq!(state.messages[0]["content"], "previous");
+    assert_eq!(state.messages[1]["content"], "next");
+    assert!(
+        state.persisted_messages.is_empty(),
+        "store:false must not retain durable history"
+    );
+}
+
+#[test]
+fn managed_rehydrate_and_store_capture_reduce_large_text_allocations() {
+    let body = json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_previous",
+        "input": "x".repeat(200_000),
+    });
+    let (legacy_bytes, legacy_count, current_bytes, current_count) = compare_rehydrated_capture_allocations(body);
+    assert!(
+        current_bytes < legacy_bytes,
+        "complete large-text path should allocate less: legacy={legacy_bytes} bytes/{legacy_count} allocations, current={current_bytes} bytes/{current_count} allocations"
+    );
+}
+
+#[test]
+fn managed_rehydrate_and_store_capture_reduce_many_small_item_allocations() {
+    let input = (0..2_000)
+        .map(|index| json!({"type": "message", "role": "user", "content": format!("message-{index}")}))
+        .collect::<Vec<_>>();
+    let body = json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_previous",
+        "input": input,
+    });
+    let (legacy_bytes, legacy_count, current_bytes, current_count) = compare_rehydrated_capture_allocations(body);
+    assert!(
+        current_bytes < legacy_bytes && current_count < legacy_count,
+        "complete many-item path should allocate less: legacy={legacy_bytes} bytes/{legacy_count} allocations, current={current_bytes} bytes/{current_count} allocations"
+    );
 }
 
 // -----------------------------------------------------------------------------

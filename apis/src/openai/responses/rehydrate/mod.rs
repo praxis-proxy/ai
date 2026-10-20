@@ -1422,7 +1422,7 @@ fn rehydrate_existing_state(
     state
         .provider_compaction_ids
         .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
-    state.persisted_messages.prepend_shared(stored);
+    state.prepend_persisted_messages(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
@@ -1438,13 +1438,13 @@ fn build_state(
 ) -> ResponsesState {
     let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
-    let mut state = ResponsesState::from_request_body(parsed_body);
+    let mut state = ResponsesState::from_managed_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.prepend_shared(replay);
     state
         .provider_compaction_ids
         .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
-    state.persisted_messages.prepend_shared(stored);
+    state.prepend_persisted_messages(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state

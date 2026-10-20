@@ -728,13 +728,10 @@ async fn sync_state_with_budget(
     // stored as request parameters; the resolved input is not retained in
     // `request_body` (the params-only invariant, #1618).
     if let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) {
-        let ResponsesState {
-            messages,
-            persisted_messages,
-            ..
-        } = &mut *state;
-        sync_message_history(messages, input_len, Some(resolved_input), resolver, budget).await?;
-        sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await?;
+        sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
+        if let Some(persisted_messages) = state.persisted_messages_mut() {
+            sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await?;
+        }
     }
 
     state.set_request_params(resolved_body);
@@ -777,7 +774,10 @@ async fn resolve_state_history(
 
     let input_len = state.input.len();
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, resolver, budget).await
+    if let Some(persisted_messages) = state.persisted_messages_mut() {
+        sync_persisted_history(persisted_messages, input_len, None, resolver, budget).await?;
+    }
+    Ok(())
 }
 
 /// Shared dependencies for resolving one state history vector.

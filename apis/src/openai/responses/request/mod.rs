@@ -811,7 +811,7 @@ fn insert_responses_state(
     response_id: &str,
     budget: Option<super::agentic_loop::budget::SimpleBudget>,
 ) {
-    let mut state = ResponsesState::from_request_body(parsed);
+    let mut state = ResponsesState::from_managed_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
     state.simple_budget = budget;
     ctx.extensions.insert(state);

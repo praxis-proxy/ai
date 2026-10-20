@@ -667,6 +667,12 @@ pub(crate) struct ResponsesState {
     /// inference.
     pub persisted_messages: MessageHistory,
 
+    /// Whether this request needs an independently maintained history for a
+    /// future durable response record. `store:false` disables that consumer;
+    /// request-scoped `input` and `messages` remain available for translation,
+    /// tools, streaming, and conversation append-back.
+    pub(crate) persistence_history_enabled: bool,
+
     /// Server-owned pending MCP approvals emitted during this request.
     ///
     /// Populated by `mcp_dispatch` when it pauses on an
@@ -1151,6 +1157,7 @@ impl Default for ResponsesState {
             provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
             persisted_messages: MessageHistory::default(),
+            persistence_history_enabled: true,
             #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
@@ -1305,8 +1312,30 @@ impl ResponsesState {
     }
 
     /// Create initial state from a parsed request body.
+    #[cfg(test)]
+    pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
+        Self::from_request_body_with_persistence(body, true)
+    }
+
+    /// Create state using the request's persistence eligibility.
+    ///
+    /// `store` defaults to true under the Responses API contract. A conversation
+    /// can still append its request input and completed response when `store` is
+    /// false; that path does not consume this durable rehydration history.
+    pub(crate) fn from_managed_request_body(body: serde_json::Value) -> Self {
+        let capture_persistence = Self::request_captures_persistence_history(&body);
+        Self::from_request_body_with_persistence(body, capture_persistence)
+    }
+
+    /// Whether the Responses request contract requires a durable rehydration
+    /// history. Omitted or malformed `store` values conservatively retain it.
+    pub(crate) fn request_captures_persistence_history(body: &serde_json::Value) -> bool {
+        body.get("store").and_then(serde_json::Value::as_bool) != Some(false)
+    }
+
+    /// Create initial state with explicit persistence-history capture.
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
-    pub(crate) fn from_request_body(mut body: serde_json::Value) -> Self {
+    fn from_request_body_with_persistence(mut body: serde_json::Value, capture_persistence: bool) -> Self {
         // Move `input` out of the parsed parameters so it is decoded exactly once
         // (#1618). Supported shapes (null/string/object/array) normalize into
         // shared items and leave `request_body` with parameters only; an
@@ -1326,7 +1355,14 @@ impl ResponsesState {
             MessageHistory::default()
         };
         let input = messages.clone();
-        let persisted_messages = messages.clone();
+        // The persistence-only handle vector is absent for store:false. Keep the
+        // original input and backend history alive: tools, translation, streaming,
+        // and conversation append-back still consume those request-scoped views.
+        let persisted_messages = if capture_persistence {
+            messages.clone()
+        } else {
+            MessageHistory::default()
+        };
         let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
         let tool_choice = request_tool_choice_or_auto(&body);
         let tools = extract_array_field(&body, "tools");
@@ -1342,6 +1378,7 @@ impl ResponsesState {
             provider_compaction_ids,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
+            persistence_history_enabled: capture_persistence,
             previous_response_id: extract_string(&body, "previous_response_id"),
             // `input` was removed above; `request_body` now holds parameters only.
             request_body: body,
@@ -1418,10 +1455,13 @@ impl ResponsesState {
     /// lockstep so storage assembly can drop the later wholesale append of the
     /// same item without guessing by value.
     #[cfg(feature = "openai-agentic-loop")]
-    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: serde_json::Value) {
+    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: &serde_json::Value) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
-        self.persisted_messages.push(item);
+        self.persisted_messages.push(item.clone());
     }
 
     /// Arc-sharing variant of [`Self::persist_collected_output`]: record the same
@@ -1434,6 +1474,9 @@ impl ResponsesState {
         accumulated_index: usize,
         item: std::sync::Arc<serde_json::Value>,
     ) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
         self.persisted_messages.push_shared(item);
@@ -1444,12 +1487,48 @@ impl ResponsesState {
     /// lengths captured when the round began collecting.
     #[cfg(feature = "openai-agentic-loop")]
     pub(crate) fn record_collected_round(&mut self, output_start: usize, persisted_start: usize) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_rounds.push(CollectedRound {
             output_start,
             output_end: self.accumulated_output.len(),
             persisted_start,
             persisted_end: self.persisted_messages.len(),
         });
+    }
+
+    /// Whether this exchange retains a durable history for a later store write.
+    pub(crate) fn captures_persistence_history(&self) -> bool {
+        self.persistence_history_enabled
+    }
+
+    /// Borrow the durable history only when the request can persist it.
+    pub(crate) fn persisted_messages_mut(&mut self) -> Option<&mut MessageHistory> {
+        self.persistence_history_enabled.then_some(&mut self.persisted_messages)
+    }
+
+    /// Append a persistence-only item when durable history capture is enabled.
+    #[cfg(any(feature = "store", feature = "openai-agentic-loop", test))]
+    pub(crate) fn push_persisted_message(&mut self, item: serde_json::Value) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.push(item);
+        }
+    }
+
+    /// Append persistence-only items when durable history capture is enabled.
+    pub(crate) fn extend_persisted_messages(&mut self, items: impl IntoIterator<Item = serde_json::Value>) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.extend(items);
+        }
+    }
+
+    /// Prepend stored history when this request will produce a durable record.
+    #[cfg(feature = "store")]
+    pub(crate) fn prepend_persisted_messages(&mut self, history: MessageHistory) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.prepend_shared(history);
+        }
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
@@ -1957,6 +2036,36 @@ mod tests {
         assert!(
             state.input.shares_item_with(0, &state.persisted_messages, 0),
             "shares item 0 with persisted_messages"
+        );
+    }
+
+    #[test]
+    fn store_false_keeps_working_input_and_conversation_append_back_data() {
+        let input = json!([{"type": "message", "role": "user", "content": "hello"}]);
+        let mut state = ResponsesState::from_managed_request_body(json!({
+            "model": "gpt-4o",
+            "store": false,
+            "conversation": "conv_123",
+            "input": input,
+        }));
+
+        assert!(!state.captures_persistence_history());
+        assert!(state.persisted_messages.is_empty());
+        assert_eq!(
+            state.input, state.messages,
+            "the backend working history remains available"
+        );
+        assert_eq!(state.conversation, Some(json!("conv_123")));
+        assert_eq!(
+            super::super::request_input::input_echo_value(&state),
+            Some(input),
+            "conversation append-back still has the original client input"
+        );
+
+        state.push_persisted_message(json!({"type": "private"}));
+        assert!(
+            state.persisted_messages.is_empty(),
+            "disabled capture must stay disabled"
         );
     }
 
