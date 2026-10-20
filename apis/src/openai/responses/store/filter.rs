@@ -63,7 +63,10 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
+    super::{
+        DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, request_input::input_echo_value,
+        state::ResponsesState,
+    },
     config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
@@ -1106,10 +1109,18 @@ impl HttpFilter for ResponseStoreFilter {
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
         }
-        if !should_skip(ctx)
-            && let Some(input) = extract_request_input(body)
-        {
-            capture_request_input(ctx, input);
+        if !should_skip(ctx) {
+            // Reuse the input already decoded into ResponsesState (#1618) instead
+            // of re-parsing the whole request body. A standalone store passthrough
+            // without a managed/translation filter has no state, so fall back to
+            // parsing the body for input in that case.
+            let input = match ctx.extensions.get::<ResponsesState>() {
+                Some(state) => input_echo_value(state),
+                None => extract_request_input(body),
+            };
+            if let Some(input) = input {
+                capture_request_input(ctx, input);
+            }
         }
         if should_init_store_for_request(ctx) {
             if !store_available(ctx) {
