@@ -82,8 +82,21 @@ const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 /// `max_calls_per_round`.
 const MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION: usize = 64;
 
+/// Server-side cap on one dispatched search query, in UTF-8 bytes.
+///
+/// `action.query`/`action.queries` are model-generated, so without a bound a
+/// malicious or defective upstream could spend paid provider calls on blank
+/// queries or force URI and JSON-body allocation amplification with a
+/// body-sized string before the provider request fails (issue #1145). Mirrors
+/// the Anthropic managed-search cap (`MAX_SEARCH_QUERY_BYTES`).
+const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
+
 /// Model-facing result for a malformed call without `action.query`.
 const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
+
+/// Model-facing result for a call whose query failed dispatch validation:
+/// blank after trimming, or over the [`MAX_SEARCH_QUERY_BYTES`] cap.
+const INVALID_QUERY_OUTPUT: &str = "Web search could not run because the query was blank or exceeded 8192 bytes.";
 
 /// Model-facing result when the response-wide tool budget is exhausted.
 const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_calls was exhausted.";
@@ -310,7 +323,11 @@ impl WebSearchDispatchFilter {
         identity: &CalloutIdentity,
         query_cap: usize,
     ) -> usize {
-        let PreparedCall { ids, queries, action } = prepared;
+        // `incomplete_output` is only read on the incomplete path this call
+        // never takes: `admit_call` already verified `queries` is non-empty.
+        let PreparedCall {
+            ids, queries, action, ..
+        } = prepared;
         let mut results = Vec::new();
         let mut dispatched = 0_usize;
         let mut successful = 0_usize;
@@ -988,10 +1005,14 @@ impl<'a> SearchCallIds<'a> {
 struct PreparedCall<'a> {
     /// Identities derived from this call's id, queries, and round position.
     ids: SearchCallIds<'a>,
-    /// Queries in provider-supplied order; empty when the call is malformed.
+    /// Queries in provider-supplied order; empty when the call is incomplete.
     queries: Vec<&'a str>,
-    /// Canonical client-visible search action; `Null` when the call is malformed.
+    /// Canonical client-visible search action; `Null` when the call is incomplete.
     action: Value,
+    /// Bounded model-facing output explaining why `queries` is empty. Only
+    /// read on the incomplete path, distinguishing a structurally missing
+    /// query from one that failed dispatch validation.
+    incomplete_output: &'static str,
 }
 
 impl<'a> PreparedCall<'a> {
@@ -1001,12 +1022,29 @@ impl<'a> PreparedCall<'a> {
             ids: SearchCallIds::new(call_id, &queries, index, output_index),
             queries,
             action,
+            incomplete_output: MISSING_QUERY_OUTPUT,
         }
     }
 
     /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
     fn malformed(call_id: &'a str, index: usize, output_index: usize) -> Self {
-        Self::new(call_id, index, output_index, Vec::new(), Value::Null)
+        Self::incomplete(call_id, index, output_index, MISSING_QUERY_OUTPUT)
+    }
+
+    /// Placeholder for a call whose query failed dispatch validation.
+    fn invalid(call_id: &'a str, index: usize, output_index: usize) -> Self {
+        Self::incomplete(call_id, index, output_index, INVALID_QUERY_OUTPUT)
+    }
+
+    /// Placeholder for a call that dispatches nothing, surfacing
+    /// `incomplete_output` as its bounded model-facing failure.
+    fn incomplete(call_id: &'a str, index: usize, output_index: usize, incomplete_output: &'static str) -> Self {
+        Self {
+            ids: SearchCallIds::new(call_id, &[], index, output_index),
+            queries: Vec::new(),
+            action: Value::Null,
+            incomplete_output,
+        }
     }
 }
 
@@ -1018,7 +1056,6 @@ fn prepare_calls(calls: &[(usize, Value)]) -> Vec<PreparedCall<'_>> {
         .map(|(index, (output_index, call))| {
             let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
             parse_search_request(call, call_id, index, *output_index)
-                .unwrap_or_else(|| PreparedCall::malformed(call_id, index, *output_index))
         })
         .collect()
 }
@@ -1034,8 +1071,9 @@ fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
 /// Decide whether one pending call may reach the provider, appending its
 /// terminal turn when it may not.
 ///
-/// A call without a usable query is surfaced as failed on every path, since
-/// neither rejection nor a budget has anything to dispatch. A call `rejected` by
+/// A call without a dispatchable query — missing, or invalid per
+/// [`validated_query`] — is surfaced as failed on every path, since neither
+/// rejection nor a budget has anything to dispatch. A call `rejected` by
 /// the response-wide ordered admission pass fails locally and forces completion
 /// without another model round. An `over_budget` call — one that can spend
 /// neither a tool-call unit nor a single provider request — is surfaced as
@@ -1049,9 +1087,9 @@ fn admit_call<'a>(
     if prepared.queries.is_empty() {
         warn!(
             call_id = prepared.ids.public,
-            "web_search_call missing valid action.queries or action.query, skipping"
+            "web_search_call has no dispatchable query (missing or invalid), skipping"
         );
-        append_incomplete(ctx, &prepared.ids);
+        append_incomplete(ctx, &prepared.ids, prepared.incomplete_output);
         return None;
     }
     let (status, notice) = if rejected {
@@ -1140,32 +1178,95 @@ fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
 
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
 /// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
-fn parse_search_request<'a>(
-    call: &'a Value,
-    call_id: &'a str,
-    index: usize,
-    output_index: usize,
-) -> Option<PreparedCall<'a>> {
-    let action = call.get("action")?;
+///
+/// Every query must pass [`validated_query`] before it reaches hashing or
+/// request construction: one that is blank after trimming or exceeds
+/// [`MAX_SEARCH_QUERY_BYTES`] fails the whole call locally as a bounded
+/// incomplete turn, so no paid provider request is issued and no body-sized
+/// string is amplified into the outbound URI or JSON body (issue #1145).
+fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize, output_index: usize) -> PreparedCall<'a> {
+    let Some(action) = call.get("action") else {
+        return PreparedCall::malformed(call_id, index, output_index);
+    };
     let legacy_query = action.get("query").and_then(Value::as_str);
     match action.get("queries") {
         Some(Value::Array(values)) if !values.is_empty() => {
-            let queries = values.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
-            if legacy_query.is_some() {
-                warn!(
-                    call_id,
-                    "web_search_call contains deprecated action.query and action.queries; using action.queries"
-                );
-            }
-            let action = serde_json::json!({"type": "search", "queries": queries});
-            Some(PreparedCall::new(call_id, index, output_index, queries, action))
+            prepared_from_current_queries(call_id, index, output_index, values, legacy_query.is_some())
         },
-        Some(Value::Array(_)) | None => legacy_query.map(|query| {
-            let action = serde_json::json!({"type": "search", "query": query});
-            PreparedCall::new(call_id, index, output_index, vec![query], action)
-        }),
-        Some(_) => None,
+        Some(Value::Array(_)) | None => match legacy_query {
+            Some(query) => match validated_query(query) {
+                Some(query) => {
+                    let action = serde_json::json!({"type": "search", "query": query});
+                    PreparedCall::new(call_id, index, output_index, vec![query], action)
+                },
+                None => PreparedCall::invalid(call_id, index, output_index),
+            },
+            None => PreparedCall::malformed(call_id, index, output_index),
+        },
+        Some(_) => PreparedCall::malformed(call_id, index, output_index),
     }
+}
+
+/// Assemble a call from the authoritative `queries` array.
+///
+/// A non-string member is a structural failure, so the call never falls back
+/// to the deprecated `query` field. Every string member must still pass
+/// [`validated_queries`] before the call becomes dispatchable.
+fn prepared_from_current_queries<'a>(
+    call_id: &'a str,
+    index: usize,
+    output_index: usize,
+    values: &'a [Value],
+    has_legacy_query: bool,
+) -> PreparedCall<'a> {
+    let Some(queries) = values.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+        return PreparedCall::malformed(call_id, index, output_index);
+    };
+    if has_legacy_query {
+        warn!(
+            call_id,
+            "web_search_call contains deprecated action.query and action.queries; using action.queries"
+        );
+    }
+    let Some(queries) = validated_queries(&queries) else {
+        return PreparedCall::invalid(call_id, index, output_index);
+    };
+    let action = serde_json::json!({"type": "search", "queries": queries});
+    PreparedCall::new(call_id, index, output_index, queries, action)
+}
+
+/// Trim and validate every query of one call, or `None` when any is invalid.
+///
+/// A single invalid query fails its whole call rather than being silently
+/// dropped: the model then receives a bounded failed result naming the
+/// problem, instead of a completed call that quietly searched less than it
+/// asked for.
+fn validated_queries<'a>(raw: &[&'a str]) -> Option<Vec<&'a str>> {
+    let mut validated = Vec::with_capacity(raw.len());
+    for query in raw {
+        let Some(trimmed) = validated_query(query) else {
+            // Log only the size, never the query text: an invalid query may be
+            // body-sized, and echoing it would repeat the amplification in the
+            // log pipeline.
+            warn!(
+                query_bytes = query.len(),
+                limit_bytes = MAX_SEARCH_QUERY_BYTES,
+                "web_search_call query is blank or exceeds the dispatch byte cap; failing the call"
+            );
+            return None;
+        };
+        validated.push(trimmed);
+    }
+    Some(validated)
+}
+
+/// Trim one model-generated query and enforce the dispatch bounds.
+///
+/// Returns the trimmed query when it is non-empty and at most
+/// [`MAX_SEARCH_QUERY_BYTES`] UTF-8 bytes; `None` marks it invalid.
+fn validated_query(query: &str) -> Option<&str> {
+    let trimmed = query.trim();
+    (!trimmed.is_empty() && trimmed.len() <= MAX_SEARCH_QUERY_BYTES).then_some(trimmed)
 }
 
 /// Remaining web searches this continuation may dispatch.
@@ -1240,11 +1341,14 @@ fn append_search_turn(
 
 /// Append a malformed search turn to [`ResponsesState`].
 ///
-/// The public item uses the schema's fail-closed `failed` status, while the
-/// backend-valid bridge carries the missing arguments and an explicit failure
-/// message. This prevents the next inference iteration and persisted replay
-/// from treating a missing query as a successful search with zero results.
-fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
+/// The public item uses the schema's fail-closed `failed` status with a
+/// bounded placeholder action, while the backend-valid bridge carries the
+/// missing arguments and `incomplete_output` — the specific reason the call
+/// dispatched nothing. This prevents the next inference iteration and
+/// persisted replay from treating a missing or invalid query as a successful
+/// search with zero results, and never echoes a potentially body-sized query
+/// into the output (issue #1145).
+fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, incomplete_output: &'static str) {
     let Some((peak_charge, retained_charge)) = web_search_incomplete_charges(ids) else {
         record_web_search_budget_failure(ctx);
         return;
@@ -1264,7 +1368,7 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
         &[],
         include_sources,
     );
-    let bridge = build_incomplete_tool_result_messages(&ids.bridge);
+    let bridge = build_incomplete_tool_result_messages(&ids.bridge, incomplete_output);
     push_search_turn(ctx, output_item, bridge, ids);
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
         && let Some(budget) = state.simple_budget.as_mut()
@@ -1527,12 +1631,13 @@ fn search_arguments(action: &Value) -> String {
     .unwrap_or_else(|_error| "{}".to_owned())
 }
 
-/// Build the backend-valid continuation for a call missing `action.query`.
+/// Build the backend-valid continuation for a call that dispatched nothing.
 ///
 /// The synthetic function call is fully generated, so its status is
-/// `completed`; the empty arguments and explicit output truthfully describe
-/// the incomplete hosted-tool execution.
-pub(crate) fn build_incomplete_tool_result_messages(call_id: &str) -> [Value; 2] {
+/// `completed`; the empty arguments and `incomplete_output` truthfully
+/// describe the incomplete hosted-tool execution and stay bounded even when
+/// the rejected query was body-sized.
+pub(crate) fn build_incomplete_tool_result_messages(call_id: &str, incomplete_output: &str) -> [Value; 2] {
     [
         serde_json::json!({
             "type": "function_call",
@@ -1544,7 +1649,7 @@ pub(crate) fn build_incomplete_tool_result_messages(call_id: &str) -> [Value; 2]
         serde_json::json!({
             "type": "function_call_output",
             "call_id": call_id,
-            "output": MISSING_QUERY_OUTPUT,
+            "output": incomplete_output,
         }),
     ]
 }

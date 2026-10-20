@@ -6747,6 +6747,99 @@ fn incomplete_web_search_still_consumes_response_wide_budget() {
     }));
 }
 
+/// #1145: a model-generated query that is blank after trimming (or over the
+/// dispatch byte cap) never reaches the search provider. The call surfaces as
+/// a bounded failed turn — the potentially body-sized query text is never
+/// echoed into the public output or the model-facing bridge — and the loop
+/// re-enters inference so the model can react to the failure.
+#[test]
+fn invalid_web_search_query_fails_locally_without_provider_request() {
+    let first_response = serde_json::json!({
+        "id": "resp_invalid_query_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_invalid_query",
+            "status": "completed",
+            "action": {"type": "search", "query": "   "}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_invalid_query_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "The search could not run."}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_web_search_config(proxy_port, model.port(), search_port));
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for something",
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "invalid-query response failed: {raw}");
+    assert_eq!(
+        search_count.load(Ordering::SeqCst),
+        0,
+        "an invalid query must never reach the search provider (issue #1145)"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        response["id"], "resp_invalid_query_2",
+        "the loop must re-enter inference after the failed turn"
+    );
+    let failed_call = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "web_search_call")
+        .expect("final response must carry the web_search_call");
+    assert_eq!(failed_call["id"], "ws_invalid_query");
+    assert_eq!(failed_call["status"], "failed");
+    assert_eq!(
+        failed_call["action"],
+        serde_json::json!({"type": "search", "query": ""}),
+        "the failed turn carries the bounded placeholder action, never the raw query"
+    );
+
+    // The model received the bounded failure through the backend-valid bridge.
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        2,
+        "the failed turn must re-enter inference exactly once"
+    );
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request should be valid JSON");
+    let input = second_body["input"]
+        .as_array()
+        .expect("second model request input should be an array");
+    let function_output = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("second inference input should contain a function_call_output");
+    assert_eq!(
+        function_output["output"], "Web search could not run because the query was blank or exceeded 8192 bytes.",
+        "the bridge must explain the invalid query so the model can correct it"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // #985: logical-stream SSE conformance helpers
 //

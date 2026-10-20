@@ -8191,6 +8191,59 @@ class TestAgenticLoopVLLM:
             SimulatorBackendHandler.web_search_queries = []
             SimulatorBackendHandler.web_search_multi_query_call = False
 
+    @requires_simulator
+    def test_web_search_blank_query_fails_without_provider_request(
+        self,
+        translated_agentic_client,
+    ):
+        """#1145: a whitespace-only query fails locally, never reaching the provider.
+
+        The chat-translation layer only rejects structurally empty queries, so
+        a blank-after-trim query still reaches the dispatcher — which must
+        surface it as a bounded failed call without spending a paid search.
+        """
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = ["   "]
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search, then report the result title and "
+                    "URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice="auto",
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "failed"
+            assert len(BraveSearchHandler.request_paths) == request_count, (
+                "a blank query must never reach the search provider"
+            )
+
+            # The loop re-entered inference with the bounded failure and the
+            # model produced a final message, so the response still completes.
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "blank or exceeded" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(
         self,
