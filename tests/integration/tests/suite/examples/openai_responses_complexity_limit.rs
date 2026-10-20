@@ -22,7 +22,11 @@ fn request_within_node_limit_is_forwarded() {
     let inference = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
-    let config = load_example_config(CONFIG, proxy_port, HashMap::from([("127.0.0.1:8000", inference.port())]));
+    let config = load_example_config(
+        CONFIG,
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", inference.port())]),
+    );
     let proxy = start_proxy(&config);
 
     let body = r#"{"model":"gpt-4.1","input":"Hello, world!"}"#;
@@ -45,12 +49,18 @@ fn structurally_complex_request_is_rejected() {
     let inference = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
-    let config = load_example_config(CONFIG, proxy_port, HashMap::from([("127.0.0.1:8000", inference.port())]));
+    let config = load_example_config(
+        CONFIG,
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", inference.port())]),
+    );
     let proxy = start_proxy(&config);
 
     // 15 tiny input items blow past the 20-node cap while the body stays small,
     // demonstrating that structural complexity — not byte size — trips the guard.
-    let items: Vec<String> = (0..15).map(|i| format!(r#"{{"role":"user","content":"m{i}"}}"#)).collect();
+    let items: Vec<String> = (0..15)
+        .map(|i| format!(r#"{{"role":"user","content":"m{i}"}}"#))
+        .collect();
     let body = format!(r#"{{"model":"gpt-4.1","input":[{}]}}"#, items.join(","));
     assert!(
         body.len() < 1024,
