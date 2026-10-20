@@ -92,6 +92,28 @@ async fn mount_nemo_checks_responses(mock_server: &wiremock::MockServer, bodies:
         .await;
 }
 
+/// Mount a `/v1/checks` response for one exact request-phase conversation prefix.
+async fn mount_nemo_response_for_messages(
+    mock_server: &wiremock::MockServer,
+    messages: serde_json::Value,
+    response: serde_json::Value,
+) {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{body_json, method},
+    };
+
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "model": "",
+            "messages": messages,
+            "guardrails": {"rail_types": ["input"]}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(mock_server)
+        .await;
+}
+
 /// A valid OpenAI Chat Completion response body for testing.
 fn chat_completion_response(content: &str) -> bytes::Bytes {
     bytes::Bytes::from(
@@ -106,6 +128,54 @@ fn chat_completion_response(content: &str) -> bytes::Bytes {
                 },
                 "finish_reason": "stop"
             }]
+        }))
+        .unwrap(),
+    )
+}
+
+/// Build chat messages with one text content per message.
+fn chat_messages(role: &str, contents: &[&str]) -> Vec<serde_json::Value> {
+    contents
+        .iter()
+        .map(|content| serde_json::json!({"role": role, "content": content}))
+        .collect()
+}
+
+/// Build a request body containing user messages.
+fn chat_request_body(contents: &[&str]) -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "messages": chat_messages("user", contents)
+        }))
+        .unwrap(),
+    )
+}
+
+/// Build a request with a large non-target history and many short user turns.
+fn large_history_request_body(user_turns: usize) -> bytes::Bytes {
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": "x".repeat(512 * 1024)
+    })];
+    messages.extend((0..user_turns).map(|_| serde_json::json!({"role": "user", "content": "x"})));
+    bytes::Bytes::from(serde_json::to_vec(&serde_json::json!({"messages": messages})).unwrap())
+}
+
+/// Build a Chat Completions response containing multiple assistant choices.
+fn chat_completion_response_with_choices(contents: &[&str]) -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": contents
+                .iter()
+                .enumerate()
+                .map(|(index, content)| serde_json::json!({
+                    "index": index,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }))
+                .collect::<Vec<_>>()
         }))
         .unwrap(),
     )
@@ -145,6 +215,22 @@ fn assert_request_users_redacted(ctx: &HttpFilterContext<'_>, body: &bytes::Byte
     );
     assert_no_injected_content_length(ctx);
     assert_forwarded_messages(body, expected_messages);
+}
+
+/// Assert that request-phase `NeMo` redaction rewrites the expected messages.
+async fn assert_nemo_request_redaction(
+    mock_server: &wiremock::MockServer,
+    request_body: bytes::Bytes,
+    expected_messages: &[(&str, &str)],
+) {
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(request_body);
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_request_users_redacted(&ctx, body.as_ref().expect("forwarded body"), expected_messages);
 }
 
 /// Assert the filter did not inject a `content-length` header.
@@ -624,6 +710,409 @@ async fn on_request_body_passes_through() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration setup covers concurrent prefix fan-out"
+)]
+async fn on_request_body_checks_multiple_messages_concurrently() {
+    use std::time::Duration;
+
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(serde_json::json!({"status": "passed", "content": "hello"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(chat_request_body(&["one", "two", "three", "four", "five", "six"]));
+
+    let evaluation = filter.on_request_body(&mut ctx, &mut body, true);
+    tokio::pin!(evaluation);
+    tokio::select! {
+        _ = &mut evaluation => panic!("evaluation completed before all checks were observed"),
+        observed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if mock_server.received_requests().await.unwrap().len() == 6 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }) => observed.expect("all six checks should start before the delayed responses complete"),
+    }
+
+    assert!(matches!(
+        evaluation.await.unwrap(),
+        praxis_filter::FilterAction::Continue
+    ));
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        6,
+        "all six prefix checks should complete"
+    );
+}
+
+fn message_count(request: &wiremock::Request) -> usize {
+    serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|request| {
+            request
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or_default()
+}
+
+async fn mount_block_and_slow_modified_check(mock_server: &wiremock::MockServer) {
+    use std::time::Duration;
+
+    use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers::method};
+
+    struct BlockAndSlowModified;
+
+    impl Respond for BlockAndSlowModified {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let messages = message_count(request);
+            let response = if messages == 1 {
+                serde_json::json!({"status": "blocked", "content": "blocked", "rail": "toxicity"})
+            } else {
+                serde_json::json!({"status": "modified", "content": "masked slow", "rail": "pii"})
+            };
+            let template = ResponseTemplate::new(200).set_body_json(response);
+            if messages == 1 {
+                template
+            } else {
+                template.set_delay(Duration::from_millis(500))
+            }
+        }
+    }
+
+    Mock::given(method("POST"))
+        .respond_with(BlockAndSlowModified)
+        .mount(mock_server)
+        .await;
+}
+
+#[tokio::test]
+async fn on_request_body_waits_for_started_checks_before_returning_block() {
+    use std::time::{Duration, Instant};
+
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    mount_block_and_slow_modified_check(&mock_server).await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(chat_request_body(&["blocked", "slow"]));
+
+    let started = Instant::now();
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let elapsed = started.elapsed();
+
+    let rejection = as_rejection(action);
+    assert_eq!(rejection.status, 403);
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "a block must wait for the 500 ms sibling check to complete, but took {elapsed:?}"
+    );
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration setup covers out-of-order redaction aggregation"
+)]
+async fn on_request_body_applies_out_of_order_redactions_to_original_messages() {
+    use std::time::Duration;
+
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method},
+    };
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "model": "",
+            "messages": [{"role": "user", "content": "first"}],
+            "guardrails": {"rail_types": ["input"]}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(serde_json::json!({
+                    "status": "modified",
+                    "content": "masked first",
+                    "rail": "pii"
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "model": "",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"}
+            ],
+            "guardrails": {"rail_types": ["input"]}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "modified",
+            "content": "masked second",
+            "rail": "pii"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test",
+            "messages": chat_messages("user", &["first", "second"])
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_request_users_redacted(
+        &ctx,
+        body.as_ref().expect("forwarded body"),
+        &[("user", "masked first"), ("user", "masked second")],
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration setup covers first, middle, and last blocked messages"
+)]
+async fn on_request_body_blocks_at_each_message_position() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method},
+    };
+
+    let contents = ["one", "two", "three"];
+    for blocked_at in 0..contents.len() {
+        let mock_server = MockServer::start().await;
+        for end in 0..contents.len() {
+            let prefix = contents.get(..=end).expect("message index should be in bounds");
+            let response = if end == blocked_at {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "blocked",
+                    "content": "blocked",
+                    "rail": "toxicity"
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "passed",
+                    "content": "safe"
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(body_json(serde_json::json!({
+                    "model": "",
+                    "messages": chat_messages("user", prefix),
+                    "guardrails": {"rail_types": ["input"]}
+                })))
+                .respond_with(response)
+                .mount(&mock_server)
+                .await;
+        }
+
+        let endpoint = format!("{}/v1/checks", mock_server.uri());
+        let filter = nemo_filter(&endpoint);
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(chat_request_body(&contents));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert_eq!(as_rejection(action).status, 403, "blocked position: {blocked_at}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration setup covers response-phase first-choice evaluation"
+)]
+async fn on_response_body_checks_only_first_choice() {
+    use std::time::Duration;
+
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(serde_json::json!({"status": "passed", "content": "hello"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter_response(&endpoint);
+    let evaluation = tokio::task::spawn_blocking(move || {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+        let mut body = Some(chat_completion_response_with_choices(&[
+            "one", "two", "three", "four", "five", "six",
+        ]));
+        let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        matches!(action, praxis_filter::FilterAction::Continue)
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if mock_server.received_requests().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first response choice should be checked before the delayed response completes");
+    assert!(evaluation.await.unwrap());
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        1,
+        "response guardrails should check only the first choice"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_rejects_more_than_max_message_checks_before_calling_provider() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+provider:
+  type: nemo
+  endpoint: "{}/v1/checks"
+  max_message_checks: 2
+"#,
+        mock_server.uri()
+    ))
+    .unwrap();
+    let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(chat_request_body(&["one", "two", "three"]));
+
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+
+    assert!(result.is_err(), "the configured message-check limit must fail closed");
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn on_request_body_fails_closed_when_one_concurrent_check_errors() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method},
+    };
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "model": "",
+            "messages": chat_messages("user", &["one"]),
+            "guardrails": {"rail_types": ["input"]}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "passed",
+            "content": "safe"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(chat_request_body(&["one", "two"]));
+
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+
+    assert!(result.is_err(), "a malformed sibling response must fail closed");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration setup verifies the deadline stops queued large prefixes"
+)]
+async fn on_request_body_skips_queued_checks_after_deadline() {
+    use std::time::{Duration, Instant};
+
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(serde_json::json!({"status": "passed", "content": "safe"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+provider:
+  type: nemo
+  endpoint: "{}/v1/checks"
+  timeout_ms: 1
+  max_message_checks: 256
+"#,
+        mock_server.uri()
+    ))
+    .unwrap();
+    let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(large_history_request_body(256));
+
+    let started = Instant::now();
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "concurrent checks must fail closed at the shared deadline"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "expired queued prefixes must not serialize the large history, but took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn callout_timeout_starts_when_evaluation_begins() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -696,39 +1185,49 @@ async fn on_request_body_blocked_writes_filter_results() {
     );
 }
 
+async fn mount_last_user_redaction(mock_server: &wiremock::MockServer) {
+    mount_nemo_response_for_messages(
+        mock_server,
+        serde_json::json!([
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "first"}
+        ]),
+        serde_json::json!({"status": "passed", "content": "first"}),
+    )
+    .await;
+    mount_nemo_response_for_messages(
+        mock_server,
+        serde_json::json!([
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "my email is secret@example.com"}
+        ]),
+        serde_json::json!({"status": "modified", "content": "masked text", "rail": "pii"}),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn on_request_body_modified_rewrites_last_user_message() {
     use wiremock::MockServer;
 
     let mock_server = MockServer::start().await;
-    mount_nemo_checks_responses(
+    mount_last_user_redaction(&mock_server).await;
+
+    assert_nemo_request_redaction(
         &mock_server,
-        vec![
-            serde_json::json!({"status": "passed", "content": "first"}),
-            serde_json::json!({"status": "modified", "content": "masked text", "rail": "pii"}),
-        ],
-    )
-    .await;
-
-    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    let mut body = Some(bytes::Bytes::from_static(
-        br#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"my email is secret@example.com"}]}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    assert_request_users_redacted(
-        &ctx,
-        body.as_ref().expect("forwarded body"),
+        bytes::Bytes::from_static(
+            br#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"my email is secret@example.com"}]}"#,
+        ),
         &[
             ("system", "Be helpful"),
             ("user", "first"),
             ("assistant", "ok"),
             ("user", "masked text"),
         ],
-    );
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -736,33 +1235,35 @@ async fn on_request_body_modified_rewrites_all_user_messages() {
     use wiremock::MockServer;
 
     let mock_server = MockServer::start().await;
-    mount_nemo_checks_responses(
+    mount_nemo_response_for_messages(
         &mock_server,
-        vec![
-            serde_json::json!({"status": "modified", "content": "My mail is <EMAIL>", "rail": "pii"}),
-            serde_json::json!({"status": "modified", "content": "my credit card is <CREDIT-CARD>", "rail": "pii"}),
-        ],
+        serde_json::json!([{"role": "user", "content": "My mail is xxx@gmail.com"}]),
+        serde_json::json!({"status": "modified", "content": "My mail is <EMAIL>", "rail": "pii"}),
+    )
+    .await;
+    mount_nemo_response_for_messages(
+        &mock_server,
+        serde_json::json!([
+            {"role": "user", "content": "My mail is xxx@gmail.com"},
+            {"role": "assistant", "content": "No."},
+            {"role": "user", "content": "my credit card is 1234-5678-92211"}
+        ]),
+        serde_json::json!({"status": "modified", "content": "my credit card is <CREDIT-CARD>", "rail": "pii"}),
     )
     .await;
 
-    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    let mut body = Some(bytes::Bytes::from_static(
-        br#"{"model":"test","messages":[{"role":"user","content":"My mail is xxx@gmail.com"},{"role":"assistant","content":"No."},{"role":"user","content":"my credit card is 1234-5678-92211"}]}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    assert_request_users_redacted(
-        &ctx,
-        body.as_ref().expect("forwarded body"),
+    assert_nemo_request_redaction(
+        &mock_server,
+        bytes::Bytes::from_static(
+            br#"{"model":"test","messages":[{"role":"user","content":"My mail is xxx@gmail.com"},{"role":"assistant","content":"No."},{"role":"user","content":"my credit card is 1234-5678-92211"}]}"#,
+        ),
         &[
             ("user", "My mail is <EMAIL>"),
             ("assistant", "No."),
             ("user", "my credit card is <CREDIT-CARD>"),
         ],
-    );
+    )
+    .await;
 }
 
 #[tokio::test]
