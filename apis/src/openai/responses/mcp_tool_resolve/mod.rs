@@ -390,6 +390,13 @@ fn discovery_retained_charge(
 /// more resolvable MCP entries share the same `server_label`
 /// (including entries that differ only by credentials).
 ///
+/// With `require_connector: true`, raw client-selected `server_url` entries are
+/// rejected before identity staging or any MCP callout. `openai_mcp_dispatch`
+/// needs no duplicate gate: its existing connector-context policy already
+/// refuses ambient identity to non-connector entries and round-matches the
+/// resolver configuration, making resolve-side rejection the single effective
+/// connector-only gate.
+///
 /// Configured `connector_id` entries with `defer_loading: true` are
 /// accepted when the request also includes a `tool_search` tool.
 /// Those entries are resolved to an internal endpoint without an
@@ -489,6 +496,9 @@ pub struct McpToolResolveFilter {
 
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
+
+    /// Whether client-selected direct MCP `server_url` entries are rejected.
+    require_connector: bool,
 
     /// Operator metadata-admission policy snapshot.
     admission_policy: McpAdmissionPolicy,
@@ -636,6 +646,7 @@ impl McpToolResolveFilter {
                 .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
                 .collect(),
             connectors,
+            require_connector: validated.require_connector,
             admission_policy: validated.tool_admission.snapshot(),
             connector_trust,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
@@ -683,6 +694,9 @@ impl McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if self.require_connector {
+            reject_direct_server_urls(&mcp_entries.values)?;
+        }
         resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
         let has_configured_connector = mcp_entries
             .values
@@ -1176,6 +1190,13 @@ pub(crate) enum ResolveError {
     #[error("unknown connector_id \"{0}\"")]
     UnknownConnector(String),
 
+    /// A direct client-selected `server_url` was supplied while connector-only
+    /// routing is enabled.
+    #[error(
+        "Direct MCP server URLs are disabled by your administrator. Use an administrator-configured connector_id instead."
+    )]
+    DirectServerUrl,
+
     /// Both `connector_id` and `server_url` were provided.
     #[error("connector_id and server_url are mutually exclusive on entry \"{0}\"")]
     MutuallyExclusiveTarget(String),
@@ -1480,6 +1501,19 @@ fn resolve_connector_ids(
     Ok(())
 }
 
+/// Reject direct client-selected MCP destinations before any identity staging or
+/// outbound callout is acquired.
+///
+/// The error intentionally contains no request data: `server_url`,
+/// `server_label`, credentials, and assertions must not leak through the
+/// client-visible rejection.
+fn reject_direct_server_urls(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
+    if entries.iter().any(|entry| entry.get("server_url").is_some()) {
+        return Err(ResolveError::DirectServerUrl);
+    }
+    Ok(())
+}
+
 /// Validate that a connector entry has required fields and no conflicts.
 fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Result<(), ResolveError> {
     let label = entry
@@ -1582,6 +1616,7 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
         | ResolveError::TooManyServers { .. }
         | ResolveError::NameCollision(_)
         | ResolveError::UnknownConnector(_)
+        | ResolveError::DirectServerUrl
         | ResolveError::MutuallyExclusiveTarget(_)
         | ResolveError::MissingToolSearch(_)
         | ResolveError::InvalidConnectorId

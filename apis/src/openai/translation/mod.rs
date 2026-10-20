@@ -3200,6 +3200,52 @@ mod tests {
     }
 
     #[test]
+    fn response_with_multiple_valid_choices_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": "stop", "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_with_one_valid_and_one_invalid_choice_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": null, "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn response_without_choices_key_is_rejected() {
         let request = json!({"model": "m", "input": "hello"});
         let context = make_response_context(&request);

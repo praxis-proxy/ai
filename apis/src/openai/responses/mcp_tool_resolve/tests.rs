@@ -3,7 +3,52 @@
 
 //! Unit tests for the `openai_mcp_tool_resolve` filter.
 
+use std::sync::{Arc, Mutex};
+
 use super::*;
+
+/// Capture WARN messages emitted on this test thread without changing the
+/// process-wide tracing subscriber shared by parallel tests.
+fn capture_warn_messages<F: FnOnce()>(f: F) -> Vec<String> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let layer = WarnMessageCapture(Arc::clone(&messages));
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+    std::mem::take(&mut messages.lock().unwrap())
+}
+
+struct WarnMessageCapture(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnMessageCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = WarnMessageVisitor::default();
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.message);
+    }
+}
+
+#[derive(Default)]
+struct WarnMessageVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for WarnMessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_owned();
+        }
+    }
+}
 
 // =========================================================================
 // Config Parsing
@@ -36,6 +81,42 @@ fn config_accepts_scoped_connector_slots() {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("user_credential: mcp_gateway\nauthorization_assertion: mcp_gateway\n").unwrap();
     assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn require_connector_defaults_to_false_and_accepts_true() {
+    let default: McpToolResolveConfig = serde_yaml::from_str("{}").unwrap();
+    assert!(!default.require_connector, "require_connector must default to false");
+
+    let enabled: McpToolResolveConfig = serde_yaml::from_str("require_connector: true").unwrap();
+    assert!(enabled.require_connector, "require_connector must parse true");
+}
+
+#[test]
+fn scoped_connector_context_without_require_connector_warns() {
+    for yaml in ["user_credential: mcp_gateway", "authorization_assertion: mcp_gateway"] {
+        let warnings = capture_warn_messages(|| {
+            let cfg: McpToolResolveConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(build_config(cfg).is_ok());
+        });
+        assert_eq!(warnings.len(), 1, "expected one warning for {yaml:?}: {warnings:?}");
+        assert!(
+            warnings[0].contains("per-user MCP authorization is configured without require_connector"),
+            "warning must explain the direct-server risk: {warnings:?}"
+        );
+    }
+
+    let warnings = capture_warn_messages(|| {
+        let cfg: McpToolResolveConfig = serde_yaml::from_str(
+            "user_credential: mcp_gateway\nauthorization_assertion: mcp_gateway\nrequire_connector: true",
+        )
+        .unwrap();
+        assert!(build_config(cfg).is_ok());
+    });
+    assert!(
+        warnings.is_empty(),
+        "connector-only configuration must not warn: {warnings:?}"
+    );
 }
 
 #[tokio::test]
@@ -1500,6 +1581,32 @@ async fn connector_id_entry_without_configured_connectors_rejects_with_400() {
         other => panic!("expected Reject, got {other:?}"),
     };
     assert_eq!(rejection.status, 400, "unknown connector_id should be 400");
+}
+
+#[tokio::test]
+async fn require_connector_rejects_direct_server_url_before_identity_or_callout() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("require_connector: true").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "direct",
+            "server_url": "https://mcp.example/mcp"
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(rejection) => rejection,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400, "direct server_url should be rejected as a 400");
 }
 
 // =========================================================================

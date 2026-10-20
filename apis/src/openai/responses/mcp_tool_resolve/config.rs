@@ -136,6 +136,14 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default)]
     pub authorization_assertion: Option<String>,
 
+    /// Require MCP tool entries to reference an operator-configured connector.
+    ///
+    /// When false, client-selected direct `server_url` entries remain allowed for
+    /// deployments that intentionally mix public direct servers with scoped
+    /// connector traffic.
+    #[serde(default)]
+    pub require_connector: bool,
+
     /// Trusted request headers forwarded to connector-backed MCP `initialize`
     /// and `tools/list` requests.
     /// No request headers are forwarded by default. Credential headers such as
@@ -220,6 +228,13 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
     reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
     validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
     validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
+    if !cfg.require_connector && (cfg.user_credential.is_some() || cfg.authorization_assertion.is_some()) {
+        tracing::warn!(
+            user_credential = ?cfg.user_credential,
+            authorization_assertion = ?cfg.authorization_assertion,
+            "openai_mcp_tool_resolve: per-user MCP authorization is configured without require_connector; direct server_url entries remain allowed"
+        );
+    }
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",

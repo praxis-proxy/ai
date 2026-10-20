@@ -354,6 +354,7 @@ def render(report, detailed=False):
     lines = [START, "### vLLM Responses gateway qualification", ""]
     if status == "unavailable":
         lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
+        lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
         lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
     else:
@@ -422,9 +423,9 @@ def render(report, detailed=False):
     return "\n".join(lines)
 
 
-def compose_notes(existing, section):
-    if START in existing and END in existing:
-        return existing[:existing.index(START)] + section.rstrip() + existing[existing.index(END) + len(END):]
+def compose_notes(existing, section, start=START, end=END):
+    if start in existing and end in existing:
+        return existing[:existing.index(start)] + section.rstrip() + existing[existing.index(end) + len(end):]
     return existing.rstrip() + "\n\n" + section
 
 
