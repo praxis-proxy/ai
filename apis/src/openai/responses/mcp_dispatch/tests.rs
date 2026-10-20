@@ -3664,7 +3664,7 @@ async fn over_budget_approval_is_retryable_then_replay_is_rejected() {
     let mut body1 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx1, &mut body1, true).await.unwrap());
     assert_eq!(rejection.status, 413, "an over-budget resumption is rejected");
-    assert!(reject_message(&rejection).contains("max_retained_bytes"));
+    assert!(reject_message(&rejection).contains("limit set by the platform administrator"));
     assert!(
         ctx1.extensions
             .get::<ResponsesState>()
