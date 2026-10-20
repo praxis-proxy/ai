@@ -884,6 +884,22 @@ fn release_completed_round(
     if fits {
         return Ok(None);
     }
+    // A streaming request has already committed `text/event-stream` to the client
+    // by the time a mid-loop round completes, so the overflow terminal cannot be a
+    // JSON 502 reject. Signal `openai_stream_events` to append one terminal SSE
+    // `error` event (and no `response.completed`) during its finalization, then
+    // `Continue` so that finalizer runs — mirroring `reject_mixed_ownership_round`
+    // and `finish_response_failure`. Only the buffered path, which has committed
+    // nothing, surfaces the JSON error envelope.
+    if request_is_streaming(state) {
+        end_stream_with_error(
+            ctx,
+            state,
+            "server_error",
+            "The request exceeds a processing limit set by the platform administrator.",
+        )?;
+        return Ok(Some(FilterAction::Continue));
+    }
     ctx.set_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)?;
     Ok(Some(FilterAction::Reject(responses_error_rejection(

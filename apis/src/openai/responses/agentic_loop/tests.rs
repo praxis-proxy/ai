@@ -658,6 +658,65 @@ fn budgeted_buffered_output_rejects_before_json_parse() {
 }
 
 #[test]
+fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
+    // A streaming request has already committed `text/event-stream` by the time a
+    // mid-loop round completes, so a retained-output overflow at the round boundary
+    // must terminate the committed stream with one terminal SSE `error` event
+    // (handed to `openai_stream_events`) and `Continue` — never a JSON 502 reject.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a committed stream cannot be rejected; the terminal error rides the stream"
+    );
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert!(
+        ctx.get_metadata("responses.stream_error_message")
+            .unwrap()
+            .contains("max_retained_bytes"),
+        "the terminal error must name the retained-payload overflow"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+}
+
+#[test]
+fn buffered_round_boundary_overflow_rejects_with_json_502() {
+    // The buffered path has committed nothing, so the same round-boundary overflow
+    // still surfaces the JSON 502 error envelope and sets no stream-error metadata.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi"}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+}
+
+#[test]
 fn preparse_filter_reserves_against_existing_responses_state() {
     let policy =
         super::super::AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
