@@ -67,6 +67,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(plugin.profile_for_item(item("openai_client")), "native")
         self.assertEqual(plugin.profile_for_item(item("chat_streaming_client")), "translation")
         self.assertEqual(plugin.profile_for_item(item("reasoning_capture_client")), "supporting")
+        self.assertEqual(plugin.profile_for_item(item("streaming_mcp_failure_client")), "supporting")
         self.assertEqual(plugin.profile_for_item(item("new_gateway_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item("openai_client", "chat_streaming_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item(override="supporting")), "supporting")

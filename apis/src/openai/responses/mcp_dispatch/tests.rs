@@ -2700,6 +2700,83 @@ async fn configured_connector_call_missing_assertion_records_security_failure_be
 }
 
 #[tokio::test]
+async fn require_approval_never_missing_assertion_fails_closed_as_streaming_sse_terminal() {
+    let dispatch_filter = make_scoped_dispatch_filter();
+    let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ClientResponseHeadersCommitted);
+    assert!(
+        matches!(
+            crate::callout_identity::stage_mcp_callout_identity(&ctx, None, Some("mcp_gateway")),
+            Err(crate::callout_identity::McpCalloutContextMissing::Authorization)
+        ),
+        "the trusted owner must be present so only the missing assertion blocks dispatch"
+    );
+
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        json!({
+            "connector_id": "trusted",
+            "server_label": "weather",
+            "server_url": "https://mcp.example/mcp",
+            "name": "get_weather",
+            "require_approval": "never"
+        }),
+    );
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "test",
+        "stream": true
+    }));
+    state.mcp_connector_context_policy = McpConnectorContextPolicy::new(None, Some("mcp_gateway"));
+    state.mcp_tool_map = tool_map;
+    state.select_test_output(
+        "function_call",
+        vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("weather", "get_weather"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+    );
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = dispatch_filter
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("missing assertion should record a security terminal before tools/call");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+
+    let action = loop_filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(response) = action else {
+        panic!("a committed stream must terminate through an SSE error reject");
+    };
+    assert_eq!(response.status, 200, "a committed stream keeps its 200 status");
+    let content_type = response.headers.iter().find(|(name, _)| name == "content-type");
+    assert_eq!(content_type.map(|(_, value)| value.as_str()), Some("text/event-stream"));
+    let body = String::from_utf8(response.body.as_ref().unwrap().to_vec()).unwrap();
+    assert!(body.contains("event: error"), "terminal frame is an SSE error: {body}");
+    assert!(
+        body.contains("missing_callout_context"),
+        "SSE error identifies the missing context: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "the failure must not emit a success terminal: {body}"
+    );
+}
+
+#[tokio::test]
 async fn connector_call_rejects_dispatch_context_policy_mismatch_before_dispatch() {
     let filter = make_scoped_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");

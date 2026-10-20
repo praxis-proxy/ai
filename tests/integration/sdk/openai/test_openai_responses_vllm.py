@@ -70,6 +70,12 @@ TRUSTED_OWNER_HEADERS = {
     "x-auth-tenant": "test-tenant",
     "x-auth-user": "test-user",
 }
+# These emulated values are normally established by a trusted authentication
+# boundary and captured into the dedicated MCP credential/assertion slots.
+TRUSTED_MCP_HEADERS = {
+    "x-user-mcp-key": "sdk-mcp-user-key",
+    "x-mcp-authorized": "Bearer sdk-mcp-authorized",
+}
 # The full-flow binding router maps model "vllm-chat" to the Chat Completions
 # backend — the ONLY route that runs openai_responses_to_chat_completions. Every
 # Chat-translation test MUST send this model or it silently routes to the native
@@ -267,6 +273,7 @@ def _write_full_flow_config(
     *,
     backend_endpoint: str | None = None,
     search_port: int | None = None,
+    mcp_endpoint: str | None = None,
     nemo_port: int | None = None,
     max_event_bytes: int | None = None,
     chat_rewrite_model: str | None = None,
@@ -279,6 +286,7 @@ def _write_full_flow_config(
     file_url_origin: str | None = None,
     web_search_provider: str = "brave",
     tool_admission: str | None = None,
+    require_connector: bool | None = None,
     mcp_minimum_approval: str | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
@@ -294,6 +302,13 @@ def _write_full_flow_config(
         marker = "      - filter: openai_mcp_tool_resolve\n"
         assert config.count(marker) == 1, config
         config = config.replace(marker, marker + tool_admission)
+    if require_connector is not None:
+        marker = "        require_connector: true\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(
+            marker,
+            f"        require_connector: {str(require_connector).lower()}\n",
+        )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
@@ -394,6 +409,10 @@ def _write_full_flow_config(
             f"                base_url: http://127.0.0.1:{search_port}\n"
             "                # Require the per-user key",
         )
+    if mcp_endpoint is not None:
+        mcp_anchor = "server_url: http://127.0.0.1:8001/mcp"
+        assert config.count(mcp_anchor) == 1, config
+        config = config.replace(mcp_anchor, f"server_url: {mcp_endpoint}")
     if nemo_port is not None:
         nemo_anchor = "http://127.0.0.1:3003/v1/checks"
         assert config.count(nemo_anchor) == 1
@@ -557,11 +576,13 @@ def test_full_flow_config_writer_inherits_root_override(tmp_path, monkeypatch):
         backend_endpoint=_vllm_endpoint(),
         chat_translation_model=VLLM_MODEL,
         reasoning_dialect="vllm",
+        require_connector=False,
     )
     try:
         with open(path) as config_file:
             config = config_file.read()
         assert config.count("allow_root: true") == 1, config
+        assert config.count("require_connector: false") == 1, config
     finally:
         os.unlink(path)
 
@@ -639,9 +660,18 @@ class MCPHandler(BaseHTTPRequestHandler):
     """Streamable HTTP MCP server with deterministic weather/time tools."""
 
     authorization_headers: ClassVar[list[str | None]] = []
+    assertion_headers: ClassVar[list[str | None]] = []
 
+    _request_count = 0
+    _request_count_lock = threading.Lock()
     _tool_call_count = 0
     _tool_call_count_lock = threading.Lock()
+
+    @classmethod
+    def request_count(cls) -> int:
+        """Return the number of MCP requests received by this test process."""
+        with cls._request_count_lock:
+            return cls._request_count
 
     @classmethod
     def tool_call_count(cls) -> int:
@@ -650,7 +680,10 @@ class MCPHandler(BaseHTTPRequestHandler):
             return cls._tool_call_count
 
     def do_POST(self):
+        with type(self)._request_count_lock:
+            type(self)._request_count += 1
         type(self).authorization_headers.append(self.headers.get("Authorization"))
+        type(self).assertion_headers.append(self.headers.get("x-mcp-authorized"))
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         req = json.loads(body)
         method = req.get("method")
@@ -5777,6 +5810,7 @@ def agentic_proxy(
         port,
         db_path,
         backend_endpoint=_vllm_endpoint(),
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
         # Route the openai_responses_compact summarization callout at the
         # deterministic mock so the budgeted explicit-compact test is stable.
@@ -5819,7 +5853,8 @@ def agentic_client(agentic_proxy):
     """Return an OpenAI client pointed at the agentic Praxis proxy."""
     proxy_port, _, _ = agentic_proxy
     return _make_openai_client(
-        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
@@ -5846,6 +5881,7 @@ def admission_proxy(
         backend_endpoint=_vllm_endpoint(),
         nemo_port=nemo_guardrails_server,
         tool_admission=_PROTECTED_ADMISSION_BLOCK,
+        require_connector=False,
     )
     binary = _find_binary()
 
@@ -5903,6 +5939,7 @@ def mcp_approval_floor_proxy(
         port,
         db_path,
         backend_endpoint=_vllm_endpoint(),
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
         mcp_minimum_approval="always",
     )
@@ -5943,7 +5980,8 @@ def mcp_approval_floor_client(mcp_approval_floor_proxy):
     """Return an OpenAI client pointed at the approval-floor Praxis proxy."""
     proxy_port, _, _ = mcp_approval_floor_proxy
     return _make_openai_client(
-        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
@@ -5965,6 +6003,7 @@ def translated_agentic_proxy(
         db_path,
         backend_endpoint=backend_endpoint,
         search_port=search_server,
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         chat_translation_model=VLLM_MODEL,
         nemo_port=nemo_guardrails_server,
     )
@@ -6006,6 +6045,7 @@ def translated_agentic_client(translated_agentic_proxy):
         translated_agentic_proxy,
         default_headers={
             **TRUSTED_OWNER_HEADERS,
+            **TRUSTED_MCP_HEADERS,
             # full-flow binds the Brave provider secret from this per-user header
             # via callout_credentials; the mock search server ignores its value.
             "x-user-brave-key": "controlled-test-only",
@@ -6029,6 +6069,7 @@ def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_serve
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
     )
     binary = _find_binary()
 
@@ -6043,7 +6084,13 @@ def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_serve
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), mcp_server
+        yield (
+            _make_openai_client(
+                port,
+                default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+            ),
+            mcp_server,
+        )
     finally:
         proc.send_signal(signal.SIGINT)
         try:
@@ -6802,6 +6849,7 @@ def mcp_invalid_args_proxy(
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
@@ -6817,7 +6865,7 @@ def mcp_invalid_args_proxy(
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        yield port, mcp_server
+        yield port
     finally:
         proc.send_signal(signal.SIGINT)
         try:
@@ -6838,13 +6886,16 @@ def mcp_invalid_args_proxy(
 @pytest.fixture(scope="session")
 def mcp_invalid_args_client(mcp_invalid_args_proxy):
     """Return an OpenAI client pointed at the deterministic MCP proxy."""
-    proxy_port, _ = mcp_invalid_args_proxy
-    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+    proxy_port = mcp_invalid_args_proxy
+    return _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+    )
 
 
 @qualification_profile("supporting")
 def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
-    mcp_invalid_args_client, mcp_invalid_args_proxy
+    mcp_invalid_args_client,
 ):
     """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
 
@@ -6853,12 +6904,11 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
     with an actionable, value-free tool error, make zero outbound ``tools/call``,
     and let the loop recover to a model message.
     """
-    _, mcp_port = mcp_invalid_args_proxy
     tools = [
         {
             "type": "mcp",
             "server_label": "weather",
-            "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+            "connector_id": "trusted-mcp",
             "allowed_tools": ["get_weather"],
             "require_approval": "never",
         }
@@ -6906,6 +6956,81 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
 
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
+
+    def test_mcp_connector_only_rejects_direct_url_before_callout(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1672: raw client URLs cannot bypass operator connectors."""
+        _, mcp_port, _ = agentic_proxy
+        requests_before = MCPHandler.request_count()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="What is the weather in Paris? /no_think",
+                tools=[
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "allowed_tools": ["get_weather"],
+                        "require_approval": "never",
+                    }
+                ],
+                store=False,
+                max_output_tokens=128,
+            )
+
+        assert exc_info.value.status_code == 400, exc_info.value
+        assert exc_info.value.body["message"] == (
+            "Direct MCP server URLs are disabled by your administrator. "
+            "Use an administrator-configured connector_id instead."
+        )
+        assert MCPHandler.request_count() == requests_before, (
+            "connector-only rejection must happen before any MCP request"
+        )
+
+    def test_mcp_connector_executes_through_operator_configured_connector(
+        self, agentic_client,
+    ):
+        """Issue #1672: connector_id traffic carries trusted MCP identity."""
+        MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
+        requests_before = MCPHandler.request_count()
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "connector_id": "trusted-mcp",
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), response
+        assert any(item.type == "mcp_call" for item in response.output), (
+            f"connector-backed MCP execution must surface its result: "
+            f"{[item.type for item in response.output]}"
+        )
+        assert MCPHandler.request_count() > requests_before
+        assert MCPHandler.tool_call_count() > calls_before
+        assert set(MCPHandler.authorization_headers) == {
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
+        }
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
 
     def test_protected_mode_excludes_untrusted_direct_mcp_tool(
         self, admission_client, admission_proxy,
@@ -7030,12 +7155,11 @@ class TestAgenticLoopVLLM:
         self, agentic_client, agentic_proxy,
     ):
         """An SDK approval response resumes and executes the MCP call once."""
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "always",
             }
@@ -7100,7 +7224,7 @@ class TestAgenticLoopVLLM:
 
     @requires_vllm_compat
     def test_mcp_approval_read_only_selector_gates_over_never_name(
-        self, agentic_client, agentic_proxy,
+        self, agentic_client,
     ):
         """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
 
@@ -7110,12 +7234,11 @@ class TestAgenticLoopVLLM:
         the fix the ignored read_only selector left only the never name-match and
         the tool executed automatically.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": {
                     "always": {"read_only": True},
@@ -7152,7 +7275,7 @@ class TestAgenticLoopVLLM:
 
     @requires_vllm_compat
     def test_mcp_approval_read_only_selector_auto_executes(
-        self, agentic_client, agentic_proxy,
+        self, agentic_client,
     ):
         """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
 
@@ -7161,12 +7284,11 @@ class TestAgenticLoopVLLM:
         request -- proving the discovered readOnlyHint drives the exemption
         through the OpenAI client.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": {"never": {"read_only": True}},
             }
@@ -7218,12 +7340,11 @@ class TestAgenticLoopVLLM:
         surface that raised the regression. Reaching ``get_final_response()``
         without an exception is itself the primary assertion.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "always",
             }
@@ -7339,8 +7460,6 @@ class TestAgenticLoopVLLM:
         accumulated output contains the full execution trace:
         function_call, mcp_call, and the final message.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -7352,7 +7471,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -7398,8 +7517,6 @@ class TestAgenticLoopVLLM:
         on the model -- the same reliability profile as
         ``test_mcp_tool_auto_executes_and_returns``.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -7411,7 +7528,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather_map"],
                     "require_approval": "never",
                 }
@@ -7449,7 +7566,6 @@ class TestAgenticLoopVLLM:
         agentic_client,
         agentic_proxy,
     ):
-        _, mcp_port, _ = agentic_proxy
         MCPHandler.authorization_headers.clear()
 
         response = agentic_client.responses.create(
@@ -7461,7 +7577,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "always",
                 }
@@ -7495,7 +7611,7 @@ class TestAgenticLoopVLLM:
         round is rejected with a 502 before any approval is persisted and
         before the MCP tool executes.
         """
-        client, mcp_port = oversized_call_id_client
+        client, _ = oversized_call_id_client
         calls_before = MCPHandler.tool_call_count()
 
         with pytest.raises(openai.InternalServerError) as exc_info:
@@ -7508,7 +7624,7 @@ class TestAgenticLoopVLLM:
                     {
                         "type": "mcp",
                         "server_label": "weather",
-                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "connector_id": "trusted-mcp",
                         "allowed_tools": ["get_weather"],
                         "require_approval": "always",
                     }
@@ -7533,7 +7649,6 @@ class TestAgenticLoopVLLM:
     def test_operator_floor_forces_approval_over_client_never(
         self,
         mcp_approval_floor_client,
-        mcp_approval_floor_proxy,
     ):
         """Operator ``minimum_approval: always`` must force an approval exchange
         even when the client sends ``require_approval: "never"`` (issue #1723).
@@ -7541,7 +7656,6 @@ class TestAgenticLoopVLLM:
         The MCP server must receive zero ``tools/call`` because the floor stops
         dispatch and returns an ``mcp_approval_request`` instead.
         """
-        _, mcp_port, _ = mcp_approval_floor_proxy
         MCPHandler.authorization_headers.clear()
         calls_before = MCPHandler.tool_call_count()
 
@@ -7554,7 +7668,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     # The client opts out of approval; the operator floor overrides.
                     "require_approval": "never",
@@ -7579,14 +7693,14 @@ class TestAgenticLoopVLLM:
             "the operator floor must stop dispatch before the MCP server is called"
         )
 
-    def test_mcp_authorization_is_bearer_and_not_forwarded_to_model(
+    def test_mcp_connector_identity_is_bearer_and_not_exposed_in_response(
         self,
         agentic_client,
         agentic_proxy,
     ):
-        _, mcp_port, _ = agentic_proxy
         token = "sdk-mcp-secret-789"
         MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -7597,8 +7711,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
-                    "authorization": token,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "always",
                 }
@@ -7607,6 +7720,7 @@ class TestAgenticLoopVLLM:
             # requires store=true; store=false is rejected before emit.
             store=True,
             max_output_tokens=256,
+            extra_headers={"x-user-mcp-key": token},
         )
 
         assert any(item.type == "mcp_approval_request" for item in response.output), (
@@ -7614,15 +7728,18 @@ class TestAgenticLoopVLLM:
         )
         assert MCPHandler.authorization_headers
         assert set(MCPHandler.authorization_headers) == {f"Bearer {token}"}
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
         assert token not in json.dumps(response.model_dump(), default=str)
 
-    def test_authorization_in_mcp_headers_is_stripped(
+    def test_authorization_in_mcp_headers_is_stripped_in_favor_of_connector_identity(
         self,
         agentic_client,
         agentic_proxy,
     ):
-        _, mcp_port, _ = agentic_proxy
         MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -7633,7 +7750,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
                     "headers": {"Authorization": "Bearer must-be-stripped"},
                     "allowed_tools": ["get_weather"],
                     "require_approval": "always",
@@ -7649,7 +7766,12 @@ class TestAgenticLoopVLLM:
             response.output
         )
         assert MCPHandler.authorization_headers
-        assert set(MCPHandler.authorization_headers) == {None}
+        assert set(MCPHandler.authorization_headers) == {
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
+        }
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
 
     def test_web_search_executes_and_returns_result(
         self,
@@ -7941,8 +8063,6 @@ class TestAgenticLoopVLLM:
         agentic_proxy,
     ):
         """Two MCP calls emitted in one model round both complete."""
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -7955,7 +8075,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "utilities",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather", "get_time"],
                     "require_approval": "never",
                 }
@@ -7984,12 +8104,11 @@ class TestAgenticLoopVLLM:
         The pre-fix dispatcher rejected any ``mcp_approval_response`` batch
         with more than one item, so this whole flow returned a 400.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "utilities",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather", "get_time"],
                 "require_approval": "always",
             }
@@ -8062,12 +8181,11 @@ class TestAgenticLoopVLLM:
         The denied call must not reach the MCP server; only the approved
         ``get_weather`` produces an ``mcp_call`` in the resumed response.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "utilities",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather", "get_time"],
                 "require_approval": "always",
             }
@@ -8146,8 +8264,6 @@ class TestAgenticLoopVLLM:
         response.completed carries the same execution trace the buffered
         test observes: function_call, mcp_call, and the final message.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8159,7 +8275,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -8242,8 +8358,6 @@ class TestAgenticLoopVLLM:
         rounds), before the resumed model output, with an id and output index
         that agree with the terminal snapshot.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8255,7 +8369,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -8426,8 +8540,6 @@ class TestAgenticLoopVLLM:
         Tool *selection* still depends on the model, but the discovery item is
         emitted from the proxy's own resolution and is model-independent.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8439,7 +8551,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -8506,8 +8618,6 @@ class TestAgenticLoopVLLM:
         numbers that agree with the terminal snapshot. This is what turns an
         opaque terminal listing into discovery progress the client can render.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8519,7 +8629,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -8911,8 +9021,6 @@ class TestAgenticLoopVLLM:
         a present, positive, internally consistent summed usage -- against a
         real backend.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8924,7 +9032,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -8951,8 +9059,6 @@ class TestAgenticLoopVLLM:
         buffered and streaming expose equivalent accumulated terminal output
         and usage.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -8964,7 +9070,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -9052,6 +9158,58 @@ def _collect_replay_with_retry(
     )
 
 
+@pytest.fixture(scope="session")
+def streaming_mcp_failure_client(
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
+):
+    """Start a full-flow proxy whose configured MCP connector is unreachable."""
+    proxy_port = _free_port()
+    dead_mcp_port = _free_port()
+    db_dir = tmp_path_factory.mktemp("streaming-mcp-failure")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        proxy_port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        mcp_endpoint=f"http://127.0.0.1:{dead_mcp_port}/mcp",
+        nemo_port=nemo_guardrails_server,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    client = _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+    )
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(proxy_port, proc, log_path)
+        started = True
+        yield client
+    finally:
+        client.close()
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Streaming MCP failure Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 class TestStreamingMcpDiscoveryFailureVLLM:
     """Issue #320: a streaming Responses request whose MCP ``tools/list``
     discovery fails at runtime must surface to the official OpenAI SDK as a
@@ -9060,8 +9218,8 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     stream -- and, when ``store`` is effective, the failed resource must be
     retrievable via the SDK.
 
-    The failure is triggered with an MCP ``server_url`` pointing at a dead
-    loopback port. The agentic config enables
+    The failure is triggered through the operator-configured connector when
+    its URL points at a dead loopback port. The agentic config enables
     ``insecure_options.allow_private_upstreams``, so the loopback MCP callout
     passes SSRF validation and the refused connection is classified as a
     genuine *runtime* discovery failure (-> 200 SSE lifecycle) rather than a
@@ -9075,19 +9233,16 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     """
 
     def test_streaming_discovery_failure_surfaces_failed_lifecycle(
-        self, agentic_client, agentic_proxy,
+        self, streaming_mcp_failure_client,
     ):
-        dead_port = _free_port()
-        mcp_url = f"http://127.0.0.1:{dead_port}/mcp"
-
-        stream = agentic_client.responses.create(
+        stream = streaming_mcp_failure_client.responses.create(
             model=VLLM_MODEL,
             input="What is the weather in Paris? /no_think",
             tools=[
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -9149,7 +9304,7 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         # store=True -> the failed resource is persisted and retrievable
         # through the SDK, echoing the same failed status and error.
         assert response_id, "response.created must carry an id for retrieval"
-        retrieved = _retrieve_with_retry(agentic_client, response_id)
+        retrieved = _retrieve_with_retry(streaming_mcp_failure_client, response_id)
         rd = retrieved.model_dump()
         assert rd["status"] == "failed", rd
         assert rd["error"]["code"] == "server_error", rd

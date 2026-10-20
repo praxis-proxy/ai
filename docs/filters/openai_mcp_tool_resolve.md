@@ -9,6 +9,8 @@ Resolves MCP tool entries from the Responses API `tools` array into concrete too
 
 Rejects the request with HTTP 400 before any callouts if two or more resolvable MCP entries share the same `server_label` (including entries that differ only by credentials).
 
+With `require_connector: true`, raw client-selected `server_url` entries are rejected before identity staging or any MCP callout. `openai_mcp_dispatch` needs no duplicate gate: its existing connector-context policy already refuses ambient identity to non-connector entries and round-matches the resolver configuration, making resolve-side rejection the single effective connector-only gate.
+
 Configured `connector_id` entries with `defer_loading: true` are accepted when the request also includes a `tool_search` tool. Those entries are resolved to an internal endpoint without an eager `tools/list` call; `connector_id`, the configured URL, and credentials are stripped from the outbound body. Deferred loading requires `openai_mcp_dispatch` inside an agentic loop. The first inference round keeps a sanitized `type: mcp` stub plus `tool_search` (an OpenAI-shaped hosted-tool backend); any later `tool_search_call` loads every pending deferred connector.
 
 For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
@@ -21,6 +23,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 |-------|------|---------|-------------|
 | `user_credential` | string | no | Optional per-user bearer slot from `callout_credentials`. Must match the corresponding `openai_mcp_dispatch` setting. |
 | `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_credentials.assertions`. Must match the corresponding `openai_mcp_dispatch` setting. |
+| `require_connector` | bool | no | Require MCP tool entries to reference an operator-configured connector. When false, client-selected direct `server_url` entries remain allowed for deployments that intentionally mix public direct servers with scoped connector traffic. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. Inside an iterative request router, initialize and listing exchanges are capped by the router's remaining deadline. |
