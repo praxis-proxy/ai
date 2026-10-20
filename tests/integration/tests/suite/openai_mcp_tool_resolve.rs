@@ -1303,6 +1303,53 @@ fn protected_read_only_excludes_catalog_connector_without_contact() {
     );
 }
 
+/// The same exclusion holds for a DEFERRED `catalog` connector under operator
+/// read-only mode: it is dropped at resolve time so `openai_mcp_dispatch` never
+/// queues it for deferred discovery. Without this, the dispatch path would dial
+/// the gateway (`initialize` + `tools/list`) only to deny every tool. Proven end
+/// to end: the gateway receives zero network calls.
+#[test]
+fn protected_read_only_excludes_deferred_catalog_connector_without_contact() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("read_docs").with_annotations(serde_json::json!({"readOnlyHint": true}))],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        tool_admission:\n          mode: protected\n          require_read_only: true\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            trust: catalog"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // A deferred connector requires a `tool_search` entry in the request.
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"tool_search"},{"type":"mcp","server_label":"docs","connector_id":"gw","defer_loading":true}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the deferred connector excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    assert!(!echoed.contains("read_docs"), "no tool reaches the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("initialize"),
+        0,
+        "an excluded deferred catalog connector must never be dialed"
+    );
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "an excluded deferred catalog connector must never be dialed"
+    );
+}
+
 /// In protected mode a client-selected direct `server_url` is untrusted: its
 /// advertised `readOnlyHint: true` cannot admit a destructive tool. The
 /// definition never reaches the model.

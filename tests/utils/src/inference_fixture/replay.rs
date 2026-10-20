@@ -1880,14 +1880,78 @@ mod tests {
             sanitize::RedactionRules,
         },
         ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, build_replay_config_with_aliases,
-        compare_imported_requests, config_contains_endpoint_address, finish_backend_after_proxy_shutdown,
-        fixture_comparison_value, has_only_normal_relative_components, is_network_value_key,
-        is_replay_contained_filter, load_and_validate_config_source, resolve_example_config_path,
-        send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
-        validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
-        validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
+        compare_imported_requests, config_contains_endpoint_address, connector_trust_level,
+        finish_backend_after_proxy_shutdown, fixture_comparison_value, has_only_normal_relative_components,
+        is_network_value_key, is_replay_contained_filter, load_and_validate_config_source, mcp_tool_would_dial,
+        resolve_example_config_path, resolver_requires_read_only, send_recorded_request, validate_endpoint_collection,
+        validate_generic_network_string, validate_network_string_with_context, validate_replay_filters,
+        validate_replay_network_value, validate_scenario_requests, validate_singular_endpoint, validate_sse_events,
+        validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
+
+    #[test]
+    fn mcp_tool_would_dial_tracks_connector_trust_level() {
+        // Replay containment must mirror the resolver's protected-mode exclusion:
+        // a connector is dialed only when it can admit at least one tool. A
+        // `catalog` connector under require_read_only admits nothing, so it is
+        // excluded without contact and must NOT be predicted to dial.
+        let resolver = |level: Option<&str>, require_read_only: bool| {
+            let mut connector = json!({"id": "gw", "server_url": "https://gw.internal/mcp"});
+            if let Some(level) = level {
+                connector["trust"] = json!(level);
+            }
+            json!({
+                "tool_admission": {"mode": "protected", "require_read_only": require_read_only},
+                "connectors": [connector],
+            })
+        };
+        let connector_tool = json!({"type": "mcp", "server_label": "s", "connector_id": "gw"});
+
+        // require_read_only = false: any catalog trust dials; untrusted does not.
+        assert!(
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("untrusted"), false)),
+            "untrusted connector is excluded without contact"
+        );
+        assert!(
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog"), false)),
+            "catalog connector dials when read-only is not required"
+        );
+        assert!(
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog_and_read_only"), false)),
+            "catalog_and_read_only connector dials"
+        );
+
+        // require_read_only = true: catalog is excluded without contact; only
+        // catalog_and_read_only dials.
+        assert!(
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog"), true)),
+            "catalog connector under require_read_only is excluded without contact"
+        );
+        assert!(
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog_and_read_only"), true)),
+            "catalog_and_read_only connector still dials under require_read_only"
+        );
+
+        // Omitted trust defaults to untrusted (no dial in protected mode).
+        assert!(
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(None, false)),
+            "a connector without a declared trust level defaults to untrusted"
+        );
+
+        // Direct helper behavior.
+        assert_eq!(
+            connector_trust_level(&resolver(Some("catalog"), false), "gw"),
+            "catalog"
+        );
+        assert_eq!(
+            connector_trust_level(&resolver(Some("catalog"), false), "missing"),
+            "untrusted",
+            "an unknown connector id is untrusted"
+        );
+        assert!(resolver_requires_read_only(&resolver(Some("catalog"), true)));
+        assert!(!resolver_requires_read_only(&resolver(Some("catalog"), false)));
+    }
 
     #[tokio::test]
     async fn runner_rejects_vacuous_turns_before_starting_a_backend() {
