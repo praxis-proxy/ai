@@ -1304,9 +1304,7 @@ impl HttpFilter for McpDispatchFilter {
                     .get::<ResponsesState>()
                     // Serialize the current request explicitly: `request_body` holds
                     // parameters only, so re-attach the current input in its form (#1618).
-                    .and_then(|state| {
-                        serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)).ok()
-                    })
+                    .and_then(|state| serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)).ok())
                     .unwrap_or_default()
             } else {
                 Vec::new()
