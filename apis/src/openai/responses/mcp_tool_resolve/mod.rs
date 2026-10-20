@@ -951,18 +951,20 @@ impl McpToolResolveFilter {
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
-        // Protected mode: a target with no operator catalog-admission trust has
-        // every tool excluded regardless of what it would advertise. Resolve it to
-        // zero tools without dialing, so exclusion never contacts an untrusted,
-        // client-selected endpoint and does not depend on its reachability.
+        // Protected mode: a target that can admit no tool has every tool excluded
+        // regardless of what it would advertise — an untrusted target, or a
+        // `catalog` connector denied read-only authority under require_read_only.
+        // Resolve it to zero tools without dialing, so exclusion never contacts an
+        // untrusted, client-selected endpoint and does not depend on its
+        // reachability.
         //
         // This runs BEFORE the `resolvable_server_url` deferral gate so it also
         // covers `defer_loading: true` entries — a deferred direct `server_url`
         // (which `resolvable_server_url` reports as `None`) would otherwise
         // pass through to the backend, and a deferred untrusted connector would
         // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
-        if protected_exclusion(entry, self.admission_policy, &self.connector_trust).is_some() {
-            debug!(label, "protected mode: excluding untrusted MCP target without dialing");
+        if let Some(reason) = protected_exclusion(entry, self.admission_policy, &self.connector_trust) {
+            debug!(label, ?reason, "protected mode: excluding MCP target without dialing");
             return Ok(Some(Vec::new()));
         }
         let Some(server_url) = resolvable_server_url(entry) else {

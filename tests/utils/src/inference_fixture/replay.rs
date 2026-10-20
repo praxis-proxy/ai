@@ -582,7 +582,7 @@ fn resolver_is_protected(resolver: &Value) -> bool {
 /// The configured operator trust level for a connector (`untrusted` | `catalog`
 /// | `catalog_and_read_only`). An omitted `trust` or unknown connector is
 /// `untrusted`.
-fn connector_trust_level(resolver: &Value, connector_id: &str) -> String {
+fn connector_trust_level<'a>(resolver: &'a Value, connector_id: &str) -> &'a str {
     resolver
         .get("connectors")
         .and_then(Value::as_array)
@@ -593,7 +593,6 @@ fn connector_trust_level(resolver: &Value, connector_id: &str) -> String {
         })
         .and_then(|connector| connector.get("trust").and_then(Value::as_str))
         .unwrap_or("untrusted")
-        .to_owned()
 }
 
 /// Whether a resolver filter enforces operator read-only.
@@ -644,7 +643,7 @@ fn mcp_tool_would_dial(tool: &Value, protected: bool, resolver: &Value) -> bool 
     match tool.get("connector_id").and_then(Value::as_str) {
         Some(connector_id) => {
             let level = connector_trust_level(resolver, connector_id);
-            let admits_catalog = matches!(level.as_str(), "catalog" | "catalog_and_read_only");
+            let admits_catalog = matches!(level, "catalog" | "catalog_and_read_only");
             let trusts_read_only = level == "catalog_and_read_only";
             admits_catalog && (trusts_read_only || !resolver_requires_read_only(resolver))
         },

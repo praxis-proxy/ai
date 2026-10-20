@@ -6413,12 +6413,14 @@ mod admission {
 
     #[test]
     fn config_defaults_connector_trust_to_untrusted() {
-        // Omitting `trust` is valid and leaves the connector untrusted.
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n",
-        )
-        .unwrap();
-        assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+        // Omitting `trust` is valid and must leave the connector untrusted.
+        let connector: super::super::config::ConnectorConfig =
+            serde_yaml::from_str("id: gw\nserver_url: https://gw.internal/mcp\n").unwrap();
+        assert_eq!(
+            connector.trust.snapshot(),
+            ConnectorTrust::Untrusted,
+            "omitting `trust` must leave the connector untrusted"
+        );
     }
 
     #[test]
