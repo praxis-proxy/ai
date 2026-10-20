@@ -42,10 +42,20 @@ mod agentic_mocks;
 mod anthropic_messages;
 mod claude_code;
 mod claude_code_vllm;
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 mod codex_http;
+#[cfg(all(
+    feature = "openai-agentic-loop",
+    feature = "openai-compact",
+    feature = "openai-conversations",
+    feature = "openai-file-resolve-filter",
+    feature = "openai-mcp-tools"
+))]
 mod codex_websocket;
+#[cfg(feature = "openai-conversations")]
 #[cfg(feature = "store-sqlite")]
 mod conversations_rehydrate;
+#[cfg(feature = "openai-responses")]
 mod error_response_formatter;
 mod examples;
 mod failure_mode;
@@ -53,14 +63,29 @@ mod fips;
 mod guardrails;
 mod harness;
 // Several replayed scenarios run examples backed by the SQLite response store.
-#[cfg(feature = "store-sqlite")]
+#[cfg(all(
+    feature = "store-sqlite",
+    feature = "openai-agentic-loop",
+    feature = "openai-mcp-tools",
+    feature = "openai-compact",
+    feature = "openai-conversations",
+    feature = "openai-file-resolve-filter"
+))]
 mod inference_fixtures;
+mod live_vllm;
 mod mcp;
 mod mcp_broker;
+#[cfg(feature = "openai-mcp-tools")]
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;
+#[cfg(feature = "openai-responses")]
 mod openai_responses_model_rewrite;
+#[cfg(feature = "openai-responses")]
 mod openai_responses_request;
+#[cfg(feature = "openai-responses")]
 mod openai_tool_parse;
+mod opencode;
+mod opencode_vllm;
 mod prompt_enrich;
+#[cfg(feature = "openai-responses")]
 mod responses_routing;

@@ -12,6 +12,8 @@ use crate::AzureAdFilter;
 use crate::GcpAdcFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
+#[cfg(feature = "inflight-tracker-filter")]
+use crate::InFlightTrackerFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
 #[cfg(feature = "token-ceiling-filter")]
@@ -20,8 +22,9 @@ use crate::TokenCeilingFilter;
 use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
-    IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
+    ModelToProviderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -64,23 +67,37 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
 
 /// Install the pipeline extensions the registered AI filters rely on.
 ///
-/// With the `store` feature this adds a fresh response store registry, which
+/// With the `inflight-tracker-filter` feature, `inflight_registry` is installed
+/// as a pipeline extension so the `inflight_tracker` filter finds its shared
+/// per-model counter table; it is gated on the same feature that registers the
+/// filter, so a stable build carries neither the filter nor its registry
+/// extension. Unlike the response store registry, which is created fresh per
+/// pipeline build, the caller is expected to pass the *same* `InFlightRegistry`
+/// handle across every (re)build of a server's pipelines: in-flight counts are
+/// a live gauge of requests the old pipeline is still serving, and a registry
+/// recreated on every hot reload would reset to zero while those requests are
+/// still in-flight.
+///
+/// With the `store` feature this also adds a response store registry, which
 /// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
-/// share backends. It is gated on this crate's `store` feature, the same one
-/// that registers those filters, so a pipeline can never carry them without
-/// their registry. Builds without the store have nothing to install.
+/// share backends; that one is gated on the same `store` feature that
+/// registers those filters, so a pipeline can never carry them without their
+/// registry.
 #[cfg_attr(
-    not(feature = "store"),
+    not(any(feature = "inflight-tracker-filter", feature = "store")),
     expect(
+        unused_variables,
         clippy::needless_pass_by_ref_mut,
-        reason = "the pipeline is only mutated when the store feature installs its registry"
+        reason = "a lean build installs no extensions; the signature stays uniform across feature sets"
     )
 )]
-pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline) {
+pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline, inflight_registry: &InFlightRegistry) {
+    #[cfg(feature = "inflight-tracker-filter")]
+    pipeline.add_pipeline_extension(Box::new(inflight_registry.clone()));
+    #[cfg(not(feature = "inflight-tracker-filter"))]
+    let _ = inflight_registry;
     #[cfg(feature = "store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    #[cfg(not(feature = "store"))]
-    let _ = pipeline;
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -189,23 +206,42 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "identity_header_guard" => IdentityHeaderGuardFilter::from_config
     );
+    register_inference_filters(registry);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "prompt_enrich" => PromptEnrichFilter::from_config
+    );
+    register_request_metadata_filters(registry);
+    register_token_filters(registry);
+}
+
+/// Register filters that observe per-request metadata (timing, in-flight load).
+fn register_request_metadata_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "time_to_first_token" => TimeToFirstTokenFilter::from_config
+    );
+    #[cfg(feature = "inflight-tracker-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "inflight_tracker" => InFlightTrackerFilter::from_config
+    );
+}
+
+/// Register request-model extraction and provider-resolution filters.
+fn register_inference_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "model_to_header" => ModelToHeaderFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "model_to_provider" => ModelToProviderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "prompt_enrich" => PromptEnrichFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "time_to_first_token" => TimeToFirstTokenFilter::from_config
-    );
-    register_token_filters(registry);
 }
 
 /// Register token counting/usage/rate-limiting filters.
@@ -304,11 +340,25 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
         @register registry,
         http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_anthropic" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_anthropic_stream" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicStreamFilter::from_config
+    );
     register_anthropic_web_search(registry, subrequest_client);
 }
 
 /// Register Vertex AI translation filters.
 fn register_vertex_filters(registry: &mut FilterRegistry) {
+    #[cfg(feature = "vertex-anthropic-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "anthropic_messages_to_vertexai_anthropic" =>
+            praxis_ai_apis::vertex::AnthropicMessagesToVertexaiAnthropicFilter::from_config
+    );
     praxis_filter::register_filters!(
         @register registry,
         http "openai_chat_completions_to_vertexai_gemini" => praxis_ai_apis::vertex::OpenaiChatCompletionsToVertexaiGeminiFilter::from_config
@@ -431,6 +481,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
     );
     register_web_search_dispatch(registry, subrequest_client);
+    #[cfg(feature = "openai-agentic-loop")]
     register_openai_agentic_filters(registry);
 }
 
@@ -487,8 +538,8 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
     );
 }
 
-/// Register OpenAI agentic loop filters.
-#[cfg(feature = "openai-responses")]
+/// Register the experimental OpenAI agentic loop only when explicitly selected.
+#[cfg(feature = "openai-agentic-loop")]
 fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
@@ -500,15 +551,24 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
 
-/// Register `ai_guardrails` as a chain-binding filter that resolves its
-/// optional outbound chain at construction time.
+/// Register `ai_guardrails` as a security-critical chain-binding filter.
+///
+/// The optional outbound chain is resolved at construction time. Pipeline
+/// validation rejects `failure_mode: open` unless
+/// `insecure_options.allow_open_security_filters` is set.
+/// `insecure_options.skip_pipeline_validation` also bypasses that check.
+/// With either option, a provider timeout or error can skip content
+/// screening. Request `conditions:` are rejected, and body hooks do not run
+/// inside a branch, so a listener that also serves `/v1/responses` or
+/// `/v1/embeddings` needs a separate Chat Completions listener for this
+/// filter.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let isolated_client = crate::isolated_subrequest_client(4);
     let shared_client = subrequest_client.cloned();
 
     registry
-        .register_chain_binding(
+        .register_chain_binding_with_class(
             "ai_guardrails",
             std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
                 let cfg: crate::guardrails::config::AiGuardrailsConfig =
@@ -517,6 +577,7 @@ fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Opti
                 let client = shared_client.clone().unwrap_or_else(|| isolated_client.clone());
                 AiGuardrailsFilter::build(cfg, outbound, client)
             }),
+            praxis_filter::SecurityClass::Security,
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'ai_guardrails'"));
 }
@@ -667,10 +728,8 @@ fn register_web_search_dispatch(registry: &mut FilterRegistry, subrequest_client
 mod tests {
     use std::collections::HashMap;
 
-    use praxis_core::config::InsecureOptions;
-    #[cfg(feature = "openai-responses")]
-    use praxis_filter::FilterEntry;
-    use praxis_filter::FilterPipeline;
+    use praxis_core::config::{InsecureOptions, SkipPipelineChecks};
+    use praxis_filter::{FilterEntry, FilterPipeline};
 
     use super::build_ai_registry;
 
@@ -682,6 +741,7 @@ mod tests {
             "ai_guardrails",
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
+            "model_to_provider",
             "state_owner",
             "project_state_owner_headers",
             "callout_credentials",
@@ -768,6 +828,59 @@ provider:
         );
     }
 
+    /// One YAML shape for every failure-mode case, so the tests cannot drift apart.
+    fn guardrails_entry(prefix: &str) -> FilterEntry {
+        serde_yaml::from_str(&format!(
+            "{prefix}\
+filter: ai_guardrails
+provider:
+  type: nemo
+  endpoint: \"http://nemo:8000/v1/checks\"
+"
+        ))
+        .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}"))
+    }
+
+    /// The same pipeline the server validates. `allow_open_security` is
+    /// `insecure_options.allow_open_security_filters`.
+    fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
+        let registry = build_ai_registry();
+        let mut entries = vec![guardrails_entry(prefix)];
+        let pipeline =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &HashMap::new(), &InsecureOptions::default())
+                .expect("ai_guardrails should build");
+        pipeline.ordering_errors(&entries, allow_open_security, &SkipPipelineChecks::default())
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_fails_pipeline_validation() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", false);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("failure_mode: open") && error.contains("ai_guardrails")),
+            "open ai_guardrails should fail security validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_open_failure_mode_allowed_by_insecure_flag() {
+        let errors = guardrails_ordering_errors("failure_mode: open\n", true);
+        assert!(
+            errors.is_empty(),
+            "allow_open_security_filters should allow this configuration: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ai_guardrails_closed_failure_mode_passes_security_validation() {
+        let errors = guardrails_ordering_errors("", false);
+        assert!(
+            errors.is_empty(),
+            "the default closed failure mode should pass validation: {errors:?}"
+        );
+    }
+
     /// Assert `name` is registered iff its cargo feature is `enabled`.
     fn assert_experimental_registration(names: &[&str], name: &str, enabled: bool) {
         if enabled {
@@ -792,13 +905,20 @@ provider:
         assert_experimental_registration(&names, "http_callout", cfg!(feature = "http-callout-filter"));
         assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
         assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
+        assert_experimental_registration(
+            &names,
+            "anthropic_messages_to_vertexai_anthropic",
+            cfg!(feature = "vertex-anthropic-filter"),
+        );
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
         assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
+        assert_experimental_registration(&names, "inflight_tracker", cfg!(feature = "inflight-tracker-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.
     const OPTIONAL_FILTERS: &[(&str, bool)] = &[
         ("aws_sigv4_sign", cfg!(feature = "aws-sigv4-filter")),
+        ("openai_responses_request", cfg!(feature = "openai-responses")),
         ("openai_responses_proxy", cfg!(feature = "openai-responses")),
         ("openai_stream_events", cfg!(feature = "openai-responses")),
         (
@@ -807,7 +927,7 @@ provider:
         ),
         ("openai_doc_extract", cfg!(feature = "openai-responses")),
         ("openai_client_tool_compat", cfg!(feature = "openai-responses")),
-        ("openai_agentic_loop", cfg!(feature = "openai-responses")),
+        ("openai_agentic_loop", cfg!(feature = "openai-agentic-loop")),
         ("openai_file_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_web_search_dispatch", cfg!(feature = "openai-responses")),
         ("openai_file_resolve", cfg!(feature = "openai-file-resolve-filter")),
@@ -830,9 +950,42 @@ provider:
         }
     }
 
+    /// Disabled experimental OpenAI filters fail before a pipeline can serve traffic.
+    #[test]
+    fn disabled_openai_filters_reject_pipeline_configuration() {
+        let registry = build_ai_registry();
+        for (name, enabled) in [
+            ("openai_responses_request", cfg!(feature = "openai-responses")),
+            ("openai_agentic_loop", cfg!(feature = "openai-agentic-loop")),
+        ] {
+            if enabled {
+                continue;
+            }
+            let mut entries: Vec<FilterEntry> =
+                serde_yaml::from_str(&format!("- filter: {name}\n")).expect("filter entry parses");
+            let result = FilterPipeline::build_with_chains(
+                &mut entries,
+                &registry,
+                &HashMap::new(),
+                &InsecureOptions::default(),
+            );
+            let Err(error) = result else {
+                panic!("an unavailable filter must fail pipeline construction");
+            };
+            assert!(
+                error.to_string().contains(name),
+                "diagnostic must identify {name}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn build_ai_registry_marks_security_filters() {
         let registry = build_ai_registry();
+        assert!(
+            registry.is_security_filter("ai_guardrails"),
+            "ai_guardrails must be registered as a security filter"
+        );
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         #[cfg(feature = "aws-sigv4-filter")]

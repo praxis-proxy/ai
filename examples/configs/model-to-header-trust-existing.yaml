@@ -1,0 +1,74 @@
+# AI Inference Model Routing: Trust an Existing Model Header
+#
+# Routes on a model header that a trusted hop in front of Praxis has
+# already set, skipping the filter entirely when the header is present.
+# The `unless: {headers_present: ["X-AI-Model"]}` condition keeps the
+# incoming header as is. A request without one still has the body's
+# "model" field promoted into X-AI-Model by the filter, as usual.
+#
+# Security: this turns off the anti-spoofing strip when the header is
+# present, so whoever sends the header picks the backend. Only use it
+# when every request reaches Praxis through a hop that sets or scrubs
+# the header.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/model-to-header-trust-existing.yaml
+#
+#   # Routed by the header to the granite cluster; the filter is skipped.
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "X-AI-Model: granite-3.1-8b" \
+#     -d '{"model": "granite-3.1-8b", "messages": []}'
+#
+#   # No header: the body's model is promoted and routes to mistral.
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "mistral-7b-instruct", "messages": []}'
+
+listeners:
+  - name: inference-gateway
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - extract-model
+      - routing
+
+filter_chains:
+  # Skip the filter when X-AI-Model is already present from a trusted
+  # hop; otherwise promote the body's "model" field into it.
+  - name: extract-model
+    filters:
+      - filter: model_to_header
+        conditions:
+          - unless:
+              headers_present: ["X-AI-Model"]
+        header: X-AI-Model
+
+  # Route based on X-AI-Model, wherever it came from.
+  - name: routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-ai-model: "mistral-7b-instruct"
+            cluster: mistral
+          - path_prefix: "/"
+            headers:
+              x-ai-model: "granite-3.1-8b"
+            cluster: granite
+          - path_prefix: "/"
+            cluster: default
+      - filter: load_balancer
+        clusters:
+          - name: mistral
+            endpoints:
+              - "127.0.0.1:3000"
+          - name: granite
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: default
+            endpoints:
+              - "127.0.0.1:3002"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

@@ -480,12 +480,8 @@ fn streamed_late_reasoning_followed_by_tool_call_replays_with_the_assistant_answ
     assert_late_reasoning_continuation(true);
 }
 
-fn assert_late_reasoning_continuation(with_tool_call: bool) {
-    // vLLM can stream the assistant answer *before* any reasoning delta. The
-    // message then claims output_index 0 and reasoning claims 1; the client-facing
-    // terminal must preserve those announced positions ([message, reasoning]).
-    // On a stored continuation the reasoning must still reattach to the assistant
-    // turn it justifies rather than detaching into a standalone reasoning message.
+/// Build a stream whose assistant answer arrives before its reasoning.
+fn late_reasoning_stream(with_tool_call: bool) -> String {
     let mut sse = String::new();
     let mut deltas = vec![
         serde_json::json!({"content": "Done."}),
@@ -508,8 +504,18 @@ fn assert_late_reasoning_continuation(with_tool_call: bool) {
         ));
     }
     sse.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+    sse
+}
+
+/// Verify late reasoning retains its announced position and reattaches on replay.
+fn assert_late_reasoning_continuation(with_tool_call: bool) {
+    // vLLM can stream the assistant answer *before* any reasoning delta. The
+    // message then claims output_index 0 and reasoning claims 1; the client-facing
+    // terminal must preserve those announced positions ([message, reasoning]).
+    // On a stored continuation the reasoning must still reattach to the assistant
+    // turn it justifies rather than detaching into a standalone reasoning message.
     let backend = StatefulCapturingBackend::new(vec![
-        (200, sse),
+        (200, late_reasoning_stream(with_tool_call)),
         (
             200,
             serde_json::json!({"id":"chatcmpl_followup", "object":"chat.completion", "model":"deepseek-r1",
@@ -531,7 +537,7 @@ fn assert_late_reasoning_continuation(with_tool_call: bool) {
             r#"{"model":"deepseek-r1","input":"Pick a number.","stream":true,"store":true}"#,
         ),
     );
-    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_status(&raw), 200, "late-reasoning stream should succeed");
     let body = parse_body(&raw);
     let events: Vec<serde_json::Value> = body
         .lines()
@@ -539,16 +545,50 @@ fn assert_late_reasoning_continuation(with_tool_call: bool) {
         .map(|data| serde_json::from_str(data).expect("translated event should be JSON"))
         .collect();
     let terminal = &events.last().expect("stream has a terminal")["response"];
-    assert_eq!(terminal["status"], "completed");
+    assert_eq!(terminal["status"], "completed", "late-reasoning stream should complete");
     // The client terminal preserves the announced positions: the message streamed
     // first (index 0) and reasoning arrived later (index 1).
-    assert_eq!(terminal["output"][0]["type"], "message");
-    assert_eq!(terminal["output"][0]["content"][0]["text"], "Done.");
-    assert_eq!(terminal["output"][1]["type"], "reasoning");
-    assert_eq!(terminal["output"][1]["content"][0]["text"], "I picked 42.");
+    assert_eq!(
+        terminal["output"][0]["type"], "message",
+        "the first output must stay a message"
+    );
+    assert_eq!(
+        terminal["output"][0]["content"][0]["text"], "Done.",
+        "the answer must be preserved"
+    );
+    assert_eq!(
+        terminal["output"][1]["type"], "reasoning",
+        "late reasoning must retain index 1"
+    );
+    assert_eq!(
+        terminal["output"][1]["content"][0]["text"], "I picked 42.",
+        "reasoning must be preserved"
+    );
     if with_tool_call {
-        assert_eq!(terminal["output"][2]["type"], "function_call");
+        assert_eq!(
+            terminal["output"][2]["type"], "function_call",
+            "the tool call must follow reasoning"
+        );
     }
+    let continuation = late_reasoning_continuation(terminal, with_tool_call);
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "stored late-reasoning continuation should succeed"
+    );
+    let captured = backend.requests();
+    assert_eq!(
+        captured.len(),
+        2,
+        "the initial request and continuation must each reach the backend"
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    assert_late_reasoning_replay(&forwarded, with_tool_call);
+}
+
+/// Build a continuation that satisfies any tool call emitted by the prior turn.
+fn late_reasoning_continuation(terminal: &serde_json::Value, with_tool_call: bool) -> serde_json::Value {
     let input = if with_tool_call {
         serde_json::json!([
             {"type": "function_call_output", "call_id": "call_lookup", "output": "42"},
@@ -557,26 +597,36 @@ fn assert_late_reasoning_continuation(with_tool_call: bool) {
     } else {
         serde_json::json!("Which number?")
     };
-    let continuation = serde_json::json!({"model":"deepseek-r1","previous_response_id":terminal["id"],
-        "input": input,"stream":false,"store":false});
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
-    assert_eq!(parse_status(&raw), 200);
-    let captured = backend.requests();
-    assert_eq!(captured.len(), 2);
-    let forwarded: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    serde_json::json!({"model":"deepseek-r1","previous_response_id":terminal["id"],
+        "input": input,"stream":false,"store":false})
+}
+
+/// Check replay preserves one reasoning-bearing assistant answer and any tool turn.
+fn assert_late_reasoning_replay(forwarded: &serde_json::Value, with_tool_call: bool) {
     // The reasoning reattaches to its assistant turn; it is not replayed as a
     // detached standalone reasoning message.
     assert_eq!(
         forwarded["messages"][1],
-        serde_json::json!({"role":"assistant","content":"Done.","reasoning":"I picked 42."})
+        serde_json::json!({"role":"assistant","content":"Done.","reasoning":"I picked 42."}),
+        "late reasoning must reattach to the assistant answer"
     );
     if with_tool_call {
-        assert_eq!(forwarded["messages"][2]["tool_calls"][0]["id"], "call_lookup");
-        assert!(forwarded["messages"][2].get("reasoning").is_none());
-        assert_eq!(forwarded["messages"][3]["role"], "tool");
+        assert_eq!(
+            forwarded["messages"][2]["tool_calls"][0]["id"], "call_lookup",
+            "the tool call must be replayed"
+        );
+        assert!(
+            forwarded["messages"][2].get("reasoning").is_none(),
+            "reasoning must not be duplicated on the tool call"
+        );
+        assert_eq!(
+            forwarded["messages"][3]["role"], "tool",
+            "the tool result must follow the tool call"
+        );
     }
     assert_eq!(
         forwarded["messages"].as_array().unwrap().last().unwrap(),
-        &serde_json::json!({"role":"user","content":"Which number?"})
+        &serde_json::json!({"role":"user","content":"Which number?"}),
+        "the continuation must end with the new user message"
     );
 }

@@ -40,7 +40,7 @@ the wire and forwards to vLLM, so the "only `/v1/responses` crossed Praxis" and
 
 Usage:
     # Deterministic (scripted backend), the required CI gate:
-    cargo build -p praxis-ai-proxy
+    cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
 
     # Live vLLM (GPU suite):

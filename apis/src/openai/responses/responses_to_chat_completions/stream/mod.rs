@@ -44,8 +44,8 @@ use self::{
 use crate::openai::translation::{
     chat_completions::{
         ResponseContext, chat_response_to_response_resource, context_has_web_search,
-        function_call_output_item_from_parts, in_progress_response_resource, message_output_item, output_text_item,
-        refusal_item, web_search_call_output_item_from_parts,
+        function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
+        output_text_item, refusal_item, web_search_call_output_item_from_parts,
     },
     reasoning::{ReasoningOptions, reasoning_item_id},
 };
@@ -367,6 +367,12 @@ pub(super) struct StreamConverter {
     tool_calls: Vec<ToolCallState>,
     /// Total accumulated semantic bytes.
     accumulated_bytes: usize,
+    /// Portion of the shared request ledger held for live converter state.
+    pub(super) budget_retained_charge: usize,
+    /// Emitted bytes remain charged until the next callback reaches downstream.
+    pub(super) budget_output_handoff_charge: usize,
+    /// Portion of the up-front snapshot reserve allotted to emitted SSE bytes.
+    pub(super) budget_output_allowance: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
     /// Late reasoning position from a successful terminal, consumed once by the
@@ -406,6 +412,9 @@ impl StreamConverter {
             message: None,
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
+            budget_retained_charge: 0,
+            budget_output_handoff_charge: 0,
+            budget_output_allowance: 0,
             frames_processed: 0,
             replay_reasoning_index: None,
         }
@@ -415,6 +424,52 @@ impl StreamConverter {
     /// output items all belong to this same completion, even if tool calls follow.
     pub(super) fn take_replay_reasoning_index(&mut self) -> Option<usize> {
         self.replay_reasoning_index.take()
+    }
+
+    /// Conservative live charge after the transient source-chunk reserve can
+    /// be released. The raw frame can outlive this callback; decoded text,
+    /// arguments, logprobs, and metadata can appear in later terminal output.
+    pub(super) fn budget_live_charge(&self) -> Option<usize> {
+        let value_bytes = self
+            .service_tier
+            .iter()
+            .chain(self.usage.iter())
+            .try_fold(0_usize, |bytes, value| {
+                bytes.checked_add(serialized_json_len(value).ok()?)
+            })?;
+        let identity_bytes = self
+            .chat_id
+            .iter()
+            .chain(self.model.iter())
+            .chain(self.finish_reason.iter())
+            .try_fold(0_usize, |bytes, value| bytes.checked_add(value.len()))?;
+        self.framing
+            .retained_capacity_bytes()
+            .checked_mul(8)?
+            .checked_add(self.accumulated_bytes.checked_mul(16)?)?
+            .checked_add(value_bytes.checked_mul(16)?)?
+            .checked_add(identity_bytes.checked_mul(16)?)?
+            .checked_add(self.tool_calls.len().checked_mul(1_024)?)?
+            .checked_add(usize::from(self.message.is_some()).checked_mul(1_024)?)
+    }
+
+    /// A tiny callback can complete a much larger buffered frame, copying it
+    /// into SSE data, decoded semantic state, and translated output at once.
+    pub(super) fn budget_framing_growth_charge(&self) -> Option<usize> {
+        self.framing.buffered_bytes().checked_mul(32)
+    }
+
+    /// A completed frame can close the entire response, repeating retained
+    /// text, logprobs, and arguments in item-done and terminal SSE snapshots.
+    /// Reserve this projection before parsing the frame, then release whatever
+    /// was not retained at the end of the callback.
+    pub(super) fn budget_closeout_growth_charge(&self) -> Option<usize> {
+        if matches!(self.phase, Phase::EmittedTerminal | Phase::Failed) {
+            return Some(0);
+        }
+        self.accumulated_bytes
+            .checked_mul(24)?
+            .checked_add(self.tool_calls.len().checked_mul(2_048)?)
     }
 
     /// Feed one response body chunk, returning any completed Responses SSE bytes.
@@ -456,13 +511,6 @@ impl StreamConverter {
             Phase::Open | Phase::ProviderDone => {},
         }
         self.check_timeout(inputs.now)?;
-        // Emit the opening lifecycle events on the first non-empty callback, even
-        // when it carries only part of the first SSE frame; otherwise a
-        // fragmented first frame would delay `response.created` until the frame
-        // completes.
-        if !chunk.is_empty() {
-            self.ensure_lifecycle(inputs, out)?;
-        }
         // The frame cap is enforced during decoding (see `Framing::push`), so an
         // oversized callback stops at the ceiling instead of materializing every
         // frame first. Count the frames this callback actually decoded so the cap
@@ -561,7 +609,6 @@ impl StreamConverter {
         if is_done_sentinel(frame) {
             return self.handle_done(inputs, out);
         }
-        self.ensure_lifecycle(inputs, out)?;
         let chunk: ChatChunk<'_> = serde_json::from_slice(&frame.data).map_err(|error| {
             tracing::trace!(%error, "malformed chat completion chunk");
             ConvertError::MalformedJson
@@ -569,6 +616,9 @@ impl StreamConverter {
         Self::validate_chunk(&chunk)?;
         self.require_initial_metadata(&chunk)?;
         self.capture_metadata(&chunk)?;
+        if self.service_tier.is_some() || Self::chunk_requires_lifecycle(&chunk) {
+            self.ensure_lifecycle(inputs, out)?;
+        }
         if let Some(usage) = &chunk.usage {
             self.usage = Some(usage.clone());
         }
@@ -657,6 +707,27 @@ impl StreamConverter {
             }
         }
         Ok(())
+    }
+
+    /// Whether a chunk must resolve the pending opening lifecycle.
+    ///
+    /// A provider may introduce `service_tier` after a metadata-only opening
+    /// chunk. Waiting across those chunks lets the lifecycle use the provider
+    /// tier without buffering output. The first output-bearing chunk resolves
+    /// the lifecycle with the captured tier or the existing request/default
+    /// fallback, preserving immediate output translation.
+    fn chunk_requires_lifecycle(chunk: &ChatChunk<'_>) -> bool {
+        chunk.choices.iter().any(|choice| {
+            choice.finish_reason.is_some()
+                || choice.delta.as_ref().is_some_and(|delta| {
+                    delta.reasoning.is_some()
+                        || delta.reasoning_content.is_some()
+                        || delta.content.as_deref().is_some_and(|content| !content.is_empty())
+                        || delta.refusal.as_deref().is_some_and(|refusal| !refusal.is_empty())
+                        || !delta.tool_calls.is_empty()
+                        || delta.function_call.is_some()
+                })
+        })
     }
 
     /// Translate one choice's delta and finish reason.
@@ -774,8 +845,8 @@ impl StreamConverter {
         }
         self.lifecycle_started = true;
         let context = self.response_context(inputs, None);
-        let resource =
-            in_progress_response_resource(&context).map_err(|_error| ConvertError::InvalidTerminalResource)?;
+        let resource = in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref())
+            .map_err(|_error| ConvertError::InvalidTerminalResource)?;
         if serialized_json_len(&resource)? > self.limits.max_body_bytes {
             return Err(ConvertError::ByteLimit);
         }
@@ -1520,7 +1591,7 @@ impl StreamConverter {
         // nothing and marks the lifecycle started, so the reserved
         // `response.failed` terminal can still close the stream below.
         match self.ensure_lifecycle(inputs, out) {
-            Ok(()) | Err(ConvertError::FrameSizeLimit | ConvertError::EventLimit) => {},
+            Ok(()) | Err(ConvertError::FrameSizeLimit | ConvertError::EventLimit | ConvertError::ByteLimit) => {},
             Err(other) => return Err(other),
         }
         // A failed response has no completion moment, so no completed_at timestamp.
@@ -1530,7 +1601,7 @@ impl StreamConverter {
         // terminal never streamed completion events for the accumulated items.
         let synthetic = self.synthetic_completion("stop");
         let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .or_else(|_| in_progress_response_resource(&context))
+            .or_else(|_| in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref()))
             .unwrap_or_else(|_| minimal_failed_resource(&context, message));
         mark_failed(&mut resource, message);
         // The partial snapshot can be arbitrarily large — this failure may itself

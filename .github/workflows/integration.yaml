@@ -331,8 +331,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
 
-      - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+      - name: Check Responses and agentic feature boundaries
+        run: make test-responses-features
+
+      - name: Build Praxis with experimental Responses
+        run: cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 
       - name: Run OpenAI Agents SDK Responses compatibility test
         run: uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s
@@ -373,6 +376,12 @@ jobs:
 
       - name: Run Anthropic web-search Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_web_search.py -s
+
+      - name: Build experimental Vertex adapter
+        run: cargo build -p praxis-ai-proxy --features vertex-anthropic-filter
+
+      - name: Run Vertex Anthropic Python SDK tests
+        run: uv run tests/integration/sdk/anthropic/test_vertex_anthropic.py -s
 
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI HTTP acceptance
@@ -432,7 +441,14 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --test suite --no-run
+          cargo test -p praxis-tests-integration --features openai-all --test suite --no-run
+          # Fail if feature gates or renamed selectors remove either acceptance case.
+          cargo test -p praxis-tests-integration --features openai-all --test suite \
+            codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --list --exact \
+            | grep -Fx "codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http: test"
+          cargo test -p praxis-tests-integration --features openai-all --test suite \
+            codex_http::pinned_codex_uses_responses_http_through_full_flow -- --list --exact \
+            | grep -Fx "codex_http::pinned_codex_uses_responses_http_through_full_flow: test"
 
       - name: Run pinned Codex HTTP acceptance test without external network access
         env:
@@ -473,11 +489,15 @@ jobs:
                 CARGO_INCREMENTAL=0 \
                 PATH="$runner_path" \
                 PRAXIS_TEST_CODEX_BIN="$codex_bin" \
-                bash -ceu "
-                  cargo test --offline -p praxis-tests-integration --test suite \
-                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
-                  cargo test --offline -p praxis-tests-integration --test suite \
-                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact
+                bash -ceuo pipefail "
+                  cargo test --offline -p praxis-tests-integration --features openai-all --test suite \
+                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact \
+                    | tee target/codex-http-chat.log
+                  grep -F \"test result: ok. 1 passed; 0 failed; 0 ignored;\" target/codex-http-chat.log
+                  cargo test --offline -p praxis-tests-integration --features openai-all --test suite \
+                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact \
+                    | tee target/codex-http-responses.log
+                  grep -F \"test result: ok. 1 passed; 0 failed; 0 ignored;\" target/codex-http-responses.log
                 "
           ' bash \
             "$runner_uid" \
@@ -486,6 +506,107 @@ jobs:
             "$runner_cargo_home" \
             "$runner_path" \
             "$PRAXIS_TEST_CODEX_BIN"
+
+  # ----------------------------------------------------------------------------
+  # Pinned OpenCode CLI acceptance
+  #
+  # Split out of `test-integration` rather than riding along with the Claude
+  # Code install, because the whole point of this lane is the network
+  # namespace. OpenCode needs no egress beyond Praxis — verified against the
+  # pinned build — and running it with the runner's full network would let a
+  # future startup fetch slip in unnoticed. Isolation is what makes that a
+  # standing guarantee rather than a one-time observation.
+  #
+  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. To bump the
+  # version, update that manifest, OPENCODE_PINNED_VERSION in
+  # tests/integration/tests/suite/harness.rs, and OPENCODE_VERSION below
+  # together; `pin_toml_version_matches_harness_const` and
+  # `opencode_lane_is_wired_in_ci` fail if any of the three drifts.
+  # ----------------------------------------------------------------------------
+
+  opencode-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      OPENCODE_VERSION: "1.18.35"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-cpu-cargo
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          npm install -g "opencode-ai@${OPENCODE_VERSION}"
+          # Resolve the absolute path: the test clears the environment before
+          # spawning, so a bare name on the runner PATH would not be found.
+          opencode_bin="$(command -v opencode)"
+          test -x "$opencode_bin"
+          # The client prints the bare version with no product prefix.
+          test "$("$opencode_bin" --version)" = "${OPENCODE_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_BIN=$opencode_bin" >> "$GITHUB_ENV"
+
+      - name: Build test binary
+        # Compiled outside the namespace, where the network still exists.
+        run: cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: OpenCode acceptance (network namespace)
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            opencode_bin="$6"
+
+            ip link set lo up
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in OpenCode test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in OpenCode test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_OPENCODE_BIN="$opencode_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --features openai-all,store-all --test suite \
+                    opencode:: -- --nocapture
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_OPENCODE_BIN"
 
   # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Vertex/Gemini translation (local fake backend)
@@ -521,6 +642,38 @@ jobs:
 
       - name: Run Vertex Gemini OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py -s
+
+  # OpenAI Python SDK vs selected Anthropic Messages provider (local fake backend).
+  selected-anthropic-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: selected-anthropic-sdk-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Run selected Anthropic OpenAI Python SDK tests
+        run: uv run tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI WebSocket acceptance
@@ -598,5 +751,5 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --features store-sqlite --test suite \
+          cargo test -p praxis-tests-integration --features openai-all,store-sqlite --test suite \
             codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact

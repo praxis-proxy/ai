@@ -1,12 +1,13 @@
 version: 1
 id: vertex/invalid-content
-description: Reject untranslatable Chat content and accept valid Gemini text metadata.
+description: Reject untranslatable Chat content and emit schema-complete Gemini responses.
 protocol: openai_chat_completions
 example_config: vertex/chat-completions-to-gemini.yaml
 upstream_authority: 127.0.0.1:3000
 features:
   - vertex.gemini.request.invalid_content
   - vertex.gemini.response.text_metadata
+  - vertex.gemini.response.schema_complete
 turns:
   - name: unsupported-image-part
     request:

@@ -19,6 +19,8 @@ pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
 pub mod hash;
+#[cfg(all(test, feature = "openai-responses"))]
+mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
 #[cfg(feature = "openai-mcp-tools")]
@@ -37,6 +39,9 @@ pub mod subrequest;
 pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
+
+/// Request metadata carrying the client model ID across a provider target rewrite.
+pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
@@ -117,6 +122,7 @@ pub(crate) mod test_utils {
             cluster: None,
             current_filter_id: None,
             downstream_tls: false,
+            hedge_policy: None,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
             executed_branch_filters: Vec::new(),

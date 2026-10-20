@@ -181,17 +181,40 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           # latest=auto tags this release as latest-fips too, mirroring the
-          # standard image's latest tag. Only the Release workflow (on a
-          # version tag) does this; the nightly Publish workflow keeps
-          # latest=false so scheduled builds never move latest-fips.
+          # standard image's latest tag. onlatest=true is what applies the
+          # -fips suffix to that latest tag: without it metadata-action emits a
+          # bare latest (suffix is applied to every tag "and optionally for
+          # latest"), and the push loop below would overwrite the standard
+          # (Alpine) image's latest with the FIPS build, breaking SQLite-backed
+          # stores for :latest deployments (issue #1731). Only the Release
+          # workflow (on a version tag) does this; the nightly Publish workflow
+          # keeps latest=false so scheduled builds never move latest-fips.
           flavor: |
             latest=auto
-            suffix=-fips
+            suffix=-fips,onlatest=true
           tags: |
             type=sha
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+
+      # Guard the one tag that must never belong to the FIPS image: a bare
+      # latest. The standard container job owns latest (the Alpine full build);
+      # if the suffix flavor ever regresses to emitting an unsuffixed latest
+      # here, the push loop below would clobber it with the FIPS build (#1731).
+      # Checked from the resolved tag list so it catches the mistake before any
+      # push, with no registry round-trip.
+      - name: Assert the FIPS metadata did not emit a bare latest tag
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+          BARE_LATEST: ghcr.io/${{ github.repository }}:latest
+        run: |
+          if grep -qxF "$BARE_LATEST" <<< "$PUBLISHED_TAGS"; then
+            echo "::error::FIPS metadata emitted a bare '$BARE_LATEST'; the push loop would overwrite the standard (Alpine) image's latest with the FIPS build. The -fips suffix needs onlatest=true so the FIPS release lands on latest-fips (issue #1731)."
+            exit 1
+          fi
+          echo "FIPS tags (no bare latest):"
+          printf '%s\n' "$PUBLISHED_TAGS" | sed 's/^/  /'
 
       - name: Tag and push the scanned FIPS image
         id: push-fips
@@ -391,10 +414,13 @@ jobs:
               -f tag_name="$TAG" -f target_commitish="$sha" \
               --jq .body > "$RUNNER_TEMP/release-qualification/base-notes.md"
           fi
-          python3 .github/scripts/vllm_qualification.py compose \
-            --existing "$RUNNER_TEMP/release-qualification/base-notes.md" \
-            --section "$RUNNER_TEMP/release-qualification/qualification-section.md" \
-            --output "$RUNNER_TEMP/release-qualification/release-notes.md"
+          python3 .github/scripts/release_qualification.py \
+            --repo "$GH_REPO" --sha "$sha" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --gpu-report "$RUNNER_TEMP/release-qualification/qualification.json" \
+            --existing-notes "$RUNNER_TEMP/release-qualification/base-notes.md" \
+            --output-dir "$RUNNER_TEMP/release-qualification"
+          cat "$RUNNER_TEMP/release-qualification/release-qualification.md" >> "$GITHUB_STEP_SUMMARY"
           if [ "$existing" = true ]; then
             gh release edit "$TAG" --repo "$GH_REPO" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
@@ -402,7 +428,10 @@ jobs:
             gh release create "$TAG" --repo "$GH_REPO" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
           fi
-          gh release upload "$TAG" "$RUNNER_TEMP/release-qualification/qualification.json" \
+          gh release upload "$TAG" \
+            "$RUNNER_TEMP/release-qualification/qualification.json" \
+            "$RUNNER_TEMP/release-qualification/release-qualification.json" \
+            "$RUNNER_TEMP/release-qualification/release-qualification.md" \
             --repo "$GH_REPO" --clobber
           gh release view "$TAG" --repo "$GH_REPO" --json body,assets \
             > "$RUNNER_TEMP/release-qualification/published.json"
@@ -413,6 +442,8 @@ jobs:
           names = {asset["name"] for asset in release.get("assets", [])}
           if body.count("<!-- praxis:native-vllm-qualification:start -->") != 1 \
                   or body.count("<!-- praxis:native-vllm-qualification:end -->") != 1 \
-                  or "qualification.json" not in names:
-              raise SystemExit("release is missing its unique qualification section or report asset")
+                  or body.count("<!-- praxis:release-ci-qualification:start -->") != 1 \
+                  or body.count("<!-- praxis:release-ci-qualification:end -->") != 1 \
+                  or not {"qualification.json", "release-qualification.json", "release-qualification.md"} <= names:
+              raise SystemExit("release is missing its unique qualification sections or report assets")
           PY

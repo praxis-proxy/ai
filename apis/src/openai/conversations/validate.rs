@@ -10,11 +10,11 @@ use serde_json::Value;
 /// Maximum number of metadata keys.
 const MAX_METADATA_KEYS: usize = 16;
 
-/// Maximum length of a metadata key in bytes.
-const MAX_KEY_BYTES: usize = 64;
+/// Maximum length of a metadata key in Unicode scalar values.
+const MAX_KEY_CHARS: usize = 64;
 
-/// Maximum length of a metadata string value in bytes.
-const MAX_VALUE_BYTES: usize = 512;
+/// Maximum length of a metadata string value in Unicode scalar values.
+const MAX_VALUE_CHARS: usize = 512;
 
 /// Metadata validation failure.
 #[derive(Debug)]
@@ -38,8 +38,8 @@ impl fmt::Display for MetadataError {
 /// Rules:
 /// - Must be a JSON object (or null/absent → default `{}`)
 /// - At most 16 keys
-/// - Each key ≤ 64 bytes
-/// - Each value must be a string ≤ 512 bytes
+/// - Each key ≤ 64 Unicode scalar values
+/// - Each value must be a string ≤ 512 Unicode scalar values
 #[expect(clippy::too_many_lines, reason = "sequential validation pipeline")]
 pub(crate) fn validate_metadata(metadata: &Value) -> Result<(), MetadataError> {
     let obj = match metadata {
@@ -56,16 +56,16 @@ pub(crate) fn validate_metadata(metadata: &Value) -> Result<(), MetadataError> {
     }
 
     for (key, value) in obj {
-        if key.len() > MAX_KEY_BYTES {
+        if key.chars().count() > MAX_KEY_CHARS {
             return Err(MetadataError::ConstraintViolation(format!(
-                "metadata key exceeds {MAX_KEY_BYTES} bytes: '{key}'"
+                "metadata key exceeds {MAX_KEY_CHARS} characters: '{key}'"
             )));
         }
         match value {
             Value::String(s) => {
-                if s.len() > MAX_VALUE_BYTES {
+                if s.chars().count() > MAX_VALUE_CHARS {
                     return Err(MetadataError::ConstraintViolation(format!(
-                        "metadata value for key '{key}' exceeds {MAX_VALUE_BYTES} bytes"
+                        "metadata value for key '{key}' exceeds {MAX_VALUE_CHARS} characters"
                     )));
                 }
             },

@@ -1,0 +1,140 @@
+# MCP Tool Metadata Admission and Read-Only Enforcement
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+#
+# Demonstrates operator-owned metadata admission and read-only enforcement for
+# the `openai_mcp_tool_resolve` filter (issue #1724).
+#
+# MCP servers supply tool descriptions, schemas, and annotations. A
+# client-selected server is NOT an authority for its own safety claims, so its
+# `annotations.readOnlyHint` cannot establish a trusted read-only classification.
+# This example makes the trust contract explicit.
+#
+# ## Advisory vs operator-enforced
+#
+# The standard client selector `allowed_tools.read_only` remains ADVISORY: it
+# filters using the server-supplied `readOnlyHint` and is preserved for API
+# compatibility. It is NOT an operator guarantee. Operator enforcement is
+# configured here under `tool_admission` and cannot be weakened by client fields,
+# tool descriptions, annotations, labels, or a matching URL.
+#
+# ## Trust contract
+#
+# `tool_admission.mode: protected` turns on operator enforcement. In protected
+# mode:
+#
+#   * A client-selected direct `server_url` is UNTRUSTED. Its tools are excluded
+#     from the model-visible set — a `readOnlyHint: true` claim cannot admit
+#     them. (Connector-only deployments can additionally reject direct targets
+#     outright; that switch is tracked separately.)
+#   * A connector is untrusted unless the operator declares a trust contract on
+#     it. `trust.catalog: true` makes the service authoritative for catalog
+#     admission (its tools are admitted without a per-tool digest). Merely
+#     configuring a connector endpoint does NOT grant trust.
+#   * `trust.read_only: true` makes the service authoritative for read-only
+#     CLASSIFICATION (its `readOnlyHint` is trusted). It is independent of
+#     catalog trust: declaring it alone grants no admission.
+#
+# `tool_admission.require_read_only: true` is operator-enforced read-only: only
+# tools with a trusted AFFIRMATIVE read-only classification are admitted. A
+# trusted service reporting a tool as writable, or a missing / malformed /
+# conflicting classification, is excluded. Trusting the classification does not
+# waive this restriction. `require_read_only` requires `mode: protected`.
+#
+# ## Enforcement ownership and failure semantics
+#
+# Praxis does not duplicate a trusted gateway's catalog or per-call authorization
+# engine: the gateway remains responsible for those. Praxis enforces the operator
+# trust contract across fresh/deferred discovery, cached listings, and restored
+# conversations, and RE-ENFORCES eligibility at dispatch so a model-generated
+# call to an excluded tool cannot execute (it is rejected with zero `tools/call`
+# requests). A digest proves an unchanged definition; it does not prove the
+# implementation has no side effects. Actual read-only guarantees require
+# enforcement by the tool service or appropriately scoped credentials.
+#
+# ## Example requests
+#
+# ## Declaring a trusted gateway
+#
+# To make a secured MCP Gateway authoritative, add a connector with a scoped
+# trust declaration (see the `openai_mcp_tool_resolve` filter reference for the
+# full field list):
+#
+#   connectors:
+#     - id: trusted_gateway
+#       server_url: https://gateway.internal/mcp
+#       trust:
+#         catalog: true     # admit its tools without a per-tool digest
+#         read_only: true   # honor its readOnlyHint as a trusted classification
+#
+# A request then references it by `connector_id` instead of a direct `server_url`:
+#   {"type": "mcp", "server_label": "docs", "connector_id": "trusted_gateway"}
+#
+# This example omits a live connector so it stays self-contained; the trusted
+# gateway path is exercised in the filter's integration tests.
+#
+# ## Example request
+#
+#   # A client-selected direct URL is untrusted; its tools are excluded in
+#   # protected mode regardless of any readOnlyHint it advertises, and the
+#   # endpoint is not even contacted:
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "hi",
+#       "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://unknown.example/mcp"}]
+#     }'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_tool_parse
+
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+        # Operator-owned metadata admission. Defaults to advisory; protected mode
+        # excludes untrusted targets and enforces trusted read-only
+        # classification. Declare trusted connectors under `connectors` (see the
+        # trust snippet in the header comment).
+        tool_admission:
+          mode: protected
+          require_read_only: true
+
+      - filter: openai_responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

@@ -1,4 +1,5 @@
 # Responses API Mode Routing
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # Routes Responses API traffic by detected mode. The `openai_responses_request`
 # filter classifies requests as `stateless` (simple inference, no

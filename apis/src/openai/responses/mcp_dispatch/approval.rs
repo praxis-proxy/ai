@@ -180,24 +180,34 @@ pub(crate) fn resolve_approval(
     let tool_name = pending.tool_name.as_str();
 
     let encoded_name = encode_function_name(server_label, tool_name);
-    let entry = bind_target(tool_map, &encoded_name, server_label, tool_name, approval_id)?;
 
-    // Bind the decision to the concrete target the proxy resolved when it asked
-    // for approval. A resume turn that keeps the approved (server_label,
-    // tool_name) but redirects to a different URL, swaps headers or the
-    // authorization credential, or points at another connector produces a
-    // different fingerprint and is rejected before any call is made. An empty
-    // stored fingerprint (e.g. an ambiguous target or case-colliding header names
-    // at approval time) can never match, so it also fails closed.
-    if pending.target_fingerprint.is_empty() {
-        return Err(ApprovalError::TargetIdentityMismatch(format!(
-            "stored approval '{approval_id}' is missing its target fingerprint"
-        )));
-    }
-    if target_fingerprint(entry) != pending.target_fingerprint {
-        return Err(ApprovalError::TargetIdentityMismatch(format!(
-            "approval '{approval_id}' was granted for a different target than the current request resolves"
-        )));
+    // A denial never executes a tool, so it binds to the server-owned pending
+    // record alone and must succeed even if the tool has since lost admission and
+    // left the current tool map (e.g. trust was revoked between the approval
+    // request and this continuation). Requiring a currently executable target for
+    // a denial would strand the pending approval, leaving the user unable to
+    // decline it (#1724). Only an approval, which will execute, must still resolve
+    // to the same single target identity it was granted for.
+    if input.approve {
+        let entry = bind_target(tool_map, &encoded_name, server_label, tool_name, approval_id)?;
+
+        // Bind the decision to the concrete target the proxy resolved when it
+        // asked for approval. A resume turn that keeps the approved (server_label,
+        // tool_name) but redirects to a different URL, swaps headers or the
+        // authorization credential, or points at another connector produces a
+        // different fingerprint and is rejected before any call is made. An empty
+        // stored fingerprint (e.g. an ambiguous target or case-colliding header
+        // names at approval time) can never match, so it also fails closed.
+        if pending.target_fingerprint.is_empty() {
+            return Err(ApprovalError::TargetIdentityMismatch(format!(
+                "stored approval '{approval_id}' is missing its target fingerprint"
+            )));
+        }
+        if target_fingerprint(entry) != pending.target_fingerprint {
+            return Err(ApprovalError::TargetIdentityMismatch(format!(
+                "approval '{approval_id}' was granted for a different target than the current request resolves"
+            )));
+        }
     }
 
     Ok(ResolvedApproval {

@@ -27,7 +27,7 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::prepare_url_target;
+use praxis_core::connectivity::{UrlResolutionPolicy, prepare_url_target_with_policy};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback, SubrequestRuntime, TlsPeerIdentity,
@@ -287,16 +287,21 @@ impl ApiClient {
             body,
         };
 
-        let mut response = subrequest::execute_url(
-            &self.client,
-            url,
-            request,
-            max_response_bytes,
-            self.timeout,
-            self.address_policy,
-        )
-        .await
-        .map_err(map_subrequest_error)?;
+        // The credential-origin guard above proves `url` matches the configured
+        // provider authority, so resolve it through the shared DNS cache.
+        let mut response = self
+            .client
+            .execute_url(
+                url,
+                request,
+                subrequest::address_policy_hook(self.address_policy),
+                UrlResolutionPolicy::OperatorCached,
+                self.timeout,
+                max_response_bytes,
+                None,
+            )
+            .await
+            .map_err(|error| map_subrequest_error(subrequest::map_url_error(error)))?;
         sanitize_response_headers(&mut response.headers);
         Ok(response)
     }
@@ -389,16 +394,23 @@ impl ApiClient {
 
         // Pin the resolved target before dialing: the validation hook runs
         // once on the complete address set, rejecting private or reserved
-        // addresses unless the bound pipeline opted into private upstreams.
+        // addresses unless the bound pipeline opted into private upstreams. The
+        // credential-origin guard above proves `url` matches the operator-
+        // configured target origin, so it resolves through the shared DNS cache.
         let address_policy = AddressPolicy::from_allow_private(outbound.pipeline.allow_private_upstreams());
-        let target = Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
-            if addresses.iter().any(|addr| address_policy.blocks(&addr.ip())) {
-                return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
-                    "callout target resolves to an address blocked by outbound policy".into(),
-                );
-            }
-            Ok(())
-        }))
+        let target = Box::pin(prepare_url_target_with_policy(
+            url,
+            deadline,
+            |addresses: &[SocketAddr]| {
+                if addresses.iter().any(|addr| address_policy.blocks(&addr.ip())) {
+                    return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                        "callout target resolves to an address blocked by outbound policy".into(),
+                    );
+                }
+                Ok(())
+            },
+            UrlResolutionPolicy::OperatorCached,
+        ))
         .await
         .map_err(|error| ApiClientError::Transport {
             source: SubRequestError::Connect(error.to_string()),
