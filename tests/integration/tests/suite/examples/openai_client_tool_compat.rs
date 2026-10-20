@@ -1385,6 +1385,10 @@ fn history_backend_response(id: &str, store: bool) -> serde_json::Value {
 /// history (the #1764 regression) and ordinary `function_call`/`function_call_output`
 /// history (the positive control). Either pair carries the same `call_history`
 /// `call_id` and `SENTINEL` output.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "stored continuation JSON values are bounded integration-test fixtures"
+)]
 fn stored_client_tool_continuation(custom: bool) -> (serde_json::Value, serde_json::Value) {
     const SENTINEL: &str = "PRIOR_CLIENT_TOOL_RESULT_SENTINEL";
 
