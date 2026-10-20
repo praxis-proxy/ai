@@ -13,6 +13,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 ## Architecture
 
 - [AI inference](architecture/ai-inference.md)
+- [OpenAI Responses retained-payload budget](architecture/responses-retained-payload.md)
 - [Routing facts](architecture/routing-facts.md)
 - [Agentic protocols](architecture/agentic-protocols.md)
 - [Response store](architecture/response-store.md)

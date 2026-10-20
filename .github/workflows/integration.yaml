@@ -643,6 +643,38 @@ jobs:
       - name: Run Vertex Gemini OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py -s
 
+  # OpenAI Python SDK vs selected Anthropic Messages provider (local fake backend).
+  selected-anthropic-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: selected-anthropic-sdk-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Run selected Anthropic OpenAI Python SDK tests
+        run: uv run tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py -s
+
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI WebSocket acceptance
   # ----------------------------------------------------------------------------

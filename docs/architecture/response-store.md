@@ -358,7 +358,9 @@ tenant sentinel while retaining issuer and subject isolation.
 ## Body Buffering
 
 The filter declares `BodyMode::StreamBuffer` with a
-64 MiB ceiling globally. Non-streaming Responses API
+64 MiB ceiling globally. On a listener with an agentic
+[retained-payload budget](responses-retained-payload.md),
+the buffered response cap can be lower. Non-streaming Responses API
 payloads are bounded by output token limits (typically
 under 2 MiB). Non-persistable exchanges release chunks
 immediately via `FilterAction::Release` so

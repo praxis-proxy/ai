@@ -340,6 +340,14 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
         @register registry,
         http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_anthropic" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_anthropic_stream" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicStreamFilter::from_config
+    );
     register_anthropic_web_search(registry, subrequest_client);
 }
 

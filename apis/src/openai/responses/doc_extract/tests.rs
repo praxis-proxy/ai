@@ -15,6 +15,144 @@ use super::{
 };
 use crate::test_utils::{make_filter_context, make_request};
 
+fn install_document_budget(ctx: &mut HttpFilterContext<'_>, body: &serde_json::Value, limit: usize) {
+    let raw = serde_json::to_vec(body).unwrap();
+    let policy =
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap())
+            .unwrap();
+    let mut state = ResponsesState::from_request_body(body.clone());
+    state.simple_budget = Some(SimpleBudget::new_with_store(limit, input_charge(&raw).unwrap(), false).unwrap());
+    ctx.extensions.insert(policy);
+    ctx.extensions.insert(state);
+}
+
+#[tokio::test]
+async fn budgeted_document_extract_reserves_rewritten_owners() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("a\u{0000}b")}
+        ]}
+    ]));
+    install_document_budget(&mut ctx, &body_json, 1_048_576);
+    let initial = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "budgeted text file should be extracted"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.messages[0]["content"][0]["text"], "[Source: notes.txt]\na\u{0000}b",
+        "decoded text and control characters must survive extraction"
+    );
+    assert!(
+        state.simple_budget.unwrap().remaining_bytes().unwrap() < initial,
+        "rewritten document owners must consume request headroom"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_document_extract_rejects_growth_before_decode() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data(&"x".repeat(2_000))}
+        ]}
+    ]));
+    install_document_budget(&mut ctx, &body_json, 262_144);
+    let original = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "document growth must fail before decoding"
+    );
+    assert_eq!(
+        body.unwrap().as_ref(),
+        original,
+        "rejection must leave the body unchanged"
+    );
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().messages[0]["content"][0]["type"],
+        "input_file",
+        "rejection must leave request state unchanged"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_history_only_extract_counts_both_mirrors() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::json!("new text"));
+    install_document_budget(&mut ctx, &body_json, 1_048_576);
+    let history_file = serde_json::json!({"type": "message", "role": "user", "content": [
+        {"type": "input_file", "filename": "history.txt", "file_data": text_file_data("old text")}
+    ]});
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.messages.insert(0, history_file.clone());
+    state.persisted_messages.insert(0, history_file);
+    let initial = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "restored files should be extracted"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.messages[0]["content"][0]["type"], "input_text",
+        "outbound history must be rewritten"
+    );
+    assert_eq!(
+        state.persisted_messages[0]["content"][0]["type"], "input_text",
+        "persisted history must be rewritten independently"
+    );
+    assert!(
+        state.simple_budget.unwrap().remaining_bytes().unwrap() < initial,
+        "both restored history mirrors must consume request headroom"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_sparse_json_rejects_before_second_parse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let body_json = responses_body(&serde_json::Value::Array(vec![
+        serde_json::Value::String("x".to_owned());
+        128
+    ]));
+    install_document_budget(&mut ctx, &body_json, 131_072);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "compact JSON with many nodes must be rejected before another parse"
+    );
+}
+
 // -- Helpers ------------------------------------------------------------------
 
 fn make_filter() -> DocExtractFilter {

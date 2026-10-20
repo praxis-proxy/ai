@@ -7,10 +7,10 @@ use std::{collections::HashMap, time::Duration};
 
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
-    Backend, CapturedWsMessage, StatefulCapturingBackend, TempSqlite, WsBackendEvent, WsServerAction,
-    example_config_path, free_port, http_send, json_post as raw_json_post, parse_body, parse_header, parse_status,
-    patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
-    start_stateful_backend,
+    Backend, CapturedWsMessage, McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, WsBackendEvent,
+    WsServerAction, example_config_path, free_port, http_send, json_post as raw_json_post, parse_body, parse_header,
+    parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config,
+    start_proxy, start_scripted_websocket_backend, start_stateful_backend,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::{
@@ -77,6 +77,15 @@ fn authenticated_request(request: &str) -> String {
 /// Build an authenticated JSON request for the full-flow example.
 fn json_post(path: &str, body: &str) -> String {
     authenticated_request(&raw_json_post(path, body))
+}
+
+/// Build an authenticated JSON request with the full per-user MCP context.
+fn json_post_with_mcp_context(path: &str, body: &str, credential: &str, assertion: &str) -> String {
+    json_post(path, body).replacen(
+        "\r\n\r\n",
+        &format!("\r\nx-user-mcp-key: {credential}\r\nx-mcp-authorized: {assertion}\r\n\r\n"),
+        1,
+    )
 }
 
 /// Send an authenticated GET and return `(status, body)`.
@@ -2274,6 +2283,7 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("outer chain should contain openai_mcp_tool_resolve");
     assert_eq!(mcp_resolve["user_credential"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_resolve["authorization_assertion"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_resolve["require_connector"].as_bool(), Some(true));
     let mcp_dispatch = outer_filters[irr_index]["steps"][0]["filters"]
         .as_sequence()
         .expect("IRR inference step should contain filters")
@@ -2282,6 +2292,154 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("IRR inference step should contain openai_mcp_dispatch");
     assert_eq!(mcp_dispatch["user_credential"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_dispatch["authorization_assertion"].as_str(), Some("mcp_gateway"));
+}
+
+#[test]
+fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
+    let model = StatefulCapturingBackend::new(vec![
+        (
+            200,
+            json!({
+                "id": "resp_mcp_call",
+                "created_at": 1000,
+                "model": "gpt-4.1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_mcp_call",
+                    "call_id": "call_mcp_weather",
+                    "name": "weather__get_weather",
+                    "arguments": r#"{"location":"SF"}"#,
+                    "status": "completed"
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            200,
+            json!({
+                "id": "resp_mcp_final",
+                "created_at": 2000,
+                "model": "gpt-4.1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The weather in SF is 72F."}]
+                }]
+            })
+            .to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let direct = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let nemo = start_backend_with_shutdown(r#"{"status":"passed","content":"safe"}"#);
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_mcp_connector_only");
+    let config = load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:8001", mcp.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "connector_id": "trusted-mcp",
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_mcp_context(
+            "/v1/responses",
+            &request.to_string(),
+            "integration-mcp-key",
+            "Bearer integration-mcp-assertion",
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "connector round trip should succeed: {raw}");
+
+    let requests = mcp.received_requests();
+    let assertion_values: Vec<&str> = ["initialize", "tools/list", "tools/call"]
+        .into_iter()
+        .map(|method| {
+            let request = requests
+                .iter()
+                .find(|request| request.json_rpc_method.as_deref() == Some(method))
+                .unwrap_or_else(|| panic!("configured connector should receive {method}"));
+            let authorization = request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                authorization,
+                Some("Bearer integration-mcp-key"),
+                "{method} should carry the caller's bearer credential"
+            );
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-mcp-authorized"))
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("{method} should carry x-mcp-authorized"))
+        })
+        .collect();
+    assert_eq!(assertion_values[0], "Bearer integration-mcp-assertion");
+    assert!(
+        assertion_values.windows(2).all(|values| values[0] == values[1]),
+        "discovery and execution must observe the same assertion: {assertion_values:?}"
+    );
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+
+    let direct_request = json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", direct.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_mcp_context(
+            "/v1/responses",
+            &direct_request.to_string(),
+            "integration-mcp-key",
+            "Bearer integration-mcp-assertion",
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "direct server_url must be rejected: {raw}");
+    assert!(
+        parse_body(&raw).contains("Use an administrator-configured connector_id instead."),
+        "direct server_url rejection should be bounded and client-visible"
+    );
+    assert!(
+        direct.received_requests().is_empty(),
+        "a rejected direct destination must receive no HTTP request at all"
+    );
 }
 
 #[test]

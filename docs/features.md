@@ -30,7 +30,9 @@ injection, see the [Praxis core documentation][praxis].
   agentic loop.
 
 See the generated [OpenAI filter inventory](filters/reference.md#openai)
-for the complete list.
+for the complete list. The [Responses retained-payload budget]
+explains how the agentic loop bounds payload held across inference rounds,
+tools, streaming, and Store operations.
 
 ## Anthropic Messages
 
@@ -108,3 +110,4 @@ Start with the [example configurations](../examples/README.md), then use the
 [filter reference](filters/reference.md) for exact configuration fields.
 
 [praxis]: https://github.com/praxis-proxy/praxis
+[Responses retained-payload budget]: architecture/responses-retained-payload.md

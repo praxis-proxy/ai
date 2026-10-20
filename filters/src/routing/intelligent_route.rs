@@ -39,9 +39,10 @@ use serde::Deserialize;
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
-        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CANDIDATE_COUNT,
-        ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_OUTCOME, ROUTE_PROVIDER_HOP_REQUEST_ID,
-        ROUTE_RANK, ROUTE_SELECTION_GROUP, ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID,
+        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_API_FORMAT,
+        ROUTE_CANDIDATE_COUNT, ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_OUTCOME,
+        ROUTE_OVERLAY_REVISION, ROUTE_PATH, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
+        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, ROUTE_TARGET_MODEL,
         SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     metrics::{self, DecisionOutcome, SessionEvent},
@@ -1032,7 +1033,7 @@ fn apply_reused(
     mode: PickerPolicy,
 ) -> Result<FilterAction, FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
-    record_route_decision(ctx, local_site, candidate);
+    record_route_decision(ctx, local_site, candidate, semantic_revision);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
@@ -1058,7 +1059,7 @@ fn apply_route(
     mode: PickerPolicy,
 ) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
-    record_route_decision(ctx, local_site, candidate);
+    record_route_decision(ctx, local_site, candidate, semantic_revision);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
@@ -1357,7 +1358,12 @@ fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>
 /// Keys use `intelligent_route.` namespace. All values are bounded by the
 /// existing `set_metadata` limits.  No HTTP forwarding headers are
 /// written by this function.
-fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
+fn record_route_decision(
+    ctx: &mut HttpFilterContext<'_>,
+    local_site: &Arc<str>,
+    candidate: &RouteCandidate,
+    semantic_revision: Option<&Arc<str>>,
+) {
     ctx.set_metadata(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str());
     ctx.set_metadata(ROUTE_CLUSTER, &*candidate.cluster);
     ctx.set_metadata(ROUTE_KIND, candidate.kind.as_str());
@@ -1365,6 +1371,14 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     ctx.set_metadata(ROUTE_NAME, &*candidate.name);
     ctx.set_metadata(ROUTE_SITE, &*candidate.site);
     ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
+    if let Some(profile) = &candidate.provider_profile {
+        ctx.set_metadata(ROUTE_API_FORMAT, profile.api_format.as_str());
+        ctx.set_metadata(ROUTE_PATH, profile.path.as_ref());
+        ctx.set_metadata(ROUTE_TARGET_MODEL, profile.target_model.as_ref());
+    }
+    if let Some(revision) = semantic_revision {
+        ctx.set_metadata(ROUTE_OVERLAY_REVISION, revision.as_ref());
+    }
     if let Some(rank) = candidate.rank {
         ctx.set_metadata(ROUTE_RANK, rank.to_string());
     }
@@ -4427,6 +4441,7 @@ mod tests {
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
+                provider_profile: None,
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))

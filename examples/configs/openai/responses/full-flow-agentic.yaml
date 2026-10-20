@@ -294,14 +294,21 @@
 #       "tools": [{"type": "file_search", "vector_store_ids": ["vs_abc"]}]
 #     }'
 #
-#   # MCP tool loop — model issues an MCP call, executed via the server URL
+#   # MCP tool loop — execute via the administrator-configured connector.
+#   # Local testing only: emulate the trusted authentication boundary below.
+#   # MCP_USER_KEY is a raw token; MCP_AUTHORIZATION_ASSERTION is the verified
+#   # assertion. Production gateways must overwrite these identity headers.
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
+#     -H "x-auth-tenant: example-tenant" \
+#     -H "x-auth-user: example-user" \
+#     -H "x-user-mcp-key: ${MCP_USER_KEY}" \
+#     -H "x-mcp-authorized: ${MCP_AUTHORIZATION_ASSERTION}" \
 #     -d '{
 #       "model": "gpt-4.1",
 #       "input": "What is the weather in SF?",
 #       "tools": [{"type": "mcp", "server_label": "weather",
-#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "connector_id": "trusted-mcp",
 #                  "allowed_tools": ["get_weather"],
 #                  "require_approval": "never"}]
 #     }'
@@ -705,6 +712,7 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
         authorization_assertion: mcp_gateway
+        require_connector: true
         forward_headers:
           - x-tenant-id
           - x-user-id

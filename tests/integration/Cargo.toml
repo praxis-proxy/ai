@@ -83,6 +83,7 @@ praxis-tls = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
