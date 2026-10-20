@@ -1840,6 +1840,62 @@ async fn non_streaming_chat_response_becomes_response_resource() {
 }
 
 #[tokio::test]
+async fn non_streaming_response_echoes_array_input_moved_out_of_request_body() {
+    // #1618 moves `input` out of `request_body` at state init, so the synthesized
+    // Responses resource must echo it from the shared history instead. Regression
+    // guard for the inference-fixture replay that caught an empty `input` echo.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
+    context.set_metadata("responses.response_id", "resp_echo_input");
+    let input = json!([{"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}]);
+    let request_value = json!({"model": "gpt-4.1-mini", "input": input, "stream": false});
+    let state = ResponsesState::from_request_body(request_value);
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1-mini", "input": input, "stream": false})).unwrap(),
+    ));
+    assert!(matches!(
+        filter
+            .on_selected_upstream_request_body(&mut context, &mut request_body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
+    ));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4.1-mini","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["input"], input,
+        "the resource must echo the array input reconstructed from state, not an empty value"
+    );
+}
+
+#[tokio::test]
 async fn chat_file_search_function_call_becomes_responses_function_call() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

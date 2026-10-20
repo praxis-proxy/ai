@@ -890,7 +890,7 @@ pub(crate) mod rehydrate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod request;
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "openai-responses")]
 pub(crate) mod request_input;
 #[cfg(feature = "openai-responses")]
 #[cfg(feature = "openai-responses")]

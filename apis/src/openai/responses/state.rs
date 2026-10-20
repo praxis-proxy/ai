@@ -27,11 +27,9 @@ use praxis_filter::FilterAction;
 use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
-use super::{history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat};
+use super::{history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat, request_input::InputForm};
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use crate::json_body::MAX_JSON_BODY_BYTES;
-#[cfg(feature = "openai-mcp-tools")]
-use super::request_input::InputForm;
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -510,10 +508,10 @@ pub(crate) struct ResponsesState {
     /// array), kept so the current-request view reproduces the client's form
     /// without retaining a second decoded copy in [`Self::request_body`] (#1618).
     ///
-    /// Only MCP tool discovery re-serializes the current request, so this is
-    /// tracked under `openai-mcp-tools`; input is stripped from `request_body`
-    /// regardless of features.
-    #[cfg(feature = "openai-mcp-tools")]
+    /// Response synthesis echoes the client's `input` back onto the Responses
+    /// resource and MCP tool discovery re-serializes the current request, so the
+    /// original shape is tracked whenever the Responses API is built; input is
+    /// stripped from `request_body` regardless of features.
     pub input_form: InputForm,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
@@ -1125,7 +1123,6 @@ impl Default for ResponsesState {
             current_round_output_start: None,
             history_rehydrated: false,
             input: MessageHistory::default(),
-            #[cfg(feature = "openai-mcp-tools")]
             input_form: InputForm::default(),
             iteration: 0,
             deferred_mcp: Vec::new(),
@@ -1318,7 +1315,6 @@ impl ResponsesState {
         // translation) to reject. Cloning `MessageHistory` shares each item's
         // `Arc` payload, so the immutable snapshot and persistence view never
         // deep-copy the input; only `messages` detaches an item on later mutation.
-        #[cfg(feature = "openai-mcp-tools")]
         let input_form = InputForm::classify(body.get("input"));
         let messages = if input_is_normalizable(body.get("input")) {
             let value = body
@@ -1339,7 +1335,6 @@ impl ResponsesState {
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
             input,
-            #[cfg(feature = "openai-mcp-tools")]
             input_form,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,

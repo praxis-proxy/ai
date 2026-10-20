@@ -86,6 +86,10 @@ pub(super) struct SnapshotInputs<'a> {
     pub(super) tools: &'a [Value],
     /// Client-visible tool choice preserved across internal agentic rounds.
     pub(super) original_tool_choice: Option<&'a Value>,
+    /// Client's `input` reconstructed in its original shape, echoed onto the
+    /// resource because `input` was moved out of `request_body` at init (#1618).
+    /// `None` falls back to the absent-input default.
+    pub(super) input: Option<&'a Value>,
     /// Current wall-clock time in seconds.
     pub(super) now: u64,
 }
@@ -1838,6 +1842,9 @@ impl StreamConverter {
         context.tools = inputs.tools;
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
+        }
+        if let Some(input) = inputs.input {
+            context.input = Some(input);
         }
         match completed_at {
             Some(timestamp) => context.with_completed_at(timestamp),

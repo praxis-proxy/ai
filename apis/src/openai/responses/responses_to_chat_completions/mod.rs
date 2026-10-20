@@ -431,6 +431,9 @@ impl ResponsesToChatCompletionsFilter {
                 "openai_responses_to_chat_completions: missing Responses state for streaming translation".into(),
             );
         };
+        // `input` was moved out of `request_body` at state init (#1618); rebuild
+        // the client's input so streaming snapshots echo it onto the resource.
+        let echoed_input = super::request_input::input_echo_value(state);
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
             tools: &state.tools,
@@ -439,6 +442,7 @@ impl ResponsesToChatCompletionsFilter {
             // hosted form even after openai_file_search_dispatch lowers
             // request_body for the backend.
             original_tool_choice: state.original_tool_choice.as_ref().or(Some(&state.tool_choice)),
+            input: echoed_input.as_ref(),
             now,
         };
 
@@ -1135,6 +1139,13 @@ fn translate_success_response(
     // outbound request is built from `state.tools`/`state.tool_choice`.
     response_context.tools = &state.tools;
     response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
+    // `input` was moved out of `request_body` at state init (#1618), so echo the
+    // client's input onto the resource from the shared history instead. `None`
+    // leaves `from_responses_request`'s absent-input default in place.
+    let echoed_input = super::request_input::input_echo_value(state);
+    if let Some(echoed_input) = echoed_input.as_ref() {
+        response_context.input = Some(echoed_input);
+    }
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)
