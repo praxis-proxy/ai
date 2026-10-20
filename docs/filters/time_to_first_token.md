@@ -13,6 +13,8 @@ The histogram's `model` label is read from metadata set by an upstream request f
 
 The `cluster` label is the upstream cluster the request was routed to (`HttpFilterContext::cluster_name`), falling back to `unknown`.
 
+Distinct `model` label values are capped at 1024 per process lifetime; values arriving after the cap are labeled `other` (see `llm_metrics`).
+
 Chat traffic that originates as a Responses or Anthropic request and is translated downstream keeps the model its originating classifier promoted.
 
 ## Example

@@ -13,6 +13,11 @@
 //! for provider-level rollup, so both per-model and per-provider views are
 //! one `sum by (...)` away.
 //!
+//! The `model` label is bounded: at most [`MAX_MODEL_LABELS`] distinct values
+//! are admitted per process lifetime, and later unseen values are labeled
+//! `other`, so the exporter registry cannot grow without bound on chains
+//! without a model allowlist (the exporter has no idle eviction).
+//!
 //! # Metric rationale
 //!
 //! - `praxis_ai_prompt_tokens_total` / `praxis_ai_output_tokens_total`: token volumes per model/provider (capacity,
@@ -26,7 +31,10 @@
 //! - `praxis_ai_empty_completions_total`: zero-output responses = silent generation failures.
 //! - `praxis_ai_tpot_seconds` (histogram): inter-token decode time (tokens/s ≈ 1/TPOT) — pure generation throughput.
 
-use std::sync::Once;
+use std::{
+    collections::HashSet,
+    sync::{Mutex, Once, OnceLock},
+};
 
 use metrics::{Unit, counter, describe_histogram, histogram};
 use praxis_ai_apis::promotion::is_promotable_value;
@@ -53,9 +61,26 @@ pub const METRIC_TPOT_SECONDS: &str = "praxis_ai_tpot_seconds";
 
 /// Metadata key where the `model_to_header` filter publishes the model it
 /// promoted from the request body. Server-published (not a raw client header),
-/// and validated by `model_to_header` for header-safety; keep it bounded to the
-/// models routing actually serves.
+/// and validated by `model_to_header` for header-safety; distinct admitted
+/// values are capped at [`MAX_MODEL_LABELS`] per process lifetime.
 pub(crate) const META_MODEL_TO_HEADER_MODEL: &str = "model_to_header.model";
+
+/// Upper bound on distinct `model` label values admitted per process.
+///
+/// The production Prometheus recorder has no idle eviction, so every distinct
+/// label value lives for the recorder lifetime. Routing bounds the model set
+/// in chains with a model allowlist, but chains without one (for example the
+/// token-counting example's catch-all route) would let clients expand the
+/// label set — and with it the registry and `/metrics` output — without
+/// bound. Values arriving after this cap is full are labeled
+/// [`OTHER_MODEL_LABEL`]. The current `EnMaaS` catalog serves ~29 models, so
+/// 1024 leaves an order of magnitude of headroom for catalog churn.
+pub(crate) const MAX_MODEL_LABELS: usize = 1024;
+
+/// Label for model values that arrive once [`MAX_MODEL_LABELS`] distinct
+/// values have been admitted. Distinct from `"unknown"` (no model metadata)
+/// so capped cardinality stays observable.
+const OTHER_MODEL_LABEL: &str = "other";
 
 /// Guards the one-time histogram descriptions.
 static DESCRIBED: Once = Once::new();
@@ -71,8 +96,12 @@ fn ensure_described() {
 
 /// Resolve the `model` label from request/filter metadata, falling back to
 /// `unknown` when no upstream format filter (or `model_to_header`) ran.
+///
+/// Distinct values are capped at [`MAX_MODEL_LABELS`] for the process
+/// lifetime; values arriving after the cap are labeled `"other"`.
 pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
-    ctx.get_metadata("openai_responses_request.model")
+    let model = ctx
+        .get_metadata("openai_responses_request.model")
         .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
         .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
@@ -81,12 +110,43 @@ pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
         // it so the label is populated even when no format filter ran. Only that
         // server-published, header-safety-validated value is used — a raw
         // client-supplied `X-Model` request header is never read, so clients
-        // cannot spoof the label. Distinct values stay bounded to the model set
-        // the gateway routes (a catch-all route could still admit new values).
+        // cannot spoof the label. On chains without a model allowlist the value
+        // still originates from the request body, so admitted values are
+        // hard-capped at MAX_MODEL_LABELS for the recorder lifetime (the
+        // exporter has no idle eviction); values beyond the cap are labeled
+        // "other" instead of growing the registry.
         .or_else(|| ctx.get_metadata(META_MODEL_TO_HEADER_MODEL))
         .filter(|v| !v.is_empty() && is_promotable_value(v))
-        .unwrap_or("unknown")
-        .to_owned()
+        .unwrap_or("unknown");
+    if model == OTHER_MODEL_LABEL || model == "unknown" {
+        return model.to_owned();
+    }
+    admit_model(model).to_owned()
+}
+
+/// Distinct model labels admitted so far in this process.
+static ADMITTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Admit `value` against `admitted` while below `cap`; values arriving after
+/// the cap map to [`OTHER_MODEL_LABEL`]. Already-admitted values keep their
+/// label, so the cap bounds the set without relabeling earlier traffic.
+fn admit_model_label<'v>(admitted: &mut HashSet<String>, cap: usize, value: &'v str) -> &'v str {
+    if admitted.contains(value) {
+        return value;
+    }
+    if admitted.len() < cap {
+        admitted.insert(value.to_owned());
+        value
+    } else {
+        OTHER_MODEL_LABEL
+    }
+}
+
+/// Apply the process-lifetime [`MAX_MODEL_LABELS`] bound to `value`.
+fn admit_model(value: &str) -> &str {
+    let set = ADMITTED_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut admitted = set.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    admit_model_label(&mut admitted, MAX_MODEL_LABELS, value)
 }
 
 /// Resolve the `cluster` (provider) label.
@@ -291,6 +351,35 @@ mod tests {
         assert!(
             !present(METRIC_REASONING_TOKENS_TOTAL),
             "reasoning tokens must not be recorded when unreported"
+        );
+    }
+
+    #[test]
+    fn admit_model_label_caps_distinct_values() {
+        let mut admitted = HashSet::new();
+        assert_eq!(admit_model_label(&mut admitted, 3, "m1"), "m1");
+        assert_eq!(admit_model_label(&mut admitted, 3, "m2"), "m2");
+        assert_eq!(admit_model_label(&mut admitted, 3, "m3"), "m3");
+        assert_eq!(
+            admit_model_label(&mut admitted, 3, "m4"),
+            "other",
+            "values arriving after the cap map to other"
+        );
+        assert_eq!(
+            admit_model_label(&mut admitted, 3, "m1"),
+            "m1",
+            "already-admitted values keep their label"
+        );
+        assert_eq!(admitted.len(), 3, "the cap bounds the admitted set");
+    }
+
+    #[test]
+    fn admit_model_admits_values_under_the_process_cap() {
+        let value = format!("cap-probe-{}", line!());
+        assert_eq!(
+            admit_model(&value),
+            value,
+            "values under the process cap are admitted unchanged"
         );
     }
 }
