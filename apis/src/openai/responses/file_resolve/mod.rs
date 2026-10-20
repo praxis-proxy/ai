@@ -452,7 +452,7 @@ impl HttpFilter for FileResolveFilter {
 fn budgeted_plain_input_without_references(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
         state.simple_budget.is_some()
-            && super::text_only_input(state.request_body.get("input"))
+            && super::text_only_messages(state.input.iter())
             && state.messages.iter().all(|item| !history_needs_file_resolution(item))
             && state
                 .persisted_messages

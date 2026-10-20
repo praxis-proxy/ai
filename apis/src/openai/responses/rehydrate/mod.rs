@@ -178,6 +178,11 @@ impl RehydrateFilter {
         bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
+        // Re-guard structural complexity before reconstructing state so this
+        // alternate initialization path cannot bypass the managed-create bound (#1618).
+        if let Err(action) = super::complexity::enforce(ctx, &parsed_body) {
+            return Ok(action);
+        }
         let state = merge_configuration_and_build_state(body, parsed_body, stored, previous_tools, previous_usage);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
@@ -209,6 +214,10 @@ impl RehydrateFilter {
             return Ok(action);
         }
         let stored = stored_messages_for_conversation(record);
+        // Re-guard structural complexity before reconstructing state (#1618).
+        if let Err(action) = super::complexity::enforce(ctx, &parsed_body) {
+            return Ok(action);
+        }
         let state = merge_configuration_and_build_state(body, parsed_body, stored, vec![], None);
         install_rehydrated_state(ctx, state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");

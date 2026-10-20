@@ -33,6 +33,8 @@ mod body_limits;
 #[cfg(feature = "openai-compact")]
 pub(crate) mod compact;
 #[cfg(feature = "openai-responses")]
+pub(crate) mod complexity;
+#[cfg(feature = "openai-responses")]
 mod config;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod content_parts;
@@ -135,32 +137,34 @@ pub(crate) fn plain_agentic_budget(
     })
 }
 
-/// Recognize requests whose file resolver can skip a second JSON projection.
+/// Recognize current input whose normalized message items are plain text with no
+/// file references, so the file resolver can skip a second JSON projection.
+///
+/// Reads the normalized items (`ResponsesState::input`) rather than the raw body:
+/// since #1618 `input` no longer lives in `request_body`. A string shorthand
+/// normalizes to a single text message, so it is covered by the message check.
 #[cfg(feature = "openai-file-resolve-filter")]
-fn text_only_input(input: Option<&serde_json::Value>) -> bool {
-    let Some(input) = input else {
-        return false;
-    };
-    match input {
-        serde_json::Value::String(_) => true,
-        serde_json::Value::Array(items) => items.iter().all(|item| {
-            let Some(message) = item.as_object() else {
-                return false;
-            };
-            if message.get("type").is_some_and(|kind| kind != "message") {
-                return false;
-            }
-            match message.get("content") {
-                Some(serde_json::Value::String(_)) => true,
-                Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) == Some("input_text")
-                        && part.get("text").is_some_and(serde_json::Value::is_string)
-                }),
-                _ => false,
-            }
-        }),
-        _ => false,
-    }
+#[expect(
+    single_use_lifetimes,
+    reason = "anonymous lifetimes in impl Trait arguments are unstable"
+)]
+fn text_only_messages<'a>(mut items: impl Iterator<Item = &'a serde_json::Value>) -> bool {
+    items.all(|item| {
+        let Some(message) = item.as_object() else {
+            return false;
+        };
+        if message.get("type").is_some_and(|kind| kind != "message") {
+            return false;
+        }
+        match message.get("content") {
+            Some(serde_json::Value::String(_)) => true,
+            Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("input_text")
+                    && part.get("text").is_some_and(serde_json::Value::is_string)
+            }),
+            _ => false,
+        }
+    })
 }
 
 #[cfg(feature = "openai-responses")]

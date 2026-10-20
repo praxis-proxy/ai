@@ -118,7 +118,14 @@ async fn budgeted_create_preserves_provider_owned_parameters() {
         matches!(action, FilterAction::Release),
         "provider parameters must reach the backend"
     );
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().request_body, original);
+    // `input` is moved out of request_body into state.input (#1618); every other
+    // provider parameter is preserved in the parameter object.
+    let mut expected_params = original.clone();
+    expected_params.as_object_mut().unwrap().remove("input");
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().request_body,
+        expected_params
+    );
 }
 
 #[tokio::test]
@@ -178,7 +185,11 @@ async fn budgeted_create_admits_stream_tools_and_typed_input() {
         let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
         assert!(matches!(action, FilterAction::Release), "{body}");
         let state = ctx.extensions.get::<ResponsesState>().unwrap();
-        assert_eq!(state.request_body, body);
+        // `input` is moved out of request_body into state.input (#1618); the
+        // parameter object retains everything else.
+        let mut expected_params = body.clone();
+        expected_params.as_object_mut().unwrap().remove("input");
+        assert_eq!(state.request_body, expected_params, "{body}");
         assert!(state.simple_budget.is_some());
     }
 }

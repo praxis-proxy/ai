@@ -1073,7 +1073,8 @@ fn write_state_creates_state_when_missing() {
         Vec::new(),
         context_policy.clone(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -1115,7 +1116,8 @@ fn write_state_updates_existing_state() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert!(
@@ -2031,7 +2033,8 @@ fn write_state_skips_state_creation_with_previous_response_id() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx
         .extensions
@@ -2768,7 +2771,8 @@ fn write_state_syncs_request_body_and_tools_on_existing_state() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert_eq!(state.tools.len(), 1, "tools synced from rewritten body");
