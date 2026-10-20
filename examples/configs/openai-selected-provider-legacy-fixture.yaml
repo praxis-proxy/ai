@@ -1,0 +1,48 @@
+# Controlled inference-fixture replay for OpenAI Chat Completions to an
+# Anthropic Messages provider. The routing overlay is a checked-in synthetic
+# fixture and is resolved by the inference replay harness.
+
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+        header: X-Model
+
+      - filter: intelligent_route
+        overlay_file: tests/integration/fixtures/inference/routing/openai-to-anthropic.json
+        model_header: X-Model
+        clusters: [anthropic-backend]
+        reload: {enabled: false}
+
+      - filter: openai_chat_completions_to_anthropic_stream
+        max_partial_event_bytes: 1048576
+        max_tool_blocks: 256
+
+      - filter: openai_chat_completions_to_anthropic
+        api_translation_enabled: true
+        max_body_bytes: 1048576
+
+      - filter: credential_inject
+        credentials:
+          - name: anthropic-fixture-secret
+            namespace: grid-fixture
+            key: api-key
+            strategy: apikey
+            header: x-api-key
+            value: fixture-only-dummy-token
+
+      - filter: load_balancer
+        clusters:
+          - name: anthropic-backend
+            endpoints: ["127.0.0.1:8001"]
+
+admin: {}
+shutdown_timeout_secs: 5
+
+insecure_options:
+  allow_private_endpoints: true

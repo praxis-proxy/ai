@@ -47,6 +47,7 @@ pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
 /// [`MIN_RETAINED_RESULT_BYTES`]. Ids that fail either check are rejected
 /// before any approval is persisted; they are never truncated, because
 /// truncation would break correlation.
+#[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
 pub(super) const MAX_MCP_CALL_ID_BYTES: usize = 128;
 
 /// YAML configuration for the `openai_mcp_dispatch` filter.

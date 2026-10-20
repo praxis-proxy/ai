@@ -1,0 +1,823 @@
+{
+  "version": 1,
+  "scenario_id": "openai_legacy/anthropic-json-sse-error",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "fixture-openai-model",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-msg_json": "chatcmpl-recorded-0001",
+      "chatcmpl-msg_stream": "chatcmpl-recorded-0003",
+      "msg_json": "msg_recorded_0002",
+      "msg_stream": "msg_recorded_0004",
+      "chatcmpl-msg_context_json": "chatcmpl-recorded-0005",
+      "msg_context_json": "msg_recorded_0006",
+      "chatcmpl-msg_context_stream": "chatcmpl-recorded-0007",
+      "msg_context_stream": "msg_recorded_0008",
+      "chatcmpl-msg_null": "chatcmpl-recorded-0009",
+      "msg_null": "msg_recorded_0010"
+    }
+  },
+  "turns": [
+    {
+      "name": "json",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "fixture hello",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0001",
+              "model": "fixture-openai-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 2,
+                "prompt_tokens": 1060,
+                "prompt_tokens_details": {
+                  "cached_tokens": 1000
+                },
+                "total_tokens": 1062
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Say hello.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "fixture hello",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0002",
+              "model": "claude-fixture-model",
+              "role": "assistant",
+              "stop_reason": "end_turn",
+              "type": "message",
+              "usage": {
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 1000,
+                "input_tokens": 10,
+                "output_tokens": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "stream",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Stream hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              }
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"progressive \"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":1060,\"total_tokens\":1064}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Stream hello.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"model\":\"claude-fixture-model\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":1000,\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"progressive \",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_reason\":\"end_turn\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      }
+    },
+    {
+      "name": "provider-error",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "One more hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": 429,
+                "message": "synthetic rate limit",
+                "type": "rate_limit_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "One more hello.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "synthetic rate limit",
+                "type": "rate_limit_error"
+              },
+              "type": "error"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "context-window-json",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Keep answering until the context window is exhausted.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "length",
+                  "index": 0,
+                  "message": {
+                    "content": "partial answer",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0005",
+              "model": "fixture-openai-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 2,
+                "prompt_tokens": 4,
+                "total_tokens": 6
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Keep answering until the context window is exhausted.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "partial answer",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0006",
+              "model": "claude-fixture-model",
+              "role": "assistant",
+              "stop_reason": "model_context_window_exceeded",
+              "type": "message",
+              "usage": {
+                "input_tokens": 4,
+                "output_tokens": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "context-window-stream",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Stream until the context window is exhausted.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              }
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0007\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"progressive \"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0007\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0007\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0007\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0007\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":3,\"total_tokens\":7}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Stream until the context window is exhausted.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0008\",\"model\":\"claude-fixture-model\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"progressive \",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      }
+    },
+    {
+      "name": "null-cache-json",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello with null cache counters.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "fixture hello",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0009",
+              "model": "fixture-openai-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 2,
+                "prompt_tokens": 10,
+                "total_tokens": 12
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Say hello with null cache counters.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "fixture hello",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0010",
+              "model": "claude-fixture-model",
+              "role": "assistant",
+              "stop_reason": "end_turn",
+              "type": "message",
+              "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null,
+                "output_tokens": 2
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

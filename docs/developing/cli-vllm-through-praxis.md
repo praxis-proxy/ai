@@ -260,15 +260,14 @@ export PRAXIS_PID=$!
 
 Praxis listens at `http://127.0.0.1:8080`.
 
-### Run Praxis from the official container image
+### Run Praxis from a container image
 
-Released images are published to
-[`ghcr.io/praxis-proxy/ai`](https://ghcr.io/praxis-proxy/ai). The `latest` tag
-tracks the most recent release; substitute a version tag such as `0.4` to pin
-one:
+The published image leaves experimental Responses and the agentic loop out.
+Build an image with an explicit opt-in for the examples in this guide:
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:latest
+docker build -f Containerfile -t praxis-ai-responses \
+  --build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite .
 ```
 
 The image entrypoint is `praxis-ai`, its working directory is `/etc/praxis`,
@@ -289,7 +288,7 @@ docker run -d --rm --name praxis-vllm \
   --network host \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
 Praxis listens at `http://127.0.0.1:8080`, and sections 3 through 5 apply
@@ -316,7 +315,7 @@ docker run -d --rm --name praxis-vllm \
   --add-host=host.docker.internal:host-gateway \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
 With Podman, both commands work unchanged. Podman also resolves
@@ -344,8 +343,8 @@ the cleanup section with `docker rm -f praxis-vllm`.
 
 #### The native Codex example needs a writable database path
 
-The image is built with `full,store-sqlite`, so `client-tool-compat.yaml` — the
-preferred native Codex example — runs on the stock image. The other three
+The custom image above includes `openai-all,store-sqlite`, so
+`client-tool-compat.yaml` — the preferred native Codex example — is available. The other three
 configurations in this section have no store filter and need no change at all.
 
 The one edit the store example does need is an absolute `database_url`. The
@@ -366,7 +365,7 @@ docker run -d --rm --name praxis-vllm \
   --network host \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
 The database then lives in the container's writable layer and disappears with
@@ -375,15 +374,10 @@ restarts, mount a volume at `/var/lib/praxis`: `-v praxis-state:/var/lib/praxis`
 with Podman adds `:U` to chown it to the container user, and a host directory
 needs `chown 100:100` (or `-m 0777`) before the first run.
 
-SQLite in the image landed after `v0.5.0`, so a pinned older tag still rejects
-the config at startup with
-`backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature`. Use
-`latest` or a tag newer than `v0.5.0`.
-
-The image can also serve this example with `backend: postgres`,
-`allow_private_database_url: true`, and a reachable PostgreSQL instance — see
-`examples/configs/openai/responses/response-store-postgres-mtls.yaml` — but for
-a single-developer CLI loop SQLite is less setup.
+The stock image rejects these experimental filters at startup. A custom image
+can also serve this example with PostgreSQL by selecting `store-postgres`
+instead of `store-sqlite`; see
+`examples/configs/openai/responses/response-store-postgres-mtls.yaml`.
 
 ## 3. Connect Codex
 

@@ -17,7 +17,7 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
@@ -145,7 +145,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite` first"
     )
 
 
@@ -5762,7 +5762,12 @@ def nemo_guardrails_server():
 
 @pytest.fixture(scope="session")
 def agentic_proxy(
-    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+    tmp_path_factory,
+    request,
+    mcp_server,
+    search_server,
+    nemo_guardrails_server,
+    compaction_server,
 ):
     """Start a Praxis proxy with the native Responses agentic loop."""
     port = _free_port()
@@ -5773,6 +5778,9 @@ def agentic_proxy(
         db_path,
         backend_endpoint=_vllm_endpoint(),
         nemo_port=nemo_guardrails_server,
+        # Route the openai_responses_compact summarization callout at the
+        # deterministic mock so the budgeted explicit-compact test is stable.
+        compact_inference_port=compaction_server,
     )
     binary = _find_binary()
 
@@ -6944,6 +6952,80 @@ class TestAgenticLoopVLLM:
             "the untrusted direct target must never be dispatched in protected mode"
         )
 
+    def test_retained_budget_allows_default_store_for_plain_text(self, agentic_client):
+        """The default Store path persists a bounded plain text response."""
+        response = agentic_client.responses.create(model=VLLM_MODEL, input="Hello")
+        stored = agentic_client.responses.retrieve(response.id)
+        assert stored.id == response.id, "the bounded response must be retrievable"
+
+    def test_retained_budget_allows_text_message_array(self, agentic_client):
+        """The usual SDK message-array form stays available with a budget."""
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=[{"role": "user", "content": "Reply briefly: Hello."}],
+            store=False,
+        )
+        assert response.status == "completed", response
+
+    def test_retained_budget_allows_buffered_chat_translation(
+        self, translated_agentic_client
+    ):
+        """A normal SDK create still works through the bounded Chat adapter."""
+        response = translated_agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply briefly to this greeting: Hello.",
+            stream=False,
+            store=False,
+        )
+        assert response.status == "completed", response
+        assert response.object == "response", response
+
+    def test_retained_budget_restores_previous_plain_response(self, agentic_client):
+        """A stored text turn can be resumed with a request-wide budget."""
+        first = agentic_client.responses.create(model=VLLM_MODEL, input="Say hello briefly")
+        second = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say goodbye briefly",
+            previous_response_id=first.id,
+            store=False,
+        )
+        assert second.id != first.id
+        assert second.previous_response_id == first.id
+
+    def test_retained_budget_appends_plain_conversation(self, agentic_client):
+        """Two budgeted text turns persist and replay through Conversations."""
+        conversation = agentic_client.conversations.create()
+        try:
+            first = agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say hello briefly",
+                conversation=conversation.id,
+                store=False,
+            )
+            second = agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say goodbye briefly",
+                conversation=conversation.id,
+                store=False,
+            )
+            assert first.status == "completed"
+            assert second.status == "completed"
+            items = agentic_client.conversations.items.list(conversation.id, order="asc")
+            assert len(items.data) >= 4, "both input and output turns must be appended"
+        finally:
+            agentic_client.conversations.delete(conversation.id)
+
+    def test_retained_budget_explicit_compact(self, agentic_client):
+        """The SDK can compact inline input and retrieve the bounded result."""
+        compacted = agentic_client.responses.compact(
+            model=VLLM_MODEL,
+            input="Summarize this short exchange.",
+        )
+        assert compacted.object == "response.compaction", compacted
+        assert compacted.output, compacted
+        retrieved = agentic_client.responses.retrieve(compacted.id)
+        assert retrieved.id == compacted.id
+
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
     ):
@@ -7400,7 +7482,7 @@ class TestAgenticLoopVLLM:
         assert not any(item.type == "mcp_call" for item in response.output), (
             response.output
         )
-        
+
     @qualification_profile("supporting")
     def test_mcp_oversized_call_id_fails_closed_before_dispatch(
         self,
@@ -9642,11 +9724,12 @@ def _drain_response_stream(stream):
     """Consume a Responses SSE stream.
 
     Returns the ordered event types, every output item announced via
-    output_item.added/.done, and the terminal response status.
+    output_item.added/.done, and the terminal response status and output.
     """
     event_types = []
     output_items = []
     terminal_status = None
+    terminal_output = []
     for event in stream:
         event_types.append(event.type)
         if event.type in (
@@ -9656,7 +9739,8 @@ def _drain_response_stream(stream):
             output_items.append(event.item)
         if event.type in ("response.completed", "response.incomplete"):
             terminal_status = event.response.status
-    return event_types, output_items, terminal_status
+            terminal_output = event.response.output
+    return event_types, output_items, terminal_status, terminal_output
 
 
 class TestFileSearchStreamingVLLM:
@@ -9699,7 +9783,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=2048,
         )
 
-        event_types, output_items, terminal_status = _drain_response_stream(
+        event_types, output_items, terminal_status, terminal_output = _drain_response_stream(
             stream
         )
 
@@ -9723,6 +9807,14 @@ class TestFileSearchStreamingVLLM:
             "a hosted file_search_call item must be announced on the stream; "
             f"got event types: {event_types}"
         )
+        announced_ids = {item.id for item in file_search_items}
+        terminal_ids = {
+            item.id for item in terminal_output if item.type == "file_search_call"
+        }
+        assert terminal_ids == announced_ids, (
+            "the terminal output must retain each announced file-search ID; "
+            f"announced={announced_ids}, terminal={terminal_ids}"
+        )
         for item in file_search_items:
             assert item.status in ("searching", "completed", "incomplete"), (
                 "file_search_call status should be a known lifecycle state; "
@@ -9744,7 +9836,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=512,
         )
 
-        event_types, output_items, _status = _drain_response_stream(stream)
+        event_types, output_items, _status, _terminal_output = _drain_response_stream(stream)
 
         # The #756/#313 logical stream unifies the search round and the
         # terminal re-inference round into ONE client-visible envelope.

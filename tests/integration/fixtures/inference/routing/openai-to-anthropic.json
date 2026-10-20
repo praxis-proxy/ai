@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "09b2423e218d28725c168e07f31a23f3df558fb2813a9703d157ec343286eda2"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "09b2423e218d28725c168e07f31a23f3df558fb2813a9703d157ec343286eda2"
+  },
+  "scope": {
+    "network": "fixture-network",
+    "gateway": "fixture-gateway",
+    "namespace": "grid-fixture",
+    "local_site": "fixture-site"
+  },
+  "provenance": {
+    "producer": "praxis-ai-inference-fixture",
+    "producer_version": "1",
+    "source_name": "fixture-network",
+    "source_uid": "fixture-only",
+    "source_generation": 1,
+    "rendered_at": "2026-10-17T00:00:00Z"
+  },
+  "overlay": {
+    "local_site": "fixture-site",
+    "network": "fixture-network",
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "fixture-openai-model",
+        "site": "fixture-site",
+        "cluster": "anthropic-backend",
+        "fresh": true,
+        "stable_id": "fixture-anthropic-candidate",
+        "api_format": "messages",
+        "path": "/v1/messages",
+        "target_model": "claude-fixture-model",
+        "credential": {
+          "strategy": "apikey",
+          "secretRef": {
+            "name": "anthropic-fixture-secret",
+            "namespace": "grid-fixture",
+            "key": "api-key"
+          }
+        }
+      }
+    ]
+  }
+}
