@@ -2057,7 +2057,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        for feature in &manifest.features[77..85] {
+        for feature in &manifest.features[77..86] {
             assert_eq!(
                 feature
                     .providers
