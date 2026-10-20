@@ -699,11 +699,10 @@ fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
         Some("server_error"),
         "stream exhaustion must be reported as a server_error"
     );
-    assert!(
-        ctx.get_metadata("responses.stream_error_message")
-            .unwrap()
-            .contains("max_retained_bytes"),
-        "the terminal error must name the retained-payload overflow"
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("The request exceeds a processing limit set by the platform administrator."),
+        "the terminal error must use the sanitized client-facing message"
     );
     assert_eq!(
         ctx.get_metadata("responses.skip_persist"),
