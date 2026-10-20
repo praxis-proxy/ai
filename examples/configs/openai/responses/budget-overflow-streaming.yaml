@@ -1,5 +1,6 @@
 # Committed-stream retained-payload overflow (Responses streaming)
-# Requires `--features openai-responses` because these filters are opt-in.
+# Requires `--features openai-agentic-loop` (experimental, off by default; it
+# transitively enables openai-responses) because this chain uses openai_agentic_loop.
 #
 # Demonstrates the terminal-failure contract when an upstream Responses SSE
 # stream overflows the request-wide retained-payload budget AFTER the client

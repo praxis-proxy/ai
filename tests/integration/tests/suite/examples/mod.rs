@@ -22,7 +22,7 @@ mod aws_sigv4;
 mod azure_ad;
 mod azure_translation;
 mod bedrock;
-#[cfg(feature = "store-sqlite")]
+#[cfg(feature = "openai-agentic-loop")]
 mod budget_overflow_streaming;
 #[cfg(feature = "openai-agentic-loop")]
 #[cfg(feature = "store-sqlite")]
