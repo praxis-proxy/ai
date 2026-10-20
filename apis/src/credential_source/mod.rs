@@ -1,9 +1,8 @@
 //! Shared credential source (`value | env_var | file`) with bounded reads,
 //! restart-free file rotation, and fail-closed publication.
 //!
-//! Used by the web-search filters (`apis`) and, imported upward, by
-//! `credential_inject` (`filters`). See
-//! `docs/superpowers/specs/2026-09-21-shared-credential-source-design.md`.
+//! Used by the web-search filters (`apis`) and the external metering filter
+//! (`filters`).
 
 use std::sync::Arc;
 
@@ -191,8 +190,9 @@ pub(crate) fn resolve_raw_token(
 ) -> Result<Zeroizing<String>, FilterError> {
     match source {
         CredentialSource::Value(value) => {
-            file::validate_token(value, ctx.owner)?;
-            Ok(value.clone())
+            let token = value.trim();
+            file::validate_token(token, ctx.owner)?;
+            Ok(Zeroizing::new(token.to_owned()))
         },
         CredentialSource::EnvVar(name) => {
             file::validate_source_len("env_var", name, ctx.owner)?;
@@ -201,15 +201,15 @@ pub(crate) fn resolve_raw_token(
                 Some(reference) => format!(" for '{reference}'"),
                 None => String::new(),
             };
-            let token = std::env::var(name).map_err(|error| -> FilterError {
+            let token = Zeroizing::new(std::env::var(name).map_err(|error| -> FilterError {
                 let detail = match error {
                     std::env::VarError::NotPresent => "not set",
                     std::env::VarError::NotUnicode(_) => "not valid UTF-8",
                 };
                 format!("{owner}: env var '{name}' {detail}{for_ref}").into()
-            })?;
+            })?);
             file::validate_token(&token, ctx.owner)?;
-            Ok(Zeroizing::new(token))
+            Ok(token)
         },
         CredentialSource::File(path) => {
             file::validate_source_len("file", path, ctx.owner)?;
@@ -357,6 +357,21 @@ mod tests {
         let src = CredentialSource::Value(Zeroizing::new("inline-tok".to_owned()));
         let (handle, watch) = build_one(ctx, &src, identity_transform()).unwrap();
         assert!(watch.is_none(), "value source must not spawn a watcher");
+        assert_eq!(
+            handle.current().payload.as_deref().map(String::as_str),
+            Some("inline-tok")
+        );
+    }
+
+    #[test]
+    fn build_one_value_trims_surrounding_whitespace() {
+        let ctx = DiagnosticContext {
+            owner: "test",
+            reference: None,
+        };
+        let src = CredentialSource::Value(Zeroizing::new("  inline-tok \n".to_owned()));
+        let (handle, watch) = build_one(ctx, &src, identity_transform()).unwrap();
+        assert!(watch.is_none());
         assert_eq!(
             handle.current().payload.as_deref().map(String::as_str),
             Some("inline-tok")

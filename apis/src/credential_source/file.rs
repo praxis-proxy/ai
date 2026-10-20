@@ -19,7 +19,7 @@ fn for_reference(ctx: &DiagnosticContext) -> String {
 }
 
 /// Reject an empty (trimmed) or oversized token. `owner` qualifies the error
-/// with the owning filter name (spec §7).
+/// with the owning filter name.
 pub(crate) fn validate_token(token: &str, owner: &str) -> Result<(), FilterError> {
     if token.trim().is_empty() || token.len() > MAX_TOKEN_BYTES {
         return Err(format!("{owner}: credential token must contain 1-{MAX_TOKEN_BYTES} bytes").into());
@@ -28,7 +28,7 @@ pub(crate) fn validate_token(token: &str, owner: &str) -> Result<(), FilterError
 }
 
 /// Reject an empty or oversized env-var name / file path. `owner` qualifies the
-/// error with the owning filter name (spec §7).
+/// error with the owning filter name.
 pub(crate) fn validate_source_len(kind: &str, value: &str, owner: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_SOURCE_LEN {
         return Err(format!("{owner}: {kind} must contain 1-{MAX_SOURCE_LEN} bytes").into());
@@ -126,7 +126,7 @@ mod tests {
     fn invalid_utf8_file_rejected_without_leaking_bytes() {
         // A projected file whose bytes are not valid UTF-8 must fail closed, and
         // the underlying `read_to_string` error (`ErrorKind::InvalidData`) must
-        // never surface the raw non-UTF-8 bytes in the diagnostic (spec §7).
+        // never surface the raw non-UTF-8 bytes in the diagnostic.
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[0xFF, 0xFE]).unwrap();
         let err = read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).unwrap_err();
