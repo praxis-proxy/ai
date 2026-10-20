@@ -49,17 +49,19 @@ make container-fips # FIPS runtime image on UBI 9 (see docs/fips.md)
 Run a single test:
 
 ```console
-cargo test -p praxis-ai-apis --features full -- test_name
-cargo test -p praxis-ai-filters --features full -- test_name
-cargo test -p praxis-ai-proxy --features full -- test_name
+cargo test -p praxis-ai-apis --features full,openai-all,store-all -- test_name
+cargo test -p praxis-ai-filters --features full,openai-all,store-all -- test_name
+cargo test -p praxis-ai-proxy --features full,openai-all,store-all -- test_name
 ```
 
-The `praxis-ai-proxy` production binary defaults to `full`, including the
-PostgreSQL-backed OpenAI Responses and Conversations APIs. The library crates
-retain the lean `standard` default, so their tests for opt-in OpenAI groups are
-compiled out without `--features full` (or the group's own feature). A name
-filter that matches only compiled-out tests reports "0 passed" and exits
-successfully.
+The `praxis-ai-proxy` production binary defaults to `full` (currently `standard`).
+Responses and its stores are experimental and off by default. The independent
+`openai-agentic-loop` feature enables the ephemeral agent and requires Responses;
+both select the passive `experimental` marker. Use `openai-all` to explicitly
+opt in to all OpenAI groups, plus `store-sqlite` or `store-postgres` as needed.
+A test name filter that matches only compiled-out tests reports "0 passed" and
+exits successfully. Developer `cargo xtask` commands opt in through the alias;
+plain workspace builds do not.
 
 ## Architecture
 

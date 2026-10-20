@@ -20,6 +20,8 @@ see the [Praxis core filter reference][core-ref].
 | [`anthropic_messages_to_chat_completions`](anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
 | [`anthropic_messages_to_chat_completions_stream`](anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
+| [`openai_chat_completions_to_anthropic`](openai_chat_completions_to_anthropic.md) | Translates OpenAI Chat Completions requests only when the selected `ExternalModel` candidate uses Anthropic Messages; OpenAI candidates pass through with their configured path and model. |
+| [`openai_chat_completions_to_anthropic_stream`](openai_chat_completions_to_anthropic_stream.md) | Converts the selected Anthropic provider's event stream incrementally. OpenAI-compatible candidates are left byte-for-byte unchanged. |
 
 ### Azure
 

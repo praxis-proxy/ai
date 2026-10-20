@@ -24,14 +24,12 @@ changes; drift here breaks no build (the guards above do the enforcing).
 
 The proxy ships two profiles and the inventory tracks both:
 
-- **full** — `standard` + `openai-all` + `store-postgres` (`make release`, the
-  production PostgreSQL backend). The **published container image** additionally
-  enables `store-sqlite` (builds `full,store-sqlite`) so it can also serve the
-  SQLite-backed examples. SQLite ships no cryptographic primitive (no SQLCipher),
-  so the crypto surface of the container equals that of `full`.
-- **fips** — the reduced FIPS runtime, built `--no-default-features` with the
-  feature set shared from `xtask/src/fips.rs::FIPS_FEATURES`
-  (`openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth`).
+- **full** — currently `standard` (`make release` and the published container).
+  Experimental Responses, the agentic loop and stores require explicit opt-in.
+- **fips** — the reduced FIPS runtime, built `--no-default-features` with
+  `aws-sigv4-filter`, shared from `xtask/src/fips.rs::FIPS_FEATURES`.
+  The certificate-only PostgreSQL profile is an experimental opt-in.
+
 
 `fips ⊆ full`: the FIPS runtime is a subset of the published image. FIPS itself
 is **host-activated** (see [`docs/fips.md`](../fips.md)); no build feature

@@ -37,8 +37,7 @@ use clap::{Parser, Subcommand};
 /// This is the single Rust-side source of truth for the FIPS profile; it must
 /// stay in sync with `FIPS_FEATURES` in the `Makefile`. The runtime probe
 /// references this constant rather than re-spelling the literal.
-pub(crate) const FIPS_FEATURES: &str =
-    "openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth";
+pub(crate) const FIPS_FEATURES: &str = "aws-sigv4-filter";
 
 // -----------------------------------------------------------------------------
 // CLI Arguments

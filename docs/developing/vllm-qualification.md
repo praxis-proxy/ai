@@ -87,7 +87,7 @@ the workflow, build the gateway and run the existing suite with the reporting
 plugin:
 
 ```console
-cargo build -p praxis-ai-proxy --features full
+cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
 PRAXIS_QUALIFICATION_RESULTS=/tmp/responses-cases.json \
   DATABASE_URL=postgres://praxis:praxis@127.0.0.1:5432/praxis \
   VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \

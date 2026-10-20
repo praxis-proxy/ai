@@ -7,7 +7,7 @@
 //!
 //! ```console
 //! PRAXIS_TEST_CODEX_BIN=/absolute/path/to/codex \
-//!   cargo test -p praxis-tests-integration --test suite \
+//!   cargo test -p praxis-tests-integration --features openai-all --test suite \
 //!   codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
 //! ```
 //!

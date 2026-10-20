@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    descriptor::{
+        self, AdmissionState, CandidateConfig, CapabilityKind, ProviderApiFormat, ProviderProfile, RouteCandidate,
+    },
     group_index::{self, GroupIndex},
     metadata::{CandidateCredential, CredentialRef},
     metrics::{self, ReloadResult},
@@ -64,6 +66,9 @@ const WATCHER_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum length of envelope scope and provenance string fields.
 const MAX_ENVELOPE_FIELD_LEN: usize = 256;
+
+/// Request metadata carries the selected provider path with this value limit.
+const MAX_PROVIDER_PATH_LEN: usize = 256;
 
 // -----------------------------------------------------------------------------
 // Contract format
@@ -314,6 +319,18 @@ pub(crate) struct OverlayCandidate {
     /// Deterministic identifier assigned by the configuration producer.
     #[serde(default)]
     pub(crate) stable_id: Option<String>,
+
+    /// Trusted provider API format, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) api_format: Option<String>,
+
+    /// Trusted provider request path, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+
+    /// Trusted provider target model, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) target_model: Option<String>,
 }
 
 /// Default freshness for overlay candidates.
@@ -552,6 +569,11 @@ impl RouteSnapshot {
             .map_err(|e| FilterError::from(format!("routing: overlay parse error: {e}")))?;
 
         descriptor::validate_local_site(&doc.local_site)?;
+        if doc.candidates.iter().any(|candidate| {
+            candidate.api_format.is_some() || candidate.path.is_some() || candidate.target_model.is_some()
+        }) {
+            return Err("routing: provider profiles require a versioned content-addressed overlay".into());
+        }
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
@@ -855,6 +877,115 @@ pub(super) fn enrich_from_overlay(
             }
             c.stable_id = Arc::from(id.as_str());
         }
+        enrich_provider_profile(i, c, oc)?;
+    }
+    Ok(())
+}
+
+/// Validate and copy an optional trusted provider profile from one overlay entry.
+fn enrich_provider_profile(
+    index: usize,
+    candidate: &mut RouteCandidate,
+    overlay: &OverlayCandidate,
+) -> Result<(), FilterError> {
+    let (api_format, path, target_model) = match (
+        overlay.api_format.as_deref(),
+        overlay.path.as_deref(),
+        overlay.target_model.as_deref(),
+    ) {
+        (None, None, None) => return Ok(()),
+        (Some(api_format), Some(path), Some(target_model)) => (api_format, path, target_model),
+        _ => {
+            return Err(format!(
+                "routing: candidate {index}: api_format, path, and target_model must be supplied together"
+            )
+            .into());
+        },
+    };
+    if overlay.stable_id.is_none() {
+        return Err(format!("routing: candidate {index}: provider profile requires stable_id").into());
+    }
+    let profile = ProviderProfile {
+        api_format: validate_provider_api_format(index, api_format)?,
+        path: Arc::from(path),
+        target_model: Arc::from(target_model),
+    };
+    validate_provider_profile(index, candidate.kind, candidate.credential.as_ref(), &profile)?;
+    candidate.provider_profile = Some(profile);
+    Ok(())
+}
+
+/// Reject incomplete, unsupported, or unsafe provider profiles before a new
+/// overlay snapshot can replace the last-known-good serving snapshot.
+fn validate_provider_profile(
+    index: usize,
+    kind: CapabilityKind,
+    credential: Option<&CandidateCredential>,
+    profile: &ProviderProfile,
+) -> Result<(), FilterError> {
+    validate_provider_kind(index, kind)?;
+    validate_provider_path(index, &profile.path)?;
+    validate_provider_target_model(index, &profile.target_model)?;
+    validate_provider_credential(index, profile.api_format, credential)
+}
+
+/// Ensure selected provider profiles are attached only to inference routes.
+fn validate_provider_kind(index: usize, kind: CapabilityKind) -> Result<(), FilterError> {
+    if kind != CapabilityKind::InferenceModel {
+        return Err(format!("routing: candidate {index}: provider profiles require inference_model kind").into());
+    }
+    Ok(())
+}
+
+/// Ensure the provider dialect is one the translation dispatcher understands.
+fn validate_provider_api_format(index: usize, api_format: &str) -> Result<ProviderApiFormat, FilterError> {
+    match api_format {
+        "openai-chat" => Ok(ProviderApiFormat::OpenAiChat),
+        "messages" => Ok(ProviderApiFormat::Messages),
+        other => Err(format!("routing: candidate {index}: unsupported api_format {other:?}").into()),
+    }
+}
+
+/// Ensure the provider request target is a safe absolute path without a query.
+fn validate_provider_path(index: usize, path: &str) -> Result<(), FilterError> {
+    if path.is_empty()
+        || path.len() > MAX_PROVIDER_PATH_LEN
+        || !path.starts_with('/')
+        || path
+            .chars()
+            .any(|character| matches!(character, '?' | '#' | '\r' | '\n'))
+        || path.parse::<http::uri::PathAndQuery>().is_err()
+    {
+        return Err(format!(
+            "routing: candidate {index}: path must be a valid absolute-path request target of at most {MAX_PROVIDER_PATH_LEN} bytes"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Ensure the provider model name is bounded and contains no control bytes.
+fn validate_provider_target_model(index: usize, target_model: &str) -> Result<(), FilterError> {
+    if target_model.trim().is_empty()
+        || target_model.len() > 256
+        || target_model.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(format!("routing: candidate {index}: target_model must be 1-256 printable bytes").into());
+    }
+    Ok(())
+}
+
+/// Require an API-key Secret reference for Anthropic Messages providers.
+fn validate_provider_credential(
+    index: usize,
+    api_format: ProviderApiFormat,
+    credential: Option<&CandidateCredential>,
+) -> Result<(), FilterError> {
+    if api_format == ProviderApiFormat::Messages && credential.is_none_or(|value| value.strategy != "apikey") {
+        return Err(format!(
+            "routing: candidate {index}: messages provider profile requires an apikey credential reference"
+        )
+        .into());
     }
     Ok(())
 }
@@ -2233,6 +2364,89 @@ mod tests {
             "overlay": overlay_obj
         }))
         .unwrap()
+    }
+
+    /// Create a content-addressed overlay with an optional provider profile.
+    fn make_provider_profile_overlay(
+        api_format: Option<&str>,
+        path: Option<&str>,
+        target_model: Option<&str>,
+    ) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&make_envelope_json("site-a", "m", "provider", "net")).unwrap();
+        let candidate = &mut value["overlay"]["candidates"][0];
+        candidate["stable_id"] = serde_json::json!("model/provider-a");
+        if let Some(api_format) = api_format {
+            candidate["api_format"] = serde_json::json!(api_format);
+        }
+        if let Some(path) = path {
+            candidate["path"] = serde_json::json!(path);
+        }
+        if let Some(target_model) = target_model {
+            candidate["target_model"] = serde_json::json!(target_model);
+        }
+        if api_format == Some("messages") {
+            candidate["credential"] = serde_json::json!({
+                "strategy":"apikey",
+                "secretRef":{"name":"provider-key","namespace":"ns","key":"api-key"}
+            });
+        }
+        let digest = compute_semantic_digest(&value["overlay"]).unwrap();
+        value["revision"]["value"] = serde_json::json!(digest);
+        value["content_digest"]["value"] = value["revision"]["value"].clone();
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn provider_profile_is_complete_or_absent_and_rejects_malformed_values() {
+        let complete = make_provider_profile_overlay(Some("messages"), Some("/v1/messages"), Some("claude-test"));
+        let snapshot = RouteSnapshot::from_overlay(complete.as_bytes()).unwrap();
+        let profile = snapshot.candidates[0]
+            .provider_profile
+            .as_ref()
+            .expect("complete trusted profile should be retained");
+        assert_eq!(profile.api_format, ProviderApiFormat::Messages);
+        assert_eq!(profile.path.as_ref(), "/v1/messages");
+        assert_eq!(profile.target_model.as_ref(), "claude-test");
+
+        let absent = make_provider_profile_overlay(None, None, None);
+        let snapshot = RouteSnapshot::from_overlay(absent.as_bytes()).unwrap();
+        assert!(snapshot.candidates[0].provider_profile.is_none());
+
+        for (malformed, expected_error) in [
+            (
+                make_provider_profile_overlay(Some("messages"), Some("/v1/messages"), None),
+                "api_format, path, and target_model must be supplied together",
+            ),
+            (
+                make_provider_profile_overlay(Some("custom-format"), Some("/v1/messages"), Some("claude-test")),
+                "unsupported api_format",
+            ),
+        ] {
+            let error = RouteSnapshot::from_overlay(malformed.as_bytes())
+                .expect_err("partial and unknown provider profiles must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_path_must_fit_request_metadata() {
+        let accepted = format!("/{}", "x".repeat(255));
+        let overlay = make_provider_profile_overlay(Some("messages"), Some(&accepted), Some("claude-test"));
+        assert!(
+            RouteSnapshot::from_overlay(overlay.as_bytes()).is_ok(),
+            "256-byte path should be accepted"
+        );
+
+        let rejected = format!("/{}", "x".repeat(256));
+        let overlay = make_provider_profile_overlay(Some("messages"), Some(&rejected), Some("claude-test"));
+        assert!(
+            RouteSnapshot::from_overlay(overlay.as_bytes()).is_err(),
+            "257-byte path should be rejected"
+        );
     }
 
     fn make_empty_envelope_json(local_site: &str, network: &str) -> String {

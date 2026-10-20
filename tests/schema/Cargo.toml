@@ -9,13 +9,15 @@ publish = false
 
 [features]
 # Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
-# default is `full` so a plain `cargo test -p <crate>` exercises every filter.
+# default is `full`; experimental filter suites require explicit opt-in.
 default = ["full"]
 standard = ["praxis-test-utils/standard"]
 # The signing filter alone, so the FIPS suite run can enable exactly the
 # feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
 aws-sigv4-filter = ["praxis-test-utils/aws-sigv4-filter"]
-openai-responses = ["praxis-test-utils/openai-responses"]
+openai-responses = ["experimental", "praxis-test-utils/openai-responses"]
+# Experimental ephemeral agent orchestration; separate from Responses support.
+openai-agentic-loop = ["openai-responses", "experimental", "praxis-test-utils/openai-agentic-loop"]
 openai-file-resolve-filter = ["openai-responses", "praxis-test-utils/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-test-utils/store"]
 store-postgres = ["store", "praxis-test-utils/store-postgres"]
@@ -25,8 +27,10 @@ store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-test-utils/openai-conversations"]
 openai-compact = ["store", "praxis-test-utils/openai-compact"]
 openai-mcp-tools = ["store", "praxis-test-utils/openai-mcp-tools"]
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
-full = ["standard", "openai-all", "store-postgres"]
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["standard"]
+# Passive marker; experimental capabilities remain individually selected.
+experimental = ["praxis-test-utils/experimental"]
 praxis-main = ["praxis-test-utils/praxis-main"]
 
 [lints]

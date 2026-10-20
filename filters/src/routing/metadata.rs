@@ -58,6 +58,14 @@ pub(crate) const ROUTE_SELECTION_TIER: &str = "intelligent_route.selection_tier"
 pub(crate) const ROUTE_SITE: &str = "intelligent_route.site";
 /// Stable identifier for the selected candidate.
 pub(crate) const ROUTE_STABLE_ID: &str = "intelligent_route.stable_id";
+/// Trusted provider API format from the selected overlay candidate.
+pub(crate) const ROUTE_API_FORMAT: &str = "intelligent_route.api_format";
+/// Trusted provider request path from the selected overlay candidate.
+pub(crate) const ROUTE_PATH: &str = "intelligent_route.path";
+/// Trusted upstream model from the selected overlay candidate.
+pub(crate) const ROUTE_TARGET_MODEL: &str = "intelligent_route.target_model";
+/// Serving content-addressed overlay revision used for this selection.
+pub(crate) const ROUTE_OVERLAY_REVISION: &str = "intelligent_route.overlay_revision";
 /// Hop request ID forwarded to the provider gateway.
 pub(crate) const ROUTE_PROVIDER_HOP_REQUEST_ID: &str = "intelligent_route.provider_hop_request_id";
 /// How the request left the filter (`routed`, `reused`, `no_candidate`,

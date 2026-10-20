@@ -15,22 +15,21 @@ and how the tooling works is in [FIPS Tooling](developing/fips.md).
 
 ## The FIPS build
 
-The standard build enables every non-experimental filter (`full`); the image
-(`make container`) adds the SQLite store backend on top of it. The FIPS build
-turns off what is known not to be FIPS compliant yet, so nobody has to know
-which features to pick:
+The standard build and image enable every non-experimental filter (`full`).
+The FIPS build also excludes the policy engine. Neither enables experimental
+Responses, stores or the agentic loop by default:
 
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` (`full,store-sqlite` in the image) | `openai-responses`, `openai-file-resolve-filter`, `aws-sigv4-filter`, `store-postgres-cert-auth` |
-| Responses API kernel (`openai_responses_*`, `openai_responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
+| Cargo features | `full` | `aws-sigv4-filter` |
+| Responses API and agentic loop | experimental opt-in | experimental opt-in |
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
-| PostgreSQL Responses store | yes | yes: certificate-only SQLx profile through system OpenSSL |
-| SQLite store, Conversations API, context compaction, MCP tools | yes | no: their additional dependency boundaries have not been cleared for this profile |
-| `openai_file_resolve` | yes | yes: uses the shared subrequest transport |
-| `azure_ad`, `gcp_adc`, MCP tool dispatch | `full` / experimental | no: their dependency boundaries have not been cleared for this profile |
+| PostgreSQL Responses store | experimental opt-in | experimental opt-in: certificate-only SQLx profile through system OpenSSL |
+| SQLite store, Conversations API, context compaction, MCP tools | experimental opt-in | no: their additional dependency boundaries have not been cleared for this profile |
+| `openai_file_resolve` | experimental opt-in | experimental opt-in: uses the shared subrequest transport |
+| `azure_ad`, `gcp_adc`, MCP tool dispatch | experimental opt-in | no: their dependency boundaries have not been cleared for this profile |
 | Base image | Alpine, praxis-ai built with upstream Rust | `ubi9/ubi-minimal`, praxis-ai built with Red Hat's `rust-toolset` on `ubi9/ubi`, both pinned by digest and signature-verified |
 | OpenSSL | Alpine's, dynamically linked | UBI's, dynamically linked (`openssl-libs` and `openssl-fips-provider-so`), the validated module on a FIPS host |
 | Published tags | `<version>`, `<major>.<minor>`, `sha-<hash>` (see [image tags](release.md#image-tags)) | the same with a `-fips` suffix (`0.3.0-fips`) |
@@ -48,6 +47,11 @@ crates performing security-relevant cryptography in the image are the rustls
 protocol engine and the OpenSSL bindings that delegate every primitive to the
 system library; the rest of the crypto-adjacent crates in the image are
 listed in the exemption table at the end of this page.
+
+For the experimental Responses/certificate-authenticated store profile, use
+`make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,store-postgres-cert-auth`
+or pass the same list as `--build-arg CARGO_FEATURES=...` to `Containerfile.fips`.
+The agentic loop additionally requires `openai-agentic-loop`.
 
 The certificate-only store currently pins SQLx to commit `6736b97d` from a
 temporary fork. That commit makes migrations, PostgreSQL password

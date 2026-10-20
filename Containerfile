@@ -6,14 +6,9 @@
 
 FROM rust:1.99-alpine3.24 AS builder
 
-# Cargo features for the published binary. `full` keeps every non-experimental
-# filter; the proxy crate defaults to `full` while the library crates default
-# to the smaller `standard` feature set.
-# `store-sqlite` is added on top of `full` (which selects only the PostgreSQL
-# backend) so the image can also serve the SQLite-backed example configs without
-# a local rebuild. SQLx compiles SQLite into the binary through
-# `libsqlite3-sys/bundled`, so this adds no runtime package to stage 2.
-ARG PRAXIS_AI_FEATURES=full,store-sqlite
+# Published binaries exclude experimental Responses, agentic loops and stores.
+# Opt in with --build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite.
+ARG PRAXIS_AI_FEATURES=full
 
 # praxis-ai performs all of its cryptography in the system OpenSSL and links it
 # dynamically, so the musl target must not produce a static executable (the

@@ -1,4 +1,5 @@
 # Time to First Token (TTFT)
+# Requires `--features openai-responses` (experimental and off by default).
 #
 # Measures the elapsed time from request receipt to the first non-empty
 # SSE body chunk and records a praxis_ai_ttft_seconds Prometheus

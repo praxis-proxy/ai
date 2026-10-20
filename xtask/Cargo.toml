@@ -12,7 +12,7 @@ publish = false
 
 [features]
 # Everything except the FIPS tasks: the dev commands run the proxy and read the
-# OpenAI registries, so they build every non-experimental filter. Off inside
+# OpenAI registries. Experimental APIs require explicit `openai-all`. Off inside
 # the FIPS check image, which needs only `cargo xtask fips` and must not
 # compile the standard proxy build to get it.
 default = ["dev"]
@@ -33,6 +33,9 @@ dev = [
     "praxis-ai-apis/full",
     "praxis-test-utils/full",
 ]
+# Opt-in experimental OpenAI implementations used by conformance reports and
+# developer proxies. Does not affect default workspace builds.
+openai-all = ["dev", "praxis-ai/openai-all", "praxis-ai-apis/openai-all", "praxis-test-utils/openai-all"]
 # The previous name of the dev feature set, kept for callers.
 full = ["dev"]
 store-postgres = ["dev", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]

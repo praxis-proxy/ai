@@ -122,8 +122,8 @@ The production image is a minimal Alpine container:
   configuration read-only)
 - Writable state directory: `/var/lib/praxis`, owned by the `praxis` user, for
   backends that keep local files such as the SQLite response store
-- Cargo features: `full,store-sqlite` — `full` plus the SQLite store backend so
-  the SQLite-backed examples run without rebuilding the image
+- Cargo features: `full` — experimental Responses, agentic loops and stores
+  require a custom build with explicit [feature selection](features.md#cargo-features)
 
 The `-fips` image is the same binary's FIPS feature set on
 `ubi9/ubi-minimal`, built with Red Hat's `rust-toolset` and linked against
