@@ -133,16 +133,23 @@ pub(crate) enum McpDenyReason {
 
 #[cfg(feature = "openai-mcp-tools")]
 impl McpDenyReason {
-    /// Operator-facing explanation used in a truthful dispatch rejection.
+    /// Client-facing rejection text for a denied tool call.
+    ///
+    /// Returned to the caller in the tool-call error output, so it must describe
+    /// the outcome as an administrator decision in plain terms and must NOT leak
+    /// server configuration (mode names, trust levels, hint fields). Server-side
+    /// diagnostics use the typed variant (logged separately), not this string.
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::UntrustedSource => "tool denied: source is not an operator-trusted MCP tool service (protected mode)",
+            Self::UntrustedSource => "tool denied: its source is not approved by the administrator",
             Self::NoReadOnlyAuthority => {
-                "tool denied: source is not authoritative for read-only classification (protected read-only mode)"
+                "tool denied: the administrator allows only approved read-only tools, and this source is not approved to provide them"
             },
-            Self::Writable => "tool denied: trusted source classifies this tool as writable (protected read-only mode)",
+            Self::Writable => {
+                "tool denied: the administrator allows only read-only tools, and this tool can modify data"
+            },
             Self::UnverifiedReadOnly => {
-                "tool denied: read-only classification is missing, malformed, or conflicting (protected read-only mode)"
+                "tool denied: the administrator allows only read-only tools, and this tool could not be confirmed read-only"
             },
         }
     }
