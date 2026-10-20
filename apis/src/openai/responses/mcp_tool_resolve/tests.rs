@@ -5895,13 +5895,14 @@ async fn malformed_allowed_tools_string_rejects_before_rewrite() {
 // =========================================================================
 
 mod admission {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use serde_json::json;
 
     use super::super::{
         ConnectorTrust, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
-        McpToolVerdict, admit_tools, build_entry_resolution, protected_exclusion, trust_for_entry,
+        McpToolVerdict, admit_tools, build_entry_resolution, collect_deferred_connectors, protected_exclusion,
+        trust_for_entry,
     };
     use crate::openai::responses::mcp_admission::{McpAdmissionMode, McpDenyReason};
 
@@ -6208,6 +6209,58 @@ mod admission {
             Some(McpDenyReason::NoReadOnlyAuthority)
         );
         assert!(protected_exclusion(&connector, protected(true), &with(ConnectorTrust::CatalogAndReadOnly)).is_none());
+    }
+
+    #[test]
+    fn deferred_catalog_connector_excluded_from_discovery_under_require_read_only() {
+        // `collect_deferred_connectors` is the gate that keeps an excluded
+        // connector out of `openai_mcp_dispatch`'s deferred discovery, so dispatch
+        // never dials it. A `catalog` connector admits nothing under
+        // require_read_only and must not be queued; `catalog_and_read_only` (and
+        // `catalog` without require_read_only) still are.
+        let entry = json!({
+            "type": "mcp",
+            "server_label": "docs",
+            "connector_id": "gw",
+            "server_url": "https://gw.internal/mcp",
+            "defer_loading": true,
+        });
+        let queued = |level: ConnectorTrust, policy: McpAdmissionPolicy| {
+            let mut trust = HashMap::new();
+            trust.insert("gw".to_owned(), level);
+            collect_deferred_connectors(
+                std::slice::from_ref(&entry),
+                Duration::from_secs(5),
+                128,
+                1 << 20,
+                &trust,
+                policy,
+            )
+        };
+
+        assert!(
+            queued(ConnectorTrust::Catalog, protected(true)).is_empty(),
+            "a catalog connector under require_read_only must not be queued for deferred discovery"
+        );
+        assert!(
+            queued(ConnectorTrust::Untrusted, protected(true)).is_empty(),
+            "an untrusted connector is never queued in protected mode"
+        );
+        assert_eq!(
+            queued(ConnectorTrust::Catalog, protected(false)).len(),
+            1,
+            "a catalog connector is queued when read-only is not required"
+        );
+        assert_eq!(
+            queued(ConnectorTrust::CatalogAndReadOnly, protected(true)).len(),
+            1,
+            "a catalog_and_read_only connector is queued under require_read_only"
+        );
+        assert_eq!(
+            queued(ConnectorTrust::Untrusted, McpAdmissionPolicy::default()).len(),
+            1,
+            "advisory mode queues deferred connectors unchanged"
+        );
     }
 
     #[test]
