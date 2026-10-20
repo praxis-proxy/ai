@@ -3277,7 +3277,20 @@ fn commit_deferred_listings(
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
     detect_name_collisions(&expanded_tools, &generated_names)?;
     let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
-    check_json_body_size(&request_body, &state.input, max_rewritten_body_bytes)?;
+    // Measure the resolved current input (the tail of the backend history, which
+    // file/document resolution rewrites in place) alongside the expanded
+    // parameters, so the rewritten-body bound reflects what is actually sent even
+    // though `input` no longer lives in `request_body` (#1618). An unsupported
+    // scalar retained in `expanded` leaves this tail empty, avoiding a double count.
+    let input_start = state.messages.len().saturating_sub(state.input.len());
+    let resolved_input: Vec<&serde_json::Value> = state.messages.iter().skip(input_start).collect();
+    check_json_body_size(
+        &ExpandedBodyWithInput {
+            expanded: &request_body,
+            input: &resolved_input,
+        },
+        max_rewritten_body_bytes,
+    )?;
 
     let retained = if let Some(slot) = budget {
         let mut charge = request_body
@@ -3349,20 +3362,51 @@ fn expanded_request_body(
     body
 }
 
-/// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
+/// Borrowed view of the expanded request plus the resolved current input, for an
+/// accurate rewritten-body size measurement.
 ///
-/// The current input lives outside `request_body` (params-only, #1618), so it is
-/// measured separately and added to the expanded body's size; an unsupported
-/// scalar still counted inside `body` contributes an empty `input` array here,
-/// which is a negligible over-estimate for a fail-closed bound.
-fn check_json_body_size<I: serde::Serialize + ?Sized>(
-    body: &serde_json::Value,
-    input: &I,
+/// The current input lives outside `request_body` (params-only, #1618), and after
+/// file/document resolution its *resolved* payload lives in the message history,
+/// not in the original `input` snapshot. Serializing the expanded parameters with
+/// the resolved current-input tail re-attached — rather than summing sizes —
+/// counts both the resolved payload and the `"input"` member framing, matching the
+/// pre-#1618 whole-body measurement without cloning.
+struct ExpandedBodyWithInput<'a> {
+    /// Expanded parameters (tools expanded, `input` absent unless an unsupported
+    /// scalar was retained there).
+    expanded: &'a serde_json::Value,
+    /// Resolved current-input items (the tail of the backend history).
+    input: &'a [&'a serde_json::Value],
+}
+
+impl serde::Serialize for ExpandedBodyWithInput<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        let Some(object) = self.expanded.as_object() else {
+            return self.expanded.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(None)?;
+        let mut wrote_input = false;
+        for (name, value) in object {
+            if name == "input" {
+                wrote_input = true;
+            }
+            map.serialize_entry(name, value)?;
+        }
+        if !wrote_input {
+            map.serialize_entry("input", &self.input)?;
+        }
+        map.end()
+    }
+}
+
+/// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
+fn check_json_body_size<B: serde::Serialize + ?Sized>(
+    body: &B,
     max_rewritten_body_bytes: usize,
 ) -> Result<(), ResolveError> {
-    let actual = serialized_len(body)
-        .map_err(ResolveError::Serialization)?
-        .saturating_add(serialized_len(input).map_err(ResolveError::Serialization)?);
+    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
     if actual > max_rewritten_body_bytes {
         return Err(ResolveError::BodyTooLarge {
             actual,

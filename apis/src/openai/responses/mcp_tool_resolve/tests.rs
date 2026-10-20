@@ -70,23 +70,39 @@ fn declares_dual_phase_body_access() {
 }
 
 #[test]
-fn check_json_body_size_counts_retained_input() {
-    // The current input lives outside request_body (params-only, #1618). Params
-    // alone fit under the cap, but params + the separately-held input exceed it,
-    // so the input must be counted toward the rewritten-body limit.
-    let params = serde_json::json!({"model": "m", "tools": []});
-    let big_input = serde_json::json!([{"role": "user", "content": "x".repeat(4096)}]);
+fn check_json_body_size_counts_resolved_current_input() {
+    // The current input lives outside request_body (params-only, #1618) and its
+    // resolved payload lives in the message-history tail. The expanded params fit
+    // the cap, but params + the resolved current input exceed it, so the input
+    // must be counted toward the rewritten-body limit.
+    let expanded = serde_json::json!({"model": "m", "tools": []});
+    let big = serde_json::json!({"role": "user", "content": "x".repeat(4096)});
+    let big_tail = [&big];
     let cap = 1024;
+    let empty: [&serde_json::Value; 0] = [];
     assert!(
-        check_json_body_size(&params, &serde_json::json!([]), cap).is_ok(),
-        "small params with empty input fit under the cap"
+        check_json_body_size(
+            &ExpandedBodyWithInput {
+                expanded: &expanded,
+                input: &empty
+            },
+            cap
+        )
+        .is_ok(),
+        "expanded params with empty input fit under the cap"
     );
     assert!(
         matches!(
-            check_json_body_size(&params, &big_input, cap),
+            check_json_body_size(
+                &ExpandedBodyWithInput {
+                    expanded: &expanded,
+                    input: &big_tail
+                },
+                cap
+            ),
             Err(ResolveError::BodyTooLarge { .. })
         ),
-        "the retained input must be counted toward the body-size cap"
+        "the resolved current input must be counted toward the body-size cap"
     );
 }
 
