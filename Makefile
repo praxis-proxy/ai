@@ -308,7 +308,7 @@ lint-clippy:
 # links, README/registry/coverage sync checks) plus the FIPS dependency guard.
 # The first `cargo xtask` builds the full product tree once; grouping these
 # isolates that build from the clippy passes so the two halves run in parallel.
-lint-xtask:
+lint-xtask: lint-license-headers
 	cargo xtask lint-deps
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
@@ -326,6 +326,17 @@ lint-xtask:
 	cargo xtask check-vector-stores-registry
 	cargo xtask openresponses-coverage
 	cargo xtask translation-matrix
+
+# Rust sources in this workspace use Apache-2.0. Catch accidental MIT headers
+# before the xtask lints; git grep limits the check to tracked Rust source files.
+lint-license-headers:
+	@if git grep -n '^// SPDX-License-Identifier: MIT$$' -- '*.rs'; then \
+		echo "error: Rust source files must use the workspace Apache-2.0 SPDX header" >&2; \
+		exit 1; \
+	else \
+		status=$$?; \
+		if [ "$$status" -ne 1 ]; then exit "$$status"; fi; \
+	fi
 
 # Lint the product crates with only the default-on gates. `-p` without
 # `--workspace` keeps test-crate features from unifying in and hiding leaks.
@@ -869,6 +880,7 @@ help:
 	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"
 	@echo "  lint-clippy          clippy (all feature sets) + rustfmt + dep budget + machete"
 	@echo "  lint-xtask           xtask meta lints (docs, registries, coverage) + FIPS dep guard"
+	@echo "  lint-license-headers reject incorrect MIT SPDX headers in Rust sources"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
