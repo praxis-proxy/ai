@@ -34,21 +34,15 @@ use serde_json::{Value, json};
 /// Cargo compiles `harness = false` bench targets with `--cfg test` (verified
 /// via `cargo bench --no-run -v`), so the module's `#[cfg(test)]` test code is
 /// included and its fixtures surface as dead code in a harness that never
-/// calls them. The `allow` below covers non-cargo compilations, such as
-/// rust-analyzer, where those module-level expectations may not fire.
-#[expect(
-    clippy::allow_attributes,
-    reason = "an `#[allow]` is required for compilation modes where the module-level expectations do not fire"
-)]
-#[allow(
-    unfulfilled_lint_expectations,
-    reason = "path-imported expectations only fire in compilations that include the cfg(test) module"
-)]
-#[expect(
-    dead_code,
-    unused_imports,
-    clippy::missing_docs_in_private_items,
-    reason = "bench target includes the cfg(test) module whose fixtures are dead in a benchmark harness"
+/// calls them. Apply the expectations only in that mode so compilations
+/// without the test module do not produce unfulfilled expectations.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        clippy::missing_docs_in_private_items,
+        reason = "bench target includes the cfg(test) module whose fixtures are dead in a benchmark harness"
+    )
 )]
 #[path = "../src/bedrock/converse/request.rs"]
 mod bedrock_request;

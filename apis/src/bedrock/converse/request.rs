@@ -766,7 +766,7 @@ fn translate_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, Stri
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use serde_json::Value;
 
@@ -865,6 +865,7 @@ mod tests {
     // ── Request semantics ────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn supported_request_fields_are_mapped() {
         let body = translate(
             r#"{"model":"m","messages":[],"max_completion_tokens":128,
@@ -878,6 +879,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn null_max_tokens_uses_max_completion_tokens_fallback() {
         let body = translate(r#"{"model":"m","messages":[],"max_tokens":null,"max_completion_tokens":128}"#);
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
@@ -986,6 +988,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stream_usage_false_and_omitted_are_disabled() {
         for stream_options in [None, Some(serde_json::json!({"include_usage": false}))] {
             let mut request = serde_json::json!({
@@ -1071,6 +1074,7 @@ mod tests {
     // ── System message extraction ─────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn system_role_hoisted_to_top_level() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1086,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn developer_role_hoisted_same_as_system() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1097,6 +1102,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn all_multipart_system_text_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1120,6 +1126,7 @@ mod tests {
     // ── User message ──────────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn user_string_content_wrapped_in_text_block() {
         let body = translate(r#"{"model":"m","messages":[{"role":"user","content":"Hello!"}]}"#);
         let msg = &body["messages"][0];
@@ -1128,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn user_multipart_text_parts_translated() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":[
@@ -1156,6 +1164,7 @@ mod tests {
     // ── Assistant message ─────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_text_content_wrapped() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1169,6 +1178,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_tool_calls_produce_tool_use_blocks() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1188,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_text_and_tool_calls_both_present() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1221,6 +1232,7 @@ mod tests {
     // ── Tool result message ───────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_role_becomes_user_with_tool_result_block() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1242,6 +1254,7 @@ mod tests {
     /// A translated tool result has the Bedrock `user` role, so it must merge
     /// with adjacent user content to preserve strict role alternation.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_message_after_plain_user_is_merged() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1256,6 +1269,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn adjacent_user_and_assistant_messages_are_merged_by_role() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1272,6 +1286,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn multipart_tool_result_text_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1326,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn empty_assistant_text_preserves_tool_calls() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1344,6 +1360,7 @@ mod tests {
     /// They must be merged into a single Bedrock `user` message so the output
     /// sequence maintains strict user/assistant alternation.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn consecutive_tool_messages_merged_into_single_user_message() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1380,6 +1397,7 @@ mod tests {
     /// `toolResult` blocks must appear in the same order as their source `tool`
     /// messages; content values must be preserved.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn consecutive_tool_messages_preserve_order() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1413,6 +1431,7 @@ mod tests {
     /// two-round sequence: the assistant returns one result, replies, then
     /// issues a second tool call.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn non_consecutive_tool_messages_not_merged() {
         // Input:  user → assistant(x1) → tool(x1) → assistant(reply + x2) → tool(x2)
         // Output: user / assistant / user(x1) / assistant / user(x2) — five messages.
@@ -1450,12 +1469,14 @@ mod tests {
     // ── Inference config ──────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn max_tokens_maps_to_max_tokens() {
         let body = translate(r#"{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#);
         assert_eq!(body["inferenceConfig"]["maxTokens"], 512);
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn temperature_and_top_p_mapped() {
         let body =
             translate(r#"{"model":"m","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#);
@@ -1465,12 +1486,14 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stop_string_wrapped_in_array() {
         let body = translate(r#"{"model":"m","stop":"\n\n","messages":[{"role":"user","content":"hi"}]}"#);
         assert_eq!(body["inferenceConfig"]["stopSequences"][0], "\n\n");
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stop_array_preserved() {
         let body = translate(r#"{"model":"m","stop":["END","STOP"],"messages":[{"role":"user","content":"hi"}]}"#);
         let seqs = body["inferenceConfig"]["stopSequences"].as_array().unwrap();
@@ -1489,6 +1512,7 @@ mod tests {
     // ── Tool configuration ────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tools_translated_to_tool_spec() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1505,6 +1529,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_without_description_omits_bedrock_description() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1515,6 +1540,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn strict_tool_schema_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1526,6 +1552,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_auto_emits_auto_object() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1536,6 +1563,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_required_emits_any_object() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1556,6 +1584,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_specific_function() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1586,6 +1615,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn empty_messages_produces_empty_array() {
         let body = translate(r#"{"model":"m","messages":[]}"#);
         assert_eq!(body["messages"].as_array().unwrap().len(), 0);
@@ -1699,6 +1729,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_spec_allocations_do_not_scale_with_schema_size() {
         let small = large_schema_tool(16 * 1024);
         let large = large_schema_tool(64 * 1024);
@@ -1812,6 +1843,7 @@ mod tests {
         reason = "covers the three remaining text-move callers (system, assistant, tool result) with one scale pair each"
     )]
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn system_assistant_and_tool_result_text_allocations_do_not_scale_with_payload() {
         // System/developer text moves into the hoisted `system` parts.
         let measure_system = |text_bytes: usize| {
