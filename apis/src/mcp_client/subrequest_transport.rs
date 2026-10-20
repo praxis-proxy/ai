@@ -1120,11 +1120,14 @@ impl McpSubrequestClient {
             // spurious 413 (see collect_capped). Exactly one of the two branches
             // cancels the body.
             if content_type.as_deref().is_some_and(is_json_content_type) {
-                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES.min(per_event_cap)).await {
-                    self.admit_json_parse(&bytes, &signal)?;
-                    if let Some(message) = parse_json_rpc_error(&String::from_utf8_lossy(&bytes)) {
-                        return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
-                    }
+                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES.min(per_event_cap)).await
+                    && error_body_fits_parse_charge(
+                        &bytes,
+                        self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+                    )
+                    && let Some(message) = parse_json_rpc_error(&String::from_utf8_lossy(&bytes))
+                {
+                    return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
                 }
             } else {
                 drain_body(&mut body).await;
@@ -1383,6 +1386,20 @@ fn admit_json_parse_charge(
     Ok(())
 }
 
+/// Whether a non-2xx error body is small enough to attempt JSON-RPC error
+/// parsing under the budgeted parse-charge limit.
+///
+/// Unlike [`admit_json_parse_charge`], a body over the limit is NOT a 413 and
+/// records NO size signal: an oversize (or `output_charge`-incomputable) error
+/// body is simply left unparsed so the response falls back to its upstream HTTP
+/// status, rather than masking that status with a spurious `ResponseTooLarge`.
+fn error_body_fits_parse_charge(bytes: &[u8], parse_charge_limit: Option<usize>) -> bool {
+    match parse_charge_limit {
+        Some(limit) => output_charge(bytes).is_some_and(|charge| charge <= limit),
+        None => true,
+    }
+}
+
 /// Classify a fully buffered POST response into an rmcp post response.
 /// Verbatim the ladder previously inlined in `post_message`.
 #[expect(
@@ -1445,8 +1462,13 @@ fn classify_buffered_post_response(
     }
 
     if !status.is_success() {
-        if content_type.as_deref().is_some_and(is_json_content_type) {
-            admit_json_parse_charge(&response.body, parse_charge_limit, signal)?;
+        // Unlike the success drain, a non-2xx error body never records a size
+        // signal or 413s: when it exceeds the parse-charge limit it is left
+        // unparsed and the response falls back to its HTTP status (mirrors the
+        // streaming arm).
+        if content_type.as_deref().is_some_and(is_json_content_type)
+            && error_body_fits_parse_charge(&response.body, parse_charge_limit)
+        {
             let body = String::from_utf8_lossy(&response.body);
             if let Some(message) = parse_json_rpc_error(&body) {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
@@ -2913,6 +2935,91 @@ mod tests {
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "a non-JSON error body is drained and cancelled"
+        );
+    }
+
+    // -- non-2xx oversized error body falls back to status, never a 413 (F5) --
+
+    #[test]
+    fn classify_buffered_post_non_2xx_oversized_json_falls_back_to_status_without_signal() {
+        // A valid JSON-RPC error whose output charge exceeds the parse-charge limit
+        // must be left unparsed: the reply falls back to its upstream HTTP status and
+        // records no 413 size signal, so a genuine upstream failure is never masked
+        // by a spurious ResponseTooLarge.
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(
+            500,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#,
+        );
+        let signal = test_signal();
+        let out = classify_buffered_post_response(response, &message, false, Some(1), &signal);
+        let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = out else {
+            panic!("an oversized non-2xx error body must fall back to the HTTP status");
+        };
+        assert!(msg.contains("HTTP 500"), "should surface the HTTP status, got {msg}");
+        assert!(
+            signal.get().is_none(),
+            "an oversized error body must record no 413 size signal"
+        );
+    }
+
+    #[test]
+    fn classify_buffered_post_non_2xx_within_limit_surfaces_json_rpc_error() {
+        // The in-limit counterpart still parses and surfaces the structured error.
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(
+            500,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#,
+        );
+        let signal = test_signal();
+        let out = classify_buffered_post_response(response, &message, false, Some(1_000_000), &signal)
+            .expect("a JSON-RPC error within budget is a valid reply");
+        assert!(matches!(
+            out,
+            StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _)
+        ));
+        assert!(signal.get().is_none(), "a parsed error body records no size signal");
+    }
+
+    #[tokio::test]
+    async fn streaming_post_non_2xx_oversized_json_falls_back_to_status_without_signal() {
+        // The streaming arm mirrors the buffered one: an oversized non-2xx JSON-RPC
+        // error body is left unparsed and falls back to the HTTP status.
+        let limits = McpBudgetedCallLimits {
+            wire_limit: 1_024,
+            parse_charge_limit: 1,
+        };
+        let client = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            UrlResolutionPolicy::OperatorCached,
+            Some(limits),
+            None,
+        );
+        let (body, _cancelled) = fake_body([Bytes::from(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_owned(),
+        )]);
+        let response = sub_response(500, Some("application/json"), b"");
+        let signal = test_signal();
+        let result = client
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, Arc::clone(&signal))
+            .await;
+        let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = result else {
+            panic!("an oversized streaming error body must fall back to the HTTP status");
+        };
+        assert!(msg.contains("HTTP 500"), "should surface the HTTP status, got {msg}");
+        assert!(
+            signal.get().is_none(),
+            "an oversized streaming error body must record no 413 size signal"
         );
     }
 
