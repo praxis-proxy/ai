@@ -496,10 +496,9 @@ fn budgeted_stream_conversation_append_overflow_emits_error_without_success_or_s
     let error = sole_event(&frames, "error");
     assert_eq!(error.data["code"], "invalid_request_error");
     assert_eq!(error.data["sequence_number"], 1);
-    assert!(
-        error.data["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("conversation append"))
+    assert_eq!(
+        error.data["message"],
+        "Conversation append exceeds a processing limit set by the platform administrator."
     );
     assert_eq!(model_requests.lock().unwrap().len(), 1);
     model_thread.join().expect("model should finish streaming");
