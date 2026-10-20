@@ -33,9 +33,10 @@
 
 use std::{
     collections::HashSet,
-    sync::{Mutex, Once, OnceLock},
+    sync::{Arc, Mutex, Once, OnceLock},
 };
 
+use arc_swap::ArcSwap;
 use metrics::{Unit, counter, describe_histogram, histogram};
 use praxis_ai_apis::promotion::is_promotable_value;
 use praxis_filter::HttpFilterContext;
@@ -124,8 +125,15 @@ pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
     admit_model(model).to_owned()
 }
 
-/// Distinct model labels admitted so far in this process.
-static ADMITTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Immutable snapshot of the admitted model labels. Reads are lock-free (an
+/// atomic snapshot load), so membership checks never block — not on each
+/// other and not on an in-flight admission swap. First-time admissions
+/// replace the whole snapshot under [`ADMISSION_LOCK`], which keeps the
+/// [`MAX_MODEL_LABELS`] cap exact under simultaneous first-time admissions.
+static ADMITTED_MODELS: OnceLock<ArcSwap<HashSet<String>>> = OnceLock::new();
+
+/// Serializes snapshot replacement during first-time admission only.
+static ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Admit `value` against `admitted` while below `cap`; values arriving after
 /// the cap map to [`OTHER_MODEL_LABEL`]. Already-admitted values keep their
@@ -143,10 +151,42 @@ fn admit_model_label<'v>(admitted: &mut HashSet<String>, cap: usize, value: &'v 
 }
 
 /// Apply the process-lifetime [`MAX_MODEL_LABELS`] bound to `value`.
+///
+/// The fast path is a lock-free snapshot load for already-admitted labels.
+/// First-time admissions serialize on [`ADMISSION_LOCK`] and swap in a fresh
+/// snapshot; the over-cap check runs before the clone so a stream of novel
+/// values (once the cap is full) never copies or swaps.
 fn admit_model(value: &str) -> &str {
-    let set = ADMITTED_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut admitted = set.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    admit_model_label(&mut admitted, MAX_MODEL_LABELS, value)
+    let cell = ADMITTED_MODELS.get_or_init(|| ArcSwap::from_pointee(HashSet::new()));
+    // Fast path: lock-free membership check. The Guard is scoped so the
+    // borrow checker guarantees it is dropped before any `store`.
+    {
+        let snapshot = cell.load();
+        if snapshot.contains(value) {
+            return value;
+        }
+    }
+
+    // Slow path: first-time admission, rare (at most MAX_MODEL_LABELS times
+    // per process). `load_full` takes the snapshot Arc outright, so the
+    // clone below is the deep HashSet clone.
+    let _admission = ADMISSION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut updated = {
+        // Re-check under the lock: a concurrent admission may have inserted
+        // this value or filled the cap meanwhile.
+        let snapshot = cell.load_full();
+        let current: &HashSet<String> = &snapshot;
+        if current.contains(value) {
+            return value;
+        }
+        if current.len() >= MAX_MODEL_LABELS {
+            return OTHER_MODEL_LABEL;
+        }
+        current.clone()
+    };
+    let label = admit_model_label(&mut updated, MAX_MODEL_LABELS, value);
+    cell.store(Arc::new(updated));
+    label
 }
 
 /// Resolve the `cluster` (provider) label.
@@ -196,7 +236,7 @@ pub fn record_tpot(ctx: &HttpFilterContext<'_>, delta_seconds: f64) {
     ensure_described();
     let model = resolve_model(ctx);
     let cluster = cluster(ctx);
-    histogram!(METRIC_TPOT_SECONDS, "model" => model.clone(), "cluster" => cluster.clone()).record(delta_seconds);
+    histogram!(METRIC_TPOT_SECONDS, "model" => model, "cluster" => cluster).record(delta_seconds);
 }
 
 /// Emit one finish-reason observation.
@@ -206,8 +246,8 @@ pub fn record_finish_reason(ctx: &HttpFilterContext<'_>, reason: &str) {
     let cluster = cluster(ctx);
     counter!(
         METRIC_FINISH_REASONS_TOTAL,
-        "model" => model.clone(),
-        "cluster" => cluster.clone(),
+        "model" => model,
+        "cluster" => cluster,
         "reason" => reason.to_owned()
     )
     .increment(1);
@@ -381,5 +421,121 @@ mod tests {
             value,
             "values under the process cap are admitted unchanged"
         );
+    }
+
+    /// Number of distinct labels currently in the process-wide admitted set.
+    fn admitted_len() -> usize {
+        ADMITTED_MODELS
+            .get_or_init(|| ArcSwap::from_pointee(HashSet::new()))
+            .load()
+            .len()
+    }
+
+    /// True when `value` is in the process-wide admitted set. Tests run in
+    /// parallel and share the set, so assertions use membership (a `HashSet`
+    /// admits each value exactly once) instead of set-length deltas.
+    fn admitted_contains(value: &str) -> bool {
+        ADMITTED_MODELS
+            .get_or_init(|| ArcSwap::from_pointee(HashSet::new()))
+            .load()
+            .contains(value)
+    }
+
+    #[test]
+    fn admit_model_admits_concurrent_distinct_values() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 32;
+        let start = admitted_len();
+        // One extra waiter: the main thread releases all admission threads
+        // simultaneously after spawning them.
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let mismatches = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let barrier = Arc::clone(&barrier);
+            let mismatches = Arc::clone(&mismatches);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..PER_THREAD {
+                    let value = format!("concurrent-t{t}-m{i}");
+                    let label = admit_model(&value).to_owned();
+                    if label != value {
+                        mismatches
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!("{value} -> {label}"));
+                    }
+                }
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let mismatches = std::mem::take(&mut *mismatches.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        assert!(
+            mismatches.is_empty(),
+            "simultaneous first-time admissions were mislabeled: {mismatches:?}"
+        );
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert!(
+                    admitted_contains(&format!("concurrent-t{t}-m{i}")),
+                    "every distinct value must be admitted"
+                );
+            }
+        }
+        assert!(
+            admitted_len() - start >= THREADS * PER_THREAD,
+            "the admitted set must have grown by at least the test's values"
+        );
+    }
+
+    #[test]
+    fn admit_model_dedupes_concurrent_same_value() {
+        let value = format!("dedupe-probe-{}", line!());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let value = value.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                admit_model(&value).to_owned()
+            }));
+        }
+        barrier.wait();
+        let labels: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(labels.len(), 2);
+        assert!(
+            labels.iter().all(|label| label == &value),
+            "both racers must observe the admitted value: {labels:?}"
+        );
+        assert!(
+            admitted_contains(&value),
+            "the same value must be admitted exactly once (set membership)"
+        );
+    }
+
+    #[test]
+    fn admit_model_reads_stay_consistent_during_admissions() {
+        let probe = format!("consistent-probe-{}", line!());
+        assert_eq!(admit_model(&probe), probe);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            let probe = probe.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert_eq!(admit_model(&probe), probe);
+                }
+            })
+        };
+        for i in 0..64 {
+            let value = format!("consistent-churn-{i}");
+            assert_eq!(admit_model(&value), value);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
     }
 }
