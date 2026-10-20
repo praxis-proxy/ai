@@ -10,6 +10,13 @@ output with focused HTTP/SSE failure assertions, and available service logs for
 The release workflow attaches its chosen report to the GitHub Release for
 longer term access.
 
+This is the GPU-specific report. Releases also publish a broader
+[CI evidence report](../release.md#changelog) with exact-commit workflow, job,
+and step outcomes in `release-qualification.md` and `release-qualification.json`.
+An unavailable GPU result does not hide successful unit, integration, SDK,
+security, or other CI results. The CI report never counts simulator or CPU
+jobs as live GPU qualification.
+
 ## Report version and interpretation
 
 The report has `schema_version: 3` and
@@ -133,10 +140,13 @@ If the tag is already pushed, dispatch with `--ref v0.4.2`, wait for the hosted
 summary, then manually rerun the Release workflow on that tag. Replace
 `v0.4.2` and `RUN_ID` with the actual tag and run. The release job uses generated
 changelog text, inserts
-one marked qualification section, attaches `qualification.json`, and verifies
-both. Reruns replace the section and asset; repository release immutability
-settings may reject an update, which is surfaced as a workflow error.
+marked CI and GPU qualification sections, attaches all three reports, and
+verifies their presence. Reruns replace the sections and assets; repository
+release immutability settings may reject an update, which is surfaced as a
+workflow error.
 
 A synthetic, reviewable notes fixture lives in
 `tests/qualification/release-notes.fixture.md`. It demonstrates the rendered
 section and idempotent composition; it is not real GPU qualification evidence.
+The broader CI summary has a separate synthetic fixture at
+`tests/qualification/release-ci-notes.fixture.md`.
