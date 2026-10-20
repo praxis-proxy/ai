@@ -1,7 +1,7 @@
 //! Single-thread projected-file watcher with fail-closed publication.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::Duration,
@@ -31,19 +31,35 @@ enum WatcherMessage {
 struct WatchedSource {
     /// Configured path to the watched credential file.
     path: PathBuf,
-    /// Canonicalized parent directory of `path`, used to match `notify` event
-    /// paths back to this source. Filesystem backends report the real path
-    /// (macOS `FSEvents` resolves symlinks to `/private/...`; Kubernetes atomic
-    /// rotation swaps a `..data` symlink inside the directory), so comparing
-    /// canonicalized directories — rather than the literal configured path —
-    /// keeps rotation detection correct across symlinks.
-    canonical_dir: PathBuf,
+    /// Stable lexical parent outside the configured directory's deepest
+    /// symlink component, or the configured directory's parent when no symlink
+    /// is present. Watching this anchor keeps directory deletion/recreation and
+    /// symlink replacement observable even while the directory itself is absent.
+    directory_anchor: Option<PathBuf>,
     /// Non-secret diagnostic context for byte-free error and reload logging.
     ctx: DiagnosticContext,
     /// Validation/shaping closure run on every (re)load.
     transform: TransformFn,
     /// Shared cell the watcher swaps atomically on reload.
     snapshot: Arc<ArcSwap<SecretSnapshot>>,
+}
+
+/// Filesystem identity of a watched directory. On Unix, device + inode detects
+/// replacement at the same pathname; the portable fallback uses timestamps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    /// Device containing the directory.
+    device: u64,
+    #[cfg(unix)]
+    /// Inode identifying the directory on its device.
+    inode: u64,
+    #[cfg(not(unix))]
+    /// Portable creation timestamp used when inode identity is unavailable.
+    created: Option<std::time::SystemTime>,
+    #[cfg(not(unix))]
+    /// Portable modification timestamp used when inode identity is unavailable.
+    modified: Option<std::time::SystemTime>,
 }
 
 impl WatchedSource {
@@ -171,16 +187,21 @@ impl WatchRegistry {
         let raw = resolve_raw_token(source, &ctx)?;
         let payload = transform(&raw)?;
         let handle = SecretHandle::new(SecretSnapshot { payload: Some(payload) });
-        let path_buf = PathBuf::from(path);
-        // The initial read above succeeded, so the parent directory exists and
-        // canonicalizes; the `.` fallback is defensive for exotic paths.
-        let canonical_dir = path_buf
-            .parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let configured_path = PathBuf::from(path);
+        let path_buf = if configured_path.is_absolute() {
+            configured_path
+        } else {
+            std::env::current_dir()
+                .map_err(|error| format!("{}: cannot resolve credential file path: {error}", ctx.owner))?
+                .join(configured_path)
+        };
+        // Keep the final component and configured directory lexical: projected
+        // Secrets replace them atomically. The directory anchor remains stable
+        // when that directory is removed or is a symlink retargeted elsewhere.
+        let directory_anchor = stable_directory_anchor(&path_buf);
         self.watched.push(WatchedSource {
             path: path_buf,
-            canonical_dir,
+            directory_anchor,
             ctx,
             transform,
             snapshot: handle.cell(),
@@ -229,18 +250,26 @@ impl WatchRegistry {
                         return;
                     },
                 };
-                let mut directories = HashSet::new();
-                for item in &watched {
-                    let directory = item.canonical_dir.clone();
-                    if directories.insert(directory.clone())
-                        && watcher.watch(&directory, RecursiveMode::NonRecursive).is_err()
-                    {
+                let mut directories = HashMap::new();
+                for directory in desired_watch_directories(&watched) {
+                    if watcher.watch(&directory, RecursiveMode::NonRecursive).is_err() {
                         drop(ready_tx.send(Err(format!(
                             "failed to watch credential directory {}",
                             directory.display()
                         ))));
                         return;
                     }
+                    let identity = match directory_identity(&directory) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            drop(ready_tx.send(Err(format!(
+                                "failed to identify credential directory {}: {error}",
+                                directory.display()
+                            ))));
+                            return;
+                        },
+                    };
+                    directories.insert(directory, identity);
                 }
                 // Authoritative re-read AFTER the watch is live (closes the
                 // construct-read -> watch-register TOCTOU). Any event during the
@@ -261,11 +290,26 @@ impl WatchRegistry {
                 drop(ready_tx.send(Ok(())));
                 while let Ok(message) = message_rx.recv() {
                     match message {
-                        WatcherMessage::Event(event) => process_event(&event, &watched),
+                        WatcherMessage::Event(event) => {
+                            if event_requires_reload(&event) {
+                                if reconcile_watch_directories(&mut watcher, &watched, &mut directories).is_err() {
+                                    tracing::warn!(
+                                        "credential watcher could not follow a directory replacement; failing closed"
+                                    );
+                                    fail_closed_all(&watched);
+                                } else {
+                                    reload_all(&watched);
+                                }
+                            }
+                        },
                         WatcherMessage::WatchError => {
                             // Byte-free: the notify error is not interpolated.
                             tracing::warn!("credential watcher reported an error; rescanning all sources");
-                            reload_all(&watched);
+                            if reconcile_watch_directories(&mut watcher, &watched, &mut directories).is_err() {
+                                fail_closed_all(&watched);
+                            } else {
+                                reload_all(&watched);
+                            }
                         },
                         WatcherMessage::Shutdown => break,
                     }
@@ -293,6 +337,105 @@ impl WatchRegistry {
     }
 }
 
+/// Choose a lexical directory that remains stable when the configured parent
+/// is removed or any symlink component beneath the anchor is retargeted.
+fn stable_directory_anchor(path: &Path) -> Option<PathBuf> {
+    let configured_dir = path.parent()?;
+    configured_dir
+        .ancestors()
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+        })
+        .and_then(Path::parent)
+        .or_else(|| configured_dir.parent())
+        .map(Path::to_path_buf)
+}
+
+/// Read a directory identity that changes when the same pathname is replaced.
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity, notify::Error> {
+    let metadata = std::fs::metadata(path).map_err(|error| notify::Error::io(error).add_path(path.to_path_buf()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(DirectoryIdentity {
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+/// Resolve every file-symlink hop and return the directories needed to observe
+/// both target-file changes and target-directory recreation.
+///
+/// A projected credential may traverse more than one file symlink. Watching
+/// only the first target's directory misses changes to the ultimate file. Each
+/// hop therefore contributes its resolved parent directory and a stable anchor
+/// outside that directory. The anchor remains watchable if the target directory
+/// is removed, so recreating it can re-arm the direct subscription. A visited
+/// set terminates malformed symlink cycles without affecting the startup read,
+/// which has already rejected an unreadable source.
+fn symlink_target_watch_directories(path: &Path) -> HashSet<PathBuf> {
+    let mut directories = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut current = path.to_path_buf();
+
+    // Match the conventional filesystem symlink-resolution ceiling. The
+    // startup read already rejects a loop; this bound also protects runtime
+    // reconciliation if a previously valid chain is retargeted into one.
+    for _ in 0..40 {
+        if !visited.insert(current.clone())
+            || !std::fs::symlink_metadata(&current)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if target.is_absolute() {
+            target
+        } else if let Some(parent) = current.parent() {
+            parent.join(target)
+        } else {
+            break;
+        };
+        insert_target_directory_watches(&mut directories, &current);
+    }
+
+    directories
+}
+
+/// Add direct and stable watches for one file-symlink target.
+fn insert_target_directory_watches(directories: &mut HashSet<PathBuf>, target: &Path) {
+    if let Some(parent) = target.parent().and_then(|parent| parent.canonicalize().ok()) {
+        directories.insert(parent);
+    }
+    // Keep the immediate parent of the target directory subscribed even when
+    // an unrelated higher ancestor is itself a symlink (for example, macOS
+    // `/var`). This directory observes removal and recreation of the target
+    // directory name.
+    if let Some(parent_anchor) = target
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|parent| parent.canonicalize().ok())
+    {
+        directories.insert(parent_anchor);
+    }
+    if let Some(anchor) = stable_directory_anchor(target).and_then(|anchor| anchor.canonicalize().ok()) {
+        directories.insert(anchor);
+    }
+}
+
 /// Reload every watched source unconditionally. Used when the watcher cannot
 /// tell which files changed — a `notify` runtime error or a rescan hint — so it
 /// re-resolves every source; each reload fails closed to `None` on its own read
@@ -303,38 +446,92 @@ fn reload_all(watched: &[WatchedSource]) {
     }
 }
 
-/// Reload the sources whose file/parent matches an event path; a rescan hint
-/// reloads all.
-fn process_event(event: &notify::Event, watched: &[WatchedSource]) {
-    use notify::EventKind;
-    if event.need_rescan() || matches!(event.kind, EventKind::Other) {
-        reload_all(watched);
-        return;
-    }
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) {
-        return;
-    }
+/// Publish an unavailable snapshot for every watched source without reading it.
+fn fail_closed_all(watched: &[WatchedSource]) {
     for item in watched {
-        // Match cheaply on the literal path first (the common case where the
-        // configured path has no symlink components), then fall back to
-        // canonicalized parent-directory comparison so symlinked paths — macOS
-        // FSEvents `/private/...`, Kubernetes `..data` swaps, or an atomic
-        // sibling+rename — still resolve to this source. A removed file cannot
-        // be canonicalized, so we canonicalize the (still-present) directory.
-        let matched = event.paths.iter().any(|p| {
-            p == &item.path
-                || p.parent() == item.path.parent()
-                || p.parent()
-                    .and_then(|parent| parent.canonicalize().ok())
-                    .is_some_and(|parent| parent == item.canonical_dir)
-                || p.canonicalize().ok().is_some_and(|dir| dir == item.canonical_dir)
-        });
-        if matched {
-            item.reload();
+        item.snapshot.store(Arc::new(SecretSnapshot { payload: None }));
+    }
+}
+
+/// Return the directories that must be watched for the current filesystem
+/// topology. Each source watches its resolved configured directory, every
+/// file-symlink target directory, and stable parents for all of those
+/// directories. Stable parents observe directory recreation and symlink
+/// replacement; recomputing the direct watches follows a new target after
+/// rotation.
+fn desired_watch_directories(watched: &[WatchedSource]) -> HashSet<PathBuf> {
+    let mut directories = HashSet::new();
+    for item in watched {
+        if let Some(resolved) = item.path.parent().and_then(|parent| parent.canonicalize().ok()) {
+            directories.insert(resolved);
         }
+        if let Some(anchor) = item
+            .directory_anchor
+            .as_deref()
+            .and_then(|parent| parent.canonicalize().ok())
+        {
+            directories.insert(anchor);
+        }
+        directories.extend(symlink_target_watch_directories(&item.path));
+    }
+    directories
+}
+
+/// Reconcile `notify` subscriptions after a directory or symlink replacement.
+/// New subscriptions are established before obsolete ones are removed so no
+/// rotation window is introduced while following a new target.
+fn reconcile_watch_directories(
+    watcher: &mut RecommendedWatcher,
+    watched: &[WatchedSource],
+    active: &mut HashMap<PathBuf, DirectoryIdentity>,
+) -> Result<(), notify::Error> {
+    let desired = desired_watch_directories(watched);
+    for directory in &desired {
+        let identity = directory_identity(directory)?;
+        if active.get(directory) != Some(&identity) {
+            // An identical pathname can now refer to a replacement inode. Drop
+            // any obsolete subscription before arming the current directory.
+            if active.remove(directory).is_some() {
+                drop(watcher.unwatch(directory));
+            }
+            watcher.watch(directory, RecursiveMode::NonRecursive)?;
+            active.insert(directory.clone(), identity);
+        }
+    }
+    let obsolete: Vec<_> = active
+        .keys()
+        .filter(|directory| !desired.contains(*directory))
+        .cloned()
+        .collect();
+    for directory in obsolete {
+        // A backend may already have discarded a watch after directory
+        // removal. An unwatch failure only leaves a harmless obsolete watch;
+        // failure to establish a new watch above is the fail-closed condition.
+        drop(watcher.unwatch(&directory));
+        active.remove(&directory);
+    }
+    Ok(())
+}
+
+/// Whether a filesystem event can affect a watched source. Every subscribed
+/// directory is credential-related, so path matching is deliberately avoided:
+/// re-reading a few sources is cheap and remains correct when a removed path can
+/// no longer be canonicalized.
+fn event_requires_reload(event: &notify::Event) -> bool {
+    use notify::EventKind;
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Other
+        )
+}
+
+/// Apply an event directly without the live watcher. Used by deterministic
+/// tests for removal and rescan semantics.
+#[cfg(test)]
+fn process_event(event: &notify::Event, watched: &[WatchedSource]) {
+    if event_requires_reload(event) {
+        reload_all(watched);
     }
 }
 
@@ -563,6 +760,238 @@ mod tests {
             h_missing.current().payload.is_none(),
             "a removed source must fail closed to None on rescan"
         );
+    }
+
+    #[test]
+    fn bare_relative_path_matches_absolute_rotation_and_removal_events() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let absolute_path = dir.path().join("key");
+        let relative_path = absolute_path.strip_prefix(&cwd).unwrap().to_path_buf();
+        std::fs::write(&absolute_path, "token-a\n").unwrap();
+
+        let mut registry = WatchRegistry::new();
+        let handle = registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(relative_path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        assert!(registry.watched.first().unwrap().path.is_absolute());
+
+        std::fs::write(&absolute_path, "token-b\n").unwrap();
+        let modified = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(absolute_path.clone());
+        process_event(&modified, &registry.watched);
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("token-b"));
+
+        std::fs::remove_file(&absolute_path).unwrap();
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File)).add_path(absolute_path);
+        process_event(&removed, &registry.watched);
+        assert!(handle.current().payload.is_none());
+    }
+
+    #[test]
+    fn removed_parent_directory_event_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("secrets");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("key");
+        std::fs::write(&path, "token-a\n").unwrap();
+
+        let mut registry = WatchRegistry::new();
+        let handle = registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+
+        std::fs::rename(&directory, root.path().join("old-secrets")).unwrap();
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder)).add_path(directory);
+        process_event(&removed, &registry.watched);
+        assert!(
+            handle.current().payload.is_none(),
+            "removing the watched directory must not retain the previous credential"
+        );
+    }
+
+    #[test]
+    fn same_path_directory_replacement_changes_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("secrets");
+        std::fs::create_dir(&directory).unwrap();
+        let before = directory_identity(&directory).unwrap();
+
+        std::fs::rename(&directory, root.path().join("old-secrets")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let after = directory_identity(&directory).unwrap();
+
+        assert_ne!(
+            before, after,
+            "same-path directory replacement must force the watcher subscription to re-arm"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_target_directory_is_watched_and_remains_on_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let target_dir = root.path().join("projected-secret");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("key");
+        std::fs::write(&target, "token-a\n").unwrap();
+        let path = config_dir.join("token");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let mut registry = WatchRegistry::new();
+        let handle = registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        assert!(desired_watch_directories(&registry.watched).contains(&target_dir.canonicalize().unwrap()));
+
+        std::fs::write(&target, "token-b\n").unwrap();
+        let modified = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(target.clone());
+        process_event(&modified, &registry.watched);
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("token-b"));
+
+        std::fs::remove_file(&target).unwrap();
+        assert!(desired_watch_directories(&registry.watched).contains(&target_dir.canonicalize().unwrap()));
+        let removed = notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File)).add_path(target);
+        process_event(&removed, &registry.watched);
+        assert!(handle.current().payload.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_hop_file_symlink_watches_every_target_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let links_dir = root.path().join("links");
+        let target_dir = root.path().join("secrets/live");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::create_dir(&links_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("key");
+        std::fs::write(&target, "token-a\n").unwrap();
+        let intermediate = links_dir.join("key");
+        std::os::unix::fs::symlink(&target, &intermediate).unwrap();
+        let path = config_dir.join("token");
+        std::os::unix::fs::symlink(&intermediate, &path).unwrap();
+
+        let mut registry = WatchRegistry::new();
+        registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        let directories = desired_watch_directories(&registry.watched);
+
+        assert!(
+            directories.contains(&links_dir.canonicalize().unwrap()),
+            "the intermediate file-symlink directory must remain observable"
+        );
+        assert!(
+            directories.contains(&target_dir.canonicalize().unwrap()),
+            "the ultimate token directory must be watched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "complete target-directory recreation setup")]
+    fn symlink_target_directory_keeps_recreation_anchor() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let secrets_dir = root.path().join("secrets");
+        let target_dir = secrets_dir.join("live");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("key");
+        std::fs::write(&target, "token-a\n").unwrap();
+        let path = config_dir.join("token");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let mut registry = WatchRegistry::new();
+        registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        let anchor = secrets_dir.canonicalize().unwrap();
+        let before = desired_watch_directories(&registry.watched);
+        assert!(before.contains(&target_dir.canonicalize().unwrap()));
+        assert!(
+            before.contains(&anchor),
+            "the target directory's parent must observe its removal and recreation"
+        );
+
+        std::fs::remove_dir_all(&target_dir).unwrap();
+        let missing = desired_watch_directories(&registry.watched);
+        assert!(
+            missing.contains(&anchor),
+            "the recreation anchor must remain watched while the target directory is absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "complete symlink retarget regression setup")]
+    fn symlink_parent_retarget_changes_watch_topology_and_reloads() {
+        let root = tempfile::tempdir().unwrap();
+        let version_a = root.path().join("version-a");
+        let version_b = root.path().join("version-b");
+        std::fs::create_dir_all(version_a.join("nested")).unwrap();
+        std::fs::create_dir_all(version_b.join("nested")).unwrap();
+        std::fs::write(version_a.join("nested/key"), "token-a\n").unwrap();
+        std::fs::write(version_b.join("nested/key"), "token-b\n").unwrap();
+        let current = root.path().join("current");
+        std::os::unix::fs::symlink(&version_a, &current).unwrap();
+        let path = current.join("nested/key");
+
+        let mut registry = WatchRegistry::new();
+        let handle = registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        let before = desired_watch_directories(&registry.watched);
+        assert!(before.contains(&version_a.join("nested").canonicalize().unwrap()));
+        assert!(before.contains(&root.path().canonicalize().unwrap()));
+
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(&version_b, &current).unwrap();
+        let after = desired_watch_directories(&registry.watched);
+        assert!(after.contains(&version_b.join("nested").canonicalize().unwrap()));
+        assert!(!after.contains(&version_a.join("nested").canonicalize().unwrap()));
+
+        let replaced = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(current);
+        process_event(&replaced, &registry.watched);
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("token-b"));
     }
 
     #[tokio::test]

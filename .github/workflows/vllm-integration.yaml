@@ -1254,9 +1254,9 @@ jobs:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
           PRAXIS_TEST_REQUIRE_LIVE: "1"
-          # The generated YAML keeps the ${WEB_SEARCH_API_KEY} reference, so the
-          # secret is consumed only by this one-test process and is never written
-          # into or printed with the config.
+          # The generated YAML keeps the `env_var: WEB_SEARCH_API_KEY` source, so
+          # the secret is consumed only by this one-test process and is never
+          # written into or printed with the config.
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           # Scheduled/manual full runs are controlled environments and must prove
           # the real provider path. Labeled fork PRs do not receive secrets, so

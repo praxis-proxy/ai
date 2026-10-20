@@ -43,25 +43,43 @@ pub enum CredentialSource {
 }
 
 impl<'de> Deserialize<'de> for CredentialSource {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "explicit secret-safe shape validation keeps rejected scalar values out of serde diagnostics"
+    )]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Transient parse target: exactly one field is expected to be set.
-        // Deliberately does NOT derive `Debug` — it holds the inline secret.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            #[serde(default)]
-            value: Option<Zeroizing<String>>,
-            #[serde(default)]
-            env_var: Option<String>,
-            #[serde(default)]
-            file: Option<String>,
+        // Deserialize through Value so rejecting the removed scalar shorthand
+        // never asks serde to render the scalar (which may itself be a secret)
+        // in an invalid-type diagnostic.
+        let raw = serde_yaml::Value::deserialize(deserializer)?;
+        let serde_yaml::Value::Mapping(raw) = raw else {
+            return Err(de::Error::custom(
+                "credential source must be a mapping with exactly one of `value`, `env_var`, or `file`",
+            ));
+        };
+        let mut value = None;
+        let mut env_var = None;
+        let mut file = None;
+        for (key, raw_value) in raw {
+            let Some(key) = key.as_str() else {
+                return Err(de::Error::custom("credential source keys must be strings"));
+            };
+            let Some(raw_value) = raw_value.as_str() else {
+                return Err(de::Error::custom(format!("credential source `{key}` must be a string")));
+            };
+            match key {
+                "value" => value = Some(Zeroizing::new(raw_value.to_owned())),
+                "env_var" => env_var = Some(raw_value.to_owned()),
+                "file" => file = Some(raw_value.to_owned()),
+                _ => {
+                    return Err(de::Error::unknown_field(key, &["value", "env_var", "file"]));
+                },
+            }
         }
-
-        let raw = Raw::deserialize(deserializer)?;
-        match (raw.value, raw.env_var, raw.file) {
+        match (value, env_var, file) {
             (Some(value), None, None) => Ok(Self::Value(value)),
             (None, Some(env_var), None) => Ok(Self::EnvVar(env_var)),
             (None, None, Some(file)) => Ok(Self::File(file)),
@@ -269,6 +287,14 @@ mod tests {
     #[test]
     fn rejects_unknown_source() {
         assert!(parse("secret_manager: vault").is_err());
+    }
+
+    #[test]
+    fn rejects_scalar_source_without_echoing_secret() {
+        let secret = "scalar-secret-must-not-leak";
+        let error = serde_yaml::from_str::<CredentialSource>(secret).unwrap_err();
+        assert!(!error.to_string().contains(secret), "{error}");
+        assert!(error.to_string().contains("credential source must be a mapping"));
     }
 
     #[test]

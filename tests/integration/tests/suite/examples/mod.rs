@@ -184,7 +184,7 @@ mod vllm_agentic_api;
 mod web_search;
 #[cfg(feature = "openai-agentic-loop")]
 mod web_search_chat_completions;
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-agentic-loop")]
 mod web_search_file_key;
 #[cfg(feature = "openai-agentic-loop")]
 mod web_search_scoped_credentials;
