@@ -242,6 +242,14 @@ fn run_dev(command: Command) {
         Command::LintSeparators(args) => lint_separators::run(args),
         Command::ImportInference(args) => inference_fixtures::run_import(args),
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
+        command => run_dev_continued(command),
+    }
+}
+
+/// Continuation of development subcommand dispatch.
+#[cfg(feature = "dev")]
+fn run_dev_continued(command: Command) {
+    match command {
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
@@ -257,6 +265,7 @@ fn run_dev(command: Command) {
         Command::VisualizeConfig(args) => visualize_config::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
+        _ => unreachable!(),
     }
 }
 
