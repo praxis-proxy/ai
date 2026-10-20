@@ -9,7 +9,11 @@ Measures time-to-first-token for streaming AI responses.
 
 Activates only for successful `text/event-stream` responses. On the first non-empty body chunk, records `ctx.request_start.elapsed()` as a Prometheus histogram and deactivates for the remainder of the response.
 
-The histogram's `model` label is read from metadata set by an upstream request fact filter: `openai_responses_request` (Responses create bodies), `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies), `anthropic_messages_request`, or `anthropic_messages_to_chat_completions` (Anthropic, including Anthropic-to-Chat translation). If none runs before this filter, all TTFT samples are labeled `unknown`.
+The histogram's `model` label is read from metadata set by an upstream request fact filter: `openai_responses_request` (Responses create bodies), `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies), `anthropic_messages_request`, `anthropic_messages_to_chat_completions` (Anthropic, including Anthropic-to-Chat translation), or the `model_to_header`-published `model_to_header.model` value. If none runs before this filter, all TTFT samples are labeled `unknown`.
+
+The `cluster` label is the upstream cluster the request was routed to (`HttpFilterContext::cluster_name`), falling back to `unknown`.
+
+Distinct `model` label values are capped at 1024 per process lifetime; values arriving after the cap are labeled `other` (see `llm_metrics`).
 
 Chat traffic that originates as a Responses or Anthropic request and is translated downstream keeps the model its originating classifier promoted.
 

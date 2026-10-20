@@ -5874,7 +5874,7 @@ async fn budgeted_client_tool_lowering_rejects_before_mutating_request() {
 
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 413);
-    assert!(message.contains("max_retained_bytes"));
+    assert!(message.contains("limit set by the platform administrator"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.request_body, original);
     assert!(state.client_tool_echo.is_none());
@@ -5989,7 +5989,7 @@ fn budgeted_client_tool_restoration_rejects_before_parsing_response() {
 
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 502);
-    assert!(message.contains("max_retained_bytes"));
+    assert!(message.contains("limit set by the platform administrator"));
     assert!(body.is_none());
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }

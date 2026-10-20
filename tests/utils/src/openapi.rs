@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Semantic `OpenAPI` helpers shared by development tooling and integration tests.

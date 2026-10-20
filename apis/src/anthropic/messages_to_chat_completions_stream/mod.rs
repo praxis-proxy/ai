@@ -427,7 +427,7 @@ fn store_line_buffer(
     if buffer.len() > max_partial_event_bytes {
         ctx.filter_metadata.remove(LINE_BUFFER_KEY);
         let msg = format!(
-            "anthropic_messages_to_chat_completions_stream: incomplete SSE event exceeds {max_partial_event_bytes} bytes"
+            "Anthropic Messages stream event exceeds a size limit set by the platform administrator (maximum {max_partial_event_bytes} bytes)."
         );
         return Err(msg.into());
     }
@@ -798,7 +798,7 @@ fn emit_tool_block_start(
     let opened = get_tool_block_count(ctx);
     if opened >= max_tool_blocks {
         return Err(format!(
-            "anthropic_messages_to_chat_completions_stream: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
+            "Streaming tool call count exceeds the limit set by the platform administrator (maximum {max_tool_blocks})."
         )
         .into());
     }
@@ -2266,8 +2266,8 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("exceeds 32 bytes"),
-            "oversized incomplete SSE event should mention the configured limit"
+            err.to_string().contains("platform administrator (maximum 32 bytes)"),
+            "oversized incomplete SSE event should attribute the configured limit to the platform administrator"
         );
         assert!(
             !ctx.filter_metadata.contains_key(LINE_BUFFER_KEY),
@@ -2509,8 +2509,9 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("max_tool_blocks"),
-            "exceeding the tool-block cap should fail closed and mention max_tool_blocks, got: {err}"
+            err.to_string()
+                .contains("limit set by the platform administrator (maximum 2)"),
+            "exceeding the tool-block cap should identify the administrator-set limit, got: {err}"
         );
     }
 

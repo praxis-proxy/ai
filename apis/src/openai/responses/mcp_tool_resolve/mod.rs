@@ -1142,7 +1142,7 @@ impl HttpFilter for McpToolResolveFilter {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResolveError {
     /// The shared Responses retained-payload budget cannot cover discovery.
-    #[error("MCP discovery exceeds openai_agentic_loop.max_retained_bytes")]
+    #[error("MCP tool discovery exceeds a processing limit set by the platform administrator")]
     RetainedBudget,
     /// MCP client call failed.
     #[error("MCP tools/list failed for server_label \"{server_label}\": {source}")]

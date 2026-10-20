@@ -260,7 +260,7 @@ fn model_rewrite_budget_rejection() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "model rewrite exceeds openai_agentic_loop.max_retained_bytes",
+        "Model rewriting exceeds a processing limit set by the platform administrator.",
     ))
 }
 

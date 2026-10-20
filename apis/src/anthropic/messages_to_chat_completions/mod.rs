@@ -211,7 +211,7 @@ impl AnthropicMessagesToChatCompletionsFilter {
         if buffer.overflowed {
             *body = Some(Bytes::from(wire::error_body(
                 wire::ErrorType::Api,
-                "upstream response exceeded the configured max_body_bytes",
+                "Upstream response exceeds a size limit set by the platform administrator.",
                 request_id.as_deref(),
             )));
             return FilterAction::Continue;
@@ -371,7 +371,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
                 wire::ErrorType::Api,
-                "upstream response exceeded the configured max_body_bytes",
+                "Upstream response exceeds a size limit set by the platform administrator.",
             )));
         }
 
@@ -954,8 +954,8 @@ mod tests {
         assert!(
             parsed["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("max_body_bytes")),
-            "the JSON error names the exceeded ceiling"
+                .is_some_and(|message| message.contains("size limit set by the platform administrator")),
+            "the JSON error attributes the size limit to the platform administrator"
         );
         assert_eq!(parsed["request_id"], "req_over", "the upstream request id is preserved");
     }

@@ -1028,6 +1028,9 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
 
     captured_bodies: ClassVar[list[dict]] = []
     stream_deltas: ClassVar[list[dict]] = []
+    # When set, replaces the default single-choice array of the finite
+    # (non-streaming) response so a test can script alternative shapes.
+    finite_choices: ClassVar[list[dict] | None] = None
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1052,23 +1055,24 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
             self.wfile.flush()
             return
+        choices = type(self).finite_choices or [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "I picked 42.",
+                },
+            }
+        ]
         payload = json.dumps(
             {
                 "id": "chatcmpl_reasoning_capture",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": VLLM_MODEL,
-                "choices": [
-                    {
-                        "index": 0,
-                        "finish_reason": "stop",
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "reasoning": "I picked 42.",
-                        },
-                    }
-                ],
+                "choices": choices,
                 "usage": {
                     "prompt_tokens": 12,
                     "completion_tokens": 1,
@@ -2300,6 +2304,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     """
     ChatCaptureHandler.captured_bodies = []
     ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
+    ChatCaptureHandler.finite_choices = None
     captured = ChatCaptureHandler.captured_bodies
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
@@ -5058,6 +5063,61 @@ class TestResponsesToChatCompletionsVLLM:
             "mode": "explicit",
         }, "prompt_cache_options must reach the Chat backend"
         assert chat["verbosity"] == "high", "text.verbosity must map to Chat verbosity"
+
+    def test_multiple_choice_finite_response_fails_closed(self, reasoning_capture_client):
+        """Issue #1141: a finite multi-choice Chat completion must fail closed.
+
+        A Responses resource has no faithful representation for independent
+        Chat alternatives, so a completion carrying two valid choices must be
+        withheld rather than translated into a ``completed`` response that
+        silently drops every choice after the first.
+        """
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.finite_choices = [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "first alternative"},
+            },
+            {
+                "index": 1,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "second alternative"},
+            },
+        ]
+
+        # An `APIError` means the proxy withheld the translated body. A
+        # successful create would mean only the first choice survived.
+        with pytest.raises(openai.APIError):
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="Pick an alternative.",
+                store=False,
+            )
+
+        assert len(forwarded) == 1, forwarded
+        # The status code is asserted over raw HTTP because the failure fires
+        # after response headers; Pingora may reset the connection rather
+        # than emit a status once bytes are committed.
+        base_url = str(client.base_url).rstrip("/")
+        try:
+            raw = httpx.post(
+                f"{base_url}/responses",
+                json={
+                    "model": CHAT_TRANSLATION_MODEL,
+                    "input": "Pick an alternative.",
+                    "store": False,
+                },
+                headers=TRUSTED_OWNER_HEADERS,
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            pass  # A reset connection is the committed-bytes form of fail-closed.
+        else:
+            assert raw.status_code >= 500, (
+                "a multi-choice completion must not be released as a success: "
+                f"got {raw.status_code} with body {raw.text!r}"
+            )
 
     def test_moderation_is_rejected_before_chat_backend(self, reasoning_capture_client):
         client, forwarded = reasoning_capture_client

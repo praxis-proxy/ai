@@ -538,7 +538,7 @@ fn reject_compaction_budget() -> FilterAction {
     reject_compact(
         413,
         "invalid_request_error",
-        "compaction exceeds openai_agentic_loop.max_retained_bytes",
+        "Compaction exceeds a processing limit set by the platform administrator.",
     )
 }
 
