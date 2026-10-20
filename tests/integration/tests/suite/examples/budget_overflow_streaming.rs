@@ -83,8 +83,12 @@ fn committed_stream_overflow_terminates_with_sse_error() {
         "the terminal error must be the final SSE event: {events:?}"
     );
     assert!(
-        body.contains("max_retained_bytes"),
-        "the terminal error must name the retained-payload budget overflow: {body}"
+        body.contains("processing limit set by the platform administrator"),
+        "the terminal error must use the sanitized processing-limit message: {body}"
+    );
+    assert!(
+        !body.contains("max_retained_bytes"),
+        "the terminal error must not expose the budget configuration: {body}"
     );
     assert!(
         !body.contains("response.completed"),
