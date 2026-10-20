@@ -1,0 +1,30 @@
+version: 1
+id: responses/chat-multi-choice-nonstream
+description: Finite Chat Completions success carrying multiple valid choices fails closed instead of silently dropping every choice after the first.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.multi_choice_rejected
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What is 2+2? Reply with just the number.
+          store: false
+          stream: false
+    expect:
+      client_status: 500
+      client_body_kind: empty
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

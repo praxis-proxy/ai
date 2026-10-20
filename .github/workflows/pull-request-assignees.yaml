@@ -62,7 +62,7 @@ jobs:
           # Comma-separated org team slugs. Project leads count as maintainers
           # for every repository (see MAINTAINERS.md). Every slug must be a
           # real team: a lookup that fails stops the run.
-          MAINTAINER_TEAMS: ai-maintainers,project-leads
+          MAINTAINER_TEAMS: ai-maintainers
           REVIEWER_TEAMS: ai-reviewers
         run: |
           set -euo pipefail

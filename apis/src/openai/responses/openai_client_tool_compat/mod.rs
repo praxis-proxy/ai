@@ -204,10 +204,11 @@ const EMBEDDED_JSON_NODE_RESERVE: usize = 8_192;
 /// Namespace and member names can be repeated in every restored output item.
 const RESTORATION_NAME_MULTIPLIER: usize = 8;
 /// Request-phase retained-payload rejection before rich-tool lowering allocates.
-const LOWERING_BUDGET_MESSAGE: &str = "client tool request lowering exceeded openai_agentic_loop.max_retained_bytes";
+const LOWERING_BUDGET_MESSAGE: &str =
+    "Client tool request processing exceeds a limit set by the platform administrator.";
 /// Response-phase retained-payload rejection before buffered restore parses JSON.
 const RESTORATION_BUDGET_MESSAGE: &str =
-    "client tool response restoration exceeded openai_agentic_loop.max_retained_bytes";
+    "Client tool response processing exceeds a limit set by the platform administrator.";
 
 /// Length of the `___{hash:016x}` suffix appended to a shortened or ambiguous
 /// namespace name. The triple-underscore marker domain-separates the hashed shape

@@ -1119,7 +1119,7 @@ fn anthropic_error(error: &StreamError) -> (super::super::wire::ErrorType, &'sta
         ),
         StreamError::ReentryTooLarge => (
             super::super::wire::ErrorType::Api,
-            "web search request exceeds configured max_body_bytes",
+            "Web search request body exceeds a size limit set by the platform administrator.",
         ),
         StreamError::IncompleteStream => (
             super::super::wire::ErrorType::Api,
@@ -1687,8 +1687,8 @@ mod tests {
             "an oversized re-entry maps to api_error on the committed stream"
         );
         assert!(
-            text.contains("exceeds configured max_body_bytes"),
-            "the client-safe reason names the exceeded ceiling"
+            text.contains("size limit set by the platform administrator"),
+            "the client-safe reason attributes the size limit to the platform administrator"
         );
         assert!(text.ends_with("\n\n"), "the SSE event is framed");
     }

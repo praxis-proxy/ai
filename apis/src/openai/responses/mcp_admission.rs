@@ -111,16 +111,16 @@ pub(crate) enum McpDenyReason {
 
 #[cfg(feature = "openai-mcp-tools")]
 impl McpDenyReason {
-    /// Operator-facing explanation used in a truthful dispatch rejection.
+    /// Client-safe explanation used in a truthful dispatch rejection.
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::UntrustedSource => "tool denied: source is not an operator-trusted MCP tool service (protected mode)",
+            Self::UntrustedSource => "The platform administrator has forbidden tools from this untrusted MCP service.",
             Self::NoReadOnlyAuthority => {
-                "tool denied: source is not authoritative for read-only classification (protected read-only mode)"
+                "The platform administrator permits only verified read-only tools, and this service cannot verify that requirement."
             },
-            Self::Writable => "tool denied: trusted source classifies this tool as writable (protected read-only mode)",
+            Self::Writable => "The platform administrator has forbidden tools that can make changes.",
             Self::UnverifiedReadOnly => {
-                "tool denied: read-only classification is missing, malformed, or conflicting (protected read-only mode)"
+                "The platform administrator permits only verified read-only tools, and this tool could not be verified."
             },
         }
     }
@@ -394,6 +394,20 @@ mod tests {
             def["annotations"] = a;
         }
         def
+    }
+
+    #[test]
+    fn policy_denial_messages_attribute_restrictions_to_the_platform_administrator() {
+        for reason in [
+            McpDenyReason::UntrustedSource,
+            McpDenyReason::NoReadOnlyAuthority,
+            McpDenyReason::Writable,
+            McpDenyReason::UnverifiedReadOnly,
+        ] {
+            assert!(reason.message().contains("platform administrator"));
+            assert!(!reason.message().contains("protected mode"));
+            assert!(!reason.message().contains("tool_admission"));
+        }
     }
 
     #[test]

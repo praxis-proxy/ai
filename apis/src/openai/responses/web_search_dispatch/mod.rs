@@ -1399,8 +1399,7 @@ fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
         state.dispatch_failure = Some(DispatchFailure {
             status: 502,
             code: "server_error",
-            message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during web search"
-                .to_owned(),
+            message: "Web search exceeds a processing limit set by the platform administrator.".to_owned(),
         });
     }
     ctx.set_metadata("responses.skip_persist", "true");

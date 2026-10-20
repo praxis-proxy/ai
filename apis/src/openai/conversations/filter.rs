@@ -797,8 +797,10 @@ impl AppendBudgetError {
     /// Return the stable client-facing explanation.
     fn message(&self) -> &'static str {
         match self {
-            Self::Exceeded => "conversation append exceeds openai_agentic_loop.max_retained_bytes",
-            Self::Missing => "conversation append is missing the retained-payload budget",
+            Self::Exceeded => "Conversation append exceeds a processing limit set by the platform administrator.",
+            Self::Missing => {
+                "Conversation processing is unavailable because of a platform configuration problem. Contact the platform administrator."
+            },
         }
     }
 

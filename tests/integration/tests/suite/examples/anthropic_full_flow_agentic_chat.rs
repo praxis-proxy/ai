@@ -778,8 +778,8 @@ fn streaming_oversized_error_fails_closed_with_json() {
     assert!(
         response["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("max_body_bytes")),
-        "the JSON error names the exceeded ceiling: {body}"
+            .is_some_and(|message| message.contains("size limit set by the platform administrator")),
+        "the JSON error attributes the exceeded ceiling to the platform administrator: {body}"
     );
     assert!(
         !body.contains("rate_limit_error"),

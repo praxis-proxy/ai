@@ -116,7 +116,7 @@ fn mcp_budget_rejection() -> Rejection {
     responses_error_rejection(
         413,
         "invalid_request_error",
-        "MCP dispatch exceeds openai_agentic_loop.max_retained_bytes",
+        "MCP dispatch exceeds a processing limit set by the platform administrator.",
     )
 }
 
@@ -551,7 +551,7 @@ impl McpDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "MCP result batch exceeded the configured retained-byte limit".to_owned(),
+                message: "MCP tool results exceed a size limit set by the platform administrator.".to_owned(),
             });
         }
         FilterAction::Continue
@@ -565,7 +565,7 @@ impl McpDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "MCP dispatch exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+                message: "MCP dispatch exceeds a processing limit set by the platform administrator.".to_owned(),
             });
         }
         FilterAction::Continue
@@ -605,7 +605,7 @@ impl McpDispatchFilter {
             && count > self.max_calls_per_round
         {
             return Err(approval_rejection(&ApprovalError::Malformed(format!(
-                "a request may carry at most {} mcp_approval_response item(s) (max_calls_per_round), but {count} were supplied",
+                "This request includes too many approval responses; the platform administrator allows at most {}.",
                 self.max_calls_per_round
             ))));
         }
@@ -649,8 +649,7 @@ impl McpDispatchFilter {
             let max_batch = self.max_calls_per_round;
             if responses.len() > max_batch {
                 let e = ApprovalError::Malformed(format!(
-                    "a request may carry at most {max_batch} mcp_approval_response item(s) (max_calls_per_round), but {} were supplied",
-                    responses.len()
+                    "This request includes too many approval responses; the platform administrator allows at most {max_batch}."
                 ));
                 warn!(error = %e.message(), "mcp_dispatch: rejecting oversized approval-response batch");
                 return Err(approval_rejection(&e));
@@ -714,7 +713,11 @@ impl McpDispatchFilter {
             .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
-                responses_error_rejection(500, "server_error", "response store is not available")
+                responses_error_rejection(
+                    500,
+                    "server_error",
+                    "Tool approval is unavailable on this platform. Contact the platform administrator.",
+                )
             })?;
         let approval_ids: Vec<&str> = inputs.iter().map(|i| i.approval_id.as_str()).collect();
         if ctx
@@ -786,8 +789,7 @@ impl McpDispatchFilter {
                         .admitted_denial(&decision.server_label, &decision.tool_name)
                 {
                     let e = ApprovalError::TargetUnresolvable(format!(
-                        "approved tool '{}' is no longer admitted under the current operator policy: {}",
-                        decision.encoded_name,
+                        "The platform administrator's current policy forbids this tool call. {}",
                         reason.message()
                     ));
                     warn!(error = %e.message(), "mcp_dispatch: rejecting approval for a policy-denied tool");
@@ -982,7 +984,7 @@ fn approval_persistence_rejection(state: &ResponsesState, tool_name: &str) -> Op
             "mcp_dispatch: rejecting approval-required call because the response store did not arm \
              persistence for this exchange"
         );
-        return Some(approval_store_unavailable_rejection(tool_name));
+        return Some(approval_store_unavailable_rejection());
     }
     None
 }
@@ -1047,14 +1049,11 @@ fn approval_requires_store_rejection(tool_name: &str) -> ApprovalRejection {
 /// follow-up could never resume. This mirrors the resume path, which returns the
 /// same server error when the store is unavailable.
 #[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
-fn approval_store_unavailable_rejection(tool_name: &str) -> ApprovalRejection {
+fn approval_store_unavailable_rejection() -> ApprovalRejection {
     ApprovalRejection {
         status: 500,
         code: "server_error",
-        message: format!(
-            "MCP tool '{tool_name}' requires approval, but no response store is configured to persist the \
-             pending approval; a store is required so the mcp_approval_response follow-up can resume"
-        ),
+        message: "Tool approval is unavailable on this platform. Contact the platform administrator.".to_owned(),
     }
 }
 
@@ -1541,7 +1540,7 @@ pub(crate) fn prepare_response_round(
         return Err(DispatchFailure {
             status: 502,
             code: "server_error",
-            message: "MCP approval staging exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+            message: "MCP approval processing exceeds a limit set by the platform administrator.".to_owned(),
         });
     }
 
@@ -1709,7 +1708,7 @@ fn call_id_fallback_fits(tool_call: &serde_json::Value) -> bool {
         "unknown",
         tool_name,
         "",
-        "MCP tool result exceeded the configured retained-byte limit",
+        "MCP result exceeds the platform administrator's size limit.",
         Some(call_id),
     )
     .retained_bytes()
@@ -1976,7 +1975,7 @@ fn bounded_result_limit_error(
         "unknown",
         tool_name,
         "",
-        "MCP tool result exceeded the configured retained-byte limit",
+        "MCP result exceeds the platform administrator's size limit.",
         approval_request_id(tool_call),
     );
     if fallback.retained_bytes().is_none_or(|bytes| bytes > retained_limit) {

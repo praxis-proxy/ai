@@ -1479,7 +1479,7 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied"),
+            .contains("platform administrator"),
         "denied call must surface a policy rejection: {:?}",
         result.output_item["error"]
     );
@@ -1506,7 +1506,7 @@ async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied")
+            .contains("platform administrator")
     );
 }
 
@@ -1530,7 +1530,7 @@ async fn execute_single_call_rejects_resolved_entry_without_verdict() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied")
+            .contains("platform administrator")
     );
 }
 
@@ -2277,7 +2277,7 @@ fn budgeted_approval_staging_rejects_before_emitting_or_persisting() {
 
     let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
     assert_eq!(failure.status, 502);
-    assert!(failure.message.contains("max_retained_bytes"));
+    assert!(failure.message.contains("limit set by the platform administrator"));
     assert!(state.pending_approvals.is_empty());
     assert_eq!(
         state.accumulated_output.len(),
@@ -2313,8 +2313,12 @@ fn prepare_response_round_rejects_unresumable_approval() {
 
         assert_eq!(failure.status, expected_status);
         assert!(
-            failure.message.contains("store"),
-            "unresumable approvals must explain their persistence requirement"
+            failure.message.contains(if expected_status == 400 {
+                "store=true"
+            } else {
+                "platform administrator"
+            }),
+            "unresumable approvals must explain the client requirement or server configuration issue"
         );
         assert!(
             state.pending_approvals.is_empty(),
@@ -2458,7 +2462,11 @@ fn prepare_response_round_floor_fails_closed_when_unresumable() {
         let failure = prepare_response_round(&mut state, 1, ApprovalFloor::Always).unwrap_err();
 
         assert_eq!(failure.status, expected_status);
-        assert!(failure.message.contains("store"));
+        assert!(failure.message.contains(if expected_status == 400 {
+            "store=true"
+        } else {
+            "platform administrator"
+        }));
         assert!(
             state.pending_approvals.is_empty()
                 && !state
@@ -2489,7 +2497,7 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
         bounded.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("retained-byte limit"),
+            .contains("platform administrator's size limit"),
         "the bounded replacement must explain why the result was discarded"
     );
     assert_eq!(result_payload_limit(4096), 1024);
@@ -2929,7 +2937,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
         .as_ref()
         .expect("delegate terminal to loop owner");
     assert_eq!(failure.code, "server_error");
-    assert!(failure.message.contains("max_retained_bytes"));
+    assert!(failure.message.contains("limit set by the platform administrator"));
 
     let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let action = loop_filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -3562,7 +3570,7 @@ async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 413);
-    assert!(reject_message(&rejection).contains("max_retained_bytes"));
+    assert!(reject_message(&rejection).contains("limit set by the platform administrator"));
     assert!(
         ctx.extensions
             .get::<ResponsesState>()
@@ -3892,6 +3900,46 @@ async fn resume_approval_missing_store_fails_closed() {
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 500, "missing store must fail closed, not execute");
+    assert!(
+        reject_message(&rejection).contains("Contact the platform administrator"),
+        "the server setup failure must direct the user to the platform administrator"
+    );
+}
+
+#[tokio::test]
+async fn resume_approval_rechecks_policy_and_names_the_administrator_denial() {
+    let filter = make_dispatch_filter();
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+
+    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    admission.record(
+        "weather",
+        "get_weather",
+        McpToolVerdict::Denied(McpDenyReason::Writable),
+    );
+
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    register_store(&mut ctx, store);
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        mcp_admission: admission,
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)].into(),
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(rejection.status, 400);
+    let message = reject_message(&rejection);
+    assert!(
+        message.contains("platform administrator's current policy forbids"),
+        "{message}"
+    );
+    assert!(message.contains("forbidden tools that can make changes"), "{message}");
 }
 
 #[tokio::test]
@@ -4071,7 +4119,7 @@ async fn resume_approval_batch_exceeding_cap_is_rejected() {
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 400, "an oversized approval batch is a client error");
     assert!(
-        reject_message(&rejection).contains("at most"),
+        reject_message(&rejection).contains("platform administrator allows at most"),
         "the error should state the per-request approval cap: {}",
         reject_message(&rejection)
     );
