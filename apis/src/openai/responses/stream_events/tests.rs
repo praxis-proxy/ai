@@ -286,7 +286,7 @@ fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
     );
     assert_eq!(
         ctx.get_metadata("responses.stream_error_message"),
-        Some("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes")
+        Some("The request exceeds a processing limit set by the platform administrator.")
     );
 
     let mut eos = None;

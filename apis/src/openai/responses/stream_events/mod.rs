@@ -2418,7 +2418,7 @@ fn emit_retained_payload_error(ctx: &mut HttpFilterContext<'_>, output_index_off
 
 /// Client-safe terminal reason for a request-wide retained payload overflow.
 const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
-    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
+    "The request exceeds a processing limit set by the platform administrator.";
 
 /// Make an overflow sticky across the remaining logical-stream hooks.
 fn record_retained_payload_failure(ctx: &mut HttpFilterContext<'_>) {

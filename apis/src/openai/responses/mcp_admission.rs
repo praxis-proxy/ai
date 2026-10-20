@@ -133,23 +133,16 @@ pub(crate) enum McpDenyReason {
 
 #[cfg(feature = "openai-mcp-tools")]
 impl McpDenyReason {
-    /// Client-facing rejection text for a denied tool call.
-    ///
-    /// Returned to the caller in the tool-call error output, so it must describe
-    /// the outcome as an administrator decision in plain terms and must NOT leak
-    /// server configuration (mode names, trust levels, hint fields). Server-side
-    /// diagnostics use the typed variant (logged separately), not this string.
+    /// Client-safe explanation used in a truthful dispatch rejection.
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::UntrustedSource => "tool denied: its source is not approved by the administrator",
+            Self::UntrustedSource => "The platform administrator has forbidden tools from this untrusted MCP service.",
             Self::NoReadOnlyAuthority => {
-                "tool denied: the administrator allows only approved read-only tools, and this source is not approved to provide them"
+                "The platform administrator permits only verified read-only tools, and this service cannot verify that requirement."
             },
-            Self::Writable => {
-                "tool denied: the administrator allows only read-only tools, and this tool can modify data"
-            },
+            Self::Writable => "The platform administrator has forbidden tools that can make changes.",
             Self::UnverifiedReadOnly => {
-                "tool denied: the administrator allows only read-only tools, and this tool could not be confirmed read-only"
+                "The platform administrator permits only verified read-only tools, and this tool could not be verified."
             },
         }
     }
@@ -423,6 +416,20 @@ mod tests {
             def["annotations"] = a;
         }
         def
+    }
+
+    #[test]
+    fn policy_denial_messages_attribute_restrictions_to_the_platform_administrator() {
+        for reason in [
+            McpDenyReason::UntrustedSource,
+            McpDenyReason::NoReadOnlyAuthority,
+            McpDenyReason::Writable,
+            McpDenyReason::UnverifiedReadOnly,
+        ] {
+            assert!(reason.message().contains("platform administrator"));
+            assert!(!reason.message().contains("protected mode"));
+            assert!(!reason.message().contains("tool_admission"));
+        }
     }
 
     #[test]

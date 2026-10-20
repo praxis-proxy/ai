@@ -239,7 +239,7 @@ fn reject_retained_enrichment_budget() -> FilterAction {
         Rejection::status(413)
             .with_header("content-type", "application/json")
             .with_body(Bytes::from_static(
-                br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment exceeds openai_agentic_loop.max_retained_bytes","param":null,"code":"invalid_request_error"}}"#,
+                br#"{"error":{"type":"invalid_request_error","message":"Prompt enrichment exceeds a processing limit set by the platform administrator.","param":null,"code":"invalid_request_error"}}"#,
             )),
     )
 }

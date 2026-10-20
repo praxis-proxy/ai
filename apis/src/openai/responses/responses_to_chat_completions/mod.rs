@@ -81,10 +81,10 @@ const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
 const CHAT_REQUEST_FIXED_RESERVE: usize = 4_096;
 /// Request-phase admission error before any translated body is built.
 const CHAT_REQUEST_OVERFLOW: &str =
-    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat request translation";
+    "Chat request translation exceeds a processing limit set by the platform administrator.";
 /// Response-phase admission error before a buffered Chat body is parsed.
 const CHAT_RESPONSE_OVERFLOW: &str =
-    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat response translation";
+    "Chat response translation exceeds a processing limit set by the platform administrator.";
 /// Reserve client-owned request fields cloned into opening and terminal snapshots.
 const CHAT_STREAM_ECHO_MULTIPLIER: usize = 16;
 /// Part of that reserve covers encoded opening and terminal snapshots in flight.

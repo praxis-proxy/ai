@@ -137,7 +137,7 @@ async fn budgeted_mcp_resolve_requires_shared_budget_before_discovery() {
         FilterAction::Reject(rejection) => {
             assert_eq!(rejection.status, 413);
             let error = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
-            assert!(error.contains("max_retained_bytes"), "{error}");
+            assert!(error.contains("limit set by the platform administrator"), "{error}");
         },
         _ => panic!("budgeted MCP discovery must reject before the callout"),
     }

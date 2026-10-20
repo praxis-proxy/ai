@@ -1535,6 +1535,11 @@ pub(crate) fn chat_response_to_response_resource(
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
+///
+/// A Responses resource represents a single assistant turn and has no faithful
+/// representation for independent Chat alternatives, so exactly one choice is
+/// required: translating only the first of several would silently discard the
+/// rest. The streaming converter enforces the same single-choice contract.
 fn validate_chat_response<'a>(
     obj: &'a Map<String, Value>,
     reasoning_options: &ReasoningOptions,
@@ -1543,6 +1548,11 @@ fn validate_chat_response<'a>(
         .get("choices")
         .and_then(Value::as_array)
         .ok_or(TranslationError::InvalidChatResponse("choices must be an array"))?;
+    if choices.len() > 1 {
+        return Err(TranslationError::InvalidChatResponse(
+            "choices must contain exactly one choice",
+        ));
+    }
     let choice = choices
         .first()
         .and_then(Value::as_object)
@@ -1793,7 +1803,10 @@ fn insert_request_resource_fields(resource: &mut Value, context: &ResponseContex
     }
 }
 
-/// Extract the first Chat Completions choice.
+/// Extract the single Chat Completions choice.
+///
+/// Response validation rejects any cardinality other than one before output
+/// construction runs, so the first choice is the validated only choice.
 fn first_choice(obj: &Map<String, Value>) -> Option<&Value> {
     obj.get("choices")
         .and_then(Value::as_array)
@@ -1952,7 +1965,10 @@ fn number_value(value: f64) -> Value {
     Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
-/// Build all `Responses` output items from the first Chat choice.
+/// Build all `Responses` output items from the single Chat choice.
+///
+/// The caller has already validated that the response carries exactly one
+/// choice, so the first choice is the only choice.
 fn build_output_items(
     obj: &Map<String, Value>,
     context: &ResponseContext<'_>,

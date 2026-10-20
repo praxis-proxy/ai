@@ -807,7 +807,7 @@ impl AnthropicWebSearchFilter {
             return FilterAction::Reject(wire::error_rejection(
                 413,
                 wire::ErrorType::InvalidRequest,
-                "web search request exceeds configured max_body_bytes",
+                "Web search request body exceeds a size limit set by the platform administrator.",
             ));
         }
         // Poison the logical stream so any later read observes the terminal state;
@@ -865,7 +865,7 @@ impl AnthropicWebSearchFilter {
             return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
                 wire::ErrorType::Api,
-                "web-search upstream response exceeded the configured max_body_bytes",
+                "Web search upstream response exceeds a size limit set by the platform administrator.",
             )));
         }
         Self::classify_buffered_round(ctx, body)

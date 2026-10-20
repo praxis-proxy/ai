@@ -234,7 +234,7 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
-                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+                "The request exceeds a processing limit set by the platform administrator.",
             )));
         }
 
@@ -361,7 +361,7 @@ fn handle_agentic_request_body(
             } else {
                 "server_error"
             },
-            message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+            message: "The request exceeds a processing limit set by the platform administrator.".to_owned(),
         })
     } else if let Some(failure) = state.security_failure.take() {
         // A locally-detected security-context failure (missing/invalid per-user
@@ -889,7 +889,7 @@ fn release_completed_round(
     Ok(Some(FilterAction::Reject(responses_error_rejection(
         502,
         "server_error",
-        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+        "The request exceeds a processing limit set by the platform administrator.",
     ))))
 }
 
