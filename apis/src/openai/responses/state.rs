@@ -2046,6 +2046,34 @@ mod tests {
     }
 
     #[test]
+    fn from_request_body_does_not_deep_copy_input_payload_through_init() {
+        // Measure the whole initialization, not just the snapshot clone: moving
+        // input out of the parsed body and sharing it across input, messages, and
+        // persisted_messages must never deep-copy the payload (#1618). Init cost is
+        // therefore independent of payload size, so a 200 KiB payload allocates no
+        // more than a tiny one. Bodies are built outside the measured closures so
+        // only the init work is attributed.
+        let make_body =
+            |payload: usize| json!({"model": "gpt-4o", "input": [{"role": "user", "content": "x".repeat(payload)}]});
+        let small_body = make_body(32);
+        let large_body = make_body(200_000);
+
+        let small = allocation_counter::measure(|| {
+            std::hint::black_box(ResponsesState::from_request_body(std::hint::black_box(small_body)));
+        });
+        let large = allocation_counter::measure(|| {
+            std::hint::black_box(ResponsesState::from_request_body(std::hint::black_box(large_body)));
+        });
+
+        assert!(
+            large.bytes_total < small.bytes_total + 50_000,
+            "init must not deep-copy the 200 KiB payload across the three histories: small={} bytes, large={} bytes",
+            small.bytes_total,
+            large.bytes_total
+        );
+    }
+
+    #[test]
     fn from_request_body_empty_input() {
         let body = json!({"model": "gpt-4o"});
         let state = ResponsesState::from_request_body(body);
