@@ -69,7 +69,7 @@ pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, json_values_fit,
 };
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub use provisioning::store_backend_factories;
@@ -102,10 +102,10 @@ pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
     use super::conversation_rebuild_fits;
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
     #[test]
     fn sparse_json_rebuild_needs_structural_headroom() {
         // 40 KiB of nested arrays expanded past 12 MiB across parser/copy peaks

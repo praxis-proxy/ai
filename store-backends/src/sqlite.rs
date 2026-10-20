@@ -17,6 +17,7 @@ use super::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
     PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_bytes, run_blocking},
+    json_values_fit,
     pool::apply_pool_config,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
@@ -694,22 +695,19 @@ impl ResponseStore for SqliteResponseStore {
         max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         // Post-#1509 the `messages` column is a lazy snapshot, so reconstruct the
-        // full history (legacy prefix + items) before enforcing the byte ceiling.
+        // full history (legacy prefix + items). The reconstruction preflights the
+        // raw stored bytes in its transaction before decoding, and the decoded
+        // metadata + messages are then measured with a counting writer rather than
+        // two full serialized copies.
         let Some(mut record) = self.get_conversation_record(owner, conversation_id).await? else {
             return Ok(None);
         };
         let history = self
-            .conversation_history(owner, conversation_id)
+            .conversation_history_within(owner, conversation_id, Some(max_bytes))
             .await?
             .unwrap_or_default();
         let messages = serde_json::Value::Array(history);
-        let metadata_len = serde_json::to_vec(&record.metadata)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?
-            .len();
-        let messages_len = serde_json::to_vec(&messages)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?
-            .len();
-        if metadata_len.saturating_add(messages_len) > max_bytes {
+        if !json_values_fit(&[&record.metadata, &messages], max_bytes) {
             return Err(StoreError::PayloadTooLarge);
         }
         record.messages = messages;
@@ -1536,6 +1534,84 @@ impl ConversationItemStore for SqliteResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        self.conversation_history_within(owner, conversation_id, None).await
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+            .await
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+            .await
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        let items_table = self
+            .tables
+            .items
+            .as_deref()
+            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+        let conv_table = &self.tables.conversations;
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        let deleted =
+            sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(deleted)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "transactional cache helpers sit beside their trait implementation"
+)]
+impl SqliteResponseStore {
+    /// Reconstruct a conversation's full history (legacy prefix + item rows),
+    /// optionally bounding the stored bytes before any row is decoded.
+    ///
+    /// When `max_bytes` is `Some`, a single aggregate over the snapshot column and
+    /// the item rows runs inside the read transaction first: if the raw stored
+    /// bytes already exceed the ceiling the history is rejected with
+    /// [`StoreError::PayloadTooLarge`] without materializing a single parsed value,
+    /// so an oversized conversation cannot be decoded into memory just to measure
+    /// it. The decoded result is still measured precisely (including metadata) by
+    /// the caller.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::large_stack_frames,
+        reason = "linear reconstruct-and-bound SQL read; its future is boxed at the async_trait call boundary"
+    )]
+    async fn conversation_history_within(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
         let Some(table) = self.tables.items.as_deref() else {
             return Ok(self
                 .get_conversation_record(owner, conversation_id)
@@ -1568,6 +1644,34 @@ impl ConversationItemStore for SqliteResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
         if exists.is_none() {
             return Ok(None);
+        }
+        if let Some(max_bytes) = max_bytes {
+            // Preflight the raw stored bytes (snapshot column + item rows) in the
+            // same transaction before decoding, so an oversized history is rejected
+            // without building any parsed value. The snapshot column still carries
+            // the legacy prefix post-#1509, so it is counted alongside the rows.
+            let size_sql = format!(
+                "SELECT COALESCE((SELECT length(CAST(messages AS BLOB)) FROM {conversations} \
+                   WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?), 0) \
+                 + COALESCE((SELECT SUM(length(CAST(item_data AS BLOB))) FROM {table} \
+                   WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?), 0)",
+                conversations = self.tables.conversations,
+            );
+            let raw_bytes: i64 = sqlx::query_scalar(AssertSqlSafe(size_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            if usize::try_from(raw_bytes).ok().is_none_or(|raw| raw > max_bytes) {
+                return Err(StoreError::PayloadTooLarge);
+            }
         }
         let select_sql = format!(
             "SELECT item_data FROM {table} WHERE conversation_id = ? AND tenant_id = ? \
@@ -1633,60 +1737,6 @@ impl ConversationItemStore for SqliteResponseStore {
         Ok(Some(history))
     }
 
-    async fn create_items_and_sync_messages(
-        &self,
-        owner: &StateOwner,
-        conversation_id: &str,
-        items: &[ConversationItemRecord],
-    ) -> Result<(), StoreError> {
-        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
-            .await
-    }
-
-    async fn create_items_and_sync_messages_bounded(
-        &self,
-        owner: &StateOwner,
-        conversation_id: &str,
-        items: &[ConversationItemRecord],
-        max_rebuild_bytes: usize,
-    ) -> Result<(), StoreError> {
-        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
-            .await
-    }
-
-    async fn delete_item_and_sync_messages(
-        &self,
-        owner: &StateOwner,
-        conversation_id: &str,
-        item_id: &str,
-    ) -> Result<bool, StoreError> {
-        let items_table = self
-            .tables
-            .items
-            .as_deref()
-            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
-        let conv_table = &self.tables.conversations;
-
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
-        let deleted =
-            sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
-
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(deleted)
-    }
-}
-
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "transactional cache helpers sit beside their trait implementation"
-)]
-impl SqliteResponseStore {
     /// Insert items and rebuild the owner-scoped cache in one transaction.
     #[expect(
         clippy::too_many_lines,

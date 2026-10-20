@@ -10,7 +10,7 @@
 
 use crate::{
     owner::StateOwner,
-    traits::{ConversationItemStore, PersistedStateBackend},
+    traits::{ConversationItemStore, PersistedStateBackend, ResponseStore},
     types::{
         ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
         ResponseRecord, StoreError,
@@ -89,6 +89,7 @@ async fn persist_parent_response(backend: &dyn PersistedStateBackend, owner: &St
 /// Panics if the backend violates the persistence contract.
 #[expect(
     clippy::large_stack_frames,
+    clippy::cognitive_complexity,
     reason = "sequentially runs the complete backend contract"
 )]
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
@@ -103,6 +104,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
     legacy_history_survives_incremental_mutations(backend).await;
+    bounded_read_reconstructs_full_history_and_bounds_raw_bytes(backend).await;
     history_orders_positions_without_truncation(backend).await;
     malformed_cache_requires_explicit_repair(backend).await;
     bounded_item_rebuild_rolls_back(backend).await;
@@ -116,6 +118,77 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     event_log_requires_owner_matched_response(backend).await;
     event_log_status_gates_on_terminal(backend).await;
     event_log_removed_with_response(backend).await;
+}
+
+/// `get_conversation_bounded` reconstructs the complete lazy-snapshot + items
+/// history, `get_conversation` returns only the retired snapshot, and the raw
+/// stored bytes are bounded against the caller's ceiling.
+///
+/// This pins why `rehydrate` must keep using `get_conversation_bounded` even for
+/// the unbounded case: `get_conversation` alone drops every items-table turn.
+#[expect(clippy::too_many_lines, reason = "linear bounded-read contract assertions")]
+async fn bounded_read_reconstructs_full_history_and_bounds_raw_bytes(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-history");
+    let legacy = serde_json::json!([{"role": "user", "content": "legacy"}]);
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_bounded".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: legacy.clone(),
+        })
+        .await
+        .expect("legacy parent");
+    let mut first = item(&o, "conv_bounded", "a");
+    first.item_data = serde_json::json!({"role": "assistant", "content": "a"});
+    first.position = 0;
+    let mut second = item(&o, "conv_bounded", "b");
+    second.item_data = serde_json::json!({"role": "user", "content": "b"});
+    second.position = 1;
+    backend
+        .create_items_and_sync_messages(&o, "conv_bounded", &[first, second])
+        .await
+        .expect("append item rows");
+
+    // The complete reconstructed history is the legacy prefix followed by the two
+    // item rows.
+    let full = ConversationItemStore::conversation_history(backend, &o, "conv_bounded")
+        .await
+        .expect("history read")
+        .expect("history exists");
+    assert_eq!(full.len(), 3, "legacy prefix plus two item rows");
+
+    // A generous ceiling returns that complete history.
+    let bounded = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", 1 << 20)
+        .await
+        .expect("bounded read")
+        .expect("conversation exists");
+    assert_eq!(
+        bounded.messages,
+        serde_json::Value::Array(full),
+        "the bounded read reconstructs the full lazy-snapshot + items history"
+    );
+
+    // `get_conversation` returns only the retired lazy snapshot, not the items, so
+    // it must never be substituted for the bounded read on the unbounded path.
+    let snapshot = ResponseStore::get_conversation(backend, &o, "conv_bounded")
+        .await
+        .expect("snapshot read")
+        .expect("conversation exists");
+    assert_ne!(
+        snapshot.messages, bounded.messages,
+        "get_conversation returns the incomplete lazy snapshot, not the reconstructed history"
+    );
+
+    // A ceiling below the raw stored bytes rejects before the record is returned.
+    let err = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", 1)
+        .await
+        .expect_err("a 1-byte ceiling must reject the stored history");
+    assert!(
+        matches!(err, StoreError::PayloadTooLarge),
+        "an oversized history is PayloadTooLarge, got {err:?}"
+    );
 }
 
 /// A conversation id is globally unique in the SQL schema: another owner may
