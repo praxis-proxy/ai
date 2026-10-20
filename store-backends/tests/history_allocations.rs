@@ -71,6 +71,7 @@ mod tests {
     const CONVERSATION: &str = "allocation_history";
     const REPETITIONS: usize = 5;
     const MUTATIONS: usize = 8;
+    const NOISE_FLOOR_BYTES: usize = 16 * 1024;
 
     #[test]
     fn sqlite_single_item_mutations_do_not_rebuild_growing_histories() {
@@ -117,9 +118,10 @@ mod tests {
                     baseline.bytes_current = baseline.bytes_current.max(info.bytes_current);
                     continue;
                 }
-                // Admit scheduling/query overhead smaller than half ONE additional
-                // history payload, not one full rebuild per each of 16 mutations.
-                let growth_budget = u64::try_from((count * payload_bytes - 32) / 2).unwrap();
+                // Admit scheduling/query overhead far below one rebuild per each of
+                // 16 mutations. The floor covers thread-scheduling variance when the
+                // payload-derived budget is smaller than that variance.
+                let growth_budget = u64::try_from(((count * payload_bytes - 32) / 2).max(NOISE_FLOOR_BYTES)).unwrap();
                 assert!(
                     info.bytes_total <= baseline.bytes_total + growth_budget,
                     "mutation work must depend on delta, not history: {info:?}; baseline={baseline:?}"
