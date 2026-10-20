@@ -189,6 +189,32 @@ async fn bounded_read_reconstructs_full_history_and_bounds_raw_bytes(backend: &d
         matches!(err, StoreError::PayloadTooLarge),
         "an oversized history is PayloadTooLarge, got {err:?}"
     );
+
+    // Boundary: a legacy-prefix conversation stores its prefix in the snapshot
+    // column wrapped as `{"legacy_messages":[...]}`; that wrapper is stripped on
+    // reconstruction. A preflight that counted the wrapper column would over-count
+    // and falsely reject a ceiling set exactly at the decoded size. The exact
+    // decoded size is the compact metadata + messages the caller measures.
+    let exact = serde_json::to_vec(&bounded.metadata)
+        .expect("metadata serializes")
+        .len()
+        + serde_json::to_vec(&bounded.messages)
+            .expect("messages serializes")
+            .len();
+    assert!(
+        ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", exact)
+            .await
+            .expect("ceiling at the exact decoded size must not error")
+            .is_some(),
+        "a ceiling equal to the decoded columns must admit the record (no wrapper over-count)"
+    );
+    let under = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", exact - 1)
+        .await
+        .expect_err("one byte under the decoded size must reject");
+    assert!(
+        matches!(under, StoreError::PayloadTooLarge),
+        "one byte under the decoded size is PayloadTooLarge, got {under:?}"
+    );
 }
 
 /// A conversation id is globally unique in the SQL schema: another owner may

@@ -1594,13 +1594,13 @@ impl SqliteResponseStore {
     /// Reconstruct a conversation's full history (legacy prefix + item rows),
     /// optionally bounding the stored bytes before any row is decoded.
     ///
-    /// When `max_bytes` is `Some`, a single aggregate over the snapshot column and
-    /// the item rows runs inside the read transaction first: if the raw stored
-    /// bytes already exceed the ceiling the history is rejected with
-    /// [`StoreError::PayloadTooLarge`] without materializing a single parsed value,
-    /// so an oversized conversation cannot be decoded into memory just to measure
-    /// it. The decoded result is still measured precisely (including metadata) by
-    /// the caller.
+    /// When `max_bytes` is `Some`, the item-row byte total is aggregated inside the
+    /// read transaction first: if it already exceeds the ceiling the history is
+    /// rejected with [`StoreError::PayloadTooLarge`] without decoding a single row,
+    /// so an oversized item set cannot be materialized just to measure it. The row
+    /// total is a true lower bound on the decoded size, so this never rejects a
+    /// record the caller's precise `json_values_fit` check (metadata + reconstructed
+    /// messages) would admit.
     #[expect(
         clippy::too_many_lines,
         clippy::large_stack_frames,
@@ -1646,22 +1646,21 @@ impl SqliteResponseStore {
             return Ok(None);
         }
         if let Some(max_bytes) = max_bytes {
-            // Preflight the raw stored bytes (snapshot column + item rows) in the
-            // same transaction before decoding, so an oversized history is rejected
-            // without building any parsed value. The snapshot column still carries
-            // the legacy prefix post-#1509, so it is counted alongside the rows.
+            // Preflight the item-row bytes in the same transaction before decoding
+            // them, so an oversized history is rejected without building a parsed
+            // value. Only the item rows are counted: the snapshot column is already
+            // materialized by `get_conversation_record` (so counting it protects no
+            // memory), and its `{"legacy_messages":...}` wrapper is stripped during
+            // reconstruction, so counting it would over-count and could falsely
+            // reject a conversation whose decoded columns fit. `SUM(length(item_data))`
+            // is the stored compact size of the rows, a true lower bound on their
+            // decoded contribution (reconstruction only adds array separators), so
+            // this never rejects a record the precise `json_values_fit` check admits.
             let size_sql = format!(
-                "SELECT COALESCE((SELECT length(CAST(messages AS BLOB)) FROM {conversations} \
-                   WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?), 0) \
-                 + COALESCE((SELECT SUM(length(CAST(item_data AS BLOB))) FROM {table} \
-                   WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?), 0)",
-                conversations = self.tables.conversations,
+                "SELECT COALESCE(SUM(length(CAST(item_data AS BLOB))), 0) FROM {table} \
+                   WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
             );
-            let raw_bytes: i64 = sqlx::query_scalar(AssertSqlSafe(size_sql.as_str()))
-                .bind(conversation_id)
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
+            let item_bytes: i64 = sqlx::query_scalar(AssertSqlSafe(size_sql.as_str()))
                 .bind(conversation_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -1669,7 +1668,7 @@ impl SqliteResponseStore {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
-            if usize::try_from(raw_bytes).ok().is_none_or(|raw| raw > max_bytes) {
+            if usize::try_from(item_bytes).ok().is_none_or(|raw| raw > max_bytes) {
                 return Err(StoreError::PayloadTooLarge);
             }
         }
