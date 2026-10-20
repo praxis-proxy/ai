@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Single-thread projected-file watcher with fail-closed publication.
 
 use std::{

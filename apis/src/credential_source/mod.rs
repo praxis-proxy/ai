@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Shared credential source (`value | env_var | file`) with bounded reads,
 //! restart-free file rotation, and fail-closed publication.
 //!

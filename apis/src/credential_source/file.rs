@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Bounded, fail-closed projected-file token read.
 
 use std::{fs::File, io::Read as _, path::Path};
