@@ -271,6 +271,16 @@ impl WatchRegistry {
                     };
                     directories.insert(directory, identity);
                 }
+                // Every stable anchor is now live. Recompute the topology once
+                // more so a symlink retarget between discovery and watch setup
+                // cannot leave only the old target subscribed while the
+                // authoritative read publishes the new target's token.
+                if let Err(error) = reconcile_watch_directories(&mut watcher, &watched, &mut directories) {
+                    drop(ready_tx.send(Err(format!(
+                        "failed to reconcile credential directories before readiness: {error}"
+                    ))));
+                    return;
+                }
                 // Authoritative re-read AFTER the watch is live (closes the
                 // construct-read -> watch-register TOCTOU). Any event during the
                 // read stays queued and is processed after readiness. Publish
@@ -373,17 +383,17 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentity, notify::Error> {
     }
 }
 
-/// Resolve every file-symlink hop and return the directories needed to observe
-/// both target-file changes and target-directory recreation.
+/// Resolve every symlink hop in a credential path and return the directories
+/// needed to observe link replacement, target-file changes, and target-directory
+/// recreation.
 ///
-/// A projected credential may traverse more than one file symlink. Watching
-/// only the first target's directory misses changes to the ultimate file. Each
-/// hop therefore contributes its resolved parent directory and a stable anchor
-/// outside that directory. The anchor remains watchable if the target directory
-/// is removed, so recreating it can re-arm the direct subscription. A visited
-/// set terminates malformed symlink cycles without affecting the startup read,
-/// which has already rejected an unreadable source.
-fn symlink_target_watch_directories(path: &Path) -> HashSet<PathBuf> {
+/// A projected credential may traverse file symlinks, directory symlinks, or
+/// both. Each hop contributes the link's containing directory, the target
+/// directory, and stable anchors outside them. The anchors remain watchable if
+/// a target directory is removed, so recreation can re-arm the direct
+/// subscription. A visited set and hop bound terminate malformed cycles without
+/// affecting the startup read, which has already rejected an unreadable source.
+fn symlink_chain_watch_directories(path: &Path) -> HashSet<PathBuf> {
     let mut directories = HashSet::new();
     let mut visited = HashSet::new();
     let mut current = path.to_path_buf();
@@ -392,27 +402,43 @@ fn symlink_target_watch_directories(path: &Path) -> HashSet<PathBuf> {
     // startup read already rejects a loop; this bound also protects runtime
     // reconciliation if a previously valid chain is retargeted into one.
     for _ in 0..40 {
-        if !visited.insert(current.clone())
-            || !std::fs::symlink_metadata(&current)
-                .ok()
-                .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
+        if !visited.insert(current.clone()) {
             break;
         }
-        let Ok(target) = std::fs::read_link(&current) else {
+        let Some(link) = first_symlink_component(&current) else {
             break;
         };
-        current = if target.is_absolute() {
+        let Ok(target) = std::fs::read_link(&link) else {
+            break;
+        };
+        let suffix = current.strip_prefix(&link).unwrap_or_else(|_| Path::new(""));
+        let resolved_target = if target.is_absolute() {
             target
-        } else if let Some(parent) = current.parent() {
+        } else if let Some(parent) = link.parent() {
             parent.join(target)
         } else {
             break;
         };
+        insert_target_directory_watches(&mut directories, &link);
+        current = resolved_target.join(suffix);
         insert_target_directory_watches(&mut directories, &current);
     }
 
     directories
+}
+
+/// Return the first symlink component in `path`, from the filesystem root
+/// toward the final credential file.
+fn first_symlink_component(path: &Path) -> Option<PathBuf> {
+    let mut candidate = PathBuf::new();
+    for component in path.components() {
+        candidate.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+        if metadata.file_type().is_symlink() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Add direct and stable watches for one file-symlink target.
@@ -472,7 +498,7 @@ fn desired_watch_directories(watched: &[WatchedSource]) -> HashSet<PathBuf> {
         {
             directories.insert(anchor);
         }
-        directories.extend(symlink_target_watch_directories(&item.path));
+        directories.extend(symlink_chain_watch_directories(&item.path));
     }
     directories
 }
@@ -912,6 +938,54 @@ mod tests {
             directories.contains(&target_dir.canonicalize().unwrap()),
             "the ultimate token directory must be watched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "complete chained-directory symlink setup")]
+    fn multi_hop_directory_symlink_watches_intermediate_link_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let secrets_dir = root.path().join("secrets");
+        let version_a = secrets_dir.join("version-a");
+        let version_b = secrets_dir.join("version-b");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::create_dir_all(&version_a).unwrap();
+        std::fs::create_dir_all(&version_b).unwrap();
+        std::fs::write(version_a.join("key"), "token-a\n").unwrap();
+        std::fs::write(version_b.join("key"), "token-b\n").unwrap();
+        let current = secrets_dir.join("current");
+        std::os::unix::fs::symlink(&version_a, &current).unwrap();
+        let link = config_dir.join("link");
+        std::os::unix::fs::symlink(&current, &link).unwrap();
+        let path = link.join("key");
+
+        let mut registry = WatchRegistry::new();
+        let handle = registry
+            .register(
+                ctx("a/b/c"),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap();
+        let before = desired_watch_directories(&registry.watched);
+        assert!(
+            before.contains(&secrets_dir.canonicalize().unwrap()),
+            "the directory containing an intermediate symlink must be watched"
+        );
+
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(&version_b, &current).unwrap();
+        let after = desired_watch_directories(&registry.watched);
+        assert!(after.contains(&version_b.canonicalize().unwrap()));
+        assert!(!after.contains(&version_a.canonicalize().unwrap()));
+
+        let replaced = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(current);
+        process_event(&replaced, &registry.watched);
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("token-b"));
     }
 
     #[cfg(unix)]
