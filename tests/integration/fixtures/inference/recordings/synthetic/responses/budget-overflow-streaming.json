@@ -55,7 +55,7 @@
               },
               {
                 "event": "error",
-                "data": "{\"code\":\"server_error\",\"message\":\"agentic retained payload exceeded openai_agentic_loop.max_retained_bytes\",\"param\":null,\"sequence_number\":1,\"type\":\"error\"}",
+                "data": "{\"code\":\"server_error\",\"message\":\"The request exceeds a processing limit set by the platform administrator.\",\"param\":null,\"sequence_number\":1,\"type\":\"error\"}",
                 "id": null,
                 "retry": null
               }
