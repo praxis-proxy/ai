@@ -1795,8 +1795,14 @@ impl PostgresResponseStore {
     /// The size-only query runs before any JSON column is returned to the process.
     #[expect(
         clippy::too_many_lines,
-        clippy::large_stack_frames,
-        reason = "one read transaction keeps the size preflight and reconstruction on the same snapshot; async_trait boxes the future"
+        reason = "one read transaction keeps the size preflight and reconstruction on the same snapshot"
+    )]
+    #[cfg_attr(
+        feature = "postgres",
+        expect(
+            clippy::large_stack_frames,
+            reason = "the async_trait boundary boxes this single-snapshot reconstruction future"
+        )
     )]
     async fn conversation_record_within(
         &self,
