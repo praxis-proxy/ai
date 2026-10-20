@@ -294,6 +294,55 @@ async fn validates_previous_response_and_sets_metadata() {
     assert_eq!(state.response_id.as_deref(), Some("resp_current"));
 }
 
+#[tokio::test]
+async fn reuses_existing_state_instead_of_reparsing() {
+    // #1618: when a managed owner already decoded the request into ResponsesState,
+    // rehydration merges stored history into that state rather than re-parsing the
+    // body. A sentinel field the parse path never sets must survive, proving reuse.
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"}
+    ]);
+    let store = MockStore::with_completed_response("resp_prev", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("responses.response_id", "resp_current");
+    let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
+
+    // Simulate the managed owner having built state from the same body, with a
+    // sentinel the parse-based build_state would not reproduce.
+    let mut owner_state = ResponsesState::from_request_body(serde_json::from_str(original).unwrap());
+    owner_state.history_rehydrated = false;
+    owner_state.provider_history_len = 4242;
+    assert!(
+        owner_state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    ctx.extensions.insert(owner_state);
+
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.provider_history_len, 4242,
+        "the merged state must be the owner's state, not a freshly parsed one"
+    );
+    assert!(state.history_rehydrated, "reuse must mark the state rehydrated");
+    assert_eq!(state.messages.len(), 3, "2 stored messages prepend the current input");
+    assert_eq!(state.messages[2]["content"], "What next?", "current input stays last");
+    assert_eq!(state.response_id.as_deref(), Some("resp_current"));
+}
+
 fn arm_retained_budget(ctx: &mut HttpFilterContext<'_>, request_body: &str, limit: usize) -> usize {
     let config: serde_yaml::Value = serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap();
     ctx.extensions
