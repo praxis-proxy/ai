@@ -46,6 +46,10 @@ fn default_header() -> String {
 
 /// Promotes the JSON `"model"` field from the request body to a request header.
 ///
+/// The promoted value is also published to `model_to_header.model` metadata for
+/// downstream consumers (e.g. the `llm_metrics` model label), so those readers
+/// use the server-validated value instead of a client-supplied request header.
+///
 /// Promotion is deferred until end-of-stream so a later body-writing filter
 /// (for example `llmisvc_model_provider_resolver`) can observe the pending
 /// header in the same `StreamBuffer` pre-read pass.
@@ -165,7 +169,21 @@ impl HttpFilter for ModelToHeaderFilter {
                 "model_to_header: dropping client-supplied promotion header (anti-spoofing)"
             );
         }
-        self.inner.on_request_body(ctx, body, end_of_stream).await
+        let appended_from = ctx.extra_request_headers.len();
+        let action = self.inner.on_request_body(ctx, body, end_of_stream).await?;
+        // The promoted value is published as `model_to_header.model` metadata so
+        // downstream consumers (e.g. the `llm_metrics` model label) can read a
+        // server-validated model instead of a client-supplied request header.
+        let model = ctx
+            .extra_request_headers
+            .iter()
+            .skip(appended_from)
+            .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(self.header.as_str()))
+            .map(|(_, value)| value.clone());
+        if let Some(model) = model {
+            ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
+        }
+        Ok(action)
     }
 
     fn on_response_body(
@@ -451,6 +469,38 @@ mod tests {
         assert!(
             matches!(action, FilterAction::Continue),
             "on_response_body should delegate to inner and return Continue"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_body_publishes_model_metadata() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        req.headers
+            .insert("x-model", http::HeaderValue::from_static("client-spoofed-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-x","messages":[]}"#));
+
+        drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_eq!(
+            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            Some("gpt-x"),
+            "model_to_header should publish the promoted body model, not a spoofed client header"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_body_without_model_publishes_nothing() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(br#"{"messages":[]}"#));
+
+        drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        assert_eq!(
+            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            None,
+            "no model in the body should publish no model metadata"
         );
     }
 }

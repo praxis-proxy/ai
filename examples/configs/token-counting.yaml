@@ -39,7 +39,9 @@
 #   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
 # token_count reads the response body, extracts provider-specific
-# token usage, and writes the counts to filter_metadata.
+# token usage, and writes the counts to filter_metadata. It also emits
+# model/cluster-labeled praxis_ai_* token metrics; the model label
+# comes from model_to_header's published metadata (see below).
 #
 # token_usage_headers injects Praxis-Token-Input, Praxis-Token-Output,
 # and Praxis-Token-Total into the downstream response — but only when
@@ -56,6 +58,12 @@
 # Supported provider values:
 #   openai | anthropic | google | bedrock | azure
 
+# The health and metrics endpoints (/healthy, /ready, /metrics) bind here;
+# scrape the praxis_ai_* token metrics (labeled by model and cluster) from
+# /metrics.
+admin:
+  address: "127.0.0.1:9901"
+
 listeners:
   - name: default
     address: "127.0.0.1:8080"
@@ -69,6 +77,13 @@ filter_chains:
         routes:
           - path_prefix: "/"
             cluster: backend
+
+      # model_to_header promotes the request body's "model" field to the
+      # X-Model request header and publishes it as model_to_header.model
+      # metadata, so the praxis_ai_* token metrics emitted by token_count
+      # carry a real model label instead of "unknown". A raw client
+      # X-Model header is stripped first (anti-spoofing).
+      - filter: model_to_header
 
       # token_usage_headers is declared before token_count: response
       # hooks run in reverse declared order, so token_count's

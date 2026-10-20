@@ -227,7 +227,7 @@ fn resolve_model_openai() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("openai_responses_request.model", "gpt-4o");
-    assert_eq!(resolve_model(&ctx), "gpt-4o");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn resolve_model_chat_completions() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("openai_chat_completions_request.model", "gpt-4");
-    assert_eq!(resolve_model(&ctx), "gpt-4");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4");
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn resolve_model_prefers_responses_over_chat_completions() {
 
     ctx.set_metadata("openai_responses_request.model", "gpt-4o");
     ctx.set_metadata("openai_chat_completions_request.model", "gpt-4");
-    assert_eq!(resolve_model(&ctx), "gpt-4o");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn resolve_model_anthropic() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("anthropic_messages_request.model", "claude-sonnet-5");
-    assert_eq!(resolve_model(&ctx), "claude-sonnet-5");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "claude-sonnet-5");
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn resolve_model_anthropic_messages_to_chat_completions() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("anthropic_messages_to_chat_completions.model", "claude-haiku-4-5");
-    assert_eq!(resolve_model(&ctx), "claude-haiku-4-5");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "claude-haiku-4-5");
 }
 
 #[test]
@@ -274,7 +274,7 @@ fn resolve_model_prefers_openai_over_anthropic() {
 
     ctx.set_metadata("openai_responses_request.model", "gpt-4o");
     ctx.set_metadata("anthropic_messages_request.model", "claude-sonnet-5");
-    assert_eq!(resolve_model(&ctx), "gpt-4o");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
 #[test]
@@ -282,7 +282,23 @@ fn resolve_model_unknown_fallback() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let ctx = crate::test_utils::make_filter_context(&req);
 
-    assert_eq!(resolve_model(&ctx), "unknown");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "unknown");
+}
+
+#[test]
+fn resolve_model_ignores_raw_x_model_header() {
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-model"),
+        HeaderValue::from_static("client-claimed-model"),
+    );
+    let ctx = crate::test_utils::make_filter_context(&req);
+
+    assert_eq!(
+        crate::llm_metrics::resolve_model(&ctx),
+        "unknown",
+        "a raw client X-Model request header must never become a metric label"
+    );
 }
 
 #[test]
@@ -291,7 +307,7 @@ fn resolve_model_rejects_control_characters() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     ctx.set_metadata("anthropic_messages_to_chat_completions.model", "model\ninjection");
-    assert_eq!(resolve_model(&ctx), "unknown");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "unknown");
 }
 
 #[test]
@@ -301,7 +317,7 @@ fn resolve_model_rejects_oversized_value() {
 
     let long_model = "a".repeat(MAX_PROMOTED_VALUE_LEN + 1);
     ctx.set_metadata("openai_responses_request.model", &long_model);
-    assert_eq!(resolve_model(&ctx), "unknown");
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), "unknown");
 }
 
 #[test]
@@ -311,7 +327,7 @@ fn resolve_model_accepts_max_length_value() {
 
     let model = "a".repeat(MAX_PROMOTED_VALUE_LEN);
     ctx.set_metadata("openai_responses_request.model", &model);
-    assert_eq!(resolve_model(&ctx), model);
+    assert_eq!(crate::llm_metrics::resolve_model(&ctx), model);
 }
 
 // -----------------------------------------------------------------------------

@@ -23,6 +23,7 @@ pub mod gcp;
 pub mod guardrails;
 mod identity_guard;
 pub mod inference;
+mod llm_metrics;
 pub mod metering;
 pub mod model_access;
 pub mod model_catalog;
