@@ -3277,17 +3277,28 @@ fn commit_deferred_listings(
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
     detect_name_collisions(&expanded_tools, &generated_names)?;
     let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
-    // Measure the resolved current input (the tail of the backend history, which
-    // file/document resolution rewrites in place) alongside the expanded
-    // parameters, so the rewritten-body bound reflects what is actually sent even
-    // though `input` no longer lives in `request_body` (#1618). An unsupported
-    // scalar retained in `expanded` leaves this tail empty, avoiding a double count.
-    let input_start = state.messages.len().saturating_sub(state.input.len());
-    let resolved_input: Vec<&serde_json::Value> = state.messages.iter().skip(input_start).collect();
+    // Bound the actual rewritten outbound body. `input` no longer lives in
+    // `request_body` (params-only, #1618), and the backend receives the message
+    // history (resolved current input, appended output, and non-provider-owned
+    // history) serialized under `input`, so measure the same projection the
+    // outbound serializer sends — from the same start offset — rather than trying
+    // to locate the current input within a history that later rounds append to.
+    let outbound_start = if !state.history_rehydrated
+        && state
+            .conversation
+            .as_ref()
+            .is_some_and(|conversation| !conversation.is_null())
+        && state.iteration > 0
+    {
+        state.provider_history_len
+    } else {
+        0
+    };
+    let outbound_messages: Vec<&serde_json::Value> = state.messages.iter().skip(outbound_start).collect();
     check_json_body_size(
         &ExpandedBodyWithInput {
             expanded: &request_body,
-            input: &resolved_input,
+            input: &outbound_messages,
         },
         max_rewritten_body_bytes,
     )?;
@@ -3362,20 +3373,20 @@ fn expanded_request_body(
     body
 }
 
-/// Borrowed view of the expanded request plus the resolved current input, for an
-/// accurate rewritten-body size measurement.
+/// Borrowed view of the expanded request plus the outbound message projection,
+/// for an accurate rewritten-body size measurement.
 ///
-/// The current input lives outside `request_body` (params-only, #1618), and after
-/// file/document resolution its *resolved* payload lives in the message history,
-/// not in the original `input` snapshot. Serializing the expanded parameters with
-/// the resolved current-input tail re-attached — rather than summing sizes —
-/// counts both the resolved payload and the `"input"` member framing, matching the
-/// pre-#1618 whole-body measurement without cloning.
+/// `input` no longer lives in `request_body` (params-only, #1618); the backend
+/// receives the message history serialized under `input`. Serializing the expanded
+/// parameters with those messages re-attached — rather than summing sizes — counts
+/// the real payload (including the resolved current input) and the `"input"` member
+/// framing without cloning.
 struct ExpandedBodyWithInput<'a> {
     /// Expanded parameters (tools expanded, `input` absent unless an unsupported
     /// scalar was retained there).
     expanded: &'a serde_json::Value,
-    /// Resolved current-input items (the tail of the backend history).
+    /// Outbound message projection serialized under `input` (empty when an
+    /// unsupported scalar is already present in `expanded`).
     input: &'a [&'a serde_json::Value],
 }
 
