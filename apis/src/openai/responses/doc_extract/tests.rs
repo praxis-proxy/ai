@@ -26,6 +26,32 @@ fn install_document_budget(ctx: &mut HttpFilterContext<'_>, body: &serde_json::V
     ctx.extensions.insert(state);
 }
 
+#[test]
+fn preflight_rejects_budgeted_request_missing_budget_state_as_server_error() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let policy = AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap();
+    ctx.extensions.insert(policy);
+    // A configured budget policy but no admitted ResponsesState (e.g. a facts-only
+    // classifier minted none): the retained-payload budget state is missing, which
+    // is a server-side wiring failure rather than malformed client input.
+    let err = preflight_doc_parse(&ctx, br#"{"input":"hi"}"#)
+        .expect_err("a budgeted pipeline with no admitted budget state must reject");
+    let FilterAction::Reject(rejection) = err else {
+        panic!("expected a rejection");
+    };
+    assert_eq!(
+        rejection.status, 500,
+        "a missing budget state is a server error, not a 400"
+    );
+    let body = String::from_utf8(rejection.body.expect("error body").to_vec()).unwrap();
+    assert!(body.contains("server_error"), "error type must be server_error: {body}");
+    assert!(
+        body.contains("retained-payload budget state is missing"),
+        "error must name the missing budget state: {body}"
+    );
+}
+
 #[tokio::test]
 async fn budgeted_document_extract_reserves_rewritten_owners() {
     let filter = make_filter();
