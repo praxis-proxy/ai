@@ -52,7 +52,6 @@ object = { version = "0.40.0", default-features = false, features = ["read_core"
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
-openssl-sys = "0.9.117"
 quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"
@@ -344,3 +343,9 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
+
+# Temporary: pin praxis-proxy-tls to the commit that includes the FIPS crypto
+# readiness changes (praxis-proxy/praxis#1365). Switch back to a crates.io
+# version once the next praxis release is cut.
+[patch.crates-io]
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "60ee753c" }

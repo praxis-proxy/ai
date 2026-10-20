@@ -23,7 +23,6 @@ pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
 pub mod credential_source;
-pub mod crypto_readiness;
 pub mod hash;
 #[cfg(all(test, feature = "openai-responses"))]
 mod history_allocation_tests;

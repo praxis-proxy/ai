@@ -3512,7 +3512,6 @@ dependencies = [
  "metrics-util",
  "notify",
  "openssl",
- "openssl-sys",
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-backends",
@@ -7280,3 +7279,8 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "praxis-proxy-tls"
+version = "0.7.4"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=60ee753c#60ee753cb150ea917652ad71313337f360cc7256"

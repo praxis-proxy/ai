@@ -79,35 +79,31 @@ The pin can return to an upstream release after [transact-rs/sqlx#4417],
 At startup praxis-ai installs its one crypto provider and logs what it found:
 
 ```text
-installed rustls crypto provider provider=openssl provider_fips=true kernel_fips=Some(true) openssl_fips_properties=true crypto_policy=Some("FIPS") fips_required=true
+installed rustls crypto provider provider=openssl provider_fips=true kernel_fips=Some(true) crypto_policy=Some("FIPS") fips_required=true
 ```
 
 - `provider_fips`: whether the rustls crypto provider reports every algorithm
-  it offers as FIPS approved (rustls' `CryptoProvider::fips`).
+  it offers as FIPS approved (rustls' `CryptoProvider::fips`). On the
+  OpenSSL-backed provider this reflects
+  `EVP_default_properties_is_fips_enabled`, the host's effective FIPS
+  property, queried through the provider's safe API.
 - `kernel_fips`: `/proc/sys/crypto/fips_enabled`; `None` where the file does
   not exist (a container without `/proc`, a non-Linux host).
-- `openssl_fips_properties`: a direct call to
-  `EVP_default_properties_is_fips_enabled(NULL)`, independent of the rustls
-  provider abstraction — the effective default property query that RHEL's
-  FIPS mode configures. On a correctly configured host this agrees with
-  `provider_fips`; a disagreement indicates inconsistent OpenSSL state.
 - `crypto_policy`: the system crypto policy from
   `/etc/crypto-policies/config`; `None` on platforms that do not use system
-  crypto policies (Alpine, Debian, macOS). A value of `FIPS` or `FIPS:*`
-  is the operating system's own signal that FIPS mode is fully configured.
+  crypto policies. Only `FIPS` or `FIPS:OSPP` (which tightens FIPS) are
+  accepted; subpolicies that loosen FIPS (`NO-ENFORCE-EMS`, `SHA1`) are
+  rejected.
 
 Set `PRAXIS_REQUIRE_FIPS=1` (also `true`, `yes`, `on`) in production FIPS
 deployments. It is a check, never a switch: praxis-ai then refuses to start
-unless the provider, kernel, and crypto policy signals are all present and
-positive, naming each one that is missing, and refuses any listener TLS
-configuration that rustls does not consider FIPS-approved. On platforms
-that do not provide `/etc/crypto-policies/config` (Alpine, Debian, macOS)
-the crypto policy check is logged as a warning but does not block startup;
-the provider and kernel checks still apply. A fully attested FIPS
-deployment requires RHEL 9 or a derivative that supports system crypto
-policies. Upstream connections always require Extended Master Secret and
-share the same provider, so they are FIPS whenever the listeners are.
-Without the variable praxis-ai starts either way and only logs the status.
+unless all three signals are present and positive, naming each one that is
+missing, and refuses any listener TLS configuration that rustls does not
+consider FIPS-approved. A fully attested FIPS deployment requires RHEL 9 or
+a derivative that supports system crypto policies. Upstream connections
+always require Extended Master Secret and share the same provider, so they
+are FIPS whenever the listeners are. Without the variable praxis-ai starts
+either way and only logs the status.
 
 The requirement also covers what the binary itself carries: a build that
 registers a filter whose dependencies do their own cryptography outside the
