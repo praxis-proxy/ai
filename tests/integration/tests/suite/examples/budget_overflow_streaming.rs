@@ -5,8 +5,8 @@
 //!
 //! The `budget-overflow-streaming.yaml` config installs a tiny
 //! `openai_agentic_loop.max_retained_bytes`. The backend commits the client
-//! stream with `response.created`, then streams an output frame whose raw
-//! transport charge exceeds the whole budget. The committed stream must
+//! stream with `response.created`, then streams an output frame whose weighted
+//! ledger charge exceeds the remaining budget. The committed stream must
 //! terminate with one SSE `error` event, suppressing `response.completed` and
 //! the `[DONE]` sentinel.
 
@@ -25,13 +25,13 @@ const EXAMPLE: &str = "openai/responses/budget-overflow-streaming.yaml";
 const CREATED_EVENT: &str = concat!(
     "event: response.created\n",
     "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",",
-    "\"object\":\"response\",\"model\":\"gpt-4.1\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+    "\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-4.1\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
 );
 
 #[test]
 fn committed_stream_overflow_terminates_with_sse_error() {
-    // A post-commit output frame larger than the whole retained budget. Its raw
-    // transport charge alone far exceeds `max_retained_bytes`.
+    // The 16 KiB raw frame is charged at 32x, plus a transient parsing peak, so
+    // its ledger charge exceeds the configured 128 KiB budget.
     let oversized = "A".repeat(16_384);
     let delta_event = format!(
         "event: response.output_text.delta\n\
@@ -53,6 +53,7 @@ fn committed_stream_overflow_terminates_with_sse_error() {
         r#"{"model":"gpt-4.1","input":"Reply briefly.","stream":true}"#,
     );
     let body = parse_body(&raw);
+    let events = sse_event_names(&body);
 
     assert_eq!(
         parse_status(&raw),
@@ -71,6 +72,16 @@ fn committed_stream_overflow_terminates_with_sse_error() {
         body.contains("event: error"),
         "the committed stream must terminate with a terminal SSE error event: {body}"
     );
+    let error_count = events.iter().filter(|event| event.as_str() == "error").count();
+    assert_eq!(
+        error_count, 1,
+        "the committed stream must emit exactly one error event: {events:?}"
+    );
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("error"),
+        "the terminal error must be the final SSE event: {events:?}"
+    );
     assert!(
         body.contains("max_retained_bytes"),
         "the terminal error must name the retained-payload budget overflow: {body}"
@@ -83,6 +94,18 @@ fn committed_stream_overflow_terminates_with_sse_error() {
         !body.contains("[DONE]"),
         "the [DONE] sentinel must be suppressed after the committed-stream overflow: {body}"
     );
+}
+
+fn sse_event_names(body: &str) -> Vec<String> {
+    body.split("\n\n")
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event:").map(str::trim))
+                .filter(|event| !event.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn start_example_proxy(backend_port: u16) -> praxis_test_utils::ProxyGuard {

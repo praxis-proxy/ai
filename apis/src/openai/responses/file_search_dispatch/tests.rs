@@ -2768,9 +2768,10 @@ fn build_search_body(num_results: usize, chunks_per_result: usize, chunk_bytes: 
 /// Hold the four file-search staging artifacts live together for one workload
 /// and compare the current reuse path against a deep-copy baseline.
 ///
-/// Both closures build `body_count` parallel raw bodies, bounded-decode each to
-/// the top-`RETAIN` results, build the private model context, and stage
-/// citations over a per-body marker text. The baseline additionally keeps a full
+/// Both closures build `body_count` parallel raw bodies inside the measured
+/// region, bounded-decode each to the top-`RETAIN` results, build context from
+/// all retained results, and stage citations over per-body marker text. The
+/// baseline additionally keeps a full
 /// `serde_json::Value` tree per body, builds the context via owned per-chunk
 /// annotations copied into the wrapper, and stages citations on the legacy path
 /// that collects removal offset ranges. The assertion covers allocation count
@@ -2786,16 +2787,18 @@ fn measure_combined_staging_peak(
     const RETAIN: usize = 5;
     const QUERY: &str = "combined staging fixture";
 
-    let bodies: Vec<Vec<u8>> = (0..body_count)
-        .map(|body_index| {
-            build_search_body(
-                results_per_body,
-                chunks_per_result,
-                chunk_bytes,
-                &format!("{label}{body_index}-"),
-            )
-        })
-        .collect();
+    let build_bodies = || {
+        (0..body_count)
+            .map(|body_index| {
+                build_search_body(
+                    results_per_body,
+                    chunks_per_result,
+                    chunk_bytes,
+                    &format!("{label}{body_index}-"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     // Each body's text references its retained file IDs with a marker, so the
     // legacy path stages one removal range per marker while the current path
     // skips the unused offsets.
@@ -2820,21 +2823,25 @@ fn measure_combined_staging_peak(
         .collect();
 
     let optimized = allocation_counter::measure(|| {
+        let bodies = build_bodies();
         let mut staged = Vec::with_capacity(bodies.len());
         for (body, text) in bodies.iter().zip(texts.iter()) {
             let decoded = client::decode_retained_results(body, RETAIN);
-            let context = model_context::build_context_reused(&decoded[0], QUERY);
+            let retained: Vec<&SearchResult> = decoded.iter().collect();
+            let context = model_context::build_context_reused(&retained, QUERY);
             let citations = citations::stage_citations_owned(text, &files, false);
             staged.push((decoded, context, citations));
         }
         std::hint::black_box((&bodies, &staged));
     });
     let baseline = allocation_counter::measure(|| {
+        let bodies = build_bodies();
         let mut staged = Vec::with_capacity(bodies.len());
         for (body, text) in bodies.iter().zip(texts.iter()) {
             let tree: Value = serde_json::from_slice(body).expect("baseline full tree decodes");
             let decoded = client::decode_retained_results(body, RETAIN);
-            let context = model_context::build_context_deep_copy(&decoded[0], QUERY);
+            let retained: Vec<&SearchResult> = decoded.iter().collect();
+            let context = model_context::build_context_deep_copy(&retained, QUERY);
             let citations = citations::stage_citations_owned(text, &files, true);
             staged.push((tree, decoded, context, citations));
         }

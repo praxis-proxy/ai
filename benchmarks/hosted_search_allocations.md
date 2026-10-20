@@ -34,14 +34,16 @@ successful hosted result.
 The per-stage probes above measure one hot path at a time. This combined
 fixture holds all four file-search staging artifacts live together — the
 parallel raw response bodies, the bounded-decoded results, the private
-model-context text, and the staged citations — so the peak reflects their
-coexistence. It compares the current borrow/reuse path against a deep-copy
-baseline that additionally keeps a full `serde_json::Value` tree per body,
-builds the model context from owned per-chunk annotations copied into the
-wrapper, and stages citations on the legacy path that collects a removal offset
-range per marker. Each workload retains the top 5 results per body and stages 5
-citation markers per body; the assertions cover both allocation count and peak
-live bytes (`bytes_max`).
+model-context text, and the staged citations — so the peak includes the raw
+bodies and reflects their coexistence. The per-body marker text and file
+metadata are shared fixture inputs prepared before measurement. It compares the
+current borrow/reuse path against a deep-copy baseline that additionally keeps
+a full `serde_json::Value` tree per body, builds model context from all retained
+results using owned per-chunk annotations copied into the wrapper, and stages
+citations on the legacy path that collects a removal offset range per marker.
+Each workload retains the top 5 results per body and stages 5 citation markers
+per body; the assertions cover both allocation count and peak live bytes
+(`bytes_max`).
 
 Run with:
 
@@ -50,13 +52,12 @@ cargo test -p praxis-ai-apis --features full,store-sqlite --lib \
   combined_hosted_search_staging_peak_beats_deep_copy_baseline -- --nocapture
 ```
 
-| Fixed input | Deep-copy baseline | Current path | Allocations, baseline → current | Peak live bytes, baseline → current |
-| --- | --- | --- | ---: | ---: |
-| Many small: 256 bodies × 32 results × 4 chunks × 64 B, retain 5 | Full `Value` tree per body + per-chunk owned context + legacy citation offsets | Bounded decode + reused context buffer + offset-skipping citations | 378,881 → 77,825 | 28,301,829 → 3,967,444 |
-| Few large: 4 bodies × 8 results × 16 chunks × 4,096 B, retain 5 | Full `Value` tree per body + per-chunk owned context + legacy citation offsets | Bounded decode + reused context buffer + offset-skipping citations | 5,009 → 1,097 | 4,126,488 → 1,765,056 |
+| Fixed input | Deep-copy baseline | Current path | Required result |
+| --- | --- | --- | --- |
+| Many small: 256 bodies × 32 results × 4 chunks × 64 B, retain 5 | Full `Value` tree per body + per-chunk owned context + legacy citation offsets | Bounded decode + reused context buffer + offset-skipping citations | Fewer allocations and lower peak live bytes |
+| Few large: 4 bodies × 8 results × 16 chunks × 4,096 B, retain 5 | Full `Value` tree per body + per-chunk owned context + legacy citation offsets | Bounded decode + reused context buffer + offset-skipping citations | Fewer allocations and lower peak live bytes |
 
 Both workloads carry the same 2 MiB total result-content payload (256 × 32 × 4 ×
-64 B and 4 × 8 × 16 × 4,096 B) and the current path stays below the deep-copy
-baseline on both allocation count and peak live bytes, demonstrating that the
-targeted deep copies and unbounded staging were removed even when all four
-stages coexist.
+64 B and 4 × 8 × 16 × 4,096 B). The test prints the measured values with
+`--nocapture`; the assertions require the current path to stay below the
+deep-copy baseline on both allocation count and peak live bytes.

@@ -675,8 +675,7 @@ pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
 impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "test setup uses explicit failure messages")]
 mod tests {
     use super::{ResponseStore, StateOwner, StoreError};
     use crate::types::{

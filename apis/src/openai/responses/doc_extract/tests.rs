@@ -44,10 +44,16 @@ fn preflight_rejects_budgeted_request_missing_budget_state_as_server_error() {
         rejection.status, 500,
         "a missing budget state is a server error, not a 400"
     );
-    let body = String::from_utf8(rejection.body.expect("error body").to_vec()).unwrap();
-    assert!(body.contains("server_error"), "error type must be server_error: {body}");
+    let body: serde_json::Value =
+        serde_json::from_slice(rejection.body.as_deref().expect("error body")).expect("error body is JSON");
+    assert_eq!(
+        body["error"]["type"], "server_error",
+        "error type must be server_error: {body}"
+    );
     assert!(
-        body.contains("retained-payload budget state is missing"),
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retained-payload budget state is missing")),
         "error must name the missing budget state: {body}"
     );
 }

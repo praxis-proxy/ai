@@ -1147,6 +1147,33 @@ fn history_item_is_lowered_matches_the_lowering_pass() {
         !history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c2"}), &lowered),
         "an output whose call was not lowered is left untouched"
     );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t1", "execution": "client"}),
+            &no_ids,
+        ),
+        "a client-executed tool_search_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_call", "call_id": "t2"}), &no_ids),
+        "a tool_search_call without client execution is left untouched"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t3", "execution": "server"}),
+            &no_ids,
+        ),
+        "a server-executed tool_search_call is left untouched"
+    );
+    let lowered_search = lowered_ids(&["t1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t1"}), &lowered_search),
+        "a tool_search_output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t2"}), &lowered_search),
+        "a tool_search_output whose call was not lowered is left untouched"
+    );
 }
 
 #[test]

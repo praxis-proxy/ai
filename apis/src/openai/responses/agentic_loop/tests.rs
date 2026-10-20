@@ -316,10 +316,23 @@ fn indexed_collection_saves_copies_for_many_small_items() {
         std::hint::black_box(&new_state);
     });
 
-    assert_eq!(new_state.selected_tool_calls().len(), ITEMS);
-    assert_eq!(new_state.messages, old_state.messages);
-    assert_eq!(new_state.persisted_messages, old_state.persisted_messages);
-    assert_eq!(new_state.accumulated_output, old_state.accumulated_output);
+    assert_eq!(
+        new_state.selected_tool_calls().len(),
+        ITEMS,
+        "indexed collection must preserve every selected tool call"
+    );
+    assert_eq!(
+        new_state.messages, old_state.messages,
+        "indexed collection must preserve messages"
+    );
+    assert_eq!(
+        new_state.persisted_messages, old_state.persisted_messages,
+        "indexed collection must preserve persisted messages"
+    );
+    assert_eq!(
+        new_state.accumulated_output, old_state.accumulated_output,
+        "indexed collection must preserve accumulated output"
+    );
     assert!(
         old.bytes_total >= new.bytes_total + 2 * total_payload,
         "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
@@ -681,15 +694,27 @@ fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
         matches!(action, FilterAction::Continue),
         "a committed stream cannot be rejected; the terminal error rides the stream"
     );
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "stream exhaustion must be reported as a server_error"
+    );
     assert!(
         ctx.get_metadata("responses.stream_error_message")
             .unwrap()
             .contains("max_retained_bytes"),
         "the terminal error must name the retained-payload overflow"
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted stream must not persist a successful response"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the stream must end the agentic loop after exhaustion"
+    );
 }
 
 #[test]
@@ -710,10 +735,25 @@ fn buffered_round_boundary_overflow_rejects_with_json_502() {
     let action = super::release_completed_round(&mut ctx, &mut state)
         .unwrap()
         .expect("retained overflow must terminate the round");
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "buffered round exhaustion must reject with HTTP 502"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        None,
+        "a buffered rejection must not set streaming error metadata"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted buffered response must not be persisted as successful"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the agentic loop must end after buffered exhaustion"
+    );
 }
 
 #[test]

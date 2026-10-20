@@ -28,10 +28,14 @@ turns:
       upstream_body_kind: json
       # openai_agentic_loop installs a tiny retained-payload budget. The upstream
       # commits the client stream with response.created, then streams an output
-      # frame whose raw transport charge exceeds the whole budget. The committed
+      # frame whose weighted wire and parsing charges exceed the remaining
+      # budget. The committed
       # stream can only terminate with one SSE error event; response.completed
       # and the [DONE] sentinel are suppressed and later frames are dropped.
       client_sse_events:
         - response.created
         - error
-      upstream_sse_events: []
+      upstream_sse_events:
+        - response.created
+        - response.output_text.delta
+        - response.completed

@@ -63,14 +63,15 @@ filter_chains:
 
               # Publishes the AgenticBudgetPolicy and owns the single terminal
               # decision. A tiny retained budget admits the create body and the
-              # committing response.created frame but rejects a later oversized
-              # output frame.
+              # committing response.created frame but rejects a later output
+              # frame after its weighted wire and parsing charges exceed the
+              # remaining budget.
               - filter: openai_agentic_loop
                 max_infer_iters: 1
                 # Tiny retained budget. It admits the small create body and the
-                # committing response.created frame but rejects the oversized
-                # post-commit output frame (whose raw transport charge alone far
-                # exceeds the whole budget).
+                # committing response.created frame but rejects the post-commit
+                # output frame after its weighted wire and parsing charges exceed
+                # the remaining budget.
                 max_retained_bytes: 131072
 
               # Selects typed streaming automatically when the effective outbound
