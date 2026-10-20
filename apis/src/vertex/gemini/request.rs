@@ -1263,6 +1263,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_name_only_declaration_is_rejected() {
+        // The id's only declaration carries an empty `function.name`, so
+        // nothing can satisfy the lookup: the reverse scan kept scanning and
+        // rejected, and the index must reject the same way rather than emit
+        // a `functionResponse` with an empty name.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_e","type":"function","function":{"name":"","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_e","content":"{}"}
+        ]}"#;
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("no matching function call"), "{error}");
+    }
+
+    #[test]
     fn future_declaration_cannot_satisfy_earlier_result() {
         // The assistant call appears AFTER the result that references its id.
         // Nearest-preceding semantics: the index must not see forward
