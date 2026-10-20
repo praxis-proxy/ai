@@ -3276,32 +3276,22 @@ fn commit_deferred_listings(
 
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
     detect_name_collisions(&expanded_tools, &generated_names)?;
-    let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
-    // Bound the actual rewritten outbound body. `input` no longer lives in
-    // `request_body` (params-only, #1618), and the backend receives the message
-    // history (resolved current input, appended output, and non-provider-owned
-    // history) serialized under `input`, so measure the same projection the
-    // outbound serializer sends — from the same start offset — rather than trying
-    // to locate the current input within a history that later rounds append to.
-    let outbound_start = if !state.history_rehydrated
-        && state
-            .conversation
-            .as_ref()
-            .is_some_and(|conversation| !conversation.is_null())
-        && state.iteration > 0
-    {
-        state.provider_history_len
-    } else {
-        0
-    };
-    let outbound_messages: Vec<&serde_json::Value> = state.messages.iter().skip(outbound_start).collect();
-    check_json_body_size(
-        &ExpandedBodyWithInput {
-            expanded: &request_body,
-            input: &outbound_messages,
-        },
-        max_rewritten_body_bytes,
-    )?;
+    let expanded_body = expanded_request_body(&state.request_body, &function_tools_by_label);
+    // Put the expanded tools in place, then bound the *actual* rewritten outbound
+    // body the serializer will send. `input` no longer lives in `request_body`
+    // (params-only, #1618): the backend receives the message history under `input`,
+    // so reuse the outbound projection — which translates compaction items and skips
+    // provider-owned history exactly as the wire body does — rather than measuring
+    // raw history items. A failed bound rejects the request, discarding this state.
+    state.set_request_params(expanded_body);
+    let outbound_len =
+        super::responses_proxy::serialized_outbound_body_len(state).map_err(ResolveError::Serialization)?;
+    if outbound_len > max_rewritten_body_bytes {
+        return Err(ResolveError::BodyTooLarge {
+            actual: outbound_len,
+            limit: max_rewritten_body_bytes,
+        });
+    }
 
     let retained = if let Some(slot) = budget {
         let mut charge = request_body
@@ -3351,7 +3341,8 @@ fn commit_deferred_listings(
     // encoded-name collision cannot reject an admitted or client function (#1724).
     state.mcp_admission.mark_available_functions(&expanded_tools);
     state.tools = expanded_tools;
-    state.set_request_params(request_body);
+    // `request_body` already holds the expanded parameters (set before the size
+    // bound above); just flag the rebuild.
     state.mark_request_body_for_rebuild();
     Ok(retained)
 }
@@ -3371,60 +3362,6 @@ fn expanded_request_body(
         );
     }
     body
-}
-
-/// Borrowed view of the expanded request plus the outbound message projection,
-/// for an accurate rewritten-body size measurement.
-///
-/// `input` no longer lives in `request_body` (params-only, #1618); the backend
-/// receives the message history serialized under `input`. Serializing the expanded
-/// parameters with those messages re-attached — rather than summing sizes — counts
-/// the real payload (including the resolved current input) and the `"input"` member
-/// framing without cloning.
-struct ExpandedBodyWithInput<'a> {
-    /// Expanded parameters (tools expanded, `input` absent unless an unsupported
-    /// scalar was retained there).
-    expanded: &'a serde_json::Value,
-    /// Outbound message projection serialized under `input` (empty when an
-    /// unsupported scalar is already present in `expanded`).
-    input: &'a [&'a serde_json::Value],
-}
-
-impl serde::Serialize for ExpandedBodyWithInput<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
-
-        let Some(object) = self.expanded.as_object() else {
-            return self.expanded.serialize(serializer);
-        };
-        let mut map = serializer.serialize_map(None)?;
-        let mut wrote_input = false;
-        for (name, value) in object {
-            if name == "input" {
-                wrote_input = true;
-            }
-            map.serialize_entry(name, value)?;
-        }
-        if !wrote_input {
-            map.serialize_entry("input", &self.input)?;
-        }
-        map.end()
-    }
-}
-
-/// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
-fn check_json_body_size<B: serde::Serialize + ?Sized>(
-    body: &B,
-    max_rewritten_body_bytes: usize,
-) -> Result<(), ResolveError> {
-    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
-    if actual > max_rewritten_body_bytes {
-        return Err(ResolveError::BodyTooLarge {
-            actual,
-            limit: max_rewritten_body_bytes,
-        });
-    }
-    Ok(())
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
