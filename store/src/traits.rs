@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -73,6 +73,25 @@ pub trait ResponseStore: Send + Sync {
         ))
     }
 
+    /// Fetch a response admitted against a retained-payload allowance.
+    /// Implementations must inspect JSON structure before constructing Value
+    /// trees and return the exact charge that was admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured record exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_response_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted response reads".to_owned(),
+        ))
+    }
+
     /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
@@ -119,6 +138,26 @@ pub trait ResponseStore: Send + Sync {
     ) -> Result<Option<ConversationRecord>, StoreError> {
         Err(StoreError::Unavailable(
             "backend does not implement bounded conversation reads".to_owned(),
+        ))
+    }
+
+    /// Fetch a reconstructed conversation admitted against a retained-payload
+    /// allowance. Implementations inspect every source JSON payload before
+    /// constructing Value trees and return the charge measured for the returned
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured history exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_conversation_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted conversation reads".to_owned(),
         ))
     }
 
@@ -616,22 +655,22 @@ pub trait ConversationItemStore: Send + Sync {
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
 
-    /// Append items under a bounded retained-payload allowance. Backends must
-    /// check stored row sizes inside the append transaction before loading item
-    /// data, then invalidate the message cache incrementally like the unbounded
-    /// path.
+    /// Append items under a bounded retained-payload allowance. Backends charge
+    /// the new items and bound any legacy-prefix read/copy required by this
+    /// append. Existing item rows are not reread or charged a second time; the
+    /// cache is invalidated incrementally.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::PayloadTooLarge`] when the retained payload would
-    /// exceed the allowance, or [`StoreError::Unavailable`] when the backend has
-    /// no bounded append.
+    /// Returns [`StoreError::PayloadTooLarge`] when this append's work would
+    /// exceed the allowance, or [`StoreError::Unavailable`] when the backend
+    /// has no bounded append.
     async fn create_items_and_sync_messages_bounded(
         &self,
         _owner: &StateOwner,
         _conversation_id: &str,
         _items: &[ConversationItemRecord],
-        _max_rebuild_bytes: usize,
+        _max_append_charge_bytes: usize,
     ) -> Result<(), StoreError> {
         Err(StoreError::Unavailable(
             "backend does not implement bounded conversation appends".to_owned(),

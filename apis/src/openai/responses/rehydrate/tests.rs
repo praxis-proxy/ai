@@ -11,8 +11,9 @@ use super::{super::state::RequestReasoningPresence, *};
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+        PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError, json_values_charge, json_values_fit,
     },
 };
 
@@ -334,7 +335,7 @@ async fn budgeted_previous_response_rejects_large_store_row_before_replacement()
     let store = MockStore::with_completed_response(
         "resp_prev",
         json!("First turn"),
-        json!([{"role":"user","content":"x".repeat(128_000)}]),
+        json!([{"role":"user","content":"x".repeat(256_000)}]),
     );
     let registry = setup_registry(store);
     let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
@@ -468,7 +469,7 @@ async fn budgeted_conversation_restores_plain_history_with_shared_charge() {
 
 #[tokio::test]
 async fn budgeted_conversation_rejects_large_row_before_replay() {
-    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(128_000)}]));
+    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(256_000)}]));
     let registry = setup_registry(store);
     let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -4190,13 +4191,29 @@ impl ResponseStore for MockStore {
     ) -> Result<Option<ResponseRecord>, StoreError> {
         let record = self.records.get(id).filter(|record| &record.owner == tenant_id);
         if record.is_some_and(|record| {
-            count_record_values(&[&record.response_object, &record.input, &record.messages])
-                .and_then(|bytes| bytes.checked_add(record.model.len()))
-                .is_none_or(|bytes| bytes > max_bytes)
+            !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes)
+                || record.model.len() > max_bytes
         }) {
             return Err(StoreError::PayloadTooLarge);
         }
         self.get_response(tenant_id, id).await
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let Some(record) = self.get_response(tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
     }
 
     async fn get_conversation_bounded(
@@ -4206,12 +4223,27 @@ impl ResponseStore for MockStore {
         max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         let record = self.conversations.get(id).filter(|record| &record.owner == tenant_id);
-        if record.is_some_and(|record| {
-            count_record_values(&[&record.metadata, &record.messages]).is_none_or(|bytes| bytes > max_bytes)
-        }) {
+        if record.is_some_and(|record| !json_values_fit(&[&record.metadata, &record.messages], max_bytes)) {
             return Err(StoreError::PayloadTooLarge);
         }
         ResponseStore::get_conversation(self, tenant_id, id).await
+    }
+
+    async fn get_conversation_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let Some(record) = ResponseStore::get_conversation(self, tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.metadata, &record.messages],
+            &[&record.conversation_id],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
     }
 
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {

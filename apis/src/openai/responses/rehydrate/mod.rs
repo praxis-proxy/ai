@@ -29,7 +29,7 @@
 //!
 //! [`ResponsesState`]: super::state::ResponsesState
 
-use std::{collections::HashSet, io};
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -57,19 +57,6 @@ use crate::{
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
-
-/// A bounded read's raw columns, parsed JSON, replay copies, and replacement
-/// state can coexist. Sparse nested arrays expand sharply under `serde_json`'s
-/// Value representation, so reserve well beyond their encoded byte length.
-///
-/// The worst case is the parsed tree (deeply nested arrays expand ~20x) held
-/// alongside the handful of replay, message, and response-state copies derived
-/// from it — on the order of 80x. The reserve keeps a ~3x margin over that. It
-/// must also stay low enough that a continuation restoring a realistically sized
-/// prior turn (e.g. a few tens of KB of retained reasoning) still fits beneath
-/// the default `max_retained_bytes` ceiling after its fixed IRR transport
-/// reserve; 512 left such continuations failing by a hair.
-const RESTORED_PAYLOAD_MULTIPLIER: usize = 256;
 
 /// Return whether the current operation is a budgeted Responses create.
 fn budgeted_create(ctx: &HttpFilterContext<'_>) -> bool {
@@ -164,11 +151,11 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id).await {
+        let (record, charge_bytes) = match fetch_and_validate_previous(ctx, &owner, &prev_id).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        if let Err(action) = reserve_restored_response(ctx, &record) {
+        if let Err(action) = reserve_restored_bytes(ctx, charge_bytes) {
             return Ok(action);
         }
         let previous_tools = collect_mcp_tool_listings(&record);
@@ -200,11 +187,11 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
+        let (record, charge_bytes) = match fetch_conversation(ctx, &owner, &conv_id).await {
             Ok(record) => record,
             Err(action) => return Ok(action),
         };
-        if let Err(action) = reserve_restored_conversation(ctx, &record) {
+        if let Err(action) = reserve_restored_bytes(ctx, charge_bytes) {
             return Ok(action);
         }
         let stored = stored_messages_for_conversation(record);
@@ -1184,8 +1171,8 @@ fn stored_messages_for_conversation(record: ConversationRecord) -> Vec<Value> {
     }
 }
 
-/// Leave enough headroom for every live projection before Store decodes a row.
-/// A backend without bounded reads fails closed through its default method.
+/// Return the current retained-payload allowance before Store decodes a row.
+/// A backend without budgeted reads fails closed through its default method.
 fn restore_read_limit(ctx: &HttpFilterContext<'_>) -> Result<Option<usize>, FilterAction> {
     if !budgeted_create(ctx) {
         return Ok(None);
@@ -1195,19 +1182,15 @@ fn restore_read_limit(ctx: &HttpFilterContext<'_>) -> Result<Option<usize>, Filt
         .get::<ResponsesState>()
         .and_then(|state| state.simple_budget)
         .ok_or_else(|| reject_server_error("retained-payload budget state is missing"))?;
-    Ok(Some(
-        budget.remaining_bytes().unwrap_or(0) / RESTORED_PAYLOAD_MULTIPLIER,
-    ))
+    Ok(Some(budget.remaining_bytes().unwrap_or(0)))
 }
 
-/// Charge Store's independently owned record before any replay or metadata copy.
-fn reserve_restored_bytes(ctx: &mut HttpFilterContext<'_>, bytes: Option<usize>) -> Result<(), FilterAction> {
+/// Reserve Store's measured history allowance before deriving replay projections.
+fn reserve_restored_bytes(ctx: &mut HttpFilterContext<'_>, charge_bytes: Option<usize>) -> Result<(), FilterAction> {
     if !budgeted_create(ctx) {
         return Ok(());
     }
-    let charge = bytes
-        .and_then(|bytes| bytes.checked_mul(RESTORED_PAYLOAD_MULTIPLIER))
-        .ok_or_else(reject_restored_payload_too_large)?;
+    let charge = charge_bytes.ok_or_else(reject_restored_payload_too_large)?;
     let budget = ctx
         .extensions
         .get_mut::<ResponsesState>()
@@ -1217,57 +1200,6 @@ fn reserve_restored_bytes(ctx: &mut HttpFilterContext<'_>, bytes: Option<usize>)
         Ok(())
     } else {
         Err(reject_restored_payload_too_large())
-    }
-}
-
-/// Reserve the complete stored response projection before deriving replay state.
-fn reserve_restored_response(ctx: &mut HttpFilterContext<'_>, record: &ResponseRecord) -> Result<(), FilterAction> {
-    if !budgeted_create(ctx) {
-        return Ok(());
-    }
-    let bytes = count_record_values(&[&record.response_object, &record.input, &record.messages])
-        .and_then(|bytes| bytes.checked_add(record.id.len()))
-        .and_then(|bytes| bytes.checked_add(record.model.len()));
-    reserve_restored_bytes(ctx, bytes)
-}
-
-/// Reserve the conversation row before replay and append-back can copy it.
-fn reserve_restored_conversation(
-    ctx: &mut HttpFilterContext<'_>,
-    record: &ConversationRecord,
-) -> Result<(), FilterAction> {
-    if !budgeted_create(ctx) {
-        return Ok(());
-    }
-    let bytes = count_record_values(&[&record.metadata, &record.messages])
-        .and_then(|bytes| bytes.checked_add(record.conversation_id.len()));
-    reserve_restored_bytes(ctx, bytes)
-}
-
-/// `serde_json::to_writer` visits the decoded tree without allocating another
-/// payload. Its encoded length is a conservative size basis for every copy.
-fn count_record_values(values: &[&Value]) -> Option<usize> {
-    let mut counter = JsonByteCounter(0);
-    for value in values {
-        serde_json::to_writer(&mut counter, value).ok()?;
-    }
-    Some(counter.0)
-}
-
-/// Allocation-free count of serialized JSON bytes.
-struct JsonByteCounter(usize);
-
-impl io::Write for JsonByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(buf.len())
-            .ok_or_else(|| io::Error::other("JSON size overflow"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1285,10 +1217,10 @@ async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
-) -> Result<ResponseRecord, FilterAction> {
-    let record = fetch_previous_response(ctx, owner, prev_id).await?;
+) -> Result<(ResponseRecord, Option<usize>), FilterAction> {
+    let (record, charge_bytes) = fetch_previous_response(ctx, owner, prev_id).await?;
     validate_response_status(&record)?;
-    Ok(record)
+    Ok((record, charge_bytes))
 }
 
 /// Resolve the conversation ID from the request body, returning a
@@ -1315,11 +1247,15 @@ fn resolve_conversation_id(body: &Value) -> Result<String, FilterAction> {
 }
 
 /// Fetch a conversation record from the store.
+#[expect(
+    clippy::too_many_lines,
+    reason = "budgeted and unbudgeted reads plus error mapping stay in one function"
+)]
 async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     conv_id: &str,
-) -> Result<ConversationRecord, FilterAction> {
+) -> Result<(ConversationRecord, Option<usize>), FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
         reject_server_error("response store is not available")
@@ -1331,12 +1267,18 @@ async fn fetch_conversation(
     })?;
 
     let read_limit = restore_read_limit(ctx)?;
-    // Post-#1509 the `messages` column is a lazy snapshot; `get_conversation_bounded`
-    // reconstructs the full history (legacy prefix + items). The unbounded case uses
-    // the same reconstruction with an effectively unlimited ceiling.
-    let result = store
-        .get_conversation_bounded(conv_id, read_limit.unwrap_or(usize::MAX))
-        .await;
+    // Item rows are reconstructed from one snapshot. Budgeted reads inspect
+    // each raw JSON value before building the corresponding Value tree.
+    let result = match read_limit {
+        Some(limit) => store
+            .get_conversation_budgeted(conv_id, limit)
+            .await
+            .map(|record| record.map(|record| (record.record, Some(record.charge_bytes)))),
+        None => store
+            .get_conversation_bounded(conv_id, usize::MAX)
+            .await
+            .map(|record| record.map(|record| (record, None))),
+    };
     let record = result.map_err(|e| {
         if matches!(&e, StoreError::PayloadTooLarge) {
             return reject_restored_payload_too_large();
@@ -1477,11 +1419,15 @@ fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), Fi
 // -----------------------------------------------------------------------------
 
 /// Fetch the previous response record from the store.
+#[expect(
+    clippy::too_many_lines,
+    reason = "budgeted and unbudgeted reads plus error mapping stay in one function"
+)]
 async fn fetch_previous_response(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
-) -> Result<ResponseRecord, FilterAction> {
+) -> Result<(ResponseRecord, Option<usize>), FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
         reject_server_error("response store is not available")
@@ -1494,8 +1440,14 @@ async fn fetch_previous_response(
 
     let read_limit = restore_read_limit(ctx)?;
     let result = match read_limit {
-        Some(limit) => store.get_response_bounded(prev_id, limit).await,
-        None => store.get_response(prev_id).await,
+        Some(limit) => store
+            .get_response_budgeted(prev_id, limit)
+            .await
+            .map(|record| record.map(|record| (record.record, Some(record.charge_bytes)))),
+        None => store
+            .get_response(prev_id)
+            .await
+            .map(|record| record.map(|record| (record, None))),
     };
     let record = result.map_err(|e| {
         if matches!(&e, StoreError::PayloadTooLarge) {

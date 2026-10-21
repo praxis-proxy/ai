@@ -3560,7 +3560,7 @@ class TestOpenAIResponsesVLLM:
                 "input": "Reply OK. /no_think",
                 "truncation": truncation,
                 "max_output_tokens": 32,
-                "store": False,
+                "store": True,
             }
             if truncation == "disabled":
                 with pytest.raises(BadRequestError) as error:
@@ -3591,6 +3591,19 @@ class TestOpenAIResponsesVLLM:
                     )
                     assert response.status in {"completed", "incomplete"}
                     assert response.output, response
+                    if response.status == "completed":
+                        # A successful managed turn must append only its new
+                        # input/output items. Existing over-context history is
+                        # admitted during rehydration and not recharged during
+                        # this append-back.
+                        items = client.conversations.items.list(
+                            conversation.id, order="asc"
+                        ).data
+                        assert len(items) > 2, items
+                        assert any(
+                            item.type == "message" and item.role == "assistant"
+                            for item in items[2:]
+                        ), items
                 except APIStatusError as exc:
                     assert exc.status_code in {400, 502, 504}, exc
 
