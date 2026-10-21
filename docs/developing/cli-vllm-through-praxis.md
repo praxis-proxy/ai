@@ -127,15 +127,14 @@ that broke, not interactive plan mode, which the CLI does not expose to
 The 32,768-token window is intentional for Claude Code auto mode. Its
 client-initiated safety classifier asks for roughly 2,112 output tokens
 independently of the main Claude Code output-token setting and includes a large
-client-owned prompt; on 16K and 18K servers that request can exhaust the window
-before inference. On an A10G, eager execution reclaims CUDA-graph memory and
-the 0.97 utilization is reserved for this single-user development workload. If
-you lower the window or share the GPU, do not use auto mode unless the
-classifier request still fits.
+client-owned prompt, which on 16K and 18K servers can alone exceed the window.
+On an A10G, eager execution reclaims CUDA-graph memory and the 0.97 utilization
+is reserved for this single-user development workload. If you lower the window
+or share the GPU, do not use auto mode unless the classifier request still
+fits.
 
-Claude Code's default output budget is also larger than this window, so
-section 4 caps it with `CLAUDE_CODE_MAX_OUTPUT_TOKENS`; whether that cap is
-load-bearing depends on the vLLM version, as described there.
+Claude Code's default output budget is also larger than this window; section 4
+explains why that is harmless on the vLLM version this guide serves.
 
 ## 2. Point a Praxis example at vLLM
 
@@ -530,8 +529,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$VLLM_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-# Cap the requested output budget; see the version note below for when this is
-# load-bearing on a 32,768-token window.
+# Optional headroom: cap the requested output budget (see the note below).
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
 # Tell Claude Code the server's real window so it auto-compacts in time
 # (Claude Code 2.1.75 and newer).
@@ -564,24 +562,17 @@ export CLAUDE_CODE_DISABLE_THINKING=1
 export DISABLE_PROMPT_CACHING=1
 ```
 
-`CLAUDE_CODE_MAX_OUTPUT_TOKENS` exists because Claude Code does not know the
-served model's real window, so it sends the default `max_tokens` for the
-Anthropic model name it believes it is calling — around 21,000 tokens. What
-that budget does at the server is vLLM-version-dependent:
-
-- Current vLLM **clamps**: `get_max_tokens` caps the request's `max_tokens` at
-  `--max-model-len` minus the prompt length and only rejects when the prompt
-  itself exceeds the window (verified in source for 0.29.0 and 0.31.0, on both
-  the Chat Completions and the Anthropic-compatible `/v1/messages` paths the
-  clients in this guide use). An oversized budget costs nothing — it is an upper
-  bound, not a reservation.
-- Older vLLM **reserves**: `max_tokens` is held against `--max-model-len`
-  before inference, so that budget plus a modest prompt exceeds the window and
-  the request fails with HTTP 400 even though the prompt itself is small.
-
-Capping the budget at 8192 keeps the setup working on either behavior and
-leaves roughly 24K for input on a 32,768-token server; on a current vLLM it is
-headroom insurance rather than a requirement.
+Claude Code does not know the served model's real window, so it sends the
+default `max_tokens` for the Anthropic model name it believes it is calling —
+around 21,000 tokens. vLLM treats that budget as an upper bound, not a
+reservation: `get_max_tokens` caps it at `--max-model-len` minus the prompt
+length, and a request is rejected up front only when the prompt itself exceeds
+the window (verified against vLLM 0.29.0 — the version the on-demand endpoint
+and the GPU nightly serve — on both the Chat Completions and the
+Anthropic-compatible `/v1/messages` paths). An oversized budget therefore
+costs no prompt space, and the 8192 cap above is optional: it is kept to make
+each turn's output budget predictable on the 32,768-token server, not to
+prevent a failure.
 
 Claude Code also sizes its own auto-compaction against the window it assumes,
 not the real one, so it will not compact in time on its own: once the prompt
@@ -1016,21 +1007,19 @@ kill "$PRAXIS_PID"
   This bites OpenCode hardest: it is the one client whose traffic
   (`/v1/chat/completions`) shares a listener with another protocol, so a config
   derived from an older copy sends it problem details its SDK cannot parse.
-- `400` with `maximum context length is 32768 tokens` and a requested output
-  count near 21,000: Claude Code's default output budget does not fit the
-  window, and the server is an older vLLM that reserves `max_tokens` instead
-  of clamping it (see section 4). Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as
-  shown in section 4. On current vLLM the same 400 means the *prompt* alone
-  exceeds the window — see the `/context` entry below.
+- `400` with `maximum context length is 32768 tokens`: the prompt itself
+  exceeds the server's window. vLLM clamps the requested output budget to the
+  space left after the prompt rather than holding it against the window, so an
+  oversized `max_tokens` is never the cause on its own. Reduce what Claude
+  Code loads before the first turn — see the `/context` entry below.
 - `400` with `maximum context length is 32768 tokens` on the first turn, with a
-  reported input count near 28,000 and a modest output count: the output cap
-  from the previous entry is already in effect and the startup prompt itself is
-  the problem. Claude Code loads MCP tool definitions, plugin skills, and
-  `CLAUDE.md` before the session begins, so an empty conversation can consume
-  most of the window. Run `/context` for the breakdown; it is a local command
-  and still works while every request is failing. Start Claude Code with
-  `--strict-mcp-config` to drop globally configured MCP servers, disable
-  unneeded plugins with `/plugin`, and prefer a working directory whose
+  reported input count near 28,000 and a modest output count: the startup
+  prompt itself is the problem. Claude Code loads MCP tool definitions, plugin
+  skills, and `CLAUDE.md` before the session begins, so an empty conversation
+  can consume most of the window. Run `/context` for the breakdown; it is a
+  local command and still works while every request is failing. Start Claude
+  Code with `--strict-mcp-config` to drop globally configured MCP servers,
+  disable unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
 - Claude Code never finishes a turn — plan mode keeps looping, or reasoning
   text appears in the answer or the rendered plan: the server may be emitting

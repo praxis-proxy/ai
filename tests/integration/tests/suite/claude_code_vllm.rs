@@ -119,12 +119,10 @@ const CLAUDE_CODE_VERSION: &str = "2.1.278";
 
 /// Output-token ceiling passed to the pinned client for the 32K vLLM context.
 ///
-/// Claude Code otherwise requests 32K output tokens. Current vLLM clamps that
-/// to the space left in a 32K total context rather than rejecting it (older
-/// vLLM reserved `max_tokens` and rejected the request before inference — see
-/// the client guide's version note), but an explicit small ceiling keeps the
-/// run working on either behavior. The coding task needs only short tool calls
-/// and a summary.
+/// Claude Code otherwise requests 32K output tokens. vLLM clamps that to the
+/// space left in a 32K total context rather than rejecting it, but an
+/// explicit small ceiling keeps each turn's output budget predictable. The
+/// coding task needs only short tool calls and a summary.
 const CLAUDE_CODE_MAX_OUTPUT_TOKENS: &str = "2048";
 
 /// Context window advertised to the pinned client for its compaction policy.
