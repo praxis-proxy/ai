@@ -530,7 +530,7 @@ fn has_literal_provider_credentials(config: &serde_yaml::Mapping) -> bool {
 /// normally call `tools/list` even when the connector URL is the replay-owned
 /// backend, so those scenario requests are not contained — **unless** the
 /// resolver runs in protected admission mode (#1724), where an untrusted target
-/// (a direct `server_url`, or a connector with no catalog trust) is excluded
+/// (a direct `server_url`, or a connector with `tool_policy: deny`) is excluded
 /// without dialing and is therefore replay-contained.
 fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScenario) -> Result<(), FixtureError> {
     let mut resolvers = Vec::new();
@@ -579,10 +579,9 @@ fn resolver_is_protected(resolver: &Value) -> bool {
         == Some("protected")
 }
 
-/// The configured operator trust level for a connector (`untrusted` | `catalog`
-/// | `catalog_and_read_only`). An omitted `trust` or unknown connector is
-/// `untrusted`.
-fn connector_trust_level<'a>(resolver: &'a Value, connector_id: &str) -> &'a str {
+/// The configured operator tool policy for a connector (`deny` | `allow_all` |
+/// `read_only`). An omitted policy or unknown connector defaults to `deny`.
+fn connector_tool_policy<'a>(resolver: &'a Value, connector_id: &str) -> &'a str {
     resolver
         .get("connectors")
         .and_then(Value::as_array)
@@ -591,17 +590,8 @@ fn connector_trust_level<'a>(resolver: &'a Value, connector_id: &str) -> &'a str
                 .iter()
                 .find(|connector| connector.get("id").and_then(Value::as_str) == Some(connector_id))
         })
-        .and_then(|connector| connector.get("trust").and_then(Value::as_str))
-        .unwrap_or("untrusted")
-}
-
-/// Whether a resolver filter enforces operator read-only.
-fn resolver_requires_read_only(resolver: &Value) -> bool {
-    resolver
-        .get("tool_admission")
-        .and_then(|admission| admission.get("require_read_only"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .and_then(|connector| connector.get("tool_policy").and_then(Value::as_str))
+        .unwrap_or("deny")
 }
 
 /// Whether a scenario request body contains an MCP tool that would call
@@ -636,17 +626,10 @@ fn mcp_tool_would_dial(tool: &Value, protected: bool, resolver: &Value) -> bool 
     if !protected {
         return true;
     }
-    // Protected mode: a connector is dialed only when it can admit at least one
-    // tool. Untrusted direct targets and untrusted connectors are excluded
-    // without dialing; so is a `catalog` connector under require_read_only (its
-    // read-only claims are not trusted, so it could admit nothing).
+    // Protected mode excludes direct client-selected targets and connectors
+    // whose operator tool policy is `deny` before dialing.
     match tool.get("connector_id").and_then(Value::as_str) {
-        Some(connector_id) => {
-            let level = connector_trust_level(resolver, connector_id);
-            let admits_catalog = matches!(level, "catalog" | "catalog_and_read_only");
-            let trusts_read_only = level == "catalog_and_read_only";
-            admits_catalog && (trusts_read_only || !resolver_requires_read_only(resolver))
-        },
+        Some(connector_id) => matches!(connector_tool_policy(resolver, connector_id), "allow_all" | "read_only"),
         None => false,
     }
 }
@@ -1966,78 +1949,59 @@ mod tests {
             sanitize::RedactionRules,
         },
         ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, build_replay_config_with_aliases,
-        compare_imported_requests, config_contains_endpoint_address, connector_trust_level,
+        compare_imported_requests, config_contains_endpoint_address, connector_tool_policy,
         contain_replay_external_resources, finish_backend_after_proxy_shutdown, fixture_comparison_value,
         has_only_normal_relative_components, is_network_value_key, is_replay_contained_filter,
         load_and_validate_config_source, mcp_tool_would_dial, patch_overlay_path, resolve_example_config_path,
-        resolver_requires_read_only, send_recorded_request, validate_endpoint_collection,
-        validate_generic_network_string, validate_network_string_with_context, validate_replay_filters,
-        validate_replay_network_value, validate_scenario_requests, validate_singular_endpoint, validate_sse_events,
-        validate_upstream_inputs,
+        send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
+        validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
+        validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
 
     #[test]
-    fn mcp_tool_would_dial_tracks_connector_trust_level() {
-        // Replay containment must mirror the resolver's protected-mode exclusion:
-        // a connector is dialed only when it can admit at least one tool. A
-        // `catalog` connector under require_read_only admits nothing, so it is
-        // excluded without contact and must NOT be predicted to dial.
-        let resolver = |level: Option<&str>, require_read_only: bool| {
+    fn mcp_tool_would_dial_tracks_connector_tool_policy() {
+        // Replay containment must mirror protected-mode admission: `deny` is
+        // excluded before contact, while both policies that may admit tools need
+        // discovery (read_only must inspect tool annotations).
+        let resolver = |tool_policy: Option<&str>| {
             let mut connector = json!({"id": "gw", "server_url": "https://gw.internal/mcp"});
-            if let Some(level) = level {
-                connector["trust"] = json!(level);
+            if let Some(tool_policy) = tool_policy {
+                connector["tool_policy"] = json!(tool_policy);
             }
             json!({
-                "tool_admission": {"mode": "protected", "require_read_only": require_read_only},
+                "tool_admission": {"mode": "protected"},
                 "connectors": [connector],
             })
         };
         let connector_tool = json!({"type": "mcp", "server_label": "s", "connector_id": "gw"});
 
-        // require_read_only = false: any catalog trust dials; untrusted does not.
         assert!(
-            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("untrusted"), false)),
-            "untrusted connector is excluded without contact"
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("deny"))),
+            "denied connector is excluded without contact"
         );
         assert!(
-            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog"), false)),
-            "catalog connector dials when read-only is not required"
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("allow_all"))),
+            "allow_all connector is dialed for discovery"
         );
         assert!(
-            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog_and_read_only"), false)),
-            "catalog_and_read_only connector dials"
-        );
-
-        // require_read_only = true: catalog is excluded without contact; only
-        // catalog_and_read_only dials.
-        assert!(
-            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog"), true)),
-            "catalog connector under require_read_only is excluded without contact"
-        );
-        assert!(
-            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("catalog_and_read_only"), true)),
-            "catalog_and_read_only connector still dials under require_read_only"
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("read_only"))),
+            "read_only connector is dialed to inspect tool metadata"
         );
 
-        // Omitted trust defaults to untrusted (no dial in protected mode).
+        // Omitted policy defaults to deny (no dial in protected mode).
         assert!(
-            !mcp_tool_would_dial(&connector_tool, true, &resolver(None, false)),
-            "a connector without a declared trust level defaults to untrusted"
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(None)),
+            "a connector without a tool policy defaults to deny"
         );
 
         // Direct helper behavior.
+        assert_eq!(connector_tool_policy(&resolver(Some("allow_all")), "gw"), "allow_all");
         assert_eq!(
-            connector_trust_level(&resolver(Some("catalog"), false), "gw"),
-            "catalog"
+            connector_tool_policy(&resolver(Some("allow_all")), "missing"),
+            "deny",
+            "an unknown connector defaults to deny"
         );
-        assert_eq!(
-            connector_trust_level(&resolver(Some("catalog"), false), "missing"),
-            "untrusted",
-            "an unknown connector id is untrusted"
-        );
-        assert!(resolver_requires_read_only(&resolver(Some("catalog"), true)));
-        assert!(!resolver_requires_read_only(&resolver(Some("catalog"), false)));
     }
 
     #[test]

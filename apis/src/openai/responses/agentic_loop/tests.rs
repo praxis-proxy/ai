@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::{super::budget::SimpleBudget, collect_output_items};
 #[cfg(feature = "openai-mcp-tools")]
-use crate::openai::responses::mcp_admission::ConnectorTrust;
+use crate::openai::responses::mcp_admission::ConnectorToolPolicy;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
@@ -3903,7 +3903,7 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
         server_label: "drive".to_owned(),
         server_url: "https://drive.example.com/mcp".to_owned(),
         timeout: std::time::Duration::from_secs(5),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }
 }
 
@@ -3921,7 +3921,6 @@ fn denied_mcp_call_is_dispatchable_and_server_owned() {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "x"}));
     let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
         mode: McpAdmissionMode::Protected,
-        require_read_only: true,
     });
     admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
     state.mcp_admission = admission;

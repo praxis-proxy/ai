@@ -77,7 +77,7 @@ use super::{
     bound_body_outcome,
     error::responses_error_rejection,
     mcp_admission::{
-        ConnectorTrust, McpAdmissionDecisions, McpAdmissionPolicy, McpDenyReason, McpToolVerdict, evaluate_tool,
+        ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionPolicy, McpDenyReason, McpToolVerdict, evaluate_tool,
     },
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
@@ -447,17 +447,15 @@ fn discovery_retained_charge(
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
 /// # Operator-owned metadata admission (issue #1724). Defaults to advisory
-/// # (unchanged behavior); protected mode enforces the trust contract below.
+/// # (unchanged behavior); protected mode enforces the connector tool policy below.
 /// tool_admission:
 ///   mode: protected          # advisory (default) | protected
-///   require_read_only: true  # admit only trusted-affirmative read-only tools
 /// connectors:
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
-///     # Operator trust level (default untrusted): `catalog` admits its tools
-///     # (writes included) without trusting readOnlyHint; `catalog_and_read_only`
-///     # additionally trusts its readOnlyHint classifications.
-///     trust: catalog_and_read_only
+///     # Connector policy defaults to deny. `allow_all` permits writes;
+///     # `read_only` admits only affirmed read-only tools.
+///     tool_policy: read_only
 /// ```
 ///
 /// `forward_headers` applies only to configured `connector_id` targets. Direct
@@ -475,14 +473,13 @@ fn discovery_retained_charge(
 ///
 /// In `protected` mode a client-selected direct `server_url` is untrusted and
 /// its tools are excluded (the target is not even dialed). A connector is
-/// untrusted unless the operator declares a `trust` contract on it; a trusted
-/// service's tools are admitted without a per-tool digest. With
-/// `require_read_only: true`, only tools a trusted service classifies read-only
-/// are admitted — writable, missing, malformed, or conflicting classifications
-/// are excluded. Eligibility is re-enforced at dispatch, so a model-generated
-/// call to an excluded tool cannot execute. The trusted service remains the
-/// owner of its catalog and per-call authorization; Praxis does not duplicate
-/// that policy engine.
+/// excluded unless the operator configures its `tool_policy`. `allow_all` admits
+/// all of its tools, including tools that write. `read_only` admits only tools
+/// with an affirmative `readOnlyHint`; writable, missing, malformed, or
+/// conflicting classifications are excluded. Eligibility is re-enforced at
+/// dispatch, so a model-generated call to an excluded tool cannot execute. The
+/// service remains the owner of its catalog and per-call authorization; Praxis
+/// does not duplicate that policy engine.
 pub struct McpToolResolveFilter {
     /// Optional per-user bearer slot required for configured connectors.
     user_credential_slot: Option<String>,
@@ -502,9 +499,9 @@ pub struct McpToolResolveFilter {
     /// Operator metadata-admission policy snapshot.
     admission_policy: McpAdmissionPolicy,
 
-    /// Per-connector operator trust, keyed by connector id. Direct,
-    /// client-selected targets are always untrusted and never appear here.
-    connector_trust: HashMap<String, ConnectorTrust>,
+    /// Per-connector operator tool policies, keyed by connector id. Direct,
+    /// client-selected targets always use `Deny` and never appear here.
+    connector_tool_policies: HashMap<String, ConnectorToolPolicy>,
 
     /// Maximum size in bytes of the body produced after expanding
     /// `mcp` tool entries into `function` entries.
@@ -631,10 +628,10 @@ impl McpToolResolveFilter {
                 Ok((c.id.clone(), url))
             })
             .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
-        let connector_trust = validated
+        let connector_tool_policies = validated
             .connectors
             .iter()
-            .map(|c| (c.id.clone(), c.trust.snapshot()))
+            .map(|c| (c.id.clone(), c.tool_policy.snapshot()))
             .collect();
         Ok(Box::new(Self {
             user_credential_slot: validated.user_credential.clone(),
@@ -647,7 +644,7 @@ impl McpToolResolveFilter {
             connectors,
             require_connector: validated.require_connector,
             admission_policy: validated.tool_admission.snapshot(),
-            connector_trust,
+            connector_tool_policies,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
@@ -723,7 +720,7 @@ impl McpToolResolveFilter {
             self.timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
-            &self.connector_trust,
+            &self.connector_tool_policies,
             self.admission_policy,
         );
         let resolution = self
@@ -923,7 +920,7 @@ impl McpToolResolveFilter {
             &entry_to_task,
             task_results,
             self.admission_policy,
-            &self.connector_trust,
+            &self.connector_tool_policies,
         )
     }
 
@@ -951,9 +948,8 @@ impl McpToolResolveFilter {
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
-        // Protected mode: a target that can admit no tool has every tool excluded
-        // regardless of what it would advertise — an untrusted target, or a
-        // `catalog` connector denied read-only authority under require_read_only.
+        // Protected mode: a target with `tool_policy: deny` has every tool
+        // excluded regardless of what it would advertise.
         // Resolve it to zero tools without dialing, so exclusion never contacts an
         // untrusted, client-selected endpoint and does not depend on its
         // reachability.
@@ -963,7 +959,7 @@ impl McpToolResolveFilter {
         // (which `resolvable_server_url` reports as `None`) would otherwise
         // pass through to the backend, and a deferred untrusted connector would
         // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
-        if let Some(reason) = protected_exclusion(entry, self.admission_policy, &self.connector_trust) {
+        if let Some(reason) = protected_exclusion(entry, self.admission_policy, &self.connector_tool_policies) {
             debug!(label, ?reason, "protected mode: excluding MCP target without dialing");
             return Ok(Some(Vec::new()));
         }
@@ -1337,7 +1333,7 @@ fn collect_resolutions(
     entry_to_task: &[Option<usize>],
     mut task_results: Vec<Option<Vec<serde_json::Value>>>,
     policy: McpAdmissionPolicy,
-    connector_trust: &HashMap<String, ConnectorTrust>,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
 ) -> Result<Resolution, ResolveError> {
     let mut tool_map = HashMap::new();
     let mut per_entry = Vec::with_capacity(entries.len());
@@ -1352,17 +1348,21 @@ fn collect_resolutions(
             (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
         // Record any target excluded without dialing so a forged call into its
         // namespace is rejected explicitly, with the precise reason (untrusted
-        // source, or a catalog connector denied read-only authority under
-        // require_read_only). Done for every excluded entry, whether it reaches
+        // source). Done for every excluded entry, whether it reaches
         // the Resolved branch (eager short-circuit) or the deferred/targetless
         // branch below (#1724).
-        let excluded = protected_exclusion(entry, policy, connector_trust);
+        let excluded = protected_exclusion(entry, policy, connector_tool_policies);
         if let Some(reason) = excluded {
             decisions.record_excluded_namespace(server_label(entry), reason);
         }
-        if let Some((resolution, listing_tools)) =
-            build_entry_resolution(entry, tools, &mut tool_map, policy, connector_trust, &mut decisions)?
-        {
+        if let Some((resolution, listing_tools)) = build_entry_resolution(
+            entry,
+            tools,
+            &mut tool_map,
+            policy,
+            connector_tool_policies,
+            &mut decisions,
+        )? {
             has_resolved = true;
             let label = server_label(entry).to_owned();
             resolved_labels.insert(label.clone());
@@ -1554,7 +1554,7 @@ fn build_entry_resolution(
     tools: Option<Vec<serde_json::Value>>,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
     policy: McpAdmissionPolicy,
-    connector_trust: &HashMap<String, ConnectorTrust>,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
     decisions: &mut McpAdmissionDecisions,
 ) -> Result<Option<(EntryResolution, Vec<serde_json::Value>)>, ResolveError> {
     let Some(tools) = tools else {
@@ -1567,8 +1567,8 @@ fn build_entry_resolution(
     // advisory mode this returns `filtered` unchanged; in protected mode denied
     // tools are dropped here and recorded in `decisions` so they never reach the
     // model, the function tools, or the dispatch map.
-    let trust = trust_for_entry(entry, connector_trust);
-    let admitted = admit_tools(policy, trust, label, filtered, decisions);
+    let tool_policy = tool_policy_for_entry(entry, connector_tool_policies);
+    let admitted = admit_tools(policy, tool_policy, label, filtered, decisions);
     let function_tools: Vec<serde_json::Value> = admitted
         .iter()
         .map(|def| mcp_tool_to_function_tool(label, def))
@@ -2239,14 +2239,14 @@ fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
 /// callout — not captured here.
 #[expect(
     clippy::too_many_arguments,
-    reason = "deferred snapshot threads limits, connector trust, and the admission policy"
+    reason = "deferred snapshot threads limits, connector tool policy, and the admission policy"
 )]
 fn collect_deferred_connectors(
     entries: &[serde_json::Value],
     timeout: Duration,
     max_tools: usize,
     max_rewritten_body_bytes: usize,
-    connector_trust: &HashMap<String, ConnectorTrust>,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
     policy: McpAdmissionPolicy,
 ) -> Vec<DeferredMcpConnector> {
     entries
@@ -2255,14 +2255,13 @@ fn collect_deferred_connectors(
         .filter_map(|entry| {
             let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
             let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
-            let trust = connector_trust.get(connector_id).copied().unwrap_or_default();
+            let tool_policy = connector_tool_policies.get(connector_id).copied().unwrap_or_default();
             // Protected mode excludes a connector that can supply no admissible
             // tool in `resolve_entry` without dialing, so never queue it for
             // deferred discovery — doing so would make `openai_mcp_dispatch` dial
             // the service only to deny every tool (and abort the request if it is
-            // unreachable). Covers untrusted connectors and catalog connectors
-            // denied read-only authority under require_read_only (#1724).
-            if protected_exclusion_reason(trust, policy).is_some() {
+            // unreachable). Covers connectors with tool_policy: deny (#1724).
+            if protected_exclusion_reason(tool_policy, policy).is_some() {
                 return None;
             }
             Some(DeferredMcpConnector {
@@ -2279,10 +2278,10 @@ fn collect_deferred_connectors(
                 server_label: server_label(entry).to_owned(),
                 server_url: server_url.to_owned(),
                 timeout,
-                // Trust is stamped from operator configuration at resolve time so
+                // Tool policy is stamped from operator configuration at resolve time so
                 // deferred discovery (which runs inside openai_mcp_dispatch) never
                 // needs the resolver's connector config.
-                trust,
+                tool_policy,
             })
         })
         .collect()
@@ -3234,7 +3233,7 @@ async fn prepare_deferred_listing(
     let filtered = apply_allowed_tools_filter(listing, &allowed);
     // Operator admission runs on the deferred connector exactly as on fresh
     // discovery, using the trust stamped onto the connector at resolve time.
-    let (admitted, verdicts) = admit_deferred_tools(policy, connector.trust, filtered);
+    let (admitted, verdicts) = admit_deferred_tools(policy, connector.tool_policy, filtered);
     let functions: Vec<serde_json::Value> = admitted
         .iter()
         .map(|def| mcp_tool_to_function_tool(&connector.server_label, def))
@@ -3937,13 +3936,13 @@ fn tool_read_only_hint(tool: &serde_json::Value) -> bool {
 /// In advisory mode this is a no-op: the tools pass through unchanged and no
 /// verdict is recorded, so existing behavior is byte-for-byte preserved. In
 /// protected mode each tool is evaluated against the operator policy and the
-/// resolving entry's connector trust ([`trust_for_entry`]); admitted tools are
-/// returned (and reach the model + dispatch map), while denied tools are dropped
+/// resolving entry's connector policy ([`tool_policy_for_entry`]); admitted
+/// tools are returned (and reach the model + dispatch map), while denied tools are dropped
 /// and recorded in `decisions` so a later forged call can be rejected explicitly
 /// rather than mis-classified as a client function.
 fn admit_tools(
     policy: McpAdmissionPolicy,
-    trust: ConnectorTrust,
+    tool_policy: ConnectorToolPolicy,
     label: &str,
     tools: Vec<serde_json::Value>,
     decisions: &mut McpAdmissionDecisions,
@@ -3958,7 +3957,7 @@ fn admit_tools(
         let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
             continue;
         };
-        let verdict = evaluate_tool(policy, trust, &tool);
+        let verdict = evaluate_tool(policy, tool_policy, &tool);
         decisions.record(label, &tool_name, verdict);
         if matches!(verdict, McpToolVerdict::Admitted { .. }) {
             admitted.push(tool);
@@ -3970,48 +3969,45 @@ fn admit_tools(
 /// Why protected mode excludes an MCP entry outright without dialing, or `None`
 /// if the target may be contacted.
 ///
-/// A target is excluded without contact when it can supply no admissible tool:
-/// - no catalog trust (`UntrustedSource`) — direct `server_url` targets, untrusted connectors, and targetless
-///   (label-only) entries; or
-/// - catalog trust but not read-only authority while `require_read_only` is set (`NoReadOnlyAuthority`) — every tool it
-///   could advertise would be denied, so dialing it is pure cost (and an unreachable service would fail the request).
+/// A target is excluded without contact when its policy is `Deny` — direct
+/// `server_url` targets, denied connectors, and targetless (label-only) entries.
 ///
 /// Centralizes the exclusion rule shared by `resolve_entry` (eager dial),
 /// `collect_resolutions` (deferred/targetless entries with no resolution task),
 /// and `collect_deferred_connectors` (deferred-discovery queueing) (#1724).
-fn protected_exclusion_reason(trust: ConnectorTrust, policy: McpAdmissionPolicy) -> Option<McpDenyReason> {
+fn protected_exclusion_reason(tool_policy: ConnectorToolPolicy, policy: McpAdmissionPolicy) -> Option<McpDenyReason> {
     if !policy.is_protected() {
         return None;
     }
-    if !trust.admits_catalog() {
+    if !tool_policy.admits_tools() {
         return Some(McpDenyReason::UntrustedSource);
-    }
-    if policy.require_read_only && !trust.trusts_read_only() {
-        return Some(McpDenyReason::NoReadOnlyAuthority);
     }
     None
 }
 
 /// [`protected_exclusion_reason`] resolved for one MCP entry via its connector
-/// trust ([`trust_for_entry`]).
+/// policy ([`tool_policy_for_entry`]).
 fn protected_exclusion(
     entry: &serde_json::Value,
     policy: McpAdmissionPolicy,
-    connector_trust: &HashMap<String, ConnectorTrust>,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
 ) -> Option<McpDenyReason> {
-    protected_exclusion_reason(trust_for_entry(entry, connector_trust), policy)
+    protected_exclusion_reason(tool_policy_for_entry(entry, connector_tool_policies), policy)
 }
 
-/// Resolve the operator trust for one MCP entry.
+/// Resolve the operator tool policy for one MCP entry.
 ///
-/// A direct, client-selected `server_url` entry is always untrusted. A
-/// connector entry's trust is looked up by `connector_id` in the operator
-/// configuration; an unknown connector id is untrusted (fail-closed).
-fn trust_for_entry(entry: &serde_json::Value, connector_trust: &HashMap<String, ConnectorTrust>) -> ConnectorTrust {
+/// A direct, client-selected `server_url` entry and an unknown connector are
+/// denied by default. A configured connector's policy is looked up by
+/// `connector_id`; a missing entry fails closed.
+fn tool_policy_for_entry(
+    entry: &serde_json::Value,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
+) -> ConnectorToolPolicy {
     entry
         .get("connector_id")
         .and_then(serde_json::Value::as_str)
-        .and_then(|id| connector_trust.get(id))
+        .and_then(|id| connector_tool_policies.get(id))
         .copied()
         .unwrap_or_default()
 }
@@ -4024,7 +4020,7 @@ fn trust_for_entry(entry: &serde_json::Value, connector_trust: &HashMap<String, 
 /// Advisory mode returns the tools unchanged with no verdicts.
 fn admit_deferred_tools(
     policy: McpAdmissionPolicy,
-    trust: ConnectorTrust,
+    tool_policy: ConnectorToolPolicy,
     tools: Vec<serde_json::Value>,
 ) -> (Vec<serde_json::Value>, Vec<(String, McpToolVerdict)>) {
     if !policy.is_protected() {
@@ -4036,7 +4032,7 @@ fn admit_deferred_tools(
         let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
             continue;
         };
-        let verdict = evaluate_tool(policy, trust, &tool);
+        let verdict = evaluate_tool(policy, tool_policy, &tool);
         verdicts.push((tool_name, verdict));
         if matches!(verdict, McpToolVerdict::Admitted { .. }) {
             admitted.push(tool);

@@ -778,8 +778,8 @@ impl McpDispatchFilter {
             // Re-validate every approving resumption against the current operator
             // policy BEFORE the single-use approval is consumed (#1724). Resolve
             // re-ran this request and rebuilt the admission verdicts, so a call
-            // whose tool is now denied (trust revoked, or writable under operator
-            // read-only mode) is rejected here without spending its approval. The
+            // whose tool is now denied (connector policy changed, or no longer
+            // classified read-only) is rejected here without spending its approval. The
             // dispatch-time check in `execute_single_call` remains as defense in
             // depth.
             for decision in &resolved {

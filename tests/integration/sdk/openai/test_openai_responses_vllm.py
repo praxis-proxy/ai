@@ -5919,11 +5919,10 @@ def agentic_client(agentic_proxy):
 
 
 # Operator metadata-admission policy injected under the resolver (#1724):
-# protected mode with operator-enforced read-only.
+# protected mode with per-connector tool policies.
 _PROTECTED_ADMISSION_BLOCK = (
     "        tool_admission:\n"
     "          mode: protected\n"
-    "          require_read_only: true\n"
 )
 
 
