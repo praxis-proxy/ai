@@ -536,6 +536,37 @@ mod tests {
     }
 
     #[test]
+    fn output_frame_fails_after_committing_created_event_with_ledger_charge() {
+        const LIMIT: usize = 131_072;
+        const REQUEST: &[u8] = br#"{"model":"gpt-4.1","input":"Reply briefly.","stream":true}"#;
+        const CREATED_WIRE: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-4.1\",\"status\":\"in_progress\",\"output\":[]}}\n\n";
+        const CREATED_DATA: &[u8] = b"{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"model\":\"gpt-4.1\",\"status\":\"in_progress\",\"output\":[]}}";
+
+        let mut budget = SimpleBudget::new(LIMIT, input_charge(REQUEST).unwrap()).unwrap();
+        assert!(budget.admit_stream_chunk(CREATED_WIRE));
+        assert!(budget.admit_stream_frame(CREATED_DATA));
+        let committed_charge = budget.charge();
+
+        let delta_wire = format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
+            "x".repeat(16_384)
+        );
+        assert!(
+            delta_wire.len() < LIMIT,
+            "the raw event remains below the configured ceiling"
+        );
+        assert!(
+            !budget.admit_stream_chunk(delta_wire.as_bytes()),
+            "weighted wire and transient parsing charges must reject the output frame"
+        );
+        assert_eq!(
+            budget.charge(),
+            committed_charge,
+            "a rejected frame must leave the previously committed charge unchanged"
+        );
+    }
+
+    #[test]
     fn local_sse_synthesis_admits_at_ceiling_and_fails_atomically_above_it() {
         let mut budget = SimpleBudget::new(65_536, 0).unwrap();
         assert_eq!(budget.remaining_bytes(), Some(40_960));

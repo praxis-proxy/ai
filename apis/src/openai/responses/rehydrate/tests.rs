@@ -687,7 +687,10 @@ async fn sqlite_item_history_rehydrates_complete_order_after_delete_and_append_a
             .on_bound_upstream_request_body(&mut ctx, &mut body)
             .await
             .unwrap();
-        assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+        assert!(
+            matches!(outcome, BoundUpstreamBodyOutcome::Continue),
+            "unexpected bounded upstream body outcome: {outcome:?}"
+        );
         assert_eq!(body.as_ref(), Some(&original));
         let state = ctx.extensions.get::<ResponsesState>().unwrap();
         assert!(state.history_rehydrated);
