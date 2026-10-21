@@ -1296,7 +1296,8 @@ pipeline:
     phase: IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call
     config:
       provider: brave
-      api_key: ${WEB_SEARCH_API_KEY}
+      api_key:
+        env_var: WEB_SEARCH_API_KEY
       user_credential: brave_search
       max_calls_per_round: 32
     promotes: executes web_search_call assignments prepared by the loop owner; fails closed if per-user brave_search slot missing

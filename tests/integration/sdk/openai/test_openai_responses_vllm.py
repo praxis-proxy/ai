@@ -311,19 +311,20 @@ def _write_full_flow_config(
         )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
-    # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
-    # These vLLM turns never emit a web_search_call, so a literal placeholder
+    # resolves the `env_var: WEB_SEARCH_API_KEY` source at startup and fails closed
+    # when unset. These vLLM turns never emit a web_search_call, so a literal inline
     # key keeps the dispatcher inert while letting the binary start. The Tavily
     # provider rejects ``user_credential`` at startup, so a Tavily test replaces
     # the whole provider block below instead of swapping in the placeholder key.
     if web_search_provider != "tavily":
         config = config.replace(
-            "api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key"
+            "env_var: WEB_SEARCH_API_KEY", "value: test-key"
         )
     else:
         provider_block = (
             "                provider: brave\n"
-            "                api_key: ${WEB_SEARCH_API_KEY}\n"
+            "                api_key:\n"
+            "                  env_var: WEB_SEARCH_API_KEY\n"
             "                # Require the per-user key captured by the outer\n"
             "                # callout_credentials filter. The secret is injected only at\n"
             "                # the exact resolved provider authority.\n"
@@ -333,7 +334,8 @@ def _write_full_flow_config(
         config = config.replace(
             provider_block,
             "                provider: tavily\n"
-            "                api_key: ${TAVILY_API_KEY}\n",
+            "                api_key:\n"
+            "                  env_var: TAVILY_API_KEY\n",
         )
     if chat_rewrite_model is not None:
         # The native Chat ingress model policy (instance B) rewrites the
@@ -401,11 +403,11 @@ def _write_full_flow_config(
             f'          - "{file_url_origin}"\n' + anchor,
         )
     if search_port is not None:
-        search_anchor = "api_key: test-key\n                # Require the per-user key"
+        search_anchor = "value: test-key\n                # Require the per-user key"
         assert config.count(search_anchor) == 1
         config = config.replace(
             search_anchor,
-            "api_key: test-key\n"
+            "value: test-key\n"
             f"                base_url: http://127.0.0.1:{search_port}\n"
             "                # Require the per-user key",
         )

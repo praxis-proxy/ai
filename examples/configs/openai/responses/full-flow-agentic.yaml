@@ -814,7 +814,8 @@ filter_chains:
               # until the model emits a web_search_call.
               - filter: openai_web_search_dispatch
                 provider: brave
-                api_key: ${WEB_SEARCH_API_KEY}
+                api_key:
+                  env_var: WEB_SEARCH_API_KEY
                 # Require the per-user key captured by the outer
                 # callout_credentials filter. The secret is injected only at
                 # the exact resolved provider authority.

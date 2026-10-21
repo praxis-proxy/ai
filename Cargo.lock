@@ -3498,6 +3498,7 @@ name = "praxis-ai-apis"
 version = "0.7.0"
 dependencies = [
  "allocation-counter",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -3508,6 +3509,7 @@ dependencies = [
  "jsonschema",
  "metrics",
  "metrics-util",
+ "notify",
  "openssl",
  "percent-encoding",
  "praxis-ai-store",
@@ -3535,6 +3537,7 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]

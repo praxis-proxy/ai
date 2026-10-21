@@ -58,6 +58,7 @@ praxis-main = []
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -66,6 +67,7 @@ futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 metrics = { workspace = true }
+notify = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
@@ -98,6 +100,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
