@@ -1487,17 +1487,15 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
 
 #[tokio::test]
 async fn execute_single_call_rejects_non_read_only_tool_under_read_only_policy() {
-    // Defense in depth: a read_only policy's admitted verdict must retain its
-    // affirmative classification before dispatch.
+    // Defense in depth: a writable tool under the read_only policy is denied at
+    // discovery (an admitted-but-writable verdict is unrepresentable), and
+    // dispatch re-surfaces that denial before any side effect.
     let map = sample_tool_map();
     let mut admission = McpAdmissionDecisions::new(protected_policy());
     admission.record(
         "weather",
         "get_weather",
-        McpToolVerdict::Admitted {
-            tool_policy: ConnectorToolPolicy::ReadOnly,
-            read_only: false,
-        },
+        McpToolVerdict::Denied(McpDenyReason::Writable),
     );
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "weather__get_weather", "call_id": "c1"});

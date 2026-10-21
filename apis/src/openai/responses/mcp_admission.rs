@@ -83,19 +83,6 @@ pub(crate) enum ConnectorToolPolicy {
     ReadOnly,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
-impl ConnectorToolPolicy {
-    /// Whether this policy permits any tools from the connector.
-    pub(crate) fn admits_tools(self) -> bool {
-        matches!(self, Self::AllowAll | Self::ReadOnly)
-    }
-
-    /// Whether read-only classification constrains this connector's tools.
-    pub(crate) fn requires_read_only(self) -> bool {
-        matches!(self, Self::ReadOnly)
-    }
-}
-
 /// Why a discovered tool was denied admission under protected mode.
 #[cfg(feature = "openai-mcp-tools")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,19 +111,29 @@ impl McpDenyReason {
     }
 }
 
+/// Basis on which a tool was admitted under protected mode.
+///
+/// A single enum rather than a `(ConnectorToolPolicy, bool)` pair so invalid
+/// admitted states (a `deny` policy, or an unclassified `read_only` admission)
+/// are unrepresentable: the only admitting policies are `allow_all` and a
+/// `read_only` policy with an affirmative classification.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionBasis {
+    /// Admitted under `tool_policy: allow_all`; read-only classification is not
+    /// consulted.
+    AllowAll,
+    /// Admitted under `tool_policy: read_only` with an affirmative, non-conflicting
+    /// read-only classification.
+    AffirmedReadOnly,
+}
+
 /// Admission verdict for one discovered tool.
 #[cfg(feature = "openai-mcp-tools")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum McpToolVerdict {
-    /// The tool is admitted. Retain the operator policy and classification so
-    /// dispatch can re-enforce a `read_only` decision.
-    Admitted {
-        /// Policy under which the tool was admitted.
-        tool_policy: ConnectorToolPolicy,
-        /// Whether the connector affirmatively classified this tool as
-        /// read-only under a `read_only` policy.
-        read_only: bool,
-    },
+    /// The tool is admitted; the basis records which policy admitted it.
+    Admitted(AdmissionBasis),
     /// The tool is denied and must not reach the model or dispatch.
     Denied(McpDenyReason),
 }
@@ -198,22 +195,16 @@ pub(crate) fn evaluate_tool(
         policy.is_protected(),
         "evaluate_tool is only meaningful in protected mode"
     );
-    if !tool_policy.admits_tools() {
-        return McpToolVerdict::Denied(McpDenyReason::UntrustedSource);
-    }
-    if tool_policy.requires_read_only() {
-        return match classify_read_only(tool_def) {
-            ReadOnlyClass::Affirmative => McpToolVerdict::Admitted {
-                tool_policy,
-                read_only: true,
-            },
+    // Exhaustive over `ConnectorToolPolicy` on purpose: a new variant must force a
+    // decision here rather than fall through to a fail-open admission.
+    match tool_policy {
+        ConnectorToolPolicy::Deny => McpToolVerdict::Denied(McpDenyReason::UntrustedSource),
+        ConnectorToolPolicy::AllowAll => McpToolVerdict::Admitted(AdmissionBasis::AllowAll),
+        ConnectorToolPolicy::ReadOnly => match classify_read_only(tool_def) {
+            ReadOnlyClass::Affirmative => McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly),
             ReadOnlyClass::Writable => McpToolVerdict::Denied(McpDenyReason::Writable),
             ReadOnlyClass::Unverified => McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly),
-        };
-    }
-    McpToolVerdict::Admitted {
-        tool_policy,
-        read_only: false,
+        },
     }
 }
 
@@ -275,7 +266,7 @@ impl McpAdmissionDecisions {
                 self.denied_encoded
                     .insert(encode_function_name(server_label, tool_name), reason);
             },
-            McpToolVerdict::Admitted { .. } => {
+            McpToolVerdict::Admitted(_) => {
                 self.available_encoded
                     .insert(encode_function_name(server_label, tool_name));
             },
@@ -356,20 +347,18 @@ impl McpAdmissionDecisions {
     ///
     /// In advisory mode this never denies. In protected mode an admitted entry
     /// must carry a matching admitted verdict; a missing verdict (a forged or
-    /// bypassed map entry) fails closed. A `read_only` verdict must also retain
-    /// its affirmative classification. This is defense in depth: discovery
-    /// already excluded denied tools, and this guarantees a model-generated call to a resolved entry is
-    /// re-checked against the operator-owned verdict before any side effect.
+    /// bypassed map entry) fails closed. An admitted verdict always carries a
+    /// valid [`AdmissionBasis`] (an unclassified `read_only` admission is
+    /// unrepresentable), so any admitted basis clears dispatch. This is defense
+    /// in depth: discovery already excluded denied tools, and this guarantees a
+    /// model-generated call to a resolved entry is re-checked against the
+    /// operator-owned verdict before any side effect.
     pub(crate) fn admitted_denial(&self, server_label: &str, tool_name: &str) -> Option<McpDenyReason> {
         if !self.policy.is_protected() {
             return None;
         }
         match self.verdict(server_label, tool_name) {
-            Some(McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: false,
-            }) => Some(McpDenyReason::Writable),
-            Some(McpToolVerdict::Admitted { .. }) => None,
+            Some(McpToolVerdict::Admitted(_)) => None,
             Some(McpToolVerdict::Denied(reason)) => Some(reason),
             None => Some(McpDenyReason::UntrustedSource),
         }
@@ -383,8 +372,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason,
-        McpToolVerdict, evaluate_tool,
+        AdmissionBasis, ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy,
+        McpDenyReason, McpToolVerdict, evaluate_tool,
     };
 
     fn protected() -> McpAdmissionPolicy {
@@ -429,10 +418,7 @@ mod tests {
         let verdict = evaluate_tool(protected(), ConnectorToolPolicy::AllowAll, &tool(None));
         assert_eq!(
             verdict,
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::AllowAll,
-                read_only: false,
-            }
+            McpToolVerdict::Admitted(AdmissionBasis::AllowAll)
         );
     }
 
@@ -445,10 +431,7 @@ mod tests {
         );
         assert_eq!(
             verdict,
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: true,
-            }
+            McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly)
         );
     }
 
@@ -461,10 +444,7 @@ mod tests {
         );
         assert_eq!(
             verdict,
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::AllowAll,
-                read_only: false,
-            }
+            McpToolVerdict::Admitted(AdmissionBasis::AllowAll)
         );
     }
 
@@ -502,30 +482,27 @@ mod tests {
 
     #[test]
     fn dispatch_reenforces_read_only_but_allows_writes_under_allow_all() {
+        // A writable tool under the read_only policy is denied at evaluation
+        // (an admitted-but-writable verdict is unrepresentable), and dispatch
+        // re-surfaces that denial.
         let mut read_only_decisions = McpAdmissionDecisions::new(protected());
-        read_only_decisions.record(
-            "gw",
-            "write",
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: false,
-            },
-        );
+        read_only_decisions.record("gw", "write", McpToolVerdict::Denied(McpDenyReason::Writable));
         assert_eq!(
             read_only_decisions.admitted_denial("gw", "write"),
             Some(McpDenyReason::Writable),
             "dispatch must reject a non-read-only tool under the read_only policy"
         );
 
-        let mut allow_all_decisions = McpAdmissionDecisions::new(protected());
-        allow_all_decisions.record(
-            "gw",
-            "write",
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::AllowAll,
-                read_only: false,
-            },
+        // A forged or bypassed tool-map entry with no recorded verdict fails
+        // closed at dispatch.
+        assert_eq!(
+            read_only_decisions.admitted_denial("gw", "never_listed"),
+            Some(McpDenyReason::UntrustedSource),
+            "dispatch must fail closed for an entry with no recorded verdict"
         );
+
+        let mut allow_all_decisions = McpAdmissionDecisions::new(protected());
+        allow_all_decisions.record("gw", "write", McpToolVerdict::Admitted(AdmissionBasis::AllowAll));
         assert_eq!(
             allow_all_decisions.admitted_denial("gw", "write"),
             None,
@@ -540,10 +517,7 @@ mod tests {
         decisions.record(
             "gw",
             "search",
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: true,
-            },
+            McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly),
         );
 
         assert!(decisions.is_denied_encoded("gw__delete_repo"));
@@ -554,10 +528,7 @@ mod tests {
         assert!(!decisions.is_denied_encoded("gw__search"));
         assert_eq!(
             decisions.verdict("gw", "search"),
-            Some(McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: true,
-            })
+            Some(McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly))
         );
         assert!(decisions.policy().is_protected());
         assert!(decisions.has_denied());
@@ -574,10 +545,7 @@ mod tests {
         decisions.record(
             "gw",
             "read_docs",
-            McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::ReadOnly,
-                read_only: true,
-            },
+            McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly),
         );
 
         assert!(

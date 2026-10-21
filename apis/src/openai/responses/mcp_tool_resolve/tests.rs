@@ -6321,7 +6321,7 @@ mod admission {
         McpToolVerdict, admit_tools, build_entry_resolution, collect_deferred_connectors, protected_exclusion,
         tool_policy_for_entry,
     };
-    use crate::openai::responses::mcp_admission::{McpAdmissionMode, McpDenyReason};
+    use crate::openai::responses::mcp_admission::{AdmissionBasis, McpAdmissionMode, McpDenyReason};
 
     fn protected() -> McpAdmissionPolicy {
         McpAdmissionPolicy {
@@ -6500,10 +6500,7 @@ mod admission {
         // `allow_all` does not treat the server's readOnlyHint as an admission constraint.
         assert_eq!(
             decisions.verdict("srv", "search"),
-            Some(McpToolVerdict::Admitted {
-                tool_policy: ConnectorToolPolicy::AllowAll,
-                read_only: false,
-            })
+            Some(McpToolVerdict::Admitted(AdmissionBasis::AllowAll))
         );
     }
 

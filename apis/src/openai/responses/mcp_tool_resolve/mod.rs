@@ -3959,7 +3959,7 @@ fn admit_tools(
         };
         let verdict = evaluate_tool(policy, tool_policy, &tool);
         decisions.record(label, &tool_name, verdict);
-        if matches!(verdict, McpToolVerdict::Admitted { .. }) {
+        if matches!(verdict, McpToolVerdict::Admitted(_)) {
             admitted.push(tool);
         }
     }
@@ -3979,10 +3979,12 @@ fn protected_exclusion_reason(tool_policy: ConnectorToolPolicy, policy: McpAdmis
     if !policy.is_protected() {
         return None;
     }
-    if !tool_policy.admits_tools() {
-        return Some(McpDenyReason::UntrustedSource);
+    // Exhaustive over `ConnectorToolPolicy` on purpose: a new variant must force a
+    // decision here rather than silently become contactable.
+    match tool_policy {
+        ConnectorToolPolicy::Deny => Some(McpDenyReason::UntrustedSource),
+        ConnectorToolPolicy::AllowAll | ConnectorToolPolicy::ReadOnly => None,
     }
-    None
 }
 
 /// [`protected_exclusion_reason`] resolved for one MCP entry via its connector
@@ -4034,7 +4036,7 @@ fn admit_deferred_tools(
         };
         let verdict = evaluate_tool(policy, tool_policy, &tool);
         verdicts.push((tool_name, verdict));
-        if matches!(verdict, McpToolVerdict::Admitted { .. }) {
+        if matches!(verdict, McpToolVerdict::Admitted(_)) {
             admitted.push(tool);
         }
     }
