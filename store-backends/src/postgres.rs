@@ -1974,7 +1974,7 @@ impl PostgresResponseStore {
         reason = "one read transaction keeps charge preflight and reconstruction on the same snapshot"
     )]
     #[cfg_attr(
-        feature = "postgres",
+        any(feature = "postgres", feature = "postgres-cert-auth"),
         expect(
             clippy::large_stack_frames,
             reason = "the async_trait boundary boxes this single-snapshot reconstruction future"
