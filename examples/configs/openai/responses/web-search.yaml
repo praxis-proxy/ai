@@ -8,7 +8,7 @@
 #
 # Configuration:
 #   provider:             Search backend (brave or tavily)
-#   api_key:              Provider API key (supports ${ENV_VAR} syntax)
+#   api_key:              Provider API key (`value`, `env_var`, or `file`)
 #   default_context_size: How many results to return (low/medium/high)
 #   timeout_ms:           Callout timeout in milliseconds
 #   outbound_chain:       Named filter chain each provider callout executes
@@ -33,7 +33,8 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_web_search_dispatch
         provider: brave
-        api_key: ${WEB_SEARCH_API_KEY}
+        api_key:
+          env_var: WEB_SEARCH_API_KEY
         default_context_size: medium
         timeout_ms: 10000
         outbound_chain: web-search-outbound

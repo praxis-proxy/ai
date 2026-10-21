@@ -1293,11 +1293,12 @@ fn web_search_config(live: &LiveConfig, proxy_port: u16, relay_port: u16, tavily
     );
     // The provider key is inlined (not an env var the test cannot set) and the
     // callout is pointed at the loopback relay. `base_url` must align with the
-    // 16-space-indented `api_key` key it follows, or the YAML scanner rejects it.
+    // 16-space-indented `api_key` key (two spaces less than the `value:` child
+    // that replaces `env_var:`), or the YAML scanner rejects it.
     let patched = replace_once(
         &patched,
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: {tavily_key}\n                base_url: http://127.0.0.1:{relay_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: {tavily_key}\n                base_url: http://127.0.0.1:{relay_port}"),
         "web-search provider key",
     );
     let patched = replace_once(

@@ -32,7 +32,8 @@ fn test_filter() -> Box<dyn HttpFilter> {
     let config = serde_yaml::from_str(
         r"
 provider: you
-api_key: test-key
+api_key:
+  value: test-key
 default_context_size: medium
 ",
     )
@@ -42,7 +43,7 @@ default_context_size: medium
 
 fn test_filter_with_max_body_bytes(max_body_bytes: usize) -> Box<dyn HttpFilter> {
     let config = serde_yaml::from_str(&format!(
-        "provider: you\napi_key: test-key\ndefault_context_size: medium\nmax_body_bytes: {max_body_bytes}",
+        "provider: you\napi_key:\n  value: test-key\ndefault_context_size: medium\nmax_body_bytes: {max_body_bytes}",
     ))
     .unwrap();
     AnthropicWebSearchFilter::from_config(&config).unwrap()
@@ -52,7 +53,8 @@ fn test_filter_impl_with_base_url(base_url: &str) -> AnthropicWebSearchFilter {
     let config = serde_yaml::from_str(&format!(
         r#"
 provider: you
-api_key: test-key
+api_key:
+  value: test-key
 default_context_size: medium
 base_url: "{base_url}"
 outbound_chain: web_search_outbound
@@ -60,7 +62,7 @@ outbound_chain: web_search_outbound
     ))
     .unwrap();
     let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, &config).unwrap();
-    let validated = build_config(FILTER_NAME, &config).unwrap();
+    let (validated, watch_handle) = build_config(FILTER_NAME, &config).unwrap();
     let client = crate::subrequest::isolated_client(4);
     let search_client = SearchClient::from_config(FILTER_NAME, &validated, client).unwrap();
     // Bind a minimal builtin-only outbound chain; the executor seeds the staged
@@ -73,6 +75,7 @@ outbound_chain: web_search_outbound
         search_client,
         outbound: Arc::new(outbound),
         user_credential_slot: validated.user_credential,
+        _watch_handle: watch_handle,
     }
 }
 

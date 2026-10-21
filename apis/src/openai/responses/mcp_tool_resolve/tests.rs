@@ -4146,7 +4146,7 @@ fn deferred_connector(
         server_label: "weather".to_owned(),
         server_url: server_url.to_owned(),
         timeout: Duration::from_secs(5),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }
 }
 
@@ -6312,20 +6312,20 @@ async fn malformed_allowed_tools_string_rejects_before_rewrite() {
 // =========================================================================
 
 mod admission {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use serde_json::json;
 
     use super::super::{
-        ConnectorTrust, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
-        McpToolVerdict, admit_tools, build_entry_resolution, excluded_as_untrusted, trust_for_entry,
+        ConnectorToolPolicy, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
+        McpToolVerdict, admit_tools, build_entry_resolution, collect_deferred_connectors, protected_exclusion,
+        tool_policy_for_entry,
     };
-    use crate::openai::responses::mcp_admission::{McpAdmissionMode, McpDenyReason};
+    use crate::openai::responses::mcp_admission::{AdmissionBasis, McpAdmissionMode, McpDenyReason};
 
-    fn protected(require_read_only: bool) -> McpAdmissionPolicy {
+    fn protected() -> McpAdmissionPolicy {
         McpAdmissionPolicy {
             mode: McpAdmissionMode::Protected,
-            require_read_only,
         }
     }
 
@@ -6360,12 +6360,12 @@ mod admission {
         entry: &serde_json::Value,
         tools: Vec<serde_json::Value>,
         policy: McpAdmissionPolicy,
-        trust: &HashMap<String, ConnectorTrust>,
+        policies: &HashMap<String, ConnectorToolPolicy>,
     ) -> ResolveOutcome {
         let mut tool_map = HashMap::new();
         let mut decisions = McpAdmissionDecisions::new(policy);
         let (resolution, _listing) =
-            build_entry_resolution(entry, Some(tools), &mut tool_map, policy, trust, &mut decisions)
+            build_entry_resolution(entry, Some(tools), &mut tool_map, policy, policies, &mut decisions)
                 .expect("resolution succeeds")
                 .expect("entry resolved");
         let EntryResolution::Resolved(functions) = resolution else {
@@ -6377,82 +6377,76 @@ mod admission {
     // --- Config validation ---
 
     #[test]
-    fn config_rejects_require_read_only_in_advisory_mode() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str("tool_admission:\n  require_read_only: true\n").unwrap();
-        let err = McpToolResolveFilter::from_config(&yaml)
-            .err()
-            .expect("advisory + require_read_only must be rejected");
-        assert!(
-            err.to_string().contains("require_read_only requires"),
-            "expected contradictory-config rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn config_accepts_protected_require_read_only() {
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str("tool_admission:\n  mode: protected\n  require_read_only: true\n").unwrap();
+    fn config_accepts_protected_mode() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("tool_admission:\n  mode: protected\n").unwrap();
         assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
     }
 
     #[test]
-    fn config_accepts_connector_read_only_trust_without_catalog() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    \
-             trust:\n      read_only: true\n",
-        )
-        .unwrap();
-        assert!(
-            McpToolResolveFilter::from_config(&yaml).is_ok(),
-            "read-only trust without catalog trust must be valid"
+    fn config_accepts_every_connector_tool_policy() {
+        for level in ["deny", "allow_all", "read_only"] {
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "tool_admission:\n  mode: protected\nconnectors:\n  - id: gw\n    server_url: \
+                 https://gw.internal/mcp\n    tool_policy: {level}\n"
+            ))
+            .unwrap();
+            assert!(
+                McpToolResolveFilter::from_config(&yaml).is_ok(),
+                "tool policy {level} must be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn config_defaults_connector_tool_policy_to_deny() {
+        // Omitting `tool_policy` is valid and denies the connector in protected mode.
+        let connector: super::super::config::ConnectorConfig =
+            serde_yaml::from_str("id: gw\nserver_url: https://gw.internal/mcp\n").unwrap();
+        assert_eq!(
+            connector.tool_policy.snapshot(),
+            ConnectorToolPolicy::Deny,
+            "omitting `tool_policy` must default to deny"
         );
     }
 
     #[test]
-    fn config_rejects_unknown_trust_field() {
+    fn config_rejects_unknown_connector_tool_policy() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "connectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    trust:\n      bogus: true\n",
+            "connectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    tool_policy: bogus\n",
         )
         .unwrap();
         assert!(McpToolResolveFilter::from_config(&yaml).is_err());
     }
 
-    // --- Trust resolution ---
+    // --- Connector policy resolution ---
 
     #[test]
     fn targetless_mcp_entry_is_excluded_in_protected_mode() {
         // A label-only MCP entry has no server_url and no connector_id. Protected
-        // mode must still exclude it (no trust) rather than passing it through to
+        // mode must still exclude it (default deny) rather than passing it through to
         // the backend (#1724).
         let entry = json!({"type": "mcp", "server_label": "x"});
-        assert!(excluded_as_untrusted(&entry, protected(false), &HashMap::new()));
+        assert!(protected_exclusion(&entry, protected(), &HashMap::new()).is_some());
         // Advisory mode leaves it alone (unchanged behavior).
-        assert!(!excluded_as_untrusted(
-            &entry,
-            McpAdmissionPolicy::default(),
-            &HashMap::new()
-        ));
+        assert!(protected_exclusion(&entry, McpAdmissionPolicy::default(), &HashMap::new()).is_none());
     }
 
     #[test]
     fn direct_entry_is_always_untrusted() {
-        let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
+        let mut policies = HashMap::new();
+        policies.insert("gw".to_owned(), ConnectorToolPolicy::ReadOnly);
+        assert_eq!(
+            tool_policy_for_entry(&direct_entry("srv"), &policies),
+            ConnectorToolPolicy::default()
         );
-        assert_eq!(trust_for_entry(&direct_entry("srv"), &trust), ConnectorTrust::default());
     }
 
     #[test]
-    fn unknown_connector_id_is_untrusted() {
-        let trust = HashMap::new();
+    fn unknown_connector_id_defaults_to_deny() {
+        let policies = HashMap::new();
         assert_eq!(
-            trust_for_entry(&connector_entry("srv", "missing"), &trust),
-            ConnectorTrust::default()
+            tool_policy_for_entry(&connector_entry("srv", "missing"), &policies),
+            ConnectorToolPolicy::default()
         );
     }
 
@@ -6463,7 +6457,7 @@ mod admission {
         let policy = McpAdmissionPolicy::default();
         let admitted = admit_tools(
             policy,
-            ConnectorTrust::default(),
+            ConnectorToolPolicy::default(),
             "srv",
             vec![tool("write_it", None)],
             &mut McpAdmissionDecisions::new(policy),
@@ -6478,7 +6472,7 @@ mod admission {
         let (tool_map, functions, decisions) = resolve(
             &direct_entry("srv"),
             vec![tool("read_it", None)],
-            protected(false),
+            protected(),
             &HashMap::new(),
         );
         assert!(tool_map.is_empty(), "denied tool must not enter the dispatch map");
@@ -6491,45 +6485,29 @@ mod admission {
     }
 
     #[test]
-    fn protected_catalog_trusted_connector_admits_with_identity_preserved() {
-        let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: false,
-            },
-        );
+    fn protected_allow_all_connector_admits_with_identity_preserved() {
+        let mut policies = HashMap::new();
+        policies.insert("gw".to_owned(), ConnectorToolPolicy::AllowAll);
         let def = tool("search", Some(json!({"readOnlyHint": true})));
-        let (tool_map, functions, decisions) = resolve(
-            &connector_entry("srv", "gw"),
-            vec![def.clone()],
-            protected(false),
-            &trust,
-        );
+        let (tool_map, functions, decisions) =
+            resolve(&connector_entry("srv", "gw"), vec![def.clone()], protected(), &policies);
         assert_eq!(functions.len(), 1, "admitted tool reaches the model");
         assert_eq!(
             functions[0]["name"], "srv__search",
             "tool identity preserved via encoded name"
         );
         assert!(tool_map.contains_key(&("srv".to_owned(), "search".to_owned())));
-        // Without read-only authority, no trusted read-only verdict is recorded.
+        // `allow_all` does not treat the server's readOnlyHint as an admission constraint.
         assert_eq!(
             decisions.verdict("srv", "search"),
-            Some(McpToolVerdict::Admitted { read_only: false })
+            Some(McpToolVerdict::Admitted(AdmissionBasis::AllowAll))
         );
     }
 
     #[test]
-    fn protected_require_read_only_admits_only_affirmative_trusted_tools() {
-        let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+    fn read_only_policy_admits_only_affirmative_tools() {
+        let mut policies = HashMap::new();
+        policies.insert("gw".to_owned(), ConnectorToolPolicy::ReadOnly);
         let tools = vec![
             tool("reader", Some(json!({"readOnlyHint": true}))),
             tool("writer", Some(json!({"readOnlyHint": false}))),
@@ -6539,7 +6517,7 @@ mod admission {
                 Some(json!({"readOnlyHint": true, "destructiveHint": true})),
             ),
         ];
-        let (tool_map, functions, decisions) = resolve(&connector_entry("srv", "gw"), tools, protected(true), &trust);
+        let (tool_map, functions, decisions) = resolve(&connector_entry("srv", "gw"), tools, protected(), &policies);
         assert_eq!(functions.len(), 1, "only the affirmative read-only tool is admitted");
         assert_eq!(functions[0]["name"], "srv__reader");
         assert!(tool_map.contains_key(&("srv".to_owned(), "reader".to_owned())));
@@ -6558,26 +6536,80 @@ mod admission {
     }
 
     #[test]
-    fn protected_require_read_only_denies_connector_without_read_only_authority() {
-        let mut trust = HashMap::new();
-        trust.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: false,
-            },
-        );
-        let (tool_map, functions, decisions) = resolve(
-            &connector_entry("srv", "gw"),
-            vec![tool("reader", Some(json!({"readOnlyHint": true})))],
-            protected(true),
-            &trust,
-        );
-        assert!(functions.is_empty());
-        assert!(tool_map.is_empty());
+    fn protected_exclusion_matches_connector_tool_policy() {
+        // Only `deny` excludes a connector before discovery. Both `allow_all`
+        // and `read_only` must discover the catalog; read-only filtering needs
+        // the server's tool annotations.
+        let connector = connector_entry("srv", "gw");
+        let with = |level: ConnectorToolPolicy| {
+            let mut policies = HashMap::new();
+            policies.insert("gw".to_owned(), level);
+            policies
+        };
+
+        // Advisory mode: never excluded without contact, any level.
+        for level in [
+            ConnectorToolPolicy::Deny,
+            ConnectorToolPolicy::AllowAll,
+            ConnectorToolPolicy::ReadOnly,
+        ] {
+            assert!(
+                protected_exclusion(&connector, McpAdmissionPolicy::default(), &with(level)).is_none(),
+                "advisory mode never excludes without contact"
+            );
+        }
+
         assert_eq!(
-            decisions.verdict("srv", "reader"),
-            Some(McpToolVerdict::Denied(McpDenyReason::NoReadOnlyAuthority))
+            protected_exclusion(&connector, protected(), &with(ConnectorToolPolicy::Deny)),
+            Some(McpDenyReason::UntrustedSource)
+        );
+        assert!(protected_exclusion(&connector, protected(), &with(ConnectorToolPolicy::AllowAll)).is_none());
+        assert!(protected_exclusion(&connector, protected(), &with(ConnectorToolPolicy::ReadOnly)).is_none());
+    }
+
+    #[test]
+    fn deferred_connector_queue_follows_tool_policy() {
+        // `collect_deferred_connectors` is the gate that keeps an excluded
+        // connector out of `openai_mcp_dispatch`'s deferred discovery, so dispatch
+        // never dials it. `deny` is excluded; the other policies need discovery.
+        let entry = json!({
+            "type": "mcp",
+            "server_label": "docs",
+            "connector_id": "gw",
+            "server_url": "https://gw.internal/mcp",
+            "defer_loading": true,
+        });
+        let queued = |level: ConnectorToolPolicy, policy: McpAdmissionPolicy| {
+            let mut policies = HashMap::new();
+            policies.insert("gw".to_owned(), level);
+            collect_deferred_connectors(
+                std::slice::from_ref(&entry),
+                Duration::from_secs(5),
+                128,
+                1 << 20,
+                &policies,
+                policy,
+            )
+        };
+
+        assert!(
+            queued(ConnectorToolPolicy::Deny, protected()).is_empty(),
+            "a denied connector is never queued in protected mode"
+        );
+        assert_eq!(
+            queued(ConnectorToolPolicy::AllowAll, protected()).len(),
+            1,
+            "allow_all connector is queued for discovery"
+        );
+        assert_eq!(
+            queued(ConnectorToolPolicy::ReadOnly, protected()).len(),
+            1,
+            "read_only connector is queued to inspect tool annotations"
+        );
+        assert_eq!(
+            queued(ConnectorToolPolicy::Deny, McpAdmissionPolicy::default()).len(),
+            1,
+            "advisory mode queues deferred connectors unchanged"
         );
     }
 
@@ -6590,8 +6622,7 @@ mod admission {
             "delete_all",
             Some(json!({"readOnlyHint": true, "praxis_admitted": true, "operator_read_only": true})),
         );
-        let (tool_map, functions, decisions) =
-            resolve(&direct_entry("srv"), vec![def], protected(true), &HashMap::new());
+        let (tool_map, functions, decisions) = resolve(&direct_entry("srv"), vec![def], protected(), &HashMap::new());
         assert!(functions.is_empty(), "forged markers cannot admit an untrusted tool");
         assert!(tool_map.is_empty());
         assert_eq!(
@@ -6601,29 +6632,23 @@ mod admission {
     }
 
     #[test]
-    fn two_connectors_same_url_do_not_share_trust() {
-        let mut trust = HashMap::new();
-        trust.insert(
-            "trusted".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
-        trust.insert("untrusted".to_owned(), ConnectorTrust::default());
+    fn two_connectors_same_url_do_not_share_policy() {
+        let mut policies = HashMap::new();
+        policies.insert("trusted".to_owned(), ConnectorToolPolicy::ReadOnly);
+        policies.insert("untrusted".to_owned(), ConnectorToolPolicy::default());
         let def = tool("search", Some(json!({"readOnlyHint": true})));
 
         let (trusted_map, trusted_fns, _) = resolve(
             &connector_entry("a", "trusted"),
             vec![def.clone()],
-            protected(true),
-            &trust,
+            protected(),
+            &policies,
         );
         assert_eq!(trusted_fns.len(), 1, "trusted connector admits its tool");
         assert!(trusted_map.contains_key(&("a".to_owned(), "search".to_owned())));
 
         let (untrusted_map, untrusted_fns, untrusted_decisions) =
-            resolve(&connector_entry("b", "untrusted"), vec![def], protected(true), &trust);
+            resolve(&connector_entry("b", "untrusted"), vec![def], protected(), &policies);
         assert!(
             untrusted_fns.is_empty(),
             "same URL via an untrusted connector gains no trust"
@@ -6636,33 +6661,23 @@ mod admission {
     }
 
     #[test]
-    fn trust_revocation_changes_verdict_on_the_next_request() {
+    fn policy_change_updates_verdict_on_the_next_request() {
         let def = tool("search", Some(json!({"readOnlyHint": true})));
         let mut trusted = HashMap::new();
-        trusted.insert(
-            "gw".to_owned(),
-            ConnectorTrust {
-                catalog: true,
-                read_only: true,
-            },
-        );
+        trusted.insert("gw".to_owned(), ConnectorToolPolicy::ReadOnly);
 
-        let (map_before, fns_before, _) = resolve(
-            &connector_entry("srv", "gw"),
-            vec![def.clone()],
-            protected(true),
-            &trusted,
-        );
+        let (map_before, fns_before, _) =
+            resolve(&connector_entry("srv", "gw"), vec![def.clone()], protected(), &trusted);
         assert_eq!(fns_before.len(), 1);
         assert!(map_before.contains_key(&("srv".to_owned(), "search".to_owned())));
 
-        // Operator revokes trust: a new request re-derives the verdict and denies.
+        // Operator removes the policy: a new request re-derives the verdict and denies.
         let revoked = HashMap::new();
         let (map_after, fns_after, decisions_after) =
-            resolve(&connector_entry("srv", "gw"), vec![def], protected(true), &revoked);
+            resolve(&connector_entry("srv", "gw"), vec![def], protected(), &revoked);
         assert!(
             fns_after.is_empty(),
-            "revoked trust denies the tool on the next request"
+            "removed policy denies the tool on the next request"
         );
         assert!(map_after.is_empty());
         assert_eq!(

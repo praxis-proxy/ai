@@ -166,7 +166,7 @@ fn reject_too_large_returns_413() {
 #[test]
 fn reject_file_url_blocked_returns_403() {
     let err = ResolveError::FileUrlBlocked {
-        label: "https://evil.example.com/file.pdf".to_owned(),
+        label: "PATH_SECRET".to_owned(),
     };
     let action = reject_resolve_error(&err);
     match action {
@@ -177,6 +177,10 @@ fn reject_file_url_blocked_returns_403() {
                 body.contains("blocked by security policy"),
                 "client response should describe the block reason"
             );
+            assert!(
+                !body.contains("PATH_SECRET"),
+                "client response must not expose the URL label"
+            );
         },
         _ => panic!("expected Reject action"),
     }
@@ -185,7 +189,7 @@ fn reject_file_url_blocked_returns_403() {
 #[test]
 fn reject_file_url_failed_returns_502() {
     let err = ResolveError::FileUrlFailed {
-        label: "https://files.example.com/report.pdf?token=[REDACTED]".to_owned(),
+        label: "PATH_SECRET".to_owned(),
         detail: "connection refused".to_owned(),
     };
     let action = reject_resolve_error(&err);
@@ -198,6 +202,10 @@ fn reject_file_url_failed_returns_502() {
                 "client response must not expose internal transport details"
             );
             assert!(body.contains("file URL"), "client response should identify a URL fetch");
+            assert!(
+                !body.contains("PATH_SECRET"),
+                "client response must not expose the URL label"
+            );
             assert!(
                 !body.contains("Files API"),
                 "URL fetch failures must not be described as Files API failures"
@@ -1586,7 +1594,8 @@ async fn file_url_truncated_body_reports_url_failure() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let stub_url = format!("http://{address}/file.txt?sig=secret");
+    let stub_url = format!("http://{address}/PATH_SECRET/file.txt?sig=QUERY_SECRET");
+    let expected_label = format!("http://{address}");
 
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -1613,8 +1622,7 @@ async fn file_url_truncated_body_reports_url_failure() {
 
     match result {
         Err(ResolveError::FileUrlFailed { label, .. }) => {
-            assert!(label.contains("[REDACTED]"), "signed query value should be redacted");
-            assert!(!label.contains("secret"), "signed query value must not be exposed");
+            assert_eq!(label, expected_label, "only the URL origin should be retained");
         },
         Err(other) => panic!("expected FileUrlFailed for a truncated URL body, got {other}"),
         Ok(_) => panic!("expected FileUrlFailed for a truncated URL body"),
@@ -1630,7 +1638,8 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let stub_url = format!("http://{address}/file.txt?sig=secret");
+    let stub_url = format!("http://{address}/PATH_SECRET/file.txt?sig=QUERY_SECRET");
+    let expected_reference = format!("http://{address}");
 
     let body = "X".repeat(100);
     std::thread::spawn(move || {
@@ -1658,11 +1667,7 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
     match result {
         Err(ResolveError::TooLarge { reference, limit }) => {
             assert_eq!(limit, 64, "error should report the configured resolved-body limit");
-            assert!(
-                reference.contains("[REDACTED]"),
-                "signed query value should be redacted"
-            );
-            assert!(!reference.contains("secret"), "signed query value must not be exposed");
+            assert_eq!(reference, expected_reference, "only the URL origin should be retained");
         },
         Err(other) => panic!("expected TooLarge for an oversized URL response, got {other}"),
         Ok(_) => panic!("expected TooLarge for an oversized URL response"),
@@ -2005,17 +2010,11 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
 }
 
 #[test]
-fn display_redacts_signed_file_url() {
+fn display_omits_file_url_path_and_query() {
     use crate::openai::responses::file_resolve::resolve::ReferenceSource;
 
-    let source = ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890");
+    let source =
+        ReferenceSource::FileUrl("https://storage.example.com/PATH_SECRET/file.pdf?sig=QUERY_SECRET&exp=1234567890");
     let displayed = format!("{source}");
-    assert!(
-        !displayed.contains("SECRET_TOKEN"),
-        "Display must not expose signed query parameters: {displayed}"
-    );
-    assert!(
-        displayed.contains("[REDACTED]"),
-        "query values should be redacted: {displayed}"
-    );
+    assert_eq!(displayed, "https://storage.example.com");
 }
