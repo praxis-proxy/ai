@@ -61,6 +61,8 @@ pub(crate) mod model_rewrite;
 /// Responses backend and restores the typed items on the response (#1131).
 #[cfg(feature = "openai-responses")]
 pub(crate) mod openai_client_tool_compat;
+#[cfg(any(test, feature = "bench-responses-state"))]
+pub mod rehydrate_benchmark;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod responses_proxy;
 #[cfg(feature = "openai-responses")]
@@ -85,6 +87,9 @@ pub(crate) mod usage;
 pub use agentic_loop::AgenticBudgetPolicy;
 #[cfg(feature = "openai-agentic-loop")]
 pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "bench-responses-state")]
+#[doc(hidden)]
+pub use rehydrate_benchmark as initialization_benchmark;
 
 /// Preflight a budgeted Responses body before the first JSON parser allocates.
 /// The same listener policy applies to every reachable loop instance.

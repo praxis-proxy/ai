@@ -86,36 +86,11 @@ fn compare_rehydrated_capture_allocations(body: Value) -> (u64, u64, u64, u64) {
     let legacy_raw = raw;
 
     let legacy = allocation_counter::measure(|| {
-        // Before the input split, state retained the parsed request body while
-        // normalization cloned its input; Store then parsed the raw body again.
-        let messages = MessageHistory::from(
-            legacy_body
-                .get("input")
-                .cloned()
-                .map(normalize_input_owned)
-                .unwrap_or_default(),
-        );
-        let mut state = ResponsesState {
-            input: messages.clone(),
-            input_form: InputForm::classify(legacy_body.get("input")),
-            messages: messages.clone(),
-            persisted_messages: messages,
-            request_body: legacy_body,
-            ..ResponsesState::default()
-        };
-        let stored = MessageHistory::from(legacy_stored);
-        state.messages.prepend_shared(replay_messages_from_stored(&stored));
-        state.persisted_messages.prepend_shared(stored);
-        state.history_rehydrated = true;
-
-        let mut store_body: Value = serde_json::from_slice(&legacy_raw).expect("parse Store's request snapshot");
-        let store_input = store_body.as_object_mut().and_then(|object| object.remove("input"));
-        std::hint::black_box((state, store_input));
+        super::super::rehydrate_benchmark::legacy(legacy_body, legacy_stored, &legacy_raw)
+            .expect("request fixture serialized as valid JSON");
     });
     let current = allocation_counter::measure(|| {
-        let state = build_state(current_body, current_stored, vec![], None);
-        let store_input = input_echo_value(&state);
-        std::hint::black_box((state, store_input));
+        super::super::rehydrate_benchmark::current(current_body, current_stored);
     });
     (
         legacy.bytes_total,

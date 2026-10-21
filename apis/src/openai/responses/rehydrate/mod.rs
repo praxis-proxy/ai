@@ -1430,7 +1430,7 @@ fn rehydrate_existing_state(
 
 /// Build [`ResponsesState`] from a freshly parsed body, prepending stored messages
 /// before the current input. Used when no managed owner built state upstream.
-fn build_state(
+pub(super) fn build_state(
     parsed_body: Value,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
@@ -1533,7 +1533,7 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 }
 
 /// Return stored items that should be replayed as backend request input.
-fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
+pub(super) fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
     let mut replay = MessageHistory::default();
     for item in stored.shared_items() {
         let is_locally_marked = item.get(LOCAL_COMPACTION_MARKER).and_then(Value::as_bool) == Some(true);
