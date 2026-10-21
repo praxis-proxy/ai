@@ -4,79 +4,56 @@
 # Demonstrates operator-owned metadata admission and read-only enforcement for
 # the `openai_mcp_tool_resolve` filter (issue #1724).
 #
-# MCP servers supply tool descriptions, schemas, and annotations. A
-# client-selected server is NOT an authority for its own safety claims, so its
-# `annotations.readOnlyHint` cannot establish a trusted read-only classification.
-# This example makes the trust contract explicit.
+# MCP servers supply tool descriptions, schemas, and annotations. In protected
+# mode, operators choose how each configured connector's tools are admitted.
 #
 # ## Advisory vs operator-enforced
 #
 # The standard client selector `allowed_tools.read_only` remains ADVISORY: it
 # filters using the server-supplied `readOnlyHint` and is preserved for API
 # compatibility. It is NOT an operator guarantee. Operator enforcement is
-# configured here under `tool_admission` and cannot be weakened by client fields,
-# tool descriptions, annotations, labels, or a matching URL.
+# configured under `tool_admission` and connector `tool_policy` fields. Client
+# fields cannot override the operator's selected policy.
 #
-# ## Trust contract
+# ## Connector policies
 #
 # `tool_admission.mode: protected` turns on operator enforcement. In protected
 # mode:
 #
-#   * A client-selected direct `server_url` is UNTRUSTED. Its tools are excluded
-#     from the model-visible set — a `readOnlyHint: true` claim cannot admit
-#     them. (Connector-only deployments can additionally reject direct targets
-#     outright; that switch is tracked separately.)
-#   * A connector is untrusted unless the operator declares a trust contract on
-#     it. `trust.catalog: true` makes the service authoritative for catalog
-#     admission (its tools are admitted without a per-tool digest). Merely
-#     configuring a connector endpoint does NOT grant trust.
-#   * `trust.read_only: true` makes the service authoritative for read-only
-#     CLASSIFICATION (its `readOnlyHint` is trusted). It is independent of
-#     catalog trust: declaring it alone grants no admission.
+#   * A client-selected direct `server_url` is denied. Its tools are excluded
+#     from the model-visible set, and the endpoint is not contacted.
+#   * A configured connector defaults to `tool_policy: deny`, which excludes it
+#     without contact.
+#   * `tool_policy: allow_all` admits every tool from that connector, including
+#     tools that write. The server's readOnlyHint does not restrict admission.
+#   * `tool_policy: read_only` admits only tools with `readOnlyHint: true` from
+#     that connector. Writable, missing, malformed, or contradictory hints are
+#     excluded.
 #
-# `tool_admission.require_read_only: true` is operator-enforced read-only: only
-# tools with a trusted AFFIRMATIVE read-only classification are admitted. A
-# trusted service reporting a tool as writable, or a missing / malformed /
-# conflicting classification, is excluded. Trusting the classification does not
-# waive this restriction. `require_read_only` requires `mode: protected`.
+# The tool service remains responsible for its catalog, authorization, and
+# actual side effects. A read_only policy depends on the service's classification;
+# preventing writes also requires service enforcement or appropriately scoped
+# credentials.
 #
-# ## Enforcement ownership and failure semantics
+# ## Declaring a connector
 #
-# Praxis does not duplicate a trusted gateway's catalog or per-call authorization
-# engine: the gateway remains responsible for those. Praxis enforces the operator
-# trust contract across fresh/deferred discovery, cached listings, and restored
-# conversations, and RE-ENFORCES eligibility at dispatch so a model-generated
-# call to an excluded tool cannot execute (it is rejected with zero `tools/call`
-# requests). A digest proves an unchanged definition; it does not prove the
-# implementation has no side effects. Actual read-only guarantees require
-# enforcement by the tool service or appropriately scoped credentials.
-#
-# ## Example requests
-#
-# ## Declaring a trusted gateway
-#
-# To make a secured MCP Gateway authoritative, add a connector with a scoped
-# trust declaration (see the `openai_mcp_tool_resolve` filter reference for the
-# full field list):
+# Add a connector and choose one policy:
 #
 #   connectors:
 #     - id: trusted_gateway
 #       server_url: https://gateway.internal/mcp
-#       trust:
-#         catalog: true     # admit its tools without a per-tool digest
-#         read_only: true   # honor its readOnlyHint as a trusted classification
+#       tool_policy: read_only
 #
-# A request then references it by `connector_id` instead of a direct `server_url`:
+# Requests reference it by `connector_id`:
 #   {"type": "mcp", "server_label": "docs", "connector_id": "trusted_gateway"}
 #
-# This example omits a live connector so it stays self-contained; the trusted
-# gateway path is exercised in the filter's integration tests.
+# This example omits a live connector so it stays self-contained; the configured
+# connector path is exercised in the filter's integration tests.
 #
 # ## Example request
 #
-#   # A client-selected direct URL is untrusted; its tools are excluded in
-#   # protected mode regardless of any readOnlyHint it advertises, and the
-#   # endpoint is not even contacted:
+#   # A client-selected direct URL is denied in protected mode; its endpoint is
+#   # not contacted and its advertised readOnlyHint cannot grant access:
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{
@@ -84,6 +61,16 @@
 #       "input": "hi",
 #       "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://unknown.example/mcp"}]
 #     }'
+#
+# ## Enforcement ownership and failure semantics
+#
+# Praxis applies the configured policy during fresh and deferred discovery,
+# cached listing reuse, and restored conversations. It checks the policy again
+# before dispatch, so a model-generated call to an excluded tool is rejected
+# without sending a `tools/call` request. The tool service remains responsible
+# for authorization and actual side effects; a read_only policy depends on its
+# classification, and preventing writes also requires service enforcement or
+# appropriately scoped credentials.
 #
 # Build:
 #   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
@@ -113,12 +100,9 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
         # Operator-owned metadata admission. Defaults to advisory; protected mode
-        # excludes untrusted targets and enforces trusted read-only
-        # classification. Declare trusted connectors under `connectors` (see the
-        # trust snippet in the header comment).
+        # enforces each connector's configured tool_policy (default: deny).
         tool_admission:
           mode: protected
-          require_read_only: true
 
       - filter: openai_responses_proxy
         name: inference

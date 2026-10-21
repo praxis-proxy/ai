@@ -258,6 +258,7 @@ fn reject_unsafe_promotion_target(
 mod tests {
     use super::*;
 
+    /// Checks field-value byte acceptance against HTTP's rule in RFC 9110 §5.5.
     #[test]
     fn byte_scan_matches_header_value_parse_for_every_byte() {
         for byte in 0_u8..=255 {

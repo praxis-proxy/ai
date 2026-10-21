@@ -44,6 +44,15 @@ pub struct ResponseRecord {
     pub messages: serde_json::Value,
 }
 
+/// A Store record admitted against the caller's retained-payload allowance.
+#[derive(Clone, Debug)]
+pub struct BudgetedRecord<T> {
+    /// Decoded record.
+    pub record: T,
+    /// Byte-and-structure allowance measured before JSON tree construction.
+    pub charge_bytes: usize,
+}
+
 // -----------------------------------------------------------------------------
 // ConversationRecord
 // -----------------------------------------------------------------------------

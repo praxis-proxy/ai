@@ -53,6 +53,7 @@ backend can serve the same client.
 | **OpenCode** | native | Chat Completions passed through | `/v1/chat/completions` |
 | **OpenAI Agents SDK** | native | SDK-owned tool loop over Responses | `/v1/responses` |
 | **OpenAI SDK (Responses)** | native | Responses SDK suite, SDK **2.x and 3.x** | `/v1/responses` |
+| **OpenAI SDK (Chat Completions)** | translated (selected provider) | `openai_chat_completions_to_anthropic[_stream]` | `/v1/messages` |
 
 Details per use case:
 
@@ -77,6 +78,18 @@ Details per use case:
   against both major SDK generations to catch protocol drift. Tests marked
   `real_inference` / `vllm_compat` run only in live (GPU) mode; the same tests
   run on PRs against the CPU simulator (`VLLM_TEST_BACKEND=simulator`).
+- **OpenAI SDK (Chat Completions) — selected-provider translation.** An official
+  OpenAI Chat Completions client is routed by `intelligent_route` to a selected
+  Anthropic candidate and translated via
+  `openai_chat_completions_to_anthropic[_stream]` to vLLM's native `/v1/messages`,
+  then back to OpenAI shape — real-model coverage for the translation shipped in
+  PR #1736 (JSON, streaming, tool round-trip). Because a `messages` provider's
+  overlay credential is `apikey`-only while keyed vLLM wants `Authorization:
+  Bearer`, the backend bearer is injected by the core `credential_injection`
+  filter (as in `messages-native-vllm.yaml`); the selected-provider `x-api-key`
+  credential path stays covered by the deterministic per-PR lane
+  `integration.yaml::selected-anthropic-sdk`. Test:
+  `test_selected_anthropic_chat_completions_vllm.py`.
 - **CLI self-compaction (Codex + Claude Code).** Two acceptance tests prove a
   real pinned CLI grows its context past its own window, performs its **own**
   self-compaction, and keeps working through Praxis afterward — without ever
@@ -227,7 +240,10 @@ for a pulled image.
   store.
 - `vllm-gpu-claude-acceptance` — pinned Claude Code over native + translated
   Anthropic paths (acceptEdits + auto mode), including the #1418 planning-turn
-  regression guard, in a locked-down network namespace.
+  regression guard, in a locked-down network namespace. Also runs the
+  selected-provider OpenAI-chat → `/v1/messages` translation lane host-side
+  against the same keyed vLLM (step `selected_anthropic_openai_chat`, captured in
+  the `claude_acceptance` qualification suite).
 - `vllm-gpu-codex-acceptance` — pinned Codex over native Responses + translated
   Chat paths.
 - `vllm-gpu-opencode-acceptance` — pinned OpenCode over the native Chat
@@ -253,6 +269,11 @@ carry the detail.
   SDK → Praxis → real vLLM Messages acceptance.
 - `tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py` — Anthropic
   web search.
+- `tests/integration/sdk/openai/test_selected_anthropic_chat_completions_vllm.py`
+  — OpenAI Chat client → `intelligent_route`-selected Anthropic candidate →
+  `openai_chat_completions_to_anthropic[_stream]` → real vLLM `/v1/messages`.
+  Includes a deterministic overlay-digest check and a scripted-backend
+  credential-shim test that run without a GPU.
 - `tests/integration/tests/suite/claude_code_vllm.rs` — Claude Code acceptance
   (native vs transformed path diagram, scenarios incl. #1418).
 - `tests/integration/tests/suite/codex_http.rs` — Codex acceptance + pin-update

@@ -111,14 +111,14 @@ pub(super) struct AgenticLoopConfig {
     /// translation reserves its additional request and response JSON owners
     /// before allocating them. Streaming reserves raw chunks, parsed frames,
     /// terminal output, and separately retained tool results. When a create
-    /// restores history, Store reads are capped before decoding. The decoded
-    /// record, replay, and replacement state are charged at 256
-    /// times the stored record's serialized bytes. Conversation append-back
-    /// uses a transactional bounded cache rebuild. The listener also clamps
-    /// its raw request body limit to at most one
+    /// restores history, Store reads are capped before decoding; stored JSON
+    /// is charged once at 32 times its serialized bytes plus 8 `KiB` per
+    /// JSON node. Conversation append-back charges new items and any one-time
+    /// legacy-prefix migration; existing item rows are not reread or recharged.
+    /// The listener also clamps its raw request body limit to at most one
     /// thirty-second of this ceiling and its buffered IRR response limit to
-    /// at most one eighth. These reserves can
-    /// reject a request well below the configured ceiling. Budgeted MCP calls
+    /// at most one eighth. These reserves can reject a request well below the
+    /// configured ceiling. Budgeted MCP calls
     /// use fresh sessions so each call applies its current transport limit.
     /// Initial budget overflow returns HTTP 413; buffered provider overflow
     /// returns HTTP 502; a committed stream emits one SSE error on overflow.

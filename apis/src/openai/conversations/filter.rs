@@ -9,8 +9,6 @@
 //! The `ai_operation` filter must run earlier in the same chain. Its typed
 //! match is the sole runtime authority for Conversations dispatch.
 
-use std::io;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -42,7 +40,7 @@ use crate::{
     operation_classifier::AiOperationMatch,
     service::conversations::build_item_records,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseStoreRegistry, StoreError},
+    store::{OwnerScopedResponseStore, ResponseStoreRegistry, StoreError, json_values_charge},
 };
 
 // -----------------------------------------------------------------------------
@@ -369,14 +367,20 @@ impl OpenaiConversationsFilter {
         conversation_id: &str,
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
-        max_rebuild_bytes: Option<usize>,
+        max_append_charge_bytes: Option<usize>,
     ) -> Result<(), FilterError> {
         let store = resolve_store(ctx, owner)
             .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
 
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| {
-            handle.block_on(persist_items(&store, conversation_id, ctx, items, max_rebuild_bytes))
+            handle.block_on(persist_items(
+                &store,
+                conversation_id,
+                ctx,
+                items,
+                max_append_charge_bytes,
+            ))
         })
     }
 }
@@ -596,7 +600,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let max_rebuild_bytes = match reserve_budgeted_append(ctx, body) {
+        let max_append_charge_bytes = match reserve_budgeted_append(ctx, body) {
             Ok(limit) => limit,
             Err(error) if streaming => {
                 return replace_stream_completion_with_error(ctx, body, error.code(), error.message());
@@ -623,11 +627,13 @@ impl HttpFilter for OpenaiConversationsFilter {
         // return a clean 500 if headers are unflushed, or reset a committed 2xx.
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
         // the pipeline logs this error and releases the terminal even though
-        // items were lost. Item insertion and cache rebuild are transactional.
+        // items were lost. Item insertion and any legacy-prefix migration are
+        // transactional.
         if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
             state.append_attempted = true;
         }
-        if let Err(error) = Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items, max_rebuild_bytes)
+        if let Err(error) =
+            Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items, max_append_charge_bytes)
         {
             warn!(error = %error, conversation_id = %conv_id, "conversation append-back failed");
             if error
@@ -715,13 +721,16 @@ fn reserve_budgeted_append(
     let Some(bytes) = body.as_deref() else {
         return Err(AppendBudgetError::Exceeded);
     };
-    let input_bytes = ctx
+    let current_input_charge = ctx
         .extensions
         .get::<ResponsesState>()
         .ok_or(AppendBudgetError::Missing)
-        .and_then(|state| json_size(&state.input).ok_or(AppendBudgetError::Exceeded))?;
+        .and_then(|state| {
+            json_values_charge(state.input.iter(), &[], usize::MAX)
+                .map_err(|_charge_overflow| AppendBudgetError::Exceeded)
+        })?;
     let item_charge = input_charge(bytes)
-        .and_then(|charge| input_bytes.checked_mul(512).and_then(|input| charge.checked_add(input)))
+        .and_then(|charge| charge.checked_add(current_input_charge))
         .ok_or(AppendBudgetError::Exceeded)?;
     let budget = ctx
         .extensions
@@ -736,27 +745,6 @@ fn reserve_budgeted_append(
         return Err(AppendBudgetError::Exceeded);
     }
     Ok(Some(cache_allowance))
-}
-
-/// Count a borrowed JSON value without materializing another payload copy.
-fn json_size(value: &impl serde::Serialize) -> Option<usize> {
-    struct Counter(usize);
-    impl io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(buf.len())
-                .ok_or_else(|| io::Error::other("JSON size overflow"))?;
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
 }
 
 /// Return a client-visible size failure before append-back allocates items.
@@ -962,7 +950,7 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Result
     Ok(Some(all_items))
 }
 
-/// Persist items and refresh the denormalized message cache.
+/// Persist items and preserve a cache-only legacy prefix when required.
 ///
 /// Records are built with the handle's bound owner, so the owner-scoped write
 /// path accepts them; a record under any other owner would be rejected.
@@ -971,7 +959,7 @@ async fn persist_items(
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
-    max_rebuild_bytes: Option<usize>,
+    max_append_charge_bytes: Option<usize>,
 ) -> Result<(), FilterError> {
     let created_at = handlers::current_timestamp(ctx);
 
@@ -985,7 +973,7 @@ async fn persist_items(
     }
 
     let count = records.len();
-    let result = if let Some(limit) = max_rebuild_bytes {
+    let result = if let Some(limit) = max_append_charge_bytes {
         store
             .create_items_and_sync_messages_bounded(conversation_id, &records, limit)
             .await

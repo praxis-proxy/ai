@@ -633,7 +633,15 @@ fn reserve_client_tool_lowering(state: &mut ResponsesState) -> bool {
         |echo| Some(&echo.tools),
     );
     let has_rich = request_has_rich_client_tool(state);
-    let has_typed_history = state.messages.iter().any(is_typed_client_tool_history);
+    // Charge exactly the history entries `lower_history_items` rewrites: a plain
+    // (non-namespaced, server-owned) `function_call`, or a container/server-owned
+    // `shell_call`/`tool_search_call` and its output, is never lowered and so
+    // creates no owned copy to reserve.
+    let lowered_call_ids = client_executed_call_ids(state.messages.iter());
+    let has_typed_history = state
+        .messages
+        .iter()
+        .any(|item| history_item_is_lowered(item, &lowered_call_ids));
     if !has_rich && !has_typed_history {
         return true;
     }
@@ -647,7 +655,7 @@ fn reserve_client_tool_lowering(state: &mut ResponsesState) -> bool {
                 .checked_add(namespace_fanout_charge(tool)?)?;
         }
         for item in &state.messages {
-            if is_typed_client_tool_history(item) {
+            if history_item_is_lowered(item, &lowered_call_ids) {
                 total = total
                     .checked_add(retained_value_charge(item)?)?
                     .checked_add(LOWERING_ITEM_RESERVE)?;
@@ -709,20 +717,24 @@ fn namespace_fanout_charge(tool: &Value) -> Option<usize> {
     header.checked_mul(members)?.checked_mul(LOWERING_SOURCE_MULTIPLIER)
 }
 
-/// Identify history entries that may create new owned lowered payloads.
-fn is_typed_client_tool_history(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some(
-            "custom_tool_call"
-                | "custom_tool_call_output"
-                | "shell_call"
-                | "shell_call_output"
-                | "tool_search_call"
-                | "tool_search_output"
-                | "function_call"
-        )
-    )
+/// Identify the history entries [`lower_history_items`] rewrites into newly owned
+/// lowered payloads, so the budget reserves exactly the copies lowering creates.
+///
+/// This is the single predicate both the lowering pass and its budget reservation
+/// consult, so a charge can never be reserved for an item that is left untouched
+/// (a plain `function_call`, or a container/server-owned `shell_call`/
+/// `tool_search_call` and its output), nor skipped for one that is lowered.
+fn history_item_is_lowered(item: &Value, lowered_call_ids: &HashSet<String>) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("custom_tool_call" | "custom_tool_call_output") => true,
+        Some("shell_call" | "tool_search_call") => is_client_executed_tool_call(item),
+        Some("shell_call_output" | "tool_search_output") => output_call_was_lowered(item, lowered_call_ids),
+        Some("function_call") => item
+            .get("namespace")
+            .and_then(Value::as_str)
+            .is_some_and(|namespace| !namespace.is_empty()),
+        _ => false,
+    }
 }
 
 /// Buffering is already capped at the listener before this callback. Reserve
@@ -2360,16 +2372,7 @@ fn lower_history_items(messages: &mut super::history::MessageHistory) -> Result<
     for index in 0..messages.len() {
         let needs_lowering = messages
             .get(index)
-            .is_some_and(|item| match item.get("type").and_then(Value::as_str) {
-                Some("custom_tool_call" | "custom_tool_call_output") => true,
-                Some("shell_call" | "tool_search_call") => is_client_executed_tool_call(item),
-                Some("shell_call_output" | "tool_search_output") => output_call_was_lowered(item, &lowered_call_ids),
-                Some("function_call") => item
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .is_some_and(|namespace| !namespace.is_empty()),
-                _ => false,
-            });
+            .is_some_and(|item| history_item_is_lowered(item, &lowered_call_ids));
         if needs_lowering && let Some(item) = messages.get_mut(index) {
             changed |= lower_history_item(item, &lowered_call_ids);
         }

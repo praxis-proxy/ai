@@ -109,7 +109,8 @@ filter_chains:
               # chat path (or the native Anthropic response on the native path).
               - filter: anthropic_web_search
                 provider: tavily
-                api_key: ${WEB_SEARCH_API_KEY}
+                api_key:
+                  env_var: WEB_SEARCH_API_KEY
                 default_context_size: medium
                 timeout_ms: 10000
 

@@ -437,6 +437,8 @@ fn usage_event_has_correct_structure() {
     assert_eq!(event["data"]["reasoning_tokens"], 30);
     assert_eq!(event["data"]["duration_ms"], 500);
     assert_eq!(event["data"]["model"], "gpt-4");
+    assert_eq!(event["data"]["organization_id"], "org-1");
+    assert_eq!(event["data"]["cost_center"], "cc-42");
 }
 
 #[test]
@@ -498,6 +500,30 @@ fn error_event_has_correct_structure() {
     assert_eq!(event["type"], CE_TYPE_ERROR);
     assert_eq!(event["data"]["status_code"], 500);
     assert_eq!(event["data"]["user"], "testuser");
+    assert_eq!(event["data"]["organization_id"], "org-1");
+    assert_eq!(event["data"]["cost_center"], "cc-42");
+}
+
+#[test]
+fn absent_organization_and_cost_center_emit_empty_strings() {
+    let mut state = state_for("testuser", "gpt-4");
+    state.organization_id.clear();
+    state.cost_center.clear();
+
+    let event = build_usage_event(
+        &event_ctx("evt-empty", &state),
+        &TokenCounts {
+            input: 1,
+            output: 1,
+            total: 2,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        },
+    );
+
+    assert_eq!(event["data"]["organization_id"], "");
+    assert_eq!(event["data"]["cost_center"], "");
 }
 
 // -----------------------------------------------------------------------------
@@ -511,6 +537,8 @@ fn captures_tenant_headers_with_default_prefix() {
     req.headers.insert("x-tenant-group", "engineering".parse().unwrap());
     req.headers.insert("x-tenant-subscription", "sub-42".parse().unwrap());
     req.headers.insert("x-tenant-model", "gpt-4".parse().unwrap());
+    req.headers.insert("x-tenant-organization-id", "org-9".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
     let state = capture_identity(&mut ctx, "x-tenant-", "identity");
@@ -519,6 +547,8 @@ fn captures_tenant_headers_with_default_prefix() {
     assert_eq!(state.group, "engineering");
     assert_eq!(state.subscription, "sub-42");
     assert_eq!(state.model, "gpt-4");
+    assert_eq!(state.organization_id, "org-9");
+    assert_eq!(state.cost_center, "cc-7");
 }
 
 #[test]
@@ -526,12 +556,16 @@ fn strips_identity_and_auth_headers() {
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers.insert("x-tenant-username", "alice".parse().unwrap());
     req.headers.insert("authorization", "Bearer sk-test".parse().unwrap());
+    req.headers.insert("x-tenant-organization-id", "org-9".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
     let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"x-tenant-username"));
+    assert!(removed.contains(&"x-tenant-organization-id"));
+    assert!(removed.contains(&"x-tenant-cost-center"));
     assert!(removed.contains(&"authorization"));
     assert!(removed.contains(&"x-api-key"));
 }
@@ -590,6 +624,29 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
         "forged model must be ignored when identity is verified: {}",
         state.model
     );
+}
+
+#[test]
+fn verified_billing_identity_ignores_forged_org_and_cost_center() {
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-organization-id", "org-forged".parse().unwrap());
+    req.headers.insert("x-tenant-cost-center", "cc-forged".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());
+    ctx.filter_metadata
+        .insert("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned());
+    ctx.filter_metadata
+        .insert("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
+
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+
+    assert_eq!(state.organization_id, "org-verified");
+    assert_eq!(state.cost_center, "cc-verified");
 }
 
 #[test]
@@ -910,6 +967,202 @@ fn response_body_without_state_is_noop() {
     assert!(matches!(action, FilterAction::Continue));
 }
 
+// -----------------------------------------------------------------------------
+// Internal Auth Token (issue #1721)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn internal_auth_token_value_builds_authenticated_filter() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  value: mtoken\n");
+    assert!(
+        filter.auth_token.is_some(),
+        "a configured internal_auth_token must publish an auth handle"
+    );
+}
+
+#[test]
+fn no_internal_auth_token_leaves_callouts_unauthenticated() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
+    assert!(filter.auth_token.is_none());
+    assert!(
+        matches!(filter.auth_header(), AuthOutcome::Unauthenticated),
+        "omitting internal_auth_token must resolve to Unauthenticated (unchanged legacy behavior)"
+    );
+}
+
+#[test]
+fn internal_auth_token_resolves_to_sensitive_bearer_header() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  value: mtoken\n");
+    let AuthOutcome::Header(value) = filter.auth_header() else {
+        panic!("a configured token must resolve to an authenticated header outcome");
+    };
+    assert_eq!(value.to_str().unwrap(), "Bearer mtoken");
+    assert!(
+        value.is_sensitive(),
+        "the Authorization header must be marked sensitive so it is never logged"
+    );
+}
+
+#[test]
+fn auth_outcome_from_missing_payload_fails_closed() {
+    // A post-startup rotation gap publishes a None payload; the callout must
+    // not be sent unauthenticated.
+    assert!(matches!(auth_outcome_from_payload(None), AuthOutcome::Unavailable));
+}
+
+#[test]
+fn auth_outcome_from_payload_builds_sensitive_header() {
+    let AuthOutcome::Header(value) = auth_outcome_from_payload(Some("Bearer tok")) else {
+        panic!("a valid payload must resolve to a header");
+    };
+    assert_eq!(value.to_str().unwrap(), "Bearer tok");
+    assert!(value.is_sensitive());
+}
+
+#[test]
+fn auth_outcome_from_invalid_payload_fails_closed() {
+    // A payload that cannot form a legal header value fails closed rather than
+    // panicking or sending garbage (defense in depth; the transform already
+    // validates at publication).
+    assert!(matches!(
+        auth_outcome_from_payload(Some("bad\nvalue")),
+        AuthOutcome::Unavailable
+    ));
+}
+
+#[test]
+fn authed_headers_unauthenticated_sends_no_authorization() {
+    let headers = authed_headers(AuthOutcome::Unauthenticated).expect("unauthenticated must not fail closed");
+    assert!(headers.is_empty());
+}
+
+#[test]
+fn authed_headers_attaches_authorization() {
+    let value = http::HeaderValue::from_static("Bearer tok");
+    let headers = authed_headers(AuthOutcome::Header(value)).expect("an available token must not fail closed");
+    assert_eq!(headers.get(http::header::AUTHORIZATION).unwrap(), "Bearer tok");
+}
+
+#[test]
+fn authed_headers_unavailable_fails_closed() {
+    assert!(
+        authed_headers(AuthOutcome::Unavailable).is_none(),
+        "an unavailable token must fail the callout closed (no unauthenticated send)"
+    );
+}
+
+#[test]
+fn balance_callout_fail_open_admits_on_unavailable_token() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\nfail_open: true\n");
+    assert!(
+        matches!(
+            filter.balance_callout_headers(AuthOutcome::Unavailable),
+            Err(FilterAction::Continue)
+        ),
+        "a token gap must not send an unauthenticated balance callout; fail_open then admits"
+    );
+}
+
+#[test]
+fn balance_callout_fail_closed_rejects_on_unavailable_token() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\nfail_open: false\n");
+    assert!(
+        matches!(
+            filter.balance_callout_headers(AuthOutcome::Unavailable),
+            Err(FilterAction::Reject(_))
+        ),
+        "a token gap must not send an unauthenticated balance callout; fail_closed then rejects"
+    );
+}
+
+#[test]
+fn balance_callout_attaches_authorization_when_available() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
+    match filter.balance_callout_headers(AuthOutcome::Header(http::HeaderValue::from_static("Bearer tok"))) {
+        Ok(headers) => assert_eq!(headers.get(http::header::AUTHORIZATION).unwrap(), "Bearer tok"),
+        Err(_) => panic!("an available token must produce authenticated balance headers"),
+    }
+}
+
+#[test]
+fn balance_callout_unauthenticated_when_no_token() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
+    match filter.balance_callout_headers(AuthOutcome::Unauthenticated) {
+        Ok(headers) => assert!(
+            headers.is_empty(),
+            "no token configured must send an unauthenticated callout"
+        ),
+        Err(_) => panic!("no token configured must not fail closed"),
+    }
+}
+
+#[test]
+fn report_callout_drops_on_unavailable_token() {
+    assert!(
+        report_callout_headers(AuthOutcome::Unavailable).is_none(),
+        "a token gap must drop the usage report rather than send it unauthenticated"
+    );
+}
+
+#[test]
+fn report_callout_attaches_authorization_when_available() {
+    match report_callout_headers(AuthOutcome::Header(http::HeaderValue::from_static("Bearer tok"))) {
+        Some(headers) => assert_eq!(headers.get(http::header::AUTHORIZATION).unwrap(), "Bearer tok"),
+        None => panic!("an available token must produce authenticated usage-report headers"),
+    }
+}
+
+#[test]
+fn internal_auth_token_empty_value_fails_build() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  value: \"\"\n").unwrap();
+    assert!(
+        ExternalMeteringFilter::from_config(&yaml).is_err(),
+        "an empty internal_auth_token must fail loud at startup"
+    );
+}
+
+#[test]
+fn internal_auth_token_invalid_header_value_fails_build() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  value: \"bad\\nvalue\"\n",
+    )
+    .unwrap();
+    assert!(
+        ExternalMeteringFilter::from_config(&yaml).is_err(),
+        "a token that cannot form a legal header value must fail at startup"
+    );
+}
+
+#[test]
+fn internal_auth_token_missing_file_fails_build() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  file: \"/nonexistent/praxis-metering-token-xyz\"\n",
+    )
+    .unwrap();
+    assert!(
+        ExternalMeteringFilter::from_config(&yaml).is_err(),
+        "an unreadable token file must fail loud at startup"
+    );
+}
+
+#[test]
+fn internal_auth_token_debug_redacts_inline_value() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("metering_url: \"http://metering:8080\"\ninternal_auth_token:\n  value: top-secret-xyz\n")
+            .unwrap();
+    let cfg = parse_filter_config::<ExternalMeteringConfig>("external_metering", &yaml).unwrap();
+    let rendered = format!("{cfg:?}");
+    assert!(
+        !rendered.contains("top-secret-xyz"),
+        "config Debug must not leak the inline token: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "config Debug must redact the inline token: {rendered}"
+    );
+}
+
 fn event_ctx<'a>(event_id: &'a str, state: &'a MeteringState) -> EventContext<'a> {
     EventContext {
         duration_ms: 500,
@@ -925,6 +1178,8 @@ fn state_for(username: &str, model: &str) -> MeteringState {
         username: username.into(),
         group: "engineering".into(),
         subscription: "sub-1".into(),
+        organization_id: "org-1".into(),
+        cost_center: "cc-42".into(),
         model: model.into(),
         user_agent: "test/1.0".into(),
         request_start: std::time::Instant::now(),

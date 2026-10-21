@@ -134,6 +134,8 @@ fn external_metering_strips_tenant_and_auth_headers() {
          Host: localhost\r\n\
          x-tenant-username: alice\r\n\
          x-tenant-group: engineering\r\n\
+         x-tenant-organization-id: org-9\r\n\
+         x-tenant-cost-center: cc-7\r\n\
          Authorization: Bearer sk-client-secret\r\n\
          x-api-key: client-key\r\n\
          Connection: close\r\n\r\n",
@@ -145,6 +147,8 @@ fn external_metering_strips_tenant_and_auth_headers() {
         !body.contains("x-tenant-username"),
         "tenant header should be stripped from upstream: {body}"
     );
+    assert!(!body.contains("x-tenant-organization-id") && !body.contains("org-9"));
+    assert!(!body.contains("x-tenant-cost-center") && !body.contains("cc-7"));
     assert!(
         !body.contains("sk-client-secret"),
         "authorization should be stripped from upstream: {body}"
@@ -193,6 +197,8 @@ fn external_metering_event_carries_provider_and_reasoning_tokens() {
          Host: localhost\r\n\
          x-tenant-username: alice\r\n\
          x-tenant-group: engineering\r\n\
+         x-tenant-organization-id: org-9\r\n\
+         x-tenant-cost-center: cc-7\r\n\
          Content-Type: application/json\r\n\
          Content-Length: 2\r\n\
          Connection: close\r\n\r\n{}",
@@ -219,6 +225,8 @@ fn external_metering_event_carries_provider_and_reasoning_tokens() {
     assert_eq!(json["data"]["completion_tokens"], 90);
     assert_eq!(json["data"]["prompt_tokens"], 10);
     assert_eq!(json["data"]["user"], "alice");
+    assert_eq!(json["data"]["organization_id"], "org-9");
+    assert_eq!(json["data"]["cost_center"], "cc-7");
 }
 
 /// Poll the metering mock until the fire-and-forget usage report POST

@@ -17,7 +17,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
 | `user_credential` | string | no | Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]). |
-| `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
+| `api_key` | CredentialSource | yes | API key credential source for the search provider: exactly one of `value`, `env_var`, or `file`; see [`CredentialSource`]. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `max_calls_per_round` | integer | no | Hard cap on web-search calls processed from one model response (1..=1024; default: 32). |
@@ -31,7 +31,8 @@ Each provider request is executed through the shared filtered-subrequest executo
 ```yaml
 filter: openai_web_search_dispatch
 provider: brave
-api_key: ${WEB_SEARCH_API_KEY}
+api_key:
+  env_var: WEB_SEARCH_API_KEY
 ```
 
 ### Example 2
@@ -39,7 +40,8 @@ api_key: ${WEB_SEARCH_API_KEY}
 ```yaml
 filter: openai_web_search_dispatch
 provider: brave
-api_key: ${WEB_SEARCH_API_KEY}
+api_key:
+  env_var: WEB_SEARCH_API_KEY
 outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000

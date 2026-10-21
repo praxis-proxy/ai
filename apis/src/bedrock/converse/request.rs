@@ -85,37 +85,38 @@ pub(crate) struct TransformResult {
 /// Returns `Err(message)` when the request is malformed or cannot be
 /// represented by Bedrock Converse.
 pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let mut obj: Map<String, Value> = match serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))? {
+        Value::Object(map) => map,
+        _ => return Err("request body is not a JSON object".to_owned()),
+    };
 
-    let obj = value.as_object().ok_or("request body is not a JSON object")?;
     obj.get("messages")
         .and_then(Value::as_array)
         .ok_or("missing required array field `messages`")?;
-    let stream = optional_bool(obj, "stream")?.unwrap_or(false);
-    let include_usage = validate_request_semantics(obj, stream)?;
+    let stream = optional_bool(&obj, "stream")?.unwrap_or(false);
+    let include_usage = validate_request_semantics(&obj, stream)?;
 
-    let model = extract_model_id(obj)?;
+    let model = extract_model_id(&obj)?;
 
     let mut converse: Map<String, Value> = Map::new();
 
-    // Collect system/developer prompts into the top-level `system` array.
-    let system_parts = collect_system_parts(obj)?;
+    // Split the message array in one consuming pass: system/developer
+    // content is hoisted to the top-level `system` array and the remaining
+    // roles become Converse `messages`, moving values instead of copying.
+    let (system_parts, translated) = translate_messages(&mut obj)?;
     if !system_parts.is_empty() {
         converse.insert("system".to_owned(), Value::Array(system_parts));
     }
-
-    // Translate the message array.
-    let messages = translate_messages(obj)?;
-    converse.insert("messages".to_owned(), Value::Array(messages));
+    converse.insert("messages".to_owned(), Value::Array(translated));
 
     // Inference parameters.
-    let inference_config = build_inference_config(obj)?;
+    let inference_config = build_inference_config(&mut obj)?;
     if !inference_config.is_empty() {
         converse.insert("inferenceConfig".to_owned(), Value::Object(inference_config));
     }
 
     // Tool configuration.
-    if let Some(tool_config) = build_tool_config(obj)? {
+    if let Some(tool_config) = build_tool_config(&mut obj)? {
         converse.insert("toolConfig".to_owned(), tool_config);
     }
 
@@ -255,70 +256,47 @@ fn validate_model_id_for_path(model: &str) -> Result<(), String> {
 }
 
 // -----------------------------------------------------------------------------
-// System message extraction
-// -----------------------------------------------------------------------------
-
-/// Collect all `system` and `developer` role messages from the Chat
-/// Completions message array into Bedrock `system` content blocks.
-///
-/// Bedrock places system context in a top-level `system` array rather
-/// than inline in the `messages` array.
-fn collect_system_parts(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
-    let Some(messages) = obj.get("messages").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-
-    let mut parts = Vec::new();
-    for msg in messages {
-        let Some(role) = msg.get("role").and_then(Value::as_str) else {
-            continue;
-        };
-        if role == "system" || role == "developer" {
-            let content = msg
-                .get("content")
-                .ok_or_else(|| format!("{role} message is missing `content`"))?;
-            append_system_content(&mut parts, content, role)?;
-        }
-    }
-    Ok(parts)
-}
-
-/// Append one system/developer message without dropping multipart text.
-fn append_system_content(parts: &mut Vec<Value>, content: &Value, role: &str) -> Result<(), String> {
-    match content {
-        Value::String(text) => parts.push(serde_json::json!({"text": text})),
-        Value::Array(content_parts) => {
-            for part in content_parts {
-                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
-                if part_type != "text" {
-                    return Err(format!("unsupported {role} content part type `{part_type}`"));
-                }
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| format!("{role} text content part is missing `text`"))?;
-                parts.push(serde_json::json!({"text": text}));
-            }
-        },
-        _ => return Err(format!("{role} message `content` must be a string or array")),
-    }
-    Ok(())
-}
-
-// -----------------------------------------------------------------------------
 // Message translation
 // -----------------------------------------------------------------------------
 
 /// Translate the Chat Completions `messages` array into Bedrock Converse
-/// `messages`, skipping `system` and `developer` roles (handled separately).
-fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
-    let messages = obj
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or("missing required array field `messages`")?;
+/// `messages`, hoisting `system` and `developer` roles into a top-level
+/// `system` parts array.
+///
+/// The messages are consumed in place: text payloads are moved into the
+/// translated blocks rather than copied. System/developer content is
+/// extracted first so malformed system content is reported before any
+/// other message translation error, matching the original two-pass order.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two passes over one array (system hoisting, then role translation); splitting would duplicate the walking logic"
+)]
+fn translate_messages(obj: &mut Map<String, Value>) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let Value::Array(mut messages) = obj
+        .remove("messages")
+        .ok_or("missing required array field `messages`")?
+    else {
+        return Err("missing required array field `messages`".to_owned());
+    };
+    let mut system_parts = Vec::new();
 
+    // Pass 1: hoist system/developer content, taking each payload by value.
+    for msg in &mut messages {
+        let is_system = msg.get("role").and_then(Value::as_str) == Some("system");
+        let is_developer = msg.get("role").and_then(Value::as_str) == Some("developer");
+        if !is_system && !is_developer {
+            continue;
+        }
+        let role = if is_developer { "developer" } else { "system" };
+        let Some(content) = msg.get_mut("content") else {
+            return Err(format!("{role} message is missing `content`"));
+        };
+        append_system_content(&mut system_parts, std::mem::take(content), role)?;
+    }
+
+    // Pass 2: translate the remaining roles.
     let mut out = Vec::new();
-    for msg in messages {
+    for msg in &mut messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
 
         match role {
@@ -326,12 +304,13 @@ fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
                 // Already extracted into the top-level `system` field.
             },
             "user" => {
-                let content = translate_user_content(msg)?;
-                push_or_merge_message(&mut out, "user", content);
+                let content = msg.get_mut("content").map(std::mem::take);
+                let blocks = translate_user_content(content)?;
+                push_or_merge_message(&mut out, "user", blocks);
             },
             "assistant" => {
-                let content = translate_assistant_content(msg)?;
-                push_or_merge_message(&mut out, "assistant", content);
+                let blocks = translate_assistant_content(msg)?;
+                push_or_merge_message(&mut out, "assistant", blocks);
             },
             "tool" => {
                 // Bedrock requires tool results inside a user-role message.
@@ -342,7 +321,7 @@ fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
         }
     }
 
-    Ok(out)
+    Ok((system_parts, out))
 }
 
 /// Preserve Bedrock's strict role alternation by combining adjacent messages
@@ -365,24 +344,69 @@ fn push_or_merge_message(out: &mut Vec<Value>, role: &str, mut blocks: Vec<Value
 // Per-role content translators
 // -----------------------------------------------------------------------------
 
-/// Translate a `user` message's content into Bedrock content blocks.
+/// Build a `{"text": …}` content block, moving the payload string into the
+/// block instead of copying it.
+fn text_block(text: String) -> Value {
+    let mut block = Map::with_capacity(1);
+    block.insert("text".to_owned(), Value::String(text));
+    Value::Object(block)
+}
+
+/// Append one system/developer message without dropping multipart text,
+/// taking the content by value so text payloads move into `parts`.
+fn append_system_content(parts: &mut Vec<Value>, content: Value, role: &str) -> Result<(), String> {
+    match content {
+        Value::String(text) => parts.push(text_block(text)),
+        Value::Array(content_parts) => {
+            for part in content_parts {
+                let Value::Object(mut part) = part else {
+                    return Err(format!("unsupported {role} content part type ``"));
+                };
+                let part_type = match part.remove("type") {
+                    Some(Value::String(part_type)) => part_type,
+                    _ => String::new(),
+                };
+                if part_type != "text" {
+                    return Err(format!("unsupported {role} content part type `{part_type}`"));
+                }
+                let Some(Value::String(text)) = part.remove("text") else {
+                    return Err(format!("{role} text content part is missing `text`"));
+                };
+                parts.push(text_block(text));
+            }
+        },
+        _ => return Err(format!("{role} message `content` must be a string or array")),
+    }
+    Ok(())
+}
+
+/// Translate a `user` message's content into Bedrock content blocks,
+/// moving text payloads instead of copying them.
 ///
 /// Handles both string content and the multipart content-part array.
-fn translate_user_content(msg: &Value) -> Result<Vec<Value>, String> {
-    let content = msg.get("content");
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates both supported user content shapes while building the output blocks"
+)]
+fn translate_user_content(content: Option<Value>) -> Result<Vec<Value>, String> {
     match content {
-        Some(Value::String(s)) => Ok(vec![serde_json::json!({"text": s})]),
+        Some(Value::String(s)) => Ok(vec![text_block(s)]),
         Some(Value::Array(parts)) => {
             let mut blocks = Vec::new();
             for part in parts {
-                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
-                match part_type {
+                let Value::Object(mut part) = part else {
+                    return Err("unsupported user content part type ``".to_owned());
+                };
+                let part_type = match part.remove("type") {
+                    Some(Value::String(part_type)) => part_type,
+                    _ => String::new(),
+                };
+                match part_type.as_str() {
                     "text" => {
-                        let text = part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .ok_or("user text content part is missing `text`")?;
-                        blocks.push(serde_json::json!({"text": text}));
+                        let Some(Value::String(text)) = part.remove("text") else {
+                            return Err("user text content part is missing `text`".to_owned());
+                        };
+                        blocks.push(text_block(text));
                     },
                     "image_url" => {
                         return Err("`image_url` content parts are not supported by this translator".to_owned());
@@ -402,7 +426,8 @@ fn translate_user_content(msg: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
-/// Translate an `assistant` message's content into Bedrock content blocks.
+/// Translate an `assistant` message's content into Bedrock content blocks,
+/// moving text and tool-call payloads instead of copying them.
 ///
 /// An assistant message may contain:
 /// - Plain text in `content`
@@ -412,28 +437,33 @@ fn translate_user_content(msg: &Value) -> Result<Vec<Value>, String> {
     clippy::too_many_lines,
     reason = "maps both text and tool-call content blocks; splitting would obscure the logic"
 )]
-fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
+fn translate_assistant_content(msg: &mut Value) -> Result<Vec<Value>, String> {
     let mut blocks: Vec<Value> = Vec::new();
 
     // Text content (may be null when the message is tool-calls only).
-    match msg.get("content") {
+    match msg.get_mut("content").map(std::mem::take) {
         Some(Value::String(s)) => {
             if !s.is_empty() {
-                blocks.push(serde_json::json!({"text": s}));
+                blocks.push(text_block(s));
             }
         },
         Some(Value::Array(parts)) => {
             for part in parts {
-                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                let Value::Object(mut part) = part else {
+                    return Err("unsupported assistant content part type ``".to_owned());
+                };
+                let part_type = match part.remove("type") {
+                    Some(Value::String(part_type)) => part_type,
+                    _ => String::new(),
+                };
                 if part_type != "text" {
                     return Err(format!("unsupported assistant content part type `{part_type}`"));
                 }
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("assistant text content part is missing `text`")?;
+                let Some(Value::String(text)) = part.remove("text") else {
+                    return Err("assistant text content part is missing `text`".to_owned());
+                };
                 if !text.is_empty() {
-                    blocks.push(serde_json::json!({"text": text}));
+                    blocks.push(text_block(text));
                 }
             }
         },
@@ -442,90 +472,99 @@ fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
     }
 
     // Tool calls → `toolUse` blocks.
-    if let Some(tool_calls) = msg.get("tool_calls").filter(|calls| !calls.is_null()) {
-        let tool_calls = tool_calls
-            .as_array()
-            .ok_or("assistant message `tool_calls` must be an array")?;
+    if let Some(tool_calls) = msg.get_mut("tool_calls").map(std::mem::take)
+        && !tool_calls.is_null()
+    {
+        let Value::Array(tool_calls) = tool_calls else {
+            return Err("assistant message `tool_calls` must be an array".to_owned());
+        };
         for tc in tool_calls {
-            let id = tc
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("tool call is missing `id`")?;
-            let function = tc.get("function");
-            let name = function
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .ok_or("tool call is missing `function.name`")?;
+            let Value::Object(mut tc) = tc else {
+                return Err("tool call is missing `id`".to_owned());
+            };
+            let Some(Value::String(id)) = tc.remove("id") else {
+                return Err("tool call is missing `id`".to_owned());
+            };
+            let Some(Value::Object(mut function)) = tc.remove("function") else {
+                return Err("tool call is missing `function.name`".to_owned());
+            };
+            let Some(Value::String(name)) = function.remove("name") else {
+                return Err("tool call is missing `function.name`".to_owned());
+            };
             // Parse the JSON-encoded arguments string into a Value so Bedrock
             // receives a nested object, not a JSON string.
-            let arguments = function
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-                .ok_or("tool call is missing `function.arguments`")?;
-            let input: Value = serde_json::from_str(arguments)
+            let Some(Value::String(arguments)) = function.remove("arguments") else {
+                return Err("tool call is missing `function.arguments`".to_owned());
+            };
+            let input: Value = serde_json::from_str(&arguments)
                 .map_err(|e| format!("tool call `function.arguments` is not valid JSON: {e}"))?;
 
-            blocks.push(serde_json::json!({
-                "toolUse": {
-                    "toolUseId": id,
-                    "name": name,
-                    "input": input
-                }
-            }));
+            let mut tool_use = Map::with_capacity(3);
+            tool_use.insert("toolUseId".to_owned(), Value::String(id));
+            tool_use.insert("name".to_owned(), Value::String(name));
+            tool_use.insert("input".to_owned(), input);
+            let mut block = Map::with_capacity(1);
+            block.insert("toolUse".to_owned(), Value::Object(tool_use));
+            blocks.push(Value::Object(block));
         }
     }
 
     // Bedrock requires at least one content block.
     if blocks.is_empty() {
-        blocks.push(serde_json::json!({"text": ""}));
+        blocks.push(text_block(String::new()));
     }
 
     Ok(blocks)
 }
 
-/// Translate a `tool` role message into a Bedrock `toolResult` content block.
+/// Translate a `tool` role message into a Bedrock `toolResult` content block,
+/// moving the result text instead of copying it.
 ///
-/// Returns a single `{"toolResult": {...}}` block; the caller places it into
+/// Returns a single `{"toolResult": {…}}` block; the caller places it into
 /// a `user`-role message, merging with adjacent blocks when appropriate.
 #[expect(
     clippy::too_many_lines,
     reason = "validates both supported OpenAI tool-result content shapes before building one Bedrock block"
 )]
-fn translate_tool_result(msg: &Value) -> Result<Value, String> {
-    let tool_use_id = msg
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .ok_or("tool message is missing `tool_call_id`")?;
+fn translate_tool_result(msg: &mut Value) -> Result<Value, String> {
+    let Some(Value::String(tool_use_id)) = msg.get_mut("tool_call_id").map(std::mem::take) else {
+        return Err("tool message is missing `tool_call_id`".to_owned());
+    };
 
     // OpenAI tool results support a string or multipart text content.
-    let content_block = match msg.get("content") {
-        Some(Value::String(s)) => vec![serde_json::json!({"text": s})],
+    let content_block = match msg.get_mut("content").map(std::mem::take) {
+        Some(Value::String(s)) => vec![text_block(s)],
         Some(Value::Array(parts)) => parts
-            .iter()
+            .into_iter()
             .map(|part| {
-                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                let Value::Object(mut part) = part else {
+                    return Err("unsupported tool content part type ``".to_owned());
+                };
+                let part_type = match part.remove("type") {
+                    Some(Value::String(part_type)) => part_type,
+                    _ => String::new(),
+                };
                 if part_type != "text" {
                     return Err(format!("unsupported tool content part type `{part_type}`"));
                 }
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("tool text content part is missing `text`")?;
-                Ok(serde_json::json!({"text": text}))
+                let Some(Value::String(text)) = part.remove("text") else {
+                    return Err("tool text content part is missing `text`".to_owned());
+                };
+                Ok(text_block(text))
             })
             .collect::<Result<Vec<_>, String>>()?,
         Some(value) if !value.is_null() => {
             return Err("tool message `content` must be a string or array".to_owned());
         },
-        _ => vec![serde_json::json!({"text": ""})],
+        _ => vec![text_block(String::new())],
     };
 
-    Ok(serde_json::json!({
-        "toolResult": {
-            "toolUseId": tool_use_id,
-            "content": content_block
-        }
-    }))
+    let mut result = Map::with_capacity(2);
+    result.insert("toolUseId".to_owned(), Value::String(tool_use_id));
+    result.insert("content".to_owned(), Value::Array(content_block));
+    let mut block = Map::with_capacity(1);
+    block.insert("toolResult".to_owned(), Value::Object(result));
+    Ok(Value::Object(block))
 }
 
 // -----------------------------------------------------------------------------
@@ -540,7 +579,7 @@ fn translate_tool_result(msg: &Value) -> Result<Value, String> {
     clippy::too_many_lines,
     reason = "maps the complete Bedrock inferenceConfig field set in one linear validation pass"
 )]
-fn build_inference_config(obj: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+fn build_inference_config(obj: &mut Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut cfg = Map::new();
 
     // max_tokens / max_completion_tokens → maxTokens
@@ -569,14 +608,14 @@ fn build_inference_config(obj: &Map<String, Value>) -> Result<Map<String, Value>
         cfg.insert("topP".to_owned(), Value::Number(n));
     }
 
-    // stop → stopSequences (string or array)
-    let stop_seqs = match obj.get("stop") {
-        Some(Value::String(s)) => vec![Value::String(s.clone())],
+    // stop → stopSequences (string or array); the array moves element-wise.
+    let stop_seqs = match obj.remove("stop") {
+        Some(Value::String(s)) => vec![Value::String(s)],
         Some(Value::Array(values)) => {
             if values.iter().any(|value| !value.is_string()) {
                 return Err("`stop` array values must be strings".to_owned());
             }
-            values.clone()
+            values
         },
         None | Some(Value::Null) => Vec::new(),
         Some(_) => return Err("`stop` must be a string or array of strings".to_owned()),
@@ -596,20 +635,24 @@ fn build_inference_config(obj: &Map<String, Value>) -> Result<Map<String, Value>
 /// `tool_choice` fields.
 ///
 /// Returns `None` if no tools are defined.
-fn build_tool_config(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
+fn build_tool_config(obj: &mut Map<String, Value>) -> Result<Option<Value>, String> {
     if obj.get("tool_choice").and_then(Value::as_str) == Some("none") {
         return Ok(None);
     }
 
-    let Some(tools) = obj.get("tools") else {
-        return Ok(None);
+    let tools_arr = match obj.remove("tools") {
+        Some(Value::Array(tools)) => tools,
+        Some(_) => return Err("`tools` must be an array".to_owned()),
+        None => return Ok(None),
     };
-    let tools_arr = tools.as_array().ok_or("`tools` must be an array")?;
     if tools_arr.is_empty() {
         return Ok(None);
     }
 
-    let bedrock_tools: Vec<Value> = tools_arr.iter().map(translate_tool_spec).collect::<Result<_, _>>()?;
+    let bedrock_tools: Vec<Value> = tools_arr
+        .into_iter()
+        .map(translate_tool_spec)
+        .collect::<Result<_, _>>()?;
 
     let mut tool_config = serde_json::json!({"tools": bedrock_tools});
 
@@ -622,54 +665,68 @@ fn build_tool_config(obj: &Map<String, Value>) -> Result<Option<Value>, String> 
     Ok(Some(tool_config))
 }
 
-/// Convert a single Chat Completions tool definition to Bedrock `toolSpec`.
-fn translate_tool_spec(tool: &Value) -> Result<Value, String> {
+/// Convert a single Chat Completions tool definition to Bedrock `toolSpec`,
+/// moving the input schema and function metadata instead of copying them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates the function tool shape field by field while moving each field into the toolSpec"
+)]
+fn translate_tool_spec(tool: Value) -> Result<Value, String> {
     // We only handle `function` type tools.
-    if tool.get("type").and_then(Value::as_str) != Some("function") {
+    let Value::Object(mut tool) = tool else {
+        return Err("only function tools are supported".to_owned());
+    };
+    let tool_type = match tool.remove("type") {
+        Some(Value::String(tool_type)) => tool_type,
+        _ => String::new(),
+    };
+    if tool_type != "function" {
         return Err("only function tools are supported".to_owned());
     }
-    let func = tool
-        .get("function")
-        .and_then(Value::as_object)
-        .ok_or("function tool is missing object `function`")?;
-    let name = func
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or("function tool is missing `function.name`")?;
-    let description = optional_string_field(func, "description")?.filter(|description| !description.is_empty());
-    let strict = optional_bool_field(func, "strict")?;
+    let Some(Value::Object(mut func)) = tool.remove("function") else {
+        return Err("function tool is missing object `function`".to_owned());
+    };
+    let Some(Value::String(name)) = func.remove("name") else {
+        return Err("function tool is missing `function.name`".to_owned());
+    };
+    let description =
+        take_optional_string_field(&mut func, "description")?.filter(|description| !description.is_empty());
+    let strict = take_optional_bool_field(&mut func, "strict")?;
     let schema = func
-        .get("parameters")
-        .cloned()
+        .remove("parameters")
         .unwrap_or_else(|| serde_json::json!({"type": "object"}));
 
-    let mut tool_spec = Map::new();
-    tool_spec.insert("name".to_owned(), Value::String(name.to_owned()));
-    tool_spec.insert("inputSchema".to_owned(), serde_json::json!({"json": schema}));
+    let mut tool_spec = Map::with_capacity(4);
+    tool_spec.insert("name".to_owned(), Value::String(name));
+    let mut input_schema = Map::with_capacity(1);
+    input_schema.insert("json".to_owned(), schema);
+    tool_spec.insert("inputSchema".to_owned(), Value::Object(input_schema));
     if let Some(description) = description {
-        tool_spec.insert("description".to_owned(), Value::String(description.to_owned()));
+        tool_spec.insert("description".to_owned(), Value::String(description));
     }
     if let Some(strict) = strict {
         tool_spec.insert("strict".to_owned(), Value::Bool(strict));
     }
 
-    Ok(serde_json::json!({"toolSpec": tool_spec}))
+    let mut outer = Map::with_capacity(1);
+    outer.insert("toolSpec".to_owned(), Value::Object(tool_spec));
+    Ok(Value::Object(outer))
 }
 
-/// Read an optional string function field while rejecting a wrong JSON type.
-fn optional_string_field<'a>(obj: &'a Map<String, Value>, field: &str) -> Result<Option<&'a str>, String> {
-    match obj.get(field) {
+/// Remove an optional string function field while rejecting a wrong JSON type.
+fn take_optional_string_field(obj: &mut Map<String, Value>, field: &str) -> Result<Option<String>, String> {
+    match obj.remove(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
         Some(_) => Err(format!("`function.{field}` must be a string or null")),
     }
 }
 
-/// Read an optional boolean function field while rejecting a wrong JSON type.
-fn optional_bool_field(obj: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
-    match obj.get(field) {
+/// Remove an optional boolean function field while rejecting a wrong JSON type.
+fn take_optional_bool_field(obj: &mut Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
+    match obj.remove(field) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Bool(value)) => Ok(Some(value)),
         Some(_) => Err(format!("`function.{field}` must be a boolean or null")),
     }
 }
@@ -709,7 +766,7 @@ fn translate_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, Stri
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use serde_json::Value;
 
@@ -808,6 +865,7 @@ mod tests {
     // ── Request semantics ────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn supported_request_fields_are_mapped() {
         let body = translate(
             r#"{"model":"m","messages":[],"max_completion_tokens":128,
@@ -821,6 +879,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn null_max_tokens_uses_max_completion_tokens_fallback() {
         let body = translate(r#"{"model":"m","messages":[],"max_tokens":null,"max_completion_tokens":128}"#);
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
@@ -929,6 +988,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stream_usage_false_and_omitted_are_disabled() {
         for stream_options in [None, Some(serde_json::json!({"include_usage": false}))] {
             let mut request = serde_json::json!({
@@ -1014,6 +1074,7 @@ mod tests {
     // ── System message extraction ─────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn system_role_hoisted_to_top_level() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1029,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn developer_role_hoisted_same_as_system() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1040,6 +1102,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn all_multipart_system_text_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1063,6 +1126,7 @@ mod tests {
     // ── User message ──────────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn user_string_content_wrapped_in_text_block() {
         let body = translate(r#"{"model":"m","messages":[{"role":"user","content":"Hello!"}]}"#);
         let msg = &body["messages"][0];
@@ -1071,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn user_multipart_text_parts_translated() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":[
@@ -1099,6 +1164,7 @@ mod tests {
     // ── Assistant message ─────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_text_content_wrapped() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1112,6 +1178,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_tool_calls_produce_tool_use_blocks() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1131,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn assistant_text_and_tool_calls_both_present() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1164,6 +1232,7 @@ mod tests {
     // ── Tool result message ───────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_role_becomes_user_with_tool_result_block() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1185,6 +1254,7 @@ mod tests {
     /// A translated tool result has the Bedrock `user` role, so it must merge
     /// with adjacent user content to preserve strict role alternation.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_message_after_plain_user_is_merged() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1199,6 +1269,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn adjacent_user_and_assistant_messages_are_merged_by_role() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1215,6 +1286,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn multipart_tool_result_text_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1269,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn empty_assistant_text_preserves_tool_calls() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1287,6 +1360,7 @@ mod tests {
     /// They must be merged into a single Bedrock `user` message so the output
     /// sequence maintains strict user/assistant alternation.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn consecutive_tool_messages_merged_into_single_user_message() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1323,6 +1397,7 @@ mod tests {
     /// `toolResult` blocks must appear in the same order as their source `tool`
     /// messages; content values must be preserved.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn consecutive_tool_messages_preserve_order() {
         let body = translate(
             r#"{"model":"m","messages":[
@@ -1356,6 +1431,7 @@ mod tests {
     /// two-round sequence: the assistant returns one result, replies, then
     /// issues a second tool call.
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn non_consecutive_tool_messages_not_merged() {
         // Input:  user → assistant(x1) → tool(x1) → assistant(reply + x2) → tool(x2)
         // Output: user / assistant / user(x1) / assistant / user(x2) — five messages.
@@ -1393,12 +1469,14 @@ mod tests {
     // ── Inference config ──────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn max_tokens_maps_to_max_tokens() {
         let body = translate(r#"{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#);
         assert_eq!(body["inferenceConfig"]["maxTokens"], 512);
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn temperature_and_top_p_mapped() {
         let body =
             translate(r#"{"model":"m","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#);
@@ -1408,12 +1486,14 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stop_string_wrapped_in_array() {
         let body = translate(r#"{"model":"m","stop":"\n\n","messages":[{"role":"user","content":"hi"}]}"#);
         assert_eq!(body["inferenceConfig"]["stopSequences"][0], "\n\n");
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn stop_array_preserved() {
         let body = translate(r#"{"model":"m","stop":["END","STOP"],"messages":[{"role":"user","content":"hi"}]}"#);
         let seqs = body["inferenceConfig"]["stopSequences"].as_array().unwrap();
@@ -1432,6 +1512,7 @@ mod tests {
     // ── Tool configuration ────────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tools_translated_to_tool_spec() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1448,6 +1529,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_without_description_omits_bedrock_description() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1458,6 +1540,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn strict_tool_schema_is_preserved() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1469,6 +1552,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_auto_emits_auto_object() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1479,6 +1563,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_required_emits_any_object() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1499,6 +1584,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn tool_choice_specific_function() {
         let body = translate(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -1529,8 +1615,318 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
     fn empty_messages_produces_empty_array() {
         let body = translate(r#"{"model":"m","messages":[]}"#);
         assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+    }
+
+    // ── Allocation evidence (allocation-counter) ───────────────────────────
+
+    /// Pre-ownership `translate_tool_spec`: borrowed the tool and deep-cloned
+    /// the input schema plus every metadata string. Kept as the allocation
+    /// baseline the consuming translator must beat.
+    fn translate_tool_spec_legacy(tool: &Value) -> Result<Value, String> {
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            return Err("only function tools are supported".to_owned());
+        }
+        let func = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or("function tool is missing object `function`")?;
+        let name = func
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("function tool is missing `function.name`")?;
+        let description = func
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty());
+        let strict = func.get("strict").and_then(Value::as_bool);
+        let schema = func
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+
+        let mut tool_spec = Map::new();
+        tool_spec.insert("name".to_owned(), Value::String(name.to_owned()));
+        tool_spec.insert("inputSchema".to_owned(), serde_json::json!({"json": schema}));
+        if let Some(description) = description {
+            tool_spec.insert("description".to_owned(), Value::String(description.to_owned()));
+        }
+        if let Some(strict) = strict {
+            tool_spec.insert("strict".to_owned(), Value::Bool(strict));
+        }
+
+        Ok(serde_json::json!({"toolSpec": tool_spec}))
+    }
+
+    /// Pre-ownership stop extraction: borrowed the request and cloned every
+    /// stop sequence into a fresh array. Kept as the allocation baseline.
+    fn stop_sequences_legacy(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
+        let stop_seqs = match obj.get("stop") {
+            Some(Value::String(s)) => vec![Value::String(s.clone())],
+            Some(Value::Array(values)) => {
+                if values.iter().any(|value| !value.is_string()) {
+                    return Err("`stop` array values must be strings".to_owned());
+                }
+                values.clone()
+            },
+            None | Some(Value::Null) => Vec::new(),
+            Some(_) => return Err("`stop` must be a string or array of strings".to_owned()),
+        };
+        Ok(stop_seqs)
+    }
+
+    /// Build a function tool whose nested schema carries a `description_bytes`
+    /// payload string, the stand-in for a large provider schema.
+    fn large_schema_tool(description_bytes: usize) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tool",
+                "description": "large schema fixture",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "string", "description": "s".repeat(description_bytes)}
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn tool_spec_schema_moves_without_deep_copy() {
+        let tool = large_schema_tool(16 * 1024);
+        let owned_input = tool.clone();
+
+        let mut owned_output = None;
+        let owned = allocation_counter::measure(|| {
+            owned_output = Some(translate_tool_spec(owned_input).unwrap());
+        });
+        let mut legacy_output = None;
+        let legacy = allocation_counter::measure(|| {
+            legacy_output = Some(translate_tool_spec_legacy(&tool).unwrap());
+        });
+
+        assert_eq!(
+            owned_output, legacy_output,
+            "moved and cloned tool specs must stay byte-equivalent"
+        );
+        assert!(
+            owned.count_total < legacy.count_total,
+            "consuming toolSpec must allocate fewer times than the cloning baseline: moved={} cloned={}",
+            owned.count_total,
+            legacy.count_total
+        );
+        assert!(
+            owned.bytes_total < legacy.bytes_total,
+            "consuming toolSpec must allocate fewer bytes than the cloning baseline: moved={} cloned={}",
+            owned.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
+    fn tool_spec_allocations_do_not_scale_with_schema_size() {
+        let small = large_schema_tool(16 * 1024);
+        let large = large_schema_tool(64 * 1024);
+
+        let mut small_output = None;
+        let small_allocs = allocation_counter::measure(|| {
+            small_output = Some(translate_tool_spec(small).unwrap());
+        });
+        let mut large_output = None;
+        let large_allocs = allocation_counter::measure(|| {
+            large_output = Some(translate_tool_spec(large).unwrap());
+        });
+
+        let payload_len = |output: Value| {
+            output["toolSpec"]["inputSchema"]["json"]["properties"]["payload"]["description"]
+                .as_str()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(payload_len(small_output.unwrap()), 16 * 1024);
+        assert_eq!(payload_len(large_output.unwrap()), 64 * 1024);
+        assert_eq!(
+            small_allocs.count_total, large_allocs.count_total,
+            "toolSpec translation allocations must be independent of schema payload size"
+        );
+        assert!(
+            large_allocs.bytes_total <= small_allocs.bytes_total + 1024,
+            "toolSpec translation must not allocate proportionally to schema payload: small={} large={}",
+            small_allocs.bytes_total,
+            large_allocs.bytes_total
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds the fixture, measures both paths, and asserts output equality plus the allocation drop"
+    )]
+    #[test]
+    fn stop_sequences_move_without_element_copy() {
+        let stop_request = || {
+            serde_json::json!({
+                "stop": (0..16)
+                    .map(|index| serde_json::json!(format!("stop_{index}_{}", "x".repeat(256))))
+                    .collect::<Vec<_>>()
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        let mut moved_obj = stop_request();
+        let legacy_obj = stop_request();
+
+        let mut moved_cfg = None;
+        let moved = allocation_counter::measure(|| {
+            moved_cfg = Some(build_inference_config(&mut moved_obj).unwrap());
+        });
+        let mut legacy_stops = None;
+        let legacy = allocation_counter::measure(|| {
+            legacy_stops = Some(stop_sequences_legacy(&legacy_obj).unwrap());
+        });
+
+        let moved_stops = moved_cfg
+            .unwrap()
+            .get("stopSequences")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        assert_eq!(
+            moved_stops,
+            Value::Array(legacy_stops.unwrap()),
+            "moved and cloned stop sequences must stay byte-equivalent"
+        );
+        assert!(
+            moved.bytes_total < legacy.bytes_total,
+            "stop array must move element-wise instead of cloning: moved={} cloned={}",
+            moved.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[test]
+    fn user_message_text_moves_without_copy() {
+        let text = "x".repeat(64 * 1024);
+        let moved_input = Value::String(text.clone());
+        let legacy_input = Value::String(text);
+
+        let mut moved_blocks = None;
+        let moved = allocation_counter::measure(|| {
+            moved_blocks = Some(translate_user_content(Some(moved_input)).unwrap());
+        });
+        let mut legacy_blocks = None;
+        let legacy = allocation_counter::measure(|| {
+            legacy_blocks = Some(vec![serde_json::json!({
+                "text": legacy_input.as_str().unwrap()
+            })]);
+        });
+
+        assert_eq!(
+            moved_blocks, legacy_blocks,
+            "moved and cloned text blocks must stay byte-equivalent"
+        );
+        assert!(
+            moved.bytes_total < legacy.bytes_total,
+            "user text must move into the block instead of being copied: moved={} cloned={}",
+            moved.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers the three remaining text-move callers (system, assistant, tool result) with one scale pair each"
+    )]
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "tests index known fixture shapes")]
+    fn system_assistant_and_tool_result_text_allocations_do_not_scale_with_payload() {
+        // System/developer text moves into the hoisted `system` parts.
+        let measure_system = |text_bytes: usize| {
+            let text = "x".repeat(text_bytes);
+            let mut parts = Vec::new();
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                append_system_content(&mut parts, Value::String(text), "system").unwrap();
+                moved_len = parts[0]["text"].as_str().unwrap().len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_system(16 * 1024);
+        let (large, large_len) = measure_system(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small system payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large system payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "system text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "system text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
+
+        // Assistant text moves out of the message via `mem::take`.
+        let measure_assistant = |text_bytes: usize| {
+            let mut msg = serde_json::json!({"role": "assistant", "content": "x".repeat(text_bytes)});
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                moved_len = translate_assistant_content(&mut msg).unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_assistant(16 * 1024);
+        let (large, large_len) = measure_assistant(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small assistant payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large assistant payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "assistant text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "assistant text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
+
+        // Tool-result text moves into the `toolResult` content block.
+        let measure_tool_result = |text_bytes: usize| {
+            let mut msg = serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "x".repeat(text_bytes)
+            });
+            let mut moved_len = 0;
+            let allocs = allocation_counter::measure(|| {
+                moved_len = translate_tool_result(&mut msg).unwrap()["toolResult"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len();
+            });
+            (allocs, moved_len)
+        };
+        let (small, small_len) = measure_tool_result(16 * 1024);
+        let (large, large_len) = measure_tool_result(64 * 1024);
+        assert_eq!(small_len, 16 * 1024, "small tool-result payload must land intact");
+        assert_eq!(large_len, 64 * 1024, "large tool-result payload must land intact");
+        assert_eq!(
+            small.count_total, large.count_total,
+            "tool-result text allocations must be independent of payload size"
+        );
+        assert!(
+            large.bytes_total <= small.bytes_total + 1024,
+            "tool-result text must move into the block instead of being copied: small={} large={}",
+            small.bytes_total,
+            large.bytes_total
+        );
     }
 }

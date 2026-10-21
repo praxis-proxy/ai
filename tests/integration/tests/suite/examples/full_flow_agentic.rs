@@ -113,7 +113,7 @@ fn load_full_flow_config_with_db(
     let patched = patch_yaml(
         &yaml
             .replace("sqlite://responses.db?mode=rwc", db.url())
-            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
+            .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key"),
         proxy_port,
         port_map,
     );
@@ -132,7 +132,7 @@ fn load_full_flow_agentic_config(
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, port_map);
     let config = praxis_core::config::Config::from_yaml(&patched)
         .unwrap_or_else(|e| panic!("parse full-flow-agentic.yaml: {e}"));
@@ -184,7 +184,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let patched = patch_yaml(
         &yaml
             .replace("sqlite://responses.db?mode=rwc", db.url())
-            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
+            .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key"),
         proxy_port,
         &HashMap::from([
             ("127.0.0.1:9999", files_api_port),
@@ -273,7 +273,7 @@ fn full_flow_openai_provider_passes_conversations_through() {
         .expect("example config should exist");
     let yaml = route_conversations_to_openai(&yaml)
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
@@ -1102,7 +1102,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let db = TempSqlite::new("full_flow_prev");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1183,7 +1183,7 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     let db = TempSqlite::new("full_flow_prev_restore");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1257,7 +1257,7 @@ async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let db = TempSqlite::new("full_flow_prev_restore_stream");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1344,7 +1344,7 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     let db = TempSqlite::new("full_flow_encoded_passthrough");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1427,7 +1427,7 @@ async fn full_flow_response_with_validators_drops_stale_validator_on_rewrite() {
     let db = TempSqlite::new("full_flow_validators_passthrough");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1876,9 +1876,9 @@ fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
+        "env_var: WEB_SEARCH_API_KEY",
         &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{}",
+            "value: test-key\n                base_url: http://127.0.0.1:{}",
             search.port()
         ),
     );
@@ -2624,7 +2624,7 @@ fn ws_full_flow_config(
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, ports);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("full-flow config should parse");
     (config, db)

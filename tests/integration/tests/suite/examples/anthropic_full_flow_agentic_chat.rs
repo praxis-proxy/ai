@@ -260,8 +260,8 @@ fn load_config_full(
     // can assert the credential travels in the `Authorization` header (issue
     // #1389), never in the request body the outbound chain can read.
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // `credential_injection` and other secret-bearing filters resolve at
     // pipeline-build time; repoint the backend Bearer to a Cargo-provided var so

@@ -14,7 +14,8 @@ fn make_filter_yaml(provider: &str, api_key: &str) -> serde_yaml::Value {
     serde_yaml::from_str(&format!(
         r#"
 provider: {provider}
-api_key: "{api_key}"
+api_key:
+  value: "{api_key}"
 default_context_size: medium
 timeout_ms: 5000
 "#,
@@ -44,7 +45,8 @@ fn from_config_tavily() {
 fn from_config_missing_provider() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
-api_key: "test-key"
+api_key:
+  value: "test-key"
 "#,
     )
     .unwrap();
@@ -76,7 +78,8 @@ fn from_config_unknown_provider() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 provider: google
-api_key: "test-key"
+api_key:
+  value: "test-key"
 "#,
     )
     .unwrap();
@@ -89,7 +92,8 @@ fn from_config_unknown_field_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 provider: brave
-api_key: "test-key"
+api_key:
+  value: "test-key"
 unknown_field: true
 "#,
     )
@@ -102,13 +106,13 @@ unknown_field: true
 fn from_config_validates_max_calls_per_round() {
     for max_calls in [0, MAX_CALLS_PER_ROUND + 1] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-            "provider: brave\napi_key: test-key\nmax_calls_per_round: {max_calls}"
+            "provider: brave\napi_key:\n  value: test-key\nmax_calls_per_round: {max_calls}"
         ))
         .unwrap();
         assert!(WebSearchDispatchFilter::from_config(&yaml).is_err());
     }
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "provider: brave\napi_key: test-key\nmax_calls_per_round: {MAX_CALLS_PER_ROUND}"
+        "provider: brave\napi_key:\n  value: test-key\nmax_calls_per_round: {MAX_CALLS_PER_ROUND}"
     ))
     .unwrap();
     assert!(WebSearchDispatchFilter::from_config(&yaml).is_ok());
@@ -124,7 +128,8 @@ fn from_config_rejects_max_body_bytes() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 provider: brave
-api_key: "test-key"
+api_key:
+  value: "test-key"
 max_body_bytes: 1024
 "#,
     )
@@ -349,7 +354,8 @@ fn make_filter_yaml_with_base_url(provider: &str, api_key: &str, base_url: &str)
     serde_yaml::from_str(&format!(
         r#"
 provider: {provider}
-api_key: "{api_key}"
+api_key:
+  value: "{api_key}"
 default_context_size: medium
 timeout_ms: 5000
 base_url: "{base_url}"
@@ -1859,7 +1865,7 @@ async fn stale_web_selection_cannot_replace_another_search_output() {
 async fn missing_required_credential_records_security_failure() {
     // Filter requires the caller's per-user "brave" slot; ctx has NO credentials.
     let yaml: serde_yaml::Value =
-        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+        serde_yaml::from_str("provider: brave\napi_key:\n  value: fallback-key\nuser_credential: brave").unwrap();
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1901,7 +1907,7 @@ async fn missing_required_credential_records_security_failure() {
 /// Build a web-search filter that requires the caller's per-user "brave" slot.
 fn scoped_web_search_filter() -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value =
-        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+        serde_yaml::from_str("provider: brave\napi_key:\n  value: fallback-key\nuser_credential: brave").unwrap();
     WebSearchDispatchFilter::from_config(&yaml).unwrap()
 }
 

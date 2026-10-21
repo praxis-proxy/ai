@@ -28,8 +28,8 @@ fn patched_yaml(listener_port: u16, model_port: u16, search_port: u16) -> String
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
     let yaml = patch_yaml(&yaml, listener_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.

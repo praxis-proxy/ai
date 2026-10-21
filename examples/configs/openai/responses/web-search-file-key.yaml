@@ -1,0 +1,160 @@
+# Responses Web Search with a File-Sourced Provider Key
+# Requires `--features openai-responses` because these filters are opt-in.
+#
+# A variant of web-search-chat-completions.yaml that sources the shared Brave
+# provider key from a projected FILE instead of an environment variable. The
+# `file:` source suits a Kubernetes projected Secret mounted at a fixed path:
+#
+#   * Restart-free rotation: the key is watched and re-read when the projected
+#     file changes, so rotating the Secret does not require restarting the proxy.
+#   * Fail-closed: an unreadable, empty, oversized, or non-UTF-8 file fails the
+#     pipeline build at startup (never a silent unauthenticated callout), and a
+#     post-startup removal publishes no key so the callout fails closed.
+#
+# Everything else matches web-search-chat-completions.yaml: it accepts OpenAI
+# Responses requests with hosted web search while targeting a backend that only
+# implements /v1/chat/completions, serving both finite (`"stream": false`) and
+# streaming (`"stream": true`) requests from one pipeline. The compatibility
+# filter privately exposes web_search to that backend as a strict function tool.
+# The existing openai_web_search_dispatch executor handles the returned call and
+# IRR drives the second inference round.
+#
+# openai_responses_to_chat_completions runs inside the iterative router and selects its
+# transport from the effective request: a `"stream": true` request streams, so
+# each translated per-round stream stays internal to the router; a finite request
+# buffers. openai_stream_events accumulates each translated
+# per-round Responses SSE stream and withholds per-round terminal events until the
+# IRR transition is known, exposing one coherent client-facing Responses SSE
+# lifecycle across the model round, the web search, and the resumed model output.
+# On a finite request openai_stream_events never arms (the response is not SSE),
+# so it is a no-op and the finite round-trip is unaffected.
+#
+# Request order inside IRR:
+#   openai_stream_events -> openai_web_search_dispatch -> openai_agentic_loop
+#     -> openai_responses_to_chat_completions -> path_rewrite -> router
+#
+# Response filters run in reverse. Each Chat Completions response (finite JSON or
+# streamed SSE) is therefore converted into a Responses resource before
+# openai_agentic_loop and openai_web_search_dispatch see it, and openai_stream_events
+# (client-facing) composes the logical stream last. A private
+# function_call(name="web_search") becomes a canonical web_search_call, which
+# openai_web_search_dispatch executes on the next iteration.
+#
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "stream": true,
+#       "tools": [{"type": "web_search"}]
+#     }'
+
+listeners:
+  - name: responses-web-search-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-web-search-chat]
+
+filter_chains:
+  - name: responses-web-search-chat
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
+
+      - filter: openai_tool_parse
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        # Terminal streaming rounds resume real inference after the web-search
+        # dispatch, so allow generous per-request and per-step deadlines for
+        # slower backends (mirrors full-flow-agentic.yaml). The default step
+        # deadline is too tight for a full translated streaming generation.
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_stream_response_bytes: 67108864
+        steps:
+          - name: inference
+            filters:
+              # Parses every translated inference SSE stream, preserves one
+              # logical response identity across rounds, and withholds per-round
+              # terminal events until the IRR transition is known. Runs last in
+              # the response phase so it observes the translated Responses SSE. A
+              # no-op on finite (non-SSE) responses.
+              - filter: openai_stream_events
+
+              - filter: openai_web_search_dispatch
+                provider: brave
+                # Source the shared provider key from a projected file. A
+                # Kubernetes projected Secret mounted here is watched and re-read
+                # on rotation (restart-free); an unreadable file fails closed.
+                api_key:
+                  file: /var/run/secrets/web-search/api-key
+                # Each provider callout executes through this outbound chain; the
+                # filtered-subrequest executor enforces destination authority,
+                # DNS/SSRF, TLS/SNI, and Host centrally.
+                outbound_chain:
+                  name: web-search-outbound
+                  filters:
+                    - filter: request_id
+
+              - filter: openai_agentic_loop
+                max_infer_iters: 10
+
+              - filter: openai_responses_to_chat_completions
+                max_rewritten_body_bytes: 67108864
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/chat/completions"
+                    cluster: "chat-completions-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "chat-completions-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              # openai_agentic_loop is the sole loop authority (issue #1046): it
+              # parses each model response, records the assignment consumed by
+              # the request-phase openai_web_search_dispatch dispatcher, and publishes the
+              # single continuation signal. The IRR transitions only on the
+              # owner's action, never on a dispatcher's.
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

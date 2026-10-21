@@ -401,8 +401,8 @@ def _write_config(proxy_port: int, model_port: int, search_port: int) -> str:
     config = replaced
 
     replaced = config.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        f"api_key: test-key\n                base_url: http://127.0.0.1:{search_port}",
+        "env_var: WEB_SEARCH_API_KEY",
+        f"value: test-key\n                base_url: http://127.0.0.1:{search_port}",
     )
     assert replaced != config, "example drift: provider api_key not found"
     config = replaced
@@ -493,8 +493,8 @@ def scoped_credential_client(web_search_stack, request):
         ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
         ('endpoints: ["127.0.0.1:8000"]', f'endpoints: ["127.0.0.1:{model_port}"]'),
         (
-            "api_key: ${WEB_SEARCH_API_KEY}",
-            f"api_key: test-key\n                base_url: http://127.0.0.1:{search_port}",
+            "env_var: WEB_SEARCH_API_KEY",
+            f"value: test-key\n                base_url: http://127.0.0.1:{search_port}",
         ),
         (
             "allow_private_endpoints: true",
