@@ -1417,9 +1417,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 87, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 67, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 72, "manifest recording inventory count");
+        assert_eq!(report.features_total, 88, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 68, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 73, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1493,7 +1493,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 87, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 88, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
