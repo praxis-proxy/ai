@@ -208,8 +208,7 @@ flags = [
 # Container image pinned by digest for Claude Code acceptance
 # (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
 # Responses suite builds the model-baked image from vllm/Containerfile instead.
-# vLLM v0.32.0
-# serves the native Anthropic Messages surface (`/v1/messages`,
+# vLLM v0.32.0 serves the native Anthropic Messages surface (`/v1/messages`,
 # `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
 # so one container backs both the native and transformed acceptance paths with no
 # extra flag. Qwen3-8B on the A10G (24GB) is the capable model the full suite is
