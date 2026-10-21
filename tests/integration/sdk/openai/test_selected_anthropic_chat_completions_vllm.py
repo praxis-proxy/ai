@@ -7,22 +7,30 @@
 by real vLLM.
 
 An official OpenAI Chat Completions client reaches Praxis, which selects a
-trusted Anthropic candidate from a signed routing overlay, translates the
-request through ``openai_chat_completions_to_anthropic[_stream]``, and forwards
-it to vLLM's native Anthropic Messages surface (``/v1/messages``). The
-Anthropic JSON/SSE response is translated back into OpenAI Chat Completions
-shape for the client.
+trusted Anthropic candidate from a signed routing overlay
+(``intelligent_route``), translates the request through
+``openai_chat_completions_to_anthropic[_stream]``, and forwards it to vLLM's
+native Anthropic Messages surface (``/v1/messages``). The Anthropic JSON/SSE
+response is translated back into OpenAI Chat Completions shape for the client.
 
-This complements the deterministic fake-backend lane
-(``test_selected_anthropic_chat_completions.py``): that one pins exact token
-math and error/policy cases against a scripted server, while this one proves
-the shipped translation against the real model the product serves.
+Scope of this lane: it proves selected-provider ROUTING and the two TRANSLATION
+filters end to end against the real model the product serves. The credential
+boundary is deliberately vLLM-specific: the keyed vLLM `/v1/messages` surface
+authenticates with ``Authorization: Bearer`` (an OpenAI-style ``--api-key``),
+whereas a `messages` provider's overlay credential can only be ``apikey`` (real
+Anthropic's ``x-api-key``). So, exactly like the shipped
+``examples/configs/anthropic/messages-native-vllm.yaml``, this lane injects the
+backend bearer with the core ``credential_injection`` filter keyed on the
+``intelligent_route``-selected cluster. The shipped selected-provider CREDENTIAL
+behavior (overlay ``apikey`` -> ``x-api-key``) remains covered by the
+deterministic per-PR lane ``test_selected_anthropic_chat_completions.py``.
 
 Required for the live cases: PRAXIS_TEST_VLLM_BASE_URL (local http URL),
 PRAXIS_TEST_VLLM_MODEL, VLLM_API_KEY, and a built praxis-ai binary (or
 PRAXIS_AI_BIN). Set PRAXIS_TEST_REQUIRE_LIVE=1 in CI so missing infrastructure
 fails instead of reporting a misleading green run. The digest-reproduction test
-needs none of these and always runs.
+needs none of these and always runs; the scripted-backend shim test needs only
+a built praxis-ai binary (no GPU).
 """
 
 import hashlib
@@ -33,7 +41,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,18 +53,19 @@ from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[4]
 FIXTURE = ROOT / "tests/integration/fixtures/inference/routing/openai-to-anthropic.json"
-EXAMPLE = ROOT / "examples/configs/openai-selected-provider-legacy-translation.yaml"
 
 # The client-facing model id the OpenAI SDK sends. `intelligent_route` matches it
-# against the overlay candidate's `name`; Praxis then rewrites the upstream model
-# to the candidate's `target_model` (the served vLLM model). Decoupling the two
-# is the whole point of selected-provider routing, so they are deliberately
-# different here.
+# against the overlay candidate's `name` (picker.rs select_legacy); Praxis then
+# rewrites the upstream model to the candidate's `target_model` (the served vLLM
+# model). Decoupling the two is the point of selected-provider routing.
 CLIENT_MODEL = "client-model"
 
-# Projected-credential coordinates. These must agree between the overlay
-# candidate's `secretRef` and the file written under the example's
-# `projected_credential_mount_base`, or `credential_inject` fails closed (503).
+# The overlay candidate must carry an `apikey` credential reference or the
+# overlay validator rejects a `messages` provider at load
+# (filters/src/routing/overlay.rs validate_provider_credential). This lane does
+# not inject that reference (no `credential_inject` filter); the backend bearer
+# is injected by the core `credential_injection` filter instead. The secretRef
+# is therefore structurally valid but unconsumed.
 NAMESPACE = "grid-live"
 SECRET_NAME = "vllm-backend-secret"
 SECRET_KEY = "api-key"
@@ -75,7 +87,9 @@ def _semantic_digest(overlay_body: dict) -> str:
 
 def _signed_overlay(target_model: str) -> dict:
     """Build a content-addressed overlay envelope selecting one Anthropic
-    candidate that targets ``target_model`` behind a bearer credential."""
+    candidate that targets ``target_model``. The credential is `apikey` only to
+    satisfy the `messages` provider validator; it is not injected (see module
+    docstring)."""
     body = {
         "local_site": "site-a",
         "network": "grid-live",
@@ -91,7 +105,7 @@ def _signed_overlay(target_model: str) -> dict:
                 "path": "/v1/messages",
                 "target_model": target_model,
                 "credential": {
-                    "strategy": "bearer_token",
+                    "strategy": "apikey",
                     "secretRef": {"name": SECRET_NAME, "namespace": NAMESPACE, "key": SECRET_KEY},
                 },
             }
@@ -112,6 +126,62 @@ def _signed_overlay(target_model: str) -> dict:
             "rendered_at": "2026-10-21T00:00:00Z",
         },
         "overlay": body,
+    }
+
+
+def _build_config(proxy_port: int, overlay_path: Path, authority: str) -> dict:
+    """Selected-provider routing + both translation filters, with the backend
+    bearer injected the native-vLLM way (core `credential_injection` keyed on the
+    `intelligent_route`-selected cluster). `credential_injection` reads the token
+    from the VLLM_API_KEY environment variable and strips any client-supplied
+    Authorization first."""
+    insecure = {"allow_private_endpoints": True}
+    if os.geteuid() == 0:
+        # The ephemeral GPU runner runs as root; opt in only here.
+        insecure["allow_root"] = True
+    return {
+        "listeners": [{"name": "proxy", "address": f"127.0.0.1:{proxy_port}", "filter_chains": ["main"]}],
+        "filter_chains": [
+            {
+                "name": "main",
+                "filters": [
+                    {"filter": "model_to_header", "header": "X-Model"},
+                    {
+                        "filter": "intelligent_route",
+                        "overlay_file": str(overlay_path),
+                        "model_header": "X-Model",
+                        "clusters": ["anthropic-backend"],
+                        "reload": {"enabled": False},
+                    },
+                    {
+                        "filter": "openai_chat_completions_to_anthropic_stream",
+                        "max_partial_event_bytes": 1048576,
+                        "max_tool_blocks": 256,
+                    },
+                    {
+                        "filter": "openai_chat_completions_to_anthropic",
+                        "api_translation_enabled": True,
+                        "max_body_bytes": 1048576,
+                    },
+                    {
+                        "filter": "credential_injection",
+                        "clusters": [
+                            {
+                                "name": "anthropic-backend",
+                                "header": "Authorization",
+                                "env_var": "VLLM_API_KEY",
+                                "header_prefix": "Bearer ",
+                                "strip_client_credential": True,
+                            }
+                        ],
+                    },
+                    {"filter": "load_balancer", "clusters": [{"name": "anthropic-backend", "endpoints": [authority]}]},
+                ],
+            }
+        ],
+        "admin": {},
+        "shutdown_timeout_secs": 5,
+        "insecure_options": insecure,
     }
 
 
@@ -165,30 +235,38 @@ def _wait_for_proxy(port: int, process: subprocess.Popen, log_path: Path) -> Non
     pytest.fail(f"Praxis did not listen on {port}:\n{log_path.read_text()}")
 
 
-def _render_config(proxy_port: int, overlay_path: Path, mount_base: Path, authority: str) -> str:
-    """Render the shipped selected-provider example with test-local addresses and
-    the real vLLM authority, so the lane exercises exactly what ships."""
-    text = EXAMPLE.read_text()
-    sentinels = (
-        'address: "0.0.0.0:8080"',
-        "127.0.0.1:9901",
-        "/etc/praxis/routing/routing-overlay.json",
-        "/run/secrets/provider-credentials",
-        "127.0.0.1:8001",
-        "insecure_options:\n",
-    )
-    for sentinel in sentinels:
-        assert text.count(sentinel) == 1, f"{sentinel!r} is not unique in {EXAMPLE}"
-    text = text.replace('address: "0.0.0.0:8080"', f'address: "127.0.0.1:{proxy_port}"')
-    text = text.replace("127.0.0.1:9901", f"127.0.0.1:{_free_port()}")
-    text = text.replace("/etc/praxis/routing/routing-overlay.json", str(overlay_path))
-    text = text.replace("/run/secrets/provider-credentials", str(mount_base))
-    text = text.replace("127.0.0.1:8001", authority)
-    # The ephemeral GPU runner runs as root; opt in only in this generated config,
-    # mirroring the Anthropic SDK harness.
-    if os.geteuid() == 0:
-        text = text.replace("insecure_options:\n", "insecure_options:\n  allow_root: true\n", 1)
-    return text
+def _start_proxy(directory: Path, authority: str, target_model: str, backend_key: str) -> tuple[subprocess.Popen, int]:
+    """Write the overlay + shim config, start praxis-ai pointed at ``authority``
+    with VLLM_API_KEY=``backend_key``, and wait for it to listen."""
+    overlay_path = directory / "routing-overlay.json"
+    overlay_path.write_text(json.dumps(_signed_overlay(target_model)))
+    proxy_port = _free_port()
+    config_path = directory / "praxis.yaml"
+    config_path.write_text(json.dumps(_build_config(proxy_port, overlay_path, authority)))
+    log_path = directory / "praxis.log"
+    environment = os.environ.copy()
+    environment["VLLM_API_KEY"] = backend_key
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [_binary(), "-c", str(config_path)], stdout=log, stderr=subprocess.STDOUT, env=environment
+        )
+    _wait_for_proxy(proxy_port, process, log_path)
+    return process, proxy_port
+
+
+def _terminate(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+# -----------------------------------------------------------------------------
+# Overlay digest self-check (deterministic; no binary, no backend)
+# -----------------------------------------------------------------------------
 
 
 def test_overlay_generator_reproduces_fixture_digest():
@@ -197,50 +275,114 @@ def test_overlay_generator_reproduces_fixture_digest():
     assert fixture["content_digest"]["value"] == fixture["revision"]["value"]
 
 
+# -----------------------------------------------------------------------------
+# Credential-shim proof against a scripted Anthropic backend (deterministic; needs
+# only the praxis-ai binary, no GPU). Proves routing + translation reach
+# /v1/messages AND that the backend receives Authorization: Bearer <VLLM_API_KEY>
+# and never the client credential or an x-api-key.
+# -----------------------------------------------------------------------------
+
+_SCRIPTED_BACKEND_KEY = "scripted-backend-bearer-key"
+
+
+class _BackendCapture:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.requests: deque[dict] = deque()
+
+
+_CAPTURE = _BackendCapture()
+
+
+class _AnthropicHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        length = int(self.headers.get("content-length", 0))
+        self.rfile.read(length)
+        authorization = self.headers.get("authorization")
+        with _CAPTURE.lock:
+            _CAPTURE.requests.append(
+                {"path": self.path, "authorization": authorization, "x_api_key": self.headers.get("x-api-key")}
+            )
+        if authorization != f"Bearer {_SCRIPTED_BACKEND_KEY}":
+            body = json.dumps({"type": "error", "error": {"type": "authentication_error", "message": "no bearer"}})
+            encoded = body.encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        body = json.dumps(
+            {
+                "type": "message",
+                "id": "msg_scripted",
+                "role": "assistant",
+                "model": "claude-scripted",
+                "content": [{"type": "text", "text": "hello from backend"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            }
+        )
+        encoded = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+def test_credential_shim_routes_and_translates_with_bearer():
+    with _CAPTURE.lock:
+        _CAPTURE.requests.clear()
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), _AnthropicHandler)
+    authority = f"127.0.0.1:{backend.server_address[1]}"
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+    with tempfile.TemporaryDirectory(prefix="praxis-selected-anthropic-shim-") as temporary:
+        process, proxy_port = _start_proxy(Path(temporary), authority, "scripted-model", _SCRIPTED_BACKEND_KEY)
+        try:
+            with OpenAI(
+                base_url=f"http://127.0.0.1:{proxy_port}/v1", api_key="caller-only", max_retries=0, timeout=10
+            ) as client:
+                response = client.chat.completions.create(
+                    model=CLIENT_MODEL, max_tokens=16, messages=[{"role": "user", "content": "hi"}]
+                )
+            assert response.choices[0].message.content == "hello from backend", "Anthropic text must reach OpenAI message"
+            assert response.usage.prompt_tokens == 5 and response.usage.completion_tokens == 3
+        finally:
+            _terminate(process)
+    backend.shutdown()
+    thread.join(timeout=5)
+    captured = [r for r in _CAPTURE.requests if r["path"] == "/v1/messages"]
+    assert captured, f"backend never received /v1/messages; saw {[r['path'] for r in _CAPTURE.requests]}"
+    last = captured[-1]
+    assert last["authorization"] == f"Bearer {_SCRIPTED_BACKEND_KEY}", "backend must receive the injected vLLM bearer"
+    assert last["x_api_key"] is None, "no x-api-key may reach the backend"
+
+
+# -----------------------------------------------------------------------------
+# Live tests against real vLLM /v1/messages (GPU; gated on PRAXIS_TEST_REQUIRE_LIVE)
+# -----------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="module")
 def live_client():
     authority, served_model, backend_key = _live_config()
-    binary = _binary()
     with tempfile.TemporaryDirectory(prefix="praxis-selected-anthropic-vllm-") as temporary:
-        directory = Path(temporary)
-        overlay_path = directory / "routing-overlay.json"
-        overlay_path.write_text(json.dumps(_signed_overlay(served_model)))
-        mount_base = directory / "secrets"
-        secret_dir = mount_base / NAMESPACE / SECRET_NAME
-        secret_dir.mkdir(parents=True)
-        (secret_dir / SECRET_KEY).write_text(backend_key)
-
-        proxy_port = _free_port()
-        config_path = directory / "praxis.yaml"
-        config_path.write_text(_render_config(proxy_port, overlay_path, mount_base, authority))
-        log_path = directory / "praxis.log"
-        with log_path.open("w") as log:
-            process = subprocess.Popen(
-                [binary, "-c", str(config_path)],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
-            )
+        process, proxy_port = _start_proxy(Path(temporary), authority, served_model, backend_key)
         try:
-            _wait_for_proxy(proxy_port, process, log_path)
             client = OpenAI(
-                base_url=f"http://127.0.0.1:{proxy_port}/v1",
-                api_key="caller-only",
-                max_retries=0,
-                timeout=180,
+                base_url=f"http://127.0.0.1:{proxy_port}/v1", api_key="caller-only", max_retries=0, timeout=180
             )
             try:
                 yield client, CLIENT_MODEL
             finally:
                 client.close()
         finally:
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _terminate(process)
 
 
 def test_live_json_and_usage(live_client):
@@ -291,8 +433,7 @@ def test_live_tool_round_trip(live_client):
         messages=[{"role": "user", "content": prompt}],
     )
     calls = first.choices[0].message.tool_calls or []
-    if not calls:
-        pytest.xfail("pinned vLLM v0.29.0 did not emit a tool call for this turn")
+    assert calls, f"model must emit a tool call; got finish_reason={first.choices[0].finish_reason}"
     call = calls[0]
     assert call.function.name == "get_weather"
     assert "paris" in str(json.loads(call.function.arguments).get("city", "")).lower()
