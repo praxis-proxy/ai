@@ -8226,20 +8226,22 @@ class TestAgenticLoopVLLM:
                 item for item in response.output if item.type == "web_search_call"
             ]
             assert len(web_search_calls) == 1, response.output
-            assert web_search_calls[0].status == "failed"
+            assert web_search_calls[0].status == "failed", (
+                f"blank query should fail the call, got {web_search_calls[0].status}"
+            )
             assert len(BraveSearchHandler.request_paths) == request_count, (
                 "a blank query must never reach the search provider"
             )
 
-            # The loop re-entered inference with the bounded failure and the
-            # model produced a final message, so the response still completes.
             messages = [
                 item.model_dump()
                 for item in response.output
                 if item.type == "message"
             ]
-            assert messages
-            assert "blank or exceeded" in json.dumps(messages)
+            assert messages, "the loop should re-enter inference and produce a final message"
+            assert "blank or exceeded" in json.dumps(messages), (
+                f"the model-facing bridge should explain the blank query, got {messages}"
+            )
         finally:
             BraveSearchHandler.reset()
             SimulatorBackendHandler.web_search_queries = []

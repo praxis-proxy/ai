@@ -57,8 +57,8 @@ use crate::{
     callout_policy::MISSING_CALLOUT_CONTEXT,
     web_search::{
         CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
-        SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
-        provider::MAX_SEARCH_RESPONSE_BYTES,
+        SearchQueryValidation, SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results,
+        is_web_search_tool_type, provider::MAX_SEARCH_RESPONSE_BYTES, validate_search_query,
     },
 };
 
@@ -82,21 +82,17 @@ const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 /// `max_calls_per_round`.
 const MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION: usize = 64;
 
-/// Server-side cap on one dispatched search query, in UTF-8 bytes.
-///
-/// `action.query`/`action.queries` are model-generated, so without a bound a
-/// malicious or defective upstream could spend paid provider calls on blank
-/// queries or force URI and JSON-body allocation amplification with a
-/// body-sized string before the provider request fails (issue #1145). Mirrors
-/// the Anthropic managed-search cap (`MAX_SEARCH_QUERY_BYTES`).
-const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
-
 /// Model-facing result for a malformed call without `action.query`.
 const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
 
 /// Model-facing result for a call whose query failed dispatch validation:
-/// blank after trimming, or over the [`MAX_SEARCH_QUERY_BYTES`] cap.
-const INVALID_QUERY_OUTPUT: &str = "Web search could not run because the query was blank or exceeded 8192 bytes.";
+/// blank after trimming, or over the configured `max_query_bytes` bound.
+///
+/// Names the configured cap so the model can shorten its query on the next
+/// round; the ceiling itself is [`crate::web_search::MAX_SEARCH_QUERY_BYTES`].
+fn invalid_query_output(max_query_bytes: usize) -> String {
+    format!("Web search could not run because the query was blank or exceeded {max_query_bytes} bytes.")
+}
 
 /// Model-facing result when the response-wide tool budget is exhausted.
 const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_calls was exhausted.";
@@ -150,6 +146,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_calls_per_round: 32
+/// max_query_bytes: 8192
 /// ```
 pub struct WebSearchDispatchFilter {
     /// The search client for executing queries.
@@ -158,6 +155,9 @@ pub struct WebSearchDispatchFilter {
     default_context_size: SearchContextSize,
     /// Maximum calls accepted from one model response.
     max_calls_per_round: usize,
+    /// Maximum UTF-8 bytes accepted for one dispatched search query. Defaults
+    /// to the shared [`crate::web_search::MAX_SEARCH_QUERY_BYTES`] ceiling; admins may lower it.
+    max_query_bytes: usize,
     /// Prebuilt outbound filter chain each provider request executes through.
     outbound: Arc<FilterPipeline>,
     /// Configured callout-credential slot id (non-secret). When set, each provider
@@ -256,6 +256,7 @@ impl WebSearchDispatchFilter {
             search_client,
             default_context_size: validated.default_context_size,
             max_calls_per_round,
+            max_query_bytes: validated.max_query_bytes,
             outbound,
             user_credential_slot: validated.user_credential,
             _watch_handle: watch_handle,
@@ -323,11 +324,13 @@ impl WebSearchDispatchFilter {
         identity: &CalloutIdentity,
         query_cap: usize,
     ) -> usize {
-        // `incomplete_output` is only read on the incomplete path this call
-        // never takes: `admit_call` already verified `queries` is non-empty.
-        let PreparedCall {
-            ids, queries, action, ..
-        } = prepared;
+        // `admit_call` only passes dispatchable calls through, so the
+        // incomplete branch is unreachable by construction; fail closed if
+        // that invariant is ever violated.
+        let PreparedCall::Dispatchable { ids, queries, action } = prepared else {
+            warn!("web_search_call reached dispatch without a validated query; skipping");
+            return 0;
+        };
         let mut results = Vec::new();
         let mut dispatched = 0_usize;
         let mut successful = 0_usize;
@@ -549,11 +552,11 @@ impl WebSearchDispatchFilter {
             {
                 break;
             }
-            let rejected = rejected(batch.admissions, prepared.ids.index);
+            let rejected = rejected(batch.admissions, prepared.index());
             tool_limit_exceeded |= rejected;
             let query_cap = batch.query_budget.saturating_sub(queries_dispatched);
             let over_budget = calls_dispatched >= batch.call_budget || query_cap == 0;
-            let Some(prepared) = admit_call(ctx, prepared, rejected, over_budget) else {
+            let Some(prepared) = admit_call(ctx, prepared, rejected, over_budget, self.max_query_bytes) else {
                 continue;
             };
             let dispatched = self
@@ -727,7 +730,7 @@ impl HttpFilter for WebSearchDispatchFilter {
 
         // Parse each pending action once here; every dispatch branch below
         // reuses the same parse instead of re-reading the raw call.
-        let prepared = prepare_calls(&calls);
+        let prepared = prepare_calls(&calls, self.max_query_bytes);
 
         let execute_count = admissions.as_ref().map_or(prepared.len(), |values| {
             values.iter().filter(|admitted| **admitted).count()
@@ -1002,60 +1005,99 @@ impl<'a> SearchCallIds<'a> {
 }
 
 /// One pending call, with its hosted action parsed once for the whole batch.
-struct PreparedCall<'a> {
-    /// Identities derived from this call's id, queries, and round position.
-    ids: SearchCallIds<'a>,
-    /// Queries in provider-supplied order; empty when the call is incomplete.
-    queries: Vec<&'a str>,
-    /// Canonical client-visible search action; `Null` when the call is incomplete.
-    action: Value,
-    /// Bounded model-facing output explaining why `queries` is empty. Only
-    /// read on the incomplete path, distinguishing a structurally missing
-    /// query from one that failed dispatch validation.
-    incomplete_output: &'static str,
+///
+/// The two states are exclusive by construction: a dispatchable call carries
+/// its validated queries and canonical action, while an incomplete call
+/// carries only the bounded reason it can never dispatch, so a reason can
+/// never be combined with queries the batch would dispatch (see
+/// `docs/developing/type-design.md`).
+enum PreparedCall<'a> {
+    /// A call with at least one validated query, ready for the provider.
+    Dispatchable {
+        /// Identities derived from this call's id, queries, and round position.
+        ids: SearchCallIds<'a>,
+        /// Queries in provider-supplied order, each trimmed and bounded by the
+        /// configured `max_query_bytes`.
+        queries: Vec<&'a str>,
+        /// Canonical client-visible search action.
+        action: Value,
+    },
+    /// A call that can never dispatch, carrying why.
+    Incomplete {
+        /// Identities derived from this call's id and round position.
+        ids: SearchCallIds<'a>,
+        /// Bounded reason the call dispatched nothing.
+        reason: IncompleteReason,
+    },
+}
+
+/// Why a pending call can never dispatch.
+enum IncompleteReason {
+    /// `action.query`/`action.queries` was missing or structurally malformed.
+    MissingQuery,
+    /// A query failed dispatch validation: blank after trimming, or over the
+    /// configured `max_query_bytes` bound.
+    InvalidQuery,
+}
+
+impl IncompleteReason {
+    /// Bounded model-facing output explaining why the call dispatched nothing.
+    ///
+    /// The invalid-query text names the configured cap so the model can
+    /// shorten its query on the next round.
+    fn output(self, max_query_bytes: usize) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::MissingQuery => std::borrow::Cow::Borrowed(MISSING_QUERY_OUTPUT),
+            Self::InvalidQuery => std::borrow::Cow::Owned(invalid_query_output(max_query_bytes)),
+        }
+    }
 }
 
 impl<'a> PreparedCall<'a> {
+    /// Position within the current model round, regardless of dispatchability.
+    fn index(&self) -> usize {
+        match self {
+            Self::Dispatchable { ids, .. } | Self::Incomplete { ids, .. } => ids.index,
+        }
+    }
+
     /// Pair a parsed action with the identities its queries and position derive.
-    fn new(call_id: &'a str, index: usize, output_index: usize, queries: Vec<&'a str>, action: Value) -> Self {
-        Self {
+    fn dispatchable(call_id: &'a str, index: usize, output_index: usize, queries: Vec<&'a str>, action: Value) -> Self {
+        Self::Dispatchable {
             ids: SearchCallIds::new(call_id, &queries, index, output_index),
             queries,
             action,
-            incomplete_output: MISSING_QUERY_OUTPUT,
         }
     }
 
     /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
     fn malformed(call_id: &'a str, index: usize, output_index: usize) -> Self {
-        Self::incomplete(call_id, index, output_index, MISSING_QUERY_OUTPUT)
+        Self::incomplete(call_id, index, output_index, IncompleteReason::MissingQuery)
     }
 
     /// Placeholder for a call whose query failed dispatch validation.
     fn invalid(call_id: &'a str, index: usize, output_index: usize) -> Self {
-        Self::incomplete(call_id, index, output_index, INVALID_QUERY_OUTPUT)
+        Self::incomplete(call_id, index, output_index, IncompleteReason::InvalidQuery)
     }
 
-    /// Placeholder for a call that dispatches nothing, surfacing
-    /// `incomplete_output` as its bounded model-facing failure.
-    fn incomplete(call_id: &'a str, index: usize, output_index: usize, incomplete_output: &'static str) -> Self {
-        Self {
+    /// Placeholder for a call that dispatches nothing, surfacing `reason` as
+    /// its bounded model-facing failure.
+    fn incomplete(call_id: &'a str, index: usize, output_index: usize, reason: IncompleteReason) -> Self {
+        Self::Incomplete {
             ids: SearchCallIds::new(call_id, &[], index, output_index),
-            queries: Vec::new(),
-            action: Value::Null,
-            incomplete_output,
+            reason,
         }
     }
 }
 
 /// Parse each pending call once, preserving pending-queue order.
-fn prepare_calls(calls: &[(usize, Value)]) -> Vec<PreparedCall<'_>> {
+fn prepare_calls(calls: &[(usize, Value)], max_query_bytes: usize) -> Vec<PreparedCall<'_>> {
     calls
         .iter()
         .enumerate()
         .map(|(index, (output_index, call))| {
             let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-            parse_search_request(call, call_id, index, *output_index)
+            parse_search_request(call, call_id, index, *output_index, max_query_bytes)
         })
         .collect()
 }
@@ -1071,8 +1113,8 @@ fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
 /// Decide whether one pending call may reach the provider, appending its
 /// terminal turn when it may not.
 ///
-/// A call without a dispatchable query — missing, or invalid per
-/// [`validated_query`] — is surfaced as failed on every path, since neither
+/// A call without a dispatchable query — missing, or invalid per the shared
+/// query policy — is surfaced as failed on every path, since neither
 /// rejection nor a budget has anything to dispatch. A call `rejected` by
 /// the response-wide ordered admission pass fails locally and forces completion
 /// without another model round. An `over_budget` call — one that can spend
@@ -1083,24 +1125,28 @@ fn admit_call<'a>(
     prepared: PreparedCall<'a>,
     rejected: bool,
     over_budget: bool,
+    max_query_bytes: usize,
 ) -> Option<PreparedCall<'a>> {
-    if prepared.queries.is_empty() {
-        warn!(
-            call_id = prepared.ids.public,
-            "web_search_call has no dispatchable query (missing or invalid), skipping"
-        );
-        append_incomplete(ctx, &prepared.ids, prepared.incomplete_output);
-        return None;
+    match prepared {
+        PreparedCall::Incomplete { ids, reason } => {
+            warn!(
+                call_id = ids.public,
+                "web_search_call has no dispatchable query (missing or invalid), skipping"
+            );
+            append_incomplete(ctx, &ids, &reason.output(max_query_bytes));
+            None
+        },
+        PreparedCall::Dispatchable { .. } if !rejected && !over_budget => Some(prepared),
+        PreparedCall::Dispatchable { ids, action, .. } => {
+            let (status, notice) = if rejected {
+                ("failed", TOOL_LIMIT_OUTPUT)
+            } else {
+                ("failed", NOT_PERFORMED_OUTPUT)
+            };
+            append_search_turn(ctx, &ids, status, action, Vec::new(), Some(notice));
+            None
+        },
     }
-    let (status, notice) = if rejected {
-        ("failed", TOOL_LIMIT_OUTPUT)
-    } else if over_budget {
-        ("failed", NOT_PERFORMED_OUTPUT)
-    } else {
-        return Some(prepared);
-    };
-    append_search_turn(ctx, &prepared.ids, status, prepared.action, Vec::new(), Some(notice));
-    None
 }
 
 /// Resolve one dispatched call's terminal status and its model-facing notice.
@@ -1179,27 +1225,41 @@ fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
 /// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
 ///
-/// Every query must pass [`validated_query`] before it reaches hashing or
-/// request construction: one that is blank after trimming or exceeds
-/// [`MAX_SEARCH_QUERY_BYTES`] fails the whole call locally as a bounded
+/// Every query must pass the shared query policy ([`validate_search_query`])
+/// before it reaches hashing or request construction: one that is blank after
+/// trimming or exceeds the configured `max_query_bytes` (bounded above by
+/// [`crate::web_search::MAX_SEARCH_QUERY_BYTES`]) fails the whole call locally as a bounded
 /// incomplete turn, so no paid provider request is issued and no body-sized
 /// string is amplified into the outbound URI or JSON body (issue #1145).
-fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize, output_index: usize) -> PreparedCall<'a> {
+fn parse_search_request<'a>(
+    call: &'a Value,
+    call_id: &'a str,
+    index: usize,
+    output_index: usize,
+    max_query_bytes: usize,
+) -> PreparedCall<'a> {
     let Some(action) = call.get("action") else {
         return PreparedCall::malformed(call_id, index, output_index);
     };
     let legacy_query = action.get("query").and_then(Value::as_str);
     match action.get("queries") {
-        Some(Value::Array(values)) if !values.is_empty() => {
-            prepared_from_current_queries(call_id, index, output_index, values, legacy_query.is_some())
-        },
+        Some(Value::Array(values)) if !values.is_empty() => prepared_from_current_queries(
+            call_id,
+            index,
+            output_index,
+            values,
+            legacy_query.is_some(),
+            max_query_bytes,
+        ),
         Some(Value::Array(_)) | None => match legacy_query {
-            Some(query) => match validated_query(query) {
-                Some(query) => {
+            Some(query) => match validate_search_query(query, max_query_bytes) {
+                SearchQueryValidation::Valid(query) => {
                     let action = serde_json::json!({"type": "search", "query": query});
-                    PreparedCall::new(call_id, index, output_index, vec![query], action)
+                    PreparedCall::dispatchable(call_id, index, output_index, vec![query], action)
                 },
-                None => PreparedCall::invalid(call_id, index, output_index),
+                SearchQueryValidation::Blank | SearchQueryValidation::Oversized => {
+                    PreparedCall::invalid(call_id, index, output_index)
+                },
             },
             None => PreparedCall::malformed(call_id, index, output_index),
         },
@@ -1212,12 +1272,17 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize, out
 /// A non-string member is a structural failure, so the call never falls back
 /// to the deprecated `query` field. Every string member must still pass
 /// [`validated_queries`] before the call becomes dispatchable.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "call identity and position plus the parsed action fields and shared query bound"
+)]
 fn prepared_from_current_queries<'a>(
     call_id: &'a str,
     index: usize,
     output_index: usize,
     values: &'a [Value],
     has_legacy_query: bool,
+    max_query_bytes: usize,
 ) -> PreparedCall<'a> {
     let Some(queries) = values.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
         return PreparedCall::malformed(call_id, index, output_index);
@@ -1228,11 +1293,11 @@ fn prepared_from_current_queries<'a>(
             "web_search_call contains deprecated action.query and action.queries; using action.queries"
         );
     }
-    let Some(queries) = validated_queries(&queries) else {
+    let Some(queries) = validated_queries(&queries, max_query_bytes) else {
         return PreparedCall::invalid(call_id, index, output_index);
     };
     let action = serde_json::json!({"type": "search", "queries": queries});
-    PreparedCall::new(call_id, index, output_index, queries, action)
+    PreparedCall::dispatchable(call_id, index, output_index, queries, action)
 }
 
 /// Trim and validate every query of one call, or `None` when any is invalid.
@@ -1241,16 +1306,16 @@ fn prepared_from_current_queries<'a>(
 /// dropped: the model then receives a bounded failed result naming the
 /// problem, instead of a completed call that quietly searched less than it
 /// asked for.
-fn validated_queries<'a>(raw: &[&'a str]) -> Option<Vec<&'a str>> {
+fn validated_queries<'a>(raw: &[&'a str], max_query_bytes: usize) -> Option<Vec<&'a str>> {
     let mut validated = Vec::with_capacity(raw.len());
     for query in raw {
-        let Some(trimmed) = validated_query(query) else {
+        let SearchQueryValidation::Valid(trimmed) = validate_search_query(query, max_query_bytes) else {
             // Log only the size, never the query text: an invalid query may be
             // body-sized, and echoing it would repeat the amplification in the
             // log pipeline.
             warn!(
                 query_bytes = query.len(),
-                limit_bytes = MAX_SEARCH_QUERY_BYTES,
+                limit_bytes = max_query_bytes,
                 "web_search_call query is blank or exceeds the dispatch byte cap; failing the call"
             );
             return None;
@@ -1258,15 +1323,6 @@ fn validated_queries<'a>(raw: &[&'a str]) -> Option<Vec<&'a str>> {
         validated.push(trimmed);
     }
     Some(validated)
-}
-
-/// Trim one model-generated query and enforce the dispatch bounds.
-///
-/// Returns the trimmed query when it is non-empty and at most
-/// [`MAX_SEARCH_QUERY_BYTES`] UTF-8 bytes; `None` marks it invalid.
-fn validated_query(query: &str) -> Option<&str> {
-    let trimmed = query.trim();
-    (!trimmed.is_empty() && trimmed.len() <= MAX_SEARCH_QUERY_BYTES).then_some(trimmed)
 }
 
 /// Remaining web searches this continuation may dispatch.
@@ -1348,7 +1404,7 @@ fn append_search_turn(
 /// persisted replay from treating a missing or invalid query as a successful
 /// search with zero results, and never echoes a potentially body-sized query
 /// into the output (issue #1145).
-fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, incomplete_output: &'static str) {
+fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, incomplete_output: &str) {
     let Some((peak_charge, retained_charge)) = web_search_incomplete_charges(ids) else {
         record_web_search_budget_failure(ctx);
         return;

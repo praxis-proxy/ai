@@ -268,6 +268,10 @@ filter_chains:
                 api_key:
                   env_var: WEB_SEARCH_API_KEY
                 max_calls_per_round: 32
+                # Per-query UTF-8 bound (1..=8192, default 8192): a blank or
+                # oversized model-generated query fails the call locally
+                # instead of reaching the provider.
+                max_query_bytes: 8192
                 # Each provider callout executes through this outbound chain; the
                 # filtered-subrequest executor enforces destination authority,
                 # DNS/SSRF, TLS/SNI, and Host centrally.

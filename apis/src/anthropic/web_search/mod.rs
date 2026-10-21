@@ -26,8 +26,8 @@ use crate::{
     anthropic::messages_to_chat_completions::RESPONSE_RAW_BYTES_KEY,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     web_search::{
-        CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
-        build_config, format_search_results,
+        CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchQueryValidation,
+        WebSearchFilterConfig, build_config, format_search_results, validate_search_query,
     },
 };
 
@@ -39,8 +39,6 @@ const ACTION_LOOP: &str = "loop";
 const ACTION_DONE: &str = "done";
 /// IRR accumulator entry holding the latest serialized Messages request.
 const REQUEST_ACCUMULATOR_KEY: &str = "anthropic_web_search.request";
-/// Maximum UTF-8 size accepted for a server-managed search query.
-const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 
 /// The managed tool name this filter owns in the Anthropic Messages tool list.
 /// Matched both when a request *declares* the tool (credential preflight) and
@@ -446,6 +444,7 @@ impl<'de> Visitor<'de> for TrackedValueVisitor {
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_body_bytes: 67108864
+/// max_query_bytes: 8192
 /// ```
 ///
 /// # Live demo YAML
@@ -473,6 +472,9 @@ pub struct AnthropicWebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum request and response body size buffered by the loop.
     max_body_bytes: usize,
+    /// Maximum UTF-8 bytes accepted for one server-managed search query.
+    /// Defaults to the shared 8 KiB ceiling; admins may lower it.
+    max_query_bytes: usize,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
     /// Prebuilt outbound filter chain each provider request executes through.
@@ -546,6 +548,7 @@ impl AnthropicWebSearchFilter {
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
+            max_query_bytes: validated.max_query_bytes,
             search_client,
             outbound,
             user_credential_slot: validated.user_credential,
@@ -724,14 +727,14 @@ impl AnthropicWebSearchFilter {
             .unwrap_or(&iteration_state.original_request.body);
 
         let (pending, assistant_content) = if let Some(reconstructed) = reconstructed.as_deref() {
-            managed_search_from_response(reconstructed)?
+            managed_search_from_response(reconstructed, self.max_query_bytes)?
         } else {
             let Some(previous_response) = iteration_state.previous_response.as_ref() else {
                 return Err(FilterError::from(format!(
                     "{FILTER_NAME}: previous IRR response unavailable during re-entry"
                 )));
             };
-            managed_search_from_response(&previous_response.body)?
+            managed_search_from_response(&previous_response.body, self.max_query_bytes)?
         };
 
         let mut request: Value = match serde_json::from_slice(request_bytes) {
@@ -875,11 +878,12 @@ impl AnthropicWebSearchFilter {
                 "Web search upstream response exceeds a size limit set by the platform administrator.",
             )));
         }
-        Self::classify_buffered_round(ctx, body)
+        self.classify_buffered_round(ctx, body)
     }
 
     /// Map a fully-buffered round body to its loop decision and matching action.
     fn classify_buffered_round(
+        &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
@@ -887,7 +891,9 @@ impl AnthropicWebSearchFilter {
             set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Continue);
         }
-        match body.as_deref().map_or(ResponseDecision::Done, classify_response) {
+        match body.as_deref().map_or(ResponseDecision::Done, |bytes| {
+            classify_response(bytes, self.max_query_bytes)
+        }) {
             ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
             ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
             ResponseDecision::InvalidManagedCall => {
@@ -901,7 +907,7 @@ impl AnthropicWebSearchFilter {
                 return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
                     wire::ErrorType::InvalidRequest,
-                    "WebSearch input.query must not exceed 8192 bytes",
+                    &format!("WebSearch input.query must not exceed {} bytes", self.max_query_bytes),
                 )));
             },
         }
@@ -949,9 +955,9 @@ impl AnthropicWebSearchFilter {
 
         let reentry = router_reentry(ctx);
         let chunk = body.take();
-        let logical = ctx
-            .extensions
-            .get_or_insert_with(|| streaming::LogicalStream::new(self.max_body_bytes, self.max_body_bytes));
+        let logical = ctx.extensions.get_or_insert_with(|| {
+            streaming::LogicalStream::new(self.max_body_bytes, self.max_body_bytes, self.max_query_bytes)
+        });
         if logical.has_failed() {
             // The stream already failed closed: drop remaining upstream bytes so
             // exactly one terminal error reaches the client.
@@ -1352,7 +1358,7 @@ fn finish_streaming_round(logical: &mut streaming::LogicalStream, reentry: Reent
 }
 
 /// Select a sole, well-formed server-owned search call.
-fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
+fn classify_response(response_bytes: &[u8], max_query_bytes: usize) -> ResponseDecision {
     let Ok(response) = serde_json::from_slice::<ResponseEnvelope<'_>>(response_bytes) else {
         return ResponseDecision::Done;
     };
@@ -1377,6 +1383,7 @@ fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
         response.role.as_ref().and_then(TextField::as_str),
         response.stop_reason.as_ref().and_then(TextField::as_str),
         tools,
+        max_query_bytes,
     )
 }
 
@@ -1396,6 +1403,7 @@ fn classify_tool_calls<'a>(
     role: Option<&'a str>,
     stop_reason: Option<&'a str>,
     tools: impl Iterator<Item = ToolCall<'a>>,
+    max_query_bytes: usize,
 ) -> ResponseDecision {
     if kind != Some("message")
         || role != Some("assistant")
@@ -1418,24 +1426,30 @@ fn classify_tool_calls<'a>(
     let Some(id) = tool.id.filter(|value| !value.is_empty()) else {
         return ResponseDecision::InvalidManagedCall;
     };
-    let Some(query) = tool.query.map(str::trim).filter(|value| !value.is_empty()) else {
-        return ResponseDecision::InvalidManagedCall;
+    // Shared query policy (issue #1145): trim, reject blank, and bound the
+    // UTF-8 size before the query reaches the provider request.
+    let query = match tool.query.map(|query| validate_search_query(query, max_query_bytes)) {
+        Some(SearchQueryValidation::Valid(query)) => query,
+        Some(SearchQueryValidation::Blank) | None => return ResponseDecision::InvalidManagedCall,
+        Some(SearchQueryValidation::Oversized) => return ResponseDecision::QueryTooLong,
     };
-    if query.len() > MAX_SEARCH_QUERY_BYTES {
-        return ResponseDecision::QueryTooLong;
-    }
     let id = id.to_owned();
     let query = query.to_owned();
     ResponseDecision::Managed(PendingSearch { id, query })
 }
 
 /// Recover the managed call and complete content from the accounted response.
-fn managed_search_from_response(response_bytes: &[u8]) -> Result<(PendingSearch, Vec<Value>), FilterError> {
-    let response: ReentryResponseEnvelope<'_> = serde_json::from_slice(response_bytes).map_err(|_error| {
+fn managed_search_from_response(
+    response_bytes: &[u8],
+    max_query_bytes: usize,
+) -> Result<(PendingSearch, Vec<Value>), FilterError> {
+    let missing_call = || {
         FilterError::from(format!(
             "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
         ))
-    })?;
+    };
+    let response: ReentryResponseEnvelope<'_> =
+        serde_json::from_slice(response_bytes).map_err(|_error| missing_call())?;
     let tools = response
         .content
         .as_deref()
@@ -1447,20 +1461,23 @@ fn managed_search_from_response(response_bytes: &[u8]) -> Result<(PendingSearch,
         response.role.as_ref().and_then(TextField::as_str),
         response.stop_reason.as_ref().and_then(TextField::as_str),
         tools,
+        max_query_bytes,
     ) else {
-        return Err(FilterError::from(format!(
-            "{FILTER_NAME}: previous response no longer contains a managed WebSearch call"
-        )));
+        return Err(missing_call());
     };
-    let assistant_content = response
-        .content
+    let assistant_content = tracked_assistant_content(response.content)?;
+    Ok((pending, assistant_content))
+}
+
+/// Recover the complete assistant content from the accounted response.
+fn tracked_assistant_content(content: Option<Vec<TrackedContentValue>>) -> Result<Vec<Value>, FilterError> {
+    content
         .map(|content| content.into_iter().map(|field| field.value).collect())
         .ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: previous response content unavailable during re-entry"
             ))
-        })?;
-    Ok((pending, assistant_content))
+        })
 }
 
 /// Borrow tool fields from the owned content only when the typed classifier
