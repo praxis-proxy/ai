@@ -291,7 +291,10 @@ async fn the_request_head_phase_publishes_the_match_before_the_pre_read() {
     let mut ctx = make_filter_context(&request);
 
     // The head hook runs with nothing buffered — exactly core's ordering.
-    assert!(ctx.buffered_request_body.is_none(), "no body is read before the head phase");
+    assert!(
+        ctx.buffered_request_body.is_none(),
+        "no body is read before the head phase"
+    );
     drop(classifier.on_request_head(&mut ctx).await.unwrap());
 
     let matched = ctx
@@ -306,7 +309,10 @@ async fn the_request_head_phase_publishes_the_match_before_the_pre_read() {
         serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
     ));
     let action = consumer.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Release), "the consumer processes the matched Responses body");
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the consumer processes the matched Responses body"
+    );
     assert_eq!(
         ctx.filter_metadata
             .get("openai_responses_request.format")
