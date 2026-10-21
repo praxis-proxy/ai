@@ -783,6 +783,15 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let action = pipeline
         .execute_http_request_body(&mut ctx, &mut body, true)
         .await
