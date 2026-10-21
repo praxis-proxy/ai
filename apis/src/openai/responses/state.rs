@@ -524,7 +524,7 @@ pub(crate) struct ResponsesState {
     /// Operator metadata-admission decisions for this request (#1724).
     ///
     /// Stamped afresh by `openai_mcp_tool_resolve` from operator configuration
-    /// (policy + connector trust), extended through deferred discovery, and
+    /// (admission mode + connector tool policy), extended through deferred discovery, and
     /// re-enforced at dispatch. Verdicts are typed and operator-owned; client
     /// fields, cached definitions, and restored history never supply admission
     /// authority. Defaults to advisory (empty, no enforcement).
@@ -1031,13 +1031,13 @@ pub(crate) struct DeferredMcpConnector {
     /// Per-server timeout for the deferred `tools/list` call.
     pub timeout: Duration,
 
-    /// Operator trust stamped from connector configuration at resolve time.
+    /// Operator tool policy stamped from connector configuration at resolve time.
     ///
     /// Deferred discovery runs inside `openai_mcp_dispatch`, which has no access
-    /// to the resolver's connector configuration, so the trust is carried here —
+    /// to the resolver's connector configuration, so the policy is carried here —
     /// operator-owned and never derived from server, cached, or client data.
     #[cfg(feature = "openai-mcp-tools")]
-    pub trust: super::mcp_admission::ConnectorTrust,
+    pub tool_policy: super::mcp_admission::ConnectorToolPolicy,
 }
 
 /// Request-scoped slot policy bound to configured MCP connector state.

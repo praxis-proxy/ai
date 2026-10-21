@@ -27,7 +27,8 @@ use crate::{
         DEFAULT_TENANT_ID,
         agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
         mcp_admission::{
-            ConnectorTrust, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+            ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason,
+            McpToolVerdict,
         },
         mcp_classify::{ApprovalFloor, ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval},
         mcp_dispatch::{
@@ -1502,10 +1503,9 @@ fn execution_options_with_admission<'a>(
     }
 }
 
-fn protected_policy(require_read_only: bool) -> McpAdmissionPolicy {
+fn protected_policy() -> McpAdmissionPolicy {
     McpAdmissionPolicy {
         mode: McpAdmissionMode::Protected,
-        require_read_only,
     }
 }
 
@@ -1514,7 +1514,7 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
     // A tool denied at discovery is not in the map; a forged model call to it is
     // rejected explicitly and no `tools/call` is ever dialed.
     let map = sample_tool_map();
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
     admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "gw__delete_repo", "call_id": "c1"});
@@ -1537,12 +1537,17 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
 }
 
 #[tokio::test]
-async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
-    // Defense in depth: an admitted entry whose trusted verdict is writable must
-    // not execute when operator read-only mode is active.
+async fn execute_single_call_rejects_non_read_only_tool_under_read_only_policy() {
+    // Defense in depth: a writable tool under the read_only policy is denied at
+    // discovery (an admitted-but-writable verdict is unrepresentable), and
+    // dispatch re-surfaces that denial before any side effect.
     let map = sample_tool_map();
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
-    admission.record("weather", "get_weather", McpToolVerdict::Admitted { read_only: false });
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
+    admission.record(
+        "weather",
+        "get_weather",
+        McpToolVerdict::Denied(McpDenyReason::Writable),
+    );
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
     let result = execute_single_call(
@@ -1566,7 +1571,7 @@ async fn execute_single_call_rejects_resolved_entry_without_verdict() {
     // A map entry with no operator verdict in protected mode is treated as a
     // bypass and fails closed.
     let map = sample_tool_map();
-    let admission = McpAdmissionDecisions::new(protected_policy(false));
+    let admission = McpAdmissionDecisions::new(protected_policy());
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
     let result = execute_single_call(
@@ -2217,7 +2222,6 @@ fn prepare_response_round_enforces_cap_on_denied_only_round() {
     // rather than the empty-map early return skipping it (#1724).
     let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
         mode: McpAdmissionMode::Protected,
-        require_read_only: true,
     });
     admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
     let mut state = {
@@ -2689,7 +2693,7 @@ async fn configured_deferred_connector_missing_assertion_records_security_failur
                 server_label: "drive".to_owned(),
                 server_url: "https://mcp.example/mcp".to_owned(),
                 timeout: std::time::Duration::from_secs(1),
-                trust: ConnectorTrust::default(),
+                tool_policy: ConnectorToolPolicy::default(),
             }],
             accumulated_output: vec![search.clone()],
             response_object: json!({"output": [search]}),
@@ -2905,7 +2909,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
                 server_label: "drive".to_owned(),
                 server_url,
                 timeout: std::time::Duration::from_secs(1),
-                trust: ConnectorTrust::default(),
+                tool_policy: ConnectorToolPolicy::default(),
             }],
             max_tool_calls: Some(0),
             accumulated_output: vec![search.clone()],
@@ -2955,7 +2959,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
         server_label: "drive".to_owned(),
         server_url: "http://127.0.0.1:9/mcp".to_owned(),
         timeout: std::time::Duration::from_secs(1),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }];
     state.select_test_output(
         "tool_search_call",
@@ -3049,7 +3053,7 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
         server_label: "drive".to_owned(),
         server_url,
         timeout: std::time::Duration::from_secs(1),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }];
     state.select_test_output(
         "tool_search_call",
@@ -4057,7 +4061,7 @@ async fn resume_approval_rechecks_policy_and_names_the_administrator_denial() {
     let store = make_approval_store().await;
     seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
 
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
     admission.record(
         "weather",
         "get_weather",
