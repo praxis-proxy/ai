@@ -275,6 +275,85 @@ fn indexed_buffered_collection_allocates_less_than_payload_dispatch_copies() {
 }
 
 #[test]
+fn indexed_collection_saves_copies_for_many_small_items() {
+    // Companion to the single-long-string probe above: the same total payload
+    // (256 KiB) split across many small items. Indexed dispatch must still avoid
+    // the per-item accumulated and dispatch deep copies, so all three metrics
+    // (allocation count, cumulative bytes, peak live bytes) improve.
+    const ITEMS: usize = 256;
+    const ITEM_BYTES: usize = 1024;
+    let total_payload = (ITEMS * ITEM_BYTES) as u64;
+    let output: Vec<Value> = (0..ITEMS)
+        .map(|i| {
+            json!({
+                "type": "function_call",
+                "id": format!("fc_{i}"),
+                "call_id": format!("call_{i}"),
+                "name": "server__lookup",
+                "arguments": "x".repeat(ITEM_BYTES),
+                "status": "completed"
+            })
+        })
+        .collect();
+    let response = json!({ "object": "response", "output": output });
+    let mut old_response = response.clone();
+    let mut new_response = response;
+    let mut old_state = ResponsesState::default();
+    let mut new_state = ResponsesState::default();
+    let mut old_dispatch = Vec::new();
+
+    let old = allocation_counter::measure(|| {
+        for item in old_response["output"].as_array_mut().unwrap().iter() {
+            old_state.accumulated_output.push(item.clone());
+            old_dispatch.push(item.clone());
+            old_state.messages.push(item.clone());
+            old_state.persisted_messages.push(item.clone());
+        }
+        std::hint::black_box(&old_dispatch);
+    });
+    let new = allocation_counter::measure(|| {
+        collect_output_items(&mut new_response, &mut new_state, &[]);
+        std::hint::black_box(&new_state);
+    });
+
+    assert_eq!(
+        new_state.selected_tool_calls().len(),
+        ITEMS,
+        "indexed collection must preserve every selected tool call"
+    );
+    assert_eq!(
+        new_state.messages, old_state.messages,
+        "indexed collection must preserve messages"
+    );
+    assert_eq!(
+        new_state.persisted_messages, old_state.persisted_messages,
+        "indexed collection must preserve persisted messages"
+    );
+    assert_eq!(
+        new_state.accumulated_output, old_state.accumulated_output,
+        "indexed collection must preserve accumulated output"
+    );
+    assert!(
+        old.bytes_total >= new.bytes_total + 2 * total_payload,
+        "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
+        old.bytes_total,
+        new.bytes_total
+    );
+    assert!(
+        old.count_total > new.count_total,
+        "old payload copies allocated {} times; indexed collection allocated {} times",
+        old.count_total,
+        new.count_total
+    );
+    assert!(
+        old.bytes_max >= new.bytes_max + 2 * total_payload,
+        "old retained copies peaked at {} bytes; indexed collection peaked at {} bytes",
+        old.bytes_max,
+        new.bytes_max
+    );
+}
+
+#[test]
 fn streamed_round_moves_public_output_payload_without_reallocating_it() {
     let mut state = ResponsesState {
         response_object: json!({
@@ -589,6 +668,91 @@ fn budgeted_buffered_output_rejects_before_json_parse() {
     assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
+    // A streaming request has already committed `text/event-stream` by the time a
+    // mid-loop round completes, so a retained-output overflow at the round boundary
+    // must terminate the committed stream with one terminal SSE `error` event
+    // (handed to `openai_stream_events`) and `Continue` — never a JSON 502 reject.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a committed stream cannot be rejected; the terminal error rides the stream"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "stream exhaustion must be reported as a server_error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("The request exceeds a processing limit set by the platform administrator."),
+        "the terminal error must use the sanitized client-facing message"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted stream must not persist a successful response"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the stream must end the agentic loop after exhaustion"
+    );
+}
+
+#[test]
+fn buffered_round_boundary_overflow_rejects_with_json_502() {
+    // The buffered path has committed nothing, so the same round-boundary overflow
+    // still surfaces the JSON 502 error envelope and sets no stream-error metadata.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi"}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "buffered round exhaustion must reject with HTTP 502"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        None,
+        "a buffered rejection must not set streaming error metadata"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted buffered response must not be persisted as successful"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the agentic loop must end after buffered exhaustion"
+    );
 }
 
 #[test]

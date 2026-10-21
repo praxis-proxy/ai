@@ -1,0 +1,106 @@
+# Committed-stream retained-payload overflow (Responses streaming)
+# Requires `--features openai-agentic-loop` (experimental, off by default; it
+# transitively enables openai-responses) because this chain uses openai_agentic_loop.
+#
+# Demonstrates the terminal-failure contract when an upstream Responses SSE
+# stream overflows the request-wide retained-payload budget AFTER the client
+# stream is already committed.
+#
+# `openai_agentic_loop.max_retained_bytes` publishes the request-wide budget
+# policy (`AgenticBudgetPolicy`). `openai_responses_request` installs a
+# per-request `SimpleBudget` from that policy, sized here small enough to admit
+# the create body and the first `response.created` frame (which commits the
+# `text/event-stream` response to the client) but to reject a later oversized
+# output frame.
+#
+# When `openai_stream_events` charges that oversized post-commit chunk and the
+# budget rejects it, the logical stream is poisoned: the loop owner emits one
+# terminal SSE `error` frame and suppresses `response.completed` and the
+# `[DONE]` sentinel, stops processing later frames, and skips successful
+# persistence. There is no second commitment authority on the wire.
+#
+# This is the streaming counterpart to the buffered 413/502 retained-payload
+# rejection: once the stream is committed the terminal can only be an SSE
+# `error` event, never a buffered JSON error.
+#
+# Example:
+#
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Say hello","stream":true}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-budget-overflow-stream]
+
+filter_chains:
+  - name: responses-budget-overflow-stream
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      # Parses the create body and installs the per-request retained-payload
+      # SimpleBudget from the AgenticBudgetPolicy published by
+      # openai_agentic_loop. A create body larger than the budget is rejected
+      # here with a buffered 413 before any backend request.
+      - filter: openai_responses_request
+        on_invalid: reject
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 2
+        # The IRR's 30s default is too short for production model streams.
+        timeout_ms: 360000
+        steps:
+          - name: inference
+            filters:
+              # Composes the inference SSE stream into one logical Responses
+              # lifecycle and owns the terminal frame. Charges each raw chunk
+              # against the retained-payload budget; a rejected post-commit chunk
+              # poisons the stream so the terminal becomes an SSE error.
+              - filter: openai_stream_events
+
+              # Publishes the AgenticBudgetPolicy and owns the single terminal
+              # decision. A tiny retained budget admits the create body and the
+              # committing response.created frame but rejects a later output
+              # frame after its weighted wire and parsing charges exceed the
+              # remaining budget.
+              - filter: openai_agentic_loop
+                max_infer_iters: 1
+                # Tiny retained budget. It admits the small create body and the
+                # committing response.created frame but rejects the post-commit
+                # output frame after its weighted wire and parsing charges exceed
+                # the remaining budget.
+                max_retained_bytes: 131072
+
+              # Selects typed streaming automatically when the effective outbound
+              # body carries `"stream": true`.
+              - filter: openai_responses_proxy
+
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    read_timeout_ms: 300000
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

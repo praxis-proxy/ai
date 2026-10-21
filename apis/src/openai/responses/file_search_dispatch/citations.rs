@@ -504,6 +504,25 @@ fn split_marker(candidate: &str) -> Option<(&str, &str)> {
     Some((file_id, candidate.get(marker_end..)?))
 }
 
+/// Stage citations for the combined staging-peak fixture, returning owned
+/// artifacts. `legacy` selects the former path that also collects removal
+/// offset ranges; the optimized path skips them when no annotation remaps.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "combined-peak fixture stages test-controlled citation text"
+)]
+pub(super) fn stage_citations_owned(
+    text: &str,
+    citation_files: &HashMap<String, String>,
+    legacy: bool,
+) -> (String, Vec<Value>, usize) {
+    let extraction = extract_citations_bounded(text, citation_files, &mut CitationBudget::default(), legacy)
+        .expect("combined-peak fixture citation staging must succeed");
+    let removal_count = extraction.removals.len();
+    (extraction.cleaned, extraction.annotations, removal_count)
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, reason = "tests")]

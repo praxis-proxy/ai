@@ -23,6 +23,8 @@ mod azure_ad;
 mod azure_translation;
 mod bedrock;
 #[cfg(feature = "openai-agentic-loop")]
+mod budget_overflow_streaming;
+#[cfg(feature = "openai-agentic-loop")]
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
 #[cfg(all(feature = "openai-compact", feature = "openai-file-resolve-filter"))]

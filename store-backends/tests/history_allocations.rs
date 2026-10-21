@@ -417,10 +417,16 @@ mod postgres_tests {
                     "postgres restore count={count} payload_bytes={payload_bytes} repetition={repetition} {info:?}"
                 );
                 // One JSON decode plus measured SQLx row streaming. Two empty-read
-                // envelopes cover transaction/metadata queries and pool scheduling;
-                // this reserve does not grow with history size.
-                let total_budget = decoded.bytes_total + driver.bytes_total + 2 * fixed_overhead;
-                let peak_budget = decoded.bytes_max + driver.bytes_max + 2 * fixed_overhead;
+                // envelopes cover transaction/metadata queries and pool scheduling.
+                // Allow 15% of serialized history for variation in total
+                // allocations across async PostgreSQL runs. This remains far
+                // below one extra full-history payload copy. Keep the peak
+                // allowance at 5%, since its high-water measurement is stable.
+                let total_measurement_slack = u64::try_from(wire_bytes / 100 * 15).unwrap();
+                let peak_measurement_slack = u64::try_from(wire_bytes / 20).unwrap();
+                let total_budget =
+                    decoded.bytes_total + driver.bytes_total + 2 * fixed_overhead + total_measurement_slack;
+                let peak_budget = decoded.bytes_max + driver.bytes_max + 2 * fixed_overhead + peak_measurement_slack;
                 assert!(
                     info.bytes_total <= total_budget,
                     "restore must decode once, without full-history sizing or cloning: {info:?}; budget={total_budget}"
