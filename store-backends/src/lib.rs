@@ -64,12 +64,38 @@ fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -
         .is_some_and(|bytes| bytes <= max_bytes)
 }
 
+/// Reconstruct the history from a lazy snapshot and ordered item rows.
+///
+/// A snapshot array is authoritative only when the item table has no rows. Once
+/// item rows exist, only the explicitly wrapped legacy prefix is retained.
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
+fn reconstruct_conversation_history(
+    snapshot: serde_json::Value,
+    mut item_rows: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let prefix = match snapshot {
+        serde_json::Value::Array(messages) if item_rows.is_empty() => return messages,
+        serde_json::Value::Object(mut object) => match object.remove("legacy_messages") {
+            Some(serde_json::Value::Array(messages)) => messages,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if prefix.is_empty() {
+        item_rows
+    } else {
+        let mut messages = prefix;
+        messages.append(&mut item_rows);
+        messages
+    }
+}
+
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, json_values_fit,
 };
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub use provisioning::store_backend_factories;
@@ -102,10 +128,10 @@ pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
     use super::conversation_rebuild_fits;
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
     #[test]
     fn sparse_json_rebuild_needs_structural_headroom() {
         // 40 KiB of nested arrays expanded past 12 MiB across parser/copy peaks
