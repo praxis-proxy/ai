@@ -2742,3 +2742,134 @@ async fn on_request_body_lowers_native_file_search_before_dispatch() {
         "no assignments means no vector-store callout"
     );
 }
+
+/// Build a raw vector-store search body with `num_results` results, each
+/// carrying `chunks_per_result` text chunks of `chunk_bytes` bytes. File IDs are
+/// `file-<prefix><n>` so citation markers can reference the retained results.
+/// All scores are equal, so the stable top-k retains the lowest indices.
+fn build_search_body(num_results: usize, chunks_per_result: usize, chunk_bytes: usize, prefix: &str) -> Vec<u8> {
+    let data: Vec<Value> = (0..num_results)
+        .map(|index| {
+            let content: Vec<Value> = (0..chunks_per_result)
+                .map(|_| json!({"type": "text", "text": "x".repeat(chunk_bytes)}))
+                .collect();
+            json!({
+                "attributes": null,
+                "content": content,
+                "file_id": format!("file-{prefix}{index}"),
+                "filename": format!("{prefix}{index}.txt"),
+                "score": 0.9,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&json!({"data": data})).expect("fixture body serializes")
+}
+
+/// Hold the four file-search staging artifacts live together for one workload
+/// and compare the current reuse path against a deep-copy baseline.
+///
+/// Both closures build `body_count` parallel raw bodies inside the measured
+/// region, bounded-decode each to the top-`RETAIN` results, build context from
+/// all retained results, and stage citations over per-body marker text. The
+/// baseline additionally keeps a full
+/// `serde_json::Value` tree per body, builds the context via owned per-chunk
+/// annotations copied into the wrapper, and stages citations on the legacy path
+/// that collects removal offset ranges. The assertion covers allocation count
+/// and peak live bytes (`bytes_max`) while all artifacts coexist.
+#[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
+fn measure_combined_staging_peak(
+    label: &str,
+    body_count: usize,
+    results_per_body: usize,
+    chunks_per_result: usize,
+    chunk_bytes: usize,
+) {
+    const RETAIN: usize = 5;
+    const QUERY: &str = "combined staging fixture";
+
+    let build_bodies = || {
+        (0..body_count)
+            .map(|body_index| {
+                build_search_body(
+                    results_per_body,
+                    chunks_per_result,
+                    chunk_bytes,
+                    &format!("{label}{body_index}-"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Each body's text references its retained file IDs with a marker, so the
+    // legacy path stages one removal range per marker while the current path
+    // skips the unused offsets.
+    let texts: Vec<String> = (0..body_count)
+        .map(|body_index| {
+            (0..RETAIN)
+                .map(|result_index| {
+                    format!("chunk {result_index} source <|file-{label}{body_index}-{result_index}|>\n")
+                })
+                .collect::<String>()
+        })
+        .collect();
+    let files: HashMap<String, String> = (0..body_count)
+        .flat_map(|body_index| {
+            (0..RETAIN).map(move |result_index| {
+                (
+                    format!("file-{label}{body_index}-{result_index}"),
+                    format!("{label}{body_index}-{result_index}.txt"),
+                )
+            })
+        })
+        .collect();
+
+    let optimized = allocation_counter::measure(|| {
+        let bodies = build_bodies();
+        let mut staged = Vec::with_capacity(bodies.len());
+        for (body, text) in bodies.iter().zip(texts.iter()) {
+            let decoded = client::decode_retained_results(body, RETAIN);
+            let retained: Vec<&SearchResult> = decoded.iter().collect();
+            let context = model_context::build_context_reused(&retained, QUERY);
+            let citations = citations::stage_citations_owned(text, &files, false);
+            staged.push((decoded, context, citations));
+        }
+        std::hint::black_box((&bodies, &staged));
+    });
+    let baseline = allocation_counter::measure(|| {
+        let bodies = build_bodies();
+        let mut staged = Vec::with_capacity(bodies.len());
+        for (body, text) in bodies.iter().zip(texts.iter()) {
+            let tree: Value = serde_json::from_slice(body).expect("baseline full tree decodes");
+            let decoded = client::decode_retained_results(body, RETAIN);
+            let retained: Vec<&SearchResult> = decoded.iter().collect();
+            let context = model_context::build_context_deep_copy(&retained, QUERY);
+            let citations = citations::stage_citations_owned(text, &files, true);
+            staged.push((tree, decoded, context, citations));
+        }
+        std::hint::black_box((&bodies, &staged));
+    });
+
+    eprintln!("combined hosted-search staging peak [{label}]: optimized={optimized:?}, baseline={baseline:?}");
+    assert!(
+        optimized.count_total < baseline.count_total,
+        "[{label}] current staging must allocate fewer times than the deep-copy baseline: optimized={optimized:?}, baseline={baseline:?}"
+    );
+    assert!(
+        optimized.bytes_max < baseline.bytes_max,
+        "[{label}] current staging peak live bytes must stay below the deep-copy baseline: optimized={optimized:?}, baseline={baseline:?}"
+    );
+}
+
+/// #1479 combined-peak acceptance: hold parallel response bodies, decoded
+/// results, model-context text, and citation staging live together and prove
+/// the current borrow/reuse path beats a deep-copy baseline for both a
+/// many-small and a few-large workload at comparable total payload.
+#[test]
+fn combined_hosted_search_staging_peak_beats_deep_copy_baseline() {
+    // Many small results: hundreds of bodies, each with many small results so
+    // bounded retention drops most rows the baseline tree still holds.
+    measure_combined_staging_peak("small", 256, 32, 4, 64);
+    // A few large results: a handful of bodies, each with few but large results
+    // (16 chunks x 4 KiB = 64 KiB per result) so the full tree and deep-copy
+    // context dominate the baseline peak at a comparable total payload.
+    measure_combined_staging_peak("large", 4, 8, 16, 4_096);
+}

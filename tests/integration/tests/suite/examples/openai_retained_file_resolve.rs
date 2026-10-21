@@ -33,7 +33,7 @@ fn agentic_file_config(
         1,
     );
     let with_store = with_budget.replace("sqlite://responses.db?mode=rwc", db.url());
-    let with_key = with_store.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key");
+    let with_key = with_store.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &with_key,
         proxy_port,

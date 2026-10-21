@@ -866,6 +866,8 @@ insecure_options:
 
 #[test]
 fn example_config_rejects_ssrf_blocked_file_url_with_403() {
+    const PATH_SECRET: &str = "PATH_BEARER_SECRET";
+
     let files_api_port = start_files_api_stub();
     let inference_guard = start_backend_with_shutdown("inference-backend");
     let default_guard = start_backend_with_shutdown("default-backend");
@@ -881,18 +883,20 @@ fn example_config_rejects_ssrf_blocked_file_url_with_403() {
         ]),
     );
     let proxy = start_proxy(&config);
-    let body = r#"{
+    let body = format!(
+        r#"{{
         "model": "gpt-4.1",
-        "input": [{
+        "input": [{{
             "type": "message",
             "role": "user",
-            "content": [{
+            "content": [{{
                 "type": "input_file",
-                "file_url": "http://192.0.2.1/latest/meta-data/"
-            }]
-        }]
-    }"#;
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+                "file_url": "http://192.0.2.1/{PATH_SECRET}/latest/meta-data/"
+            }}]
+        }}]
+    }}"#,
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     let status = parse_status(&raw);
 
     assert_eq!(
@@ -913,6 +917,12 @@ fn example_config_rejects_ssrf_blocked_file_url_with_403() {
             .as_str()
             .is_some_and(|message| message.contains("blocked by security policy")),
         "blocked file_url response should explain the security rejection"
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.contains(PATH_SECRET)),
+        "credential-bearing URL paths must not appear in client errors"
     );
 }
 

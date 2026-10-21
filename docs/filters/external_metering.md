@@ -7,7 +7,7 @@ Integrates with an external metering service for pre-request balance checks and 
 
 ## Configuration Notes
 
-Tenant identity is resolved from the highest-trust source available: verified `{prefix}*` metadata written by an authentication filter, then the `identity_header_guard` filter's namespaced `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request headers. A higher tier always wins, so forged client headers can never override verified claims, and identity headers plus client credentials are always stripped before the request is forwarded.
+Tenant identity is resolved from the highest-trust source available: verified `{prefix}*` metadata written by an authentication filter, then the `identity_header_guard` filter's namespaced `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request headers. A higher tier always wins, so forged client headers can never override verified claims, and identity headers plus client credentials are always stripped before the request is forwarded. Both event types carry `data.organization_id` and `data.cost_center` from `{prefix}organization-id` and `{prefix}cost-center`. When absent, those fields are empty strings rather than invented defaults.
 
 When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
 
@@ -22,10 +22,11 @@ When no `{prefix}model` identity header names the model and `model_to_provider` 
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
 | `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. |
-| `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`. |
+| `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`, `{prefix}organization-id`, `{prefix}cost-center`. |
 | `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
 | `default_model` | string | no | Fallback model name when no identity model header is present. |
+| `internal_auth_token` | CredentialSource | no | Optional internal bearer token for authenticating metering callouts (the balance check and the usage report). One of `value \| env_var \| file`, read through the shared [`CredentialSource`] core: bounded reads, restart-free file rotation (ideal for a Kubernetes projected Secret), and fail-closed publication. When omitted, callouts are sent unauthenticated (unchanged behavior). |
 
 ## Example
 

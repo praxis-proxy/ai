@@ -35,8 +35,8 @@ fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> Stri
         std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read web-search-scoped-credentials example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.

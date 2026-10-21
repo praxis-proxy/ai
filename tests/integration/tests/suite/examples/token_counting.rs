@@ -18,6 +18,7 @@
 //! | `*_body_passes_through` (SSE streaming) | openai/anthropic/google | 200 OK + body byte-for-byte unchanged |
 //! | `missing_usage_fields_*` | openai | Praxis-Token-* headers absent |
 //! | `example_config_*` | openai | 200 OK + body unchanged |
+//! | `example_config_token_metrics_carry_promoted_model_label` | openai | `praxis_ai_*` metrics labeled with the `model_to_header`-promoted body model (never `unknown` or a raw client `X-Model`) |
 //!
 //! ## Why extracted counts aren't asserted here
 //!
@@ -43,11 +44,14 @@
 //! Actual extracted-value correctness for every provider is covered by
 //! boundary tests in `filters/src/token_usage/count/tests.rs`.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_header,
-    parse_status, patch_yaml, start_proxy,
+    Backend, PraxisProcess, allow_loopback_endpoints, example_config_path, free_port, http_get, http_send, json_post,
+    load_example_config, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -345,4 +349,63 @@ fn example_config_token_counting_openai() {
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(parse_status(&raw), 200, "example config smoke test should return 200");
     assert_eq!(parse_body(&raw), OPENAI_JSON, "body should pass through unchanged");
+}
+
+// -----------------------------------------------------------------------------
+// Example config model-labeled metrics
+// -----------------------------------------------------------------------------
+
+#[test]
+fn example_config_token_metrics_carry_promoted_model_label() {
+    let backend = Backend::fixed(OPENAI_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let (port, admin) = (free_port(), free_port());
+
+    let yaml = std::fs::read_to_string(example_config_path("token-counting.yaml")).expect("read example");
+    let patched = allow_loopback_endpoints(&patch_yaml(
+        &yaml,
+        port,
+        &HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:9901", admin)]),
+    ));
+    let mut proxy = PraxisProcess::spawn(&patched, &format!("127.0.0.1:{port}"));
+
+    let raw = http_send(
+        &format!("127.0.0.1:{port}"),
+        &json_post("/v1/chat/completions", r#"{"model":"gpt-4","messages":[]}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "example config should proxy the request");
+    assert_eq!(parse_body(&raw), OPENAI_JSON, "body should pass through unchanged");
+
+    // token_count emits praxis_ai_* metrics whose model label comes from the
+    // model_to_header-promoted body model, never a raw client X-Model header.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, metrics) = http_get(&format!("127.0.0.1:{admin}"), "/metrics", None);
+        let labeled = metrics.lines().any(|l| {
+            l.starts_with("praxis_ai_prompt_tokens_total")
+                && l.contains(r#"model="gpt-4""#)
+                && l.contains(r#"cluster="backend""#)
+        });
+        if labeled {
+            assert!(
+                !metrics
+                    .lines()
+                    .any(|l| l.starts_with("praxis_ai_") && l.contains(r#"model="unknown""#)),
+                "no praxis_ai_* metric should carry the unknown model label:\n{metrics}"
+            );
+            let status = proxy.terminate();
+            assert!(
+                status.success(),
+                "graceful shutdown should exit zero ({status}):\n{}",
+                proxy.logs()
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "promoted model label never appeared in /metrics:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

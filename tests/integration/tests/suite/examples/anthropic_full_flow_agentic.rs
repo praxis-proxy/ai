@@ -207,8 +207,8 @@ fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> Stri
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read full-flow-agentic example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // `credential_injection` resolves its secret at pipeline-build time; repoint the
     // Chat Completions backend Bearer to a Cargo-provided var so the build succeeds

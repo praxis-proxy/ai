@@ -530,7 +530,7 @@ fn has_literal_provider_credentials(config: &serde_yaml::Mapping) -> bool {
 /// normally call `tools/list` even when the connector URL is the replay-owned
 /// backend, so those scenario requests are not contained — **unless** the
 /// resolver runs in protected admission mode (#1724), where an untrusted target
-/// (a direct `server_url`, or a connector with no catalog trust) is excluded
+/// (a direct `server_url`, or a connector with `tool_policy: deny`) is excluded
 /// without dialing and is therefore replay-contained.
 fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScenario) -> Result<(), FixtureError> {
     let mut resolvers = Vec::new();
@@ -579,21 +579,19 @@ fn resolver_is_protected(resolver: &Value) -> bool {
         == Some("protected")
 }
 
-/// Whether a configured connector is operator-trusted for catalog admission.
-fn connector_has_catalog_trust(resolver: &Value, connector_id: &str) -> bool {
+/// The configured operator tool policy for a connector (`deny` | `allow_all` |
+/// `read_only`). An omitted policy or unknown connector defaults to `deny`.
+fn connector_tool_policy<'a>(resolver: &'a Value, connector_id: &str) -> &'a str {
     resolver
         .get("connectors")
         .and_then(Value::as_array)
-        .is_some_and(|connectors| {
-            connectors.iter().any(|connector| {
-                connector.get("id").and_then(Value::as_str) == Some(connector_id)
-                    && connector
-                        .get("trust")
-                        .and_then(|trust| trust.get("catalog"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-            })
+        .and_then(|connectors| {
+            connectors
+                .iter()
+                .find(|connector| connector.get("id").and_then(Value::as_str) == Some(connector_id))
         })
+        .and_then(|connector| connector.get("tool_policy").and_then(Value::as_str))
+        .unwrap_or("deny")
 }
 
 /// Whether a scenario request body contains an MCP tool that would call
@@ -628,10 +626,10 @@ fn mcp_tool_would_dial(tool: &Value, protected: bool, resolver: &Value) -> bool 
     if !protected {
         return true;
     }
-    // Protected mode: only a catalog-trusted connector is dialed. Untrusted
-    // direct targets and untrusted connectors are excluded without dialing.
+    // Protected mode excludes direct client-selected targets and connectors
+    // whose operator tool policy is `deny` before dialing.
     match tool.get("connector_id").and_then(Value::as_str) {
-        Some(connector_id) => connector_has_catalog_trust(resolver, connector_id),
+        Some(connector_id) => matches!(connector_tool_policy(resolver, connector_id), "allow_all" | "read_only"),
         None => false,
     }
 }
@@ -1951,15 +1949,60 @@ mod tests {
             sanitize::RedactionRules,
         },
         ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, build_replay_config_with_aliases,
-        compare_imported_requests, config_contains_endpoint_address, contain_replay_external_resources,
-        finish_backend_after_proxy_shutdown, fixture_comparison_value, has_only_normal_relative_components,
-        is_network_value_key, is_replay_contained_filter, load_and_validate_config_source, patch_overlay_path,
-        resolve_example_config_path, send_recorded_request, validate_endpoint_collection,
-        validate_generic_network_string, validate_network_string_with_context, validate_replay_filters,
-        validate_replay_network_value, validate_scenario_requests, validate_singular_endpoint, validate_sse_events,
-        validate_upstream_inputs,
+        compare_imported_requests, config_contains_endpoint_address, connector_tool_policy,
+        contain_replay_external_resources, finish_backend_after_proxy_shutdown, fixture_comparison_value,
+        has_only_normal_relative_components, is_network_value_key, is_replay_contained_filter,
+        load_and_validate_config_source, mcp_tool_would_dial, patch_overlay_path, resolve_example_config_path,
+        send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
+        validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
+        validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
+
+    #[test]
+    fn mcp_tool_would_dial_tracks_connector_tool_policy() {
+        // Replay containment must mirror protected-mode admission: `deny` is
+        // excluded before contact, while both policies that may admit tools need
+        // discovery (read_only must inspect tool annotations).
+        let resolver = |tool_policy: Option<&str>| {
+            let mut connector = json!({"id": "gw", "server_url": "https://gw.internal/mcp"});
+            if let Some(tool_policy) = tool_policy {
+                connector["tool_policy"] = json!(tool_policy);
+            }
+            json!({
+                "tool_admission": {"mode": "protected"},
+                "connectors": [connector],
+            })
+        };
+        let connector_tool = json!({"type": "mcp", "server_label": "s", "connector_id": "gw"});
+
+        assert!(
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(Some("deny"))),
+            "denied connector is excluded without contact"
+        );
+        assert!(
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("allow_all"))),
+            "allow_all connector is dialed for discovery"
+        );
+        assert!(
+            mcp_tool_would_dial(&connector_tool, true, &resolver(Some("read_only"))),
+            "read_only connector is dialed to inspect tool metadata"
+        );
+
+        // Omitted policy defaults to deny (no dial in protected mode).
+        assert!(
+            !mcp_tool_would_dial(&connector_tool, true, &resolver(None)),
+            "a connector without a tool policy defaults to deny"
+        );
+
+        // Direct helper behavior.
+        assert_eq!(connector_tool_policy(&resolver(Some("allow_all")), "gw"), "allow_all");
+        assert_eq!(
+            connector_tool_policy(&resolver(Some("allow_all")), "missing"),
+            "deny",
+            "an unknown connector defaults to deny"
+        );
+    }
 
     #[test]
     fn selected_provider_legacy_fixture_config_is_replay_contained() {

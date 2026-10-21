@@ -377,6 +377,7 @@ fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
     };
 
     set_token_usage(ctx, input, output, None);
+    crate::llm_metrics::record_token_usage(ctx, input, output, None, None);
     debug!(
         input,
         output, "extracted Bedrock InvokeModel token counts from response headers"
@@ -525,6 +526,13 @@ fn publish_token_usage(ctx: &mut HttpFilterContext<'_>, usage: TokenUsage) {
     );
     set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
     set_reasoning_token_usage(ctx, usage.reasoning_tokens());
+    crate::llm_metrics::record_token_usage(
+        ctx,
+        usage.input_tokens(),
+        usage.output_tokens(),
+        usage.cache_read_tokens(),
+        usage.reasoning_tokens(),
+    );
 }
 
 // -----------------------------------------------------------------------------

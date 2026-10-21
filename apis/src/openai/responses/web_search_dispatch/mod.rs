@@ -122,7 +122,8 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// ```yaml
 /// filter: openai_web_search_dispatch
 /// provider: brave
-/// api_key: ${WEB_SEARCH_API_KEY}
+/// api_key:
+///   env_var: WEB_SEARCH_API_KEY
 /// ```
 ///
 /// # Full YAML
@@ -130,7 +131,8 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// ```yaml
 /// filter: openai_web_search_dispatch
 /// provider: brave
-/// api_key: ${WEB_SEARCH_API_KEY}
+/// api_key:
+///   env_var: WEB_SEARCH_API_KEY
 /// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
@@ -149,6 +151,10 @@ pub struct WebSearchDispatchFilter {
     /// request uses the caller's per-user secret from this slot instead of the
     /// shared `api_key`; a missing/empty slot value fails the response closed.
     user_credential_slot: Option<String>,
+    /// Retains the API key file watcher (for a `file`-sourced key) for the
+    /// filter's lifetime so rotation keeps publishing; dropping it stops the
+    /// watcher. `None` for `value`/`env_var` sources.
+    _watch_handle: Option<crate::credential_source::WatchHandle>,
 }
 
 impl WebSearchDispatchFilter {
@@ -231,7 +237,7 @@ impl WebSearchDispatchFilter {
             .into());
         }
         let max_calls_per_round = cfg.max_calls_per_round;
-        let validated = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
+        let (validated, watch_handle) = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
         let search_client = SearchClient::from_config("openai_web_search_dispatch", &validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
@@ -239,6 +245,7 @@ impl WebSearchDispatchFilter {
             max_calls_per_round,
             outbound,
             user_credential_slot: validated.user_credential,
+            _watch_handle: watch_handle,
         }))
     }
 

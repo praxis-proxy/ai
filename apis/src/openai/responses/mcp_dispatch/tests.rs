@@ -18,7 +18,8 @@ use super::{
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
     extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
     mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, reserve_mcp_execution, resolve_tool_entry, result_payload_limit,
+    prepare_response_round, process_call_result, reserve_mcp_execution, reserve_pending_approval_rows,
+    resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -26,7 +27,8 @@ use crate::{
         DEFAULT_TENANT_ID,
         agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
         mcp_admission::{
-            ConnectorTrust, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+            ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason,
+            McpToolVerdict,
         },
         mcp_classify::{ApprovalFloor, ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval},
         mcp_dispatch::{
@@ -122,6 +124,56 @@ fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
     let before = too_tight.simple_budget.unwrap().remaining_bytes();
     assert!(reserve_mcp_execution(&mut too_tight, 1, 8_192, 8_192).is_none());
     assert_eq!(too_tight.simple_budget.unwrap().remaining_bytes(), before);
+}
+
+#[test]
+fn reserve_pending_approval_rows_fails_closed_on_unknowable_size() {
+    // The `ResponseStore` trait default returns `usize::MAX` for a backend that
+    // cannot size stored approvals. Admission must reject that sentinel rather
+    // than load an unbounded payload, so an unknown backend fails closed before
+    // the rows are fetched.
+    let mut unknowable = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let before = unknowable.simple_budget.unwrap().remaining_bytes();
+    assert!(
+        !reserve_pending_approval_rows(&mut unknowable, 1, usize::MAX),
+        "a usize::MAX payload size must be rejected, not charged"
+    );
+    assert_eq!(
+        unknowable.simple_budget.unwrap().remaining_bytes(),
+        before,
+        "a rejected reservation must not spend any headroom"
+    );
+
+    // A small, knowable payload fits within a generous budget; the charge is
+    // 8x the payload bytes plus an 8 KiB per-row fixed cost.
+    let mut ample = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let ample_before = ample.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(reserve_pending_approval_rows(&mut ample, 2, 256));
+    assert_eq!(
+        ample.simple_budget.unwrap().remaining_bytes(),
+        Some(ample_before - (256 * 8 + 2 * 8_192)),
+        "the charge is 8x payload plus 8 KiB per reserved row"
+    );
+
+    // The same small payload cannot fit a tight budget: an ordinary
+    // over-budget rejection also leaves the headroom untouched.
+    let mut tight = ResponsesState {
+        simple_budget: SimpleBudget::new(4_096, 0),
+        ..ResponsesState::default()
+    };
+    let tight_before = tight.simple_budget.unwrap().remaining_bytes();
+    assert!(!reserve_pending_approval_rows(&mut tight, 1, 256));
+    assert_eq!(tight.simple_budget.unwrap().remaining_bytes(), tight_before);
+
+    // Without a configured budget the reservation is a no-op pass.
+    let mut unbudgeted = ResponsesState::default();
+    assert!(reserve_pending_approval_rows(&mut unbudgeted, 4, usize::MAX));
 }
 
 #[test]
@@ -1451,10 +1503,9 @@ fn execution_options_with_admission<'a>(
     }
 }
 
-fn protected_policy(require_read_only: bool) -> McpAdmissionPolicy {
+fn protected_policy() -> McpAdmissionPolicy {
     McpAdmissionPolicy {
         mode: McpAdmissionMode::Protected,
-        require_read_only,
     }
 }
 
@@ -1463,7 +1514,7 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
     // A tool denied at discovery is not in the map; a forged model call to it is
     // rejected explicitly and no `tools/call` is ever dialed.
     let map = sample_tool_map();
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
     admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "gw__delete_repo", "call_id": "c1"});
@@ -1486,12 +1537,17 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
 }
 
 #[tokio::test]
-async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
-    // Defense in depth: an admitted entry whose trusted verdict is writable must
-    // not execute when operator read-only mode is active.
+async fn execute_single_call_rejects_non_read_only_tool_under_read_only_policy() {
+    // Defense in depth: a writable tool under the read_only policy is denied at
+    // discovery (an admitted-but-writable verdict is unrepresentable), and
+    // dispatch re-surfaces that denial before any side effect.
     let map = sample_tool_map();
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
-    admission.record("weather", "get_weather", McpToolVerdict::Admitted { read_only: false });
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
+    admission.record(
+        "weather",
+        "get_weather",
+        McpToolVerdict::Denied(McpDenyReason::Writable),
+    );
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
     let result = execute_single_call(
@@ -1515,7 +1571,7 @@ async fn execute_single_call_rejects_resolved_entry_without_verdict() {
     // A map entry with no operator verdict in protected mode is treated as a
     // bypass and fails closed.
     let map = sample_tool_map();
-    let admission = McpAdmissionDecisions::new(protected_policy(false));
+    let admission = McpAdmissionDecisions::new(protected_policy());
     let options = execution_options_with_admission(std::time::Duration::from_millis(100), &admission);
     let tc = json!({"name": "weather__get_weather", "call_id": "c1"});
     let result = execute_single_call(
@@ -2166,7 +2222,6 @@ fn prepare_response_round_enforces_cap_on_denied_only_round() {
     // rather than the empty-map early return skipping it (#1724).
     let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
         mode: McpAdmissionMode::Protected,
-        require_read_only: true,
     });
     admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
     let mut state = {
@@ -2638,7 +2693,7 @@ async fn configured_deferred_connector_missing_assertion_records_security_failur
                 server_label: "drive".to_owned(),
                 server_url: "https://mcp.example/mcp".to_owned(),
                 timeout: std::time::Duration::from_secs(1),
-                trust: ConnectorTrust::default(),
+                tool_policy: ConnectorToolPolicy::default(),
             }],
             accumulated_output: vec![search.clone()],
             response_object: json!({"output": [search]}),
@@ -2854,7 +2909,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
                 server_label: "drive".to_owned(),
                 server_url,
                 timeout: std::time::Duration::from_secs(1),
-                trust: ConnectorTrust::default(),
+                tool_policy: ConnectorToolPolicy::default(),
             }],
             max_tool_calls: Some(0),
             accumulated_output: vec![search.clone()],
@@ -2904,7 +2959,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
         server_label: "drive".to_owned(),
         server_url: "http://127.0.0.1:9/mcp".to_owned(),
         timeout: std::time::Duration::from_secs(1),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }];
     state.select_test_output(
         "tool_search_call",
@@ -2998,7 +3053,7 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
         server_label: "drive".to_owned(),
         server_url,
         timeout: std::time::Duration::from_secs(1),
-        trust: ConnectorTrust::default(),
+        tool_policy: ConnectorToolPolicy::default(),
     }];
     state.select_test_output(
         "tool_search_call",
@@ -3590,6 +3645,100 @@ async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
 }
 
 #[tokio::test]
+async fn over_budget_approval_is_retryable_then_replay_is_rejected() {
+    // #1478: a budget rejection must leave the approval pending so a corrected
+    // follow-up under a sufficient budget can still consume it exactly once, and
+    // a later replay of the consumed approval is rejected.
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_retry", "{\"city\":\"Paris\"}").await;
+    let filter = make_dispatch_filter();
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+
+    // Attempt 1: too small a budget rejects before loading or consuming the row.
+    let req1 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx1 = make_owned_filter_context(&req1);
+    register_store(&mut ctx1, Arc::clone(&store));
+    ctx1.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(131_072, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body1 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx1, &mut body1, true).await.unwrap());
+    assert_eq!(rejection.status, 413, "an over-budget resumption is rejected");
+    assert!(reject_message(&rejection).contains("limit set by the platform administrator"));
+    assert!(
+        ctx1.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "the rejected attempt must not execute the tool"
+    );
+
+    // Attempt 2: a sufficient budget resumes and executes the pending call once.
+    let req2 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx2 = make_owned_filter_context(&req2);
+    register_store(&mut ctx2, Arc::clone(&store));
+    ctx2.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let resumed = filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap();
+    assert!(
+        matches!(resumed, FilterAction::Continue),
+        "a retry under a sufficient budget must resume, not reject"
+    );
+    let state2 = ctx2.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state2.accumulated_output.len(),
+        1,
+        "the retry executes the tool exactly once"
+    );
+    assert_eq!(state2.accumulated_output[0]["id"], "call_retry");
+
+    // Attempt 3: the now-consumed approval cannot be replayed.
+    let req3 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx3 = make_owned_filter_context(&req3);
+    register_store(&mut ctx3, Arc::clone(&store));
+    ctx3.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body3 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let replay = expect_reject(filter.on_request_body(&mut ctx3, &mut body3, true).await.unwrap());
+    assert_eq!(replay.status, 400, "a consumed approval cannot be replayed");
+    assert!(reject_message(&replay).contains("already been used"));
+    assert!(
+        ctx3.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "replay produces no second mcp_call"
+    );
+
+    // The durable row is spent exactly once: a direct consume now finds nothing.
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_retry"], 9_999)
+            .await
+            .unwrap(),
+        Some(0),
+        "the approval was consumed exactly once by the successful retry"
+    );
+}
+
+#[tokio::test]
 async fn resume_approval_is_hidden_from_another_owner_in_the_same_tenant() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -3912,7 +4061,7 @@ async fn resume_approval_rechecks_policy_and_names_the_administrator_denial() {
     let store = make_approval_store().await;
     seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
 
-    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    let mut admission = McpAdmissionDecisions::new(protected_policy());
     admission.record(
         "weather",
         "get_weather",

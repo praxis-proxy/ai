@@ -370,6 +370,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.committed_stream_budget_overflow
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/budget-overflow-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.agentic.deferred_mcp_connectors
     scopes:
       - responses_agentic_loop

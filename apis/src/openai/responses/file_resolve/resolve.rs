@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, warn};
 
-use super::resolve_url::{FileUrlResolver, redact_url};
+use super::resolve_url::{FileUrlResolver, safe_url_label};
 use crate::{
     callout_policy::OnMissing,
     openai::{
@@ -138,7 +138,7 @@ impl std::fmt::Display for ReferenceSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FileId(id) => write!(f, "{id}"),
-            Self::FileUrl(url) => write!(f, "{}", redact_url(url)),
+            Self::FileUrl(url) => write!(f, "{}", safe_url_label(url)),
         }
     }
 }
@@ -181,13 +181,13 @@ pub(crate) enum ResolveError {
 
     /// The file URL target is blocked by SSRF policy.
     FileUrlBlocked {
-        /// Redacted URL label for client-facing messages.
+        /// Origin-only URL label for internal diagnostics.
         label: String,
     },
 
     /// The file URL fetch failed (DNS, timeout, non-success status).
     FileUrlFailed {
-        /// Redacted URL label for client-facing messages.
+        /// Origin-only URL label for internal diagnostics.
         label: String,
         /// Human-readable error description.
         detail: String,
@@ -452,7 +452,7 @@ impl ResolutionBudget {
                 ReferenceSource::FileUrl(url) => {
                     let Some(resolver) = url_resolver else {
                         return Err(ResolveError::FileUrlFailed {
-                            label: redact_url(url),
+                            label: safe_url_label(url),
                             detail: "file URL resolution not configured".to_owned(),
                         });
                     };
@@ -518,7 +518,7 @@ fn overall_timeout_error_for_source(source: ReferenceSource<'_>) -> Result<Resol
             detail: "overall file resolution deadline exceeded".to_owned(),
         }),
         ReferenceSource::FileUrl(url) => Err(ResolveError::FileUrlFailed {
-            label: redact_url(url),
+            label: safe_url_label(url),
             detail: "overall file resolution deadline exceeded".to_owned(),
         }),
     }
