@@ -18,12 +18,15 @@
 //! credential recipes the guide publishes actually work against the pinned
 //! client, end to end, through the shipped example config.
 //!
-//! Two lanes, matching the two documented recipes:
+//! Three lanes: the two documented recipes, plus an inversion of the primary
+//! one.
 //!
 //! * **options-headers** — the primary lane: `provider.<id>.options.headers.Authorization` carries the gateway Basic
 //!   credential, read from the environment at config-load time through `{env:PRAXIS_GATEWAY_AUTH}` substitution. The
 //!   lane runs exactly the recipe the guide publishes, so it proves both the provider-options pass-through and the
 //!   environment substitution end to end.
+//! * **options-headers-without-env** — the same configuration with `PRAXIS_GATEWAY_AUTH` withheld, so the substitution
+//!   must resolve to an empty string and the gateway must reject the turn.
 //! * **headers** — the schema-native per-model `headers` map carries the same thing declaratively.
 //!
 //! # The credential is asserted on every request
@@ -128,12 +131,18 @@ const MODEL_OBJECT_KEYS: &[&str] = &[
     "variants",
 ];
 
-/// Which documented credential recipe a run exercises.
+/// Which documented credential recipe a run exercises, including the
+/// missing-credential inversion of the primary one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AuthLane {
     /// `provider.options.headers.Authorization` carries the credential via the
     /// `{env:PRAXIS_GATEWAY_AUTH}` substitution the guide documents.
     OptionsHeaders,
+    /// The options-headers recipe with [`GATEWAY_AUTH_ENV`] withheld, so the
+    /// `{env:...}` substitution resolves to an empty string and no gateway
+    /// credential exists: the inversion scenario proving the credential
+    /// comes from the environment and nowhere else.
+    OptionsHeadersWithoutEnv,
     /// A per-model `headers` map carries it declaratively.
     ModelHeaders,
 }
@@ -278,11 +287,13 @@ fn model_object(headers: Option<Value>) -> Value {
 /// `provider.<id>.options.headers.Authorization` as the literal
 /// `{env:PRAXIS_GATEWAY_AUTH}` token, which OpenCode substitutes from the
 /// child's environment at config-load time, so the secret never has to be
-/// written into the file. The per-model `headers` map is the schema-declared
-/// alternative and carries the literal credential instead.
+/// written into the file. Its inversion keeps the identical configuration —
+/// including the substitution token — and withholds the variable at launch.
+/// The per-model `headers` map is the schema-declared alternative and carries
+/// the literal credential instead.
 pub(super) fn client_config(base_url: &str, model: &str, lane: AuthLane) -> Value {
     let mut options = json!({"baseURL": base_url});
-    if lane == AuthLane::OptionsHeaders {
+    if matches!(lane, AuthLane::OptionsHeaders | AuthLane::OptionsHeadersWithoutEnv) {
         options["headers"] = json!({"Authorization": GATEWAY_AUTH_SUBSTITUTION});
     }
     let headers = (lane == AuthLane::ModelHeaders).then(|| json!({"Authorization": gateway_credential()}));
@@ -355,10 +366,6 @@ pub(super) struct LaunchSpec<'a> {
     pub(super) model: &'a str,
     /// Which credential recipe to exercise.
     pub(super) lane: AuthLane,
-    /// Withhold [`GATEWAY_AUTH_ENV`] from the child even on lanes that
-    /// normally set it, so the `{env:...}` substitution resolves to an empty
-    /// string. Only meaningful for the inversion scenario.
-    pub(super) omit_gateway_auth: bool,
     /// The positional prompt.
     pub(super) prompt: &'a str,
     /// Bound on the child.
@@ -373,7 +380,6 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         base_url,
         model,
         lane,
-        omit_gateway_auth,
         prompt,
         timeout,
     } = spec;
@@ -418,11 +424,11 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if lane == AuthLane::OptionsHeaders && !omit_gateway_auth {
+    if lane == AuthLane::OptionsHeaders {
         // Read at config-load time by the documented `{env:...}`
-        // substitution. Withheld, it resolves to an empty string and the
-        // gateway rejects the turn with a bare 401 — the inversion scenario
-        // relies on exactly that.
+        // substitution. Withheld on the OptionsHeadersWithoutEnv lane, it
+        // resolves to an empty string and the gateway rejects the turn with
+        // a bare 401 — the inversion scenario relies on exactly that.
         command.env(GATEWAY_AUTH_ENV, gateway_credential());
     }
     configure_isolated_process_group(&mut command);
@@ -543,11 +549,7 @@ fn pinned_opencode_version_check() {
 }
 
 /// Drive one lane end to end and return the captured output and requests.
-async fn run_lane(
-    lane: AuthLane,
-    bin: &OsStr,
-    omit_gateway_auth: bool,
-) -> (CapturedChildOutput, Vec<praxis_test_utils::CapturedRequest>) {
+async fn run_lane(lane: AuthLane, bin: &OsStr) -> (CapturedChildOutput, Vec<praxis_test_utils::CapturedRequest>) {
     let backend = scripted_backend().start_with_shutdown();
     let proxy_port = free_port();
     let config = gateway_config(proxy_port, backend.port());
@@ -564,7 +566,6 @@ async fn run_lane(
         base_url: &base_url,
         model: MODEL_ID,
         lane,
-        omit_gateway_auth,
         prompt: PROMPT,
         timeout: CHILD_TIMEOUT,
     })
@@ -575,7 +576,7 @@ async fn run_lane(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_opencode_completes_turn_with_options_headers_auth() {
     let Some(bin) = opencode_bin() else { return };
-    let (output, requests) = run_lane(AuthLane::OptionsHeaders, &bin, false).await;
+    let (output, requests) = run_lane(AuthLane::OptionsHeaders, &bin).await;
 
     assert_not_timed_out(&output, "options-headers lane");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -607,7 +608,7 @@ async fn pinned_opencode_completes_turn_with_options_headers_auth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_opencode_completes_turn_with_model_headers_auth() {
     let Some(bin) = opencode_bin() else { return };
-    let (output, requests) = run_lane(AuthLane::ModelHeaders, &bin, false).await;
+    let (output, requests) = run_lane(AuthLane::ModelHeaders, &bin).await;
 
     assert_not_timed_out(&output, "model-headers lane");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -642,7 +643,7 @@ async fn pinned_opencode_missing_env_substitution_is_rejected() {
     // environment through the documented substitution, rather than from
     // something else in the environment happening to authenticate the run.
     let Some(bin) = opencode_bin() else { return };
-    let (output, requests) = run_lane(AuthLane::OptionsHeaders, &bin, true).await;
+    let (output, requests) = run_lane(AuthLane::OptionsHeadersWithoutEnv, &bin).await;
 
     assert_not_timed_out(&output, "missing-env lane");
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -199,7 +199,6 @@ async fn run_live(live: &LiveConfig, workspace: &Path, prompt: &str) -> Captured
         base_url: &base_url,
         model: &live.model,
         lane: AuthLane::OptionsHeaders,
-        omit_gateway_auth: false,
         prompt,
         timeout: CHILD_TIMEOUT,
     })

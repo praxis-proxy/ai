@@ -294,7 +294,7 @@ carry the detail.
 - `tests/integration/tests/suite/codex_http.rs` — Codex acceptance + pin-update
   instructions.
 - `tests/integration/tests/suite/opencode_vllm.rs` — OpenCode acceptance
-  (`opencode_vllm_plugin_auth_completes_text_turn`,
+  (`opencode_vllm_options_headers_auth_completes_text_turn`,
   `opencode_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
   deterministic CPU lane is `suite/opencode.rs`, run by the `opencode-cpu`
   job in `integration.yaml`.
@@ -324,8 +324,8 @@ VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   selection).
 - [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) — running Codex /
   Claude Code / OpenCode through Praxis and vLLM; reasoning-flag regression,
-  the headless `opencode run` forms, and how each OpenCode major's plugin
-  behaves when it fails.
+  the headless `opencode run` forms, each OpenCode major's documented
+  credential recipes, and how the 2.x plugin behaves when it fails.
 - [`vllm/README.md`](../../vllm/README.md) — GPU container: build, run, health
   check, hardware/model rationale.
 - [llmd-integration-testing.md](llmd-integration-testing.md) — adjacent CPU-side

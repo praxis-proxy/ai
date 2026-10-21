@@ -531,9 +531,11 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$VLLM_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 # Optional headroom: cap the requested output budget (see the note below).
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
-# Tell Claude Code the server's real window so it auto-compacts in time
-# (Claude Code 2.1.75 and newer).
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=32768
+# Pull Claude Code's auto-compaction below the server's window: the window
+# variable's 100k minimum combined with a percentage of it (see the note
+# below; the window variable needs Claude Code 2.1.75 and newer).
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=30
 # Required if you select Claude Code's auto permission mode with this backend.
 export CLAUDE_CODE_AUTO_MODE_SERVER=0
 
@@ -578,12 +580,20 @@ Claude Code also sizes its own auto-compaction against the window it assumes,
 not the real one, so it will not compact in time on its own: once the prompt
 alone passes `--max-model-len`, every later request fails with HTTP 400 and an
 over-long conversation cannot be compacted, only `/clear`ed. On Claude Code
-2.1.75 and newer, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (set above to the server's
-window) fixes that. Older clients have no equivalent variable — the closest is
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, a percentage of the assumed 200K window —
-so run `/compact` by hand if a long session creeps toward the limit. A larger
-window is the alternative, but Qwen3-8B is natively 32,768 tokens and anything
-beyond it needs `--rope-scaling` on `vllm serve`.
+2.1.75 and newer, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is the knob — but it
+cannot name this server's window directly: it accepts 100,000 to 1,000,000
+tokens, and a smaller value draws a startup warning and is treated as the
+100k minimum, still above the 32,768-token server. The pair exported above
+is the supported configuration under that floor: the window at its 100k
+minimum, and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` lowering the trigger to a
+percentage of that window — 30% of 100,000 is 30,000 tokens, below the
+server limit. The percentage only applies in sessions that already compact
+before the model's context limit, which is why the window variable must
+accompany it. Older clients have no way to pull the trigger below the
+assumed 200K window, so run `/compact` by hand if a long session creeps
+toward the limit. A larger window is the alternative, but Qwen3-8B is
+natively 32,768 tokens and anything beyond it needs `--rope-scaling` on
+`vllm serve`.
 
 Praxis and vLLM do not implement Anthropic's server-side auto-mode classifier
 protocol. `CLAUDE_CODE_AUTO_MODE_SERVER=0` makes Claude Code initiate the
@@ -685,6 +695,22 @@ contract: an OpenCode release that started validating provider options
 against the schema would drop the key, and the per-model alternative below is
 the schema-declared form to fall back to.
 
+A second caveat, and a security one: the header follows the resolved
+`baseURL` wherever configuration takes it. OpenCode deep-merges the global
+configuration ahead of the project's, so a project that overrides only
+`provider.praxis.options.baseURL` inherits the global
+`options.headers.Authorization` and presents the gateway credential to
+whatever host it chose. The plugin recipe this guide previously published
+guarded exactly this — it refused to attach the credential unless `baseURL`
+matched the expected gateway — and plain `options.headers` cannot express
+that guard. If you open projects you do not fully trust, keep the `praxis`
+provider entry in each trusted project's own `opencode.jsonc` rather than
+the global file, and do not export `PRAXIS_GATEWAY_AUTH` in the shell that
+launches OpenCode there: `{env:...}` substitution runs for project
+configuration too, so the exported variable alone is enough for a project
+to send the credential anywhere. The per-model alternative below shares the
+same property.
+
 #### Headless invocation
 
 `opencode run` drives a single turn non-interactively, which is what CI and
@@ -739,9 +765,10 @@ attached declaratively:
 
 The model object rejects unknown keys, so a misspelling is a hard startup error
 rather than a silently ignored setting. The trade-off is the opposite of the
-`{env:}` form: the base64 credential is baked into a file on disk and is sent
-wherever `baseURL` happens to point, with no environment lookup at runtime.
-Use it for CI and ephemeral credentials, not for a developer's `~/.config`.
+`{env:}` form: the base64 credential is baked into a file on disk, with no
+environment lookup at runtime. Both recipes send the credential wherever
+`baseURL` points — see the security caveat above. Use this form for CI and
+ephemeral credentials, not for a developer's `~/.config`.
 
 ### OpenCode 2.x
 
