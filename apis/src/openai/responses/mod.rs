@@ -61,7 +61,7 @@ pub(crate) mod model_rewrite;
 /// Responses backend and restores the typed items on the response (#1131).
 #[cfg(feature = "openai-responses")]
 pub(crate) mod openai_client_tool_compat;
-#[cfg(any(all(test, feature = "store"), feature = "bench-responses-state"))]
+#[cfg(any(all(test, feature = "store-sqlite"), feature = "bench-responses-state"))]
 pub mod rehydrate_benchmark;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod responses_proxy;
