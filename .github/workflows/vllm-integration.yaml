@@ -1268,6 +1268,25 @@ jobs:
           uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
             -p qualification_plugin -k live_tavily
 
+      - name: Run selected-Anthropic OpenAI-chat translation against real vLLM
+        id: selected_anthropic_openai_chat
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          # Reuse the praxis-ai binary built by "Build Praxis and acceptance test".
+          PRAXIS_AI_BIN: ${{ github.workspace }}/target/debug/praxis-ai
+          # Reuse the keyed vLLM container already serving native /v1/messages.
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: |
+          # An official OpenAI Chat Completions client drives the selected-provider
+          # translation (openai_chat_completions_to_anthropic[_stream]) through
+          # Praxis to vLLM's native Anthropic Messages surface. credential_inject
+          # reads VLLM_API_KEY (already in the job env) from the test's projected
+          # mount, so the backend receives its own Authorization: Bearer token.
+          uv run tests/integration/sdk/openai/test_selected_anthropic_chat_completions_vllm.py -s
+
       - name: Acceptance log tail on failure
         if: failure()
         run: |
