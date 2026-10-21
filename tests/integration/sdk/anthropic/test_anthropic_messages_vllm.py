@@ -280,8 +280,9 @@ def test_named_tool_choice_stop_reason(live_clients, route):
     )
     calls = [block for block in first.content if block.type == "tool_use"]
     assert len(calls) == 1, first.model_dump_json()
-    if first.stop_reason == "end_turn":
-        pytest.xfail("pinned vLLM v0.29.0 maps a named tool call to end_turn")
+    # vLLM maps a named (forced) tool call to `tool_use` even though the chat
+    # layer reports `finish_reason="stop"` for it; the Anthropic converter
+    # derives the stop reason from the produced tool_use blocks.
     assert first.stop_reason == "tool_use", first.model_dump_json()
 
 

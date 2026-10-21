@@ -89,7 +89,7 @@ docker run --rm --name vllm \
 
 With Podman, replace `--gpus all` with `--device nvidia.com/gpu=all` and leave
 the rest unchanged. Pin a released tag rather than `latest` for reproducible
-behavior; the on-demand GPU endpoint workflow uses `v0.29.0-cu129`. The first
+behavior; the on-demand GPU endpoint workflow uses `v0.32.0-cu129`. The first
 run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
@@ -579,7 +579,7 @@ username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you trust; it must
 exactly match `baseURL`, including any trailing slash.
 
 > **The guard withholds the credential; it does not stop the request.**
-> Verified against OpenCode 1.18.35: when the `config` hook throws — a
+> Verified against OpenCode 1.19.3: when the `config` hook throws — a
 > `baseURL` mismatch, or an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs
 > `plugin config hook failed` and **continues**, sending the turn with no
 > `Authorization` header. It exits `0` and the event stream ends in

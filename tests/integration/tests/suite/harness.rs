@@ -18,11 +18,11 @@ pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.267";
 /// Pinned version of the OpenCode CLI executable used for E2E acceptance tests.
 ///
 /// `opencode --version` prints the bare version with no product prefix
-/// (`1.18.35`, not `opencode 1.18.35`), so this is compared for equality
+/// (`1.19.3`, not `opencode 1.19.3`), so this is compared for equality
 /// against the trimmed output rather than as a substring of a longer line.
 /// Kept in sync with `tests/integration/fixtures/opencode-cli/pin.toml` by
 /// `opencode::pin_toml_version_matches_harness_const`.
-pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.18.35";
+pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.19.3";
 
 /// Portable shell fragment that reads bytes on stdin and prints their lowercase
 /// sha256 hex digest (no filename column). GNU coreutils ships `sha256sum`, but

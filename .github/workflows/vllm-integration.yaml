@@ -122,7 +122,7 @@ env:
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
   # The acceptance jobs still use their pinned upstream image.
-  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
   # The full suite's model-baked image is NOT pinned here: it is described by
   # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
   # manifest, reuses the published build when it matches this checkout, and

@@ -25,9 +25,9 @@
 # offline test `pin_toml_version_matches_harness_const` enforces the pair.
 #
 # NOTE: `opencode --version` prints the bare version with NO product prefix
-# (`1.18.35`, not `opencode 1.18.35`). Unlike the Codex pin, an equality check
+# (`1.19.3`, not `opencode 1.19.3`). Unlike the Codex pin, an equality check
 # against a prefixed string would never match.
-version = "1.18.35"
+version = "1.19.3"
 # Platform slug the pinned build targets.
 platform = "linux-x64"
 # How CI obtains the executable.
@@ -223,7 +223,7 @@ permission_env = "OPENCODE_PERMISSION"
 # Pinned by digest, and deliberately the SAME image the Claude acceptance job
 # uses, so both jobs share the warmed on-disk Hugging Face cache on the
 # ephemeral GPU runner rather than each pulling multi-gigabyte weights.
-image = "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+image = "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
 # Weights, and the exact alias they are served under. The alias is slash-free
 # and matches `[opencode.provider] model_id`: the client addresses the model as
 # `<provider_id>/<model_id>`, so a name containing "/" is unaddressable.
