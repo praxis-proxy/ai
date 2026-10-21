@@ -14,6 +14,7 @@ pub mod compression;
 mod factory;
 mod owner;
 mod registry;
+mod size;
 mod traits;
 mod types;
 
@@ -34,6 +35,7 @@ pub use factory::{
 };
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
+pub use size::json_values_fit;
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{
     ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,

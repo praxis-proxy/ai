@@ -1100,6 +1100,115 @@ fn plain_function_call_history_item_is_unchanged() {
     assert_eq!(item["name"], "f");
 }
 
+#[test]
+fn history_item_is_lowered_matches_the_lowering_pass() {
+    let no_ids = HashSet::new();
+    // Only entries `lower_history_items` rewrites count toward the lowering reserve.
+    assert!(history_item_is_lowered(&json!({"type": "custom_tool_call"}), &no_ids));
+    assert!(history_item_is_lowered(
+        &json!({"type": "custom_tool_call_output"}),
+        &no_ids
+    ));
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "function_call", "namespace": "ns", "name": "m"}),
+            &no_ids,
+        ),
+        "a namespaced function_call is flattened, so it is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "name": "f"}), &no_ids),
+        "a plain function_call is never lowered, so it is not charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "namespace": "", "name": "f"}), &no_ids,),
+        "an empty namespace is not a namespaced call"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c1", "action": {"type": "exec"}, "environment": {"type": "local"}}),
+            &no_ids,
+        ),
+        "a client-executed shell_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c2", "action": {"type": "exec"}}),
+            &no_ids,
+        ),
+        "a container/server shell_call is left untouched"
+    );
+    let lowered = lowered_ids(&["c1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c1"}), &lowered),
+        "an output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c2"}), &lowered),
+        "an output whose call was not lowered is left untouched"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t1", "execution": "client"}),
+            &no_ids,
+        ),
+        "a client-executed tool_search_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_call", "call_id": "t2"}), &no_ids),
+        "a tool_search_call without client execution is left untouched"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t3", "execution": "server"}),
+            &no_ids,
+        ),
+        "a server-executed tool_search_call is left untouched"
+    );
+    let lowered_search = lowered_ids(&["t1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t1"}), &lowered_search),
+        "a tool_search_output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t2"}), &lowered_search),
+        "a tool_search_output whose call was not lowered is left untouched"
+    );
+}
+
+#[test]
+fn budgeted_plain_function_history_reserves_no_lowering() {
+    // A budgeted request whose only tools are plain `function` tools and whose
+    // history holds only plain (non-namespaced) `function_call` items reserves
+    // nothing: the lowering pass rewrites none of them, so there is no owned
+    // lowered copy to charge. With the previous predicate every `function_call`
+    // was charged and this request would 413 against a saturated budget.
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}],
+    }));
+    state.messages = (0..64)
+        .map(|i| json!({"type": "function_call", "call_id": format!("call_{i}"), "name": "f", "arguments": "{}"}))
+        .collect();
+    // Saturate the budget so any lowering reservation at all would fail.
+    let mut budget = SimpleBudget::new(4_096, 0).unwrap();
+    let spare = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(spare), "saturate the budget");
+    assert_eq!(budget.remaining_bytes(), Some(0), "no headroom remains");
+    state.simple_budget = Some(budget);
+
+    assert!(
+        reserve_client_tool_lowering(&mut state),
+        "plain function tools and plain function_call history must proceed without a lowering reserve"
+    );
+    assert_eq!(
+        state.simple_budget.unwrap().remaining_bytes(),
+        Some(0),
+        "no lowering reservation may be charged when nothing is lowered"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Response restoration
 // -----------------------------------------------------------------------------

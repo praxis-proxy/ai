@@ -1013,6 +1013,12 @@ mod tests {
     #[expect(clippy::too_many_lines, reason = "two scopes, each checked for key and signature")]
     fn derives_the_same_key_and_signature_as_aws_sigv4() {
         use aws_sigv4::sign::v4;
+
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_some() {
+            // Tests run concurrently, so do not depend on another test to
+            // install the provider before this test's first HMAC call.
+            praxis_tls::provider::install();
+        }
         for scope in [
             SigningScope {
                 region: "us-east-1",
