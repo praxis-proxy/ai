@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http::header::HeaderValue;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use praxis_filter::{FilterAction, HttpFilter as _, Response};
 
 use super::*;
@@ -1991,4 +1992,151 @@ async fn run_sse_extraction(
         ctx.get_metadata("token.output").map(str::to_owned),
         ctx.get_metadata("token.total").map(str::to_owned),
     )
+}
+
+// -----------------------------------------------------------------------------
+// LLM gateway metrics
+// -----------------------------------------------------------------------------
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
+fn publish_token_usage_records_llm_metrics() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("cb-glm".to_owned().into());
+    ctx.set_metadata("openai_chat_completions_request.model", "gpt-x");
+
+    let usage = TokenUsage::new(12, 34, Some(46))
+        .with_cache(Some(5), None)
+        .with_reasoning(Some(2));
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || publish_token_usage(&mut ctx, usage));
+    let snap = snapshotter.snapshot().into_vec();
+
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "gpt-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "cb-glm")
+            })
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+    let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
+
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 12);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 34);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL), 5);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_REASONING_TOKENS_TOTAL), 2);
+    assert!(
+        !present(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "empty_completions must not be recorded on a non-empty response"
+    );
+}
+
+#[test]
+fn publish_token_usage_bumps_empty_completions_on_zero_output() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        publish_token_usage(&mut ctx, TokenUsage::new(12, 0, Some(12)));
+    });
+    let snap = snapshotter.snapshot().into_vec();
+
+    let total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+
+    assert_eq!(total(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL), 1);
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
+fn bedrock_headers_record_llm_metrics() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("bedrock".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("40"));
+    headers.insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("7"));
+    let mut resp = Response {
+        headers,
+        status: http::StatusCode::OK,
+    };
+    ctx.response_header = Some(&mut resp);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || extract_bedrock_headers(&mut ctx));
+    let snap = snapshotter.snapshot().into_vec();
+
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "claude-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "bedrock")
+            })
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+    let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
+
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 40);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 7);
+    assert!(
+        !present(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL),
+        "Bedrock headers carry no cache breakdown"
+    );
+    assert!(
+        !present(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "empty_completions must not be recorded on a non-empty response"
+    );
+}
+
+#[test]
+fn bedrock_headers_without_headers_record_nothing() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut resp = Response {
+        headers: http::HeaderMap::new(),
+        status: http::StatusCode::OK,
+    };
+    ctx.response_header = Some(&mut resp);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || extract_bedrock_headers(&mut ctx));
+    let snap = snapshotter.snapshot().into_vec();
+
+    assert!(
+        snap.is_empty(),
+        "missing Bedrock token headers should record nothing, got {snap:?}"
+    );
 }

@@ -101,7 +101,7 @@ pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, byte
         FilterAction::Reject(error::responses_error_rejection(
             413,
             "invalid_request_error",
-            "request body exceeds openai_agentic_loop.max_retained_bytes",
+            "Request body exceeds a processing limit set by the platform administrator.",
         ))
     })
 }
@@ -130,7 +130,7 @@ pub(crate) fn plain_agentic_budget(
         FilterAction::Reject(error::responses_error_rejection(
             413,
             "invalid_request_error",
-            "request body exceeds openai_agentic_loop.max_retained_bytes",
+            "Request body exceeds a processing limit set by the platform administrator.",
         ))
     })
 }

@@ -260,8 +260,8 @@ fn load_config_full(
     // can assert the credential travels in the `Authorization` header (issue
     // #1389), never in the request body the outbound chain can read.
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // `credential_injection` and other secret-bearing filters resolve at
     // pipeline-build time; repoint the backend Bearer to a Cargo-provided var so
@@ -778,8 +778,8 @@ fn streaming_oversized_error_fails_closed_with_json() {
     assert!(
         response["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("max_body_bytes")),
-        "the JSON error names the exceeded ceiling: {body}"
+            .is_some_and(|message| message.contains("size limit set by the platform administrator")),
+        "the JSON error attributes the exceeded ceiling to the platform administrator: {body}"
     );
     assert!(
         !body.contains("rate_limit_error"),

@@ -1,0 +1,41 @@
+version: 1
+id: responses/budget-overflow-streaming
+description: An upstream Responses SSE stream that overflows the retained-payload budget after the client stream is committed terminates as a single SSE error, suppressing response.completed and the [DONE] sentinel.
+protocol: openai_responses
+example_config: openai/responses/budget-overflow-streaming.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.agentic.committed_stream_budget_overflow
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Reply briefly.
+          store: false
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      # openai_agentic_loop installs a tiny retained-payload budget. The upstream
+      # commits the client stream with response.created, then streams an output
+      # frame whose weighted wire and parsing charges exceed the remaining
+      # budget. The committed
+      # stream can only terminate with one SSE error event; response.completed
+      # and the [DONE] sentinel are suppressed and later frames are dropped.
+      client_sse_events:
+        - response.created
+        - error
+      upstream_sse_events:
+        - response.created
+        - response.output_text.delta
+        - response.completed

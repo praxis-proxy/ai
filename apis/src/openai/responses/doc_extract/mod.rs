@@ -272,10 +272,14 @@ fn preflight_doc_parse(ctx: &HttpFilterContext<'_>, raw: &[u8]) -> Result<Option
         .get::<ResponsesState>()
         .and_then(|state| state.simple_budget)
     else {
+        // A configured budget policy with no admitted Responses state is a
+        // server-side wiring failure (the managed classifier never minted the
+        // retained-payload budget), not malformed client input. Keep the 500
+        // server error while avoiding internal wiring details in the response.
         return Err(FilterAction::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "document extraction requires admitted Responses state under openai_agentic_loop.max_retained_bytes",
+            500,
+            "server_error",
+            "Document extraction is unavailable because of a platform configuration problem. Contact the platform administrator.",
         )));
     };
     let parsed = input_charge(raw).unwrap_or(usize::MAX);
@@ -382,7 +386,7 @@ fn reject_retained_document_budget() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "document extraction exceeds openai_agentic_loop.max_retained_bytes",
+        "Document extraction exceeds a processing limit set by the platform administrator.",
     ))
 }
 

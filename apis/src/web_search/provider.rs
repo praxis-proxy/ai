@@ -23,7 +23,7 @@ use praxis_filter::{
     HttpFilterContext, IterationState, PendingCredentials, RequestExtensions, StagedUpstream, StagedUpstreamFallback,
     SubrequestRuntime,
 };
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -33,6 +33,7 @@ use super::{
 };
 use crate::{
     callout_identity::CalloutIdentity,
+    credential_source::SecretHandle,
     subrequest::{SubRequest, SubRequestClient, SubResponse},
 };
 
@@ -156,8 +157,10 @@ pub(crate) struct SearchClient {
     timeout: Duration,
     /// Search backend provider.
     provider: SearchProvider,
-    /// API key for the search provider.
-    api_key: SecretString,
+    /// Published handle to the shared provider API key. A `None` payload (a
+    /// post-startup rotation gap) fails the callout closed rather than dialing
+    /// the provider unauthenticated.
+    api_key: SecretHandle,
     /// Default search context size.
     default_context_size: SearchContextSize,
     /// Override the provider's default API base URL.
@@ -261,17 +264,20 @@ fn is_iso_3166_alpha2(country: &str) -> bool {
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
+    /// The API key is already validated as a legal HTTP header value when its
+    /// [`SecretHandle`] is published (see `build_config`); the handle is cloned
+    /// here (a cheap `Arc` bump) so request-time staging always reads the live
+    /// token.
+    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the API key header value is
-    /// not valid ASCII.
+    /// Returns [`FilterError`] if the effective base URL does not yield a
+    /// bindable `host:port` authority.
     pub(crate) fn from_config(
         filter_name: &'static str,
         config: &ValidatedConfig,
         subrequest_client: SubRequestClient,
     ) -> Result<Self, FilterError> {
-        http::HeaderValue::from_str(config.api_key.expose_secret())
-            .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
         // Validate up front that the effective base URL yields a bindable
         // `host:port` authority: a malformed authority would otherwise only
         // surface at callout time, silently dropping the deferred credential and
@@ -615,15 +621,26 @@ impl SearchClient {
         // divergence (a retargeted or port-shifted callout cannot carry the secret).
         let authority = credential_authority(url)?;
         // Prefer the caller's per-user secret from the configured slot; fall back to
-        // the shared provider key. Both are deferred (never placed on the in-chain
-        // request) and injected by the executor only at the resolved, pinned host.
-        let secret = identity
-            .user_credential()
-            .map_or_else(|| self.api_key.expose_secret(), |user| user.expose_secret());
+        // the shared provider key read from its live handle. Both are deferred
+        // (never placed on the in-chain request) and injected by the executor only
+        // at the resolved, pinned host. A post-startup rotation that publishes no
+        // valid shared key (a `None` payload) fails the callout closed here rather
+        // than dialing the provider unauthenticated.
+        //
         // Assemble the scheme-prefixed header value. The transient String is the
         // same allocation `DeferredCredential::new` wraps in `Zeroizing`, so the
         // secret is wiped on drop; the empty prefix leaves the raw key unchanged.
-        let value = format!("{prefix}{secret}");
+        let value = if let Some(user) = identity.user_credential() {
+            format!("{prefix}{}", user.expose_secret())
+        } else {
+            let snapshot = self.api_key.current();
+            let Some(key) = snapshot.payload.as_deref() else {
+                return Err(FilterError::from(
+                    "web_search: API key unavailable after rotation".to_owned(),
+                ));
+            };
+            format!("{prefix}{key}")
+        };
         let credential = DeferredCredential::new(&authority, header, value)?;
         let mut pending = PendingCredentials::new();
         pending.push(credential);
@@ -980,8 +997,14 @@ mod tests {
     use praxis_core::connectivity::Upstream;
     use secrecy::SecretString;
     use serde_json::json;
+    use zeroize::Zeroizing;
 
     use super::*;
+
+    /// Build a fixed, non-watched API-key handle for provider tests.
+    fn test_api_key(key: &str) -> SecretHandle {
+        SecretHandle::from_snapshot_for_test(Some(Zeroizing::new(key.to_owned())))
+    }
 
     fn test_subrequest_client() -> SubRequestClient {
         // Build the TLS connector (and its one-time macOS platform-cert load) once
@@ -1094,7 +1117,7 @@ mod tests {
     fn build_you_request_defers_api_key_and_sends_body() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1130,7 +1153,7 @@ mod tests {
     fn test_client_for(provider: SearchProvider) -> SearchClient {
         let config = ValidatedConfig {
             provider,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1158,7 +1181,7 @@ mod tests {
     fn brave_config_with_shared_key(shared: &str) -> ValidatedConfig {
         ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from(shared.to_owned()),
+            api_key: test_api_key(shared),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1244,7 +1267,7 @@ mod tests {
     fn search_client_from_config() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1256,24 +1279,29 @@ mod tests {
     }
 
     #[test]
-    fn invalid_api_key_diagnostic_names_owner() {
+    fn staged_credentials_fail_closed_when_shared_key_unavailable() {
+        // A post-startup rotation that publishes no valid token leaves the handle
+        // payload `None`. Staging the shared provider key must fail closed rather
+        // than dialing the provider unauthenticated. The key header value is
+        // validated when the handle is published, so `from_config` still builds.
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("invalid\nkey".to_owned()),
+            api_key: SecretHandle::from_snapshot_for_test(None),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
             user_credential: None,
         };
-
-        let error = SearchClient::from_config("anthropic_web_search", &config, test_subrequest_client()).unwrap_err();
-
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
+        let (url, _) = client.build_brave_request("test", 5, None);
+        let error = client
+            .staged_credentials(&url, &shared_key_identity())
+            .err()
+            .expect("a None shared-key payload must fail staging closed");
         assert!(
-            error
-                .to_string()
-                .contains("anthropic_web_search: invalid API key header value"),
-            "diagnostic should name the owning filter: {error}"
+            error.to_string().contains("API key unavailable after rotation"),
+            "the fail-closed error should explain the rotation gap: {error}"
         );
     }
 
@@ -1281,7 +1309,7 @@ mod tests {
     fn base_url_overrides_brave_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1300,7 +1328,7 @@ mod tests {
     fn base_url_overrides_tavily_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::Tavily,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1319,7 +1347,7 @@ mod tests {
     fn base_url_overrides_you_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1500,7 +1528,7 @@ mod tests {
     fn parse_failure_returns_failed() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1519,7 +1547,7 @@ mod tests {
     fn parse_empty_results_is_successful_zero_result_search() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -1537,7 +1565,7 @@ mod tests {
     fn test_search_client() -> SearchClient {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,

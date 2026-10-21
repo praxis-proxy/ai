@@ -22,6 +22,7 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
+    json_values_fit,
     owner::StateOwner,
     traits::{ConversationItemStore, ResponseStore},
     types::{
@@ -32,30 +33,6 @@ use crate::{
 
 /// Owner-qualified key for owner-scoped rows.
 type OwnerKey = (StateOwner, String);
-
-/// Count compact JSON without materializing a second copy before cloning a
-/// bounded in-memory record.
-fn json_values_fit(values: &[&serde_json::Value], max_bytes: usize) -> bool {
-    struct Counter(usize);
-    impl io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_sub(buf.len())
-                .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = Counter(max_bytes);
-    values
-        .iter()
-        .all(|value| serde_json::to_writer(&mut counter, value).is_ok())
-}
 
 /// A stored pending approval plus its single-use consumption stamp.
 #[derive(Clone)]

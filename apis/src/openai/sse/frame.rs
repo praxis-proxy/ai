@@ -420,7 +420,7 @@ impl fmt::Display for SseParseError {
             Self::RetainedPayloadLimitExceeded => {
                 write!(
                     f,
-                    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes"
+                    "The request exceeds a processing limit set by the platform administrator."
                 )
             },
             Self::ClientToolRestore { key, reason } => {

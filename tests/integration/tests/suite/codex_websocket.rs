@@ -105,7 +105,7 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
             // supplying a static normalized test identity.
             .replace("header: x-auth-tenant", "static: codex-test-tenant")
             .replace("header: x-auth-user", "static: codex-test-user")
-            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
+            .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key"),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );

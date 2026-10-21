@@ -482,7 +482,7 @@ fn reject_retained_file_budget() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "file resolution exceeded openai_agentic_loop.max_retained_bytes",
+        "File resolution exceeds a processing limit set by the platform administrator.",
     ))
 }
 
@@ -928,13 +928,13 @@ fn too_large_error_response(reference: &str, limit: usize) -> (u16, String) {
 /// Report a file URL blocked by SSRF policy to the caller.
 fn file_url_blocked_response(label: &str) -> (u16, String) {
     warn!(url = %label, "file URL blocked by security policy");
-    (403, format!("file URL '{label}' blocked by security policy"))
+    (403, "file URL blocked by security policy".to_owned())
 }
 
 /// Report a file URL fetch failure to the caller.
 fn file_url_failed_response(label: &str, detail: &str) -> (u16, String) {
     warn!(url = %label, detail, "file URL fetch failed");
-    (502, format!("failed to fetch file URL '{label}': request failed"))
+    (502, "failed to fetch file URL: request failed".to_owned())
 }
 
 /// Build a rejection response from a resolution error.

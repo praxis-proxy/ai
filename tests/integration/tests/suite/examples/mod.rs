@@ -23,6 +23,8 @@ mod azure_ad;
 mod azure_translation;
 mod bedrock;
 #[cfg(feature = "openai-agentic-loop")]
+mod budget_overflow_streaming;
+#[cfg(feature = "openai-agentic-loop")]
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
 #[cfg(all(feature = "openai-compact", feature = "openai-file-resolve-filter"))]
@@ -30,6 +32,7 @@ mod client_tool_compat_chat_completions;
 mod compact;
 mod credential_injection;
 mod external_metering;
+mod external_metering_file_key;
 #[cfg(target_os = "linux")]
 mod file_descriptor_limits;
 #[cfg(feature = "openai-agentic-loop")]
@@ -183,5 +186,7 @@ mod vllm_agentic_api;
 mod web_search;
 #[cfg(feature = "openai-agentic-loop")]
 mod web_search_chat_completions;
+#[cfg(feature = "openai-agentic-loop")]
+mod web_search_file_key;
 #[cfg(feature = "openai-agentic-loop")]
 mod web_search_scoped_credentials;

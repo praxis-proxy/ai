@@ -410,7 +410,7 @@ impl FileSearchDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "openai_file_search_callout: stale file-search assignment".to_owned(),
+                message: "openai_file_search_dispatch: stale file-search assignment".to_owned(),
             });
             return Ok(FilterAction::Continue);
         }
@@ -901,7 +901,7 @@ fn continuation_state_dispatch_failure() -> DispatchFailure {
     DispatchFailure {
         status: 413,
         code: "invalid_request_error",
-        message: "openai_file_search_dispatch: continuation state exceeds max_state_bytes".to_owned(),
+        message: "File search continuation state exceeds a size limit set by the platform administrator.".to_owned(),
     }
 }
 
@@ -956,8 +956,7 @@ fn file_search_budget_failure() -> DispatchFailure {
     DispatchFailure {
         status: 502,
         code: "server_error",
-        message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during file search"
-            .to_owned(),
+        message: "File search exceeds a processing limit set by the platform administrator.".to_owned(),
     }
 }
 

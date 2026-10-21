@@ -15,7 +15,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
 | `user_credential` | string | no | Optional callout-credential slot id. When set, the web-search callout uses the caller's per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot name). Supported for every provider: each stages the secret as a destination-bound header credential the executor injects after pinning the provider authority (Brave and You.com under their provider header, Tavily as an `Authorization: Bearer` token). |
-| `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
+| `api_key` | CredentialSource | yes | API key credential source for the search provider: exactly one of `value`, `env_var`, or `file`. A `file` source is watched for restart-free rotation; see [`CredentialSource`]. The token never appears in `Debug` output. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `max_body_bytes` | integer | no | Maximum request and response body bytes buffered per loop round. |
@@ -29,7 +29,8 @@ Each provider request is executed through the shared filtered-subrequest executo
 ```yaml
 filter: anthropic_web_search
 provider: you
-api_key: ${WEB_SEARCH_API_KEY}
+api_key:
+  env_var: WEB_SEARCH_API_KEY
 ```
 
 ### Example 2
@@ -37,7 +38,8 @@ api_key: ${WEB_SEARCH_API_KEY}
 ```yaml
 filter: anthropic_web_search
 provider: you
-api_key: ${WEB_SEARCH_API_KEY}
+api_key:
+  env_var: WEB_SEARCH_API_KEY
 outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000

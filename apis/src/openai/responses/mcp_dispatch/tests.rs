@@ -18,7 +18,8 @@ use super::{
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
     extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
     mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, reserve_mcp_execution, resolve_tool_entry, result_payload_limit,
+    prepare_response_round, process_call_result, reserve_mcp_execution, reserve_pending_approval_rows,
+    resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -122,6 +123,56 @@ fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
     let before = too_tight.simple_budget.unwrap().remaining_bytes();
     assert!(reserve_mcp_execution(&mut too_tight, 1, 8_192, 8_192).is_none());
     assert_eq!(too_tight.simple_budget.unwrap().remaining_bytes(), before);
+}
+
+#[test]
+fn reserve_pending_approval_rows_fails_closed_on_unknowable_size() {
+    // The `ResponseStore` trait default returns `usize::MAX` for a backend that
+    // cannot size stored approvals. Admission must reject that sentinel rather
+    // than load an unbounded payload, so an unknown backend fails closed before
+    // the rows are fetched.
+    let mut unknowable = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let before = unknowable.simple_budget.unwrap().remaining_bytes();
+    assert!(
+        !reserve_pending_approval_rows(&mut unknowable, 1, usize::MAX),
+        "a usize::MAX payload size must be rejected, not charged"
+    );
+    assert_eq!(
+        unknowable.simple_budget.unwrap().remaining_bytes(),
+        before,
+        "a rejected reservation must not spend any headroom"
+    );
+
+    // A small, knowable payload fits within a generous budget; the charge is
+    // 8x the payload bytes plus an 8 KiB per-row fixed cost.
+    let mut ample = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let ample_before = ample.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(reserve_pending_approval_rows(&mut ample, 2, 256));
+    assert_eq!(
+        ample.simple_budget.unwrap().remaining_bytes(),
+        Some(ample_before - (256 * 8 + 2 * 8_192)),
+        "the charge is 8x payload plus 8 KiB per reserved row"
+    );
+
+    // The same small payload cannot fit a tight budget: an ordinary
+    // over-budget rejection also leaves the headroom untouched.
+    let mut tight = ResponsesState {
+        simple_budget: SimpleBudget::new(4_096, 0),
+        ..ResponsesState::default()
+    };
+    let tight_before = tight.simple_budget.unwrap().remaining_bytes();
+    assert!(!reserve_pending_approval_rows(&mut tight, 1, 256));
+    assert_eq!(tight.simple_budget.unwrap().remaining_bytes(), tight_before);
+
+    // Without a configured budget the reservation is a no-op pass.
+    let mut unbudgeted = ResponsesState::default();
+    assert!(reserve_pending_approval_rows(&mut unbudgeted, 4, usize::MAX));
 }
 
 #[test]
@@ -1479,7 +1530,7 @@ async fn execute_single_call_rejects_denied_tool_without_dialing() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied"),
+            .contains("platform administrator"),
         "denied call must surface a policy rejection: {:?}",
         result.output_item["error"]
     );
@@ -1506,7 +1557,7 @@ async fn execute_single_call_rejects_writable_tool_under_operator_read_only() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied")
+            .contains("platform administrator")
     );
 }
 
@@ -1530,7 +1581,7 @@ async fn execute_single_call_rejects_resolved_entry_without_verdict() {
         result.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("denied")
+            .contains("platform administrator")
     );
 }
 
@@ -2277,7 +2328,7 @@ fn budgeted_approval_staging_rejects_before_emitting_or_persisting() {
 
     let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
     assert_eq!(failure.status, 502);
-    assert!(failure.message.contains("max_retained_bytes"));
+    assert!(failure.message.contains("limit set by the platform administrator"));
     assert!(state.pending_approvals.is_empty());
     assert_eq!(
         state.accumulated_output.len(),
@@ -2313,8 +2364,12 @@ fn prepare_response_round_rejects_unresumable_approval() {
 
         assert_eq!(failure.status, expected_status);
         assert!(
-            failure.message.contains("store"),
-            "unresumable approvals must explain their persistence requirement"
+            failure.message.contains(if expected_status == 400 {
+                "store=true"
+            } else {
+                "platform administrator"
+            }),
+            "unresumable approvals must explain the client requirement or server configuration issue"
         );
         assert!(
             state.pending_approvals.is_empty(),
@@ -2458,7 +2513,11 @@ fn prepare_response_round_floor_fails_closed_when_unresumable() {
         let failure = prepare_response_round(&mut state, 1, ApprovalFloor::Always).unwrap_err();
 
         assert_eq!(failure.status, expected_status);
-        assert!(failure.message.contains("store"));
+        assert!(failure.message.contains(if expected_status == 400 {
+            "store=true"
+        } else {
+            "platform administrator"
+        }));
         assert!(
             state.pending_approvals.is_empty()
                 && !state
@@ -2489,7 +2548,7 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
         bounded.output_item["error"]["content"]
             .as_str()
             .unwrap()
-            .contains("retained-byte limit"),
+            .contains("platform administrator's size limit"),
         "the bounded replacement must explain why the result was discarded"
     );
     assert_eq!(result_payload_limit(4096), 1024);
@@ -2929,7 +2988,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
         .as_ref()
         .expect("delegate terminal to loop owner");
     assert_eq!(failure.code, "server_error");
-    assert!(failure.message.contains("max_retained_bytes"));
+    assert!(failure.message.contains("limit set by the platform administrator"));
 
     let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let action = loop_filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -3562,7 +3621,7 @@ async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 413);
-    assert!(reject_message(&rejection).contains("max_retained_bytes"));
+    assert!(reject_message(&rejection).contains("limit set by the platform administrator"));
     assert!(
         ctx.extensions
             .get::<ResponsesState>()
@@ -3578,6 +3637,100 @@ async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
             .unwrap(),
         None,
         "the exhausted request must not consume its durable approval",
+    );
+}
+
+#[tokio::test]
+async fn over_budget_approval_is_retryable_then_replay_is_rejected() {
+    // #1478: a budget rejection must leave the approval pending so a corrected
+    // follow-up under a sufficient budget can still consume it exactly once, and
+    // a later replay of the consumed approval is rejected.
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_retry", "{\"city\":\"Paris\"}").await;
+    let filter = make_dispatch_filter();
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+
+    // Attempt 1: too small a budget rejects before loading or consuming the row.
+    let req1 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx1 = make_owned_filter_context(&req1);
+    register_store(&mut ctx1, Arc::clone(&store));
+    ctx1.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(131_072, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body1 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx1, &mut body1, true).await.unwrap());
+    assert_eq!(rejection.status, 413, "an over-budget resumption is rejected");
+    assert!(reject_message(&rejection).contains("limit set by the platform administrator"));
+    assert!(
+        ctx1.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "the rejected attempt must not execute the tool"
+    );
+
+    // Attempt 2: a sufficient budget resumes and executes the pending call once.
+    let req2 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx2 = make_owned_filter_context(&req2);
+    register_store(&mut ctx2, Arc::clone(&store));
+    ctx2.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let resumed = filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap();
+    assert!(
+        matches!(resumed, FilterAction::Continue),
+        "a retry under a sufficient budget must resume, not reject"
+    );
+    let state2 = ctx2.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state2.accumulated_output.len(),
+        1,
+        "the retry executes the tool exactly once"
+    );
+    assert_eq!(state2.accumulated_output[0]["id"], "call_retry");
+
+    // Attempt 3: the now-consumed approval cannot be replayed.
+    let req3 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx3 = make_owned_filter_context(&req3);
+    register_store(&mut ctx3, Arc::clone(&store));
+    ctx3.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_retry", true, None)].into(),
+        ..ResponsesState::default()
+    });
+    let mut body3 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let replay = expect_reject(filter.on_request_body(&mut ctx3, &mut body3, true).await.unwrap());
+    assert_eq!(replay.status, 400, "a consumed approval cannot be replayed");
+    assert!(reject_message(&replay).contains("already been used"));
+    assert!(
+        ctx3.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty(),
+        "replay produces no second mcp_call"
+    );
+
+    // The durable row is spent exactly once: a direct consume now finds nothing.
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_retry"], 9_999)
+            .await
+            .unwrap(),
+        Some(0),
+        "the approval was consumed exactly once by the successful retry"
     );
 }
 
@@ -3892,6 +4045,46 @@ async fn resume_approval_missing_store_fails_closed() {
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 500, "missing store must fail closed, not execute");
+    assert!(
+        reject_message(&rejection).contains("Contact the platform administrator"),
+        "the server setup failure must direct the user to the platform administrator"
+    );
+}
+
+#[tokio::test]
+async fn resume_approval_rechecks_policy_and_names_the_administrator_denial() {
+    let filter = make_dispatch_filter();
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+
+    let mut admission = McpAdmissionDecisions::new(protected_policy(true));
+    admission.record(
+        "weather",
+        "get_weather",
+        McpToolVerdict::Denied(McpDenyReason::Writable),
+    );
+
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    register_store(&mut ctx, store);
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        mcp_admission: admission,
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)].into(),
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(rejection.status, 400);
+    let message = reject_message(&rejection);
+    assert!(
+        message.contains("platform administrator's current policy forbids"),
+        "{message}"
+    );
+    assert!(message.contains("forbidden tools that can make changes"), "{message}");
 }
 
 #[tokio::test]
@@ -4071,7 +4264,7 @@ async fn resume_approval_batch_exceeding_cap_is_rejected() {
     let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert_eq!(rejection.status, 400, "an oversized approval batch is a client error");
     assert!(
-        reject_message(&rejection).contains("at most"),
+        reject_message(&rejection).contains("platform administrator allows at most"),
         "the error should state the per-request approval cap: {}",
         reject_message(&rejection)
     );

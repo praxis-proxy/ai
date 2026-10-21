@@ -81,7 +81,8 @@
 //!     filters:
 //!       - filter: openai_web_search_dispatch
 //!         provider: brave
-//!         api_key: ${WEB_SEARCH_API_KEY}
+//!         api_key:
+//!           env_var: WEB_SEARCH_API_KEY
 //!       - filter: openai_mcp_dispatch
 //!       - filter: openai_file_search_dispatch
 //!       - filter: openai_agentic_loop

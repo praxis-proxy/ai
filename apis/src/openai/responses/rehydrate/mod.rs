@@ -1276,7 +1276,7 @@ fn reject_restored_payload_too_large() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "stored history exceeds openai_agentic_loop.max_retained_bytes",
+        "Stored history exceeds a processing limit set by the platform administrator.",
     ))
 }
 

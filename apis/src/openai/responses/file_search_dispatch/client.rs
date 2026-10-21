@@ -2105,6 +2105,14 @@ fn deserialize_search_results(body: &[u8], result_limit: usize) -> Result<Vec<Se
     Ok(data)
 }
 
+/// Decode retained search results from a raw response body for the combined
+/// staging-peak fixture, applying the same bounded top-k retention as dispatch.
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "combined-peak fixture decodes test-controlled bodies")]
+pub(super) fn decode_retained_results(body: &[u8], retain: usize) -> Vec<SearchResult> {
+    deserialize_search_results(body, retain).expect("combined-peak fixture body must decode")
+}
+
 /// Validate one borrowed result without allocating its typed representation.
 fn validate_search_result(raw: &str, decoded_budget: Option<&mut DecodedBudget>) -> Result<(), serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(raw);

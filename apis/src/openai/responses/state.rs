@@ -2827,4 +2827,46 @@ mod tests {
             "accessor falls back to canonical tool_choice when request_body has no key",
         );
     }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "linear resolve-rejection assertions")]
+    fn output_assignment_resolves_only_the_unchanged_current_round_item() {
+        let item = json!({"id": "fc_1", "type": "function_call", "name": "t", "call_id": "c1"});
+        let assignment = OutputAssignment::new(1, &item).expect("assignment from an item carrying an id");
+
+        let output = vec![json!({"id": "prev", "type": "function_call"}), item.clone()];
+        assert_eq!(
+            assignment.resolve(&output, 1, "function_call"),
+            Some(&output[1]),
+            "a current-round item with matching id and type resolves",
+        );
+
+        assert!(
+            assignment.resolve(&output, 2, "function_call").is_none(),
+            "an index before round_start must not resolve",
+        );
+
+        let rewritten = vec![
+            json!({"id": "prev", "type": "function_call"}),
+            json!({"id": "other", "type": "function_call"}),
+        ];
+        assert!(
+            assignment.resolve(&rewritten, 1, "function_call").is_none(),
+            "a displaced or rewritten id at the index must not resolve",
+        );
+
+        let retyped = vec![
+            json!({"id": "prev", "type": "function_call"}),
+            json!({"id": "fc_1", "type": "message"}),
+        ];
+        assert!(
+            assignment.resolve(&retyped, 1, "function_call").is_none(),
+            "a changed item type at the index must not resolve",
+        );
+
+        assert!(
+            assignment.resolve(&output[..1], 0, "function_call").is_none(),
+            "an out-of-bounds index must not resolve",
+        );
+    }
 }

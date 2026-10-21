@@ -35,6 +35,11 @@ COPY store/Cargo.toml ./store/Cargo.toml
 COPY store-lifecycle/Cargo.toml ./store-lifecycle/Cargo.toml
 COPY store-backends/Cargo.toml ./store-backends/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
+# The apis manifest declares the translation_overhead bench, and cargo
+# refuses to parse a manifest whose declared bench target is missing, so
+# the bench sources must exist in the image even though `cargo build -p
+# praxis-ai-proxy` never compiles them.
+COPY apis/benches ./apis/benches
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
 COPY server/build_support/Cargo.toml ./server/build_support/Cargo.toml

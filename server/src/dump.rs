@@ -181,6 +181,7 @@ const SENSITIVE_FIELD_NAMES: &[&str] = &[
     "api_key",
     "credentials_file",
     "database_url",
+    "internal_auth_token",
     "key_path",
     "password",
     "secret",
@@ -689,6 +690,17 @@ filter_chains:
             Some("[REDACTED]"),
             "api_key field must be redacted in config dumps"
         );
+    }
+
+    #[test]
+    fn redact_sensitive_keys_internal_auth_token() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("external_metering:\n  internal_auth_token:\n    value: metering-secret-test")
+                .expect("test YAML must parse");
+        redact_sensitive_keys(&mut value);
+        let output = serde_yaml::to_string(&value).unwrap();
+        assert!(!output.contains("metering-secret-test"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
     }
 
     #[test]

@@ -496,10 +496,9 @@ fn budgeted_stream_conversation_append_overflow_emits_error_without_success_or_s
     let error = sole_event(&frames, "error");
     assert_eq!(error.data["code"], "invalid_request_error");
     assert_eq!(error.data["sequence_number"], 1);
-    assert!(
-        error.data["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("conversation append"))
+    assert_eq!(
+        error.data["message"],
+        "Conversation append exceeds a processing limit set by the platform administrator."
     );
     assert_eq!(model_requests.lock().unwrap().len(), 1);
     model_thread.join().expect("model should finish streaming");
@@ -575,8 +574,8 @@ fn retained_budget_rejects_oversized_initial_input_before_inference() {
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("max_retained_bytes")),
-        "413 must identify the retained-payload budget: {body}"
+            .is_some_and(|message| message.contains("limit set by the platform administrator")),
+        "413 must attribute the retained-payload limit to the platform administrator: {body}"
     );
     assert!(model.requests().is_empty(), "rejected input must not reach inference");
 }
@@ -7140,8 +7139,8 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
     // `insecure_options`, which is the operator opt-in the executor's SSRF check
@@ -7170,8 +7169,8 @@ fn load_unified_dispatch_config(
     );
     // Point the brave web-search provider at the local search mock.
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
     // `insecure_options`, which is the operator opt-in the executor's SSRF check
@@ -8693,8 +8692,8 @@ fn approval_without_configured_store_is_rejected() {
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("store")),
-        "the rejection must explain a store is required to persist the approval: {body:#?}"
+            .is_some_and(|message| message.contains("platform administrator")),
+        "the rejection must direct the operator to fix approval-store configuration: {body:#?}"
     );
 
     // No mcp_approval_request may be surfaced, and no tool may run.
@@ -9386,7 +9385,7 @@ fn extract_completed_response(body: &str) -> serde_json::Value {
 }
 
 fn patch_web_search_api_key(yaml: &str) -> String {
-    yaml.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+    yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key")
 }
 
 fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
