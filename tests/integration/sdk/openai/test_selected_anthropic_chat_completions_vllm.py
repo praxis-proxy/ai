@@ -264,15 +264,33 @@ def _terminate(process: subprocess.Popen) -> None:
             process.wait()
 
 
+def _dump_praxis_log(directory: Path) -> None:
+    """Print a bounded tail of the gateway log to stderr so a failed live request
+    leaves Praxis-side diagnostics in the CI step log before the temporary
+    directory is deleted (this lane is not in the workflow's log-tail step)."""
+    log_path = directory / "praxis.log"
+    if log_path.exists():
+        sys.stderr.write(f"--- praxis.log (tail) ---\n{log_path.read_text()[-20000:]}\n")
+
+
 # -----------------------------------------------------------------------------
 # Overlay digest self-check (deterministic; no binary, no backend)
 # -----------------------------------------------------------------------------
 
 
 def test_overlay_generator_reproduces_fixture_digest():
+    """RFC 8785 (JSON Canonicalization Scheme), https://datatracker.ietf.org/doc/html/rfc8785:
+    for the overlay's value types (ASCII strings, booleans, small integers) the
+    compact, key-sorted ``json.dumps`` form equals JCS output, so the Python
+    generator's SHA-256 must reproduce the digest the Rust overlay validator
+    (compute_semantic_digest) computes over the same semantic fields."""
     fixture = json.loads(FIXTURE.read_text())
-    assert _semantic_digest(fixture["overlay"]) == fixture["content_digest"]["value"]
-    assert fixture["content_digest"]["value"] == fixture["revision"]["value"]
+    assert _semantic_digest(fixture["overlay"]) == fixture["content_digest"]["value"], (
+        "generator digest must reproduce the checked-in fixture's content_digest"
+    )
+    assert fixture["content_digest"]["value"] == fixture["revision"]["value"], (
+        "content-addressed revision must equal the content_digest"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -351,7 +369,11 @@ def test_credential_shim_routes_and_translates_with_bearer():
                     model=CLIENT_MODEL, max_tokens=16, messages=[{"role": "user", "content": "hi"}]
                 )
             assert response.choices[0].message.content == "hello from backend", "Anthropic text must reach OpenAI message"
-            assert response.usage.prompt_tokens == 5 and response.usage.completion_tokens == 3
+            assert response.usage.prompt_tokens == 5, "Anthropic input_tokens must map to prompt_tokens"
+            assert response.usage.completion_tokens == 3, "Anthropic output_tokens must map to completion_tokens"
+        except BaseException:
+            _dump_praxis_log(Path(temporary))
+            raise
         finally:
             _terminate(process)
     backend.shutdown()
@@ -373,15 +395,16 @@ def live_client():
     authority, served_model, backend_key = _live_config()
     with tempfile.TemporaryDirectory(prefix="praxis-selected-anthropic-vllm-") as temporary:
         process, proxy_port = _start_proxy(Path(temporary), authority, served_model, backend_key)
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{proxy_port}/v1", api_key="caller-only", max_retries=0, timeout=180
+        )
         try:
-            client = OpenAI(
-                base_url=f"http://127.0.0.1:{proxy_port}/v1", api_key="caller-only", max_retries=0, timeout=180
-            )
-            try:
-                yield client, CLIENT_MODEL
-            finally:
-                client.close()
+            yield client, CLIENT_MODEL
+        except BaseException:
+            _dump_praxis_log(Path(temporary))
+            raise
         finally:
+            client.close()
             _terminate(process)
 
 
@@ -392,9 +415,13 @@ def test_live_json_and_usage(live_client):
         max_tokens=64,
         messages=[{"role": "user", "content": "Say hello. /no_think"}],
     )
-    assert response.choices[0].message.content and response.choices[0].message.content.strip()
-    assert response.usage.prompt_tokens > 0 and response.usage.completion_tokens > 0
-    assert response.usage.total_tokens == response.usage.prompt_tokens + response.usage.completion_tokens
+    content = response.choices[0].message.content
+    assert content and content.strip(), "translated Anthropic text must reach the OpenAI message content"
+    assert response.usage.prompt_tokens > 0, "Anthropic input usage must map to a positive prompt_tokens"
+    assert response.usage.completion_tokens > 0, "Anthropic output usage must map to a positive completion_tokens"
+    assert response.usage.total_tokens == response.usage.prompt_tokens + response.usage.completion_tokens, (
+        "total_tokens must equal prompt_tokens + completion_tokens"
+    )
 
 
 def test_live_streaming(live_client):
@@ -408,8 +435,11 @@ def test_live_streaming(live_client):
             messages=[{"role": "user", "content": "Say hello. /no_think"}],
         )
     )
-    assert any(chunk.choices and chunk.choices[0].delta.content for chunk in chunks)
-    assert chunks[-1].usage and chunks[-1].usage.total_tokens > 0
+    assert any(chunk.choices and chunk.choices[0].delta.content for chunk in chunks), (
+        "translated SSE must deliver at least one Chat Completions content delta"
+    )
+    assert chunks[-1].usage, "final chunk must carry usage when include_usage is set"
+    assert chunks[-1].usage.total_tokens > 0, "terminal usage must report positive total_tokens"
 
 
 def test_live_tool_round_trip(live_client):
@@ -435,8 +465,10 @@ def test_live_tool_round_trip(live_client):
     calls = first.choices[0].message.tool_calls or []
     assert calls, f"model must emit a tool call; got finish_reason={first.choices[0].finish_reason}"
     call = calls[0]
-    assert call.function.name == "get_weather"
-    assert "paris" in str(json.loads(call.function.arguments).get("city", "")).lower()
+    assert call.function.name == "get_weather", "the translated tool call must name the requested function"
+    assert "paris" in str(json.loads(call.function.arguments).get("city", "")).lower(), (
+        "tool-call arguments must preserve the requested city"
+    )
     second = client.chat.completions.create(
         model=model, max_tokens=128, tools=tools, tool_choice="none",
         messages=[
@@ -445,7 +477,8 @@ def test_live_tool_round_trip(live_client):
             {"role": "tool", "tool_call_id": call.id, "content": "17 degrees Celsius"},
         ],
     )
-    assert second.choices[0].message.content and second.choices[0].message.content.strip()
+    final = second.choices[0].message.content
+    assert final and final.strip(), "tool-result round trip must return translated assistant text"
 
 
 if __name__ == "__main__":
