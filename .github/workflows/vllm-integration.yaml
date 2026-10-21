@@ -1340,6 +1340,7 @@ jobs:
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
+          SELECTED_ANTHROPIC_OPENAI_CHAT: ${{ steps.selected_anthropic_openai_chat.outcome }}
         run: |
           python3 - "$RUNNER_TEMP/claude-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
@@ -1347,7 +1348,8 @@ jobs:
                    "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
                    "CLAUDE_COMPACTION",
                    "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
-                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
+                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH",
+                   "SELECTED_ANTHROPIC_OPENAI_CHAT")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
           for case, filename in (
               ("anthropic_messages", "anthropic-messages-cases.json"),
