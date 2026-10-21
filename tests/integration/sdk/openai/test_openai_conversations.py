@@ -2630,6 +2630,15 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
         assert (
             effort == expected
         ), f"forwarded reasoning effort must be {expected}, got {effort}"
+        if reasoning == {"effort": None} and not translated:
+            # The effort lookup alone cannot distinguish a forwarded explicit
+            # null from a dropped reasoning object, so pin the native body.
+            assert "reasoning" in body, (
+                "explicit null effort must keep the reasoning object"
+            )
+            assert body["reasoning"]["effort"] is None, (
+                "explicit null effort must be forwarded as null, not dropped"
+            )
         assert "configuration_update" not in json.dumps(
             body.get("messages" if translated else "input")
         ), "configuration_update must be consumed, not forwarded as history"
