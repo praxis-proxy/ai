@@ -673,3 +673,112 @@ pub trait ConversationItemStore: Send + Sync {
 pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
 
 impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test setup uses explicit failure messages")]
+mod tests {
+    use super::{ResponseStore, StateOwner, StoreError};
+    use crate::types::{
+        ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
+    };
+
+    /// A backend that implements no bounded conversation read, so it exercises the
+    /// `ResponseStore::get_conversation_bounded` default.
+    struct NoBoundedReads;
+
+    #[async_trait::async_trait]
+    impl ResponseStore for NoBoundedReads {
+        async fn upsert_response(&self, _record: &ResponseRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn record_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _records: &[PendingApprovalRecord],
+            _created_at: i64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+        ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn consume_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+            _consumed_at: i64,
+        ) -> Result<Option<usize>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_events(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _events: &[ResponseEventRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_events_after(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _after: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn event_log_status(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+        ) -> Result<EventLogStatus, StoreError> {
+            Ok(EventLogStatus::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_bounded_conversation_read_is_unavailable() {
+        // A backend that does not override `get_conversation_bounded` must surface
+        // `Unavailable` rather than silently returning an incomplete history, so a
+        // caller like `rehydrate` fails loudly instead of dropping items.
+        let backend = NoBoundedReads;
+        let owner = StateOwner::from_trusted_parts("t", "i", "s").expect("owner");
+        let err = backend
+            .get_conversation_bounded(&owner, "conv", 1_024)
+            .await
+            .expect_err("a backend without a bounded read must surface an error");
+        assert!(
+            matches!(err, StoreError::Unavailable(_)),
+            "the default bounded read must be Unavailable, got {err:?}"
+        );
+    }
+}

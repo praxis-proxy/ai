@@ -410,7 +410,7 @@ impl FileSearchDispatchFilter {
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
-                message: "openai_file_search_callout: stale file-search assignment".to_owned(),
+                message: "openai_file_search_dispatch: stale file-search assignment".to_owned(),
             });
             return Ok(FilterAction::Continue);
         }

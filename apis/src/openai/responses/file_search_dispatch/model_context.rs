@@ -474,6 +474,62 @@ pub(super) fn is_valid_filename(filename: &str) -> bool {
         && filename.chars().all(|character| !character.is_control())
 }
 
+/// Build the optimized reused-storage model context for retained results, used
+/// by the combined staging-peak fixture. Mirrors dispatch: one incremental
+/// builder reuses a single annotation buffer and finishes in place.
+#[cfg(test)]
+pub(super) fn build_context_reused(results: &[&SearchResult], query: &str) -> String {
+    let max_chunk_count = results
+        .iter()
+        .fold(0_usize, |total, result| total.saturating_add(result.content.len()))
+        .min(MAX_FORMATTED_CHUNKS);
+    let mut builder = ModelContextBuilder::new(MAX_MODEL_CONTEXT_BYTES, query, CONTEXT_TEMPLATE, max_chunk_count);
+    for result in results {
+        for chunk in &result.content {
+            builder.append_chunk(result, &chunk.text, ANNOTATION_TEMPLATE);
+        }
+    }
+    builder.finish(query, CONTEXT_TEMPLATE).0
+}
+
+/// Build the baseline deep-copy model context for retained results, used by the
+/// combined staging-peak fixture. Allocates each owned annotation and copies the
+/// concatenation into the finished wrapper.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "combined-peak fixture renders test-controlled results"
+)]
+pub(super) fn build_context_deep_copy(results: &[&SearchResult], query: &str) -> String {
+    let mut rendered = String::new();
+    let mut chunk_index = 0;
+    for result in results {
+        for chunk in &result.content {
+            chunk_index += 1;
+            let annotation = render_annotation_bounded(
+                result,
+                &chunk.text,
+                chunk_index,
+                ANNOTATION_TEMPLATE,
+                MAX_MODEL_CONTEXT_BYTES,
+            )
+            .expect("combined-peak fixture annotation must render");
+            rendered.push_str(&annotation);
+        }
+    }
+    let chunk_count = chunk_index.min(MAX_FORMATTED_CHUNKS);
+    render_template_bounded(
+        CONTEXT_TEMPLATE,
+        &[
+            ("query", query),
+            ("num_chunks", &chunk_count.to_string()),
+            ("results", &rendered),
+        ],
+        MAX_MODEL_CONTEXT_BYTES,
+    )
+    .expect("combined-peak fixture context must render")
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, reason = "tests")]
