@@ -24,10 +24,10 @@
 # Credential isolation (three distinct credentials, each at its own boundary):
 #   - `basic_auth` authenticates the *client* to this gateway. A trusted
 #     caller (Claude Code via `ANTHROPIC_CUSTOM_HEADERS`, OpenCode via its
-#     `praxis-auth.ts` plugin or a per-model `headers` entry) presents an
-#     `Authorization: Basic ...` gateway credential; `basic_auth` verifies
-#     it and, with `strip_authorization: true`, removes it so it never
-#     reaches the backend.
+#     provider `options.headers` entry or a per-model `headers` map)
+#     presents an `Authorization: Basic ...` gateway credential; `basic_auth`
+#     verifies it and, with `strip_authorization: true`, removes it so it
+#     never reaches the backend.
 #   - The `headers` filter removes the client's `x-api-key` (the native
 #     Anthropic auth header) so a caller's Anthropic key never reaches
 #     vLLM either.

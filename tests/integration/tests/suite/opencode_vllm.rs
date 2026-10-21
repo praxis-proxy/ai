@@ -21,8 +21,8 @@
 //!   user-visible answer; and
 //! * a tool-call round trip, which is the scenario that earns GPU time.
 //!
-//! The `--pure`/model-headers lane stays on CPU: it is a config-parsing
-//! concern, and a real model adds cost without adding evidence.
+//! The per-model headers lane stays on CPU: it is a config-parsing concern,
+//! and a real model adds cost without adding evidence.
 //!
 //! # Gating
 //!
@@ -37,7 +37,7 @@
 //! PRAXIS_TEST_VLLM_MODEL=qwen3-8b \
 //! VLLM_API_KEY=<backend-token> \
 //!   cargo test -p praxis-tests-integration --features store-all --test suite \
-//!   opencode_vllm::opencode_vllm_plugin_auth_completes_text_turn -- --exact
+//!   opencode_vllm::opencode_vllm_options_headers_auth_completes_text_turn -- --exact
 //! ```
 //!
 //! Pins live in `tests/integration/fixtures/opencode-cli/pin.toml` and are
@@ -61,8 +61,7 @@ use super::{
         non_empty_env,
     },
     opencode::{
-        AuthLane, CHAT_PATH, EXAMPLE_CONFIG, GATEWAY_USER, LaunchSpec, OpenCodeTrace, PLUGIN_FAILURE_LOG,
-        gateway_password, launch,
+        AuthLane, CHAT_PATH, EXAMPLE_CONFIG, GATEWAY_USER, LaunchSpec, OpenCodeTrace, gateway_password, launch,
     },
 };
 
@@ -199,28 +198,21 @@ async fn run_live(live: &LiveConfig, workspace: &Path, prompt: &str) -> Captured
         workspace,
         base_url: &base_url,
         model: &live.model,
-        lane: AuthLane::Plugin,
+        lane: AuthLane::OptionsHeaders,
+        omit_gateway_auth: false,
         prompt,
         timeout: CHILD_TIMEOUT,
     })
     .await
 }
 
-/// Shared post-run checks: the client finished, the plugin loaded, no errors.
-///
-/// The plugin check is not redundant with the exit status. A throwing `config`
-/// hook still exits 0 and still sends the turn, just unauthenticated, so
-/// without this a broken plugin would surface only as a confusing 401.
+/// Shared post-run checks: the client finished and reported no errors.
 fn assert_clean_run(output: &CapturedChildOutput, scenario: &str) -> OpenCodeTrace {
     live_vllm::assert_not_timed_out(output, "OpenCode", scenario, CHILD_TIMEOUT);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let trace = OpenCodeTrace::parse(&stdout);
 
-    assert!(
-        !stderr.contains(PLUGIN_FAILURE_LOG),
-        "{scenario}: the documented plugin must load cleanly; found {PLUGIN_FAILURE_LOG:?}\n{stderr}"
-    );
     // Diagnose from the trace before the exit status: a turn that failed for a
     // protocol reason is far more informative than a bare non-zero code.
     assert!(
@@ -241,7 +233,7 @@ fn assert_clean_run(output: &CapturedChildOutput, scenario: &str) -> OpenCodeTra
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opencode_vllm_plugin_auth_completes_text_turn() {
+async fn opencode_vllm_options_headers_auth_completes_text_turn() {
     let Some(live) = LiveConfig::from_env() else { return };
     let workspace = TempDir::new().expect("temporary workspace should be creatable");
 

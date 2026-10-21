@@ -630,11 +630,13 @@ jobs:
           # ---- OpenCode -------------------------------------------------
           # Exported so the acceptance job carries no hardcoded version
           # strings. Scattering them is exactly how the Codex pins drifted.
-          # Each OpenCode major has its own manifest and its own plugin. Every
+          # Each OpenCode major has its own manifest and its own credential
+          # recipe (1.x: provider options.headers; 2.x: a plugin). Every
           # manifest is validated against the major it declares AND the major
           # its path is reserved for, so a 2.x version dropped into the 1.x
           # manifest (or the reverse) still fails here: crossing the boundary
-          # needs a rewritten plugin and a re-validated manifest, not a bump.
+          # needs a rewritten client configuration and a re-validated
+          # manifest, not a bump.
           oc_manifests = {
               1: pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml"),
               2: pathlib.Path("tests/integration/fixtures/opencode-cli-v2/pin.toml"),
@@ -652,9 +654,9 @@ jobs:
                   )
               if actual_major != lane_major:
                   raise SystemExit(
-                      f"{path}: the OpenCode acceptance lane is pinned to the {lane_major}.x plugin "
-                      f"contract; version {client['version']} needs its own manifest and a "
-                      "rewritten praxis-auth plugin"
+                      f"{path}: the OpenCode acceptance lane is pinned to the {lane_major}.x client "
+                      f"configuration; version {client['version']} needs its own manifest and a "
+                      "rewritten client configuration"
                   )
               # The prompt is positional on both majors; the flag that would
               # swallow it differs (-p was the 1.x server password).
@@ -2226,7 +2228,7 @@ jobs:
           set -uo pipefail
           sudo --preserve-env=PRAXIS_TEST_OPENCODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            opencode_vllm::opencode_vllm_plugin_auth_completes_text_turn \
+            opencode_vllm::opencode_vllm_options_headers_auth_completes_text_turn \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-text.log"
           exit "${PIPESTATUS[0]}"
 

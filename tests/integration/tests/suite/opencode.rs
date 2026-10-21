@@ -20,21 +20,24 @@
 //!
 //! Two lanes, matching the two documented recipes:
 //!
-//! * **plugin** — the `praxis-auth.ts` `config` hook attaches the gateway Basic credential at runtime. This is the
-//!   primary lane; the plugin under test is the fixture that [`documented_plugin_matches_fixture`] pins byte-for-byte
-//!   to the code block in the guide.
-//! * **headers** — the schema-native per-model `headers` map does the same thing declaratively, with `--pure` so no
-//!   plugin loads at all.
+//! * **options-headers** — the primary lane: `provider.<id>.options.headers.Authorization` carries the gateway Basic
+//!   credential, read from the environment at config-load time through `{env:PRAXIS_GATEWAY_AUTH}` substitution. The
+//!   lane runs exactly the recipe the guide publishes, so it proves both the provider-options pass-through and the
+//!   environment substitution end to end.
+//! * **headers** — the schema-native per-model `headers` map carries the same thing declaratively.
 //!
-//! # Exit status is not an auth oracle
+//! # The credential is asserted on every request
 //!
-//! When the plugin's `config` hook throws, the pinned client logs
-//! [`PLUGIN_FAILURE_LOG`] and **continues**, sending the turn with no
-//! `Authorization` header, exiting `0`, and ending its event stream in
-//! `step_finish`. A test that only checked the exit status would pass while
-//! the credential silently vanished. So the plugin lane asserts the header on
-//! EVERY captured request and asserts the failure log is absent. See
-//! `[opencode.auth.plugin] fail_open` in the pin manifest.
+//! The lanes assert the gateway credential on EVERY captured request rather
+//! than only checking the exit status: a client sub-session that silently fell
+//! back to another provider would leave the first, correct request in place
+//! and pass a single-request check.
+//!
+//! The inversion scenario
+//! ([`pinned_opencode_missing_env_substitution_is_rejected`]) withholds
+//! `PRAXIS_GATEWAY_AUTH` so the substitution resolves to an empty string; the
+//! gateway must then reject the turn, proving the credential really comes from
+//! the environment through the documented substitution and from nowhere else.
 //!
 //! # Running locally
 //!
@@ -75,8 +78,11 @@ const OPENCODE_BIN_ENV: &str = "PRAXIS_TEST_OPENCODE_BIN";
 pub(super) const EXAMPLE_CONFIG: &str = "anthropic/messages-native-vllm.yaml";
 /// Pin manifest, relative to this crate's `fixtures/` directory.
 pub(super) const PIN_MANIFEST: &str = "opencode-cli/pin.toml";
-/// The documented plugin, mirrored from the guide.
-pub(super) const PLUGIN_FIXTURE: &str = "opencode-cli/praxis-auth.ts";
+/// Environment variable the documented `{env:PRAXIS_GATEWAY_AUTH}`
+/// substitution reads at config-load time.
+pub(super) const GATEWAY_AUTH_ENV: &str = "PRAXIS_GATEWAY_AUTH";
+/// The literal `{env:...}` token the documented recipe places in the config.
+pub(super) const GATEWAY_AUTH_SUBSTITUTION: &str = "{env:PRAXIS_GATEWAY_AUTH}";
 /// Gateway `basic_auth` username the example config configures.
 pub(super) const GATEWAY_USER: &str = "gateway";
 /// Provider id the OpenCode configuration declares.
@@ -89,8 +95,6 @@ pub(super) const CHAT_PATH: &str = "/v1/chat/completions";
 pub(super) const PROMPT: &str = "Reply with exactly PONG. Do not call any tools.";
 /// Text the scripted backend streams back.
 pub(super) const REPLY: &str = "PONG";
-/// Log line the client emits, only under `--print-logs`, when the hook throws.
-pub(super) const PLUGIN_FAILURE_LOG: &str = "plugin config hook failed";
 /// Bound on one child run. The client is a Bun binary with a slow cold start.
 pub(super) const CHILD_TIMEOUT: Duration = Duration::from_secs(90);
 /// Scripted responses to queue. A trivial prompt costs two turns (a toolless
@@ -127,24 +131,17 @@ const MODEL_OBJECT_KEYS: &[&str] = &[
 /// Which documented credential recipe a run exercises.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AuthLane {
-    /// `praxis-auth.ts` attaches the credential through the `config` hook.
-    Plugin,
-    /// A per-model `headers` map carries it, with plugins disabled.
+    /// `provider.options.headers.Authorization` carries the credential via the
+    /// `{env:PRAXIS_GATEWAY_AUTH}` substitution the guide documents.
+    OptionsHeaders,
+    /// A per-model `headers` map carries it declaratively.
     ModelHeaders,
-    /// The plugin is present but `--pure` must ignore it, so no credential is
-    /// attached and the gateway must reject the request.
-    PureIgnoresPlugin,
 }
 
 impl AuthLane {
-    /// Whether the client runs with `--pure` (no external plugins).
-    pub(super) const fn is_pure(self) -> bool {
-        matches!(self, Self::ModelHeaders | Self::PureIgnoresPlugin)
-    }
-
     /// Whether a gateway credential is expected to reach the backend.
     const fn expects_credential(self) -> bool {
-        matches!(self, Self::Plugin | Self::ModelHeaders)
+        matches!(self, Self::OptionsHeaders | Self::ModelHeaders)
     }
 }
 
@@ -277,47 +274,35 @@ fn model_object(headers: Option<Value>) -> Value {
 
 /// The full client configuration for a lane.
 ///
-/// The `plugin` array is declared whenever the plugin file is seeded on disk —
-/// every lane except `ModelHeaders` — so the `PureIgnoresPlugin` inversion lane
-/// has a DECLARED plugin for `--pure` to ignore. OpenCode loads plugins only
-/// from this array (there is no config-dir auto-discovery), so an undeclared
-/// plugin never loads with or without `--pure`; declaring it only for the
-/// non-pure lane would make `--pure` a no-op and the inversion prove nothing.
-/// The entry is a path relative to the configuration directory the caller
-/// seeded.
+/// The primary lane mirrors the guide exactly: the credential rides
+/// `provider.<id>.options.headers.Authorization` as the literal
+/// `{env:PRAXIS_GATEWAY_AUTH}` token, which OpenCode substitutes from the
+/// child's environment at config-load time, so the secret never has to be
+/// written into the file. The per-model `headers` map is the schema-declared
+/// alternative and carries the literal credential instead.
 pub(super) fn client_config(base_url: &str, model: &str, lane: AuthLane) -> Value {
+    let mut options = json!({"baseURL": base_url});
+    if lane == AuthLane::OptionsHeaders {
+        options["headers"] = json!({"Authorization": GATEWAY_AUTH_SUBSTITUTION});
+    }
     let headers = (lane == AuthLane::ModelHeaders).then(|| json!({"Authorization": gateway_credential()}));
-    let mut config = json!({
+    json!({
         "$schema": "https://opencode.ai/config.json",
         "autoupdate": false,
         "provider": {
             PROVIDER_ID: {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Praxis",
-                "options": {"baseURL": base_url},
+                "options": options,
                 "models": {model: model_object(headers)},
             },
         },
-    });
-    // Declare the plugin on every lane that seeds it (mirrors `seed_config_dir`),
-    // NOT only the non-pure lanes: `PureIgnoresPlugin` must declare it so `--pure`
-    // has a plugin to ignore, otherwise the inversion lane is vacuous.
-    if lane != AuthLane::ModelHeaders {
-        config["plugin"] = json!(["./praxis-auth.ts"]);
-    }
-    config
+    })
 }
 
 /// Seed `dir` as the client's configuration directory for `lane`.
-///
-/// The plugin is copied from the committed fixture rather than written inline,
-/// so the executable loads exactly the source the guide publishes.
 pub(super) fn seed_config_dir(dir: &Path, base_url: &str, model: &str, lane: AuthLane) {
     std::fs::create_dir_all(dir).expect("client configuration directory should be creatable");
-    if lane != AuthLane::ModelHeaders {
-        std::fs::copy(fixture_path(PLUGIN_FIXTURE), dir.join("praxis-auth.ts"))
-            .expect("documented plugin fixture should be copyable into the configuration directory");
-    }
     let config =
         serde_json::to_string_pretty(&client_config(base_url, model, lane)).expect("client config should serialize");
     std::fs::write(dir.join("opencode.jsonc"), config).expect("client configuration should be writable");
@@ -330,24 +315,21 @@ pub(super) fn seed_config_dir(dir: &Path, base_url: &str, model: &str, lane: Aut
 /// prompt that way would silently send it as a credential and leave the model
 /// with an empty turn. [`opencode_run_uses_positional_prompt_not_dash_p`]
 /// guards this.
-pub(super) fn run_args(lane: AuthLane, model: &str, prompt: &str) -> Vec<String> {
-    let mut args = vec!["run".to_owned()];
-    if lane.is_pure() {
-        args.push("--pure".to_owned());
-    }
-    args.extend([
+pub(super) fn run_args(model: &str, prompt: &str) -> Vec<String> {
+    vec![
+        "run".to_owned(),
         "--model".to_owned(),
         format!("{PROVIDER_ID}/{model}"),
         "--format".to_owned(),
         "json".to_owned(),
-        // Mandatory: a failing plugin is otherwise entirely silent.
+        // Diagnostics hygiene: failures are far easier to diagnose with the
+        // client's own stderr log available.
         "--print-logs".to_owned(),
         "--log-level".to_owned(),
         "ERROR".to_owned(),
         "--".to_owned(),
         prompt.to_owned(),
-    ]);
-    args
+    ]
 }
 
 // -----------------------------------------------------------------------------
@@ -373,6 +355,10 @@ pub(super) struct LaunchSpec<'a> {
     pub(super) model: &'a str,
     /// Which credential recipe to exercise.
     pub(super) lane: AuthLane,
+    /// Withhold [`GATEWAY_AUTH_ENV`] from the child even on lanes that
+    /// normally set it, so the `{env:...}` substitution resolves to an empty
+    /// string. Only meaningful for the inversion scenario.
+    pub(super) omit_gateway_auth: bool,
     /// The positional prompt.
     pub(super) prompt: &'a str,
     /// Bound on the child.
@@ -387,6 +373,7 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         base_url,
         model,
         lane,
+        omit_gateway_auth,
         prompt,
         timeout,
     } = spec;
@@ -395,7 +382,7 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
 
     let mut command = tokio::process::Command::new(bin);
     command
-        .args(run_args(lane, model, prompt))
+        .args(run_args(model, prompt))
         .current_dir(workspace)
         .env_clear()
         .env("HOME", home)
@@ -417,13 +404,11 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         .env("OPENCODE_DISABLE_SHARE", "1")
         .env("OPENCODE_DISABLE_LSP_DOWNLOAD", "1")
         // Deliberately NOT setting HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to a dead
-        // port, which is how `claude_code.rs` fences its client in. Plugin
-        // loading honors those variables, so against a refused proxy it retries
-        // for ~68s: measured 4s without them and 72s with them, for an
-        // otherwise identical plugin run. The CI lane gets real isolation from
-        // a network namespace with no default route, which is a hard guarantee
-        // rather than an advisory one, so the dead-proxy trick would buy
-        // nothing here and cost a minute per run.
+        // port, which is how `claude_code.rs` fences its client in. The CI
+        // lane gets real isolation from a network namespace with no default
+        // route, which is a hard guarantee rather than an advisory one, and a
+        // dead proxy would only add connection-setup latency to a run that
+        // needs no egress beyond the loopback backend.
         //
         // STDIN MUST BE NULL. With stdin open the client logs `init` and then
         // blocks forever, before issuing a single request, even though the
@@ -433,12 +418,12 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if lane != AuthLane::ModelHeaders {
-        // Read by the documented plugin. `PRAXIS_BASE_URL` must match the
-        // merged `baseURL` exactly or the hook throws.
-        command
-            .env("GATEWAY_AUTH_PASSWORD", gateway_password())
-            .env("PRAXIS_BASE_URL", base_url);
+    if lane == AuthLane::OptionsHeaders && !omit_gateway_auth {
+        // Read at config-load time by the documented `{env:...}`
+        // substitution. Withheld, it resolves to an empty string and the
+        // gateway rejects the turn with a bare 401 — the inversion scenario
+        // relies on exactly that.
+        command.env(GATEWAY_AUTH_ENV, gateway_credential());
     }
     configure_isolated_process_group(&mut command);
 
@@ -558,7 +543,11 @@ fn pinned_opencode_version_check() {
 }
 
 /// Drive one lane end to end and return the captured output and requests.
-async fn run_lane(lane: AuthLane, bin: &OsStr) -> (CapturedChildOutput, Vec<praxis_test_utils::CapturedRequest>) {
+async fn run_lane(
+    lane: AuthLane,
+    bin: &OsStr,
+    omit_gateway_auth: bool,
+) -> (CapturedChildOutput, Vec<praxis_test_utils::CapturedRequest>) {
     let backend = scripted_backend().start_with_shutdown();
     let proxy_port = free_port();
     let config = gateway_config(proxy_port, backend.port());
@@ -575,6 +564,7 @@ async fn run_lane(lane: AuthLane, bin: &OsStr) -> (CapturedChildOutput, Vec<prax
         base_url: &base_url,
         model: MODEL_ID,
         lane,
+        omit_gateway_auth,
         prompt: PROMPT,
         timeout: CHILD_TIMEOUT,
     })
@@ -583,11 +573,11 @@ async fn run_lane(lane: AuthLane, bin: &OsStr) -> (CapturedChildOutput, Vec<prax
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pinned_opencode_completes_turn_with_plugin_auth() {
+async fn pinned_opencode_completes_turn_with_options_headers_auth() {
     let Some(bin) = opencode_bin() else { return };
-    let (output, requests) = run_lane(AuthLane::Plugin, &bin).await;
+    let (output, requests) = run_lane(AuthLane::OptionsHeaders, &bin, false).await;
 
-    assert_not_timed_out(&output, "plugin lane");
+    assert_not_timed_out(&output, "options-headers lane");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let trace = OpenCodeTrace::parse(&stdout);
@@ -596,19 +586,12 @@ async fn pinned_opencode_completes_turn_with_plugin_auth() {
     // protocol reason is far more informative than a bare non-zero code.
     assert!(
         trace.errors().is_empty(),
-        "plugin lane should not surface a client error event: {:?}\nSTDERR:\n{stderr}",
+        "options-headers lane should not surface a client error event: {:?}\nSTDERR:\n{stderr}",
         trace.errors()
-    );
-    // The plugin fails OPEN: a throwing hook still exits 0 and still sends the
-    // turn, just unauthenticated. Without this the lane could pass while the
-    // very thing it exists to prove was broken.
-    assert!(
-        !stderr.contains(PLUGIN_FAILURE_LOG),
-        "the documented plugin must load and run cleanly; found {PLUGIN_FAILURE_LOG:?}:\n{stderr}"
     );
     assert!(
         output.status.success(),
-        "plugin lane should exit 0, got {:?}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+        "options-headers lane should exit 0, got {:?}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
         output.status.code()
     );
     assert!(
@@ -618,13 +601,13 @@ async fn pinned_opencode_completes_turn_with_plugin_auth() {
         trace.event_types()
     );
 
-    assert_requests_authenticated(&requests, AuthLane::Plugin);
+    assert_requests_authenticated(&requests, AuthLane::OptionsHeaders);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_opencode_completes_turn_with_model_headers_auth() {
     let Some(bin) = opencode_bin() else { return };
-    let (output, requests) = run_lane(AuthLane::ModelHeaders, &bin).await;
+    let (output, requests) = run_lane(AuthLane::ModelHeaders, &bin, false).await;
 
     assert_not_timed_out(&output, "model-headers lane");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -651,25 +634,28 @@ async fn pinned_opencode_completes_turn_with_model_headers_auth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pinned_opencode_pure_mode_ignores_the_plugin_and_is_rejected() {
+async fn pinned_opencode_missing_env_substitution_is_rejected() {
+    // The config still references `{env:PRAXIS_GATEWAY_AUTH}`, but the
+    // variable is withheld, so the substitution resolves to an empty string
+    // and the request carries an empty `Authorization` header. Inverting the
+    // options-headers lane this way proves the credential comes from the
+    // environment through the documented substitution, rather than from
+    // something else in the environment happening to authenticate the run.
     let Some(bin) = opencode_bin() else { return };
-    // The plugin IS present in the configuration directory and the config
-    // declares it; `--pure` must ignore it. Inverting the plugin lane this way
-    // proves the plugin is what supplies the credential, rather than something
-    // else in the environment happening to authenticate the run.
-    let (output, requests) = run_lane(AuthLane::PureIgnoresPlugin, &bin).await;
+    let (output, requests) = run_lane(AuthLane::OptionsHeaders, &bin, true).await;
 
-    assert_not_timed_out(&output, "pure lane");
+    assert_not_timed_out(&output, "missing-env lane");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trace = OpenCodeTrace::parse(&stdout);
 
     // `basic_auth` runs before routing, so the unauthenticated turn is rejected
     // at the gateway and never reaches the backend at all. Zero captured
     // requests is the proof that the credential really was absent — a request
-    // that got through would mean something other than the plugin supplied it.
+    // that got through would mean something other than the substituted
+    // environment variable supplied it.
     assert!(
         requests.is_empty(),
-        "--pure must not authenticate, so the gateway must reject before the backend sees anything; \
+        "the empty substitution must not authenticate, so the gateway must reject before the backend sees anything; \
          backend captured {} request(s): {:?}",
         requests.len(),
         requests.iter().map(|request| &request.uri).collect::<Vec<_>>()
@@ -801,7 +787,7 @@ pub(super) const GUIDE_V2_HEADING: &str = "\n### OpenCode 2.x\n";
 
 /// The guide text from `start` up to (not including) `end`.
 ///
-/// Each client major publishes its own plugin and config blocks, so the
+/// Each client major publishes its own credential recipe blocks, so the
 /// byte-equality assertions are scoped to one section; a whole-document search
 /// would match the other major's block. Panics if either heading is missing or
 /// out of order, so a restructured guide fails here rather than silently
@@ -836,15 +822,16 @@ fn pin_toml_version_matches_harness_const() {
 
 #[test]
 fn pinned_opencode_version_is_a_one_x_release() {
-    // OpenCode 2.x replaces the `config` plugin hook this suite depends on, so
-    // crossing the major boundary needs a rewritten plugin, not a version bump.
+    // OpenCode 2.x replaces the `provider` configuration key and the
+    // `{env:...}` substitution contract these lanes drive, so crossing the
+    // major boundary needs a rewritten suite, not a version bump.
     let major = OPENCODE_PINNED_VERSION
         .split('.')
         .next()
         .expect("version should be dotted");
     assert_eq!(
         major, "1",
-        "pinned OpenCode must stay on the 1.x plugin contract; 2.x requires a new plugin"
+        "pinned OpenCode must stay on the 1.x provider configuration; 2.x requires new lanes"
     );
     assert_eq!(
         pin_value("major_series"),
@@ -854,24 +841,28 @@ fn pinned_opencode_version_is_a_one_x_release() {
 }
 
 #[test]
-fn documented_plugin_matches_fixture() {
-    // The acceptance lane loads the fixture, so without this assertion the
-    // suite would validate its own private copy of the plugin rather than the
-    // one the guide tells users to create.
+fn options_headers_lane_matches_the_documented_recipe() {
+    // The acceptance lane builds its configuration from `client_config`, so
+    // without this assertion the suite would validate its own private recipe
+    // rather than the one the guide tells users to create.
     let section = guide_section(GUIDE_V1_HEADING, GUIDE_V2_HEADING);
-    let blocks = fenced_blocks(&section, "typescript");
-    assert_eq!(
-        blocks.len(),
-        1,
-        "the guide's OpenCode 1.x section should publish exactly one TypeScript block (the Praxis auth plugin)"
+
+    assert!(
+        section.contains(&format!("\"Authorization\": \"{GATEWAY_AUTH_SUBSTITUTION}\"")),
+        "the guide's OpenCode 1.x section should publish the {{env:...}} substitution the options-headers lane exercises"
     );
 
-    let fixture = std::fs::read_to_string(fixture_path(PLUGIN_FIXTURE)).expect("plugin fixture should be readable");
+    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::OptionsHeaders);
     assert_eq!(
-        fixture, blocks[0],
-        "fixtures/{PLUGIN_FIXTURE} must match the plugin published in the guide byte for byte; \
-         edit both or the acceptance test stops validating the documentation"
+        config["provider"][PROVIDER_ID]["options"]["headers"]["Authorization"].as_str(),
+        Some(GATEWAY_AUTH_SUBSTITUTION),
+        "the options-headers lane must carry the documented substitution token, not a literal credential"
     );
+    assert!(
+        config["provider"][PROVIDER_ID]["models"][MODEL_ID]["headers"].is_null(),
+        "the options-headers lane must rely on the provider option alone, with no per-model header"
+    );
+    assert!(config["plugin"].is_null(), "the documented recipe declares no plugin");
 }
 
 #[test]
@@ -910,29 +901,11 @@ fn model_headers_config_carries_the_gateway_credential() {
         Some(gateway_credential().as_str()),
         "the model-headers lane must carry the gateway Basic credential"
     );
-    assert!(
-        config["plugin"].is_null(),
-        "the model-headers lane runs --pure and must not declare a plugin"
-    );
-    // `provider.options` has no `headers` key in the published schema; the
-    // credential belongs on the model.
+    // The per-model lane must stay isolated from the provider-option recipe:
+    // both present would make a passing lane prove nothing about either.
     assert!(
         config["provider"][PROVIDER_ID]["options"]["headers"].is_null(),
-        "the credential must live on the model, not on provider.options"
-    );
-}
-
-#[test]
-fn plugin_config_declares_the_documented_plugin_path() {
-    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::Plugin);
-    assert_eq!(
-        config["plugin"],
-        json!(["./praxis-auth.ts"]),
-        "the plugin lane must reference the plugin exactly as the guide does"
-    );
-    assert!(
-        config["provider"][PROVIDER_ID]["models"][MODEL_ID]["headers"].is_null(),
-        "the plugin lane must rely on the hook alone, with no declarative header"
+        "the credential must live on the model, not on provider.options, in this lane"
     );
 }
 
@@ -942,7 +915,7 @@ fn opencode_run_uses_positional_prompt_not_dash_p() {
     // `claude -p "<prompt>"` habit would send the prompt as a credential and
     // leave the model with an empty turn, which is both a silent test failure
     // and a credential leak into process arguments.
-    let args = run_args(AuthLane::Plugin, MODEL_ID, PROMPT);
+    let args = run_args(MODEL_ID, PROMPT);
 
     assert!(
         !args.iter().any(|arg| arg == "-p" || arg == "--password"),
@@ -969,54 +942,7 @@ fn opencode_run_uses_positional_prompt_not_dash_p() {
     );
     assert!(
         args.iter().any(|arg| arg == "--print-logs"),
-        "--print-logs is required: a failing plugin is otherwise silent: {args:?}"
-    );
-}
-
-#[test]
-fn pure_lanes_pass_the_pure_flag() {
-    assert!(
-        run_args(AuthLane::ModelHeaders, MODEL_ID, PROMPT)
-            .iter()
-            .any(|arg| arg == "--pure"),
-        "the model-headers lane must disable plugins"
-    );
-    assert!(
-        run_args(AuthLane::PureIgnoresPlugin, MODEL_ID, PROMPT)
-            .iter()
-            .any(|arg| arg == "--pure"),
-        "the inversion lane must disable plugins"
-    );
-    assert!(
-        !run_args(AuthLane::Plugin, MODEL_ID, PROMPT)
-            .iter()
-            .any(|arg| arg == "--pure"),
-        "the plugin lane must load the plugin"
-    );
-}
-
-#[test]
-fn pure_inversion_lane_declares_a_plugin_for_pure_to_ignore() {
-    // The inversion lane's whole purpose is proving `--pure` ignores a DECLARED
-    // plugin. OpenCode loads plugins only from the config `plugin` array, so if
-    // this lane omitted the declaration the 401 would come from the plugin never
-    // loading rather than from `--pure` ignoring it, and the lane would prove
-    // nothing. Guard the declaration (and the still-present `--pure`) offline.
-    let config = client_config("http://127.0.0.1:8080/v1", MODEL_ID, AuthLane::PureIgnoresPlugin);
-    assert_eq!(
-        config["plugin"],
-        json!(["./praxis-auth.ts"]),
-        "the inversion lane must declare the plugin so --pure has something to ignore"
-    );
-    assert!(
-        run_args(AuthLane::PureIgnoresPlugin, MODEL_ID, PROMPT)
-            .iter()
-            .any(|arg| arg == "--pure"),
-        "the inversion lane must still pass --pure"
-    );
-    assert!(
-        config["provider"][PROVIDER_ID]["models"][MODEL_ID]["headers"].is_null(),
-        "the inversion lane must rely on the ignored plugin alone, with no declarative header"
+        "--print-logs keeps client diagnostics on stderr: {args:?}"
     );
 }
 
