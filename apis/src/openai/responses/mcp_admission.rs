@@ -416,10 +416,7 @@ mod tests {
     #[test]
     fn allow_all_admits_tools_without_read_only_metadata() {
         let verdict = evaluate_tool(protected(), ConnectorToolPolicy::AllowAll, &tool(None));
-        assert_eq!(
-            verdict,
-            McpToolVerdict::Admitted(AdmissionBasis::AllowAll)
-        );
+        assert_eq!(verdict, McpToolVerdict::Admitted(AdmissionBasis::AllowAll));
     }
 
     #[test]
@@ -429,10 +426,7 @@ mod tests {
             ConnectorToolPolicy::ReadOnly,
             &tool(Some(json!({"readOnlyHint": true}))),
         );
-        assert_eq!(
-            verdict,
-            McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly)
-        );
+        assert_eq!(verdict, McpToolVerdict::Admitted(AdmissionBasis::AffirmedReadOnly));
     }
 
     #[test]
@@ -442,10 +436,7 @@ mod tests {
             ConnectorToolPolicy::AllowAll,
             &tool(Some(json!({"readOnlyHint": false}))),
         );
-        assert_eq!(
-            verdict,
-            McpToolVerdict::Admitted(AdmissionBasis::AllowAll)
-        );
+        assert_eq!(verdict, McpToolVerdict::Admitted(AdmissionBasis::AllowAll));
     }
 
     #[test]
