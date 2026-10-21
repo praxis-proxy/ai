@@ -716,17 +716,48 @@ fn promote_boolean_results(
     Ok(())
 }
 
+/// Whether a stored item replays verbatim as canonical `OpenResponses` input.
+///
+/// Hosted-tool output items (for example `web_search_call`) remain available in
+/// persisted history, but `OpenResponses` backends do not accept them in a
+/// subsequent request, so they are excluded.
+///
+/// Client-owned typed tool items (`custom_tool_call`/`custom_tool_call_output`)
+/// are preserved even though a function-only `OpenResponses` backend does not
+/// accept them raw: when a client-tool-compatibility adapter is configured it
+/// lowers them to `function_call`/`function_call_output` before they reach the
+/// backend, and dropping them during replay would silently lose prior client-tool
+/// execution context on stored continuations (#1764). Only items the configured
+/// adapter can lower are kept.
+///
+/// This is the single source of truth for both replay paths: the rehydrate
+/// shared fast path ([`rehydrate::replay_messages_from_stored`]) and the owning
+/// [`canonical_openresponses_replay_item`]. Keeping both behind this predicate
+/// prevents the two lists from drifting out of sync.
+#[cfg(feature = "store")]
+pub(crate) fn is_canonical_openresponses_replay_type(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "item_reference"
+                | "reasoning"
+                | "compaction"
+                | "message"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+        )
+    )
+}
+
 /// Return an item that can be sent back as canonical `OpenResponses` input.
 ///
-/// Hosted-tool output items remain available in persisted history, but
-/// `OpenResponses` backends do not accept them in a subsequent request. Old
-/// stored rows without the defaulted `type` field are normalized.
+/// Items whose type is [`is_canonical_openresponses_replay_type`] replay
+/// verbatim; old stored rows without the defaulted `type` field are normalized.
 #[cfg(feature = "store")]
 pub(crate) fn canonical_openresponses_replay_item(item: &serde_json::Value) -> Option<serde_json::Value> {
-    if matches!(
-        item.get("type").and_then(serde_json::Value::as_str),
-        Some("item_reference" | "reasoning" | "compaction" | "message" | "function_call" | "function_call_output")
-    ) {
+    if is_canonical_openresponses_replay_type(item) {
         return Some(item.clone());
     }
     let object = item.as_object()?;

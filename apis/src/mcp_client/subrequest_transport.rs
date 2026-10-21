@@ -2530,6 +2530,7 @@ mod tests {
         }
         SubResponse {
             status,
+            version: http::Version::HTTP_11,
             headers,
             body: Bytes::from_static(body),
         }

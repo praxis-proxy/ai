@@ -34,17 +34,17 @@ mod tests;
 use std::sync::Arc;
 
 use praxis_ai_store::StoreRegistry;
-// TLS mode and compression config live in the SQL-free contract crate,
-// re-exported here at their old paths.
-pub use praxis_ai_store::{CompressionAlgorithm, SslMode, StoreCompressionConfig};
 // The persistence contracts moved to praxis-ai-store; re-exported at their old
 // paths so existing `crate::store::*` references keep compiling. OwnerScopedStore
 // keeps its former name here.
 pub use praxis_ai_store::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
     OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseEventRecord,
-    ResponseRecord, ResponseStore, StoreError,
+    ResponseRecord, ResponseStore, StoreError, json_payload_charge, json_values_charge, json_values_fit,
 };
+// TLS mode and compression config live in the SQL-free contract crate,
+// re-exported here at their old paths.
+pub use praxis_ai_store::{CompressionAlgorithm, SslMode, StoreCompressionConfig};
 #[cfg(feature = "store-sqlite")]
 pub use praxis_ai_store_backends::SqliteResponseStore;
 #[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]

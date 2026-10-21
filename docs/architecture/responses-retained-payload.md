@@ -100,7 +100,7 @@ charges.
 | Payload | What is charged | Lifetime |
 | --- | --- | --- |
 | Incoming request | The raw JSON body and an allowance for its parsed structure. An inline `file_data` value or a `file_id` string is part of this body. | Retained across inference rounds. |
-| Restored history | Bounded Store reads for `previous_response_id` or a conversation, followed by the stored record and the replay state built from it. The record includes response input, output, and messages, or conversation metadata and messages. | Retained across inference rounds. Reading a response or conversation without creating a new budgeted request does not use this ledger. |
+| Restored history | Budgeted Store reads for `previous_response_id` or a conversation. The Store accounts for serialized JSON bytes and JSON structure before decoding, then the ledger reserves the admitted charge once before replay state is built. | Retained across inference rounds. Reading a response or conversation without creating a new budgeted request does not use this ledger. |
 | Resolved files | When `openai_file_resolve` fetches a `file_id` or resolves a `file_url`, the file content, metadata, resolution results, and expanded request body. The `file_id` string alone does not charge the file's contents; a reference passed through without fetching has no fetched-content charge. | Fetched content and rewritten request projections remain charged while the request uses them. |
 | Extracted documents | When `openai_doc_extract` converts supported text-safe inline `input_file` content to text, the decoded text, rewritten body, and corresponding history projections. | Retained across inference rounds. |
 | Provider response | A buffered response body, or incoming SSE chunks and parsed frames. The ledger also reserves for the iterative router's response buffer. | Provider body and stream charges are round-local and are released on continuation; the router reserve lasts for the request. |
@@ -131,13 +131,21 @@ For a JSON body with `B` wire bytes and `E` counted JSON syntax elements:
 | Streamed provider response (round-local) | `32 × C` for cumulative raw SSE bytes `C`, plus `512 × F` for counted JSON elements `F` in completed frames; Store adds `32 × C + 256 × F` | Covers the stream's transport and parsed frames for this round. Each incoming chunk also checks a temporary `16 × chunk bytes` peak; that peak is not accumulated. |
 | Iterative-router response buffer | `3 × (limit ÷ 8)` bytes | Reserves for the core buffer and possible spare capacity before the provider responds. This is 24 MiB at the default 64 MiB limit. |
 
-For a create that restores history, the Store read is capped at the remaining
-headroom divided by 256. Once loaded, the ledger charges `256 × R`, where `R`
-is the serialized size of the stored response fields or conversation fields
-that the restore uses, including their identifiers. This covers the decoded
-record and the replay state built from it. Explicit compaction has a separate
-ledger and uses a 512× Store-read allowance. These caps apply to charged
-payload, not the entire database or process memory.
+For a create that restores history, Store receives the remaining ledger
+allowance. Before decoding, each backend preflights raw JSON byte lengths and
+scans the JSON structure. A response or conversation is charged
+`32 × B + 8,192 × E`, where `B` is the serialized JSON payload bytes and
+relevant record identifiers, and `E` counts JSON containers, keys, and scalar
+values. The backend returns the measured charge; rehydration reserves it once
+before it creates replay projections. These values are conservative accounting
+allowances, not measured allocations.
+
+Conversation append-back checks the new items it writes and any legacy prefix
+that must be read and wrapped during its first item append. Existing item rows
+are not read or rebuilt by append-back, so their history is not charged a
+second time at that boundary. Explicit compaction keeps its separate ledger
+and 512× Store-read allowance. These caps apply to charged payload, not the
+entire database or process memory.
 
 `E` counts parts **inside the JSON document**, not physical servers or
 machines. It includes the start of each object or array, each key string,

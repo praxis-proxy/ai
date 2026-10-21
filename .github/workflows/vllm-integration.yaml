@@ -1268,6 +1268,32 @@ jobs:
           uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
             -p qualification_plugin -k live_tavily
 
+      - name: Run selected-Anthropic OpenAI-chat translation against real vLLM
+        id: selected_anthropic_openai_chat
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          # Reuse the praxis-ai binary built by "Build Praxis and acceptance test".
+          PRAXIS_AI_BIN: ${{ github.workspace }}/target/debug/praxis-ai
+          # Reuse the keyed vLLM container already serving native /v1/messages.
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          # Record per-case results (digest / shim / live json / streaming / tool)
+          # like the other SDK steps so the qualification report shows which case
+          # failed, not just the overall step outcome.
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/selected-anthropic-openai-chat-cases.json
+        run: |
+          # An official OpenAI Chat Completions client drives the selected-provider
+          # routing + translation (openai_chat_completions_to_anthropic[_stream])
+          # through Praxis to vLLM's native Anthropic Messages surface. The backend
+          # bearer is injected by the core credential_injection filter from
+          # VLLM_API_KEY (already in the job env), keyed on the intelligent_route-
+          # selected cluster, matching the shipped messages-native-vllm.yaml.
+          uv run tests/integration/sdk/openai/test_selected_anthropic_chat_completions_vllm.py -s \
+            -p qualification_plugin
+
       - name: Acceptance log tail on failure
         if: failure()
         run: |
@@ -1320,6 +1346,7 @@ jobs:
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
+          SELECTED_ANTHROPIC_OPENAI_CHAT: ${{ steps.selected_anthropic_openai_chat.outcome }}
         run: |
           python3 - "$RUNNER_TEMP/claude-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
@@ -1327,12 +1354,14 @@ jobs:
                    "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
                    "CLAUDE_COMPACTION",
                    "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
-                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
+                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH",
+                   "SELECTED_ANTHROPIC_OPENAI_CHAT")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
           for case, filename in (
               ("anthropic_messages", "anthropic-messages-cases.json"),
               ("anthropic_stubbed_web_search", "anthropic-stubbed-web-search-cases.json"),
               ("anthropic_credentialed_web_search", "anthropic-credentialed-web-search-cases.json"),
+              ("selected_anthropic_openai_chat", "selected-anthropic-openai-chat-cases.json"),
           ):
               path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
               if path.exists():

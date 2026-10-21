@@ -161,9 +161,18 @@ For larger changes, open a [feature request] and follow the
 [release documentation]: docs/release.md
 [security policy]: .github/SECURITY.md
 
+## Community
+
+Read [GOVERNANCE.md](GOVERNANCE.md) to see how our community works.
+
+Feel free to join our [discussion forums] to ask questions or share ideas.
+
+Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
+
+[discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+
 ## License
 
 Apache 2.0
-
 
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_large)

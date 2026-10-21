@@ -3560,7 +3560,7 @@ class TestOpenAIResponsesVLLM:
                 "input": "Reply OK. /no_think",
                 "truncation": truncation,
                 "max_output_tokens": 32,
-                "store": False,
+                "store": True,
             }
             if truncation == "disabled":
                 with pytest.raises(BadRequestError) as error:
@@ -3591,6 +3591,19 @@ class TestOpenAIResponsesVLLM:
                     )
                     assert response.status in {"completed", "incomplete"}
                     assert response.output, response
+                    if response.status == "completed":
+                        # A successful managed turn must append only its new
+                        # input/output items. Existing over-context history is
+                        # admitted during rehydration and not recharged during
+                        # this append-back.
+                        items = client.conversations.items.list(
+                            conversation.id, order="asc"
+                        ).data
+                        assert len(items) > 2, items
+                        assert any(
+                            item.type == "message" and item.role == "assistant"
+                            for item in items[2:]
+                        ), items
                 except APIStatusError as exc:
                     assert exc.status_code in {400, 502, 504}, exc
 
@@ -6687,6 +6700,80 @@ class TestClientToolCompatVLLM:
         assert any(t.type == "custom" for t in final_response.tools), (
             final_response.tools
         )
+
+    @requires_real_inference
+    def test_custom_tool_history_survives_native_responses_continuation(
+        self, client_tool_compat_client
+    ):
+        """#1764: a stored ``custom_tool_call`` and its re-entered
+        ``custom_tool_call_output`` must survive replay on a native function-only
+        Responses continuation, lowering to a correlated ``function_call`` /
+        ``function_call_output`` pair for the backend without dropping the prior
+        client-tool execution context or leaking the private lowered name.
+
+        The turn-1 ``custom_tool_call`` lives only in persisted history, so the
+        continuation exercises the stored replay path (not re-entry alone). Before
+        the fix the stored call was dropped before adapter lowering, leaving the
+        re-entered output orphaned; the continuation must now still complete and
+        correlate to the caller's turn.
+        """
+        first = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert first.status == "completed", first
+        custom_calls = [
+            item for item in first.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            f"first turn must produce a custom_tool_call; got: {[i.type for i in first.output]}"
+        )
+        call_id = custom_calls[0].call_id
+
+        second = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": "Applied the patch successfully.",
+                }
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            previous_response_id=first.id,
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert second.status == "completed", second
+        assert second.previous_response_id == first.id, second.previous_response_id
+        assert all(
+            item.type not in ("function_call", "function_call_output")
+            for item in second.output
+        ), f"lowered names must not leak on continuation: {[i.type for i in second.output]}"
+        assert any(t.type == "custom" for t in second.tools), second.tools
 
 
 class TestClientToolCompatChatVLLM:

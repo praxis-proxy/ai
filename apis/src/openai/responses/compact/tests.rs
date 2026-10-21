@@ -894,6 +894,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
     let filter = make_filter("open");
     let resp = subrequest::SubResponse {
         status: 503,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
@@ -907,6 +908,7 @@ fn non_2xx_response_closed_mode_rejects_request() {
     let filter = make_filter("closed");
     let resp = subrequest::SubResponse {
         status: 429,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };
@@ -1723,6 +1725,22 @@ fn compaction_item_round_trips_through_canonical_replay() {
     assert_eq!(replayed["type"], "compaction");
     assert_eq!(replayed["id"], "compact_rt");
     assert!(replayed.get("encrypted_content").is_some());
+}
+
+#[test]
+fn client_owned_custom_tool_items_round_trip_through_canonical_replay() {
+    // Client-owned custom call/output items are preserved for a downstream
+    // client-tool-compat adapter to lower, while hosted items stay excluded (#1764).
+    use crate::openai::responses::canonical_openresponses_replay_item;
+    let call = json!({"type": "custom_tool_call", "call_id": "call_history", "name": "do_work", "input": "Prior"});
+    let output = json!({"type": "custom_tool_call_output", "call_id": "call_history", "output": "sentinel"});
+    assert_eq!(canonical_openresponses_replay_item(&call).as_ref(), Some(&call));
+    assert_eq!(canonical_openresponses_replay_item(&output).as_ref(), Some(&output));
+    let hosted = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
+    assert!(
+        canonical_openresponses_replay_item(&hosted).is_none(),
+        "hosted output items are not replayable backend input"
+    );
 }
 
 // =============================================================================

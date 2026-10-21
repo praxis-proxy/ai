@@ -194,8 +194,8 @@ fn token_count_extracts_json_after_response_release() {
     let (counts, mode, saw_raw, final_body) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(saw_raw, "a raw prefix must trigger the real Release action");
     assert!(
-        matches!(mode, BodyMode::StreamBuffer { .. }),
-        "the pinned 0.7.4 runtime retains StreamBuffer after Release"
+        matches!(mode, BodyMode::Stream),
+        "the pinned runtime switches to Stream after Release"
     );
     assert_eq!(
         final_body.as_deref(),

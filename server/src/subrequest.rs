@@ -132,8 +132,10 @@ async fn run_circuit_eviction_loop(
 mod tests {
     use bytes::Bytes;
     use http::HeaderMap;
-    use pingora_core::upstreams::peer::HttpPeer;
-    use praxis_core::subrequest::{SubRequest, SubRequestError, SubResponse};
+    use praxis_core::{
+        egress::PeerSpec,
+        subrequest::{SubRequest, SubRequestError, SubResponse},
+    };
 
     use super::*;
 
@@ -349,7 +351,7 @@ filter_chains:
     }
 
     async fn execute_against(client: &SubRequestClient, peer_addr: &str) -> Result<SubResponse, SubRequestError> {
-        let peer = HttpPeer::new(peer_addr.to_owned(), false, String::new());
+        let peer = PeerSpec::plain(peer_addr.parse().unwrap());
         let request = SubRequest {
             method: http::Method::GET,
             uri: "/".parse().unwrap(),

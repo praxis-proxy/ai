@@ -1332,3 +1332,223 @@ fn streaming_namespace_member_never_leaks_private_name() {
         "the restored namespaced call re-adds its namespace: {body}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Stored continuation: client-owned tool history survives replay (#1764)
+// -----------------------------------------------------------------------------
+
+/// A completed backend response object the store can persist and rehydrate.
+fn history_backend_response(id: &str, store: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-4.1",
+        "output": [{
+            "type": "message",
+            "id": "msg_history",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Acknowledged", "annotations": [], "logprobs": []}]
+        }],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": store,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        },
+        "metadata": {}
+    })
+}
+
+/// Drive the two-request stored-continuation flow and return the backend request
+/// bodies for both rounds (`store: true` first request, then a `store: false`
+/// continuation keyed by `previous_response_id`).
+///
+/// `custom` selects between client-owned `custom_tool_call`/`custom_tool_call_output`
+/// history (the #1764 regression) and ordinary `function_call`/`function_call_output`
+/// history (the positive control). Either pair carries the same `call_history`
+/// `call_id` and `SENTINEL` output.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "stored continuation JSON values are bounded integration-test fixtures"
+)]
+fn stored_client_tool_continuation(custom: bool) -> (serde_json::Value, serde_json::Value) {
+    const SENTINEL: &str = "PRIOR_CLIENT_TOOL_RESULT_SENTINEL";
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, history_backend_response("resp_history_1", true).to_string()),
+        (200, history_backend_response("resp_history_2", false).to_string()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stored_history");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let (tools, call, output) = if custom {
+        (
+            serde_json::json!([{"type": "custom", "name": "do_work"}]),
+            serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": "call_history",
+                "name": "do_work",
+                "input": "Prior invocation"
+            }),
+            serde_json::json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_history",
+                "output": SENTINEL
+            }),
+        )
+    } else {
+        (
+            serde_json::json!([{
+                "type": "function",
+                "name": "do_work",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": false
+            }]),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_history",
+                "name": "do_work",
+                "arguments": "{}"
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_history",
+                "output": SENTINEL
+            }),
+        )
+    };
+
+    // First request: a rich client-tool history is stored under resp_history_1.
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": [
+            {"type": "message", "role": "user", "content": "Previous turn"},
+            call,
+            output
+        ],
+        "tools": tools,
+        "stream": false,
+        "store": true
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&first).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "valid initial rich history must succeed: {raw}"
+    );
+    let first_response: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("first response should be JSON");
+    let stored_id = first_response["id"].as_str().expect("first response carries an id");
+
+    // Second request: a stored continuation keyed by previous_response_id.
+    let second = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Continue from the prior result",
+        "tools": tools,
+        "previous_response_id": stored_id,
+        "stream": false,
+        "store": false
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&second).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "valid stored continuation must complete: {raw}"
+    );
+
+    let posts = inference_requests(&model);
+    assert_eq!(posts.len(), 2, "exactly two inference rounds: one per request");
+    for post in &posts {
+        assert_eq!(post.uri, "/v1/responses", "every round hits native /v1/responses");
+    }
+    let first_wire: serde_json::Value =
+        serde_json::from_str(&posts[0].body).expect("first backend body should be JSON");
+    let second_wire: serde_json::Value =
+        serde_json::from_str(&posts[1].body).expect("second backend body should be JSON");
+
+    // Control: the first round already lowers the client-owned pair to the
+    // function shape, so the result sentinel reaches the backend.
+    let first_items = first_wire["input"].as_array().expect("first backend input is an array");
+    assert!(
+        first_items
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["output"] == SENTINEL),
+        "initial lowering must send the client-tool result to the backend: {first_wire}"
+    );
+
+    (second_wire, serde_json::json!(SENTINEL))
+}
+
+/// #1764 positive control: ordinary `function_call`/`function_call_output`
+/// history already survives stored replay and reaches the continuation backend.
+#[test]
+fn stored_function_tool_history_survives_continuation() {
+    let (second_wire, sentinel) = stored_client_tool_continuation(false);
+    let items = second_wire["input"]
+        .as_array()
+        .expect("second backend input is an array");
+    let call_pos = items
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_history");
+    let output_pos = items.iter().position(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "call_history" && item["output"] == sentinel
+    });
+    assert!(
+        call_pos.is_some() && output_pos.is_some() && call_pos < output_pos,
+        "the stored function call/output pair must replay in order: {second_wire}"
+    );
+}
+
+/// #1764 regression: a stored `custom_tool_call`/`custom_tool_call_output` pair
+/// must survive replay and be lowered to the function shape on the continuation
+/// backend request, instead of being silently dropped before adapter lowering.
+#[test]
+fn stored_custom_tool_history_survives_continuation() {
+    let (second_wire, sentinel) = stored_client_tool_continuation(true);
+    let items = second_wire["input"]
+        .as_array()
+        .expect("second backend input is an array");
+    assert!(
+        items
+            .iter()
+            .all(|item| item["type"] != "custom_tool_call" && item["type"] != "custom_tool_call_output"),
+        "no raw custom item may reach the function-only backend: {second_wire}"
+    );
+    let call_pos = items
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_history");
+    let output_pos = items.iter().position(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "call_history" && item["output"] == sentinel
+    });
+    assert!(
+        call_pos.is_some() && output_pos.is_some() && call_pos < output_pos,
+        "the stored custom call/output pair must replay and lower in order: {second_wire}"
+    );
+}
