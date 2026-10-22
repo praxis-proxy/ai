@@ -45,6 +45,13 @@ Supports two modes:
 |-------|------|---------|-------------|
 | `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
+| `candidates[].provider` | string | no | Optional provider marker for provider-specific downstream filters. |
+| `candidates[].target_model` | string | no | Optional provider-specific model identifier written to the request body after this candidate is selected. |
+| `candidates[].paths` | string[] | no | Optional request paths on which `target_model` is applied. |
+| `candidates[].catalog` | string[] | no | Discovery envelopes in which this candidate is advertised. |
+| `candidates[].display_name` | string | no | Optional discovery display name. |
+| `candidates[].owned_by` | string | no | Optional discovery owner label. |
+| `candidates[].created` | integer | no | Optional discovery creation timestamp. |
 | `candidates[].credential` | CandidateCredential | no | Optional final-hop credential reference. |
 | `candidates[].credential.strategy` | string | yes | Injection strategy. |
 | `candidates[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
@@ -58,6 +65,7 @@ Supports two modes:
 | `candidates[].traffic_weight` | integer | no | Optional weight for an overlay using `selection_policy.mode: weightedRandom`. Inline static candidates cannot use traffic weights. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
+| `body_authoritative` | bool | no | Resolve inference model routing from the request body during the body phase. This prevents a client-supplied model header from selecting a backend before `model_to_header` has inspected the body. |
 | `skip_paths` | string[] | no | Request-path prefixes that bypass model resolution entirely. Management and discovery endpoints (model listing, subscriptions, API-key management, health) carry no routable model; a matching request returns `Continue` before any model lookup. Defaults to the well-known OpenAI-style management paths; set an explicit list to override, or `[]` to disable path skipping. See `path_is_management` for the match rule. |
 | `management_cluster` | string | no | Cluster that serves skipped management/discovery paths. When set, a request whose path matches `skip_paths` has `ctx.cluster` set to this cluster and continues straight to `load_balancer`. When unset, skipped paths continue with the cluster untouched. Requires a non-empty `skip_paths`. |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |

@@ -7,15 +7,7 @@ Serves a configured model list as a terminal response to `GET {path}`.
 
 ## Configuration Notes
 
-Discovery only: it advertises what the gateway exposes. Authorization is owned
-by the gateway's metering policy preflight; this filter does not enforce access.
-
-For routing-overlay deployments, use `overlay_file` instead of `models`. The
-overlay candidate's `catalog` field controls whether a model appears in the
-OpenAI and/or Anthropic envelope; `display_name`, `owned_by`, and `created`
-provide optional discovery metadata. Overlay updates are reloaded without a
-proxy restart, keeping `/v1/models` and intelligent routing on one source of
-truth. `models` remains available for static profiles.
+Discovery only: it advertises what the gateway exposes. Authorization stays with `model_access`; this filter does not enforce access.
 
 ## Configuration
 
@@ -23,11 +15,12 @@ truth. `models` remains available for static profiles.
 |-------|------|---------|-------------|
 | `format` | `openai` \| `anthropic` | no | Response envelope dialect: `openai` or `anthropic`. |
 | `path` | string | no | Request path served by the catalog, matched exactly on `GET`. |
-| `models` | ModelEntry[] | yes | Advertised models, in declaration order. |
+| `models` | ModelEntry[] | no | Advertised models, in declaration order. Mutually exclusive with `overlay_file`. |
 | `models[].id` | string | yes | Model identifier returned to clients and used in requests. |
 | `models[].owned_by` | string | no | Owner shown in the OpenAI envelope's `owned_by` field. |
 | `models[].display_name` | string | no | Human-readable name shown in the Anthropic envelope's `display_name` field. Defaults to [`ModelEntry::id`] when absent. |
 | `models[].created` | integer | no | Creation time as a Unix timestamp (seconds). Emitted verbatim by OpenAI (`created`) and formatted as RFC 3339 by Anthropic (`created_at`). Defaults to the epoch so the catalog stays deterministic without reading a clock. |
+| `overlay_file` | PathBuf | no | Routing overlay whose candidates provide catalog membership and metadata. Mutually exclusive with `models`. |
 
 ## Example
 

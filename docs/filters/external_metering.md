@@ -26,6 +26,7 @@ Tenant identity is resolved from the highest-trust source available: verified `{
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
 | `default_model` | string | no | Fallback model name when no identity model header is present. |
 | `model_policy_check` | bool | no | Buffer the request body before the entitlement check so the public model ID can be included in the preflight. Enable when the metering service enforces per-user model allowlists. |
+| `model_policy_fail_open` | bool | no | Whether an unavailable metering service may bypass the model-policy decision. This is independent from `fail_open`, which controls the ordinary entitlement/budget check. |
 
 ## Example
 
@@ -43,4 +44,5 @@ internal_auth_file: "/etc/praxis-secrets/metering-token"
 default_username: "anonymous"
 default_model: "unknown"
 model_policy_check: false
+model_policy_fail_open: true
 ```

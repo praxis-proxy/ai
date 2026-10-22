@@ -32,7 +32,6 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`callout_credentials`](callout_credentials.md) | Establishing filter that captures typed per-user callout secrets from ingress headers. |
-| [`content_normalize`](content_normalize.md) | Legacy provider content normalization retained for backward-compatible deployed profiles. |
 | [`project_state_owner_headers`](project_state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
 | [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
 
@@ -110,6 +109,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`content_normalize`](content_normalize.md) | Normalizes Anthropic content block types for vLLM/Qwen compatibility. |
 
 ### GCP
 
@@ -147,25 +147,25 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`model_access`](model_access.md) | Enforces model access control by checking the `model` field in the JSON request body against configured rules. |
 
 ### Model Catalog
 
 | Filter | Description |
 |--------|-------------|
 | [`model_catalog`](model_catalog.md) | Serves a configured model list as a terminal response to `GET {path}`. |
-| [`model_access`](model_access.md) | Legacy per-group model access control retained for backward-compatible deployed profiles. |
 
 ### Prompt Enrich
 
 | Filter | Description |
 |--------|-------------|
 | [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
-| [`reasoning_effort_map`](reasoning_effort_map.md) | Legacy reasoning compatibility retained for backward-compatible deployed profiles. |
 
 ### Reasoning Effort Map
 
 | Filter | Description |
 |--------|-------------|
+| [`reasoning_effort_map`](reasoning_effort_map.md) | Rewrites `reasoning_effort` / `reasoning.effort` for configured models so clients can send effort values the backend rejects. |
 
 ### Reject Upgrade
 

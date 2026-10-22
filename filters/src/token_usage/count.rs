@@ -292,6 +292,16 @@ impl ProviderKind {
 /// for routes that serve several API formats behind one base URL. Paths with
 /// no usage format (health checks, `/v1/models`, `count_tokens`) are skipped.
 ///
+/// # Metrics
+///
+/// Emits model/cluster-labeled `praxis_ai_*` metrics: prompt, output,
+/// reasoning, and cache-read token counts; empty completions; and, for
+/// streaming responses, TPOT samples and one normalized finish reason per
+/// response. The `model` label comes from `model_to_header` metadata (not a
+/// raw client header), and finish reasons are mapped to a bounded set
+/// (`stop`, `length`, `tool_calls`, `content_filter`, `stop_sequence`,
+/// `refusal`, `other`).
+///
 /// # YAML
 ///
 /// ```yaml
