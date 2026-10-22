@@ -3,7 +3,7 @@
 
 //! Deserialized YAML configuration for the `token_rate_limit` filter.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Deserialize;
 
@@ -20,7 +20,7 @@ use serde::Deserialize;
 /// which is off by default and activates the `experimental` marker.
 /// This filter delivers the agreed M1/M2/M6/M7 milestone scope, but its
 /// parent proposal is not yet `accepted` and open questions remain
-/// (HA/clustered-Valkey failure modes, and the relationship to
+/// (HA/clustered Redis/Valkey failure modes, and the relationship to
 /// Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The
 /// configuration surface may change between releases.
 ///
@@ -40,7 +40,8 @@ use serde::Deserialize;
 /// the pipeline. Tracked as follow-on integration work in `grid#101`.
 ///
 /// Observability is group-level by rule, never by user. Metrics carry only
-/// bounded `rule`, `algorithm`, `backend`, `error`, `result`, and `capacity` labels;
+/// bounded `rule`, `algorithm`, `backend`, `error`, `result`, `capacity`,
+/// `phase`, and `outcome` labels;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
@@ -69,10 +70,27 @@ use serde::Deserialize;
 /// - `praxis_trl_soft_tier_activations_total{rule,capacity}`
 ///
 /// - `praxis_trl_backend_errors_total{rule,backend,error}`: failed reservations (the 503 path), failed reconciliation
-///   enqueues, and reconciliations abandoned after their retries. `error` is one of `unavailable`, `invalid_response`,
-///   or `configuration_mismatch`.
+///   enqueues, and reconciliations abandoned after their retries. `error` is one of `unavailable`, `unconfirmed`,
+///   `invalid_response`, or `configuration_mismatch`.
 ///
-/// - `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by a Valkey worker.
+/// - `praxis_trl_sentinel_discovery_total{phase,result}`: bounded
+///   Sentinel primary-discovery attempts. `phase` is `initial` or
+///   `rediscovery`; `result` is `success`, `failure`, or `stale` when
+///   generation fencing discards a result. This metric is emitted only for
+///   Sentinel topologies.
+///
+/// - `praxis_trl_sentinel_failover_total{outcome}`: generation-fenced
+///   recovery after a cached connection invalidation. `outcome` is
+///   `recovered` when a writable connection is returned or `failed` when the
+///   bounded discovery deadline is exhausted. `recovered` does not prove that
+///   Sentinel promoted a replica; it records proxy-side recovery only.
+///
+/// - `praxis_trl_fail_open_admissions_total{rule,backend,outcome}`: explicit `backend.on_failure: open` admissions,
+///   with `outcome` equal to `bypassed` when no mutation was dispatched or `unconfirmed` when a dispatched operation
+///   may have committed. No reservation handle is created for either outcome.
+///
+/// - `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by the shared-backend
+///   worker.
 ///
 /// - `praxis_trl_budget_remaining{rule,algorithm}`
 ///
@@ -92,7 +110,7 @@ use serde::Deserialize;
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend, `reservations_active` is scoped to the
+/// With a shared `redis`/`valkey` backend, `reservations_active` is scoped to the
 /// namespace and algorithm, so summing it over rules double-counts;
 /// aggregate with `max` across replicas and rules. `active_keys` is scoped
 /// per rule, so aggregate with `max` across replicas for each rule.
@@ -103,31 +121,48 @@ use serde::Deserialize;
 /// beyond "some key had this much left". A replica that stops seeing
 /// traffic for a rule keeps exporting its last observation until it does.
 ///
-/// The `valkey` backend requires Valkey or Redis 7.0+ (`PEXPIRE NX`/`GT`
-/// is used). The `valkey` backend keeps
+/// The shared `redis`/`valkey` backend requires Valkey or Redis 7.0+
+/// (`PEXPIRE NX`/`GT` is used). Both selectors use the same backend path and
+/// are treated as equal qualification targets. The backend keeps
 /// sliding-window usage in 60 fixed sub-windows per window (one per
 /// second for windows under a minute); usage leaves the window up to one
 /// sub-window late, never early. Changing a window's length changes its
 /// sub-window width and so starts that window's usage from zero. On the
 /// sliding window, concurrent admissions on one key are not serialised,
 /// so they can overshoot the budget by their combined estimates for one
-/// round trip. Usage written is never lost.
+/// round trip. A dispatched mutation is never replayed; asynchronous
+/// replication may still lose an acknowledged write during failover.
 ///
-/// The `valkey` token bucket, by contrast, serialises admissions per key
+#[rustfmt::skip]
+/// The initial release gate is symmetric against official Redis 8.10.2
+/// (`redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0`)
+/// and Red Hat Valkey 8.0.11 (`registry.access.redhat.com/rhel10/valkey-8@sha256:5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9`). These are symmetric qualification targets, not a claim that every deployment has passed; support requires both complete product lanes.
+/// The shared token bucket, by contrast, serialises admissions per key
 /// through an optimistic transaction: one key admits at most about one
-/// request per two Valkey round trips across the whole fleet, and
-/// contention shows up first as added latency, up to the 500 ms Valkey
-/// timeout, then as 503s. Use a non-`global` `key` for high-throughput
+/// request per two Redis/Valkey round trips across the whole fleet, and
+/// contention shows up first as added latency, up to `backend.operation_timeout`
+/// (default 500 ms), then as 503s. Use a non-`global` `key` for high-throughput
 /// token-bucket rules so the load spreads over many buckets.
 ///
-/// During a rolling upgrade from the earlier scripted `valkey` backend,
+/// During a rolling upgrade from the earlier scripted shared backend,
 /// replicas on the old and new versions keep separate state, so for one
 /// window (and until old token buckets have drained) combined admissions
-/// can reach about twice the budget. All `valkey` timestamps come from
-/// the proxy replicas' clocks, not Valkey's: skew between replicas can
+/// can reach about twice the budget. All shared-backend timestamps come from
+/// the proxy replicas' clocks, not the datastore's: skew between replicas can
 /// under-count usage at window edges by up to the skew, and a replica
 /// whose clock runs fast trims other replicas' live reservations and keys
 /// from the caps early.
+///
+/// Sentinel HA keeps admission and reconciliation on the discovered writable
+/// primary. Healthy operations reuse the cached data connection and do not
+/// query Sentinel. Discovery and connection replacement are bounded and
+/// coalesced; a dispatched operation whose reply is lost is never replayed.
+/// Replication remains asynchronous: an acknowledged write can be lost before
+/// promotion, and a partitioned old primary can accept writes later discarded.
+/// This backend does not provide RPO=0 or strong consistency. Production
+/// deployments should use at least three Sentinels, durable primary/replica
+/// persistence, suitable `min-replicas-to-write` and
+/// `min-replicas-max-lag`, and monitor `SENTINEL CKQUORUM`.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`
@@ -173,7 +208,7 @@ pub(super) struct TokenRateLimitConfig {
     /// this cap is denied (429, accounting outcome `key_capacity`)
     /// rather than growing without bound.
     ///
-    /// In-process ledgers enforce the cap per rule. Valkey enforces it
+    /// In-process ledgers enforce the cap per rule. The shared backend enforces it
     /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
     /// or the token-bucket equivalent).
     /// Idle in-process keys are reaped by ledger cleanup, which walks a
@@ -183,14 +218,14 @@ pub(super) struct TokenRateLimitConfig {
     pub max_keys: usize,
 
     /// Where every rule's admission state lives: in-process (default,
-    /// one budget per gateway instance) or a shared Valkey backend (one
+    /// one budget per gateway instance) or a shared Redis/Valkey backend (one
     /// budget shared across every gateway instance/replica). One
     /// backend for the whole filter, not per rule -- rules already
-    /// share Valkey key-space isolation via `namespace`/rule-name
+    /// share Redis/Valkey key-space isolation via `namespace`/rule-name
     /// hashing, so per-rule backend selection bought no isolation
-    /// benefit, only a separate Valkey connection per rule pointed at
+    /// benefit, only a separate shared-backend connection per rule pointed at
     /// the same URL. Revisit if a real deployment ever needs to mix
-    /// in-process and Valkey rules in one filter instance.
+    /// in-process and Redis/Valkey rules in one filter instance.
     #[serde(default)]
     pub backend: BackendConfig,
 
@@ -774,11 +809,11 @@ fn ip_dimension(ip: IpRef) -> KeyDimension {
 // flattened enum's own error path instead of this struct's.
 #[derive(Debug, Deserialize)]
 pub(super) struct RuleConfig {
-    /// Human-readable rule identifier, folded into Valkey key
+    /// Human-readable rule identifier, folded into shared-backend key
     /// namespacing so distinct rules sharing one backend never collide.
     ///
-    /// Renaming a live `valkey`-backed rule is therefore not a
-    /// no-op for operators: it changes the Valkey key hash, so the old
+    /// Renaming a live shared-backend rule is therefore not a
+    /// no-op for operators: it changes the datastore key hash, so the old
     /// name's tracked budget is orphaned (left to expire on its own TTL)
     /// and the new name starts with a fresh budget. There's no
     /// migration/rename path today -- routine config hygiene (e.g.
@@ -999,27 +1034,98 @@ impl RuleAlgorithm {
 pub(super) const DEFAULT_RESERVATION_TIMEOUT: &str = "30s";
 
 /// Backend selection and connection details.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawBackendConfig")]
 pub(super) struct BackendConfig {
     /// Which backend implementation to use.
     #[serde(default)]
     pub kind: BackendKind,
 
-    /// Backend connection URL. Supports one `${ENV_VAR}` reference, so
-    /// credentials/hostnames don't need to be committed to config.
-    /// Required when `kind: valkey`, ignored otherwise.
+    /// Standalone URL or Sentinel topology. The two input forms are mutually
+    /// exclusive and network backends require one; ignored for `kind: memory`.
+    /// TLS is derived from the endpoint scheme, so `rediss://`/`valkeys://`
+    /// enable Sentinel TLS without a second boolean that can disagree.
     #[serde(default)]
-    pub url: Option<String>,
+    pub topology: Option<BackendTopology>,
 
+    /// Validated namespace; operator guidance lives on [`RawBackendConfig`].
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Validated failure policy; operator guidance lives on [`RawBackendConfig`].
+    #[serde(default)]
+    pub on_failure: BackendOnFailure,
+
+    /// Maximum time to establish a standalone or discovered-primary data
+    /// connection. Defaults to 500ms.
+    #[serde(default)]
+    pub connect_timeout: Duration,
+
+    /// Maximum time to wait for one datastore response or transaction-pool
+    /// permit. Defaults to 500ms.
+    #[serde(default)]
+    pub operation_timeout: Duration,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            kind: BackendKind::default(),
+            topology: None,
+            namespace: None,
+            on_failure: BackendOnFailure::default(),
+            connect_timeout: Duration::from_millis(500),
+            operation_timeout: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Mutually exclusive backend connection topologies.
+pub(super) enum BackendTopology {
+    /// One standalone Redis/Valkey endpoint.
+    Standalone(String),
+    /// A Sentinel-monitored writable primary.
+    Sentinel(Box<SentinelConfig>),
+}
+
+impl std::fmt::Debug for BackendTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // URLs can contain userinfo or other credential-bearing values.
+            Self::Standalone(_) => f.debug_tuple("Standalone").field(&"<redacted>").finish(),
+            Self::Sentinel(config) => f.debug_tuple("Sentinel").field(config).finish(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Raw flat backend fields converted into [`BackendConfig`].
+struct RawBackendConfig {
+    /// Backend implementation selector.
+    #[serde(default)]
+    kind: BackendKind,
+    /// Standalone Redis/Valkey URL. Exactly one of `url` or `sentinel` is
+    /// required for `kind: redis` or `kind: valkey`; they are mutually exclusive.
+    /// Ignored for `kind: memory`. Use `rediss://` or `valkeys://` for verified
+    /// TLS and `${ENV_VAR}` substitution for credentials supplied at deployment.
+    #[serde(default)]
+    url: Option<String>,
+    /// Sentinel topology with ordered endpoints and separate Sentinel/data
+    /// credentials. Exactly one of `url` or `sentinel` is required for
+    /// `kind: redis` or `kind: valkey`; they are mutually exclusive. Ignored for
+    /// `kind: memory`. TLS is derived from the endpoint scheme: `rediss://` or
+    /// `valkeys://` enables verified TLS without a separate boolean.
+    #[serde(default)]
+    sentinel: Option<RawSentinelConfig>,
     /// Key namespace prefix, so multiple filter rules or deployments can
-    /// share one Valkey instance without colliding. The namespace is
+    /// share one Redis/Valkey instance without colliding. The namespace is
     /// configured once for the whole filter, not per rule, so changing it
     /// starts a fresh accounting generation and fresh budgets for every rule
     /// in that filter. Ignored for `kind: memory`. Defaults to
     /// `"praxis:token_rate_limit"` when unset.
     ///
-    /// Valkey permanently records a schema-versioned fingerprint for each
+    /// The shared backend permanently records a schema-versioned fingerprint for each
     /// namespace/rule/algorithm identity. Replicas with a different window,
     /// capacity, refill rate, reservation timeout, state bound, or compiled
     /// budget-key policy fail closed with 503 before mutating shared state.
@@ -1047,7 +1153,188 @@ pub(super) struct BackendConfig {
     /// cutover because their budgets are independent. Changing configuration
     /// in place is deliberately rejected.
     #[serde(default)]
-    pub namespace: Option<String>,
+    namespace: Option<String>,
+    /// Expected shared-backend failure behavior. `closed` is the safe default:
+    /// return 503 without calling upstream. `open` explicitly waives enforcement
+    /// during dependency outages: call upstream once without a reservation
+    /// handle. Configuration mismatches always fail closed. This policy is
+    /// separate from the pipeline-level `failure_mode` setting.
+    #[serde(default)]
+    on_failure: BackendOnFailure,
+    /// Maximum data-node connection time as a duration string; defaults to 500ms.
+    #[serde(default)]
+    connect_timeout: Option<String>,
+    /// Maximum datastore operation time as a duration string; defaults to 500ms.
+    #[serde(default)]
+    operation_timeout: Option<String>,
+}
+
+impl std::fmt::Debug for RawBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawBackendConfig")
+            .field("kind", &self.kind)
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("sentinel", &self.sentinel)
+            .field("namespace", &self.namespace)
+            .field("on_failure", &self.on_failure)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("operation_timeout", &self.operation_timeout)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Raw Sentinel fields converted into [`SentinelConfig`].
+struct RawSentinelConfig {
+    /// Ordered Sentinel endpoints (1..=16). Three independent endpoints are
+    /// recommended operationally; one is accepted for local development.
+    /// Use a consistent plain (`redis://`/`valkey://`) or verified TLS
+    /// (`rediss://`/`valkeys://`) scheme, including after `${ENV_VAR}` expansion.
+    endpoints: Vec<String>,
+    /// Monitored primary service name.
+    service_name: String,
+    /// Optional Sentinel ACL username.
+    #[serde(default)]
+    sentinel_username: Option<String>,
+    /// Optional Sentinel ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    sentinel_password: Option<String>,
+    /// Optional data-node ACL username.
+    #[serde(default)]
+    redis_username: Option<String>,
+    /// Optional data-node ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    redis_password: Option<String>,
+    /// Maximum Sentinel discovery time as a duration string; defaults to 5s.
+    #[serde(default)]
+    discovery_timeout: Option<String>,
+}
+
+impl std::fmt::Debug for RawSentinelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawSentinelConfig")
+            // Raw endpoints may contain inline credentials or secret expansion.
+            .field("endpoints", &"<redacted>")
+            .field("service_name", &self.service_name)
+            .field("sentinel_username", &self.sentinel_username)
+            .field(
+                "sentinel_password",
+                &self.sentinel_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_username", &self.redis_username)
+            .field("redis_password", &self.redis_password.as_ref().map(|_| "<redacted>"))
+            .field("discovery_timeout", &self.discovery_timeout)
+            .finish()
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "parse-time conversion validates the complete backend topology"
+)]
+impl TryFrom<RawBackendConfig> for BackendConfig {
+    type Error = String;
+
+    fn try_from(raw: RawBackendConfig) -> Result<Self, Self::Error> {
+        let topology = match (raw.url, raw.sentinel) {
+            (Some(url), None) => Some(BackendTopology::Standalone(url)),
+            (None, Some(sentinel)) => Some(BackendTopology::Sentinel(Box::new(SentinelConfig {
+                endpoints: sentinel.endpoints,
+                service_name: sentinel.service_name,
+                sentinel_username: sentinel.sentinel_username,
+                sentinel_password: sentinel.sentinel_password,
+                redis_username: sentinel.redis_username,
+                redis_password: sentinel.redis_password,
+                discovery_timeout: super::parse_backend_timeout(
+                    sentinel.discovery_timeout.as_deref(),
+                    "discovery_timeout",
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| error.to_string())?,
+            }))),
+            (Some(_), Some(_)) => {
+                return Err("token_rate_limit: backend.url and backend.sentinel are mutually exclusive".into());
+            },
+            (None, None) => None,
+        };
+        if matches!(raw.kind, BackendKind::Redis | BackendKind::Valkey) && topology.is_none() {
+            return Err(
+                "token_rate_limit: backend.url or backend.sentinel is required for backend.kind: redis/valkey".into(),
+            );
+        }
+        Ok(Self {
+            kind: raw.kind,
+            topology,
+            namespace: raw.namespace,
+            on_failure: raw.on_failure,
+            connect_timeout: super::parse_backend_timeout(
+                raw.connect_timeout.as_deref(),
+                "connect_timeout",
+                Duration::from_millis(500),
+            )
+            .map_err(|error| error.to_string())?,
+            operation_timeout: super::parse_backend_timeout(
+                raw.operation_timeout.as_deref(),
+                "operation_timeout",
+                Duration::from_millis(500),
+            )
+            .map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+/// Validated inputs for native redis-rs Sentinel discovery.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SentinelConfig {
+    /// Ordered Sentinel endpoints. Three independent endpoints are
+    /// recommended operationally; one is accepted for local development.
+    pub endpoints: Vec<String>,
+    /// The monitored writable-primary service name.
+    pub service_name: String,
+    /// Optional Sentinel ACL username.
+    #[serde(default)]
+    pub sentinel_username: Option<String>,
+    /// Optional Sentinel ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    pub sentinel_password: Option<String>,
+    /// Optional data-node ACL username.
+    #[serde(default)]
+    pub redis_username: Option<String>,
+    /// Optional data-node ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    pub redis_password: Option<String>,
+    /// Overall Sentinel discovery and convergence bound.
+    pub discovery_timeout: Duration,
+}
+
+impl std::fmt::Debug for SentinelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SentinelConfig")
+            .field("endpoints", &"<redacted>")
+            .field("service_name", &self.service_name)
+            .field("sentinel_username", &self.sentinel_username)
+            .field(
+                "sentinel_password",
+                &self.sentinel_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_username", &self.redis_username)
+            .field("redis_password", &self.redis_password.as_ref().map(|_| "<redacted>"))
+            .field("discovery_timeout", &self.discovery_timeout)
+            .finish()
+    }
+}
+
+/// Behavior when a shared-backend reservation cannot be confirmed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum BackendOnFailure {
+    /// Return 503 and never invoke upstream.
+    #[default]
+    Closed,
+    /// Invoke upstream once without a reservation handle.
+    Open,
 }
 
 /// Which state backend a `token_rate_limit` rule uses.
@@ -1058,6 +1345,10 @@ pub(super) enum BackendKind {
     /// across gateway instances/replicas.
     #[default]
     Memory,
+
+    /// Redis-backed shared state. Redis and Valkey use the same wire
+    /// protocol and native client path.
+    Redis,
 
     /// Valkey-backed shared state: one budget shared across every gateway
     /// instance pointed at the same `namespace`.
@@ -1147,6 +1438,139 @@ mod tests {
             "{key}\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
              reserved_tokens: 50\n"
         )
+    }
+
+    fn assert_debug_redacts(value: &dyn std::fmt::Debug, secrets: &[&str]) {
+        for rendered in [format!("{value:?}"), format!("{value:#?}")] {
+            for secret in secrets {
+                assert!(
+                    !rendered.contains(secret),
+                    "Debug output must not contain credential values"
+                );
+            }
+            assert!(rendered.contains("<redacted>"), "Debug must identify masked values");
+        }
+    }
+
+    #[test]
+    fn debug_redaction_failure_does_not_echo_credentials() {
+        let marker = "intentionally-sensitive-negative-marker";
+        let failure = std::panic::catch_unwind(|| assert_debug_redacts(&marker, &[marker]))
+            .expect_err("an unredacted value must fail the assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .expect("the assertion must panic with a text diagnostic");
+        assert!(
+            !message.contains(marker),
+            "the failure diagnostic must not echo credential values"
+        );
+    }
+
+    fn backend_config_yaml(backend: &str) -> String {
+        let indented = backend.lines().map(|line| format!("  {line}\n")).collect::<String>();
+        key_yaml(&format!("backend:\n{indented}"))
+    }
+
+    #[test]
+    fn sentinel_config_debug_redacts_credentials_at_each_boundary() {
+        let yaml = "kind: redis
+namespace: visible-namespace
+connect_timeout: 200ms
+operation_timeout: 300ms
+sentinel:
+  endpoints: [redis://inline-user:inline-secret@sentinel.invalid:26379]
+  service_name: visible-primary
+  sentinel_username: sentinel-acl
+  sentinel_password: sentinel-secret
+  redis_username: data-acl
+  redis_password: data-secret
+  discovery_timeout: 2s
+";
+        let secrets = ["inline-user", "inline-secret", "sentinel-secret", "data-secret"];
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw_sentinel = raw.sentinel.as_ref().unwrap();
+        assert_debug_redacts(raw_sentinel, &secrets);
+        assert_debug_redacts(&raw, &secrets);
+        let raw_debug = format!("{raw_sentinel:?}");
+        for visible in ["visible-primary", "sentinel-acl", "data-acl", "2s"] {
+            assert!(
+                raw_debug.contains(visible),
+                "non-secret diagnostics must preserve {visible}"
+            );
+        }
+
+        let backend = BackendConfig::try_from(raw).unwrap();
+        let topology = backend.topology.as_ref().unwrap();
+        let BackendTopology::Sentinel(sentinel) = topology else {
+            panic!("fixture must select Sentinel")
+        };
+        assert_debug_redacts(sentinel, &secrets);
+        assert_debug_redacts(topology, &secrets);
+        assert_debug_redacts(&backend, &secrets);
+        assert!(
+            sentinel.sentinel_password.as_deref() == Some("sentinel-secret"),
+            "formatting must leave the Sentinel credential unchanged"
+        );
+        assert!(
+            sentinel.redis_password.as_deref() == Some("data-secret"),
+            "formatting must leave the data credential unchanged"
+        );
+        assert!(
+            sentinel.endpoints == ["redis://inline-user:inline-secret@sentinel.invalid:26379"],
+            "formatting must leave endpoint values unchanged"
+        );
+        let parsed_debug = format!("{sentinel:?}");
+        for visible in ["visible-primary", "sentinel-acl", "data-acl", "2s"] {
+            assert!(
+                parsed_debug.contains(visible),
+                "non-secret diagnostics must preserve {visible}"
+            );
+        }
+        let config = parse(&backend_config_yaml(yaml)).unwrap();
+        assert_debug_redacts(&config, &secrets);
+        assert!(format!("{config:?}").contains("visible-namespace"));
+    }
+
+    #[test]
+    fn standalone_config_debug_redacts_urls_at_each_boundary() {
+        let yaml = "kind: valkey\nurl: rediss://standalone-user:standalone-secret@primary.invalid:6379\n";
+        let secrets = ["standalone-user", "standalone-secret"];
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_debug_redacts(&raw, &secrets);
+        let backend = BackendConfig::try_from(raw).unwrap();
+        assert_debug_redacts(&backend, &secrets);
+        let topology = backend.topology.as_ref().unwrap();
+        assert_debug_redacts(topology, &secrets);
+        let BackendTopology::Standalone(url) = topology else {
+            panic!("fixture must select standalone")
+        };
+        assert!(
+            url == "rediss://standalone-user:standalone-secret@primary.invalid:6379",
+            "formatting must leave the standalone URL unchanged"
+        );
+        let config = parse(&backend_config_yaml(yaml)).unwrap();
+        assert_debug_redacts(&config, &secrets);
+    }
+
+    #[test]
+    fn backend_config_debug_preserves_absent_credentials() {
+        let raw: RawBackendConfig = serde_yaml::from_str("kind: memory").unwrap();
+        let rendered = format!("{raw:?}");
+        assert!(rendered.contains("url: None"));
+        assert!(rendered.contains("sentinel: None"));
+        let yaml =
+            "kind: redis\nsentinel:\n  endpoints: [redis://sentinel.invalid:26379]\n  service_name: visible-primary\n";
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw_sentinel = raw.sentinel.as_ref().unwrap();
+        let rendered = format!("{raw_sentinel:?}");
+        assert!(rendered.contains("sentinel_password: None"));
+        assert!(rendered.contains("redis_password: None"));
+        let backend = BackendConfig::try_from(raw).unwrap();
+        let rendered = format!("{backend:?}");
+        assert!(rendered.contains("sentinel_password: None"));
+        assert!(rendered.contains("redis_password: None"));
     }
 
     fn ip_dim(header: Option<&str>) -> KeyDimension {

@@ -4,12 +4,14 @@ This directory tracks Praxis AI conformance against selected OpenAI API
 surfaces. The current scope is Conversations only.
 
 This directory also vendors the upstream Anthropic Messages API OpenAPI
-document at `specs/anthropic-spec.json` as a **review reference only**. It is
-read by the automated PR review prompt (`.github/prompts/automated-review.md`)
-when a change touches Anthropic surfaces, and the Anthropic Messages operation
-registry is transcribed from it by hand. It is not consumed by
-`cargo xtask openai-conformance`, and there is no `oasdiff`, capability, or CI
-gate for Anthropic. See [Anthropic Messages Reference Spec](#anthropic-messages-reference-spec).
+document at `specs/anthropic-spec.json`. It is read by the automated PR review
+prompt (`.github/prompts/automated-review.md`) when a change touches Anthropic
+surfaces, and a registry drift check
+(`cargo xtask check-anthropic-messages-registry`, wired into `make lint`)
+verifies that the Anthropic Messages operation registry's methods, paths, and
+operation IDs match the pinned document. There is no `oasdiff` structural
+comparison or capability projection for Anthropic.
+See [Anthropic Messages Reference Spec](#anthropic-messages-reference-spec).
 
 ## Contract Sources
 
@@ -302,11 +304,14 @@ Rust source, or maintaining a handwritten implementation specification.
 
 `specs/anthropic-spec.json` is the vendored Anthropic API OpenAPI document,
 used as the authoritative contract when reviewing changes to the Anthropic
-Messages surfaces under `apis/src/anthropic/`. Unlike the OpenAI spec, it is a
-**review reference only**: no `oasdiff` comparison, capability projection,
-runtime suite, or CI gate is wired to it. It exists so the automated PR review
-prompt can cross-reference request and response schemas, field names, types,
-enums, and optionality without a network fetch.
+Messages surfaces under `apis/src/anthropic/`. It serves two purposes: the
+registry drift check (`cargo xtask check-anthropic-messages-registry`, wired
+into `make lint`) verifies that every registered operation's method, path, and
+operation ID match the pinned spec, and the automated PR review prompt
+cross-references request and response schemas, field names, types, enums, and
+optionality without a network fetch. Unlike the OpenAI spec, there is no
+`oasdiff` structural comparison, capability projection, or runtime suite wired
+to it.
 
 ### Source and provenance
 
@@ -344,11 +349,11 @@ a finding.
 
 The Anthropic Messages operation registry in `apis/src/anthropic/routes.rs`
 transcribes its methods, paths, operation IDs, and request-body shapes from this
-pinned document, covering the non-beta `/v1/messages` surface named above. The
-transcription is not machine-checked: nothing compares the registry against the
-spec at build or CI time, so the registry makes no specification-conformance
-claim and a refresh of the pinned document will not flag a registry that has
-fallen behind. Wiring that gate is tracked separately.
+pinned document, covering the non-beta `/v1/messages` surface named above.
+`cargo xtask check-anthropic-messages-registry` (wired into `make lint`)
+compares every registered operation's method, path, and operation ID against
+the pinned spec and fails on divergence, so a spec refresh will flag a registry
+that has fallen behind.
 
 ### Refresh
 

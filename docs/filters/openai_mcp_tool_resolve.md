@@ -30,11 +30,11 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
 | `outbound_chain` | string \| object | no | Outbound filter chain the MCP `tools/list` callout runs through. The chain is bound at build time and carries only operator-configured cross-cutting filters, which observe and can act on the outbound MCP request. The SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. Both an inline chain and a named reference (resolved against the top-level `filter_chains`) are accepted, because this filter binds at top level. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture (which pipeline finalization applies to this bound chain), not a per-filter flag. |
-| `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
+| `connectors` | object[] | no | Named connectors mapping connector IDs to server URLs. |
 | `connectors[].id` | string | yes | Connector identifier referenced in requests. |
 | `connectors[].server_url` | string | yes | MCP server URL for this connector. |
 | `connectors[].tool_policy` | `deny` \| `allow_all` \| `read_only` | no | Operator policy for tools from this connector. Defaults to `deny` and is enforced in protected mode: `allow_all` admits every tool, while `read_only` admits only tools the service affirmatively classifies as read-only. This classification does not itself prevent side effects; enforce write restrictions at the service or with scoped credentials. |
-| `tool_admission` | ToolAdmissionConfig | no | Operator metadata-admission policy. Defaults to advisory (unchanged behavior), so existing non-protected deployments are not affected. |
+| `tool_admission` | object | no | Operator metadata-admission policy. Defaults to advisory (unchanged behavior), so existing non-protected deployments are not affected. |
 | `tool_admission.mode` | `advisory` \| `protected` | no | Admission mode (`advisory` default, or `protected`). |
 
 ## Examples

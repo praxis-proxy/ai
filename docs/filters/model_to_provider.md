@@ -19,7 +19,7 @@ The filter does not restore the client-facing model ID in responses, so a provid
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `models` | ModelProviderMappingConfig[] | yes | Exact client-facing model mappings. |
+| `models` | object[] | yes | Exact client-facing model mappings. |
 | `models[].model` | string | yes | Exact model ID sent by the client. |
 | `models[].upstream` | string | yes | Existing load-balancer cluster selected for this model. |
 | `models[].target_model` | string | yes | Provider-specific model written into the request body. |

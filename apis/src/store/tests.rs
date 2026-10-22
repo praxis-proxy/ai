@@ -4961,7 +4961,7 @@ async fn pg_bounded_message_rebuild_rejects_before_fetch_and_rolls_back() {
     assert!(items.is_empty(), "over-budget insertion must roll back");
 
     store
-        .create_items_and_sync_messages_bounded(&owner, conversation_id, &[item], 65_536)
+        .create_items_and_sync_messages_bounded(&owner, conversation_id, &[item], 1 << 20)
         .await
         .expect("fitting rebuild should succeed");
     let conversation = ConversationItemStore::get_conversation(&store, &owner, conversation_id)

@@ -20,8 +20,8 @@ use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -82,6 +82,22 @@ impl OwnerScopedStore {
         self.store.get_response_bounded(&self.owner, id, max_bytes).await
     }
 
+    /// Fetch a response after measuring its retained payload against a charge allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the measured record exceeds
+    /// `max_charge_bytes`, or the backend's read error.
+    pub async fn get_response_budgeted(
+        &self,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        self.store
+            .get_response_budgeted(&self.owner, id, max_charge_bytes)
+            .await
+    }
+
     /// Delete a response visible to this owner.
     ///
     /// # Errors
@@ -115,6 +131,21 @@ impl OwnerScopedStore {
     ) -> Result<Option<ConversationRecord>, StoreError> {
         let store: &dyn ResponseStore = self.store.as_ref();
         store.get_conversation_bounded(&self.owner, id, max_bytes).await
+    }
+
+    /// Fetch reconstructed history after measuring it against a charge allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the measured history exceeds
+    /// `max_charge_bytes`, or the backend's read error.
+    pub async fn get_conversation_budgeted(
+        &self,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let store: &dyn ResponseStore = self.store.as_ref();
+        store.get_conversation_budgeted(&self.owner, id, max_charge_bytes).await
     }
 
     /// Persist a response only when its immutable owner matches this handle.
@@ -444,7 +475,7 @@ impl OwnerScopedStore {
             .await
     }
 
-    /// Append items only if the transaction's retained payload fits the budget.
+    /// Append items only if the new write and any legacy-prefix migration fit the budget.
     ///
     /// # Errors
     ///
@@ -453,13 +484,13 @@ impl OwnerScopedStore {
         &self,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: usize,
+        max_append_charge_bytes: usize,
     ) -> Result<(), StoreError> {
         for item in items {
             self.require_matching_owner(&item.owner)?;
         }
         self.store
-            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_rebuild_bytes)
+            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_append_charge_bytes)
             .await
     }
 

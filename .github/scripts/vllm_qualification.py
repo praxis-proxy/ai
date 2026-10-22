@@ -308,13 +308,14 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
                         "test_execution": suite_result}
     report["suites"]["claude_acceptance"] = acceptance(
         claude_raw, claude_result, run_id, attempt, sha,
-        "native Messages, translated Chat, Anthropic SDK and optional tools")
+        "native Messages, translated Chat, selected-provider OpenAI-chat translation, "
+        "Anthropic SDK and optional tools")
     report["suites"]["codex_acceptance"] = acceptance(
         codex_raw, codex_result, run_id, attempt, sha,
         "native Responses and translated Chat")
     report["suites"]["opencode_acceptance"] = acceptance(
         opencode_raw, opencode_result, run_id, attempt, sha,
-        "native Chat Completions text turn and tool-call round trip")
+        "native Chat Completions text turn and tool-call round trip, pinned 1.x and 2.x clients")
     if not requested:
         report["status"], report["reason"] = "not_requested", "Responses GPU qualification was not requested"
     elif suite_result != "success" and report["status"] == "passed":

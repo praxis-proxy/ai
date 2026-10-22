@@ -19,10 +19,10 @@ In chains that also use `json_body_field` or `model_to_header`, place `prompt_en
 |-------|------|---------|-------------|
 | `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
 | `on_invalid` | `continue` \| `reject` | no | Behavior when the body is not valid JSON or lacks a `messages` array. |
-| `prepend` | MessageConfig[] | no | Messages to prepend at the beginning of the `messages` array. |
+| `prepend` | object[] | no | Messages to prepend at the beginning of the `messages` array. |
 | `prepend[].role` | `system` \| `user` | yes | Role for the injected message. |
 | `prepend[].content` | string | yes | Text content of the injected message. |
-| `append` | MessageConfig[] | no | Messages to append at the end of the `messages` array. |
+| `append` | object[] | no | Messages to append at the end of the `messages` array. |
 | `append[].role` | `system` \| `user` | yes | Role for the injected message. |
 | `append[].content` | string | yes | Text content of the injected message. |
 

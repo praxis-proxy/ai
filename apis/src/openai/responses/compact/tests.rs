@@ -894,6 +894,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
     let filter = make_filter("open");
     let resp = subrequest::SubResponse {
         status: 503,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
@@ -907,6 +908,7 @@ fn non_2xx_response_closed_mode_rejects_request() {
     let filter = make_filter("closed");
     let resp = subrequest::SubResponse {
         status: 429,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };
@@ -962,6 +964,169 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
     state.previous_usage = Some(json!({"total_tokens": 500}));
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
+}
+
+#[test]
+fn compaction_source_rejects_non_text_content_parts() {
+    for kind in ["input_image", "input_file", "input_audio"] {
+        let messages = [json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": kind, "image_url": "https://example.test/asset"}]
+        })];
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("{kind} must be rejected before compaction");
+        };
+        assert_eq!(rejection.status, 400, "{kind} rejection must return HTTP 400");
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains("non-text"), "unexpected rejection: {body}");
+        assert!(body.contains(kind), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn compaction_source_rejects_mixed_text_and_image_content() {
+    let messages = [json!({
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": "https://example.test/image.png"}
+        ]
+    })];
+    assert!(
+        validate_compaction_source(messages.iter()).is_err(),
+        "mixed text and image content must be rejected"
+    );
+}
+
+#[test]
+fn compaction_source_accepts_text_only_messages_and_function_outputs() {
+    let messages = [
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]
+        }),
+        json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [
+                {"type": "output_text", "text": "pass", "annotations": [], "logprobs": []},
+                {"type": "text", "text": "word"}
+            ]
+        }),
+    ];
+    validate_compaction_source(messages.iter()).expect("text-only source must remain compactable");
+}
+
+#[test]
+fn compaction_source_accepts_renderable_compaction_summary() {
+    let messages = [build_compaction_item(
+        "compact_prior",
+        "Prior context.",
+        DEFAULT_SUMMARY_PREFIX,
+    )];
+
+    validate_compaction_source(messages.iter()).expect("a non-empty UTF-8 compaction summary is representable");
+}
+
+#[test]
+fn compaction_source_rejects_unrenderable_compaction_summaries() {
+    for encrypted_content in ["not-valid-base64", "", "/w=="] {
+        let messages = [json!({
+            "type": "compaction",
+            "encrypted_content": encrypted_content
+        })];
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("unrenderable compaction content must be rejected: {encrypted_content:?}");
+        };
+        assert_eq!(
+            rejection.status, 400,
+            "unrenderable compaction content must return HTTP 400"
+        );
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains("compaction"), "unexpected rejection: {body}");
+        assert!(body.contains("cannot be represented"), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn compaction_source_rejects_text_part_semantic_metadata() {
+    for (field, value) in [
+        (
+            "annotations",
+            json!([{"type": "url_citation", "url": "https://example.test"}]),
+        ),
+        ("logprobs", json!([{"token": "hello", "logprob": -0.1}])),
+        ("prompt_cache_breakpoint", json!({"mode": "explicit"})),
+    ] {
+        let mut part = json!({"type": "output_text", "text": "hello"});
+        part[field] = value;
+        let messages = [json!({"type": "message", "role": "assistant", "content": [part]})];
+
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("{field} must be rejected before compaction");
+        };
+        assert_eq!(rejection.status, 400, "{field} rejection must return HTTP 400");
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains(field), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn reactive_source_validation_checks_only_replaced_history() {
+    let image = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+    });
+    let text = json!({"type": "message", "role": "user", "content": "hello"});
+
+    let mut rejected = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "new turn"}));
+    rejected.messages = vec![image.clone(), text.clone()].into();
+    assert!(
+        validate_reactive_compaction_source(&rejected).is_err(),
+        "non-text replaced history must be rejected"
+    );
+
+    let mut accepted = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+        }]
+    }));
+    accepted.messages = vec![text, image].into();
+    validate_reactive_compaction_source(&accepted)
+        .expect("multimodal current-turn tail is preserved and must remain accepted");
+}
+
+#[tokio::test]
+async fn reactive_compaction_rejects_non_text_history_before_callout() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.messages = vec![
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+        }),
+        json!({"type": "message", "role": "user", "content": "new turn"}),
+    ]
+    .into();
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+
+    let Err(FilterAction::Reject(rejection)) = filter.check_and_summarize(&mut state).await else {
+        panic!("non-text history must fail closed before the summarization callout");
+    };
+    assert_eq!(rejection.status, 400, "non-text history must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body.contains("input_image"), "unexpected rejection: {body}");
 }
 
 #[tokio::test]
@@ -1325,8 +1490,9 @@ fn parse_compact_input_text_part_with_null_or_absent_text_is_rejected() {
 
 #[test]
 fn parse_compact_input_multimodal_part_without_text_is_accepted() {
-    // An image/file part legitimately carries no `text`; the formatter ignores
-    // it, so validation must not reject it as malformed.
+    // An image/file part legitimately carries no `text`, so syntax validation
+    // accepts it. Source validation rejects it later if compaction would replace
+    // the item and thereby discard its non-text content.
     let items = parse_compact_input(Some(json!([{
         "role": "user",
         "content": [
@@ -1723,6 +1889,22 @@ fn compaction_item_round_trips_through_canonical_replay() {
     assert_eq!(replayed["type"], "compaction");
     assert_eq!(replayed["id"], "compact_rt");
     assert!(replayed.get("encrypted_content").is_some());
+}
+
+#[test]
+fn client_owned_custom_tool_items_round_trip_through_canonical_replay() {
+    // Client-owned custom call/output items are preserved for a downstream
+    // client-tool-compat adapter to lower, while hosted items stay excluded (#1764).
+    use crate::openai::responses::canonical_openresponses_replay_item;
+    let call = json!({"type": "custom_tool_call", "call_id": "call_history", "name": "do_work", "input": "Prior"});
+    let output = json!({"type": "custom_tool_call_output", "call_id": "call_history", "output": "sentinel"});
+    assert_eq!(canonical_openresponses_replay_item(&call).as_ref(), Some(&call));
+    assert_eq!(canonical_openresponses_replay_item(&output).as_ref(), Some(&output));
+    let hosted = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
+    assert!(
+        canonical_openresponses_replay_item(&hosted).is_none(),
+        "hosted output items are not replayable backend input"
+    );
 }
 
 // =============================================================================

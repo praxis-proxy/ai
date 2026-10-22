@@ -25,7 +25,6 @@ const SKIP: &[&str] = &[
     "anthropic/messages-to-openai-degrade-fixture.yaml",
     "anthropic/messages-to-openai.yaml",
     "anthropic/request-validate.yaml",
-    "anthropic/unified-gateway.yaml",
     "credential-injection.yaml",
     "json-rpc-routing.yaml",
     "mcp-classifier-routing.yaml",

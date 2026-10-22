@@ -129,6 +129,10 @@ pub(super) enum BackendError {
     /// The backend could not be reached or timed out.
     #[error("shared quota backend unavailable: {0}")]
     Unavailable(String),
+    /// A command was dispatched, but its result was not confirmed. The
+    /// caller must not replay the mutation.
+    #[error("shared quota backend operation outcome unconfirmed: {0}")]
+    Unconfirmed(String),
     /// The backend responded, but not in the expected shape.
     #[error("shared quota backend returned an invalid response")]
     InvalidResponse,
@@ -465,7 +469,11 @@ where
                     record_completed_reconciliation(&worker, &settlement);
                     break;
                 },
-                Err(error) if attempts < 2 => {
+                // Only retry failures proven to occur before command
+                // dispatch. `Unconfirmed` and malformed replies may follow a
+                // committed settlement, so replaying them would double-apply
+                // accounting after a lost reply.
+                Err(error) if matches!(error, BackendError::Unavailable(_)) && attempts < 2 => {
                     attempts += 1;
                     tracing::warn!(attempts, %error, "token-rate-limit reconciliation retry");
                     tokio::time::sleep(Duration::from_millis(25 * attempts)).await;
@@ -915,6 +923,7 @@ mod tests {
     /// [`run_reconcile_worker`]'s bounded-retry-then-abandon path.
     struct AlwaysFailsReconcile {
         attempts: Arc<AtomicUsize>,
+        unconfirmed: bool,
     }
 
     #[async_trait]
@@ -925,7 +934,11 @@ mod tests {
 
         async fn reconcile(&self, _request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            Err(BackendError::Unavailable("simulated failure".into()))
+            if self.unconfirmed {
+                Err(BackendError::Unconfirmed("simulated lost reply".into()))
+            } else {
+                Err(BackendError::Unavailable("simulated failure".into()))
+            }
         }
 
         fn enqueue_reconcile(&self, _request: ReconcileRequest) -> Result<(), BackendError> {
@@ -956,6 +969,7 @@ mod tests {
         tokio::spawn(run_reconcile_worker(
             AlwaysFailsReconcile {
                 attempts: Arc::clone(&attempts),
+                unconfirmed: false,
             },
             rx,
         ));
@@ -975,6 +989,34 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             3,
             "must retry exactly twice, then abandon"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_worker_does_not_replay_an_unconfirmed_settlement() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(run_reconcile_worker(
+            AlwaysFailsReconcile {
+                attempts: Arc::clone(&attempts),
+                unconfirmed: true,
+            },
+            rx,
+        ));
+        tx.send(ReconcileRequest {
+            key: "a".into(),
+            reservation_id: 1,
+            actual: Some(1),
+            now_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a lost settlement reply must never be replayed"
         );
     }
 }

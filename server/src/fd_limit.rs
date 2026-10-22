@@ -92,7 +92,7 @@ fn set_soft_limit(soft: u64, hard: u64, target: u64) -> u64 {
 /// Warn when `limit` is below what `config` can need at peak.
 #[cfg(unix)]
 fn warn_if_low(config: &Config, limit: u64) {
-    let threads = praxis_core::server::pingora::resolve_thread_count(config.runtime.threads);
+    let threads = praxis_core::server::resolve_thread_count(config.runtime.threads);
     let recommended = recommended_open_files(config, threads);
     if limit < recommended {
         warn!(

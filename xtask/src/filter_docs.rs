@@ -209,6 +209,8 @@ struct ConfigStruct {
     doc: String,
     /// Fields in declaration order.
     fields: Vec<RawField>,
+    /// Name of the raw deserialization struct for `serde(try_from = "...")`.
+    try_from: Option<String>,
 }
 
 /// Parsed items accumulated from source files belonging to one filter module.
@@ -800,6 +802,7 @@ fn parse_struct(s: &syn::ItemStruct, out: &mut ModuleItems) {
             name: s.ident.to_string(),
             doc: docs.clone(),
             fields,
+            try_from: s.attrs.iter().find_map(|attr| serde_lit_value(attr, "try_from")),
         };
         if is_nested_config_struct(s) {
             out.structs.insert(config.name.clone(), config.clone());
@@ -810,6 +813,7 @@ fn parse_struct(s: &syn::ItemStruct, out: &mut ModuleItems) {
                         name: "ClusterTls".to_owned(),
                         doc: config.doc.clone(),
                         fields: config.fields.clone(),
+                        try_from: config.try_from.clone(),
                     },
                 );
             }
@@ -869,6 +873,11 @@ fn collect_yaml_examples(items: &ModuleItems) -> Vec<String> {
 
 /// Build rendered field metadata for one config struct.
 fn build_fields(config: &ConfigStruct, items: &ModuleItems) -> Vec<FieldInfo> {
+    let config = config
+        .try_from
+        .as_ref()
+        .and_then(|name| items.structs.get(name))
+        .unwrap_or(config);
     let mut fields = Vec::new();
     let mut stack = Vec::new();
     append_rendered_fields("", &config.fields, items, &mut stack, &mut fields);
@@ -886,9 +895,17 @@ fn append_rendered_fields(
     for field in raw_fields {
         let path = field_path(prefix, &field.name);
         if !field.flatten {
+            let rendered_type = render_field_type(field, &items.enums);
+            // Known nested structs are YAML objects, not their internal Rust
+            // deserialization type names (for example RawSentinelConfig).
+            let type_str = match rendered_type.strip_suffix("[]") {
+                Some(inner) if items.structs.contains_key(inner) => "object[]".to_owned(),
+                _ if items.structs.contains_key(&rendered_type) => "object".to_owned(),
+                _ => rendered_type,
+            };
             out.push(FieldInfo {
                 name: path.clone(),
-                type_str: render_field_type(field, &items.enums),
+                type_str,
                 doc: field.doc.clone(),
                 required: required_kind(field),
             });
@@ -921,6 +938,11 @@ fn append_nested_fields(
     }
 
     if let Some(config) = items.structs.get(&type_name) {
+        let config = config
+            .try_from
+            .as_ref()
+            .and_then(|name| items.structs.get(name))
+            .unwrap_or(config);
         stack.push(type_name);
         append_rendered_fields(prefix, &config.fields, items, stack, out);
         stack.pop();
@@ -2330,6 +2352,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "nested YAML fixture and its shape assertions stay together"
+    )]
     fn nested_config_fields_render_dotted_paths() {
         let source = "
             #[derive(Debug, Deserialize)]
@@ -2340,6 +2366,12 @@ mod tests {
                 headers: HeaderConfig,
                 /// Cluster entries.
                 clusters: Vec<ClusterConfig>,
+                optional_headers: Option<HeaderConfig>,
+                optional_clusters: Option<Vec<ClusterConfig>>,
+                optional_entries: Vec<Option<ClusterConfig>>,
+                labels: Vec<String>,
+                optional_labels: Option<Vec<String>>,
+                modes: Vec<Mode>,
             }
 
             #[derive(Debug, Deserialize)]
@@ -2355,6 +2387,10 @@ mod tests {
                 /// Cluster name.
                 name: String,
             }
+
+            #[derive(Debug, Deserialize)]
+            #[serde(rename_all = \"snake_case\")]
+            enum Mode { First, Second }
         ";
         let file: syn::File = syn::parse_str(source).unwrap();
         let mut items = ModuleItems::new();
@@ -2364,6 +2400,60 @@ mod tests {
         let names: Vec<&str> = filter.fields.iter().map(|field| field.name.as_str()).collect();
         assert!(names.contains(&"headers.method"), "nested object field should render");
         assert!(names.contains(&"clusters[].name"), "nested list field should render");
+        for (name, expected) in [
+            ("headers", "object"),
+            ("clusters", "object[]"),
+            ("optional_headers", "object"),
+            ("optional_clusters", "object[]"),
+            ("optional_entries", "object[]"),
+            ("labels", "string[]"),
+            ("optional_labels", "string[]"),
+            ("modes", "(`first` \\| `second`)[]"),
+        ] {
+            let field = filter.fields.iter().find(|field| field.name == name).unwrap();
+            assert_eq!(field.type_str, expected, "{name} must describe its YAML shape");
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "operator-facing backend documentation is checked as one contract"
+    )]
+    fn raw_backend_docs_preserve_operator_guidance_and_yaml_shape() {
+        let root = workspace_root();
+        let shared = parse_shared_config_items(&root);
+        let filters = discover_all_filters(&root, &shared);
+        let entry = filters
+            .iter()
+            .find(|entry| entry.filter.name == "token_rate_limit")
+            .unwrap();
+        let field = |name: &str| entry.filter.fields.iter().find(|field| field.name == name).unwrap();
+        assert_eq!(
+            field("backend.sentinel").type_str,
+            "object",
+            "Sentinel is a YAML object"
+        );
+        for guidance in ["praxis:token_rate_limit", "fingerprint", "tombstone", "quiesce"] {
+            assert!(
+                field("backend.namespace").doc.contains(guidance),
+                "namespace docs must preserve {guidance}"
+            );
+        }
+        assert!(
+            field("backend.on_failure").doc.contains("without a reservation"),
+            "fail-open behavior must be documented"
+        );
+        for name in ["backend.url", "backend.sentinel"] {
+            assert!(
+                field(name).doc.contains("Exactly one"),
+                "{name} must explain topology exclusivity"
+            );
+        }
+        assert!(
+            field("backend.sentinel.sentinel_password").doc.contains("${ENV_VAR}"),
+            "credentials should use deployment secrets"
+        );
     }
 
     #[test]

@@ -11,8 +11,9 @@ use super::{super::state::RequestReasoningPresence, *};
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+        PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError, json_values_charge, json_values_fit,
     },
 };
 
@@ -334,7 +335,7 @@ async fn budgeted_previous_response_rejects_large_store_row_before_replacement()
     let store = MockStore::with_completed_response(
         "resp_prev",
         json!("First turn"),
-        json!([{"role":"user","content":"x".repeat(128_000)}]),
+        json!([{"role":"user","content":"x".repeat(256_000)}]),
     );
     let registry = setup_registry(store);
     let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
@@ -468,7 +469,7 @@ async fn budgeted_conversation_restores_plain_history_with_shared_charge() {
 
 #[tokio::test]
 async fn budgeted_conversation_rejects_large_row_before_replay() {
-    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(128_000)}]));
+    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(256_000)}]));
     let registry = setup_registry(store);
     let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -782,6 +783,15 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let action = pipeline
         .execute_http_request_body(&mut ctx, &mut body, true)
         .await
@@ -1638,6 +1648,41 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
         "fallback persistence history should preserve MCP list metadata"
     );
     assert_eq!(state.previous_tools.len(), 1, "fallback should populate previous tools");
+}
+
+#[test]
+fn replay_preserves_client_owned_custom_tool_history_without_cloning() {
+    // A stored client-tool continuation holds a correlated custom call/output
+    // pair alongside a hosted item. The client-owned pair must survive replay via
+    // the shared fast path (#1764) so the client-tool-compat adapter can lower it,
+    // while the hosted item stays excluded.
+    let persisted = MessageHistory::from(vec![
+        json!({"type": "message", "role": "user", "content": "Previous turn"}),
+        json!({"type": "custom_tool_call", "call_id": "call_history", "name": "do_work", "input": "Prior invocation"}),
+        json!({"type": "custom_tool_call_output", "call_id": "call_history", "output": "sentinel"}),
+        json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+    ]);
+
+    let replay = replay_messages_from_stored(&persisted);
+
+    assert_eq!(replay.len(), 3, "the hosted web_search_call is excluded: {replay:?}");
+    assert_eq!(replay[1]["type"], "custom_tool_call");
+    assert_eq!(replay[1]["call_id"], "call_history");
+    assert_eq!(replay[2]["type"], "custom_tool_call_output");
+    assert_eq!(replay[2]["output"], "sentinel");
+    assert!(
+        replay.iter().all(|item| item["type"] != "web_search_call"),
+        "hosted output items must not replay as request input: {replay:?}"
+    );
+    for index in 0..replay.len() {
+        // The user message (index 0) and both custom items (1, 2) replay verbatim,
+        // so none is cloned; the excluded hosted item at persisted index 3 shifts
+        // nothing because it is simply skipped.
+        assert!(
+            replay.shares_item_with(index, &persisted, index),
+            "client-owned item {index} must replay via the shared fast path, not a clone"
+        );
+    }
 }
 
 #[test]
@@ -4190,13 +4235,29 @@ impl ResponseStore for MockStore {
     ) -> Result<Option<ResponseRecord>, StoreError> {
         let record = self.records.get(id).filter(|record| &record.owner == tenant_id);
         if record.is_some_and(|record| {
-            count_record_values(&[&record.response_object, &record.input, &record.messages])
-                .and_then(|bytes| bytes.checked_add(record.model.len()))
-                .is_none_or(|bytes| bytes > max_bytes)
+            !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes)
+                || record.model.len() > max_bytes
         }) {
             return Err(StoreError::PayloadTooLarge);
         }
         self.get_response(tenant_id, id).await
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let Some(record) = self.get_response(tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
     }
 
     async fn get_conversation_bounded(
@@ -4206,12 +4267,27 @@ impl ResponseStore for MockStore {
         max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         let record = self.conversations.get(id).filter(|record| &record.owner == tenant_id);
-        if record.is_some_and(|record| {
-            count_record_values(&[&record.metadata, &record.messages]).is_none_or(|bytes| bytes > max_bytes)
-        }) {
+        if record.is_some_and(|record| !json_values_fit(&[&record.metadata, &record.messages], max_bytes)) {
             return Err(StoreError::PayloadTooLarge);
         }
         ResponseStore::get_conversation(self, tenant_id, id).await
+    }
+
+    async fn get_conversation_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let Some(record) = ResponseStore::get_conversation(self, tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.metadata, &record.messages],
+            &[&record.conversation_id],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
     }
 
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {

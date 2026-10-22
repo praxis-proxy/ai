@@ -33,10 +33,10 @@
 //!   reserve/reconcile split this filter needs.
 //!
 //! Both sit behind the same pluggable [`backend`] trait, so either
-//! algorithm runs in-process (default) or against a shared Valkey
-//! backend (`backend: {kind: valkey}`) for state shared across gateway
+//! algorithm runs in-process (default) or against a shared Redis/Valkey
+//! backend (`backend: {kind: redis}` or `{kind: valkey}`) for state shared across gateway
 //! instances/replicas -- see `praxis-proxy/grid#83` for the fuller
-//! Valkey-backend spec this milestone is a narrower slice of.
+//! shared-backend spec this milestone is a narrower slice of.
 //!
 //! Per-rule algorithm choice, rather than one fixed algorithm for the
 //! whole filter, mirrors the `GuardrailsFilter`'s own `rules: Vec<RuleConfig>`
@@ -129,9 +129,10 @@ use self::{
         InMemoryTokenRateLimitBackend, ReconcileRequest, ReserveRequest, TokenRateLimitStateBackend,
     },
     config::{
-        ActionType, BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EnforcementMode, EstimationConfig,
-        EstimationStrategy, HierarchyIdentitySource, HierarchyLevel, HierarchyLevelConfig, HierarchySubjectSource,
-        MatchConfig, OverQuotaConfig, RuleAlgorithm, RuleConfig, TierConfig, TokenRateLimitConfig,
+        ActionType, BackendConfig, BackendKind, BackendOnFailure, DEFAULT_RESERVATION_TIMEOUT, EnforcementMode,
+        EstimationConfig, EstimationStrategy, HierarchyIdentitySource, HierarchyLevel, HierarchyLevelConfig,
+        HierarchySubjectSource, MatchConfig, OverQuotaConfig, RuleAlgorithm, RuleConfig, TierConfig,
+        TokenRateLimitConfig,
     },
     keys::{CompiledKeySpec, KeyDecision, KeyInputs, compile_key_spec},
     ledger::{Budget, DenialReason, Ledger, LedgerConfig},
@@ -165,6 +166,10 @@ const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 /// the exchange. Settlement does not read it: every backend settles
 /// against the estimate it stored with the reservation.
 const META_ESTIMATE: &str = "token_rate_limit.estimate";
+
+/// Marker for an explicit fail-open admission. It never contains a
+/// reservation handle and is cleared at the end of the exchange.
+const META_FAIL_OPEN: &str = "token_rate_limit.fail_open";
 
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
@@ -246,47 +251,46 @@ const HEADER_RATELIMIT_RESET: &str = "X-RateLimit-Reset-Tokens";
 
 /// Resolved, ready-to-use form of the filter-level `backend:` config:
 /// either every rule uses in-process state, or every rule shares one
-/// already-open Valkey connection (see [`ValkeyConnection`]'s doc comment
-/// for why this is built once and `Clone`d, not once per rule).
+/// lazily connected Redis/Valkey transport (see [`ValkeyConnection`]'s doc
+/// comment for why this is built once and `Clone`d, not once per rule).
 enum BackendResource {
     /// Every rule gets its own in-process ledger (the default).
     Memory,
-    /// Every rule shares this one Valkey connection, differentiated by
+    /// Every rule shares this one Redis/Valkey connection, differentiated by
     /// `namespace`/rule-name key hashing. Boxed: `ValkeyConnection` embeds
     /// a `redis::Client`/`ConnectionInfo`, large enough that an unboxed
     /// field here would size the whole enum (including the zero-data
     /// `Memory` variant) up to match it.
-    Valkey {
-        /// Filter-shared connection, `Clone`d into each Valkey-backed
-        /// rule's own backend.
-        valkey: Box<ValkeyConnection>,
+    Shared {
+        /// Filter-shared Redis/Valkey connection, `Clone`d into each
+        /// network-backed rule's own backend.
+        connection: Box<ValkeyConnection>,
         /// Key namespace prefix, see [`BackendConfig::namespace`].
         namespace: String,
     },
 }
 
-/// Resolve the filter's `backend:` block into a [`BackendResource`],
-/// opening the Valkey connection once up front if configured.
+/// Resolve the filter's `backend:` block into a [`BackendResource`], creating
+/// one shared transport whose network connection/discovery remains lazy.
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if `backend.kind: valkey` is set without a
-/// `url`, or the URL fails to parse/expand.
+/// Returns [`FilterError`] if a network backend has neither `url` nor
+/// `sentinel`, or a topology value fails to parse/expand.
 fn build_backend_resource(backend: &BackendConfig) -> Result<BackendResource, FilterError> {
     match backend.kind {
         BackendKind::Memory => Ok(BackendResource::Memory),
-        BackendKind::Valkey => {
-            let url = backend
-                .url
-                .as_deref()
-                .ok_or("token_rate_limit: backend.url is required for backend.kind: valkey")?;
-            let url = expand_backend_url(url)?;
+        BackendKind::Redis | BackendKind::Valkey => {
+            let backend_name = match backend.kind {
+                BackendKind::Redis | BackendKind::Valkey => "shared_kv",
+                BackendKind::Memory => unreachable!("network backend name requested for memory"),
+            };
             let namespace = backend
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "praxis:token_rate_limit".to_owned());
-            let valkey = Box::new(ValkeyConnection::new(url)?);
-            Ok(BackendResource::Valkey { valkey, namespace })
+            let connection = Box::new(ValkeyConnection::from_backend_config(backend, backend_name)?);
+            Ok(BackendResource::Shared { connection, namespace })
         },
     }
 }
@@ -322,12 +326,12 @@ fn build_sliding_window_backend(
             .map_err(|error| format!("token_rate_limit: rule '{rule_name}': {error}"))?;
             Ok(Arc::new(InMemoryTokenRateLimitBackend::new(ledger)))
         },
-        BackendResource::Valkey { valkey, namespace } => build_sw_valkey_backend(
+        BackendResource::Shared { connection, namespace } => build_sw_valkey_backend(
             rule_name,
             budgets,
             reservation_timeout_ms,
             max_keys,
-            valkey,
+            connection,
             namespace.as_str(),
             accounting,
         ),
@@ -409,9 +413,9 @@ fn build_token_bucket_backend(
             .map_err(|error| format!("token_rate_limit: rule '{rule_name}': {error}"))?;
             Ok(Arc::new(InMemoryTokenBucketBackend::new(ledger)))
         },
-        BackendResource::Valkey { valkey, namespace } => {
+        BackendResource::Shared { connection, namespace } => {
             Ok(Arc::new(ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
-                valkey: (**valkey).clone(),
+                valkey: (**connection).clone(),
                 namespace: namespace.clone(),
                 rule: rule_name.to_owned(),
                 capacity,
@@ -734,18 +738,27 @@ fn hierarchy_metric_rule(level_name: &str) -> &'static str {
 ///
 /// Returns `Ok(stashed)` on success — a list of `(reservation_id, key)`
 /// per level — or `Err(action)` with the 429 rejection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hierarchy admission carries policy, keys, estimate, and request context"
+)]
 async fn admit_hierarchy(
     hierarchy: &[CompiledHierarchyLevel],
     keys: &[String],
     estimate: u64,
     now_ms: u64,
     ctx: &mut HttpFilterContext<'_>,
-) -> Result<Vec<(u64, String)>, FilterAction> {
+    on_failure: BackendOnFailure,
+) -> Result<Option<Vec<(u64, String)>>, FilterAction> {
     let mut stashed: Vec<(u64, String)> = Vec::with_capacity(hierarchy.len());
 
     for (level, key) in hierarchy.iter().zip(keys.iter()) {
-        match reserve_hierarchy_level(ctx, level, key, estimate, now_ms).await {
-            Ok(reserved) => stashed.push(reserved),
+        match reserve_hierarchy_level(ctx, level, key, estimate, now_ms, on_failure).await {
+            Ok(Some(reserved)) => stashed.push(reserved),
+            Ok(None) => {
+                rollback_hierarchy_sync(hierarchy, &stashed, now_ms);
+                return Ok(None);
+            },
             Err(action) => {
                 rollback_hierarchy_sync(hierarchy, &stashed, now_ms);
                 return Err(action);
@@ -753,17 +766,23 @@ async fn admit_hierarchy(
         }
     }
 
-    Ok(stashed)
+    Ok(Some(stashed))
 }
 
 /// Reserve one hierarchy level. The caller refunds earlier levels on `Err`.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one hierarchy level owns reserve result classification and fail-open telemetry"
+)]
 async fn reserve_hierarchy_level(
     ctx: &mut HttpFilterContext<'_>,
     level: &CompiledHierarchyLevel,
     key: &str,
     estimate: u64,
     now_ms: u64,
-) -> Result<(u64, String), FilterAction> {
+    on_failure: BackendOnFailure,
+) -> Result<Option<(u64, String)>, FilterAction> {
     let outcome = level
         .backend
         .reserve(ReserveRequest {
@@ -775,12 +794,27 @@ async fn reserve_hierarchy_level(
     match outcome {
         Ok(BackendReserve::Admitted { reservation_id, .. }) => {
             record_state_metrics(level.metric_rule, level.backend.as_ref());
-            Ok((reservation_id, key.to_owned()))
+            Ok(Some((reservation_id, key.to_owned())))
         },
         Ok(BackendReserve::Denied {
             retry_after_ms, reason, ..
         }) => Err(hierarchy_denied_action(ctx, level, estimate, retry_after_ms, reason)),
-        Err(error) => Err(hierarchy_backend_error(ctx, level, estimate, &error)),
+        Err(error) => {
+            if let BackendOnFailure::Open = on_failure
+                && let Some(outcome) = fail_open_outcome(&error)
+            {
+                record_hierarchy_fail_open(level, estimate, outcome, &error);
+                record_named_admission_span(
+                    ctx,
+                    level.metric_rule,
+                    level.backend.algorithm_name(),
+                    estimate,
+                    outcome,
+                );
+                return Ok(None);
+            }
+            Err(hierarchy_backend_error(ctx, level, estimate, &error))
+        },
     }
 }
 
@@ -2053,7 +2087,7 @@ fn compile_rule(
 /// #   missing: fallback
 /// max_keys: 100000                   # optional: per-rule cap on distinct budget keys
 /// backend:                           # optional: defaults to in-process state, shared by every rule
-///   kind: valkey                      # memory (default) | valkey
+///   kind: valkey                      # memory (default) | redis | valkey
 ///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
 ///   namespace: praxis:token_rate_limit
 /// default_weights:                   # optional: omitted types default to 1.0
@@ -2112,6 +2146,9 @@ pub struct TokenRateLimitFilter {
 
     /// Optional compiled hierarchy levels (org, team, user).
     hierarchy: Option<Vec<CompiledHierarchyLevel>>,
+
+    /// Expected shared-backend failure behavior for admission.
+    on_failure: BackendOnFailure,
 }
 
 impl TokenRateLimitFilter {
@@ -2169,8 +2206,9 @@ impl TokenRateLimitFilter {
             needs_body,
             key_spec,
             epoch: Instant::now(),
-            valkey_clock: matches!(backend, BackendResource::Valkey { .. }),
+            valkey_clock: matches!(backend, BackendResource::Shared { .. }),
             hierarchy,
+            on_failure: cfg.backend.on_failure,
         }))
     }
 
@@ -2254,16 +2292,18 @@ impl TokenRateLimitFilter {
 
     /// Reserve org, then team, then user when hierarchy is configured.
     ///
-    /// `Ok(())` means those reservations are stashed, or hierarchy is absent.
+    /// `Ok(true)` means those reservations are stashed or hierarchy is
+    /// absent. `Ok(false)` means explicit fail-open bypass after any earlier
+    /// hierarchy holds were released.
     /// `Err` is the rejection to return immediately.
     async fn reserve_hierarchy(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         estimate: u64,
         now_ms: u64,
-    ) -> Result<(), FilterAction> {
+    ) -> Result<bool, FilterAction> {
         let Some(hierarchy) = &self.hierarchy else {
-            return Ok(());
+            return Ok(true);
         };
         let keys = match resolve_hierarchy_keys(hierarchy, ctx) {
             Ok(keys) => keys,
@@ -2275,11 +2315,12 @@ impl TokenRateLimitFilter {
             tracing::info!("token_rate_limit: hierarchy estimate is zero, returning 400");
             return Err(FilterAction::Reject(Rejection::status(400)));
         }
-        match admit_hierarchy(hierarchy, &keys, estimate, now_ms, ctx).await {
-            Ok(stashed) => {
+        match admit_hierarchy(hierarchy, &keys, estimate, now_ms, ctx, self.on_failure).await {
+            Ok(Some(stashed)) => {
                 stash_hierarchy_metadata(ctx, &stashed);
-                Ok(())
+                Ok(true)
             },
+            Ok(None) => Ok(false),
             Err(action) => Err(action),
         }
     }
@@ -2312,6 +2353,10 @@ impl TokenRateLimitFilter {
         action: &FilterAction,
     ) {
         if self.hierarchy.is_none() {
+            return;
+        }
+        if ctx.get_metadata(META_FAIL_OPEN).is_some() {
+            self.release_hierarchy(ctx, now_ms);
             return;
         }
         match action {
@@ -2369,6 +2414,7 @@ impl TokenRateLimitFilter {
                 request_estimate: estimate,
             },
             outcome,
+            self.on_failure,
         )
     }
 
@@ -2388,8 +2434,10 @@ impl TokenRateLimitFilter {
         now_ms: u64,
         body_probe: Option<&BodyProbe>,
     ) -> FilterAction {
-        if let Err(action) = self.reserve_hierarchy(ctx, estimate, now_ms).await {
-            return action;
+        match self.reserve_hierarchy(ctx, estimate, now_ms).await {
+            Err(action) => return action,
+            Ok(false) => return FilterAction::Continue,
+            Ok(true) => {},
         }
         let action = self
             .reserve_matched_rule(ctx, rule_index, rule, estimate, now_ms, body_probe)
@@ -2483,12 +2531,17 @@ impl TokenRateLimitFilter {
     /// record admission metadata/metrics, evaluate graduated tiers and
     /// inject headers (S1), hard-reject / soft-annotate
     /// on denial, or fail closed (503) on a backend error.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "admission outcome needs rule, pending request, backend result, and policy"
+    )]
     fn handle_reserve_outcome(
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
         rule: &CompiledRule,
         pending: PendingReservation,
         outcome: Result<BackendReserve, BackendError>,
+        on_failure: BackendOnFailure,
     ) -> FilterAction {
         match outcome {
             Ok(BackendReserve::Admitted {
@@ -2511,7 +2564,7 @@ impl TokenRateLimitFilter {
                     remaining,
                 },
             ),
-            Err(error) => Self::handle_reserve_backend_error(ctx, rule, pending.request_estimate, &error),
+            Err(error) => Self::handle_reserve_backend_error(ctx, rule, pending.request_estimate, &error, on_failure),
         }
     }
 
@@ -2552,11 +2605,30 @@ impl TokenRateLimitFilter {
         rule: &CompiledRule,
         estimate: u64,
         error: &BackendError,
+        on_failure: BackendOnFailure,
     ) -> FilterAction {
-        record_backend_error_metric(&rule.name, rule.backend.backend_name(), error);
         record_accounting_failure(rule, "reserve", error);
+        if let BackendOnFailure::Open = on_failure
+            && let Some(outcome) = fail_open_outcome(error)
+        {
+            record_fail_open_metric(rule, outcome);
+            record_fail_open_accounting(rule, estimate, outcome, error);
+            record_admission_span(ctx, rule, estimate, outcome);
+            ctx.set_metadata(META_FAIL_OPEN, outcome);
+            tracing::warn!(
+                rule = rule.name,
+                outcome,
+                "token_rate_limit: admission backend failure, forwarding without confirmed reservation"
+            );
+            return FilterAction::Continue;
+        }
+        record_backend_error_metric(&rule.name, rule.backend.backend_name(), error);
         record_admission_span(ctx, rule, estimate, "error");
-        tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
+        tracing::error!(
+            error = backend_error_kind(error),
+            rule = rule.name,
+            "token_rate_limit: admission backend failed, failing closed"
+        );
         FilterAction::Reject(Rejection::status(503))
     }
 
@@ -2852,9 +2924,77 @@ fn record_reserved_metric(rule_name: &str, estimate: u64) {
 fn backend_error_kind(error: &BackendError) -> &'static str {
     match error {
         BackendError::Unavailable(_) => "unavailable",
+        BackendError::Unconfirmed(_) => "unconfirmed",
         BackendError::InvalidResponse => "invalid_response",
         BackendError::ConfigurationMismatch => "configuration_mismatch",
     }
+}
+
+/// Classify an expected backend failure without claiming that a dispatched
+/// mutation was not applied. Only connection/pool failures that occur before
+/// dispatch are bypassed; malformed or ambiguous replies remain unconfirmed.
+fn fail_open_outcome(error: &BackendError) -> Option<&'static str> {
+    match error {
+        BackendError::Unavailable(_) => Some("bypassed"),
+        BackendError::Unconfirmed(_) | BackendError::InvalidResponse => Some("unconfirmed"),
+        BackendError::ConfigurationMismatch => None,
+    }
+}
+
+/// Count an explicit fail-open admission with bounded labels.
+fn record_fail_open_metric(rule: &CompiledRule, outcome: &'static str) {
+    counter!(
+        "praxis_trl_fail_open_admissions_total",
+        "backend" => rule.backend.backend_name(),
+        "outcome" => outcome,
+        "rule" => rule.name.clone(),
+    )
+    .increment(1);
+}
+
+/// Emit a privacy-safe accounting record for a fail-open admission.
+fn record_fail_open_accounting(rule: &CompiledRule, estimate: u64, outcome: &'static str, error: &BackendError) {
+    tracing::warn!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "admission",
+        rule = rule.name,
+        algorithm = rule.backend.algorithm_name(),
+        backend = rule.backend.backend_name(),
+        result = outcome,
+        outcome,
+        error = backend_error_kind(error),
+        estimate,
+        "token rate limit fail-open admission"
+    );
+}
+
+/// Emit a privacy-safe fail-open accounting record for a hierarchy level.
+fn record_hierarchy_fail_open(
+    level: &CompiledHierarchyLevel,
+    estimate: u64,
+    outcome: &'static str,
+    error: &BackendError,
+) {
+    counter!(
+        "praxis_trl_fail_open_admissions_total",
+        "backend" => level.backend.backend_name(),
+        "outcome" => outcome,
+        "rule" => level.metric_rule,
+    )
+    .increment(1);
+    tracing::warn!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "hierarchy_admission",
+        rule = level.metric_rule,
+        level = level.name,
+        algorithm = level.backend.algorithm_name(),
+        backend = level.backend.backend_name(),
+        result = outcome,
+        outcome,
+        error = backend_error_kind(error),
+        estimate,
+        "token rate limit hierarchy fail-open admission"
+    );
 }
 
 /// Count one bounded backend failure.
@@ -2971,7 +3111,7 @@ fn record_accounting_failure(rule: &CompiledRule, operation: &'static str, error
         algorithm = rule.backend.algorithm_name(),
         backend = rule.backend.backend_name(),
         result = "failed",
-        error = %error,
+        error = backend_error_kind(error),
         "token rate limit accounting"
     );
 }
@@ -3142,6 +3282,7 @@ impl HttpFilter for TokenRateLimitFilter {
             ctx.filter_metadata.remove(META_BUCKET_KEY);
             ctx.filter_metadata.remove(META_RULE_INDEX);
             ctx.filter_metadata.remove(META_ESTIMATE);
+            ctx.filter_metadata.remove(META_FAIL_OPEN);
             #[cfg(feature = "opentelemetry")]
             ctx.extensions.remove::<crate::opentelemetry::TokenRateLimitSpan>();
         }
@@ -3189,12 +3330,6 @@ fn expand_backend_url_with(
     lookup(name).map_err(|_error| "token_rate_limit: backend.url environment variable is not set".into())
 }
 
-/// Expand one `${ENV_VAR}` reference in a backend URL against the real
-/// process environment.
-fn expand_backend_url(url: &str) -> Result<String, FilterError> {
-    expand_backend_url_with(url, |name| std::env::var(name))
-}
-
 /// Parse a simple `<number><unit>` duration (`ms`, `s`, `m`, `h`) into
 /// milliseconds, as used by `window` and `reservation_timeout`.
 fn parse_duration_ms(value: &str) -> Result<u64, FilterError> {
@@ -3222,6 +3357,22 @@ fn parse_duration_ms(value: &str) -> Result<u64, FilterError> {
     Ok(millis)
 }
 
+/// Parse one finite backend timeout and keep all network work bounded.
+fn parse_backend_timeout(
+    value: Option<&str>,
+    name: &str,
+    default: std::time::Duration,
+) -> Result<std::time::Duration, FilterError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let millis = parse_duration_ms(value).map_err(|error| format!("token_rate_limit: backend.{name}: {error}"))?;
+    if millis > 60_000 {
+        return Err(format!("token_rate_limit: backend.{name} must not exceed 60s").into());
+    }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
 impl std::fmt::Debug for TokenRateLimitFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenRateLimitFilter")
@@ -3247,8 +3398,8 @@ mod backend_injection_tests {
             BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReserveRequest,
             TokenRateLimitStateBackend,
         },
-        backend_error_kind, record_backend_error_metric, record_request_metric, record_reserved_metric,
-        record_settlement_metrics, record_state_metrics, record_unauthenticated_metric,
+        backend_error_kind, record_backend_error_metric, record_fail_open_metric, record_request_metric,
+        record_reserved_metric, record_settlement_metrics, record_state_metrics, record_unauthenticated_metric,
     };
 
     #[test]
@@ -3260,6 +3411,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
             valkey_clock: false,
             hierarchy: None,
+            on_failure: super::config::BackendOnFailure::Closed,
         };
         assert!(
             (5_000..6_000).contains(&filter.now_ms()),
@@ -3278,6 +3430,11 @@ mod backend_injection_tests {
             backend_error_kind(&BackendError::Unavailable("backend detail".to_owned())),
             "unavailable",
             "unavailable backend errors map to the unavailable label"
+        );
+        assert_eq!(
+            backend_error_kind(&BackendError::Unconfirmed("reply was lost".to_owned())),
+            "unconfirmed",
+            "ambiguous dispatched operations map to the unconfirmed label"
         );
         assert_eq!(
             backend_error_kind(&BackendError::InvalidResponse),
@@ -3372,6 +3529,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now(),
             valkey_clock: false,
             hierarchy: None,
+            on_failure: super::config::BackendOnFailure::Closed,
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -3423,6 +3581,7 @@ mod backend_injection_tests {
                 rule.backend.backend_name(),
                 &BackendError::Unavailable("test".to_owned()),
             );
+            record_fail_open_metric(&rule, "bypassed");
             record_unauthenticated_metric(&rule.name);
         });
 
@@ -3474,6 +3633,10 @@ mod backend_injection_tests {
         assert_eq!(
             labels_for("praxis_trl_backend_errors_total"),
             vec![vec!["backend".to_owned(), "error".to_owned(), "rule".to_owned()]]
+        );
+        assert_eq!(
+            labels_for("praxis_trl_fail_open_admissions_total"),
+            vec![vec!["backend".to_owned(), "outcome".to_owned(), "rule".to_owned()]]
         );
     }
 }

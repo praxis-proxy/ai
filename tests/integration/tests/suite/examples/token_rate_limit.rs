@@ -91,6 +91,73 @@ fn token_rate_limit_config(
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
 }
 
+/// Build the shipped example with an intentionally unreachable shared backend
+/// so failure policy is tested through the real proxy binary and not only by
+/// calling the filter directly.
+fn unavailable_backend_token_rate_limit_config(
+    proxy_port: u16,
+    backend_port: u16,
+    on_failure: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("token-rate-limit.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let backend = format!(
+        "        backend:\n          kind: valkey\n          url: redis://127.0.0.1:1\n          on_failure: {on_failure}\n          operation_timeout: 20ms\n"
+    );
+    let anchor = "        key: global\n";
+    assert!(
+        yaml.contains(anchor),
+        "token-rate-limit.yaml must contain the backend insertion anchor"
+    );
+    let yaml = yaml.replacen(anchor, &format!("{anchor}{backend}"), 1);
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
+    praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
+}
+
+#[test]
+fn sentinel_example_config_is_loadable_without_live_discovery() {
+    // Configuration construction must validate the topology and timeout
+    // contract without contacting Sentinel. Live discovery/failover belongs
+    // to the credentialed Redis/Valkey matrix rather than this parser test.
+    let config = load_example_config("token-rate-limit-sentinel.yaml", free_port(), HashMap::new());
+    assert_eq!(config.filter_chains.len(), 1, "the Sentinel example has one pipeline");
+}
+
+#[test]
+fn closed_backend_failure_does_not_invoke_upstream() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = unavailable_backend_token_rate_limit_config(proxy_port, backend.port(), "closed");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&raw),
+        503,
+        "closed backend failure must reject before upstream"
+    );
+    assert!(
+        backend.requests().is_empty(),
+        "closed backend failure must not invoke upstream"
+    );
+}
+
+#[test]
+fn open_backend_failure_invokes_upstream_once_without_quota_confirmation() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = unavailable_backend_token_rate_limit_config(proxy_port, backend.port(), "open");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&raw), 200, "open backend failure should forward once");
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "open backend failure must invoke upstream exactly once"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Admission and headers
 // -----------------------------------------------------------------------------

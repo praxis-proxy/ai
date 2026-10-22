@@ -17,12 +17,12 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 |-------|------|---------|-------------|
 | `provider_id` | string | yes | Provider-owned identifier used for observability and demo attribution. |
 | `model_header` | string | no | Header populated by an inference parser with the requested model. |
-| `routes` | ProviderRouteConfig[] | yes | Exact provider-local candidate mappings. |
+| `routes` | object[] | yes | Exact provider-local candidate mappings. |
 | `routes[].candidate_id` | string | yes | Stable candidate ID selected by the edge `intelligent_route`. |
 | `routes[].cluster` | string | yes | Provider-local backend cluster. |
-| `routes[].credential` | CandidateCredential | no | Optional provider-local credential reference for the final API hop. |
+| `routes[].credential` | object | no | Optional provider-local credential reference for the final API hop. |
 | `routes[].credential.strategy` | string | yes | Injection strategy. |
-| `routes[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `routes[].credential.secretRef` | object | yes | Secret locator, never secret bytes. |
 | `routes[].credential.secretRef.key` | string | yes | Secret data key. |
 | `routes[].credential.secretRef.name` | string | yes | Secret name. |
 | `routes[].credential.secretRef.namespace` | string | yes | Secret namespace. |

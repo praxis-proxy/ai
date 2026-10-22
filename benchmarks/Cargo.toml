@@ -28,3 +28,8 @@ name = "compression"
 path = "store/compression.rs"
 harness = false
 required-features = ["store-all"]
+
+[[bench]]
+name = "gemini_translation"
+path = "gemini/translation.rs"
+harness = false

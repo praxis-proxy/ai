@@ -1,0 +1,310 @@
+# OpenCode 2.x acceptance pin manifest
+#
+# Single source of truth for the pinned OpenCode 2.x acceptance tests
+# (`tests/integration/tests/suite/opencode_v2.rs` on CPU,
+# `tests/integration/tests/suite/opencode_v2_vllm.rs` on GPU) and their CI
+# steps. It sits beside, and deliberately does not replace, the 1.x manifest in
+# `tests/integration/fixtures/opencode-cli/pin.toml`: 1.x is still shipping and
+# users are mid-migration, so both majors are pinned and both are proven.
+#
+#   OpenCode 2.x -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions
+#
+# As with 1.x there is no body translation on that path; these tests prove
+# client compatibility and credential isolation, not a transformation.
+#
+# OpenCode 2.x is a breaking client release: a different npm package, a new
+# plugin API, a restructured provider config, and a background server. NOTHING
+# in the 1.x manifest transfers by assumption. Every behavioral value below was
+# validated by hand against the pinned 2.1.2 linux-x64 executable. Where a
+# value encodes observed client behavior rather than a project choice, the
+# comment says so — those are the ones to re-validate when the version changes.
+
+[opencode]
+# Version asserted from `opencode --version`. Keep in sync with
+# OPENCODE_V2_PINNED_VERSION in `tests/integration/tests/suite/harness.rs`;
+# `pin_toml_version_matches_harness_const` enforces the pair.
+version = "2.1.2"
+# OBSERVED: unlike 1.x, which prints the bare version, 2.x prints a product
+# prefix and a `v`: `opencode v2.1.2`. The version check compares against this
+# exact line.
+version_output = "opencode v2.1.2"
+# Platform slug the pinned build targets.
+platform = "linux-x64"
+# How CI obtains the executable.
+#
+# OBSERVED: 2.x does NOT ship as `opencode-ai` (that package tops out in the
+# 1.x line, so it can never silently cross into 2.x). It ships as
+# `@opencode/cli`, whose platform binaries are `@opencode/cli-<platform>`
+# optionalDependencies. The linux-x64 tarball contains exactly
+# `package/package.json` and a self-contained ELF at `package/bin/opencode`.
+#
+# PROJECT CHOICE: both the CPU and GPU lanes fetch that platform tarball
+# directly from the registry with curl and verify it against
+# `<version>-<platform>.sha256` beside this manifest, so the two lanes stage a
+# byte-identical client by construction. `npm install -g @opencode/cli` is
+# avoided on purpose: the package declares both `bin.opencode` and
+# `bin.opencode2`, so a global 2.x install collides with a global 1.x install
+# on any runner that hosts both lanes. Lanes resolve the binary by absolute
+# path instead.
+install = "registry-tarball"
+npm_package = "@opencode/cli"
+platform_package = "@opencode/cli-linux-x64"
+tarball_binary = "package/bin/opencode"
+# Major-series tripwire. The `pins` job validates each OpenCode manifest
+# against its own declared major; this one must stay 2. The `model.request`
+# plugin hook and the `providers` config shape are 2.x contracts.
+major_series = 2
+
+[opencode.launch]
+# Headless entry point.
+subcommand = "run"
+# OBSERVED: without `--standalone`, `run` attaches to (and if necessary
+# spawns) a shared background service, `opencode serve --service`, which is
+# reparented and KEEPS RUNNING after `run` exits. In a test that is both a
+# process leak and cross-test contamination: a later run can attach to a
+# server that loaded another test's HOME and config. `--standalone` runs a
+# private in-process server that exits with the client. Mandatory.
+standalone_flag = "--standalone"
+# The prompt is POSITIONAL and is the final argument.
+prompt_is_positional = true
+# OBSERVED FOOTGUN, inverted from 1.x: do NOT put `--` before the prompt. On
+# 2.1.2 `run -- hello` sends the message `hello hello` — the positional is
+# duplicated. The 1.x guide recommended `--`; copying that habit doubles every
+# prompt. `opencode_v2_run_has_no_double_dash_separator` guards this.
+double_dash_duplicates_prompt = true
+# OBSERVED: a single argv element that contains spaces reaches the model
+# wrapped in literal double quotes (`"Reply with exactly PONG."`); separate
+# words are joined with spaces and not quoted. Harmless for these tests, and
+# recorded so a reviewer reading a captured body is not surprised.
+spaced_argument_is_quoted = true
+# OBSERVED: `-p` is no longer the server password on `run` (that moved to
+# OPENCODE_SERVER_PASSWORD); it is an unknown flag. `run -p hello` prints the
+# help text and exits 1 without issuing a request.
+dash_p_is_unknown_flag = true
+# `--format json` emits one JSON event per line. OBSERVED shapes:
+#   plain text turn: text (assistant text at `part.text`) — 2.x emits NO
+#                    step_start/step_finish around a toolless turn, unlike 1.x
+#   tool turn:       step_start -> tool_use (part.tool, part.state.status)
+#                    -> step_finish -> text
+#   failure:         error (`error.type`, `error.message`)
+format = "json"
+# Global flags. `--print-logs` is mandatory for the plugin lane: a plugin that
+# fails to LOAD is otherwise completely silent (see `[opencode.auth.plugin]`).
+# OBSERVED: the load-failure line is logged at WARN, so the level must be
+# `warn` or lower — the 1.x lane's `ERROR` would hide it.
+log_level = "warn"
+global_flags = ["--print-logs", "--log-level"]
+run_flags = ["--standalone", "--model", "--format"]
+# OBSERVED: `run` has NO `--pure` flag in 2.x and there is no environment
+# variable equivalent. The 1.x inversion lane ("--pure ignores the declared
+# plugin, so the gateway rejects the turn") has no direct port; see
+# `[opencode.auth.inversion]` for the two lanes that replace it.
+pure_flag_available = false
+# Exit codes, OBSERVED:
+#   0 = success
+#   1 = unknown model or unknown provider (`error.type` = provider.no-route),
+#       no request issued
+#   1 = a `model.request` hook threw (fail-closed, no request issued)
+#   1 = unknown CLI flag
+#   1 = gateway 401: an `error` event with `error.type` = provider.auth and
+#       `error.status` = 401. Unlike 1.x the event carries NO response
+#       headers, so the gateway's `WWW-Authenticate` realm cannot be checked
+#       from the client side; the plugin-absent lane relies on the backend
+#       capturing nothing to place the 401 at the gateway.
+exit_code_meaningful = true
+# OBSERVED request count for one trivial prompt: two POSTs to
+# /v1/chat/completions — a toolless title turn (`kind` = title) and the main
+# turn carrying the tool schema (`kind` = primary). A tool round trip adds one
+# more. The scripted backend supplies padding beyond that so an extra client
+# turn never exhausts the script and fails for the wrong reason.
+observed_turns_for_trivial_prompt = 2
+# OBSERVED: no `GET /v1/models` probe; model discovery comes from config.
+probes_models_endpoint = false
+
+# STDIN MUST BE /dev/null.
+#
+# OBSERVED, unchanged from 1.x: with stdin held open, `opencode run` issues no
+# request and produces no output until it is killed, even though the prompt
+# was supplied as an argument.
+[opencode.launch.stdin]
+must_be_null = true
+
+[opencode.config]
+# OBSERVED: 2.x reads the same global file as 1.x,
+# `$XDG_CONFIG_HOME/opencode/opencode.json(c)`, and additionally keeps state
+# under `$XDG_STATE_HOME/opencode`, so the harness roots XDG_STATE_HOME in the
+# temporary HOME too.
+config_file = "opencode.jsonc"
+schema_url = "https://opencode.ai/config.json"
+# The documented 2.x configuration blocks, asserted byte-equal to the JSON
+# blocks in the guide by `documented_v2_config_matches_fixtures`. The harness
+# builds every lane's config FROM these fixtures, patching only the gateway
+# URL and the served model name, so the tests run the configuration users copy.
+fixture = "opencode.json"
+headers_fixture = "opencode-headers.json"
+# OBSERVED: 2.1.2 SILENTLY IGNORES unknown keys on both the provider and the
+# model object — the published schema says `additionalProperties: false`, but
+# the client does not enforce it. 1.x hard-failed at startup instead. So a
+# misspelled `settings` is not an error; it just drops the baseURL. The
+# key-safety tests below are therefore the only guard against a typo.
+rejects_unknown_keys = false
+# Accepted keys on `providers.<id>`, from the pinned schema.
+provider_keys = [
+  "canonical", "name", "env", "package", "compatibility", "settings",
+  "headers", "body", "models",
+]
+# Accepted keys on `providers.<id>.models.<model>`, from the pinned schema.
+model_keys = [
+  "modelID", "family", "name", "releaseDate", "compatibility", "package",
+  "settings", "headers", "body", "capabilities", "variants", "cost",
+  "disabled", "limit",
+]
+# OBSERVED: a verbatim 1.x provider stanza (`provider`, `npm`,
+# `options.baseURL`, per-model `headers`) still completes a turn on 2.1.2, so
+# the config shape is not what breaks a 1.x setup — the plugin is. The guide
+# documents the native 2.x shape anyway, because the compatibility shim is
+# undocumented upstream and can disappear in any release.
+v1_provider_stanza_still_works = true
+
+[opencode.provider]
+# Provider id the configs declare; the model is addressed as `<id>/<model_id>`.
+id = "praxis"
+# OBSERVED: the `aisdk:` prefix selects the bundled AI SDK adapter; no npm
+# fetch happens at startup (confirmed by the isolation note below).
+package = "aisdk:@ai-sdk/openai-compatible"
+model_id = "qwen3-8b"
+context = 32768
+output = 8192
+# baseURL carries the `/v1` suffix; the client appends `/chat/completions`.
+# 2.x moves it from `options.baseURL` to `settings.baseURL`.
+base_url_key = "settings.baseURL"
+base_url_suffix = "/v1"
+
+[opencode.auth.plugin]
+# The documented primary path: a V2 plugin that attaches the gateway Basic
+# credential from a `model.request` session hook.
+fixture = "praxis-auth.ts"
+doc = "docs/developing/cli-vllm-through-praxis.md"
+# The fixture is asserted byte-equal to the sole ```typescript block in the
+# guide's 2.x section by `documented_v2_plugin_matches_fixture`.
+#
+# OBSERVED: local plugins are AUTO-DISCOVERED from
+# `$XDG_CONFIG_HOME/opencode/plugins/`, as a single file or as a directory with
+# an `index.ts`, with no `plugins` config entry. PROJECT CHOICE: the guide uses
+# the single-file form, so there is nothing to declare.
+#
+# OBSERVED: a path declared in the `plugins` array must be a DIRECTORY; a
+# declared `./praxis-auth.ts` file is rejected with "configured plugin path
+# must be a directory" and the turn runs unauthenticated.
+install_path = "plugins/praxis-auth.ts"
+hook = "model.request"
+# OBSERVED: the event passed to the hook carries `sessionID`, `agent`,
+# `model` (`id`, `providerID`, `variant`), `kind` (`title` | `primary`),
+# `baseURL`, and a mutable `headers` map. `baseURL` is the resolved provider
+# URL, which is what lets the 1.x destination guard port across unchanged.
+hook_filter = "providerID"
+# OBSERVED: `@opencode/plugin` is bundled in the executable, so the
+# `import { Plugin } from "@opencode/plugin"` line resolves with no network
+# and no node_modules.
+import_is_bundled = true
+env_password = "GATEWAY_AUTH_PASSWORD"
+env_trusted_url = "PRAXIS_BASE_URL"
+#
+# FAILURE MODES — split, unlike 1.x, and all OBSERVED on 2.1.2:
+#
+#   1. The HOOK throws (baseURL mismatch, unset password): FAIL-CLOSED. The
+#      request is never sent, the client emits an `error` event whose
+#      `error.message` is the thrown message, and exits 1. The destination
+#      guard is therefore an ENFORCING control on 2.x, not defence in depth.
+#
+#   2. The plugin fails to LOAD (setup throws, a syntax error, a missing
+#      declared path, a V1-shaped module, a declared file instead of a
+#      directory): FAIL-OPEN. The client logs `failed to load plugin` (WARN,
+#      only with `--print-logs`), sends every turn with NO Authorization
+#      header, exits 0, and the stream looks successful.
+#
+#   3. The hook's `providerID` filter does not match: the hook never runs, the
+#      turn goes out unauthenticated, exit 0, and NOTHING is logged at all.
+#
+# Because of 2 and 3, exit status is still not a valid auth oracle. The plugin
+# lane asserts the gateway credential on EVERY captured request and asserts
+# stderr is free of `plugin_failure_log`.
+hook_failure_is_fail_closed = true
+load_failure_is_fail_open = true
+plugin_failure_log = "failed to load plugin"
+
+[opencode.auth.headers]
+# The plugin-free alternative. 2.x adds a PROVIDER-level `headers` map (1.x
+# had only per-model headers), and `{env:NAME}` substitution works inside it,
+# so the credential need not be written to disk. OBSERVED: an unset variable
+# substitutes as the empty string, which the gateway rejects with 401.
+scope = "providers.<id>.headers"
+header_name = "Authorization"
+header_value = "Basic {env:PRAXIS_GATEWAY_BASIC_TOKEN}"
+env_token = "PRAXIS_GATEWAY_BASIC_TOKEN"
+
+[opencode.auth.inversion]
+# With `--pure` gone, two lanes together replace the 1.x inversion:
+#
+#   plugin_absent — identical config and environment to the plugin lane, with
+#     the plugin file removed. The gateway must reject with 401 before the
+#     backend sees anything, which proves the plugin, and nothing else in the
+#     environment, is the credential source.
+#
+#   guard_tripped — the plugin is present but PRAXIS_BASE_URL names another
+#     gateway. The hook must throw and the client must send nothing, exiting 1
+#     with the guard message, which proves the destination guard is enforcing.
+lanes = ["plugin_absent", "guard_tripped"]
+guard_error_message = "Praxis baseURL does not match the trusted gateway"
+
+[opencode.isolation]
+# OBSERVED: NO startup egress is required. The headers lane, the plugin lane,
+# and the `@opencode/plugin` import all completed inside a loopback-only
+# network namespace (`unshare --net --map-root-user`, lo up, no route to
+# 1.1.1.1) with none of the `OPENCODE_DISABLE_*` variables set.
+#
+# The variables below are hygiene, not correctness prerequisites. OBSERVED:
+# `OPENCODE_DISABLE_SHARE` and `OPENCODE_DISABLE_LSP_DOWNLOAD` from the 1.x
+# list no longer exist in the 2.x binary, so they are dropped rather than set
+# for nothing. `OPENCODE_DISABLE_PROJECT_CONFIG` keeps a stray `opencode.json`
+# above the temporary workspace from leaking into a run.
+requires_egress = false
+verified_in_netns = true
+disable_env = [
+  "OPENCODE_DISABLE_MODELS_FETCH",
+  "OPENCODE_DISABLE_AUTOUPDATE",
+  "OPENCODE_DISABLE_PROJECT_CONFIG",
+]
+
+[opencode.tools]
+# Tool names the pinned client registers, verbatim from a captured request.
+# OBSERVED renames from 1.x: `bash` -> `shell`, `task` -> `subagent`;
+# `todowrite` is gone; `question`, `websearch`, and `execute` are new.
+registered = [
+  "edit", "execute", "glob", "grep", "question", "read", "shell", "skill",
+  "subagent", "webfetch", "websearch", "write",
+]
+# The shell tool a tool-call turn should invoke. OBSERVED arguments:
+# `command` (required), `workdir`, `timeout`, `background`, `description`.
+shell_tool = "shell"
+# OBSERVED: `shell` executes inside the workspace without `--auto`; the
+# default permission allows it in a headless run.
+shell_needs_auto = false
+
+[gateway]
+# Same example config as the 1.x lane: the path is identical for both majors.
+example_config = "anthropic/messages-native-vllm.yaml"
+basic_auth_user = "gateway"
+password_env = "GATEWAY_AUTH_PASSWORD"
+backend_credential_env = "VLLM_API_KEY"
+
+[startup_matrix]
+# Every prefix the client is allowed to reach through the gateway; each must
+# have an explicit `- path:` route in `gateway.example_config`.
+allowed_prefixes = ["/v1/chat/completions"]
+
+# [vllm] is intentionally absent. The GPU lane runs inside the 1.x job,
+# `vllm-gpu-opencode-acceptance`, against the SAME vLLM container, so the
+# backend pins live once, in the 1.x manifest. The `pins` job asserts this
+# manifest's `[opencode.provider]` model and window agree with that `[vllm]`
+# block, so the two can never drift apart.

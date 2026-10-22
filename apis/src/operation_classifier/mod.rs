@@ -8,28 +8,21 @@
 //! modified, so the result is available before any body-handling decision is
 //! made.
 //!
-//! The same head-only classification runs from two hooks. The request-header
-//! hook is the usual path. The request-body hook exists only so the match is
-//! published before a downstream filter's buffered body pre-read: core runs that
-//! pre-read ahead of the header phase, so a consumer that parses the body (for
-//! example `openai_responses_request` under [`BodyMode::StreamBuffer`]) would
-//! otherwise run before this classifier and find no match. Ordered ahead of that
-//! consumer with [`BodyAccess::ReadOnly`] and [`BodyMode::Stream`], this filter's
-//! body hook inspects only the head, publishes once, and returns
-//! [`FilterAction::Continue`] without touching the body bytes. A completion
-//! marker keeps classification to a single pass across both hooks and every
-//! chunk, including when no operation matched. Enrolling in the body phase does
-//! mean the body hook is invoked once per streamed chunk; the marker makes every
-//! call after the first a cheap extension lookup, so the cost is a map read per
-//! chunk, not reclassification.
+//! Classification runs once from the request-head phase, the lifecycle point
+//! core runs before any downstream filter's buffered body pre-read and before
+//! the main request phase. Publishing the match there makes it visible to a
+//! consumer that parses the body under a buffered body mode
+//! (`BodyMode::StreamBuffer`) — for example `openai_responses_request` — whose
+//! pre-read core would otherwise run ahead of the request phase. The head phase
+//! runs exactly once per request, so the match is published in a single pass
+//! with no completion marker and without enrolling the filter in the body phase.
 //!
-//! This ordering guarantees classification before a downstream filter's body
-//! pre-read, not before all of core's pre-read work. Core enforces the
-//! configured request body size limit while reading, so an oversized body can be
-//! rejected with `413 Payload Too Large` before the first body hook runs and
-//! thus before this filter classifies. That is the weaker guarantee; the
-//! stronger one — classification ahead of every pre-read step — needs the core
-//! hook point tracked in praxis#1142 and is not provided here.
+//! Because the classifier no longer reads the body, it cannot be preempted by
+//! the body-size limit core enforces during a pre-read: the head phase runs
+//! ahead of every pre-read step, so an oversized body rejected with `413 Payload
+//! Too Large` is still classified first. That closes the weaker-guarantee caveat
+//! of the former body-phase workaround (praxis#1142), now provided as a
+//! first-class request-head hook.
 //!
 //! Every protocol-owned registry is consulted through the shared matcher, so
 //! OpenAI and Anthropic operations are recognized by one filter. The classifier
@@ -44,7 +37,7 @@
 //!
 //! The headers are pending mutations applied when the request is forwarded, so
 //! the `router` filter — which matches the downstream request headers — does not
-//! see them within the same header phase. Pipelines that branch on the
+//! see them during request-phase matching. Pipelines that branch on the
 //! classification use `on_result` against the published filter results, which
 //! are visible immediately. See the `openai/operation-classifier.yaml` example.
 //!
@@ -58,11 +51,8 @@ mod config;
 mod tests;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use praxis_filter::{
-    ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::{BodyAccess, BodyMode},
-    parse_filter_config,
+    ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::debug;
 
@@ -128,23 +118,16 @@ impl AiOperationFilter {
         }
     }
 
-    /// Classify the request head and publish the result exactly once.
+    /// Classify the request head and publish the result.
     ///
-    /// Shared by the request-header and request-body hooks so the two cannot
-    /// diverge. The completion marker makes the step idempotent: whichever hook
-    /// runs first does the work, and later calls — the other hook, or a repeated
-    /// body chunk — return without reclassifying. The marker is set even when no
-    /// operation matched, so an unmatched request is classified once rather than
-    /// on every chunk.
+    /// Runs once from the request-head phase. It reads only the method, path,
+    /// and protocol headers, so it classifies whether or not an operation
+    /// matched and never inspects the body.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] when publishing a matched operation fails.
     fn classify_and_publish(&self, ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterError> {
-        if ctx.extensions.get::<OperationClassified>().is_some() {
-            return Ok(());
-        }
-
         let method = ctx.request.method.as_str();
         let transport = request_transport(method, &ctx.request.headers);
         let path = ctx.request.uri.path();
@@ -166,7 +149,6 @@ impl AiOperationFilter {
             self.remove_routing_headers(ctx);
         }
 
-        ctx.extensions.insert(OperationClassified);
         Ok(())
     }
 }
@@ -196,64 +178,35 @@ pub struct AiOperationMatch {
     pub path_parameters: PathParameterOffsets,
 }
 
-/// Marks that this filter has run its one classify-and-publish pass.
-///
-/// Classification reads only the request head, which both hooks can see, so the
-/// work must happen once however the pipeline schedules them. This zero-sized
-/// extension records that it has, so the request-header hook, the request-body
-/// hook, and every repeated body chunk resolve to a single pass — whether or not
-/// an operation matched.
-#[derive(Clone, Copy)]
-struct OperationClassified;
-
 #[async_trait]
 impl HttpFilter for AiOperationFilter {
     fn name(&self) -> &'static str {
         "ai_operation"
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        self.classify_and_publish(ctx)?;
+    /// Classification happens in the request-head phase, so the request phase is
+    /// a no-op.
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
-    /// Read-only: the head carries the whole classification, so the body is only
-    /// observed, never buffered or modified. Declaring access enrolls the filter
-    /// in the body phase so its hook runs there.
-    fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
-    }
-
-    /// Streamed: chunks pass through untouched. The filter never needs the full
-    /// body, so it must not upgrade the pipeline-wide delivery mode to
-    /// [`BodyMode::StreamBuffer`].
-    fn request_body_mode(&self) -> BodyMode {
-        BodyMode::Stream
-    }
-
-    /// The body hook classifies from the request head, so the original method,
-    /// path, and headers must be preserved into the body phase.
-    fn needs_request_context(&self) -> bool {
-        true
-    }
-
-    /// Publish the match from the body phase for a downstream buffered pre-read.
+    /// Classify from the request head and publish the match before any
+    /// downstream buffered body pre-read.
     ///
-    /// A consumer that reads the body with [`BodyMode::StreamBuffer`] triggers a
-    /// pre-read that core runs before the header phase. Ordered ahead of that
-    /// consumer, this hook publishes the match so the consumer sees it. The body
-    /// is never read, buffered, or altered, and the completion marker keeps this
-    /// to one classification across the pre-read, the header phase, and every
-    /// chunk.
-    async fn on_request_body(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        let _ = (body, end_of_stream);
+    /// The head phase runs once per request, ahead of a consumer's
+    /// `BodyMode::StreamBuffer` pre-read and the request phase, so a filter that
+    /// parses the body still observes the published match. The body is never
+    /// read, buffered, or altered.
+    async fn on_request_head(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         self.classify_and_publish(ctx)?;
         Ok(FilterAction::Continue)
+    }
+
+    /// Opt into the request-head phase: classification needs only the request
+    /// head, and publishing there keeps the match visible to a downstream body
+    /// pre-read without enrolling this filter in the body phase.
+    fn runs_request_head(&self) -> bool {
+        true
     }
 }
 

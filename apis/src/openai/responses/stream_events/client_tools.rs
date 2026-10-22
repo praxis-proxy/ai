@@ -117,8 +117,8 @@ pub(super) enum ClientToolDisposition {
     },
     /// Emit a synthesized custom-tool input event (Task 5).
     EmitCustomInput {
-        /// Stable key of the tracked stream item.
-        #[expect(dead_code, reason = "retained for debug formatting, not read by applier")]
+        /// Stable key of the tracked stream item. Not read by the applier, but charged
+        /// against the #1767 staged-byte ceiling when this disposition is held.
         key: String,
         /// The item id to stamp on the synthesized event.
         item_id: String,

@@ -15,19 +15,19 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
     sync::Mutex,
 };
 
 use async_trait::async_trait;
 
 use crate::{
-    json_values_fit,
+    json_values_charge, json_values_fit,
     owner::StateOwner,
+    retained_charge,
     traits::{ConversationItemStore, ResponseStore},
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -286,6 +286,27 @@ impl ResponseStore for InMemoryStore {
         Ok(Some(record.clone()))
     }
 
+    async fn get_response_budgeted(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        let charge = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord {
+            record: record.clone(),
+            charge_bytes: charge,
+        }))
+    }
+
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
         let removed = inner.responses.get(id).is_some_and(|record| &record.owner == owner);
@@ -346,6 +367,62 @@ impl ResponseStore for InMemoryStore {
         let mut record = record.clone();
         record.messages = messages;
         Ok(Some(record))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "legacy/item reconstruction and charge accounting share one locked snapshot"
+    )]
+    async fn get_conversation_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut legacy = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        if items.is_empty() && legacy.is_empty() {
+            legacy = record.messages.as_array().map_or(&[][..], Vec::as_slice);
+        }
+        let item_count = legacy
+            .len()
+            .checked_add(items.len())
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let array_syntax_bytes = if item_count == 0 {
+            2
+        } else {
+            item_count.checked_add(1).ok_or(StoreError::PayloadTooLarge)?
+        };
+        let projection_overhead = retained_charge(array_syntax_bytes, 1).ok_or(StoreError::PayloadTooLarge)?;
+        let values = std::iter::once(&record.metadata)
+            .chain(legacy.iter())
+            .chain(items.iter().map(|item| &item.item_data));
+        let charge = json_values_charge(values, &[&record.conversation_id], max_charge_bytes)?
+            .checked_add(projection_overhead)
+            .filter(|charge| *charge <= max_charge_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+
+        let mut history = legacy.to_vec();
+        history.extend(ordered_messages(items));
+        Ok(Some(BudgetedRecord {
+            record: ConversationRecord {
+                conversation_id: record.conversation_id.clone(),
+                owner: record.owner.clone(),
+                created_at: record.created_at,
+                metadata: record.metadata.clone(),
+                messages: serde_json::Value::Array(history),
+            },
+            charge_bytes: charge,
+        }))
     }
 
     async fn record_pending_approvals(
@@ -799,9 +876,9 @@ impl ConversationItemStore for InMemoryStore {
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: usize,
+        max_append_charge_bytes: usize,
     ) -> Result<(), StoreError> {
-        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_append_charge_bytes))
     }
 
     async fn delete_item_and_sync_messages(
@@ -840,7 +917,7 @@ impl ConversationItemStore for InMemoryStore {
     reason = "bounded cache helper sits beside its trait implementation"
 )]
 impl InMemoryStore {
-    /// Validate the complete message-cache projection before updating items.
+    /// Validate bounded new append work before updating items.
     #[expect(
         clippy::too_many_lines,
         reason = "preflight and the mutex-protected commit form one atomic operation"
@@ -850,7 +927,7 @@ impl InMemoryStore {
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: Option<usize>,
+        max_append_charge_bytes: Option<usize>,
     ) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
@@ -859,35 +936,34 @@ impl InMemoryStore {
         let key = (owner.clone(), conversation_id.to_owned());
         require_conversation_scope(&inner, owner, conversation_id, items)?;
         reject_duplicate_item_ids(&inner, items)?;
-        if let Some(max_rebuild_bytes) = max_rebuild_bytes {
-            let previous = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
-            let count = previous
-                .len()
-                .checked_add(items.len())
-                .ok_or(StoreError::PayloadTooLarge)?;
-            let raw_allowance = max_rebuild_bytes
-                .checked_sub(count.checked_mul(4).ok_or(StoreError::PayloadTooLarge)?)
-                .and_then(|bytes| bytes.checked_sub(4))
-                .map(|bytes| bytes / 512)
-                .ok_or(StoreError::PayloadTooLarge)?;
-            let mut remaining = raw_allowance;
-            for item in previous.iter().chain(items) {
-                struct Counter<'a>(&'a mut usize);
-                impl io::Write for Counter<'_> {
-                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                        *self.0 = self
-                            .0
-                            .checked_sub(buf.len())
-                            .ok_or_else(|| io::Error::other("stored payload exceeds request limit"))?;
-                        Ok(buf.len())
-                    }
-
-                    fn flush(&mut self) -> io::Result<()> {
-                        Ok(())
-                    }
-                }
-                serde_json::to_writer(Counter(&mut remaining), &item.item_data)
-                    .map_err(|_error| StoreError::PayloadTooLarge)?;
+        if let Some(max_append_charge_bytes) = max_append_charge_bytes {
+            let mut charge = json_values_charge(std::iter::empty(), &[conversation_id], max_append_charge_bytes)?;
+            for item in items {
+                let item_charge =
+                    json_values_charge([&item.item_data], &[&item.item_id], max_append_charge_bytes - charge)?;
+                charge = charge.checked_add(item_charge).ok_or(StoreError::PayloadTooLarge)?;
+            }
+            let has_items = inner.items.get(&key).is_some_and(|existing| !existing.is_empty());
+            if !has_items
+                && inner
+                    .conversations
+                    .get(&key)
+                    .and_then(|record| record.messages.as_array())
+                    .is_some_and(|messages| !messages.is_empty())
+            {
+                let remaining = max_append_charge_bytes
+                    .checked_sub(charge)
+                    .ok_or(StoreError::PayloadTooLarge)?;
+                let cached = &inner.conversations.get(&key).ok_or(StoreError::NotFound)?.messages;
+                let cached_charge = json_values_charge([cached], &[], remaining)?;
+                charge = charge.checked_add(cached_charge).ok_or(StoreError::PayloadTooLarge)?;
+                // The first append wraps a cache-only array as an explicit legacy
+                // prefix; reserve the wrapper before moving it into the record.
+                let wrapper_charge = retained_charge(20, 2).ok_or(StoreError::PayloadTooLarge)?;
+                charge
+                    .checked_add(wrapper_charge)
+                    .filter(|total| *total <= max_append_charge_bytes)
+                    .ok_or(StoreError::PayloadTooLarge)?;
             }
         }
         // Invalidate the denormalized message cache incrementally (#1509): snapshot

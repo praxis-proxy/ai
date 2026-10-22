@@ -15,12 +15,13 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
-    compression::{StoreCompressionConfig, decode, decode_bounded, decode_bytes, run_blocking},
-    json_values_fit,
+    BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
+    compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
+    json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
     postgres_tls::PgTlsConfig,
+    retained_charge,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
         check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
@@ -179,7 +180,6 @@ impl PostgresResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: Option<usize>,
     ) -> Result<(), StoreError> {
         let max_sql = format!(
             "SELECT COALESCE(MAX(position), 0) AS max_pos \
@@ -221,29 +221,6 @@ impl PostgresResponseStore {
                 .map_err(|e| self.db_err(&e))?;
         }
 
-        // Enforce the retained-payload budget inside the mutation transaction:
-        // the new rows are already inserted, so the sum reflects the post-append
-        // state and a failure rolls the transaction back before the cache clears.
-        if let Some(max_rebuild_bytes) = max_rebuild_bytes {
-            let size_sql = format!(
-                "SELECT COALESCE(SUM(octet_length(item_data)), 0) AS raw_bytes, COUNT(*) AS row_count \
-                 FROM {items_table} \
-                 WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
-            );
-            let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
-                .bind(conversation_id)
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(|e| self.db_err(&e))?;
-            let raw_bytes: i64 = size_row.try_get("raw_bytes").map_err(|e| self.db_err(&e))?;
-            let row_count: i64 = size_row.try_get("row_count").map_err(|e| self.db_err(&e))?;
-            if !super::conversation_rebuild_fits(raw_bytes, row_count, max_rebuild_bytes) {
-                return Err(StoreError::PayloadTooLarge);
-            }
-        }
         pg_invalidate_messages(tx, conv_table, owner, conversation_id).await
     }
 
@@ -828,6 +805,57 @@ impl ResponseStore for PostgresResponseStore {
         }
     }
 
+    async fn get_response_budgeted(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let raw_limit = max_charge_bytes / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER;
+        let limit = i64::try_from(raw_limit).map_err(|_overflow| StoreError::PayloadTooLarge)?;
+        let sql = format!(
+            "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, \
+                    response_object, input, messages \
+             FROM {} \
+             WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+               AND octet_length(id)::bigint + octet_length(model)::bigint + \
+                   octet_length(response_object)::bigint + octet_length(input)::bigint + \
+                   octet_length(messages)::bigint <= $5",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(limit)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        if let Some(row) = row {
+            return run_blocking(move || row_to_response_record_budgeted(&row, max_charge_bytes))
+                .await
+                .map(Some);
+        }
+        let exists_sql = format!(
+            "SELECT 1 FROM {} WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            self.tables.responses
+        );
+        let exists = sqlx::query_scalar::<_, i32>(AssertSqlSafe(exists_sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        if exists.is_some() {
+            Err(StoreError::PayloadTooLarge)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         // Delete the response and any pending approvals it issued in one atomic
         // transaction: a deleted response must leave no consumable approval
@@ -890,6 +918,16 @@ impl ResponseStore for PostgresResponseStore {
         max_bytes: usize,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         self.conversation_record_within(owner, conversation_id, max_bytes).await
+    }
+
+    async fn get_conversation_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        self.conversation_record_budgeted(owner, conversation_id, max_charge_bytes)
+            .await
     }
 
     #[expect(clippy::too_many_lines, reason = "sequential per-record bind within a transaction")]
@@ -1769,9 +1807,9 @@ impl ConversationItemStore for PostgresResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: usize,
+        max_append_charge_bytes: usize,
     ) -> Result<(), StoreError> {
-        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_rebuild_bytes))
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_append_charge_bytes))
             .await
     }
 
@@ -1928,6 +1966,176 @@ impl PostgresResponseStore {
         Ok(Some(record))
     }
 
+    /// Reconstruct history after a byte-and-structure preflight. The database
+    /// query bounds the total raw JSON before transferring columns; each JSON
+    /// value is scanned before deserialization.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one read transaction keeps charge preflight and reconstruction on the same snapshot"
+    )]
+    #[cfg_attr(
+        any(feature = "postgres", feature = "postgres-cert-auth"),
+        expect(
+            clippy::large_stack_frames,
+            reason = "the async_trait boundary boxes this single-snapshot reconstruction future"
+        )
+    )]
+    async fn conversation_record_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let id_charge = json_values_charge(std::iter::empty(), &[conversation_id], max_charge_bytes)?;
+        let remaining = max_charge_bytes
+            .checked_sub(id_charge)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let raw_limit = remaining / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER;
+        let limit = i64::try_from(raw_limit).unwrap_or(i64::MAX);
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let (message_bytes, item_bytes, item_exists) = if let Some(table) = self.tables.items.as_deref() {
+            let item_scope = "i.conversation_id = c.conversation_id AND i.tenant_id = c.tenant_id \
+                 AND i.owner_issuer = c.owner_issuer AND i.owner_subject = c.owner_subject";
+            (
+                format!(
+                    "CASE WHEN left(c.messages, 19) = '{{\"legacy_messages\":' \
+                       THEN octet_length(c.messages)::bigint \
+                       WHEN EXISTS (SELECT 1 FROM {table} i WHERE {item_scope}) THEN 2 \
+                       ELSE octet_length(c.messages)::bigint END"
+                ),
+                format!(
+                    "COALESCE((SELECT SUM(octet_length(i.item_data)::bigint) FROM {table} i \
+                       WHERE {item_scope}), 0::bigint)"
+                ),
+                format!("EXISTS (SELECT 1 FROM {table} i WHERE {item_scope})"),
+            )
+        } else {
+            (
+                "octet_length(c.messages)::bigint".to_owned(),
+                "0::bigint".to_owned(),
+                "FALSE".to_owned(),
+            )
+        };
+        let raw_size = format!("octet_length(c.metadata)::bigint + ({message_bytes}) + ({item_bytes})");
+        let size_sql = format!(
+            "SELECT ({raw_size}) <= $5 AS within_limit FROM {} c \
+             WHERE c.conversation_id = $1 AND c.tenant_id = $2 \
+               AND c.owner_issuer = $3 AND c.owner_subject = $4",
+            self.tables.conversations
+        );
+        let size_row = Box::pin(
+            sqlx::query(AssertSqlSafe(size_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .bind(limit)
+                .fetch_optional(&mut *tx),
+        )
+        .await
+        .map_err(|e| self.db_err(&e))?;
+        let Some(size_row) = size_row else {
+            return Ok(None);
+        };
+        let fits: bool = size_row.try_get("within_limit").map_err(|e| self.db_err(&e))?;
+        if !fits {
+            return Err(StoreError::PayloadTooLarge);
+        }
+
+        let messages_projection = if self.tables.items.is_some() {
+            format!(
+                "CASE WHEN {item_exists} AND left(c.messages, 19) <> '{{\"legacy_messages\":' \
+                 THEN '[]' ELSE c.messages END"
+            )
+        } else {
+            "c.messages".to_owned()
+        };
+        let record_sql = format!(
+            "SELECT c.conversation_id, c.tenant_id, c.owner_issuer, c.owner_subject, c.created_at, \
+                    c.metadata, ({messages_projection}) AS messages \
+             FROM {} c WHERE c.conversation_id = $1 AND c.tenant_id = $2 \
+               AND c.owner_issuer = $3 AND c.owner_subject = $4",
+            self.tables.conversations
+        );
+        let row = Box::pin(
+            sqlx::query(AssertSqlSafe(record_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .fetch_optional(&mut *tx),
+        )
+        .await
+        .map_err(|e| self.db_err(&e))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let metadata_json: String = row.try_get("metadata").map_err(|e| self.db_err(&e))?;
+        let messages_json: String = row.try_get("messages").map_err(|e| self.db_err(&e))?;
+        let mut charge = id_charge;
+        let metadata_charge = json_payload_charge(metadata_json.as_bytes(), max_charge_bytes - charge)?;
+        charge = charge.checked_add(metadata_charge).ok_or(StoreError::PayloadTooLarge)?;
+        let messages_charge = json_payload_charge(messages_json.as_bytes(), max_charge_bytes - charge)?;
+        charge = charge.checked_add(messages_charge).ok_or(StoreError::PayloadTooLarge)?;
+        let metadata = serde_json::from_str(&metadata_json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let mut item_rows = Vec::new();
+        if let Some(table) = self.tables.items.as_deref() {
+            let items_sql = format!(
+                "SELECT item_data FROM {table} WHERE conversation_id = $1 AND tenant_id = $2 \
+                 AND owner_issuer = $3 AND owner_subject = $4 ORDER BY position ASC, item_id ASC"
+            );
+            let mut rows = Box::pin(
+                sqlx::query_scalar::<_, String>(AssertSqlSafe(items_sql.as_str()))
+                    .bind(conversation_id)
+                    .bind(owner.tenant_id())
+                    .bind(owner.issuer())
+                    .bind(owner.subject())
+                    .fetch(&mut *tx),
+            );
+            while let Some(json) = rows.try_next().await.map_err(|e| self.db_err(&e))? {
+                let row_charge = json_payload_charge(json.as_bytes(), max_charge_bytes - charge)?;
+                charge = charge.checked_add(row_charge).ok_or(StoreError::PayloadTooLarge)?;
+                item_rows.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
+            }
+        }
+        let item_count = item_rows.len();
+        let legacy_count = snapshot
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let extra_commas = if item_count == 0 {
+            0
+        } else if legacy_count == 0 {
+            item_count.saturating_sub(1)
+        } else {
+            item_count
+        };
+        charge = charge
+            .checked_add(retained_charge(extra_commas, 0).ok_or(StoreError::PayloadTooLarge)?)
+            .filter(|value| *value <= max_charge_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let messages = serde_json::Value::Array(super::reconstruct_conversation_history(snapshot, item_rows));
+        let record = ConversationRecord {
+            conversation_id: row.try_get("conversation_id").map_err(|e| self.db_err(&e))?,
+            owner: row_to_owner(&row)?,
+            created_at: row.try_get("created_at").map_err(|e| self.db_err(&e))?,
+            metadata,
+            messages,
+        };
+        Box::pin(tx.commit()).await.map_err(|e| self.db_err(&e))?;
+        Ok(Some(BudgetedRecord {
+            record,
+            charge_bytes: charge,
+        }))
+    }
+
     /// Reconstruct a conversation's full history (legacy prefix + item rows).
     #[expect(
         clippy::too_many_lines,
@@ -2016,17 +2224,17 @@ impl PostgresResponseStore {
         Ok(Some(history))
     }
 
-    /// Insert items and rebuild the owner-scoped cache in one transaction.
+    /// Append items and migrate a cache-only legacy prefix in one transaction.
     #[expect(
         clippy::too_many_lines,
-        reason = "transactional insert and bounded rebuild share one lock"
+        reason = "transactional insert and bounded append share one lock"
     )]
     async fn create_items_and_sync_messages_with_limit(
         &self,
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
-        max_rebuild_bytes: Option<usize>,
+        max_append_charge_bytes: Option<usize>,
     ) -> Result<(), StoreError> {
         require_matching_item_scope(owner, conversation_id, items)?;
 
@@ -2063,37 +2271,61 @@ impl PostgresResponseStore {
             return Ok(());
         }
 
+        let remaining_budget = max_append_charge_bytes
+            .map(|maximum| {
+                let append_charge = super::conversation_append_charge(conversation_id, items, maximum)?;
+                maximum.checked_sub(append_charge).ok_or(StoreError::PayloadTooLarge)
+            })
+            .transpose()?;
+        let max_legacy_json_bytes = remaining_budget.map_or(usize::MAX, |remaining| {
+            remaining / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER
+        });
+        let max_legacy_json_bytes = i64::try_from(max_legacy_json_bytes).unwrap_or(i64::MAX);
+
         let scope_sql = format!(
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM {items_table} \
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4) \
-             THEN NULL ELSE messages END FROM {conv_table} WHERE conversation_id = $1 AND tenant_id = $2 \
+             THEN NULL WHEN octet_length(messages)::bigint <= $5 THEN messages ELSE NULL END AS cached, \
+             CASE WHEN NOT EXISTS (SELECT 1 FROM {items_table} \
+             WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4) \
+             AND messages IS NOT NULL AND octet_length(messages)::bigint > $5 THEN TRUE ELSE FALSE END AS legacy_too_large \
+             FROM {conv_table} WHERE conversation_id = $1 AND tenant_id = $2 \
              AND owner_issuer = $3 AND owner_subject = $4"
         );
         let writable = Box::pin(
-            sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(scope_sql.as_str()))
+            sqlx::query(AssertSqlSafe(scope_sql.as_str()))
                 .bind(conversation_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
                 .bind(owner.subject())
+                .bind(max_legacy_json_bytes)
                 .fetch_optional(&mut *tx),
         )
         .await
         .map_err(|e| self.db_err(&e))?;
-        let cached = writable.ok_or(StoreError::NotFound)?;
+        let writable = writable.ok_or(StoreError::NotFound)?;
+        let legacy_too_large: bool = writable.try_get("legacy_too_large").map_err(|e| self.db_err(&e))?;
+        if legacy_too_large {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let cached: Option<String> = writable.try_get("cached").map_err(|e| self.db_err(&e))?;
         if let Some(json) = cached {
+            if let Some(remaining) = remaining_budget {
+                let cache_charge = json_payload_charge(json.as_bytes(), remaining)?;
+                let remaining = remaining.checked_sub(cache_charge).ok_or(StoreError::PayloadTooLarge)?;
+                // The first append wraps a cache-only array as an explicit legacy
+                // prefix; reserve the object/key overhead before parsing it.
+                if json.trim_start().starts_with('[') {
+                    let wrapper_charge = retained_charge(20, 2).ok_or(StoreError::PayloadTooLarge)?;
+                    if wrapper_charge > remaining {
+                        return Err(StoreError::PayloadTooLarge);
+                    }
+                }
+            }
             Box::pin(pg_preserve_legacy_prefix(self, &mut tx, owner, conversation_id, &json)).await?;
         }
 
-        Box::pin(self.insert_items_and_sync(
-            &mut tx,
-            items_table,
-            conv_table,
-            owner,
-            conversation_id,
-            items,
-            max_rebuild_bytes,
-        ))
-        .await?;
+        Box::pin(self.insert_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items)).await?;
 
         Box::pin(tx.commit()).await.map_err(|e| self.db_err(&e))?;
         Ok(())
@@ -2368,6 +2600,52 @@ fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
 /// Decode a response row while enforcing the aggregate encoded and decoded limit.
 fn row_to_response_record_bounded(row: &PgRow, max_bytes: usize) -> Result<ResponseRecord, StoreError> {
     row_to_response_record_with_limit(row, Some(max_bytes))
+}
+
+/// Decode a response row, charging each JSON column against the remaining
+/// allowance and returning the total measured charge.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each JSON column is charged and decoded in sequence"
+)]
+fn row_to_response_record_budgeted(
+    row: &PgRow,
+    max_charge_bytes: usize,
+) -> Result<BudgetedRecord<ResponseRecord>, StoreError> {
+    let id: &str = row.try_get("id").map_err(|e| StoreError::Database(e.to_string()))?;
+    let model: &str = row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?;
+    let mut remaining = max_charge_bytes
+        .checked_sub(json_values_charge(std::iter::empty(), &[id, model], max_charge_bytes)?)
+        .ok_or(StoreError::PayloadTooLarge)?;
+    let response_object_json: Vec<u8> = row
+        .try_get("response_object")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let input_json: Vec<u8> = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
+    let messages_json: Vec<u8> = row
+        .try_get("messages")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let (response_object, charge) = decode_budgeted(&response_object_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+    let (input, charge) = decode_budgeted(&input_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+    let (messages, charge) = decode_budgeted(&messages_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+
+    Ok(BudgetedRecord {
+        record: ResponseRecord {
+            id: id.to_owned(),
+            owner: row_to_owner(row)?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            model: model.to_owned(),
+            response_object,
+            input,
+            messages,
+        },
+        charge_bytes: max_charge_bytes - remaining,
+    })
 }
 
 /// Convert a response row, optionally applying a bounded decode to its JSON columns.

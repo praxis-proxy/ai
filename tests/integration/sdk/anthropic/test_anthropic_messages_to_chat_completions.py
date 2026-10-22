@@ -304,6 +304,33 @@ def degrading_client():
 
 
 class TestRequestFieldHandling:
+    @pytest.mark.parametrize("field", ["type", "cache_control"])
+    def test_nullable_tool_fields_match_omission(
+        self, anthropic_client, degrading_client, field
+    ):
+        for client in [anthropic_client, degrading_client]:
+            RecordingBackend.bodies.clear()
+            tool = {
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object"},
+                field: None,
+            }
+
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={"tools": [tool]},
+            )
+
+            assert response.content[0].text == "4"
+            [upstream] = RecordingBackend.bodies
+            [translated] = upstream["tools"]
+            assert translated["type"] == "function"
+            assert translated["function"]["name"] == "lookup"
+            assert field not in translated["function"]
+
     def test_tool_input_presence_is_preserved(self, anthropic_client):
         RecordingBackend.bodies.clear()
 

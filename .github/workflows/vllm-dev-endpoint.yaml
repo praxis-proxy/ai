@@ -140,7 +140,7 @@ jobs:
           MAX_MODEL_LEN: ${{ inputs.max_model_len }}
           REASONING_PARSER: ${{ inputs.reasoning_parser }}
           ENABLE_THINKING: ${{ inputs.enable_thinking }}
-          VLLM_GPU_IMAGE: docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2
+          VLLM_GPU_IMAGE: docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f
         run: |
           # Background the image pull + container launch so the multi-GB CUDA
           # image download and model weight load proceed while the tunnel binary
